@@ -115,6 +115,7 @@ pub fn afterPrepare() !void {
     if (@import("builtin").is_test and test_failure == .after_prepare) return error.InjectedSourcePinFailure;
 }
 pub fn locate(db: *DB, scope: ledger.Scope) !ledger.Located {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("sourcePinLocate", .{ db, scope });
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     return ledger.locate(&read, scope);
@@ -153,6 +154,7 @@ fn verifyInventory(alloc: Allocator, io: std.Io, root: []const u8, handle: seal.
 /// Caller holds the DB apply lock. The normal path never exposes prepared
 /// admission to another writer. Restart retries complete this same frozen cut.
 pub fn ensureAssumeApply(db: *DB, scope: ledger.Scope) !void {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("sourcePinEnsureAssumeApply", .{ db, scope });
     if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
     if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     const alloc = db.alloc;
@@ -229,6 +231,7 @@ pub fn ensureAssumeApply(db: *DB, scope: ledger.Scope) !void {
 /// Compact observation only: never exports, hashes the corpus, or recaptures
 /// live rows. A busy exporter is pending, not a reason to block status polls.
 pub fn publicationCertificateIfPresent(db: *DB, scope: ledger.Scope, cancellation: Cancellation) !?snapshot.Certificate {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("sourcePinPublicationCertificateIfPresent", .{ db, scope, cancellation });
     try cancellation.check();
     const found = try locate(db, scope);
     if (found.progress.phase == .released or found.progress.snapshot_phase == .prepared) return null;
@@ -259,6 +262,7 @@ pub fn publicationCertificateIfPresent(db: *DB, scope: ledger.Scope, cancellatio
 }
 
 pub fn preparePublication(db: *DB, scope: ledger.Scope, cancellation: Cancellation) !snapshot.Certificate {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("sourcePinPreparePublication", .{ db, scope, cancellation });
     if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
@@ -337,6 +341,7 @@ fn verifyCut(scope: ledger.Scope, progress: ledger.Progress, certificate: snapsh
 /// durable source-ledger decision. Its slot remains reserved until local
 /// cleanup is durable, so crashes cannot orphan a pin through slot reuse.
 pub fn reclaimReleased(db: *DB, scope: ledger.Scope) !void {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("sourcePinReclaimReleased", .{ db, scope });
     const found = locate(db, scope) catch |err| switch (err) {
         error.OnlineSourceScopeChanged => return,
         else => return err,
@@ -359,6 +364,7 @@ pub fn reconcileReleased(db: *DB) !void {
 }
 
 pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork {
+    if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("sourcePinReconcileReleasedWithBudget", .{ db, budget });
     // Replica-local source pins are native filesystem artifacts.
     if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;

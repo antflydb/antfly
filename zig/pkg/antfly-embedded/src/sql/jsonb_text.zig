@@ -127,7 +127,8 @@ pub fn write(a: std.mem.Allocator, value: Json, writer: *std.Io.Writer, limit: u
         },
         .string => |bytes| {
             try work.consume(bytes.len);
-            if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlTypeMismatch;
+            if (!std.unicode.utf8ValidateSlice(bytes)) return error.SqlInvalidTextEncoding;
+            if (std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlUntranslatableCharacter;
             try std.json.Stringify.value(value, .{}, writer);
         },
         .array => |items| {

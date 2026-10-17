@@ -2386,6 +2386,7 @@ fn collectFullTextResolvedDocSetAlloc(
         text_entry,
         search_query,
         true,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
     );
 }
 
@@ -8811,6 +8812,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         text_entry,
         search_query,
         false,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
     );
 }
 
@@ -8821,6 +8823,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     text_entry: *index_manager_mod.IndexManager.TextIndex,
     search_query: search_mod.SearchQuery,
     allow_analyzed_terms: bool,
+    control: query_mod.ExecutionControl,
 ) !?doc_set.ResolvedDocSet {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
@@ -8849,7 +8852,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
     if (bench_profile) filter_compile_ns = platform_time.monotonicNs() - filter_compile_start_ns;
     const execute_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    const doc_nums = try snapshot.executeFilter(alloc, filter.withControl(control));
     if (bench_profile) execute_ns = platform_time.monotonicNs() - execute_start_ns;
     defer alloc.free(doc_nums);
     if (doc_nums.len == 0) {
@@ -8924,7 +8927,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
     ))) return null;
 
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    const doc_nums = try snapshot.executeFilter(alloc, filter.withControl(.{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns }));
     if (doc_nums.len == 0) {
         alloc.free(doc_nums);
         return .none;
@@ -9021,6 +9024,7 @@ fn collectStructuredFilterDocIdsAlloc(
     const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
         .query = search_query,
+        .control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
         .k = k,
         .offset = 0,
         .include_stored = false,
@@ -9149,7 +9153,7 @@ fn queryFieldUsesKeywordAnalyzer(
     return analyzer.tokenizer == .keyword and analyzer.filters.len == 0 and analyzer.char_filters.len == 0;
 }
 
-fn resolveFilterTextIndexEntry(
+pub fn resolveFilterTextIndexEntry(
     executor: StructuredFilterResolverExecutor,
     primary_text_index_name: ?[]const u8,
     index_name: ?[]const u8,
@@ -12038,7 +12042,7 @@ pub fn searchTextQuery(
         effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
     {
         try checkSearchRequestDeadline(effective_req);
-        const total = try search_mod.countMatches(alloc, snapshot, search_query);
+        const total = try search_mod.countMatchesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns });
         try checkSearchRequestDeadline(effective_req);
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
     }
@@ -12068,7 +12072,7 @@ pub fn searchTextQuery(
             else => return err,
         };
         if (membership_filter) |filter| {
-            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter);
+            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }));
             defer membership.deinit(alloc);
 
             const cost_decision = sortedSegmentSelectiveCandidateDocValuesDecision(effective_req, membership.candidate_count, snapshot);
@@ -12157,7 +12161,7 @@ pub fn searchTextQuery(
                 alloc,
                 effective_req,
                 snapshot,
-                filter,
+                filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }),
                 executor,
                 field_sort_plan,
             );
@@ -12168,7 +12172,7 @@ pub fn searchTextQuery(
                 const selected = try arena_alloc.alloc(u32, out.hits.len);
                 for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
                 std.mem.sort(u32, selected, {}, std.sort.asc(u32));
-                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
+                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
                 defer scored.deinit();
                 var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
                 defer scores.deinit(alloc);
@@ -12253,10 +12257,11 @@ pub fn searchTextQuery(
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
-            try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+            try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
         else
             try search_mod.execute(alloc, snapshot, .{
                 .query = search_query,
+                .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
                 .offset = if (collect_window_candidates) 0 else paging.offset,
                 .include_stored = load_stored_in_search_engine,

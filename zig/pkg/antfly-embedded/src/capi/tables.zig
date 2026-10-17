@@ -69,6 +69,7 @@ pub fn closeAll(handle: *h.Handle) void {
     handle.embedded_table_records.deinit(handle.alloc);
     handle.embedded_table_records = .empty;
     handle.embedded_catalog_loaded = false;
+    handle.embedded_tables_discovered = false;
 }
 
 /// Catalog discovery never opens an index/provider belonging to another table.
@@ -106,11 +107,23 @@ pub fn load(handle: *h.Handle) !void {
     try loadCatalog(handle);
     var names = handle.embedded_table_records.keyIterator();
     while (names.next()) |name| _ = try get(handle, name.*);
+    handle.embedded_tables_discovered = true;
+}
+
+/// Integrity and unqualified DDL need every namespace, including inbound FK
+/// owners. This is handle-local: a refreshed native view starts undiscovered
+/// even when its durable recovery state is known clean. Cache discovery so
+/// repeated statements do not enumerate/open every table again.
+pub fn ensureDiscovered(handle: *h.Handle) !void {
+    if (!handle.embedded_tables_discovered) try loadAvailable(handle);
 }
 
 /// Background discovery isolates a broken namespace and exposes its error in
 /// pending-work diagnostics instead of stranding healthy tables' maintenance.
 pub fn loadAvailable(handle: *h.Handle) !void {
+    // An interrupted rescan must not leave a prior successful discovery cached
+    // after its failure diagnostics have been cleared.
+    handle.embedded_tables_discovered = false;
     try loadCatalog(handle);
     handle.embedded_table_errors.clearRetainingCapacity();
     var names = handle.embedded_table_records.keyIterator();
@@ -120,6 +133,9 @@ pub fn loadAvailable(handle: *h.Handle) !void {
             continue;
         };
     }
+    // Keep unavailable namespaces retryable on hosted handles too: they may
+    // have no maintenance worker to retry a transient open failure for us.
+    handle.embedded_tables_discovered = handle.embedded_table_errors.count() == 0;
 }
 
 fn persist(handle: *h.Handle) !void {
@@ -183,6 +199,7 @@ pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
 }
 
 pub fn create(handle: *h.Handle, name: []const u8, schema: []const u8, if_not_exists: bool) !void {
+    @import("sql_ddl.zig").invalidate(handle);
     try requireDatabase(handle);
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
     if (name.len == 0 or name.len > 1024 or std.mem.indexOfScalar(u8, name, 0) != null or !std.unicode.utf8ValidateSlice(name)) return error.InvalidSqlParameters;
@@ -288,7 +305,7 @@ pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
 fn ensureTableUnused(handle: *h.Handle, name: []const u8, table_id: u64) !void {
     if (handle.lite_connection_context) |connection| try connection.ensureOtherConnectionsCanDrop();
     for (handle.table_handles.items) |id| {
-        const child, const slot = h.handle_registry.enter(id) orelse continue;
+        const child, const slot = h.handleRegistry().enter(id) orelse continue;
         defer h.HandleRegistry.leave(slot);
         // A child can still cache a pointer into a retired generation. That
         // address may have been reused by an unrelated table after refresh.
@@ -333,7 +350,9 @@ fn checkDependency(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void 
     };
 }
 
-pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema: h.capi.Slice) h.capi.ErrorCode {
+pub fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema: h.capi.Slice) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_create_table_json), .{ .name = "antfly_db_create_table_json" }), .{ ptr, name, schema });
     h.capi.clearLastError();
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -344,7 +363,9 @@ pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, 
     create(guard.handle, name.bytes(), schema.bytes(), false) catch |err| return h.capi.mapError(err);
     return .ok;
 }
-pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.ErrorCode {
+pub fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_drop_table), .{ .name = "antfly_db_drop_table" }), .{ ptr, name });
     h.capi.clearLastError();
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -355,7 +376,9 @@ pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.
     drop(guard.handle, name.bytes(), false) catch |err| return h.capi.mapError(err);
     return .ok;
 }
-pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_list_tables_json), .{ .name = "antfly_db_list_tables_json" }), .{ ptr, out });
     h.capi.clearLastError();
     out.* = .{};
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -383,7 +406,9 @@ pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) 
 
 /// Table handles use the existing document, index, and enrichment APIs. They
 /// borrow the namespace and are invalidated safely when the database closes.
-pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopaque) h.capi.ErrorCode {
+pub fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopaque) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_open_table), .{ .name = "antfly_db_open_table" }), .{ ptr, name, out });
     h.capi.clearLastError();
     out.* = null;
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -394,11 +419,9 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
     defer guard.leave();
     const root = guard.handle;
     requireDatabase(root) catch |err| return h.capi.mapError(err);
-    @import("sql_commit.zig").recover(root) catch |err| return h.capi.mapError(err);
-    @import("sql_ddl.zig").recover(root) catch |err| return h.capi.mapError(err);
     var i: usize = 0;
     while (i < root.table_handles.items.len) {
-        if (h.handle_registry.enter(root.table_handles.items[i])) |entry| {
+        if (h.handleRegistry().enter(root.table_handles.items[i])) |entry| {
             h.HandleRegistry.leave(entry[1]);
             i += 1;
         } else {
@@ -414,7 +437,7 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
         return h.capi.mapErrorContext(err, @src().fn_name ++ ": allocating the selected table name");
     };
     child.selected_table_id = db.core.identity_namespace.table_id;
-    const id = h.handle_registry.register(child) catch |err| {
+    const id = h.handleRegistry().register(child) catch |err| {
         root.alloc.free(child.selected_table_name.?);
         root.alloc.destroy(child);
         return h.capi.mapErrorContext(err, @src().fn_name ++ ": registering the table handle");
@@ -425,4 +448,13 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
     };
     out.* = id;
     return .ok;
+}
+
+comptime {
+    @import("exports.zig").publish(@This(), &.{
+        "antfly_db_create_table_json",
+        "antfly_db_drop_table",
+        "antfly_db_list_tables_json",
+        "antfly_db_open_table",
+    });
 }

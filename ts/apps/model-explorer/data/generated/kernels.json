@@ -1450,6 +1450,14 @@
    }
   },
   {
+   "name": "termite_clamp_silu",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_compressed_attention_hybrid_attention",
    "family": "attention",
    "generated": false,
@@ -1811,6 +1819,14 @@
   },
   {
    "name": "termite_embed_absolute_position",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_embedding_head_prepare",
    "family": "data_movement",
    "generated": false,
    "source": {
@@ -2186,6 +2202,22 @@
    }
   },
   {
+   "name": "termite_layer_norm_bwd_dgdb_partial",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_layer_norm_bwd_dgdb_reduce",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_layer_norm_bwd_dx",
    "family": "training",
    "generated": false,
@@ -2338,6 +2370,30 @@
    }
   },
   {
+   "name": "termite_modernbert_training_attention_flash_dkdv",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_modernbert_training_attention_flash_dq",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_modernbert_training_attention_flash_forward",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_modernbert_training_attention_forward",
    "family": "training",
    "generated": false,
@@ -2466,8 +2522,32 @@
    }
   },
   {
+   "name": "termite_norm_residual",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_normalize_embedding",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_nvfp4_linear",
    "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_packed_gelu",
+   "family": "other",
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m"
@@ -4202,6 +4282,38 @@
    }
   },
   {
+   "name": "termite_sdpa_f32_grouped_matrix32",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_grouped_matrix64",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_grouped_short256",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_grouped_short512",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_sdpa_f32_nomic_q8",
    "family": "attention",
    "generated": false,
@@ -4259,6 +4371,14 @@
   },
   {
    "name": "termite_sdpa_f32_vision_hd64_flash_q32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_vision_hd64_flash_q32_full",
    "family": "vision",
    "generated": false,
    "source": {
@@ -4354,7 +4474,23 @@
    }
   },
   {
+   "name": "termite_training_accumulate_into_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_training_adamw_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_training_adamw_into_f32",
    "family": "training",
    "generated": false,
    "source": {
@@ -4396,6 +4532,14 @@
   {
    "name": "termite_turbo3_key_scores",
    "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_vision_norm_rope",
+   "family": "vision",
    "generated": false,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m"

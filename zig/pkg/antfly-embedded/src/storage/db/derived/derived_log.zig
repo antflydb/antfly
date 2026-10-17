@@ -88,7 +88,9 @@ pub const EntryView = struct {
 
 pub const FullStats = wal.FullStats;
 
-pub const DerivedLog = if (!supports_native_derived_log) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const DerivedLog = if (!supports_native_derived_log) UnsupportedDerivedLog else PlatformDerivedLog;
+const UnsupportedDerivedLog = struct {
     alloc: Allocator,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     next_sequence: u64 = 1,
@@ -186,7 +188,8 @@ pub const DerivedLog = if (!supports_native_derived_log) struct {
         }
         self.entries.items.len = write_index;
     }
-} else struct {
+};
+const PlatformDerivedLog = struct {
     wal_impl: wal.WAL,
 
     pub fn open(path: [*:0]const u8, opts: OpenOptions) !DerivedLog {

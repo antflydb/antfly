@@ -334,8 +334,8 @@ const SegmentFileStore = struct {
         if (writer.vtable.finish_source != null or writer.vtable.finish_mapped != null) writer.setCacheIntent(.cold_sequential);
         try writer.appendSlice(bytes);
         active = false;
-        if (writer.vtable.finish_source) |finish_source| return .fromNative(try finish_source(writer.ptr));
-        if (writer.vtable.finish_mapped) |finish_mapped| return .fromMappedArtifact(try finish_mapped(writer.ptr));
+        if (writer.vtable.finish_source != null) return .fromNative(try writer.finishSource());
+        if (writer.vtable.finish_mapped != null) return .fromMappedArtifact(try writer.finishMapped());
         writer.finish() catch |err| {
             // The atomic writer preserves the previously published segment on
             // failure and the caller receives the error for retry/rollback.
@@ -366,6 +366,7 @@ const SegmentFileStore = struct {
 
     fn delete(self: *SegmentFileStore, seg_id: u64) void {
         self.deleteChecked(seg_id) catch |err| {
+            if (err == error.EnrichmentWaitCanceled or err == error.Canceled) return;
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("text segment cleanup failed segment={d}: {s}", .{ seg_id, @errorName(err) });
             }
@@ -2307,8 +2308,8 @@ pub const PersistentIndex = struct {
 
         writer_active = false;
         const finish_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        const finished_source = if (writer.vtable.finish_source) |finish_source| try finish_source(writer.ptr) else null;
-        const finished_mapping = if (finished_source != null) null else if (writer.vtable.finish_mapped) |finish_mapped| try finish_mapped(writer.ptr) else blk: {
+        const finished_source = if (writer.vtable.finish_source != null) try writer.finishSource() else null;
+        const finished_mapping = if (finished_source != null) null else if (writer.vtable.finish_mapped != null) try writer.finishMapped() else blk: {
             try writer.finish();
             break :blk null;
         };
@@ -2988,10 +2989,10 @@ pub const PersistentIndex = struct {
         try sink_adapter.flush();
 
         writer_active = false;
-        var data: ?index_mod.SegmentData = if (writer.vtable.finish_source) |finish_source|
-            .fromNative(try finish_source(writer.ptr))
-        else if (writer.vtable.finish_mapped) |finish_mapped|
-            .fromMappedArtifact(try finish_mapped(writer.ptr))
+        var data: ?index_mod.SegmentData = if (writer.vtable.finish_source != null)
+            .fromNative(try writer.finishSource())
+        else if (writer.vtable.finish_mapped != null)
+            .fromMappedArtifact(try writer.finishMapped())
         else blk: {
             try writer.finish();
             break :blk if (publication_admission) |*admission|
@@ -6538,6 +6539,54 @@ test "lite persistent owned publication merge recovery and retained snapshot own
     // The old snapshot's exact artifact leases survive both owner closures.
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, pinned, "alpha"));
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, pinned, "beta"));
+}
+
+test "persistent reopen falls back to heap reads when foreign mapping is unavailable" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    const Foreign = struct {
+        var map_calls: usize = 0;
+        fn map(_: *anyopaque, _: Allocator, _: []const u8) anyerror!@import("../segment_source.zig").MappedArtifact {
+            map_calls += 1;
+            return error.MappedArtifactUnavailable;
+        }
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return @import("../runtime_callback_abi.zig").Boundary(storage_io.Storage.VTable).local_dispatch(contract, callback, args, output);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/mapping-fallback.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    var opts = PersistentIndexOptions{ .path = "/text", .io = std.testing.io, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    {
+        var index = try PersistentIndex.open(a, opts);
+        defer index.close();
+        const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+        defer a.free(bytes);
+        try index.indexSegment(bytes);
+        try index.syncMain(true);
+    }
+    var foreign_storage = storage.storage();
+    var vtable = foreign_storage.vtable.*;
+    // Exercise the existing heap fallback on a provider without native leases.
+    vtable.open_leased_immutable_source = null;
+    vtable.map_immutable_artifact = Foreign.map;
+    foreign_storage.vtable = &vtable;
+    foreign_storage.boundary_dispatch = Foreign.dispatch;
+    opts.main_lsm_storage = foreign_storage;
+    opts.wal_storage = foreign_storage;
+    opts.read_only = true;
+    Foreign.map_calls = 0;
+    var index = try PersistentIndex.open(a, opts);
+    defer index.close();
+    try std.testing.expectEqual(@as(usize, 1), Foreign.map_calls);
+    try std.testing.expect(index.snapshot().segments[0].data == .heap);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
 }
 
 test "lite persistent mapped read only fallback preserves unwritable directory queries" {

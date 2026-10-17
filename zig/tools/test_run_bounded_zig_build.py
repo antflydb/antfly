@@ -53,26 +53,32 @@ class BoundedZigBuildTest(unittest.TestCase):
         workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
             encoding="utf-8"
         )
-        job = re.search(
-            r"^  zig-base-tests:\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)",
-            workflow,
-            re.MULTILINE | re.DOTALL,
+        monitor = (SCRIPT.parents[2] / "scripts/ci/run-zig-unit-tests.sh").read_text(
+            encoding="utf-8"
         )
-        self.assertIsNotNone(job)
         defaults = {}
         for kind in ("IDLE", "HARD"):
-            match = re.search(rf"ANTFLY_UNIT_WATCHDOG_{kind}_SECS:-(\d+)", job.group(1))
+            match = re.search(rf"ANTFLY_UNIT_WATCHDOG_{kind}_SECS:-(\d+)", monitor)
             self.assertIsNotNone(match)
             defaults[kind] = int(match.group(1))
-        outer = re.search(r"^    timeout-minutes: (\d+)$", job.group(1), re.MULTILINE)
-        self.assertIsNotNone(outer)
-        # The observed cold-build critical path consumed 52 minutes before
-        # DB-core execution. Extend the total budget, not the idle threshold.
         self.assertEqual(defaults["IDLE"], 30 * 60)
         self.assertEqual(defaults["HARD"], 90 * 60)
-        self.assertEqual(int(outer.group(1)), 120)
-        self.assertLess(defaults["IDLE"], defaults["HARD"])
-        self.assertLess(defaults["HARD"], int(outer.group(1)) * 60)
+        for name in ("zig-base-tests", "zig-full-tests"):
+            job = re.search(
+                rf"^  {name}:\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)",
+                workflow,
+                re.MULTILINE | re.DOTALL,
+            )
+            self.assertIsNotNone(job)
+            self.assertIn("bash scripts/ci/run-zig-unit-tests.sh", job.group(1))
+            self.assertIn("name: Retain unit test progress", job.group(1))
+            outer = re.search(
+                r"^    timeout-minutes: (\d+)$", job.group(1), re.MULTILINE
+            )
+            self.assertIsNotNone(outer)
+            self.assertEqual(int(outer.group(1)), 120)
+            self.assertLess(defaults["IDLE"], defaults["HARD"])
+            self.assertLess(defaults["HARD"], int(outer.group(1)) * 60)
 
     def test_ci_scheduler_caps_admit_the_storage_compile_claim(self):
         # Production runtime construction owns the reservation. The root build
@@ -122,12 +128,20 @@ class BoundedZigBuildTest(unittest.TestCase):
             "zig-base-tests": "arc-antfly-heavy",
             "zig-full-tests": "arc-antfly-heavy",
             "zig-build-cache-tests": "arc-antfly-heavy",
-            "e2e-base-build": "arc-antfly-heavy-runtime",
-            "e2e-full-build": "arc-antfly-heavy-runtime",
+            "e2e-base-build": "arc-antfly-heavy",
+            "e2e-full-build": "arc-antfly-heavy",
         }
         for job, runner in expected_runners.items():
             with self.subTest(job=job):
                 self.assertIn(f"    runs-on: {runner}\n", jobs[job])
+                if job in ("e2e-base-build", "e2e-full-build"):
+                    # Compilation needs job-owned scratch on the heavy PVC,
+                    # not the runtime runner's 10 GiB ephemeral filesystem.
+                    self.assertIn("mountpoint -q /mnt/cache", jobs[job])
+                    self.assertIn("$cache_root/zig-local", jobs[job])
+                    self.assertIn("$cache_root/zig-global", jobs[job])
+                    self.assertIn("$cache_root/tmp", jobs[job])
+                    self.assertIn("Release completed E2E build scratch", jobs[job])
                 budget = re.search(
                     r'^      ANTFLY_ZIG_MAX_RSS: "(\d+)"$',
                     jobs[job],

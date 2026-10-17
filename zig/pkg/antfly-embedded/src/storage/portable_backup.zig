@@ -417,6 +417,7 @@ fn portableBlobIndex(blobs: []const PortableBlob, digest: [std.crypto.hash.sha2.
 /// The caller provides an allocator for temporary buffers. The output is
 /// appended to `out`.
 pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExport", .{ alloc, store, out });
     var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, out);
     defer out.* = allocating.toArrayList();
     try exportPortableToWriter(alloc, store, &allocating.writer);
@@ -504,6 +505,7 @@ pub fn exportPortableToWriterWithOptions(
     sink_writer: *std.Io.Writer,
     options: ExportOptions,
 ) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExportToWriterWithOptions", .{ alloc, store, sink_writer, options });
     var certificate_builder: ?source_snapshot.Builder = null;
     if (options.source_generation_summary_output) |output| output.output.* = null;
     if (options.source_copy != null and (options.cohort != null or options.source_certificate == null)) return error.InvalidBackupRequest;
@@ -2868,6 +2870,101 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
 pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
     try validatePortableImportBlocks(alloc, data, .{});
 }
+
+pub const FileInspectionOptions = struct {
+    max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
+    max_logical_bytes: u64 = 128 * 1024 * 1024 * 1024,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
+};
+
+pub const FileInspection = struct {
+    format_version: u32,
+    size_bytes: u64,
+    logical_bytes: u64,
+    fingerprint: backup_codec.FileReader.Fingerprint,
+};
+
+/// Read-only seam for preparation and dependency inspectors. First validate
+/// every logical record with the restore reader, then visit the authenticated
+/// blocks from the same descriptor. No DB, enrichment runtime, or network is
+/// opened. A callback must keep its output private until this function returns:
+/// a late checksum failure or source mutation invalidates the entire report.
+/// This validates the portable format, not destination/model/media eligibility.
+pub fn inspectPortableFileBlocks(
+    alloc: Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    options: FileInspectionOptions,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), backup_codec.BlockType, []const u8) anyerror!void,
+) !FileInspection {
+    try options.cancellation.check();
+    if (!try file.tryLock(io, .shared)) return error.WriterLocked;
+    defer file.unlock(io);
+    const initial_stat = try file.stat(io);
+    if (initial_stat.kind != .file) return error.InvalidBackupRequest;
+    if (initial_stat.size > options.max_input_bytes) return error.BackupInputLimitExceeded;
+    var raw = backup_codec.FileReader.init(io, file, initial_stat.size);
+    var reader: InspectionReader = .{
+        .inner = try PortableArchiveReader(backup_codec.FileReader).init(&raw),
+        .options = options,
+    };
+    defer reader.inner.deinit(alloc);
+    try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation });
+    const fingerprint = try reader.verifiedFingerprint();
+    try reader.reset(alloc);
+    const header = try reader.readHeader();
+    while (reader.hasRemaining()) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        try visit(context, block.block_type, block.payload);
+    }
+    try reader.inner.verifyFingerprint(fingerprint);
+    const final_stat = try file.stat(io);
+    if (final_stat.size != initial_stat.size or
+        !std.meta.eql(final_stat.mtime, initial_stat.mtime) or
+        !std.meta.eql(final_stat.ctime, initial_stat.ctime)) return error.SourceFileChanged;
+    try options.cancellation.check();
+    return .{
+        .format_version = header.format_version,
+        .size_bytes = initial_stat.size,
+        .logical_bytes = reader.logical_bytes,
+        .fingerprint = fingerprint,
+    };
+}
+
+const InspectionReader = struct {
+    inner: PortableArchiveReader(backup_codec.FileReader),
+    options: FileInspectionOptions,
+    logical_bytes: u64 = 0,
+
+    fn readHeader(self: *@This()) !backup_codec.FileHeader {
+        return self.inner.readHeader();
+    }
+
+    fn readBlock(self: *@This(), alloc: Allocator) !backup_codec.Block {
+        try self.options.cancellation.check();
+        const block = try self.inner.readBlock(alloc);
+        errdefer alloc.free(block.payload);
+        if (block.payload.len > self.options.max_logical_bytes -| self.logical_bytes)
+            return error.BackupExpansionLimitExceeded;
+        self.logical_bytes += block.payload.len;
+        return block;
+    }
+
+    fn hasRemaining(self: *const @This()) bool {
+        return self.inner.hasRemaining();
+    }
+
+    fn reset(self: *@This(), alloc: Allocator) !void {
+        try self.inner.reset(alloc);
+        self.logical_bytes = 0;
+    }
+
+    fn verifiedFingerprint(self: *const @This()) !backup_codec.FileReader.Fingerprint {
+        return self.inner.verifiedFingerprint();
+    }
+};
 
 /// Validate the cross-catalog invariant required when an archive represents a
 /// complete database image. Generic portable imports intentionally remain

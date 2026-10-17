@@ -107,10 +107,11 @@ pub const Prepared = struct {
     pub fn init(self: *Prepared, alloc: A, value: arrays.Value, bytes: usize, wire: usize, work: *arrays.Budget) !void {
         self.* = .{ .memory = .{ .backing = alloc, .limit = @min(bytes, MemoryBudget.headroom(alloc) orelse bytes) } };
         errdefer self.deinit();
-        if (value.element_type != .jsonb or value.elements.len == 0) return;
+        if (value.element_type != .jsonb or value.cardinality() == 0) return;
         var sorting: usize = 0;
         var has_payload = false;
-        for (value.elements) |element| {
+        for (0..value.cardinality()) |index| {
+            const element = value.flatCell(index);
             try work.consume(1);
             if (element.sql_null) continue;
             has_payload = true;
@@ -118,10 +119,11 @@ pub const Prepared = struct {
         }
         if (!has_payload) return;
         const a = self.memory.allocator();
-        self.cells = try a.alloc(Cell, value.elements.len);
+        self.cells = try a.alloc(Cell, value.cardinality());
         self.scratch = try a.alignedAlloc(u8, .of(usize), sorting);
         const before = work.remaining;
-        for (value.elements, self.cells) |element, *cell| {
+        for (self.cells, 0..) |*cell, index| {
+            const element = value.flatCell(index);
             cell.* = .{};
             if (element.sql_null) continue;
             var probe: Probe = .{ .cell = .{ .quoted = element.value == .null }, .limit = wire, .work = work };

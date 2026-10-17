@@ -495,7 +495,7 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
     try recovery_fixture.awaitMetadataRead(io, &metadata);
     var add = try sql(alloc, transport, &headers, metadata_uri, "ALTER TABLE children ADD CONSTRAINT child_parent FOREIGN KEY (parent_id) REFERENCES parents(id)");
     defer add.deinit(alloc);
-    if (add.status != 202) std.debug.print("hosted FK ADD status={d}\n", .{add.status});
+    if (add.status != 202) std.debug.print("hosted FK ADD status={d} body={s}\n", .{ add.status, add.body });
     try std.testing.expectEqual(@as(u16, 202), add.status);
     const parent_route = try awaitPublication(alloc, io, &metadata, child_id, true);
     defer parent_route.deinit(alloc);
@@ -598,7 +598,9 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
             .relational_integrity_catalog = true,
             .execution_deadline_ns = @min(parent_ready_deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
         }, .read_index) catch |err| switch (err) {
-            error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.Timeout, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => {
+            error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.Timeout, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => {
+                // Catalog placement can be visible before a restarted owner
+                // regains leadership and serves linearizable reads.
                 if (platform.time.monotonicNs() >= parent_ready_deadline) return err;
                 try io.sleep(.fromMilliseconds(20), .awake);
                 continue;

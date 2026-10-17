@@ -99,7 +99,7 @@ pub fn Cursor(comptime Provider: type) type {
             for (self.result.hits[self.position..end], rows) |hit, *out| {
                 // Even an ID-only relational projection verifies membership in
                 // the captured primary cut, without decoding unselected fields.
-                const typed = if (self.reader) |*reader| (try reader.lookupTypedRow(pa, hit.id)) orelse return error.SqlStatementReadUnavailable else null;
+                const typed = if (self.reader) |*reader| (if (comptime @hasDecl(Provider.Reader, "lookupSqlRow")) try reader.lookupSqlRow(pa, hit.id) else try reader.lookupTypedRow(pa, hit.id)) orelse return error.SqlStatementReadUnavailable else null;
                 if (typed == null and !Provider.hasSource(hit)) return error.SqlStatementReadUnavailable;
                 const document = if (typed) |row| row.typed orelse return error.InvalidSqlBackendResponse else if (self.needs_document) try Provider.document(&page, hit) else Json{ .object = .empty };
                 if (document != .object) return error.InvalidSqlBackendResponse;

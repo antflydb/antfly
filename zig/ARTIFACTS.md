@@ -177,6 +177,14 @@ is joined in when `_artifacts` is projected. For lookup projection:
 
 ## Artifact Identity
 
+[Model-aware chunk/embedding responses](../docs/plans/model-aware-media-chunking.md)
+keep descriptors and vectors associated by chunk identity even when payloads are
+omitted. Database integration must preserve existing `ArtifactRef` parent/source
+links and semantic invalidation; inference chunk IDs never expose storage keys
+or replace database artifact IDs. The optional chunk embedding target activates
+this response; `_chunk` recipes omit vectors and retain exact source coordinates.
+Model capability revision gates fused-vector reuse and retained-source replay.
+
 `ArtifactRef` remains the structured identity. `artifact_id` remains the opaque,
 round-trippable convenience token for search hits, links, and APIs that cannot
 carry structured refs.
@@ -316,6 +324,8 @@ ANTFLY_ENRICHMENT_OCR_BATCH_BYTES=67108864
 ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES=1
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_PIXELS=50000000
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES=268435456
+ANTFLY_ENRICHMENT_PDF_DECODE_WORKING_SET_BYTES=134217728
+ANTFLY_ENRICHMENT_PDF_DECODE_STREAM_BYTES=67108864
 ```
 
 PDF rendering uses the resolved OCR item count as its window size. Render
@@ -326,6 +336,55 @@ while preserving the OCR batch-byte ceiling for separately tracked output and
 request allocations. The document-scoped PDF coordinator is reused across
 streaming OCR flushes, recomputes available worker bytes before each render
 window, and each page worker has its own hard allocator ceiling.
+
+The PDF decode ceilings are node-owned controls, separate from render pixels
+and OCR batch sizes. Large page trees may require a larger decode working set
+even when their source file is smaller than another PDF. For example, an
+operator can set `ANTFLY_ENRICHMENT_PDF_DECODE_WORKING_SET_BYTES=1073741824`
+and `ANTFLY_DOCUMENT_EXTRACTION_WORKING_SET_BYTES=2147483648`; the latter
+bounds the aggregate source, decoded state, and retained extraction output.
+Process admission still applies. Invalid or zero decode overrides keep the
+defaults, and producer JSON cannot raise these limits. Rejected precommit
+extractions publish a failed manifest with their exact error code. Hierarchy
+navigation returns non-retryable `document_artifact_publication_failed` for a
+failed publication, while an active publication remains retryable.
+
+Dense text embedding uses up to two concurrent provider calls within a bounded
+logical batch. `ANTFLY_ENRICHMENT_EMBED_PARALLEL_BATCHES` accepts 1 through 4;
+providers without invocation-local context callbacks or an explicit concurrency
+guarantee stay serial. Managed providers opt in; custom providers default to one
+concurrent batch through `DenseEmbedder.dense_batch_concurrency`.
+All calls drain before a retry or replay checkpoint, and their outputs retain
+source order. The existing item and byte budgets bound the complete batch.
+Capacity rejection drains the concurrent wave, retains successful slices, and
+retries only failed slices serially within the same deadline. Providers with one
+available execution slot can progress without repeating successful inference.
+Text and multimodal query embedding retry transient inference capacity errors
+within the original deadline and observe cancellation during the wait.
+
+Embedding reprocess requests commit a config-fenced generation with the source
+mutation. Replay resolves it once per producer request, and text, sparse, and PDF
+page cache identities include it. Deferred work therefore survives reopen while
+already completed chunks stay cached during retries. Generation zero preserves
+the identities of existing embedding artifacts. Public embedding reprocess
+acceptance commits this generation and queues supervised inference without
+entering the provider; coverage and repair issues expose its eventual outcome.
+Forced generations bypass the optional dense computation memo and refresh it
+with newly computed vectors. Ordinary maintenance can still reuse memoized
+results, and completed artifact hashes prevent repeating fulfilled work.
+Ordered provider execution rechecks the requested generation in the same read
+snapshot as its source input and chunk-stream checkpoint. A newer reprocess
+invalidates an older queued request before it can capture newer input authority.
+Repair operations that explicitly wait for completion retain full-index sync.
+PDF page image embeddings use
+the page renderer and staged generation path, including for full-index sync;
+the ordinary text precompute path does not embed their source URL.
+
+Embedding producers also accept the document artifact `reprocess` endpoint
+and paged table `reprocess`/`reprocess-jobs` endpoints. These routes accept the
+embedding artifact name (for example `document_dense_v1`). Repair issue filters
+use `kind: "embedding"`; unknown fields are rejected instead of silently
+discarding a misspelled filter.
 
 Readers must stay model-neutral at this layer. The artifact producer exposes a
 batch request hook, and document-extraction OCR/transcription workers flush

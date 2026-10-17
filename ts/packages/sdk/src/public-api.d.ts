@@ -2189,8 +2189,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset across a table range
-         * @description Runs a bounded operational repair pass for any asset producer type
+         * Reprocess a derived artifact across a table range
+         * @description Runs a bounded operational repair pass for any asset or embedding producer
          *     across source rows in key order. Use `next_key` from the response as
          *     the next request's `from_key` for simple single-cursor continuation.
          *     Distributed repair controllers should persist `shard_cursors` from the
@@ -2255,7 +2255,7 @@ export interface paths {
         /**
          * Create a derived document artifact reprocess job
          * @description Creates a durable user-facing repair job for a derived document
-         *     artifact. The job advances through the same bounded per-shard repair
+         *     asset or embedding artifact. The job advances through the same bounded per-shard repair
          *     primitive used by `/reprocess`, and stores returned continuation
          *     cursors so hosted controllers can resume large sharded table repairs
          *     without collapsing progress into a single global key cursor.
@@ -2395,11 +2395,15 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset
+         * Reprocess a derived artifact
          * @description Invalidates the current artifact state and requests the producer to
          *     rebuild the derived asset for the source document. Copy, generator,
          *     reader, transcriber, extractor, and document-extraction producers are
-         *     all supported.
+         *     all supported, as are dense and sparse embedding producers. Embedding
+         *     reprocessing regenerates vectors even when the source chunks are unchanged.
+         *     Embedding requests are committed durably and queued for supervised
+         *     inference. Acceptance does not wait for inference; inspect index coverage
+         *     and repair issues for the eventual outcome.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -3760,24 +3764,28 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Chunk text into smaller segments
-         * @description Splits text into smaller chunks using semantic or fixed-size chunking models.
+         * Chunk content with optional model-aware embeddings
+         * @description Splits content into chunks. Without `embedding`, the fixed chunker and
+         *     legacy response remain unchanged. With `embedding`, the resolved target
+         *     model constrains boundaries for text, PDF pages, images or explicit tiles,
+         *     composited GIF frames, audio windows and consecutive video windows.
+         *
+         *     Each model-aware result pairs source coordinates and an optional vector
+         *     or error. `include_content` independently controls payload inclusion;
+         *     video uses the original source and sampling recipe. `execute: false`
+         *     plans without executing the embedding model. `stream: true` delivers
+         *     bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+         *     terminal record must not be treated as complete source coverage.
+         *     Continuations bind the original source version and semantic plan;
+         *     retries may deterministically recompute and must deduplicate chunk IDs.
          *
          *     ## Models
          *
-         *     ### Fixed Chunking (always available)
-         *     - Simple token-based splitting with overlap
-         *     - Use model="fixed"
+         *     ### Fixed Chunking
+         *     - Token-count splitting with overlap for text; fixed time windows for audio
+         *     - Use model="fixed" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
          *     - Fast and deterministic
-         *
-         *     ### ONNX Models
-         *     - Semantic chunking based on content similarity
-         *     - Models auto-discovered from `models_dir/chunkers/`
-         *     - Falls back to fixed chunking if model fails
-         *
-         *     ## Caching
-         *
-         *     Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+         *     - Other model names are rejected as unsupported
          */
         post: operations["chunkText"];
         delete?: never;
@@ -4353,13 +4361,12 @@ export interface paths {
          *
          *     ## Embedders
          *
-         *     - ONNX models from `models_dir/embedders/`
+         *     - Embedding models from `models_dir`
          *     - Quantized variants have `-i8` suffix
          *
          *     ## Chunkers
          *
-         *     - Always includes "fixed" (built-in)
-         *     - Plus any ONNX models from `models_dir/chunkers/`
+         *     - Always "fixed" (built-in); chunking does not load models from `models_dir`
          *
          *     ## Rerankers
          *
@@ -5378,7 +5385,20 @@ export interface components {
              */
             retryable: true;
         };
-        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"];
+        /** @description The requested source artifact failed publication and requires inspection and reprocessing. */
+        DocumentArtifactPublicationFailedError: {
+            /** @enum {string} */
+            code: "document_artifact_publication_failed";
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "document_artifact_publication_failed";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"] | components["schemas"]["DocumentArtifactPublicationFailedError"];
         /** @description A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity. */
         UnsupportedHierarchyGroupingError: {
             /**
@@ -13143,6 +13163,80 @@ export interface components {
             /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
             overlap_duration_ms?: number;
         };
+        ChunkEmbeddingTarget: {
+            model: string;
+            /** @description Optional required embedding-weight/recipe identity; a changed model is rejected before delivery. */
+            model_identity?: string;
+            /** @default RETRIEVAL_DOCUMENT */
+            task_type?: string;
+            dimensions?: number;
+            /**
+             * @description False resolves model limits and plans descriptors without running embedding inference.
+             * @default true
+             */
+            execute?: boolean;
+            /**
+             * @description Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable embedding failure.
+             * @default false
+             */
+            allow_partial?: boolean;
+        };
+        /** @description Semantic chunk policy. Execution batch size and queue depth are deliberately separate. */
+        MediaChunkPolicy: {
+            /**
+             * @description Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
+             * @default 1048576
+             */
+            max_text_bytes?: number;
+            /** @default 500 */
+            target_tokens?: number;
+            /** @default 50 */
+            overlap_tokens?: number;
+            /**
+             * Format: int64
+             * @default 32000000000
+             */
+            window_ns?: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            overlap_ns?: number;
+            /**
+             * Format: int64
+             * @default 1000000000
+             */
+            step_ns?: number;
+            /**
+             * @description Select the displayed picture at each video cadence target, including VFR holds. Zero retains at-or-after timestamp sampling.
+             * @default 1
+             */
+            video_hold?: number;
+            /** @default 32 */
+            max_frames?: number;
+            /** @default 0 */
+            tile_width?: number;
+            /** @default 0 */
+            tile_height?: number;
+            /** @default 0 */
+            tile_overlap?: number;
+            /**
+             * Format: int64
+             * @description Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
+             * @default 0
+             */
+            audio_pause_ns?: number;
+            /**
+             * Format: int64
+             * @default 5000000000
+             */
+            audio_pause_search_ns?: number;
+            /**
+             * @description Absolute normalized PCM amplitude threshold in thousandths.
+             * @default 10
+             */
+            audio_silence_milli?: number;
+        };
         /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
         ChunkOptions: {
             /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
@@ -13154,16 +13248,19 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
         };
         /**
          * @description Configuration for the Antfly inference chunking provider.
          *
          *     Antfly inference is Antfly's built-in ML service for local chunking.
-         *     The model name maps to ONNX model directory names (similar to how Ollama works).
          *
          *     **Chunking Models:**
-         *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
-         *     - Any other name will attempt to load from models/chunkers/{name}/ directory
+         *     - fixed: Fixed-size chunking by token count, with fixed time windows for audio
+         *       (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the
+         *       only chunking model Antfly inference implements; other model names are
+         *       rejected as unsupported.
          *
          *     **Deduplication:**
          *     - Within a single document write, chunk results are deduplicated when multiple
@@ -13243,6 +13340,8 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
         };
         /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
         EnrichmentNeighborContextConfig: {
@@ -17136,6 +17235,22 @@ export interface components {
             type: "image_url";
             image_url: components["schemas"]["ImageURL"];
         };
+        /** @description Explicit EmbeddingGemma 2 video-group sampling. Timestamp windows are half-open and relative to the first presentation picture. */
+        VideoSamplingPolicy: {
+            /** @enum {string} */
+            policy: "reference" | "timestamps";
+            /** Format: int64 */
+            start_ns?: number;
+            /** Format: int64 */
+            end_ns?: number;
+            /** Format: int64 */
+            step_ns?: number;
+            max_frames?: number;
+            /** @enum {string} */
+            overflow?: "uniform" | "truncate";
+            /** @description Sample the displayed picture, including VFR holds, rather than the next picture at or after the target. */
+            hold?: boolean;
+        };
         /** @description Inline binary media content (audio, image, etc.). */
         MediaContentPart: {
             /** @enum {string} */
@@ -17147,6 +17262,7 @@ export interface components {
             data: string;
             /** @description MIME type (audio/wav, image/gif, image/png, etc.). */
             mime_type: string;
+            sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
         /** @description A content part for multimodal input (text, image URL, or inline media). */
         ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
@@ -18725,7 +18841,7 @@ export interface components {
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
         InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
         InferenceContentPart: components["schemas"]["ContentPart"];
-        /** @description EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens. */
+        /** @description EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. Video uses video/mp4, video/quicktime, video/webm or video/mp2t media/attachment parts, 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. The expanded sequence must fit 8192 tokens. */
         InferenceEmbeddingGroup: {
             /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
             title?: string;
@@ -18845,7 +18961,27 @@ export interface components {
              */
             input: string | components["schemas"]["InferenceChunkContentPart"];
             config?: components["schemas"]["InferenceChunkConfig"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
+            /** @description Caller source identity; immutable content is independently fingerprinted. */
+            source_id?: string;
+            /** @description Immutable caller version, included in continuation and plan identity. */
+            source_version?: string;
+            /** @description Resume the exact source and semantic plan; changed inputs are rejected. */
+            continuation?: string;
+            /**
+             * @description In model-aware mode include chunk payloads in addition to mandatory descriptors.
+             * @default false
+             */
+            include_content?: boolean;
+            /**
+             * @description In model-aware mode return NDJSON chunk events followed by a terminal coverage response.
+             * @default false
+             */
+            stream?: boolean;
         };
+        InferenceChunkEmbeddingResponse: components["schemas"]["ChunkEmbeddingResponse"];
+        InferenceChunkOperationResponse: components["schemas"]["InferenceChunkResponse"] | components["schemas"]["InferenceChunkEmbeddingResponse"];
         /**
          * @example {
          *       "object": "list",
@@ -19403,6 +19539,18 @@ export interface components {
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
+            /**
+             * @description Effective model-aware chunk operational ceilings for working/output/event
+             *     bytes, chunk/dependency/index counts and remote fetched bytes, requests
+             *     and cache bytes. Independent of model token limits and object length.
+             *     Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
+             *     Scoped and unscoped embedding discovery expose the same values.
+             */
+            chunking_limits?: {
+                [key: string]: number;
+            };
+            /** @description Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights. */
+            model_revision?: string;
             /**
              * @description Pull-time qualified request profiles for this exact artifact,
              *     including backend, supported features and min/max geometry.
@@ -20084,13 +20232,15 @@ export interface components {
             api_key?: string;
             /**
              * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-             *     - `{models_dir}/embedders/` - Embedding models (ONNX)
-             *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
-             *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
+             *     - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+             *     - `{models_dir}/embedders/` - Embedding models
+             *     - `{models_dir}/rerankers/` - Reranking models
              *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models
              *
-             *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+             *     Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+             *     (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+             *     chunker needs no models.
              * @example ~/.antfly/inference/models
              */
             models_dir?: string;
@@ -20540,6 +20690,163 @@ export interface components {
         };
         ExtensionError: {
             error: string;
+        };
+        ChunkSourceReference: {
+            /** @enum {string} */
+            type: "source";
+            /** @description HTTP(S) or S3 object URI resolved through configured content security and credentials. */
+            uri: string;
+            mime_type: string;
+            /** @description Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read. */
+            version: string;
+            /**
+             * @description Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+             * @enum {string}
+             */
+            version_kind?: "strong_etag" | "s3_version_id";
+            /**
+             * Format: int64
+             * @description Exact immutable object length, verified against Content-Range.
+             */
+            length: number;
+        };
+        ChunkEmbeddingContext: {
+            source_reference?: components["schemas"]["ChunkSourceReference"];
+            source_id?: string;
+            source_fingerprint: string;
+            source_version: string;
+            plan_id: string;
+            model: string;
+            model_identity: string;
+            model_revision: string;
+            task_type: string;
+            /** @description Known vector width; may be absent before a planning-only or failed first item. */
+            dimensions?: number;
+            policy: components["schemas"]["MediaChunkPolicy"];
+            /** Format: int64 */
+            start_ordinal: number;
+        };
+        ChunkEmbeddingStartEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.start";
+            context: components["schemas"]["ChunkEmbeddingContext"];
+        };
+        /** @description Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets. */
+        ChunkCoordinates: {
+            /** @enum {string} */
+            kind: "text" | "pdf" | "image" | "gif" | "audio" | "video";
+            /** Format: int64 */
+            start_byte?: number;
+            /** Format: int64 */
+            end_byte?: number;
+            page?: number;
+            /** @description Full-raster coordinates [left, top, right, bottom], end exclusive; raster_width/height declare the basis, including adaptively rendered PDF pages. */
+            region?: number[];
+            /** @description Width of the complete source/prepared-page raster before tiling, not the returned crop width. */
+            raster_width?: number;
+            /** @description Height of the complete source/prepared-page raster before tiling; map PDF regions through page_box and page_rotation. */
+            raster_height?: number;
+            /** Format: int64 */
+            start_ns?: number;
+            /** Format: int64 */
+            end_ns?: number;
+            /** Format: int64 */
+            first_picture?: number;
+            /** @description Ordered selectors in the immutable source index, including repeated cadence selections. */
+            selected_pictures?: number[];
+            /**
+             * @description WebM logical presentation pictures or the first MP4 packet of a completed picture assembly.
+             * @enum {string}
+             */
+            picture_basis?: "logical" | "packet_assembly";
+            picture_count?: number;
+            /** Format: int64 */
+            start_sample?: number;
+            /** Format: int64 */
+            end_sample?: number;
+            /** Format: int64 */
+            sample_rate?: number;
+            /** Format: int64 */
+            start_tick?: number;
+            /** Format: int64 */
+            end_tick?: number;
+            /** Format: int64 */
+            timescale?: number;
+            /** Format: int64 */
+            page_rotation?: number;
+            /** @description Original PDF page box in PDF user-space coordinates. */
+            page_box?: number[];
+        };
+        ChunkDescriptor: {
+            /** @description Opaque source-plan-bound inference identity; not a database artifact ID. */
+            id: string;
+            /** Format: int64 */
+            ordinal: number;
+            coordinates: components["schemas"]["ChunkCoordinates"];
+            input_tokens: number;
+        };
+        ChunkEmbeddingError: {
+            code: string;
+            message: string;
+        };
+        ChunkEmbeddingObject: {
+            descriptor: components["schemas"]["ChunkDescriptor"];
+            mime_type: string;
+            embedding?: number[];
+            error?: components["schemas"]["ChunkEmbeddingError"];
+            text?: string;
+            /**
+             * Format: byte
+             * @description Optional base64 payload; source coordinates remain mandatory.
+             */
+            data?: string;
+        };
+        ChunkEmbeddingEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding";
+            data: components["schemas"]["ChunkEmbeddingObject"];
+        };
+        ChunkEmbeddingResponse: {
+            /** @enum {string} */
+            object: "chunk.embedding.list";
+            data: components["schemas"]["ChunkEmbeddingObject"][];
+            /**
+             * @description Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
+             * @enum {string}
+             */
+            status: "complete" | "partial" | "failed";
+            source_reference?: components["schemas"]["ChunkSourceReference"];
+            source_id?: string;
+            source_fingerprint: string;
+            source_version: string;
+            plan_id: string;
+            model: string;
+            model_identity: string;
+            /** @description Model generation revision used by inference capability leases. */
+            model_revision: string;
+            task_type: string;
+            dimensions: number;
+            policy: components["schemas"]["MediaChunkPolicy"];
+            /** Format: int64 */
+            start_ordinal: number;
+            /**
+             * Format: int64
+             * @description Exclusive end of acknowledged output ordinals; failed chunk coordinates are reported in gaps.
+             */
+            covered_through_ordinal: number;
+            error?: components["schemas"]["ChunkEmbeddingError"];
+            next_continuation?: string;
+            gaps: components["schemas"]["ChunkCoordinates"][];
+        };
+        ChunkEmbeddingTerminalEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.complete";
+            response: components["schemas"]["ChunkEmbeddingResponse"];
+        };
+        ChunkEmbeddingInitializationErrorEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.error";
+            code: string;
         };
         /**
          * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
@@ -21209,7 +21516,7 @@ export interface components {
             };
         };
         /** @description Content part supported by chunking requests. */
-        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"];
+        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["ChunkSourceReference"];
         /** @description Options for Voice Activity Detection (VAD) based audio segmentation. */
         VADOptions: {
             /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
@@ -21235,7 +21542,7 @@ export interface components {
          */
         InferenceChunkConfig: {
             /**
-             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+             * @description The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected.
              * @default fixed
              * @example fixed
              */
@@ -21244,7 +21551,7 @@ export interface components {
             max_chunks?: number;
             /**
              * Format: float
-             * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+             * @description Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker.
              */
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
@@ -21669,7 +21976,7 @@ export interface components {
                 "application/json": components["schemas"]["HierarchyCursorStaleError"];
             };
         };
-        /** @description The query's pinned hierarchy or table topology changed while it was running */
+        /** @description The query's pinned hierarchy or table topology changed, or a requested source artifact failed publication */
         QueryConflict: {
             headers: {
                 [name: string]: unknown;
@@ -27057,6 +27364,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["QueryConflict"];
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
@@ -29428,13 +29736,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Text chunked successfully */
+            /** @description Content chunked with optional model-aware embeddings */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["InferenceChunkResponse"];
+                    "application/json": components["schemas"]["InferenceChunkOperationResponse"];
+                    "application/x-ndjson": components["schemas"]["ChunkEmbeddingStartEvent"] | components["schemas"]["ChunkEmbeddingEvent"] | components["schemas"]["ChunkEmbeddingTerminalEvent"] | components["schemas"]["ChunkEmbeddingInitializationErrorEvent"];
                 };
             };
             /** @description Invalid request */
@@ -29448,6 +29757,15 @@ export interface operations {
             };
             /** @description Authentication is enabled and valid credentials were not supplied */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Source version, continuation plan or required model identity changed; replan against the intended generation. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -1863,7 +1863,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         // classification/decision tasks are declared by a bundle.
         manifest.model_type_origin = .config;
         if (manifest.inputs.len == 0) try setManifestInputs(manifest.allocator, manifest, &.{"text"});
-        for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio")) return error.InvalidModelManifest;
+        for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio") and !std.mem.eql(u8, input, "video")) return error.InvalidModelManifest;
         try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "extract", "classify" });
         try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "typed_decisions", "classification", "extraction" });
         try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{ "embed", "decide" });
@@ -2788,10 +2788,10 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             manifest.pooling = .mean;
             manifest.normalize = true;
             for (manifest.inputs) |input| {
-                if ((std.mem.eql(u8, input, "image") and !cfg.vision) or (std.mem.eql(u8, input, "audio") and !cfg.audio)) return error.InvalidEmbeddingTaskProfile;
+                if (((std.mem.eql(u8, input, "image") or std.mem.eql(u8, input, "video")) and !cfg.vision) or (std.mem.eql(u8, input, "audio") and !cfg.audio)) return error.InvalidEmbeddingTaskProfile;
             }
             if (!manifest.model_manifest_declarations.inputs) {
-                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio", "video" } else if (cfg.vision) &.{ "text", "image", "video" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
             }
         }
     }
@@ -2892,7 +2892,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
             manifest.pooling = .mean;
             manifest.normalize = true;
             if (!manifest.model_manifest_declarations.inputs) {
-                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio", "video" } else if (cfg.vision) &.{ "text", "image", "video" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
             }
         }
     }
@@ -7794,6 +7794,30 @@ test "gliner boundary manifest loading and listing preserve versioned architectu
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
     try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
+}
+
+test "gliner boundary Transformers wrapper loads and lists as a boundary extractor" {
+    const a = std.testing.allocator;
+    const config = try loadGlinerBoundaryTestFixture(a, "config_transformers.json");
+    defer a.free(config);
+    const encoder = try loadGlinerBoundaryTestFixture(a, "encoder_config.json");
+    defer a.free(encoder);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "encoder_config");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder_config/config.json", .data = encoder });
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer a.free(directory);
+    for ([_]bool{ false, true }) |listing| {
+        var manifest = if (listing) try loadListingFromDir(a, directory) else try loadFromDir(a, directory);
+        defer manifest.deinit();
+        try std.testing.expectEqual(gliner_boundary.Architecture.boundary, manifest.gliner_architecture);
+        try std.testing.expectEqual(ModelType.extractor, manifest.model_type);
+        try std.testing.expectEqual(gliner_boundary.Backbone.base, manifest.gliner_boundary_config.?.backbone);
+        // Metadata recognition alone never authorizes an extraction request.
+        try std.testing.expect(!manifest.hasTask("extract"));
+    }
 }
 
 test "gliner boundary manifests reject missing invalid and legacy conflicting metadata" {

@@ -1110,6 +1110,14 @@ split out into dedicated `src/web/*_api.zig` and `src/web/*.zig` modules
 behind thin `wasm32`/`wasm64` export shims, and local build verification
 passes for both profiles.
 
+For Zig 0.17.0, the WASM64 build prepares a cache-owned library overlay to
+correct the soft-float comparison ABI: its bundled LLVM emits `i32` results,
+while stock `compiler_rt` uses `i64` on WASM64. The build tracks the compiler
+and comparison source as inputs and rejects an unexpected runtime layout.
+It leaves the installed toolchain, native builds, and WASM32 unchanged. Recheck
+and retire this compatibility correction when upgrading the compiler; Node's
+WASM64 initialization and ABI roundtrip check validates the linked module.
+
 > **Relocated:** The detailed bullet-by-bullet refactor log behind this
 > status (31 lines) is preserved verbatim in
 > [docs/design/inference/history/wasm-status-history.md](../../../docs/design/inference/history/wasm-status-history.md).

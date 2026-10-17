@@ -595,7 +595,7 @@ fn arrayAssignmentBindingScenario(backing: Allocator) !void {
     for (0..10000) |_| {
         const literal = try prepared.insert_rows[0][1].?.evaluate(none.allocator(), &.{}, .{});
         try std.testing.expectEqual(@as(i32, -1), literal.array.?.dimensions[0].lower);
-        try std.testing.expect(literal.array.?.elements[1].sql_null);
+        try std.testing.expect(literal.array.?.flatCell(1).sql_null);
         const parameter = try prepared.insert_rows[0][2].?.evaluate(none.allocator(), &.{}, .{});
         try std.testing.expect(parameter.array == prepared.frame.values[0].array);
     }

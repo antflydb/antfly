@@ -8453,6 +8453,47 @@ pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_arch.Config 
     return if (self.arch_config == .embedding_gemma2) self.arch_config.embedding_gemma2 else null;
 }
 
+/// Called only after a relevant admission denial. The model/session remains
+/// retained, and native destruction has the same interruption protection as
+/// compute construction. Busy providers keep their weights and return zero.
+pub fn reclaimEmbeddingGemma2VisionWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .vision);
+}
+
+pub fn reclaimEmbeddingGemma2AudioWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .audio);
+}
+
+pub fn reclaimEmbeddingGemma2LanguageWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .language);
+}
+
+fn reclaimEmbeddingGemma2Weights(session: Session, control: InferenceExecutionControl, cache_class: @import("../models/embedding_gemma2_weight_cache.zig").MetalClass) !usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.arch_config != .embedding_gemma2) return 0;
+    try control.check();
+    if (self.backend_type == .native) return native_mod.reclaimEmbeddingGemma2Weights(&self.backend_data.native, cache_class);
+    if (comptime !build_options.enable_metal) return 0;
+    if (self.backend_type != .metal) return 0;
+    try control.check();
+    var guard = try control.enterUninterruptible(session.interruption());
+    defer guard.deinit();
+    return @import("../ops/metal_compute.zig").reclaimEmbeddingGemma2Weights(gpuBackendData(self), self.io, cache_class);
+}
+
+/// Preparation owns its own queue and never borrows mutable provider execution
+/// state. The loaded session handle must remain alive through producer cleanup;
+/// callers guard native driver work before querying/retaining this device.
+pub fn videoPreparationContext(session: Session) !struct { io: ?std.Io, device: ?*anyopaque } {
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return .{ .io = self.io, .device = null };
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    const device = metal_runtime.termite_metal_video_preparation_device() orelse return error.MetalRuntimeUnavailable;
+    return .{ .io = self.io, .device = device };
+}
+
 /// Incremental native Whisper decoder bound to one session for the duration
 /// of one transcription. Holds the compute backend (and on shared GPU
 /// backends its execution lease) and the session's execution gate, so it
@@ -8944,7 +8985,7 @@ test "managed direct compute guards construction and cleanup" {
     compute_vtable.deinitBackend = Probe.close;
     var managed = ManagedComputeBackend{
         .backend = .{ .ptr = &probe, .vtable = &compute_vtable },
-        .guard = try control.enterUninterruptible(.process_required),
+        .guard = try control.enterUninterruptible(.uninterruptible),
     };
     managed.deinit();
     managed.deinit();

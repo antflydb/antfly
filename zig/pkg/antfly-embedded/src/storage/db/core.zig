@@ -1121,9 +1121,10 @@ pub const DBCore = struct {
                 // mutation-free target advance may publish coverage here, but
                 // must never consume a newer transaction it does not own.
                 try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
-                // The posting checkpoint/WAL commit boundary is the durable
-                // dense applied sequence. Lifecycle metadata is persisted only
-                // when status/generation/config identity changes.
+                try self.index_manager.preserveCertifiedEmptyDenseCheckpoint(self.alloc, self.store, self.applied_sequence_checkpoint_path, index_name);
+                // Native WAL remains the applied-sequence authority. Nonempty
+                // ingestion needs lifecycle metadata only when its status,
+                // generation or config identity changes.
                 return;
             }
             const published_count = if (self.index_manager.denseIndex(index_name)) |entry|
@@ -1219,6 +1220,10 @@ pub const DBCore = struct {
 
     pub fn loadIndexes(self: *DBCore) !void {
         try self.index_manager.load(self.store);
+    }
+
+    pub fn loadIndexesDeferredBackfill(self: *DBCore) !void {
+        try self.index_manager.loadDeferredBackfill(self.store);
     }
 
     pub fn loadIndexesForRestore(self: *DBCore) !void {
@@ -3767,6 +3772,7 @@ pub const PinnedStoreSnapshot = union(enum) {
     lsm: lsm_backend_mod.Backend.NativeCheckpoint,
 
     pub fn deinit(self: *PinnedStoreSnapshot) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("pinnedSnapshotDeinit", .{self}) catch @panic("incompatible storage owner");
         switch (self.*) {
             .logical => |*snapshot| snapshot.deinit(),
             .lsm => |*snapshot| snapshot.deinit(),
@@ -3792,6 +3798,7 @@ pub const PinnedStoreSnapshot = union(enum) {
         cancellation: types.CancellationToken,
         sink: ?native_artifact_sink.Sink,
     ) !u64 {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("pinnedSnapshotMaterializeWithSink", .{ self, alloc, io, snapshot_root, cancellation, sink });
         return switch (self.*) {
             .logical => |*snapshot| try snapshot.materializeWithSink(alloc, io, snapshot_root, cancellation, sink),
             .lsm => |*snapshot| blk: {

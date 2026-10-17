@@ -337,7 +337,7 @@ test "SQL JSON pinned DOM roots own headers without reparsing or cloning admitte
     try std.testing.expectEqual(@as(usize, 0), owner.decodes);
     try std.testing.expectEqual(@as(usize, 1024 * 1024) - bytes, owner.memory.footprint());
     const retained = owner.memory.footprint();
-    try std.testing.expectError(error.SqlJsonUnicodeEscape, owner.pinValue(.{ .string = "\x00" }));
+    try std.testing.expectError(error.SqlUntranslatableCharacter, owner.pinValue(.{ .string = "\x00" }));
     try std.testing.expectEqual(retained, owner.memory.footprint());
     const Run = struct {
         fn run(alloc: std.mem.Allocator, source: std.json.Value) !void {
@@ -695,7 +695,7 @@ test "SQL row values JSON cache retains cancellation and rejects malformed sourc
         row.init(a, 1024 * 1024, &fresh);
         defer row.deinit();
         _ = row.decodePinned(1, invalid) catch |err| {
-            try std.testing.expect(err == error.SqlInvalidTextRepresentation or err == error.SqlJsonUnicodeEscape);
+            try std.testing.expect(err == error.SqlInvalidTextRepresentation or err == error.SqlUntranslatableCharacter);
             try std.testing.expectEqual(@as(usize, 0), row.entries.count());
             continue;
         };

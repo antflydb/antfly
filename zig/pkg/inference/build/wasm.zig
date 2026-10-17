@@ -57,6 +57,21 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
             .single_threaded = true,
         }),
     });
+    // Zig 0.17.0's wasm64 compiler_rt uses a pointer-sized comparison result,
+    // while the bundled LLVM backend emits i32 calls. Correct the runtime in
+    // an owned cache overlay, including its internal calls, without modifying
+    // an installed toolchain or changing other targets' ABIs.
+    if (is_wasm64 and @import("builtin").zig_version.order(.{ .major = 0, .minor = 17, .patch = 0 }) == .eq) {
+        const prepare = b.addSystemCommand(&.{"python3"});
+        prepare.addFileArg(ctx.path("build/prepare_wasm64_zig_lib.py"));
+        prepare.addArg("--zig");
+        prepare.addFileArg(.zig_exe);
+        prepare.addArg("--comparison-source");
+        prepare.addFileArg(std.Build.LazyPath.zig_lib.path(b, "compiler_rt/comparef.zig"));
+        prepare.addArg("--output");
+        wasm_lib.zig_lib_dir = prepare.addOutputDirectoryArg("zig-lib-wasm64");
+        wasm_lib.zig_lib_dir.?.addStepDependencies(&wasm_lib.step);
+    }
     wasm_lib.root_module.addOptions("build_options", runtime_build.addBuildOptions(b, wasmBackend(ctx.backend)));
     wasm_lib.entry = .disabled;
     wasm_lib.rdynamic = true;
@@ -83,6 +98,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .safe,
         .single_threaded = true,
     });
+    @import("antfly_media").support.attach(b, wasm_audio_mod, b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media" })));
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/image/src/mod.zig" })),
         .target = wasm_target,

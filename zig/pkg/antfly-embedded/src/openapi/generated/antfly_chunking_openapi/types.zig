@@ -4,7 +4,7 @@
 const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 
-/// Configuration for the Antfly inference chunking provider. Antfly inference is Antfly's built-in ML service for local chunking. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Deduplication:** - Within a single document write, chunk results are deduplicated when multiple indexes share the same source text and chunker configuration, so the source is chunked at most once per write.
+/// Configuration for the Antfly inference chunking provider. Antfly inference is Antfly's built-in ML service for local chunking. **Chunking Models:** - fixed: Fixed-size chunking by token count, with fixed time windows for audio (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the only chunking model Antfly inference implements; other model names are rejected as unsupported. **Deduplication:** - Within a single document write, chunk results are deduplicated when multiple indexes share the same source text and chunker configuration, so the source is chunked at most once per write.
 pub const AntflyChunkerConfig = struct {
     /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
@@ -59,6 +59,8 @@ pub const ChunkerConfig = struct {
     threshold: ?f32 = null,
     text: ?antfly_chunking_api_openapi.TextChunkOptions = null,
     audio: ?antfly_chunking_api_openapi.AudioChunkOptions = null,
+    embedding: ?antfly_chunking_api_openapi.ChunkEmbeddingTarget = null,
+    policy: ?antfly_chunking_api_openapi.MediaChunkPolicy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -71,6 +73,8 @@ pub const ChunkerConfig = struct {
         .{ "threshold", "threshold", true },
         .{ "text", "text", false },
         .{ "audio", "audio", false },
+        .{ "embedding", "embedding", false },
+        .{ "policy", "policy", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -121,6 +125,20 @@ pub const ChunkerConfig = struct {
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("audio");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("embedding");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("policy");
             try jw.write(@as(?u8, null));
         }
         try jw.endObject();

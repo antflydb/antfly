@@ -159,19 +159,43 @@ handle rather than opening several.
 
 libantfly runs every inference backend, including Metal, CUDA, and ONNX, in
 the calling process. This applies to `antfly_inference` handles and to Lite
-handles opened with local inference.
+handles opened with local inference. A dylib-only build needs neither a
+separate worker executable nor an `ANTFLY_INFERENCE_WORKER` setting.
 
-The `antfly` server runs those backends in a worker process instead, because
-a GPU driver call or an ONNX model load has no per-call abort: the server
-stops a stuck call by killing the worker and starting a new one. A library
-cannot do that to its host program, so libantfly accepts the trade SQLite
-makes and runs them in-process:
+The `antfly` server can supervise inference in a worker to enforce hard
+deadlines around uninterruptible driver and native runtime calls. It can stop
+a stuck call by replacing that worker. Embedded handles keep the application
+in control of its process lifetime:
 
 - Once a call reaches the device or driver it runs to completion.
   `call_timeout_ms`, and closing a handle, take effect when it returns.
   Calls on CPU backends still stop cooperatively.
 - A GPU driver fault terminates the process.
 - A session wedged in the driver blocks close instead of being abandoned.
+
+Compatible native database connections retain one local inference service across
+foreground and maintenance snapshots. Refreshing a checkpoint does not reload
+models or reset admission accounting; the service drains and closes after its
+last retained database snapshot is released. Standalone `antfly_inference`
+handles continue to own independent runtimes. Explicit database `models_dir`
+values are copied during open and remain valid after the caller releases its
+options buffer. Idle maintenance writer admission does not schedule new replay.
+An idle turn can retain the serving runtime across its own fenced allocator and
+lease cleanup when primary and immutable index roots remain unchanged. An
+external writer's commit still requires normal runtime validation and refresh.
+
+`antfly_db_status_json` includes `inference.memory_admission` for a local runtime.
+It records the last denied admission's pressure category, requested/admitted
+bytes, configured limits, denial count, and monotonic timestamp. These are
+historical diagnostic values, not a claim that a current request is blocked.
+The limits describe the first request in the denied group; requested bytes are
+the group's totals. An unavailable memory sample is reported as zero.
+
+Graph replacement rows in `antfly_db_pending_work_stats_json` expose
+`blocked_reason`, `producer_artifacts` (including upstream producers),
+`producer_replay_target`, `producer_applied_sequence`, and
+upstream retry/error details. Waiting for producer enrichment preserves the
+graph's own `last_error` and does not spend its failure retry budget.
 
 ## Read-Only Modes
 
@@ -262,16 +286,26 @@ Read-only snapshots without a lock sidecar also open from read-only directories
 or media. Their calls use a shared inode fence when sidecar creation is denied;
 every sidecar creator takes the exclusive inode fence before installing it.
 Reopened native writers discover pending generated enrichment in the durable
-journals of all tables and resume it under their connection lease.
+journals of all tables and resume it through their shared maintenance owner.
 
 After an external commit or atomic file replacement, the shared owner reopens
 its cached runtime before the next operation. An in-process handoff between
 compatible connections reuses the live runtime. Streaming SQL cursors retain the
 runtime and immutable pages they originally pinned; retiring that runtime
 releases caches without flushing them over a newer generation. Read-only
-connections observe new commits at operation boundaries. Automatic enrichment,
-TTL, and reclamation maintenance run under the same file gate and kernel lease.
-Foreground refresh defers reclamation to that owner. Lease-scoped publication
+connections observe new commits at operation boundaries. Background enrichment and index builds capture one table at a time under the
+file gate, then compute outside it. Generated artifacts, private staging, and progress writes reacquire the
+kernel writer lease and publish through the current namespace. Source digests,
+document incarnations, catalog identity, and lease tenure fence acceptance.
+Index file publications may adopt a newer primary checkpoint only while their
+immutable index inputs and inode remain unchanged; changes to those inputs
+cancel the prepared work. A bounded owner cache retains only
+pure embedding results with matching model revision, credentials, task, input and
+dimensions, allowing retries without publishing stale artifacts. Native capture
+runtimes use inode-fenced immutable inputs and release them before reclamation.
+TTL retains its short publication fence. Reclamation scans and copies outside
+the gate and validates before adoption. Foreground refresh defers allocator
+conversion, reclamation, and historical index backfill to that owner. Lease-scoped publication
 fences new read pins until page reuse and checkpoint publication finish; temporary
 lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
 
@@ -402,8 +436,42 @@ indexes. MATCH PARTIAL FK publication requires ready parent support indexes;
 a readiness deadline expires before any FK publication decision is admitted.
 Admission builds only the selected witness indexes; unrelated builds and
 reclamation do not consume its deadline. Lite background maintenance advances
-one relational index page per table and releases the writer lease between
+one table per turn, including one relational index page, and releases the writer lease between
 turns, retaining pending work for subsequent turns.
+
+Detached maintenance primary transactions and index publications join the fair
+writer queue. They adopt the latest primary checkpoint when the namespace
+and catalog remain unchanged, so unrelated foreground commits do not force a
+retry. Immutable index publication additionally checks its physical inputs;
+changed index inputs cancel that work while primary transactions can still
+persist completed replay progress against the latest checkpoint. Inference
+and segment construction run outside the writer gate; file replacement
+cancels stale publication. Reclamation continues to yield on contention.
+
+Replay-producing maintenance delivers its prepared effects to the current
+coordinator under that writer lease. It validates captured documents and
+artifact keys, reserves the replay sequence on the live runtime, and advances
+the detached replay watermark after a successful commit. Resolver primary
+effects and their replay record commit together; derived projection work runs
+outside the owner gate. Resolver publication also validates the inputs read
+during computation, including absent keys and scanned candidate ranges, and
+rejects changes to resolver configurations. Mixed full and graph-only resolver
+phases share one publication admission and input validation, preserving their
+separate replay hints without invalidating themselves between commits.
+Unrelated keys remain publishable.
+
+`antfly_db_pending_work_stats_json` includes `index_replay_debt` per namespace:
+each index reports its `applied_sequence`, `target_sequence`, and
+`catch_up_required`. Their sequence difference measures replay lag, rather
+than elapsed time or a count of documents. Lite connections also expose
+`background_publications` with owner-lifetime `attempts`, `refused` admission
+counts (including publication errors and source/fence rejection), and successful
+checkpoint `rebased` counts. `generated_attempts` / `generated_refused` cover
+generated-result commits and store acquisition, including source validation
+(one refusal per acquired store lease). `replay_attempts` / `replay_refused`
+cover detached replay-producing publication. All these paths contribute to
+the total `attempts` / `refused` counts. These totals survive foreground runtime refreshes and reset on closing
+the last compatible connection. Root results include per-table debt in `tables`.
 
 Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under
 the exact native activation checkpoint, including SQL transactions with cascades and multiple repair targets.
@@ -534,6 +602,9 @@ and temporary remote failures retry up to four times. Unclassified
 `Unexpected`, `InputOutput`, `ReadFailed` and `WriteFailed` errors fail immediately
 rather than assuming storage corruption is transient. A failure after a newer
 checkpoint uses that checkpoint for both retry accounting and recovery.
+A detached snapshot invalidated by concurrent publication yields and retries
+from its durable checkpoint. This does not fail the job or consume its
+transient-failure budget.
 
 Replacement ownership uses an IO mutex. Blocking cancellation and deletion park
 on it; backoff sleeps occur after releasing it. Regular activation catch-up has

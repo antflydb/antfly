@@ -1537,7 +1537,8 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", resp.content_type);
         for (resp.headers) |header| try ctx.setHeader(header.name, header.value);
         if (resp.public_cors) try ctx.setHeader("Access-Control-Allow-Origin", "*");
-        _ = ctx.response.body(resp.body);
+        _ = ctx.response.bodyOwned(alloc, resp.body);
+        resp.body = &.{};
         return ctx.response.build();
     }
 
@@ -2313,6 +2314,10 @@ pub const AntflyApiHandler = struct {
                 .status = 409,
                 .message = "HierarchyCursorStale",
             },
+            error.DocumentArtifactPublicationFailed => .{
+                .status = 409,
+                .message = "DocumentArtifactPublicationFailed",
+            },
             else => null,
         };
     }
@@ -2717,7 +2722,7 @@ pub const AntflyApiHandler = struct {
             const hex = std.fmt.bytesToHex(digest, .lower);
             try ctx.setHeader("X-Antfly-Primary-Digest", &hex);
         }
-        return jsonResponse(ctx, 200, result.json);
+        return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
 
     fn internalJoinJobState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3320,18 +3325,14 @@ pub const AntflyApiHandler = struct {
         return null;
     }
 
-    fn internalQueryResponse(ctx: *httpx.Context, result: *const query_api.QueryResponse) !httpx.Response {
-        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena_impl.deinit();
-        const response = try std.json.parseFromSliceLeaky(metadata_openapi.QueryResponses, arena_impl.allocator(), result.json, .{
-            .allocate = .alloc_always,
-        });
+    fn internalQueryResponse(ctx: *httpx.Context, result: *query_api.QueryResponse) !httpx.Response {
+        try @import("query_response_validation.zig").validate(ctx.allocator, result.json);
         if (result.identity_read_generation) |generation| {
             var buf: [32]u8 = undefined;
             const value = try std.fmt.bufPrint(&buf, "{d}", .{generation});
             try ctx.setHeader(query_api.QueryResponse.identity_read_generation_header, value);
         }
-        return ctx.json(response);
+        return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
 
     fn internalGroupQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3459,21 +3460,21 @@ pub const AntflyApiHandler = struct {
         var principal: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
         const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
-        const encoded = rpc.execute(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
+        const encoded = rpc.executeWithCodec(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
             .principal = principal,
             .authorization_revision = 1,
             .table_id = route.table_id,
             .group_id = route.route.group_id,
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
-        }, params.table_name, parsed.value) catch |err| return textResponse(ctx, switch (err) {
+        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| return textResponse(ctx, switch (err) {
             error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
             error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
             error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
             else => 503,
         }, @errorName(err));
         defer ctx.allocator.free(encoded);
-        try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader("content-type", if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").compact_magic)) @import("retained_read_page.zig").compact_media_type else if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").magic)) @import("retained_read_page.zig").media_type else "application/json");
         return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
     }
 
@@ -3868,6 +3869,14 @@ pub const AntflyApiHandler = struct {
             .DELETE => .DELETE,
             else => null,
         };
+    }
+
+    fn ownedJsonResponse(ctx: *httpx.Context, status: u16, body: *[]u8, owner: std.mem.Allocator) !httpx.Response {
+        _ = ctx.status(status);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.bodyOwned(owner, body.*);
+        body.* = &.{};
+        return ctx.response.build();
     }
 
     fn jsonResponse(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
@@ -10541,6 +10550,9 @@ test "typed internal HTTP errors preserve conflict semantics" {
     const stale_cursor = AntflyApiHandler.sharedInternalHttpErrorSpec(error.HierarchyCursorStale).?;
     try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
     try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
+    const failed_publication = AntflyApiHandler.sharedInternalHttpErrorSpec(error.DocumentArtifactPublicationFailed).?;
+    try std.testing.expectEqual(@as(u16, 409), failed_publication.status);
+    try std.testing.expectEqualStrings("DocumentArtifactPublicationFailed", failed_publication.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
 }
 
@@ -16176,24 +16188,25 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expect(description.columns[0].element_type != null);
             var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), result.rowCount());
             const column = result.columns[0];
             try std.testing.expectEqual(description.columns[0].element_type, column.element_type);
             try std.testing.expectEqual(try @import("../pgwire/values.zig").columnOid(description.columns[0]), try @import("../pgwire/values.zig").columnOid(column));
-            if (result.sql_nulls.?[0][0]) {
-                try std.testing.expect(result.rows[0][0] == .null);
+            const cell = try result.cell(array_alloc, 0, 0);
+            try std.testing.expect(cell.value == .null);
+            if (cell.sql_null) {
+                try std.testing.expect(cell.array == null);
                 continue;
             }
+            const expected = cell.array orelse return error.ExpectedNativeArrayCell;
             for ([_]u16{ 0, 1 }) |format| {
                 var output: std.Io.Writer.Allocating = .init(alloc);
                 defer output.deinit();
-                try @import("../pgwire/values.zig").encodeColumnInto(alloc, &output.writer, column, format, result.rows[0][0], 8 * 1024 * 1024);
+                try @import("../pgwire/values.zig").encodeCellInto(alloc, &output.writer, column, format, cell, 8 * 1024 * 1024);
                 var decoded = if (format == 0) try @import("antfly_local_sources").sql_array_text.decode(alloc, column.element_type.?, output.written(), .{}) else try @import("antfly_local_sources").sql_array_binary.decode(alloc, column.element_type.?, output.written(), .{});
                 defer decoded.deinit();
-                var expected = try @import("antfly_local_sources").sql_array_wire.decode(alloc, column.element_type.?, result.rows[0][0], .{});
-                defer expected.deinit();
                 var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
-                try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(decoded.value, &work));
+                try std.testing.expectEqual(std.math.Order.eq, try expected.compare(decoded.value, &work));
             }
         }
         // Exercise the real authenticated adapter, not only a protocol mock:
@@ -16222,11 +16235,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             array_request.parameters = &.{try wire_values.decode(array_alloc, 1016, format, encoded.written())};
             var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
-            var actual = try sources.sql_array_wire.decode(alloc, .int64, result.rows[0][0], .{});
-            defer actual.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rowCount());
+            const actual_cell = try result.cell(array_alloc, 0, 0);
+            try std.testing.expect(!actual_cell.sql_null and actual_cell.value == .null);
+            const actual = actual_cell.array orelse return error.ExpectedNativeArrayCell;
             var work: sources.sql_array_value.Budget = .{};
-            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(actual.value, &work));
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(actual.*, &work));
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, array_alloc, credential, array_request)).?;
             defer stream.close(stream.context);
             var page = try stream.next(stream.context, array_alloc, array_request, 1);
@@ -16260,8 +16274,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer result_arena.deinit();
         var result = try wire_backend.vtable.execute(wire_backend.context, result_arena.allocator(), credential, request);
         defer result.deinit();
-        try std.testing.expectEqual(@as(usize, 9), result.rows.len);
-        for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" }, result.rows) |expected, row| try std.testing.expectEqualStrings(expected, row[0].string);
+        try std.testing.expectEqual(@as(usize, 9), result.rowCount());
+        for ([_]i64{ 2, 3, 4, 5, 6, 7, 8, 9, 9007199254740993 }, 0..) |expected, row| {
+            const cell = try result.cell(result_arena.allocator(), row, 0);
+            try std.testing.expect(!cell.sql_null);
+            try std.testing.expectEqual(expected, cell.value.integer);
+        }
 
         const Wire = struct {
             fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
@@ -18250,4 +18268,21 @@ test "httpx retrieval read failures preserve retryable JSON and conflict status"
         try std.testing.expectEqual(@as(u32, 1000), parsed.value.retry_after_ms);
         try std.testing.expect(try AntflyApiHandler.respondRetrievalReadError(&ctx, error.InvalidRetrievalAgentRequest) == null);
     }
+}
+
+test "public graph metric borrowed wire owned HTTP responses keep buffers through transport teardown" {
+    const a = std.testing.allocator;
+    var owner: std.testing.FailingAllocator = .init(a, .{});
+    var request = try httpx.Request.init(a, .GET, "/");
+    defer request.deinit();
+    var context: httpx.Context = .init(a, std.testing.io, &request);
+    defer context.deinit();
+    var owned = contextual_operations.json(try owner.allocator().dupe(u8, "{\"source\":{\"value\":1}}"), false);
+    const address = @intFromPtr(owned.body.ptr);
+    var response = try AntflyApiHandler.respondOwnedContextualResponse(&context, &owned, owner.allocator());
+    defer response.deinit();
+    try std.testing.expectEqual(address, @intFromPtr(response.body.?.ptr));
+    try std.testing.expectEqual(@as(usize, 0), owner.freed_bytes);
+    response.releaseBody();
+    try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
 }

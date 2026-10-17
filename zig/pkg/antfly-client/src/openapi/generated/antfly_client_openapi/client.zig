@@ -526,15 +526,16 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
-    /// Chunk text into smaller segments
+    /// Chunk content with optional model-aware embeddings
     /// POST /ai/v1/chunk
-    pub fn chunkText(self: *@This(), body: types.InferenceChunkRequest) !ApiResponse(types.InferenceChunkResponse) {
+    pub fn chunkText(self: *@This(), body: types.InferenceChunkRequest) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/chunk", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Answer named decision questions
@@ -2721,7 +2722,7 @@ pub const Client = struct {
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
-    /// Reprocess a derived asset across a table range
+    /// Reprocess a derived artifact across a table range
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: ?types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
@@ -3003,7 +3004,7 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactManifest).fromResponse(self.allocator, &resp);
     }
 
-    /// Reprocess a derived asset
+    /// Reprocess a derived artifact
     /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);

@@ -403,9 +403,9 @@ test "SQL replay rows preserve arrays and unwind every memory and spill allocati
                 const reader = try replay.openReader();
                 defer reader.close();
                 const row = (try reader.next()).?;
-                try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.elements[0].value.integer);
+                try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
                 try std.testing.expectEqual(@as(i32, -1), row[0].array.?.dimensions[0].lower);
-                try std.testing.expect(row[0].array.?.elements[1].sql_null);
+                try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
             }
             try std.testing.expectEqual(@as(usize, 0), manager.files);
             try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);

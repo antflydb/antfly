@@ -399,3 +399,22 @@ and `_highlights`. Request/limit parameters are typed as text/integer. The
 backend must explicitly advertise search-relation support; other providers
 reject the relation before opening any scans. Embedded catalog index DDL uses
 the shared schema translator and a native schema version CAS.
+
+
+## TEXT and JSONB character domain
+
+SQL `TEXT` and `JSONB` reject NUL (`U+0000`), including nested JSONB strings
+and object keys, with SQLSTATE `22P05` (`untranslatable_character`). Invalid
+UTF-8 has SQLSTATE `22021`. Sanitize captured command output and binary content
+before binding, for example by replacing NUL with `U+FFFD`, or store binary
+content outside these SQL character types. A rejected write leaves the row
+unchanged; an explicit transaction enters its normal failed state.
+
+Native diagnostics identify a failing bound value with a one-based
+`parameter_index` and `parameter $N` in the message. The C ABI copies that
+diagnostic into `antfly_last_error_detail()` on the calling thread; read it
+immediately after failure. Rust SQL and sqlx errors retain the SQLSTATE and
+include up to 512 UTF-8 bytes of the submitted statement (plus an ellipsis
+when truncated). `SqlError.body` also retains `error.statement`. Cursor fetch
+errors in sqlx carry the original SELECT. Bound parameter values are not added
+by statement diagnostics; SQL literals remain part of the submitted statement.

@@ -81,8 +81,15 @@ pub fn allocator(self: *Budget) std.mem.Allocator {
 }
 pub fn isExhausted(self: *Budget) bool {
     self.lock();
-    defer self.mutex.unlock();
-    return self.exhausted or self.admission_exhausted;
+    const exhausted = self.exhausted or self.admission_exhausted;
+    const backing = self.backing;
+    self.mutex.unlock();
+    // A child can be below its own limit when shared parent admission fails.
+    // Preserve genuine allocator OOMs: only known Budget owners carry policy.
+    if (exhausted) return true;
+    if (backing.vtable.alloc != alloc) return false;
+    const parent: *Budget = @ptrCast(@alignCast(backing.ptr));
+    return parent.isExhausted();
 }
 /// Conservative region footprint, including intermediate buffers retained by
 /// an enclosing arena. Ordinary reclaiming owners retain peak-live accounting.
@@ -240,4 +247,20 @@ test "SQL memory budget rejects before allocation and reclaims page capacity" {
     a.free(second);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     try std.testing.expectEqual(@as(usize, 128), budget.peak);
+}
+
+test "SQL memory budget reports parent admission without misclassifying allocator OOM" {
+    var parent: Budget = .{ .backing = std.testing.allocator, .limit = 32 };
+    var child: Budget = .{ .backing = parent.allocator(), .limit = 128 };
+    const bytes = try child.allocator().alloc(u8, 16);
+    defer child.allocator().free(bytes);
+    try std.testing.expectError(error.OutOfMemory, child.allocator().alloc(u8, 17));
+    try std.testing.expect(child.isExhausted());
+    try std.testing.expect(!child.exhausted);
+    try std.testing.expectEqual(@as(usize, 16), parent.live);
+    var empty: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&empty);
+    var allocator_oom: Budget = .{ .backing = fixed.allocator(), .limit = 128 };
+    try std.testing.expectError(error.OutOfMemory, allocator_oom.allocator().alloc(u8, 1));
+    try std.testing.expect(!allocator_oom.isExhausted());
 }

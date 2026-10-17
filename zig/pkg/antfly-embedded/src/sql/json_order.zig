@@ -126,7 +126,7 @@ fn validateJsonbString(text: []const u8, budget: *Budget) !void {
     while (offset < text.len) {
         const end = offset + @min(text.len - offset, 256);
         try budget.consume(end - offset);
-        if (std.mem.indexOfScalar(u8, text[offset..end], 0) != null) return error.SqlJsonUnicodeEscape;
+        if (std.mem.indexOfScalar(u8, text[offset..end], 0) != null) return error.SqlUntranslatableCharacter;
         offset = end;
     }
     if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
@@ -152,7 +152,8 @@ pub fn validateTextDomain(value: Json, budget: *Budget, depth: usize) !void {
 
 fn validateText(text: []const u8, budget: *Budget) !void {
     try budget.consume(text.len);
-    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlTypeMismatch;
+    if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
+    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlUntranslatableCharacter;
 }
 
 /// The caller owns the allocation region and its byte admission. All retained
@@ -342,7 +343,7 @@ test "SQL JSONB domain validates discarded duplicate values before allocating a 
     for ([_][]const u8{ "{\"k\":1e131072,\"k\":2}", "{\"k\":\"\\u0000\",\"k\":2}" }) |input| {
         var memory: @import("memory_budget.zig") = .{ .backing = a, .limit = 128 };
         var work: Budget = .{};
-        const expected = if (std.mem.indexOf(u8, input, "131072") != null) error.SqlNumericOutOfRange else error.SqlJsonUnicodeEscape;
+        const expected = if (std.mem.indexOf(u8, input, "131072") != null) error.SqlNumericOutOfRange else error.SqlUntranslatableCharacter;
         try std.testing.expectError(expected, parseTextLeaky(memory.allocator(), input, &work));
         try std.testing.expect(memory.peak <= 128);
         try std.testing.expectEqual(@as(usize, 0), memory.live);

@@ -95,6 +95,7 @@ pub const AddEmbeddedOptions = struct {
     antfly_mod: *std.Build.Module,
 };
 pub const AddEmbeddedResult = struct {
+    native_storage: ?*std.Build.Step.Compile,
     native_inference: *std.Build.Step.Compile,
     native_enrichment: *std.Build.Step.Compile,
     embedded_mod: *std.Build.Module,
@@ -225,10 +226,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     }
 
     const capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"),
+        .root_source_file = b.path(if (antfly_imports.storage_boundary.shared_core) "pkg/antfly-embedded/src/storage_engine_root.zig" else "pkg/antfly-embedded/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
+        .sanitize_thread = antfly_imports.sanitize_thread,
     });
     antfly_imports.storage_boundary.configure(capi_mod, false, false);
     capi_mod.addImport("antfly_platform", platform_mod);
@@ -239,6 +241,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
     capi_root_mod.addOptions("capi_build_options", capi_options);
+    embedded_support_mod.addOptions("capi_build_options", capi_options);
+    embedded_support_mod.addImport("antfly_storage_root", embedded_support_mod);
     capi_root_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
@@ -266,13 +270,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
         .pic = true,
     });
-    if (antfly_imports.shared_inference_core) native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
+    native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
     const native_inference = @import("shared_library.zig").addProviderArchive(
         b,
         native_inference_mod,
-        if (antfly_imports.shared_inference_core) "antfly-inference-core" else "antfly-embedded-inference",
-        @as(u64, if (antfly_imports.shared_inference_core and target.result.os.tag == .macos) 20 else if (antfly_imports.darwin_release_memory) 8 else 12) * 1024 * 1024 * 1024,
+        "antfly-inference-core",
+        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -281,6 +285,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .target = target,
         .optimize = optimize,
         .pic = true,
+        .sanitize_thread = antfly_imports.sanitize_thread,
     });
     antfly_imports.configureEnrichment(b, native_enrichment_mod, link_libc);
     const native_enrichment = @import("shared_library.zig").addProviderArchive(
@@ -289,17 +294,51 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
         @as(u64, if (antfly_imports.darwin_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
-    const libantfly_link_mod = capi_mod;
+    const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
+        const owner_options = b.addOptions();
+        owner_options.addOption(bool, "shared_storage_core", true);
+        owner_options.addOption(bool, "storage_engine_owner", true);
+        capi_mod.addOptions("storage_engine_options", owner_options);
+        const owner = @import("shared_library.zig").addProviderArchive(b, capi_mod, "antfly-storage-engine", @as(u64, if (antfly_imports.darwin_shared_storage_sdk27) 14 else if (target.result.os.tag == .macos and !antfly_imports.darwin_release_memory) 24 else 16) * 1024 * 1024 * 1024);
+        owner.link_function_sections = true;
+        owner.link_data_sections = true;
+        @import("source_owner.zig").registerStorageProvider(owner, b.allocator.dupe(*std.Build.Step.Compile, &.{ native_inference, native_enrichment }) catch @panic("OOM"));
+        break :blk owner;
+    } else null;
+    // Release metadata belongs to the final product, never to a provider
+    // imported by unit tests or another independently compiled archive.
+    const libantfly_link_mod = if (native_storage != null) b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .link_libc = link_libc,
+        .sanitize_thread = antfly_imports.sanitize_thread,
+    }) else capi_mod;
     libantfly_link_mod.strip = strip;
-    libantfly_link_mod.linkLibrary(native_inference);
-    libantfly_link_mod.linkLibrary(native_enrichment);
     // Final native library consumers need release metadata even in the
     // embedded-only composition. Attach it before creating link artifacts
     // and before any consumer can cache this module's dependency graph.
     antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, libantfly_link_mod, target);
-    const libantfly = @import("shared_library.zig").add(b, libantfly_link_mod);
+    const libantfly = @import("shared_library.zig").addWithStorageOwner(b, libantfly_link_mod, &.{ native_inference, native_enrichment }, native_storage);
     const install_libantfly = libantfly.install;
+    if (native_storage) |owner| {
+        const client_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });
+        antfly_imports.configureEmbedded(b, client_mod, link_libc);
+        client_mod.addOptions("capi_build_options", capi_options);
+        client_mod.addImport("antfly_storage_root", client_mod);
+        const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
+        probe_mod.addImport("storage_client", @import("shared_library.zig").storageConsumerModule(b, client_mod));
+        probe_mod.linkLibrary(owner);
+        antfly_imports.build_info.link(probe_mod);
+        probe_mod.linkLibrary(native_inference);
+        probe_mod.linkLibrary(native_enrichment);
+        const run = @import("shared_library.zig").addStorageProbe(b, probe_mod, "storage-owner-linkage-probe");
+        _ = run.addOutputDirectoryArg("storage-owner-linkage");
+        run.has_side_effects = true;
+        b.step("storage-owner-linkage-test", "Exercise actual shared storage calls, state ownership and incompatible ABI rejection").dependOn(&run.step);
+    }
+
     b.dependOnFileContents(b.path("pkg/antfly-embedded/libantfly.pc.in"));
     const pc_path = b.root.join(b.allocator, "pkg/antfly-embedded/libantfly.pc.in") catch @panic("OOM");
     const pc_template = pc_path.root_dir.handle.readFileAlloc(b.graph.io, pc_path.sub_path, b.allocator, .limited(16 * 1024)) catch @panic("unable to read libantfly.pc.in");
@@ -529,6 +568,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
         "capi lite local-runtime-configured flag reports local_embedded only when the build links inference",
         "capi lite explicit resource budget overrides are reported in status",
+        "capi lite inference service survives foreground and maintenance snapshots",
+        "capi lite inference producer retry is visible in graph replacement status",
+        "capi lite inference failed open drains the configured generation before releasing its service",
         "capi lite defaults embedded generation budgets when no override is given",
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi inference options are prefix compatible and reject unknown flags and reserved bits",
@@ -544,8 +586,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "capi native text queries",
+        "capi native replacement wait",
+        "capi native resolver maintenance retries",
+        "capi native idle maintenance",
+        "SQL overlay native pages retain typed cells",
         "capi Lite models_dir loads a real extractor",
         "capi Lite promotion resolves ANN",
+        "capi Lite promotion retains writer admission",
         "capi inline resolver ownership",
         "capi retired resolver identities",
         "capi query retry errors",
@@ -555,6 +602,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
         "capi lite AddIndexJSON registers a graph config",
+        "inline resolver replacement",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const capi_tests = b.addTest(.{
@@ -616,12 +664,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
     });
     antfly_imports.configureEmbedded(b, resolution_test_mod, link_libc);
-    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver backfill skips", "incremental resolution", "processRecordKeys", "reresolveAll", "db ttl cleanup defers transaction guarded" } });
+    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver backfill skips", "incremental resolution", "processRecordKeys", "reresolveAll", "embedding (cosine) scoring", "db ttl cleanup defers transaction guarded" } });
     const run_resolution = b.addRunArtifact(resolution_tests);
     b.step("embedded-resolver-replay-test", "Test selective embedded resolver replay").dependOn(&run_resolution.step);
     capi_test_step.dependOn(&run_resolution.step);
 
     return .{
+        .native_storage = native_storage,
         .native_inference = native_inference,
         .native_enrichment = native_enrichment,
         .embedded_mod = embedded_mod,

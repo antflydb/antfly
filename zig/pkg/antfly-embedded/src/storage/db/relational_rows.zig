@@ -17,6 +17,7 @@
 //! parsing belongs here. One reader pins both a store snapshot and its schema;
 //! every page sees the same rows even if live writes, DDL, or GC race it.
 const std = @import("std");
+const storage_engine = @import("../engine_selection.zig");
 const time = @import("antfly_platform").time;
 const docstore = @import("../docstore.zig");
 const schema = @import("../schema.zig");
@@ -51,6 +52,12 @@ pub const PrimaryBound = struct { key: []const u8, inclusive: bool = true };
 pub const RowFilter = struct {
     context: *anyopaque,
     matches: *const fn (*anyopaque, Allocator, []const u8, codec.OrdinalRowView) anyerror!bool,
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+    const NativeCallbacks = struct { matches: @FieldType(RowFilter, "matches") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    pub fn matchesRow(self: RowFilter, alloc: Allocator, key: []const u8, row: codec.OrdinalRowView) !bool {
+        return NativeBoundary.call("matches", self.callback_dispatch, self.matches, .{ self.context, alloc, key, row });
+    }
 };
 pub const Request = struct {
     include_primary_digest: bool = false,
@@ -80,6 +87,8 @@ pub const Request = struct {
 };
 
 pub const Budget = struct {
+    /// Retain native SQL Datums instead of public JSON projections.
+    native_cells: bool = false,
     rows: usize = 128,
     records: usize = 1024,
     output_bytes: usize = 1024 * 1024,
@@ -100,6 +109,7 @@ pub const Row = struct {
     key: []const u8,
     json: []const u8,
     typed: ?std.json.Value = null,
+    typed_cells: ?@import("../../sql/catalog.zig").Row.TypedCells = null,
     sql_nulls: ?[]const bool = null,
     json_null_fields: []const []const u8 = &.{},
     version: u64,
@@ -598,6 +608,7 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderDeinit", .{self}) catch @panic("incompatible storage owner");
         if (self.row_policy_lease) |*lease| lease.release();
         if (self.failed_row) |row| self.alloc.free(row.key);
         if (self.covering_projection) |*plan| plan.deinit();
@@ -740,6 +751,7 @@ pub const Reader = struct {
     /// Page continuation advances only after successful preparation. An OOM,
     /// cancellation, or corrupt row cannot silently consume part of the result.
     pub fn nextPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderNextPage", .{ self, alloc, io, budget });
         if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var page = try self.nextPageFormat(alloc, io, budget, false, null);
@@ -753,6 +765,127 @@ pub const Reader = struct {
     /// SQL-null provenance rather than round-tripping through public JSON.
     pub fn lookupTypedRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
         if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, false, null });
+        return self.lookupRowFormat(alloc, document, false, null);
+    }
+
+    pub fn lookupSqlRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, true, null });
+        return self.lookupRowFormat(alloc, document, true, null);
+    }
+
+    /// Cache belongs to the caller's page, never to this cursor. Older source
+    /// schemas may have a different field subset/order and get a new layout.
+    pub fn lookupSqlRowWithLayout(self: *Reader, alloc: Allocator, document: []const u8, shared: *?*const @import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, true, shared });
+        return self.lookupRowFormat(alloc, document, true, shared);
+    }
+
+    fn cachedSqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan, shared: ?*?*const @import("../../sql/catalog.zig").Row.TypedLayout) !*const @import("../../sql/catalog.zig").Row.TypedLayout {
+        if (shared) |cache| if (cache.*) |layout| {
+            var same = layout.names.len == projection.ordinals.len;
+            if (same) for (layout.names, projection.ordinals) |name, ordinal| {
+                if (!std.mem.eql(u8, name, row.table_schema.relational_columns[ordinal].name)) {
+                    same = false;
+                    break;
+                }
+            };
+            if (same) return layout;
+        };
+        const layout = try sqlLayout(alloc, row, projection);
+        if (shared) |cache| cache.* = layout;
+        return layout;
+    }
+
+    fn sqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan) !*const @import("../../sql/catalog.zig").Row.TypedLayout {
+        const names = try alloc.alloc([]const u8, projection.ordinals.len);
+        for (projection.ordinals, names) |ordinal, *name| name.* = try alloc.dupe(u8, row.table_schema.relational_columns[ordinal].name);
+        return @import("../../sql/catalog.zig").Row.TypedLayout.init(alloc, names);
+    }
+
+    pub const Hydrated = struct { rows: []const ?Row, consumed: usize, output_bytes: usize };
+
+    /// Bounded ranked microbatch. Sorted physical lookups share source probes;
+    /// rows are decoded in ranking order and stop at the delivery byte target.
+    /// Returned payloads own their bytes independently of the temporary batch.
+    pub fn lookupSqlBatch(self: *Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) !Hydrated {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupSqlBatch", .{ self, alloc, documents, layout, max_bytes });
+        if (self.index != null or documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidRelationalRowsRequest;
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        const SourceBudget = @import("../../sql/memory_budget.zig");
+        const Retry = struct {
+            fn shrink(count: *usize, bytes: *usize) bool {
+                if (count.* > 1) {
+                    count.* = (count.* + 1) / 2;
+                    return true;
+                }
+                // One native row may exceed the normal source working set.
+                // Allow its bounded decode buffers, never a large prefetch.
+                if (bytes.* < 32 * 1024 * 1024) {
+                    bytes.* = 32 * 1024 * 1024;
+                    return true;
+                }
+                return false;
+            }
+        };
+        var predicate_scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer predicate_scratch.deinit();
+        var requested = documents.len;
+        var source_limit: usize = 2 * 1024 * 1024;
+        while (true) {
+            var source_budget: SourceBudget = .{ .backing = self.alloc, .limit = source_limit };
+            var scratch = std.heap.ArenaAllocator.init(source_budget.allocator());
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const Entry = struct { key: []const u8, ordinal: usize };
+            var entries: [64]Entry = undefined;
+            for (documents[0..requested], 0..) |document, i| entries[i] = .{ .key = try internal.relationalRowKeyAlloc(a, document), .ordinal = i };
+            std.mem.sort(Entry, entries[0..requested], {}, struct {
+                fn less(_: void, left: Entry, right: Entry) bool {
+                    return std.mem.order(u8, left.key, right.key) == .lt;
+                }
+            }.less);
+            var keys: [64][]const u8 = undefined;
+            var sorted: [64]?[]const u8 = undefined;
+            var raw: [64]?[]const u8 = undefined;
+            for (entries[0..requested], 0..) |entry, i| keys[i] = entry.key;
+            var scope = self.read.openReadScope(source_budget.allocator()) catch |err| {
+                if (err == error.OutOfMemory and source_budget.isExhausted()) {
+                    if (Retry.shrink(&requested, &source_limit)) continue;
+                    return error.SqlWorkingMemoryLimitExceeded;
+                }
+                return err;
+            };
+            defer scope.close();
+            scope.getManySorted(keys[0..requested], sorted[0..requested]) catch |err| {
+                if (err == error.OutOfMemory and source_budget.isExhausted()) {
+                    if (Retry.shrink(&requested, &source_limit)) continue;
+                    return error.SqlWorkingMemoryLimitExceeded;
+                }
+                return err;
+            };
+            for (entries[0..requested], sorted[0..requested]) |entry, value| raw[entry.ordinal] = if (std.mem.order(u8, entry.key, self.lower) == .lt or std.mem.order(u8, entry.key, self.upper) != .lt) null else value;
+            const rows = try alloc.alloc(?Row, requested);
+            var count: usize = 0;
+            var bytes: usize = 0;
+            // No retry after output allocation: an OOM cannot accumulate
+            // abandoned page payloads in an arena during batch downsizing.
+            for (documents[0..requested], raw[0..requested], rows) |document, value, *out| {
+                if (!predicate_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
+                out.* = if (value) |v| try self.hydratePrimary(alloc, predicate_scratch.allocator(), document, v, true, null, layout) else null;
+                count += 1;
+                if (out.*) |row| {
+                    bytes +|= row.key.len + row.typed_cells.?.presence.?.len;
+                    for (row.typed_cells.?.values) |cell| bytes +|= try @import("../../sql/operators.zig").datumBytes(cell);
+                }
+                if (bytes >= max_bytes) break;
+            }
+            return .{ .rows = rows[0..count], .consumed = count, .output_bytes = bytes };
+        }
+    }
+
+    fn lookupRowFormat(self: *Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
         if (self.index != null) return error.InvalidRelationalRowsRequest;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -764,6 +897,10 @@ pub const Reader = struct {
             error.NotFound => return null,
             else => return err,
         };
+        return self.hydratePrimary(alloc, temporary, document, raw, native_cells, shared, null);
+    }
+
+    fn hydratePrimary(self: *Reader, alloc: Allocator, temporary: Allocator, document: []const u8, raw: []const u8, native_cells: bool, shared: ?*?*const @import("../../sql/catalog.zig").Row.TypedLayout, output: ?*const @import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
         const row = try self.rowView(raw);
         if (self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
             ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns)) return null;
@@ -771,10 +908,16 @@ pub const Reader = struct {
         for (self.source_conditions) |condition| {
             if (!(try condition.evaluate(temporary, &predicate_scratch, row)).matches()) return null;
         }
-        if (self.row_filter) |filter| if (!try filter.matches(filter.context, temporary, document, row)) return null;
-        const projected = try row.projectSqlTypedAlloc(alloc, self.selected.?);
-        if (try typedSize(projected.value, 0) +| projected.sql_nulls.len +| document.len > 16 * 1024 * 1024)
-            return error.RelationalRowResultTooLarge;
+        if (self.row_filter) |filter| if (!try filter.matchesRow(temporary, document, row)) return null;
+        const cells = if (native_cells) try row.projectSqlDatumsMappedAlloc(alloc, self.selected.?, output) else null;
+        const projected = if (!native_cells) try row.projectSqlTypedAlloc(alloc, self.selected.?) else null;
+        var bytes: usize = document.len;
+        if (cells) |values| {
+            bytes +|= values.presence.len;
+            for (values.values) |value| bytes +|= try @import("../../sql/operators.zig").datumBytes(value);
+        }
+        if (projected) |value| bytes +|= (try typedSize(value.value, 0)) +| value.sql_nulls.len;
+        if (bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
         const digest: ?[32]u8 = if (self.include_primary_digest) blk: {
             var result: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(raw, &result, .{});
@@ -783,8 +926,9 @@ pub const Reader = struct {
         return .{
             .key = try alloc.dupe(u8, document),
             .json = "",
-            .typed = projected.value,
-            .sql_nulls = projected.sql_nulls,
+            .typed = if (projected) |value| value.value else null,
+            .typed_cells = if (cells) |value| .{ .layout = output orelse try cachedSqlLayout(alloc, row, self.selected.?, shared), .values = value.values, .presence = value.presence } else null,
+            .sql_nulls = if (projected) |value| value.sql_nulls else null,
             .version = row.writeTimestampNs(),
             .schema_version = row.table_schema.version,
             .semantic_hash = row.semanticHash(),
@@ -793,6 +937,7 @@ pub const Reader = struct {
     }
 
     pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderNextTypedPage", .{ self, alloc, io, budget });
         if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var page = try self.nextPageFormat(alloc, io, budget, true, null);
@@ -892,6 +1037,7 @@ pub const Reader = struct {
         }
         const page = arena.allocator();
         var output = std.ArrayList(Row).empty;
+        var native_layout: ?*const @import("../../sql/catalog.zig").Row.TypedLayout = null;
         var predicate_scratch = std.ArrayList(u8).empty;
         defer predicate_scratch.deinit(alloc);
         var continuation = std.ArrayList(u8).empty;
@@ -987,13 +1133,18 @@ pub const Reader = struct {
                     }
                     if (self.row_filter) |filter| {
                         decoded_key = (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
-                        if (!try filter.matches(filter.context, temporary, decoded_key.?, row)) break :check false;
+                        if (!try filter.matchesRow(temporary, decoded_key.?, row)) break :check false;
                     }
                     break :check true;
                 };
                 if (matches) {
                     const projection = if (self.index_only) self.covering_projection.? else self.selected.?;
-                    const typed_projection = if (typed_output) try row.projectSqlTypedAlloc(page, projection) else null;
+                    const native = typed_output and budget.native_cells;
+                    const cells = if (native) try row.projectSqlDatumsAlloc(page, projection) else null;
+                    if (native and native_layout == null) {
+                        native_layout = try sqlLayout(page, row, projection);
+                    }
+                    const typed_projection = if (typed_output and !native) try row.projectSqlTypedAlloc(page, projection) else null;
                     const typed = if (typed_projection) |projected| projected.value else null;
                     const json = if (typed_output) "" else try row.projectAlloc(temporary, projection);
                     const json_null_fields = if (typed_output) &.{} else try row.projectJsonNullFieldsAlloc(page, projection);
@@ -1004,7 +1155,12 @@ pub const Reader = struct {
                         const identity = self.cursor_identity orelse break :blk null;
                         break :blk try row_cursor_codec.encode(temporary, identity, kv.key[records.forward_prefix_len..]);
                     } else null;
-                    const size = (if (typed) |value| try typedSize(value, 0) else json.len) +| (if (typed_projection) |projected| projected.sql_nulls.len else @as(usize, 0)) +| document.len +| (if (row_cursor) |encoded| encoded.len else @as(usize, 0)) +| null_metadata_bytes;
+                    var native_bytes: usize = 0;
+                    if (cells) |projected| {
+                        native_bytes +|= projected.presence.len;
+                        for (projected.values) |datum| native_bytes +|= try @import("../../sql/operators.zig").datumBytes(datum);
+                    }
+                    const size = native_bytes +| (if (typed) |value| try typedSize(value, 0) else json.len) +| (if (typed_projection) |projected| projected.sql_nulls.len else @as(usize, 0)) +| document.len +| (if (row_cursor) |encoded| encoded.len else @as(usize, 0)) +| null_metadata_bytes;
                     if (size > budget.output_bytes) {
                         if (!self.index_only) try self.observeFailedRow(key, raw);
                         return error.RelationalRowResultTooLarge;
@@ -1018,6 +1174,7 @@ pub const Reader = struct {
                         .key = try page.dupe(u8, document),
                         .json = try page.dupe(u8, json),
                         .typed = typed,
+                        .typed_cells = if (cells) |projected| .{ .layout = native_layout.?, .values = projected.values, .presence = projected.presence } else null,
                         .sql_nulls = if (typed_projection) |projected| projected.sql_nulls else null,
                         .json_null_fields = json_null_fields,
                         .version = row.writeTimestampNs(),

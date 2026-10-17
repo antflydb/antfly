@@ -545,6 +545,14 @@ jobs:
       - name: Test portable Linux x86 inference kernel dispatch
         run: python3 zig/tools/verify_linux_x86_kernels.py
 
+      - name: Test native Linux x86 video decoding and logical indexing
+        working-directory: zig/lib/video
+        run: |
+          uname -srm
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+          zig build test-video -Dcpu=baseline -Doptimize=ReleaseSafe -j1 --summary all
+
       - name: Test optional OpenBLAS dispatch and fallback
         run: python3 zig/tools/verify_runtime_openblas.py --openblas-library /usr/lib/x86_64-linux-gnu/libopenblas.so.0
 
@@ -556,26 +564,10 @@ jobs:
           # A successful aggregate could hide a skipped process check.
           grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
 
-      - name: Set up Node for WASM tests
+      - name: Set up Node for generated source checks
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: ts/package.json
-
-      - name: Build and test Apache WASM artifacts
-        working-directory: zig
-        run: |
-          # The @antfly/web package contract suite runs from its built ESM
-          # artifact in the TypeScript SDK gate.
-          node pkg/antfly-embedded/wasm_client_test.mjs
-          zig build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
-          EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
-          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
-          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
-          cd pkg/inference
-          zig build wasm -Dwasm=true -j1 --summary all
-          node web/test-wasm-abi.mjs wasm32
-          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
-          node web/test-wasm-abi.mjs wasm64
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -609,6 +601,7 @@ jobs:
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
+          pkg/inference/build/test_prepare_wasm64_zig_lib.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
@@ -667,46 +660,6 @@ jobs:
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
 
-      - name: Exercise real Lite extraction through public graph APIs
-        if: needs.changes.outputs.zig_tests == 'true'
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
-          model_dir="$models_root/fastino/gliner2.5-base-v1"
-          trap 'rm -rf "$models_root"' EXIT
-          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
-          cd zig
-          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
-            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            -j1
-          cd pkg/inference
-          python3 ../../tools/run_bounded_zig_build.py build test \
-            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
-            --cache-dir ../../.zig-cache --prefix ../../zig-out
-          cd ../../..
-          python3 scripts/ci/prepare_lite_previous_reader.py
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
-          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
-          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
-              --output "$RUNNER_TEMP/lite-extraction-eval.json"
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
-
-      - name: Upload real-model extraction evaluation
-        if: always() && needs.changes.outputs.zig_tests == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: lite-extraction-evaluation
-          path: ${{ runner.temp }}/lite-extraction-eval.json
-          if-no-files-found: error
-
       - name: Release completed pre-unit test artifacts
         if: needs.changes.outputs.zig_tests == 'true'
         run: |
@@ -744,181 +697,10 @@ jobs:
           ANTFLY_TEST_WORK_PROFILE: "1"
           ANTFLY_TEST_CLEANUP_TRACE: "1"
           ANTFLY_TEST_TIMINGS: "1"
-        run: |
-          set -euo pipefail
-
-          collect_descendants() {
-            local roots="$*"
-            local all=" ${roots} "
-            local changed=1
-            while [ "$changed" -eq 1 ]; do
-              changed=0
-              while read -r pid ppid; do
-                if [[ " $all " == *" $ppid "* && " $all " != *" $pid "* ]]; then
-                  all="${all}${pid} "
-                  changed=1
-                fi
-              done < <(ps -eo pid=,ppid=)
-            done
-            echo "$all"
-          }
-
-          dump_stacks() {
-            local root_pid="$1"
-            for partition_log in "$ANTFLY_TEST_LOG_DIR"/*.log; do
-              [ -f "$partition_log" ] || continue
-              echo "::group::partition progress $partition_log"
-              tail -n 80 "$partition_log" || true
-              echo "::endgroup::"
-            done
-            echo "::group::antfly unit watchdog ptrace settings"
-            if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
-              cat /proc/sys/kernel/yama/ptrace_scope || true
-            fi
-            sysctl kernel.yama.ptrace_scope 2>/dev/null || true
-            echo "::endgroup::"
-
-            echo "::group::antfly unit watchdog process tree"
-            ps -eo pid,ppid,stat,etime,cmd | awk 'NR == 1 || /zig build|zig-local|\/test|make zig-unit-test|make -C \.\/zig unit-test/' || true
-            echo "::endgroup::"
-
-            local pids
-            pids="$(collect_descendants "$root_pid")"
-            for pid in $pids; do
-              if ! kill -0 "$pid" 2>/dev/null; then
-                continue
-              fi
-              local cmdline
-              cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-              case "$cmdline" in
-                *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*" make "*)
-                  # Ephemeral runner caches disappear with the pod. Keep the
-                  # test bytes even when ptrace cannot supply a stack trace.
-                  python3 zig/tools/retain_test_process.py "$pid" "$ANTFLY_TEST_LOG_DIR/hung" || true
-                  echo "::group::proc snapshot pid=$pid cmd=$cmdline"
-                  if [ -r "/proc/$pid/status" ]; then
-                    grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
-                  fi
-                  if [ -r "/proc/$pid/wchan" ]; then
-                    printf "wchan="
-                    cat "/proc/$pid/wchan" || true
-                    printf "\n"
-                  fi
-                  if [ -r "/proc/$pid/stack" ]; then
-                    cat "/proc/$pid/stack" || true
-                  fi
-                  echo "::endgroup::"
-
-                  echo "::group::gdb thread dump pid=$pid cmd=$cmdline"
-                  timeout 45s gdb -batch -p "$pid" \
-                    -ex "set pagination off" \
-                    -ex "thread apply all bt" \
-                    -ex "detach" || \
-                    timeout 45s sudo gdb -batch -p "$pid" \
-                      -ex "set pagination off" \
-                      -ex "thread apply all bt" \
-                      -ex "detach" || true
-                  echo "::endgroup::"
-                  ;;
-              esac
-            done
-          }
-
-          terminate_tree() {
-            local root_pid="$1"
-            local pids
-            pids="$(collect_descendants "$root_pid")"
-            for pid in $pids; do
-              if [ "$pid" != "$$" ]; then
-                kill -TERM "$pid" 2>/dev/null || true
-              fi
-            done
-            sleep 5
-            for pid in $pids; do
-              if [ "$pid" != "$$" ]; then
-                kill -KILL "$pid" 2>/dev/null || true
-              fi
-            done
-          }
-
-          if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
-            echo "::group::configure ptrace for unit watchdog"
-            echo "ptrace_scope before: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
-            sudo sysctl -w kernel.yama.ptrace_scope=0 || true
-            echo "ptrace_scope after: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
-            echo "::endgroup::"
-          fi
-
-          unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
-          : > "$unit_log"
-          export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"
-          mkdir -p "$ANTFLY_TEST_LOG_DIR"
-
-          (
-            set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--maxrss ${{ steps.cpus.outputs.max_rss }} --summary all" 2>&1 | tee -a "$unit_log"
-            exit "${PIPESTATUS[0]}"
-          ) &
-          unit_pid="$!"
-          (
-            # A cold Zig compile can legitimately remain silent for more than
-            # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
-            # the independent hard limit without killing an active cold build.
-            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
-            # PR #716's DB-core execution started 52 minutes into the combined
-            # build/test step and was still progressing at the old 60m limit.
-            # Allow 90m total, retaining the 30m idle and 120m outer job limits.
-            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-5400}"
-            start_epoch="$(date +%s)"
-            last_progress_epoch="$start_epoch"
-            last_mtime=0
-            while kill -0 "$unit_pid" 2>/dev/null; do
-              sleep 15
-              now_epoch="$(date +%s)"
-              for progress_log in "$unit_log" "$ANTFLY_TEST_LOG_DIR"/*.log; do
-                [ -f "$progress_log" ] || continue
-                current_mtime="$(stat -c %Y "$progress_log" 2>/dev/null || echo 0)"
-                if [ "$current_mtime" -gt "$last_mtime" ]; then
-                  last_mtime="$current_mtime"
-                  last_progress_epoch="$now_epoch"
-                fi
-              done
-
-              elapsed_secs=$((now_epoch - start_epoch))
-              idle_secs=$((now_epoch - last_progress_epoch))
-              if [ "$hard_limit_secs" -gt 0 ] && [ "$elapsed_secs" -ge "$hard_limit_secs" ]; then
-                echo "::error::zig-unit-test hard watchdog fired after ${elapsed_secs}s; dumping stacks before terminating live test processes"
-                tail -n 200 "$unit_log" || true
-                dump_stacks "$unit_pid"
-                terminate_tree "$unit_pid"
-                exit 0
-              fi
-              if [ "$idle_limit_secs" -gt 0 ] && [ "$idle_secs" -ge "$idle_limit_secs" ]; then
-                echo "::error::zig-unit-test idle watchdog fired after ${idle_secs}s without unit log progress; dumping stacks before terminating live test processes"
-                tail -n 200 "$unit_log" || true
-                dump_stacks "$unit_pid"
-                terminate_tree "$unit_pid"
-                exit 0
-              fi
-            done
-          ) &
-          watchdog_pid="$!"
-
-          status=0
-          wait "$unit_pid" || status="$?"
-          kill "$watchdog_pid" 2>/dev/null || true
-          wait "$watchdog_pid" 2>/dev/null || true
-          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
-            echo "::group::unit failure cgroup memory"
-            for metric in memory.current memory.peak memory.max memory.events; do
-              if [ -r "/sys/fs/cgroup/$metric" ]; then
-                echo "[$metric]"
-                cat "/sys/fs/cgroup/$metric"
-              fi
-            done
-            echo "::endgroup::"
-          fi
-          exit "$status"
+        run: >-
+          bash scripts/ci/run-zig-unit-tests.sh
+          '${{ steps.cpus.outputs.list }}'
+          '${{ steps.cpus.outputs.max_rss }}'
 
       - name: Verify externally fetched Apache Zig source package
         run: >-
@@ -967,6 +749,218 @@ jobs:
           path: ${{ runner.temp }}/antfly-tla-traces/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Independent target matrices own their clocks and disposable compiler caches;
+  # they do not consume the native unit gate's watchdog allowance.
+  zig-base-wasm:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      !inputs.full_validation &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      ((inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) }}
+    name: zig-base / wasm
+    needs: [admission, changes]
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: true
+
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Set up Node for WASM tests
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+
+      - name: Build and test Apache WASM artifacts
+        working-directory: zig
+        run: |
+          # The @antfly/web package contract suite runs from its built ESM
+          # artifact in the TypeScript SDK gate.
+          node pkg/antfly-embedded/wasm_client_test.mjs
+          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
+          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
+          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
+          cd pkg/inference
+          zig build wasm -Dwasm=true -j1 --summary all
+          node web/test-wasm-abi.mjs wasm32
+          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
+          node web/test-wasm-abi.mjs wasm64
+
+      - name: Release completed qualification artifacts
+        if: always() && steps.cache.outcome == 'success'
+        run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
+
+  zig-base-lite-models:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      !inputs.full_validation &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      ((inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) &&
+      needs.changes.outputs.zig_tests == 'true' }}
+    name: zig-base / lite-models
+    needs: [admission, changes]
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: true
+
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Build Lite qualification libraries
+        timeout-minutes: 60
+        run: |
+          # Cold current/baseline library builds precede the real-model clock.
+          # The following test step retains its 25-minute execution bound.
+          cd zig
+          python3 tools/run_bounded_zig_build.py build capi \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false -j1
+          cd ..
+          python3 scripts/ci/prepare_lite_previous_reader.py
+
+      - name: Exercise real Lite extraction through public graph APIs
+        if: needs.changes.outputs.zig_tests == 'true'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
+          model_dir="$models_root/fastino/gliner2.5-base-v1"
+          trap 'rm -rf "$models_root"' EXIT
+          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
+          cd zig
+          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi-test \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
+            -j1
+          cd pkg/inference
+          python3 ../../tools/run_bounded_zig_build.py build test \
+            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
+            --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
+          cd ../../..
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
+          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
+              --output "$RUNNER_TEMP/lite-extraction-eval.json"
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
+
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
+        if: always() && needs.changes.outputs.zig_tests == 'true'
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lite-extraction-evaluation
+          path: ${{ runner.temp }}/lite-extraction-eval.json
+          if-no-files-found: error
+
+      - name: Release completed qualification artifacts
+        if: always() && steps.cache.outcome == 'success'
+        run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
 
   zig-full-tests:
     if: >-
@@ -1106,21 +1100,10 @@ jobs:
       - name: Run library, Antfly, and inference unit tests
         env:
           ANTFLY_TEST_TIMINGS: "1"
-        run: |
-          set +e
-          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--maxrss ${{ steps.cpus.outputs.max_rss }} --summary all"
-          status="$?"
-          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
-            echo "::group::unit failure cgroup memory"
-            for metric in memory.current memory.peak memory.max memory.events; do
-              if [ -r "/sys/fs/cgroup/$metric" ]; then
-                echo "[$metric]"
-                cat "/sys/fs/cgroup/$metric"
-              fi
-            done
-            echo "::endgroup::"
-          fi
-          exit "$status"
+        run: >-
+          bash scripts/ci/run-zig-unit-tests.sh
+          '${{ steps.cpus.outputs.list }}'
+          '${{ steps.cpus.outputs.max_rss }}'
 
       - name: Verify server-free Apache Lite, lake, C API, WASM, and inference builds
         run: >-
@@ -1145,7 +1128,7 @@ jobs:
           cd pkg/inference
           python3 ../../tools/run_bounded_zig_build.py build test \
             '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
-            --cache-dir ../../.zig-cache --prefix ../../zig-out
+            --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
           cd ../../..
           python3 scripts/ci/prepare_lite_previous_reader.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
@@ -1161,8 +1144,16 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
 
-      - name: Upload real-model extraction evaluation
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
         if: always() && !cancelled()
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && !cancelled() && steps.lite_extraction_report.outputs.exists == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lite-extraction-evaluation
@@ -1177,6 +1168,19 @@ jobs:
           # Later scale and qualification phases keep their disk-backed paths.
           echo 'ANTFLY_TEST_WORKSPACE=' >> "$GITHUB_ENV"
           echo 'ANTFLY_TEST_WORKSPACE_MOUNTED=' >> "$GITHUB_ENV"
+
+      - name: Retain unit test progress
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/antfly-zig-unit.log
+            ${{ runner.temp }}/antfly-zig-test-logs/*.log
+            ${{ runner.temp }}/antfly-zig-test-logs/hung/
+          if-no-files-found: ignore
+          retention-days: 14
+
 
       - name: Release completed phase compiler cache
         run: |
@@ -1321,7 +1325,9 @@ jobs:
     name: zig-full / build-cache / ${{ matrix.shard }}
     needs: [admission, changes]
     runs-on: arc-antfly-heavy
-    timeout-minutes: 40
+    # The production ownership audit includes seven incremental source
+    # mutations: measured cold/read/write phases alone take 35 minutes.
+    timeout-minutes: ${{ matrix.shard == 'storage-ownership' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1424,19 +1430,26 @@ jobs:
       needs.changes.outputs.model_check == 'true' ||
       needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
-    needs: [admission, changes, zig-base-tests, arm64-codec]
+    needs: [admission, changes, zig-base-tests, zig-base-wasm, zig-base-lite-models, arm64-codec]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-base shards
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-base-tests.result }}
+          WASM_RESULT: ${{ needs.zig-base-wasm.result }}
+          LITE_MODEL_RESULT: ${{ needs.zig-base-lite-models.result }}
+          REQUIRE_LITE_MODELS: ${{ needs.changes.outputs.zig_tests == 'true' }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+          test "$WASM_RESULT" = "success"
+          if [ "$REQUIRE_LITE_MODELS" = "true" ] || [ "$LITE_MODEL_RESULT" != "skipped" ]; then
+            test "$LITE_MODEL_RESULT" = "success"
+          fi
 
   zig-full:
     if: >-
@@ -1481,7 +1494,9 @@ jobs:
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy-runtime
+    # Compilation needs the heavy runner's 50 GiB scratch PVC; runtime-only
+    # runners have a 10 GiB ephemeral container disk and no scratch mount.
+    runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
       # Override ARC's 20 GiB default: storage reserves 22 GiB. The 24 GiB
@@ -1523,11 +1538,13 @@ jobs:
 
       - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
-          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
+          mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
+          cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
+          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
+          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -1556,6 +1573,13 @@ jobs:
           overwrite: true
           if-no-files-found: error
           retention-days: 1
+
+      - name: Release completed E2E build scratch
+        if: always()
+        run: |
+          if [[ -n "${ANTFLY_E2E_BUILD_CACHE_ROOT:-}" ]]; then
+            rm -rf -- "$ANTFLY_E2E_BUILD_CACHE_ROOT"
+          fi
 
   embedded-sdk-native:
     if: >-
@@ -1860,7 +1884,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
           -tags runtimeintegration ./controllers/inference
-          -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+          -run '^Test(InferenceRuntimeContract|RuntimeModelPullRetry)$' -count=1 -v -timeout=20m
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
@@ -2128,7 +2152,9 @@ jobs:
       github.event.schedule == '0 8 * * *') }}
     name: e2e-full / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy-runtime
+    # Compilation needs the heavy runner's 50 GiB scratch PVC; runtime-only
+    # runners have a 10 GiB ephemeral container disk and no scratch mount.
+    runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
@@ -2164,11 +2190,13 @@ jobs:
 
       - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
-          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
+          mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
+          cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
+          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
+          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2197,6 +2225,13 @@ jobs:
           overwrite: true
           if-no-files-found: error
           retention-days: 1
+
+      - name: Release completed E2E build scratch
+        if: always()
+        run: |
+          if [[ -n "${ANTFLY_E2E_BUILD_CACHE_ROOT:-}" ]]; then
+            rm -rf -- "$ANTFLY_E2E_BUILD_CACHE_ROOT"
+          fi
 
   e2e-full-tests:
     if: >-

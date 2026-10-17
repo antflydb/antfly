@@ -1,9 +1,9 @@
 # EmbeddingGemma 2 embeddings and similarity decisions
 
 Antfly runs the open Hugging Face `google/embeddinggemma-2` safetensors checkpoint
-on native CPU and Metal. Text, images, audio and ordered combinations share the
-same embedding space. Video, CUDA, ONNX, PJRT and WebGPU are excluded from this
-implementation. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain
+on native CPU and Metal. Text, images, audio, video and ordered combinations share the
+same embedding space. Video accepts qualified MP4/MOV through ordered groups.
+CUDA, ONNX, PJRT and WebGPU are excluded from this implementation. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain
 their existing contracts.
 
 ## Checkpoint and numerical contract
@@ -12,7 +12,7 @@ The initial supported checkpoint is revision
 `914f7f89142e33e77833254d9c9b90c3cef7303b`. Acquire its original weights and sidecars:
 
 ```sh
-python3 tools/embeddinggemma2/reference.py acquire models/embedders/embeddinggemma2
+python3 zig/pkg/inference/scripts/embeddinggemma2/reference.py acquire models/embedders/embeddinggemma2
 ```
 
 The acquisition tool verifies the resolved revision and LFS weight digest, keeps
@@ -22,7 +22,7 @@ A managed registry reference is
 `hf:google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b`.
 
 The runtime validates the text, vision and audio geometry and weight shapes,
-tokenizer BOS/EOS and media tokens, and the pinned image/audio processor. It
+tokenizer BOS/EOS and media tokens, and the pinned image/audio/video processor. It
 accepts BF16 or F32 weights, converts BF16 values exactly to F32, and uses F32
 activations and accumulation on both supported backends. Quantized and implicit
 F16 execution are rejected for this family.
@@ -43,8 +43,13 @@ must remain consistent between indexing and retrieval.
 
 Existing flat inputs return one vector per text or media part. A group returns
 one vector for all its ordered content. Each request must use one form throughout.
-Ordered mixed groups execute serially within the request workspace. Flat encoded
-image rows use bounded vision and embedding-encoder cohorts. Local PDF
+Ordered mixed/video groups use bounded prepared cohorts on CPU and Metal.
+Compatible image/audio parts share towers across groups while preserving each
+group's order; compatible completed inputs share length-bucketed backbone calls, with at most four groups and 8192 padded rows.
+The broker also admits CPU image/audio cohorts; callbacks and caller-owned
+profiling/preparation hooks keep their dedicated execution path. Queueing does
+not reserve model scratch. A fitting singleton remains available when cohort
+admission fails. Flat encoded image rows use bounded vision and embedding-encoder cohorts. Local PDF
 page embeddings borrow the renderer's RGBA pixels, including padded row strides,
 without PNG encoding or decoding. They share the encoded-image resize and
 projector, batching compatible patch grids before executing the embedding encoder
@@ -238,7 +243,7 @@ Collect real application scores and truth labels with disjoint `fit`,
 ```
 
 ```sh
-python3 tools/embeddinggemma2/calibrate.py scores.json \
+python3 zig/pkg/inference/scripts/embeddinggemma2/calibrate.py scores.json \
   models/embedders/embeddinggemma2/calibrations/support_v1.json \
   --precision 0.9 --minimum-coverage 0.2
 ```
@@ -271,7 +276,7 @@ calibration artifact is supplied by this change.
 Run the socket-level contract campaign against the current supervised server:
 
 ```sh
-python3 tools/embeddinggemma2/qualify.py \
+python3 zig/pkg/inference/scripts/embeddinggemma2/qualify.py \
   --url http://127.0.0.1:8090/ai/v1 --model embeddinggemma2 \
   --oracle artifacts/oracle.json --media-oracle artifacts/media-oracle.json \
   --iterations 32 --concurrency 4 --output artifacts/live-qualification.json
@@ -393,7 +398,7 @@ and a source manifest mapping repository-relative files to SHA-256 digests:
 cd zig/pkg/inference
 zig build build-embeddinggemma2-bench -Dmetal=true -Doptimize=ReleaseFast -j1
 cd ../../..
-python3 tools/embeddinggemma2/encoder_campaign.py \
+python3 zig/pkg/inference/scripts/embeddinggemma2/encoder_campaign.py \
   --model-dir <model-dir> --suite suite.json \
   --baseline <archived-encoder-binary> \
   --candidate zig/pkg/inference/zig-out/bin/antfly-embeddinggemma2-bench \
@@ -420,7 +425,7 @@ These diagnostic timings do not set the performance gate.
 
 ## Compact PyTorch comparison
 
-`tools/embeddinggemma2/compare.py` compares the same pinned F32 checkpoint with
+`zig/pkg/inference/scripts/embeddinggemma2/compare.py` compares the same pinned F32 checkpoint with
 official PyTorch CPU and MPS execution. Eight edge cases cover a short document,
 a short retrieval query, exact 128/512/8192-token documents, image, audio and an
 ordered text/audio/image group. Four additional documents and three queries
@@ -433,11 +438,11 @@ Prepare the suite once, then run each backend in a separate process:
 ```sh
 export PYTHONPATH=<pinned-python-dependencies>
 export VECLIB_MAXIMUM_THREADS=4 OMP_NUM_THREADS=4
-python3 tools/embeddinggemma2/compare.py --backend prepare \
+python3 zig/pkg/inference/scripts/embeddinggemma2/compare.py --backend prepare \
   --model-dir <model-dir> --artifacts-dir <oracle-and-media-dir> --output suite.json
-python3 tools/embeddinggemma2/compare.py --backend mps \
+python3 zig/pkg/inference/scripts/embeddinggemma2/compare.py --backend mps \
   --model-dir <model-dir> --suite suite.json --output pytorch-mps.json
-python3 tools/embeddinggemma2/compare.py --backend metal \
+python3 zig/pkg/inference/scripts/embeddinggemma2/compare.py --backend metal \
   --model-dir <model-dir> --suite suite.json --reference pytorch-mps.json \
   --binary zig/pkg/inference/zig-out/bin/antfly-inference --output metal.json
 ```
@@ -462,8 +467,9 @@ checks numerical agreement; it does not estimate application retrieval quality.
 
 Sliding layers restrict their actual attention ranges while preserving original
 positions, padding holes and batch isolation. Metal groups the encoder into one
-owned frame for at most 512 total rows, including padding and batch. Longer
-inputs complete one frame per layer to bound retained intermediates. Frames
+owned frame for at most 512 total rows, including padding and batch. Larger
+inputs use workspace-bounded layer groups, releasing completed activation views
+between groups; independent rows can batch across the former 512-row cutoff. Frames
 complete or cancel before their transient projection slots are released. Cached
 MPS activation views are released at frame completion and request teardown;
 only admitted model weights and multiplication plans persist across requests.
@@ -483,11 +489,12 @@ three sorted key ranges in contiguous spans; generic finite-window callers
 retain their per-key position checks. Rotary
 frequencies are computed once per operation and trigonometric values reused
 across heads at the same position. The shared per-layer projection is acquired
-once per encoder pass. On Metal, at up to 512 total rows, one packed projection
-and RMSNorm produce all layers' per-layer inputs, matching the upstream
-implementation. Individual layers slice their columns on the device. CPU and
-larger Metal inputs compute one layer's projection at a time to retain the
-host-workspace bound.
+once per encoder pass. On Metal, one packed projection and RMSNorm produce
+all layers' per-layer inputs when the packed output fits a 64 MiB ceiling.
+Individual layers slice their columns on the device. Longer Metal contexts
+pack only the current owned layer group rather than allocating the complete
+all-layer output. CPU retains layer-at-a-time projection. Packed outputs and
+live layer groups remain inside the existing admitted execution workspace.
 CPU execution reuses uniquely owned RMSNorm and GELU inputs at their last use
 and retires replaced projection/reshape handles. Aliased inputs and unsupported
 consume operations retain independent output storage. Errors preserve source
@@ -495,14 +502,294 @@ ownership for cleanup or retry. Independent activation references, alias
 preservation, allocation failures and retry behavior have focused coverage.
 BF16 widening uses lossless vector operations, and Metal
 linear preparation uses owned shared snapshots on unified-memory devices.
-Immutable language weights also have model-owned reuse: CPU retains losslessly
-widened BF16 mirrors, and Metal retains prepared F32 projection slots across
-requests. Each cache has at most 512 entries and 640 MiB of payload, charged to
-its resident host or backend tier before allocation. Vocabulary and media
-weights, mutable tensors and transient views are excluded. Admission denial
-keeps the request-scoped preparation path. Unloading a drained model releases
-both payloads and their admission ownership; the request workspace stays bounded
-independently.
+Immutable language, vision and audio weights have independent model-owned
+payload ceilings: 640 MiB each for language/vision and 1536 MiB for the larger
+audio tower. All payloads require resident host or backend admission before
+allocation, with at most 1536 entries across the classes. CPU retains lossless
+BF16 mirrors; Metal retains prepared F32 projection slots. Packed vision QKV
+snapshots replace the three individual projection snapshots. Warm named QKV
+execution acquires the packed snapshot before loading any original weights.
+Vocabulary, mutable tensors and transient views are excluded. Cache denial
+keeps bounded request-scoped preparation. Admission pressure can reclaim idle
+classes; native compute contexts pin borrowed mirrors until teardown, and Metal
+reclamation refuses active/submitted command groups. Unloading releases payloads
+and their admission ownership; request workspace remains bounded independently.
+
+Vision normalization and two-axis RoPE execute together without intermediate
+transposes. Native dense vision attention uses bounded GEMM tiles, SIMD row
+maxima and normalization, and no segmented-range sorting or masking. BLAS
+execution holds one packed head and a 1 MiB score tile; bounded row workers
+run only after each GEMM has completed. Without BLAS, a portable SIMD kernel
+packs head-major inputs once and runs independent heads around sequential
+register-tiled GEMM, avoiding nested worker pools.
+BLAS tiles calibrate over ordinary completed calls per geometry and batch size:
+each candidate gets one discarded warm sample and three measured samples, then
+the lower median wins. A fixed 64-entry metadata table bounds exploration and
+stores no tensors; failed calls release their tickets without training. Disable
+exploration with `ANTFLY_EMBEDDINGGEMMA2_DISABLE_ATTENTION_CALIBRATION=1`.
+Legacy layouts retain their existing path. Native backbone grouped
+attention preserves compact K/V heads and reuses their packed rows across query
+heads, with explicit score scaling and the same masks/windows as Metal. Compatible FFNs use fused GELU/product execution; CPU streams through
+SIMD tiles and parallelizes large independent output ranges. Native audio local
+attention intersects legal key ranges once per query and uses SIMD reductions
+with at most four workers, retaining relative-position terms and logit capping.
+Cancellation drains all workers before borrowed inputs or scratch are released.
+
+Audio conformer cohorts concatenate independently subsampled clips. Shared
+projections and FFNs run across the cohort, while temporal attention and causal
+convolution reset at each clip boundary. Metal completes each owned conformer
+layer before releasing its activation views. Native preparation omits unused
+device DFT packing. Mixed image/audio/video prompts retain available device
+tokens through composition, and strict audio preparation validates duration
+using the decode consumed by the tower.
+
+Prepared mixed cohorts preserve source/model identity and per-item failures.
+Length buckets cap padding at 25%; original positions restore delivery order.
+Initial preparation and retained inputs stay admitted while an independently
+checked supplemental lease funds any larger encoder peak. The base lease never
+grows or loses ownership, and both leases outlive backend teardown. Resource
+pressure unwinds a cohort before retrying independent calls.
+
+Mixed cohorts gather image/raster and encoded/PCM audio parts into bounded tower
+waves. One CPU-only future wave may prepare while the current tower executes;
+its independent shared lease and allocator retire after join. Scatter maps keep
+part/group identity through geometry and audio-length differences. Invalid
+preparation marks the original group, and pressure drains all producers before
+independent execution retries.
+
+Model-owned packed linears combine compatible backbone QKV, gate/up and audio
+QKV weights under the existing cache class limits. Audio QKV packing requires
+equal input clamps and preserves each output clamp. Packed FFNs consume
+interleaved gate/up rows directly with portable SIMD workers or a Metal kernel. Dense
+native GEMM output skips redundant zero initialization when beta is zero.
+
+Flat text arrays tokenize once and share length-sorted encoder calls, with at
+most four items, 8192 padded rows and 25% padding overhead. Results scatter to
+input order; admission pressure drains and splits a cohort before retrying.
+Explicit alternate pooling/projection configurations retain their own contract.
+Metal grouped GEMM tiles stop at disjoint item ranges and compute only each
+tile's visible key envelope; score storage uses that envelope's stride. CPU
+portable grouped attention shares packed K/V across bounded head workers, with
+sequential inner GEMMs. BLAS retains its own worker scheduler.
+Backbone head preparation reads packed projections directly and combines head
+RMSNorm, split-half RoPE and row gathering/compact-KV expansion. Gather indices,
+window ranges and aligned device visibility metadata are prepared once per
+forward call and retained until completion/cancellation. Vision FFNs share
+admitted packed gate/up weights and consume them directly on CPU/Metal without
+slice buffers. Image/video position lookups preserve typed table storage and
+gather the required rows instead of copying the full 60 MiB F32 position table.
+
+Language QKV and gate/up projections use one canonical packed snapshot for all
+admitted sequence lengths, including inputs above 512 rows. Native individual
+projections borrow output-row slices; Metal applies output-row views directly
+from the parent slot. Neither view creates a second persistent weight payload.
+The model lease protects views, and cache pressure reclaims the parent as one
+allocation. Packed QKV/head preparation and packed GELU avoid extraction copies;
+activation storage remains bounded by the existing admitted row envelope.
+
+The pure Zig CPU backend uses model-owned F32 GEMM panels as its canonical
+prepared matrix representation. Panels are built directly from typed checkpoint
+rows, without first allocating a dense F32 mirror. Individual language projections
+and packed QKV/gate-up calls share one named panel owner; aligned output-row views
+borrow its panels. Portable SIMD operates across output columns with 64-column
+panels, 256-element K blocks and bounded row blocks. System BLAS retains its own
+kernels. Canonical panels obey the existing shared host budget and class ceilings;
+allocation or admission failure uses the typed/direct fallback. Request readers
+pin panel owners until teardown, and idle reclamation/unload releases their exact
+admission. Optional panels for pre-existing dense snapshots still reserve dense
+weight headroom.
+
+CPU row slices retain their source owner, including typed checkpoint mappings,
+instead of copying matrix weights. CPU per-layer input projections are grouped
+under a 16 MiB projected-output ceiling; long inputs keep the streamed path.
+Metal backbones above the small-input frame threshold encode one bounded layer
+group while its predecessor executes. MPS activation views transfer to their
+encoding frame and retire on its completion. The schedule rolls forward without
+draining the successor. The two live groups share the existing 128 KiB/row layer
+envelope; scratch released by the successor cannot be recycled by predecessor completion.
+Cancellation drops unsubmitted work and drains submitted work before releasing
+owners. `ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER=1` selects serial
+submission for diagnostics.
+
+Mixed media cohorts use a bounded readiness scheduler. A group executes once
+all its required projected parts are available, while the next CPU preparation
+wave runs. Completed CPU preparation buffers and their admission are released
+before running ready backbones. A singleton may wait one preparation wave to
+coalesce a useful backbone batch; ready work cannot be deferred indefinitely. Waves remain
+homogeneous batches of at most four items but can
+cross image/audio boundaries. Text-only groups can overlap the first media
+preparation wave. Finished groups release projected tokens promptly; public
+result order, per-group failures, cancellation and shared admission remain
+unchanged. GPU tower and backbone work stay ordered on one leased backend.
+
+
+Metal grouped attention folds query heads sharing a KV head into matrix rows,
+then batches distinct KV heads for dense key envelopes. Partial envelopes
+encode one QK/PV pair per KV head, avoiding padded RHS batch strides and K/V
+expansion. Range/window masking stays exact. Query packing and score/output
+storage are bounded by the current tile; padded tail rows are not multiplied.
+Grouped K/V and resident visibility metadata now cover short queries too;
+metadata is uploaded once per forward, rather than once per layer. Queries
+below 64 rows with at most 64 keys, or visible envelopes through 32 keys,
+use a head-width-specialized SIMD-group kernel with no threadgroup scratch.
+Aligned 512-wide global heads with key
+envelopes through 128 use fused 64-key F32 attention. Local envelopes through 1536 use GEMM,
+even above 512 total rows. Longer global heads retain GEMM when its workspace
+fits. The 1536-key bound covers a 512-query tile plus two 512-key windows.
+When GEMM workspace cannot be admitted, global heads use fused 64-key tiles
+on aligned shapes and a tail-safe 32-key variant otherwise. These kernels
+retain online softmax and F32 matrix accumulation without materializing score
+tiles, with 21,632 and 27,776 bytes of threadgroup storage respectively.
+Device capability checks retain the original compact fallback. Explicit
+strategy, query-tile and key-block overrides are reserved for qualification;
+workspace limits and cancellation still apply.
+
+The attention qualification executable also compares Flash against GEMM tiles
+of 128, 256 and 512 queries, plus automatic dispatch, at 128/512/2048/8192
+total rows, for both head
+geometries and single/four-item visibility. It reuses resident metadata,
+restricts local visibility before dispatch, checks independent F64 outputs,
+interleaves candidates, and records ten completed GPU/host samples plus paging
+counters. Explicit qualification overrides obey the workspace ceiling. Timing
+receipts qualify attention only; they do not establish end-to-end latency or
+PyTorch parity. Run on an otherwise idle device and retain the binary/source
+identity with the receipt:
+
+```sh
+cd zig/pkg/inference
+zig build build-embeddinggemma2-attention-check -Doptimize=ReleaseSafe
+zig-out/bin/antfly-embeddinggemma2-attention-check /path/to/model \
+  /path/to/attention-timings.json --benchmark
+```
+
+
+Audio relative-position inputs, query scales, normalization ones and completed
+per-layer relative-key projections are cached as immutable model constants.
+Prepared constants have an 8 MiB/128-entry ceiling within the audio class and
+shared memory admission. Device publication copies into fresh model-owned
+storage and waits for completion; failed copies are not published. Cancellation
+releases the consumer's handle; completed snapshots remain reusable on retry.
+Warm device execution performs no scale readback. Audio pressure reclamation and model
+unload release these constants alongside prepared weights.
+
+Native audio local attention scales each query once per head in worker-local
+SIMD scratch, reusing it across keys. Softmax skips masked entries when their
+exponentials are guaranteed to round to zero in F32; other finite masks keep
+the general normalization path. Clip boundaries and cancellation remain local
+to each row.
+
+Backbone post-normalization/residual epilogues use one backend operation,
+including the final per-layer output scale. PLE GELU and multiplication share
+one activation operation. Audio uses the same post-normalization/residual
+primitive, with its residual weight applied before addition, and combines
+scalar output clipping with SiLU. CPU uses portable Zig SIMD; Metal uses
+precise F32 kernels. The operation contract preserves normalization, weight,
+scale, addition and final-scale order. Unsupported backends retain the
+separate-operation path. Model-owned scalar clamp metadata is bounded to 256
+entries with keys of at most 192 bytes, owns no request tensors, and is released
+on model teardown. Mutable compute contexts do not publish it.
+
+Cold Metal packed projections populate the final owned F32 snapshot directly
+from mixed BF16/F32 checkpoint segments. No combined host F32 matrix or
+per-segment F32 staging is retained. Shared storage is used on unified-memory
+devices; other Metal devices blit that same generated staging buffer directly
+to private storage, avoiding a second shared upload allocation.
+Publication remains atomic: failed preparation preserves any previous slot,
+and the existing class/admission limits charge the final allocation.
+
+
+Embedding-only calls apply the final token RMSNorm, masked-mean pool hidden
+rows, then project once per item. Token-output callers retain the original
+per-token projection. The final bias-free linear commutes with masked mean;
+token RMSNorm does not. Metal pools, projects, truncates and normalizes the
+whole cohort inside its owned command frame and returns one compact readback.
+Admission accounts compact output vectors; the backbone workspace remains
+bounded independently. Dimension truncation stays after projection and before
+final L2 normalization.
+
+Warm embedding admission clones the loaded generation's validated manifest,
+including processor and capability policy, while briefly holding a model pin.
+Identity verification remains in place. Retirement/reload publishes a new
+snapshot; cold loads retain ordinary filesystem validation.
+
+For independent-versus-cohort replay, including unequal audio clips, mixed
+ordering, repeated media spanning preparation waves, captioned video, partial
+failures and concurrent callers:
+
+```sh
+python3 zig/pkg/inference/scripts/embeddinggemma2/cohort_qualify.py \
+  --binary zig/pkg/inference/zig-out/bin/antfly-inference-bench-server \
+  --model-dir /path/to/model --backend metal \
+  --output .benchmark-results/cohort-metal.json
+```
+
+Repeat with `--backend native`. The receipt pins the binary, corpus and model
+identity and requires observed native batching; these correctness/scheduling
+checks do not qualify the recorded latency against PyTorch.
+
+For a paired CPU kernel diagnostic, including portable SIMD attention:
+
+```sh
+cd zig/pkg/inference
+ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache" \
+  ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" \
+  ANTFLY_BENCH_DENSE_VISION_TILES=1 VECLIB_MAXIMUM_THREADS=4 \
+  zig build test-embeddinggemma2 -Doptimize=ReleaseSafe \
+  -Dtest-filter="embeddinggemma2 dense vision tile benchmark"
+```
+
+This compares actual attention outputs and completed kernel times at several
+patch grids. It is a kernel diagnostic, not an end-to-end throughput gate.
+
+The prepared CPU matrix diagnostic reports cold panel setup, retained bytes,
+paired direct/prepared timings, and output agreement for each geometry, including
+1-, 4- and 15-row projections as well as larger encoder batches:
+
+```sh
+zig build bench-linalg-prepared -Doptimize=ReleaseFast
+```
+
+`build-linalg-prepared` and `install-linalg-tests` build artifacts for execution
+on another host. Qualify Linux x86 with both
+`ANTFLY_INFERENCE_X86_KERNEL=portable` and `avx2`; the latter requires CPU and
+OS AVX2 support. Translation can check correctness but does not establish
+native hardware throughput.
+
+The Metal attention diagnostic (`build-embeddinggemma2-attention-check`, then
+`antfly-embeddinggemma2-attention-check MODEL OUTPUT --benchmark`) includes
+short and long queries, aligned boundaries, isolated items, three GEMM query
+tiles, specialized short and fused global kernels, and automatic dispatch.
+It checks independent F64 outputs, completed GPU time, paging counters and
+frame retirement. Identical or unsupported kernel variants are omitted.
+These measurements do not replace completed whole-request comparisons.
+
+### Per-case performance gate
+
+Use `performance_gate.py` with completed `compare.py` or `video_compare.py`
+receipts. It rejects mismatched weights, precision, suite/corpus, backend pairs,
+missing binary identities and mixed timing boundaries, and recomputes latency
+from raw samples. Every case must preserve F32 vector parity and meet the median
+ratio independently; the default ceiling is 1.10 and minimum sample count is 10.
+Insufficient samples, unobserved paging counters, new pageouts/swap traffic
+and slow modalities fail rather than disappearing into an aggregate. Prepared
+and request measurements record warm-sample VM counters outside their timers;
+older reports fall back conservatively to whole-process paging observations. A gate failure is retained in the output file with a nonzero exit.
+
+```sh
+python3 zig/pkg/inference/scripts/embeddinggemma2/performance_gate.py \
+  --candidate native.json --reference pytorch-cpu.json --output cpu-gate.json
+python3 zig/pkg/inference/scripts/embeddinggemma2/performance_gate.py \
+  --candidate metal-encoder.json --reference pytorch-mps-encoder.json \
+  --boundary encoder --output metal-encoder-gate.json
+```
+
+Prepared text encoder timing excludes HTTP and tokenization on both runtimes.
+Request comparison includes Antfly HTTP versus reference preprocessing and
+inference without HTTP. Cold setup, p95, memory, concurrency and cancellation
+remain separately reported boundaries. Images, PDF pages and GIF frames share
+the vision path, but source decoding/extraction must also be measured for each
+complete service workload. Passing isolated model cases does not certify those
+wrapper costs or universal PyTorch performance parity.
 
 
 ### Earlier local measurements
@@ -728,3 +1015,53 @@ Earlier focused Debug qualification also verifies that config-probe allocation f
 preserve GLiNER's model-stage HTTP error and metric classification, release
 admission, and allow a subsequent request to recover. The comparison report
 records the initial diagnostic failure and its final passing regression.
+
+
+## Video groups
+
+Submit MP4, MOV or WebM as a `media` part in an ordered group, for example:
+
+```json
+{"model":"embeddinggemma2","input":[{"content":[{"type":"text","text":"Describe the action"},{"type":"media","data":"<base64 MP4>","mime_type":"video/mp4"}]}]}
+```
+
+The existing SDK media types accept these MIME bytes. Binary attachment envelopes
+can carry `video/mp4`, `video/quicktime` or `video/webm` without base64 expansion. A group returns
+one joint embedding for its ordered text and selected frames. Audio must be an
+explicit separate part. Frames sample at 1 FPS with a uniform 32-frame cap over the
+whole clip, up to 140 soft tokens each; total wrappers, media and text must fit 8192.
+Video-only groups do not add a text task prefix. Flat video inputs are unsupported.
+Native CPU uses pure Zig H.264/MJPEG and VP8/VP9/AV1; Metal prefers VideoToolbox for
+eligible static H.264 and consumes completed Metal prepared patch buffers directly.
+Video preparation overlaps batched resident Metal vision/projector execution.
+Orthogonal MP4 rotation and SAR use direct resizing; explicit supported PQ/HLG
+signals use the qualified display/HDR recipe. Declared VUI/container matrix or
+range conflicts fail explicitly. WebM currently qualifies default-display SDR
+fixtures; broader WebM display/Colour metadata remains an open gate.
+Six pinned pretrained F32 video cases qualify native CPU and Metal numerical
+parity, including ordered mixed groups, repeated frames and HTTP dimensions.
+JPEG RGB uses the independent Pillow/libjpeg reference policy; default FFmpeg
+MJPEG IDCT can differ. See the [pretrained receipt](../../zig/lib/video/testdata/video-pretrained-validation.md)
+and [VIDEO.md](../../zig/lib/video/VIDEO.md#embeddinggemma-2-model-adapter-2026-10-09).
+
+Model FPS sampling currently requires progressive one-picture-per-sample AVC
+(Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
+transport remain library capabilities; the model adapter rejects them until a
+logical-picture index qualifies their frame-count/FPS semantics.
+
+
+WebM model sampling uses visible decoder outputs rather than packet count. Hidden
+reference frames remain dependencies, and VP9 superframe outputs have individual
+logical IDs. Indexing stores metadata, then replay decodes once up to the last
+selected picture and reuses the existing CPU/Metal projection batching. Each
+pass allows at most 8192 coded packets and 65536 visible picture entries; the
+model selects at most 32 pictures. This bounds memory without retaining a whole
+decoded clip. Equal PTS retain output order; no per-picture timestamps are invented.
+
+
+[Pretrained WebM qualification](../../zig/lib/video/testdata/webm-validation/README.md)
+compares eight vectors and three retrieval rankings against pinned PyTorch.
+Native CPU, Metal and actually executed Linux ARM64 preserve all rankings and
+top-k sets, with maximum coordinate error below `1e-6`. This includes two
+attributed real VP9/AV1 clips. WebM duration comes from the declared Segment
+Duration when present, preserving pinned FPS sampling at rounded PTS boundaries.

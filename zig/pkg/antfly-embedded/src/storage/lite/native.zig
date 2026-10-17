@@ -34,6 +34,147 @@ const CompleteScoreSink = @import("../backend_types.zig").CompleteScoreSink;
 const ReadIdentity = struct { canonical: u64, namespace: []const u8 };
 const Allocator = std.mem.Allocator;
 
+test "lite index prefix comparison scales past 4096 records and detects mutations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-prefix-comparison.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer writer.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const mutations = try arena.allocator().alloc(CatalogMutation, 5000);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{
+        .key = try std.fmt.allocPrint(arena.allocator(), "/scope/{d:0>8}", .{i}),
+        .value = "immutable",
+    };
+    try writer.putIndexCatalogBatch(mutations);
+    var captured = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer captured.close();
+    try writer.putDocument("primary", "unrelated");
+    try writer.putIndexCatalogRecord("/unrelated/entry", "outside the captured prefix");
+    const before_reads = writer.test_page_reads.load(.monotonic) + captured.test_page_reads.load(.monotonic);
+    try std.testing.expect(try captured.indexCatalogPrefixUnchanged(&writer, "/scope/"));
+    const reads = writer.test_page_reads.load(.monotonic) + captured.test_page_reads.load(.monotonic) - before_reads;
+    // Comparing unchanged subtrees should read tree paths, not 5,000 records.
+    try std.testing.expect(reads < 32);
+    try std.testing.expect(try captured.indexCatalogPrefixUnchanged(&writer, "/absent/"));
+    try writer.putIndexCatalogRecord("/scope/00002500", "new bytes");
+    try std.testing.expect(!try captured.indexCatalogPrefixUnchanged(&writer, "/scope/"));
+    try std.testing.expect(try captured.indexCatalogPrefixUnchanged(&writer, "/scope/00000"));
+    try writer.deleteIndexCatalogRecord("/scope/00000001");
+    try std.testing.expect(!try captured.indexCatalogPrefixUnchanged(&writer, "/scope/00000"));
+    try writer.putIndexCatalogRecord("/absent/new", "inserted");
+    try std.testing.expect(!try captured.indexCatalogPrefixUnchanged(&writer, "/absent/"));
+}
+
+test "lite runtime metadata comparison skips leases and fences secrets and documents" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "runtime-metadata.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer writer.close();
+    try writer.putCatalogRecord("secret-head", "original");
+    var captured = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer captured.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const mutations = try arena.allocator().alloc(CatalogMutation, 5000);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{
+        .key = try std.fmt.allocPrint(arena.allocator(), "{s}{d:0>8}", .{ NativeFile.artifact_lease_key_prefix, i }),
+        .value = "lease",
+    };
+    try writer.putCatalogBatch(mutations);
+    const before = writer.test_page_reads.load(.monotonic) + captured.test_page_reads.load(.monotonic);
+    try std.testing.expect(try captured.runtimeMetadataUnchanged(&writer));
+    try std.testing.expect(writer.test_page_reads.load(.monotonic) + captured.test_page_reads.load(.monotonic) - before < 32);
+    try captured.adoptIndexPublicationHeader(writer.header);
+    try writer.putIndexCatalogRecord("/shadow/unpublished", "bytes");
+    try std.testing.expect(try captured.runtimeMetadataUnchanged(&writer));
+    try captured.adoptIndexPublicationHeader(writer.header);
+    try writer.putCatalogRecord("secret-head", "changed");
+    try std.testing.expect(!try captured.runtimeMetadataUnchanged(&writer));
+    try captured.adoptIndexPublicationHeader(writer.header);
+    try writer.putDocument("primary", "new row");
+    try std.testing.expect(!try captured.runtimeMetadataUnchanged(&writer));
+    try captured.adoptIndexPublicationHeader(writer.header);
+    try writer.putCatalogRecord(NativeFile.artifact_lease_key_prefix ++ "evict-a", "lease");
+    try writer.putCatalogRecord(NativeFile.artifact_lease_key_prefix ++ "evict-b", "lease");
+    try std.testing.expect(!try captured.runtimeMetadataUnchanged(&writer));
+}
+
+test "lite index checkpoint adoption discards physical page caches" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-adoption-caches.aflite");
+    defer a.free(path);
+    var captured = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer captured.close();
+    try captured.putDocument("doc", "original");
+    const original = (try captured.getDocumentAlloc(a, "doc")).?;
+    a.free(original);
+    try std.testing.expect(captured.page_cache.pages.count() != 0);
+    var writer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer writer.close();
+    try writer.putDocument("doc", "updated");
+    captured.free_pages_verified = true;
+    try captured.adoptIndexPublicationHeader(writer.header);
+    try std.testing.expectEqual(@as(usize, 0), captured.page_cache.pages.count());
+    try std.testing.expect(!captured.free_pages_verified);
+    const updated = (try captured.getDocumentAlloc(a, "doc")).?;
+    defer a.free(updated);
+    try std.testing.expectEqualStrings("updated", updated);
+    try captured.putDocument("next", "after adoption");
+    try std.testing.expect((try captured.check()).valid);
+}
+
+test "lite allocator verification follows only identical certain owner checkpoints" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "allocator-proof.aflite");
+    defer a.free(path);
+    var owner = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer owner.close();
+    try owner.putDocument("doc", "original");
+    try std.testing.expect(owner.free_pages_verified);
+    var borrowed = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer borrowed.close();
+    try std.testing.expect(!borrowed.free_pages_verified);
+    try borrowed.inheritAllocatorVerification(&owner);
+    try std.testing.expect(borrowed.free_pages_verified);
+    try borrowed.adoptIndexPublicationHeader(owner.header);
+    try std.testing.expect(borrowed.free_pages_verified);
+    try owner.putDocument("next", "new generation");
+    borrowed.free_pages_verified = false;
+    try borrowed.inheritAllocatorVerification(&owner);
+    try std.testing.expect(!borrowed.free_pages_verified);
+    try borrowed.adoptIndexPublicationHeader(owner.header);
+    owner.checkpoint_publication_uncertain = true;
+    try borrowed.inheritAllocatorVerification(&owner);
+    try std.testing.expect(!borrowed.free_pages_verified);
+    owner.checkpoint_publication_uncertain = false;
+    try borrowed.inheritAllocatorVerification(&owner);
+    try std.testing.expect(borrowed.free_pages_verified);
+    const other_path = try testPath(a, tmp, "other-inode.aflite");
+    defer a.free(other_path);
+    var other = try NativeFile.createWithIo(a, std.testing.io, other_path, .{ .indexed_reclamation = true });
+    defer other.close();
+    other.header = owner.header;
+    const other_owned_path = other.path;
+    other.path = owner.path; // Same claimed path/header must still prove the inode.
+    defer other.path = other_owned_path;
+    other.free_pages_verified = false;
+    try other.inheritAllocatorVerification(&owner);
+    try std.testing.expect(!other.free_pages_verified);
+    try borrowed.putDocument("after", "adopted");
+    try std.testing.expect((try borrowed.check()).valid);
+}
+
 test "lite allocator v4 small checkpoints bound counter and queue boundary growth" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -876,6 +1017,29 @@ pub const DocumentIndexCursor = struct {
             self.depth -= 1;
         }
         return null;
+    }
+
+    fn subtreePage(self: *DocumentIndexCursor, depth: usize) u64 {
+        return if (depth == 0) self.checkpoint.document_index_root_page else blk: {
+            const parent = self.path.frames.items[depth - 1];
+            break :blk parent.pointer(parent.position);
+        };
+    }
+
+    // Advance to a sibling without opening it. Paired cursors can skip equal
+    // immutable sibling references without an I/O for every leaf in the range.
+    fn nextSubtree(self: *DocumentIndexCursor, depth: usize) !u64 {
+        self.depth = depth;
+        while (self.depth > 0) {
+            const parent = self.path.frames.items[self.depth - 1];
+            if (parent.kind != .internal) return error.InvalidDocumentIndex;
+            if (parent.position + 1 < parent.pointerCount()) {
+                parent.position += 1;
+                return parent.pointer(parent.position);
+            }
+            self.depth -= 1;
+        }
+        return 0;
     }
 
     pub fn prev(self: *DocumentIndexCursor) !?DocumentIndexEntry {
@@ -3426,6 +3590,35 @@ pub const NativeFile = struct {
         return self.header.checkpoints[self.header.active_checkpoint];
     }
 
+    /// Rebind a borrowed index writer after its owner has verified the inode,
+    /// catalog epoch and unchanged immutable index inputs under a writer lease.
+    /// The newest allocator state must accompany the newest primary roots.
+    pub fn adoptIndexPublicationHeader(self: *NativeFile, header: Header) !void {
+        if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
+            self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
+        if (std.meta.eql(self.header, header)) return;
+        self.invalidateLedger();
+        self.page_cache.clear(self.allocator);
+        if (self.secondary_page_cache) |cache| cache.clear(self.allocator);
+        self.free_pages_verified = false;
+        self.namespace_directory_cache_root = std.math.maxInt(u64);
+        self.namespace_directory_delta_depth = 0;
+        deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        self.namespace_directory_cache = .empty;
+        self.header = header;
+    }
+
+    /// Reuse an owner's completed allocator proof only for the identical
+    /// inode and both checkpoint slots. The caller serializes both owners'
+    /// publications; external or uncertain generations still validate on use.
+    pub fn inheritAllocatorVerification(self: *NativeFile, owner: *NativeFile) !void {
+        if (!std.mem.eql(u8, self.path, owner.path) or !owner.free_pages_verified or owner.transaction_header != null or owner.durable_header != null or
+            owner.checkpoint_publication_uncertain or self.transaction_header != null or self.durable_header != null or
+            self.checkpoint_publication_uncertain or !std.meta.eql(self.header, owner.header)) return;
+        if ((try self.file.stat(self.runtime())).inode != (try owner.file.stat(owner.runtime())).inode) return;
+        self.free_pages_verified = true;
+    }
+
     fn invalidateLedger(self: *NativeFile) void {
         if (self.ledger) |state| {
             state.deinit();
@@ -5139,6 +5332,101 @@ pub const NativeFile = struct {
 
     pub fn indexCatalogCursor(self: *NativeFile, checkpoint: CheckpointSlot, prefix: []const u8) !CatalogCursor {
         return try self.catalogCursor(checkpoint, .index, prefix);
+    }
+
+    /// Compare a physical index read set between pinned checkpoints of the
+    /// same inode. Copy-on-write subtree references prove equality without
+    /// enumerating unchanged records. Splits/heights may differ; fall back to
+    /// comparing leaf keys and immutable record references in changed paths.
+    /// The caller fences page reuse and generation replacement for both roots.
+    pub fn indexCatalogPrefixUnchanged(self: *NativeFile, latest: *NativeFile, prefix: []const u8) !bool {
+        const upper = try prefixUpperAlloc(self.allocator, prefix);
+        defer if (upper) |bytes| self.allocator.free(bytes);
+        return self.catalogRangeUnchanged(latest, .index, prefix, upper);
+    }
+
+    fn prefixUpperAlloc(a: Allocator, prefix: []const u8) !?[]u8 {
+        var end = prefix.len;
+        while (end > 0 and prefix[end - 1] == 255) end -= 1;
+        if (end == 0) return null;
+        const upper = try a.dupe(u8, prefix[0..end]);
+        upper[end - 1] += 1;
+        return upper;
+    }
+
+    /// Runtime metadata is stable across artifact-lease bookkeeping. Primary
+    /// namespace roots and every other metadata record must remain identical;
+    /// callers separately fence the physical index prefixes they have loaded.
+    pub fn runtimeMetadataUnchanged(self: *NativeFile, latest: *NativeFile) !bool {
+        const before = self.activeCheckpoint();
+        const after = latest.activeCheckpoint();
+        // An idle runtime has no inode reader fence. Its old page IDs are
+        // comparable only while the allocator still retains that checkpoint;
+        // a retired slot could already have been reused for unrelated bytes.
+        const retained = for (latest.header.checkpoints) |slot| {
+            if (validCheckpointSlot(slot) and std.meta.eql(before, slot)) break true;
+        } else false;
+        if (!retained) return false;
+        if (self.header.page_size != latest.header.page_size or self.header.indexed_reclamation != latest.header.indexed_reclamation or
+            before.document_root_page != after.document_root_page or before.document_index_root_page != after.document_index_root_page or
+            before.namespace_directory_root_page != after.namespace_directory_root_page) return false;
+        if (before.catalog_root_page == after.catalog_root_page) return true;
+        const upper = (try prefixUpperAlloc(self.allocator, artifact_lease_key_prefix)).?;
+        defer self.allocator.free(upper);
+        return try self.catalogRangeUnchanged(latest, .metadata, "", artifact_lease_key_prefix) and
+            try self.catalogRangeUnchanged(latest, .metadata, upper, null);
+    }
+
+    fn catalogRangeUnchanged(self: *NativeFile, latest: *NativeFile, root: CatalogRoot, lower: []const u8, upper: ?[]const u8) !bool {
+        var before = try self.catalogCursor(self.activeCheckpoint(), root, "");
+        defer before.deinit();
+        var after = try latest.catalogCursor(latest.activeCheckpoint(), root, "");
+        defer after.deinit();
+        var lhs = try before.index.seekAtOrAfter(lower, false);
+        defer if (lhs) |*entry| entry.deinit(self.allocator);
+        var rhs = try after.index.seekAtOrAfter(lower, false);
+        defer if (rhs) |*entry| entry.deinit(latest.allocator);
+        while (true) {
+            const left_in_range = if (lhs) |entry| if (upper) |limit| std.mem.lessThan(u8, entry.key, limit) else true else false;
+            const right_in_range = if (rhs) |entry| if (upper) |limit| std.mem.lessThan(u8, entry.key, limit) else true else false;
+            if (!left_in_range or !right_in_range) return left_in_range == right_in_range;
+            if (!std.mem.eql(u8, lhs.?.key, rhs.?.key) or lhs.?.document_page_id != rhs.?.document_page_id) return false;
+            // Find the largest common subtree on the two cursor paths. A
+            // shared page can occur at different depths after a root split.
+            var shared: ?struct { left: usize, right: usize } = null;
+            outer: for (0..before.index.depth) |i| {
+                const left_page = before.index.subtreePage(i);
+                for (0..after.index.depth) |j| {
+                    if (left_page == after.index.subtreePage(j)) {
+                        shared = .{ .left = i, .right = j };
+                        break :outer;
+                    }
+                }
+            }
+            lhs.?.deinit(self.allocator);
+            lhs = null;
+            rhs.?.deinit(latest.allocator);
+            rhs = null;
+            if (shared) |node| {
+                var left_page = try before.index.nextSubtree(node.left);
+                var right_page = try after.index.nextSubtree(node.right);
+                while (left_page != 0 and left_page == right_page) {
+                    left_page = try before.index.nextSubtree(before.index.depth);
+                    right_page = try after.index.nextSubtree(after.index.depth);
+                }
+                if (left_page != 0) {
+                    try before.index.descendExtreme(left_page, true);
+                    lhs = try before.index.currentEntry();
+                }
+                if (right_page != 0) {
+                    try after.index.descendExtreme(right_page, true);
+                    rhs = try after.index.currentEntry();
+                }
+            } else {
+                lhs = try before.index.next();
+                rhs = try after.index.next();
+            }
+        }
     }
 
     /// Requires canonical file keys with no empty path components. The

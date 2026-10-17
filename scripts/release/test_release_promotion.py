@@ -52,6 +52,20 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_platform_policy_rejects_invalid_optimization_modes(self) -> None:
+        platforms = load_module(
+            "release_platform_optimization_test", "release_platforms.py"
+        )
+        policy = platforms.load_policy()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "platforms.json"
+            for mode in ("ReleaseFast", "FAST", "", "unknown"):
+                with self.subTest(mode=mode):
+                    policy["platforms"][0]["optimize"] = mode
+                    path.write_text(json.dumps(policy))
+                    with self.assertRaisesRegex(SystemExit, "invalid optimize mode"):
+                        platforms.load_policy(path)
+
     def test_declared_source_contract_paths_exist_in_repository(self) -> None:
         contract = load_module(
             "validate_source_contract_paths_test", "validate_source_contract.py"

@@ -257,7 +257,7 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
     const prepare = context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
     const normalized = try prepare(context.backend.ptr, context.arena, table, proposed);
     if (normalized.len != proposed.len) return error.InvalidSqlBackendResponse;
-    const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
+    const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.alloc, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
     if (owners) |items| if (items.len != normalized.len) return error.InvalidSqlBackendResponse;
     if (clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0) {
         for (proposed, normalized) |original, value| {
@@ -614,12 +614,12 @@ fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), mutation.json_null_fields.len);
     const array = try @import("array_wire.zig").decodeBorrowed(alloc, .int64, mutation.row.?.object.get("a").?, .{});
     try std.testing.expectEqual(@as(i32, -1), array.value.dimensions[0].lower);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), array.value.elements[0].value.integer);
-    try std.testing.expect(array.value.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), array.value.flatCell(0).value.integer);
+    try std.testing.expect(array.value.flatCell(1).sql_null);
     const json_array = try @import("array_wire.zig").decodeBorrowed(alloc, .jsonb, mutation.row.?.object.get("j").?, .{});
-    try std.testing.expect(json_array.value.elements[0].value == .null);
-    try std.testing.expect(!json_array.value.elements[0].sql_null);
-    try std.testing.expect(json_array.value.elements[1].sql_null);
+    try std.testing.expect(json_array.value.flatCell(0).value == .null);
+    try std.testing.expect(!json_array.value.flatCell(0).sql_null);
+    try std.testing.expect(json_array.value.flatCell(1).sql_null);
 }
 
 test "SQL conflict decision batches own arrays once across page retirement and unwind every allocation failure" {

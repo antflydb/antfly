@@ -181,6 +181,482 @@ pub const Chunk = struct {
     }
 };
 
+/// Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets.
+pub const ChunkCoordinates = struct {
+    kind: []const u8,
+    start_byte: ?i64 = null,
+    end_byte: ?i64 = null,
+    page: ?i64 = null,
+    /// Full-raster coordinates [left, top, right, bottom], end exclusive; raster_width/height declare the basis, including adaptively rendered PDF pages.
+    region: ?[]const i64 = null,
+    /// Width of the complete source/prepared-page raster before tiling, not the returned crop width.
+    raster_width: ?i64 = null,
+    /// Height of the complete source/prepared-page raster before tiling; map PDF regions through page_box and page_rotation.
+    raster_height: ?i64 = null,
+    start_ns: ?i64 = null,
+    end_ns: ?i64 = null,
+    first_picture: ?i64 = null,
+    /// Ordered selectors in the immutable source index, including repeated cadence selections.
+    selected_pictures: ?[]const i64 = null,
+    /// WebM logical presentation pictures or the first MP4 packet of a completed picture assembly.
+    picture_basis: ?[]const u8 = null,
+    picture_count: ?i64 = null,
+    start_sample: ?i64 = null,
+    end_sample: ?i64 = null,
+    sample_rate: ?i64 = null,
+    start_tick: ?i64 = null,
+    end_tick: ?i64 = null,
+    timescale: ?i64 = null,
+    page_rotation: ?i64 = null,
+    /// Original PDF page box in PDF user-space coordinates.
+    page_box: ?[]const f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "start_byte", "start_byte", true },
+        .{ "end_byte", "end_byte", true },
+        .{ "page", "page", true },
+        .{ "region", "region", true },
+        .{ "raster_width", "raster_width", true },
+        .{ "raster_height", "raster_height", true },
+        .{ "start_ns", "start_ns", true },
+        .{ "end_ns", "end_ns", true },
+        .{ "first_picture", "first_picture", true },
+        .{ "selected_pictures", "selected_pictures", true },
+        .{ "picture_basis", "picture_basis", true },
+        .{ "picture_count", "picture_count", true },
+        .{ "start_sample", "start_sample", true },
+        .{ "end_sample", "end_sample", true },
+        .{ "sample_rate", "sample_rate", true },
+        .{ "start_tick", "start_tick", true },
+        .{ "end_tick", "end_tick", true },
+        .{ "timescale", "timescale", true },
+        .{ "page_rotation", "page_rotation", true },
+        .{ "page_box", "page_box", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.start_byte) |value| {
+            try jw.objectField("start_byte");
+            try jw.write(value);
+        }
+        if (self.end_byte) |value| {
+            try jw.objectField("end_byte");
+            try jw.write(value);
+        }
+        if (self.page) |value| {
+            try jw.objectField("page");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.raster_width) |value| {
+            try jw.objectField("raster_width");
+            try jw.write(value);
+        }
+        if (self.raster_height) |value| {
+            try jw.objectField("raster_height");
+            try jw.write(value);
+        }
+        if (self.start_ns) |value| {
+            try jw.objectField("start_ns");
+            try jw.write(value);
+        }
+        if (self.end_ns) |value| {
+            try jw.objectField("end_ns");
+            try jw.write(value);
+        }
+        if (self.first_picture) |value| {
+            try jw.objectField("first_picture");
+            try jw.write(value);
+        }
+        if (self.selected_pictures) |value| {
+            try jw.objectField("selected_pictures");
+            try jw.write(value);
+        }
+        if (self.picture_basis) |value| {
+            try jw.objectField("picture_basis");
+            try jw.write(value);
+        }
+        if (self.picture_count) |value| {
+            try jw.objectField("picture_count");
+            try jw.write(value);
+        }
+        if (self.start_sample) |value| {
+            try jw.objectField("start_sample");
+            try jw.write(value);
+        }
+        if (self.end_sample) |value| {
+            try jw.objectField("end_sample");
+            try jw.write(value);
+        }
+        if (self.sample_rate) |value| {
+            try jw.objectField("sample_rate");
+            try jw.write(value);
+        }
+        if (self.start_tick) |value| {
+            try jw.objectField("start_tick");
+            try jw.write(value);
+        }
+        if (self.end_tick) |value| {
+            try jw.objectField("end_tick");
+            try jw.write(value);
+        }
+        if (self.timescale) |value| {
+            try jw.objectField("timescale");
+            try jw.write(value);
+        }
+        if (self.page_rotation) |value| {
+            try jw.objectField("page_rotation");
+            try jw.write(value);
+        }
+        if (self.page_box) |value| {
+            try jw.objectField("page_box");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChunkDescriptor = struct {
+    /// Opaque source-plan-bound inference identity; not a database artifact ID.
+    id: []const u8,
+    ordinal: i64,
+    coordinates: ChunkCoordinates,
+    input_tokens: i64,
+};
+
+pub const ChunkEmbeddingContext = struct {
+    source_reference: ?ChunkSourceReference = null,
+    source_id: ?[]const u8 = null,
+    source_fingerprint: []const u8,
+    source_version: []const u8,
+    plan_id: []const u8,
+    model: []const u8,
+    model_identity: []const u8,
+    model_revision: []const u8,
+    task_type: []const u8,
+    /// Known vector width; may be absent before a planning-only or failed first item.
+    dimensions: ?i64 = null,
+    policy: MediaChunkPolicy,
+    start_ordinal: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "source_reference", "source_reference", true },
+        .{ "source_id", "source_id", true },
+        .{ "source_fingerprint", "source_fingerprint", false },
+        .{ "source_version", "source_version", false },
+        .{ "plan_id", "plan_id", false },
+        .{ "model", "model", false },
+        .{ "model_identity", "model_identity", false },
+        .{ "model_revision", "model_revision", false },
+        .{ "task_type", "task_type", false },
+        .{ "dimensions", "dimensions", true },
+        .{ "policy", "policy", false },
+        .{ "start_ordinal", "start_ordinal", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.source_reference) |value| {
+            try jw.objectField("source_reference");
+            try jw.write(value);
+        }
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        try jw.objectField("source_fingerprint");
+        try jw.write(self.source_fingerprint);
+        try jw.objectField("source_version");
+        try jw.write(self.source_version);
+        try jw.objectField("plan_id");
+        try jw.write(self.plan_id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("model_identity");
+        try jw.write(self.model_identity);
+        try jw.objectField("model_revision");
+        try jw.write(self.model_revision);
+        try jw.objectField("task_type");
+        try jw.write(self.task_type);
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("start_ordinal");
+        try jw.write(self.start_ordinal);
+        try jw.endObject();
+    }
+};
+
+pub const ChunkEmbeddingError = struct {
+    code: []const u8,
+    message: []const u8,
+};
+
+pub const ChunkEmbeddingEvent = struct {
+    object: []const u8,
+    data: ChunkEmbeddingObject,
+};
+
+pub const ChunkEmbeddingInitializationErrorEvent = struct {
+    object: []const u8,
+    code: []const u8,
+};
+
+pub const ChunkEmbeddingObject = struct {
+    descriptor: ChunkDescriptor,
+    mime_type: []const u8,
+    embedding: ?[]const f32 = null,
+    @"error": ?ChunkEmbeddingError = null,
+    text: ?[]const u8 = null,
+    /// Optional base64 payload; source coordinates remain mandatory.
+    data: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "descriptor", "descriptor", false },
+        .{ "mime_type", "mime_type", false },
+        .{ "embedding", "embedding", true },
+        .{ "error", "error", true },
+        .{ "text", "text", true },
+        .{ "data", "data", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("descriptor");
+        try jw.write(self.descriptor);
+        try jw.objectField("mime_type");
+        try jw.write(self.mime_type);
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.data) |value| {
+            try jw.objectField("data");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChunkEmbeddingResponse = struct {
+    object: []const u8,
+    data: []const ChunkEmbeddingObject,
+    /// Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
+    status: []const u8,
+    source_reference: ?ChunkSourceReference = null,
+    source_id: ?[]const u8 = null,
+    source_fingerprint: []const u8,
+    source_version: []const u8,
+    plan_id: []const u8,
+    model: []const u8,
+    model_identity: []const u8,
+    /// Model generation revision used by inference capability leases.
+    model_revision: []const u8,
+    task_type: []const u8,
+    dimensions: i64,
+    policy: MediaChunkPolicy,
+    start_ordinal: i64,
+    /// Exclusive end of acknowledged output ordinals; failed chunk coordinates are reported in gaps.
+    covered_through_ordinal: i64,
+    @"error": ?ChunkEmbeddingError = null,
+    next_continuation: ?[]const u8 = null,
+    gaps: []const ChunkCoordinates,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "status", "status", false },
+        .{ "source_reference", "source_reference", true },
+        .{ "source_id", "source_id", true },
+        .{ "source_fingerprint", "source_fingerprint", false },
+        .{ "source_version", "source_version", false },
+        .{ "plan_id", "plan_id", false },
+        .{ "model", "model", false },
+        .{ "model_identity", "model_identity", false },
+        .{ "model_revision", "model_revision", false },
+        .{ "task_type", "task_type", false },
+        .{ "dimensions", "dimensions", false },
+        .{ "policy", "policy", false },
+        .{ "start_ordinal", "start_ordinal", false },
+        .{ "covered_through_ordinal", "covered_through_ordinal", false },
+        .{ "error", "error", true },
+        .{ "next_continuation", "next_continuation", true },
+        .{ "gaps", "gaps", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.source_reference) |value| {
+            try jw.objectField("source_reference");
+            try jw.write(value);
+        }
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        try jw.objectField("source_fingerprint");
+        try jw.write(self.source_fingerprint);
+        try jw.objectField("source_version");
+        try jw.write(self.source_version);
+        try jw.objectField("plan_id");
+        try jw.write(self.plan_id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("model_identity");
+        try jw.write(self.model_identity);
+        try jw.objectField("model_revision");
+        try jw.write(self.model_revision);
+        try jw.objectField("task_type");
+        try jw.write(self.task_type);
+        try jw.objectField("dimensions");
+        try jw.write(self.dimensions);
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("start_ordinal");
+        try jw.write(self.start_ordinal);
+        try jw.objectField("covered_through_ordinal");
+        try jw.write(self.covered_through_ordinal);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.next_continuation) |value| {
+            try jw.objectField("next_continuation");
+            try jw.write(value);
+        }
+        try jw.objectField("gaps");
+        try jw.write(self.gaps);
+        try jw.endObject();
+    }
+};
+
+pub const ChunkEmbeddingStartEvent = struct {
+    object: []const u8,
+    context: ChunkEmbeddingContext,
+};
+
+pub const ChunkEmbeddingTarget = struct {
+    model: []const u8,
+    /// Optional required embedding-weight/recipe identity; a changed model is rejected before delivery.
+    model_identity: ?[]const u8 = null,
+    task_type: ?[]const u8 = null,
+    dimensions: ?i64 = null,
+    /// False resolves model limits and plans descriptors without running embedding inference.
+    execute: ?bool = null,
+    /// Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable embedding failure.
+    allow_partial: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "model_identity", "model_identity", true },
+        .{ "task_type", "task_type", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "execute", "execute", true },
+        .{ "allow_partial", "allow_partial", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.task_type) |value| {
+            try jw.objectField("task_type");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.execute) |value| {
+            try jw.objectField("execute");
+            try jw.write(value);
+        }
+        if (self.allow_partial) |value| {
+            try jw.objectField("allow_partial");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChunkEmbeddingTerminalEvent = struct {
+    object: []const u8,
+    response: ChunkEmbeddingResponse,
+};
+
 /// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
 pub const ChunkOptions = struct {
     /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
@@ -189,6 +665,8 @@ pub const ChunkOptions = struct {
     threshold: ?f32 = null,
     text: ?TextChunkOptions = null,
     audio: ?AudioChunkOptions = null,
+    embedding: ?ChunkEmbeddingTarget = null,
+    policy: ?MediaChunkPolicy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -196,6 +674,8 @@ pub const ChunkOptions = struct {
         .{ "threshold", "threshold", true },
         .{ "text", "text", true },
         .{ "audio", "audio", true },
+        .{ "embedding", "embedding", true },
+        .{ "policy", "policy", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -224,6 +704,64 @@ pub const ChunkOptions = struct {
             try jw.objectField("audio");
             try jw.write(value);
         }
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        }
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChunkSourceReference = struct {
+    type: []const u8,
+    /// HTTP(S) or S3 object URI resolved through configured content security and credentials.
+    uri: []const u8,
+    mime_type: []const u8,
+    /// Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
+    version: []const u8,
+    /// Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+    version_kind: ?[]const u8 = null,
+    /// Exact immutable object length, verified against Content-Range.
+    length: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "uri", "uri", false },
+        .{ "mime_type", "mime_type", false },
+        .{ "version", "version", false },
+        .{ "version_kind", "version_kind", true },
+        .{ "length", "length", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("uri");
+        try jw.write(self.uri);
+        try jw.objectField("mime_type");
+        try jw.write(self.mime_type);
+        try jw.objectField("version");
+        try jw.write(self.version);
+        if (self.version_kind) |value| {
+            try jw.objectField("version_kind");
+            try jw.write(value);
+        }
+        try jw.objectField("length");
+        try jw.write(self.length);
         try jw.endObject();
     }
 };
@@ -271,11 +809,11 @@ pub const InferenceAudioChunkConfig = struct {
 
 /// Configuration for chunking requests to Antfly inference. Combines shared text options with inference-specific audio/VAD options.
 pub const InferenceChunkConfig = struct {
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    /// The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected.
     model: ?[]const u8 = null,
     /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
     max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+    /// Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker.
     threshold: ?f32 = null,
     text: ?TextChunkOptions = null,
     audio: ?InferenceAudioChunkConfig = null,
@@ -330,11 +868,30 @@ pub const InferenceChunkRequest = struct {
     /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
     input: std.json.Value,
     config: ?InferenceChunkConfig = null,
+    embedding: ?ChunkEmbeddingTarget = null,
+    policy: ?MediaChunkPolicy = null,
+    /// Caller source identity; immutable content is independently fingerprinted.
+    source_id: ?[]const u8 = null,
+    /// Immutable caller version, included in continuation and plan identity.
+    source_version: ?[]const u8 = null,
+    /// Resume the exact source and semantic plan; changed inputs are rejected.
+    continuation: ?[]const u8 = null,
+    /// In model-aware mode include chunk payloads in addition to mandatory descriptors.
+    include_content: ?bool = null,
+    /// In model-aware mode return NDJSON chunk events followed by a terminal coverage response.
+    stream: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "input", "input", false },
         .{ "config", "config", true },
+        .{ "embedding", "embedding", true },
+        .{ "policy", "policy", true },
+        .{ "source_id", "source_id", true },
+        .{ "source_version", "source_version", true },
+        .{ "continuation", "continuation", true },
+        .{ "include_content", "include_content", true },
+        .{ "stream", "stream", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -351,6 +908,143 @@ pub const InferenceChunkRequest = struct {
         try jw.write(self.input);
         if (self.config) |value| {
             try jw.objectField("config");
+            try jw.write(value);
+        }
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        }
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        if (self.source_version) |value| {
+            try jw.objectField("source_version");
+            try jw.write(value);
+        }
+        if (self.continuation) |value| {
+            try jw.objectField("continuation");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
+pub const MediaChunkPolicy = struct {
+    /// Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
+    max_text_bytes: ?i64 = null,
+    target_tokens: ?i64 = null,
+    overlap_tokens: ?i64 = null,
+    window_ns: ?i64 = null,
+    overlap_ns: ?i64 = null,
+    step_ns: ?i64 = null,
+    /// Select the displayed picture at each video cadence target, including VFR holds. Zero retains at-or-after timestamp sampling.
+    video_hold: ?i64 = null,
+    max_frames: ?i64 = null,
+    tile_width: ?i64 = null,
+    tile_height: ?i64 = null,
+    tile_overlap: ?i64 = null,
+    /// Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
+    audio_pause_ns: ?i64 = null,
+    audio_pause_search_ns: ?i64 = null,
+    /// Absolute normalized PCM amplitude threshold in thousandths.
+    audio_silence_milli: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_text_bytes", "max_text_bytes", true },
+        .{ "target_tokens", "target_tokens", true },
+        .{ "overlap_tokens", "overlap_tokens", true },
+        .{ "window_ns", "window_ns", true },
+        .{ "overlap_ns", "overlap_ns", true },
+        .{ "step_ns", "step_ns", true },
+        .{ "video_hold", "video_hold", true },
+        .{ "max_frames", "max_frames", true },
+        .{ "tile_width", "tile_width", true },
+        .{ "tile_height", "tile_height", true },
+        .{ "tile_overlap", "tile_overlap", true },
+        .{ "audio_pause_ns", "audio_pause_ns", true },
+        .{ "audio_pause_search_ns", "audio_pause_search_ns", true },
+        .{ "audio_silence_milli", "audio_silence_milli", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_text_bytes) |value| {
+            try jw.objectField("max_text_bytes");
+            try jw.write(value);
+        }
+        if (self.target_tokens) |value| {
+            try jw.objectField("target_tokens");
+            try jw.write(value);
+        }
+        if (self.overlap_tokens) |value| {
+            try jw.objectField("overlap_tokens");
+            try jw.write(value);
+        }
+        if (self.window_ns) |value| {
+            try jw.objectField("window_ns");
+            try jw.write(value);
+        }
+        if (self.overlap_ns) |value| {
+            try jw.objectField("overlap_ns");
+            try jw.write(value);
+        }
+        if (self.step_ns) |value| {
+            try jw.objectField("step_ns");
+            try jw.write(value);
+        }
+        if (self.video_hold) |value| {
+            try jw.objectField("video_hold");
+            try jw.write(value);
+        }
+        if (self.max_frames) |value| {
+            try jw.objectField("max_frames");
+            try jw.write(value);
+        }
+        if (self.tile_width) |value| {
+            try jw.objectField("tile_width");
+            try jw.write(value);
+        }
+        if (self.tile_height) |value| {
+            try jw.objectField("tile_height");
+            try jw.write(value);
+        }
+        if (self.tile_overlap) |value| {
+            try jw.objectField("tile_overlap");
+            try jw.write(value);
+        }
+        if (self.audio_pause_ns) |value| {
+            try jw.objectField("audio_pause_ns");
+            try jw.write(value);
+        }
+        if (self.audio_pause_search_ns) |value| {
+            try jw.objectField("audio_pause_search_ns");
+            try jw.write(value);
+        }
+        if (self.audio_silence_milli) |value| {
+            try jw.objectField("audio_silence_milli");
             try jw.write(value);
         }
         try jw.endObject();

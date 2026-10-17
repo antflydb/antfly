@@ -144,7 +144,7 @@ pub const Repository = struct {
         if (self.owned_base_dir) |value| self.a.free(value);
     }
     pub fn capability(self: *Repository) port.Port {
-        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm, .reference = reference, .can_evict = canEvict };
+        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm, .reference = reference, .publish_with_proof = publishWithProof, .warm_with_proof = warmWithProof, .reuse = reuse, .can_evict = canEvict };
         return .{ .limits = self.limits, .ptr = self, .vtable = &vtable, .dispatch = @import("antfly_local_sources").runtime_callback_abi.Boundary(port.VTable).local_dispatch };
     }
     fn from(raw: *anyopaque) *Repository {
@@ -371,7 +371,9 @@ pub const Repository = struct {
         const expected_domain = try self.domain(a, namespace);
         return marked.version == 1 and marked.namespace.eql(namespace) and marked.request.table_id == request.table_id and marked.request.expires_ms == request.expires_ms and std.mem.eql(u8, marked.request.id, request.id) and std.mem.eql(u8, &marked.domain, &expected_domain);
     }
-    fn canEvict(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+    fn canEvict(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         const self = from(raw);
         try cancellation.check();
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -396,14 +398,41 @@ pub const Repository = struct {
         const bytes = try std.json.Stringify.valueAlloc(a, LocalCommit{ .domain = try self.domain(a, namespace), .request = request, .namespace = namespace }, .{});
         _ = try local.storage_db_native_backup.writeFileDurable(io, path, bytes);
     }
-    fn publish(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+    fn publish(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         _ = try publishLimited(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64));
     }
-    fn warm(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+    fn warm(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
         return publishLimited(raw, io, root, request, namespace, cancellation, max_bytes);
     }
+    fn publishWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.ReuseProof {
+        var receiver = try executor.receive();
+        const io = receiver.io();
+        var proof: ?port.ReuseProof = null;
+        _ = try publishLimitedImpl(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64), &proof);
+        return proof;
+    }
+    fn warmWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !port.WarmResult {
+        var receiver = try executor.receive();
+        const io = receiver.io();
+        if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
+        var proof: ?port.ReuseProof = null;
+        const complete = try publishLimitedImpl(raw, io, root, request, namespace, cancellation, max_bytes, &proof);
+        return .{ .complete = complete, .proof = proof };
+    }
+    fn manifestChecksum(bytes: []const u8) [32]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+        return digest;
+    }
     fn publishLimited(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+        return publishLimitedImpl(raw, io, root, request, namespace, cancellation, max_bytes, null);
+    }
+    fn publishLimitedImpl(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64, proof_out: ?*?port.ReuseProof) !bool {
         const self = from(raw);
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -515,6 +544,9 @@ pub const Repository = struct {
                     if (!std.mem.eql(u8, existing, manifest)) return error.CatalogGenerationChanged;
                     try self.markCommitted(a, io, root, request, namespace);
                     try cancellation.check();
+                    if (proof_out) |out| if (pinned.reuse_digest) |digest| {
+                        out.* = .{ .sequence = pinned.sequence, .digest = digest, .manifest_checksum = manifestChecksum(manifest) };
+                    };
                     return true;
                 },
                 else => return err,
@@ -523,12 +555,17 @@ pub const Repository = struct {
         result.deinit(self.store.opened.client.allocator);
         try self.markCommitted(a, io, root, request, namespace);
         try cancellation.check();
+        if (proof_out) |out| if (pinned.reuse_digest) |digest| {
+            out.* = .{ .sequence = pinned.sequence, .digest = digest, .manifest_checksum = manifestChecksum(manifest) };
+        };
         return true;
     }
     /// A complete remote-native checkpoint already owns its immutable extents.
     /// Publish only a new authenticated manifest; never read/download/re-upload
     /// those extents or derive a checkpoint from a partial storage view.
-    fn reference(raw: *anyopaque, io: std.Io, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
+    fn reference(raw: *anyopaque, executor: port.Executor, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         _ = io;
         const self = from(raw);
         try request.validate(cut.nowMs());
@@ -573,6 +610,49 @@ pub const Repository = struct {
             };
         };
     }
+    /// Rebind a proved unchanged physical generation to a new logical cursor.
+    /// Extent horizons must cover the new cursor; never extend them by assertion.
+    fn reuse(raw: *anyopaque, _: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
+        const self = from(raw);
+        try cancellation.check();
+        try request.validate(cut.nowMs());
+        if (!request.create or !(try request.namespace(namespace)).eql(namespace)) return error.CatalogGenerationChanged;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const bytes = self.readManifest(a, previous, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return null,
+            else => return err,
+        };
+        const checksum = manifestChecksum(bytes);
+        if (!std.mem.eql(u8, &checksum, &proof.manifest_checksum)) return null;
+        const manifest = checkedManifest(a, bytes, previous, namespace) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return null,
+            else => return err,
+        };
+        if (manifest.sequence != proof.sequence) return null;
+        _ = try self.validateManifestAuthority(a, manifest, previous, namespace);
+        const authority = try self.domain(a, namespace);
+        for (manifest.files) |file| for (file.chunks) |chunk| {
+            const scope = (try artifacts.uploadScopeFromArtifactId(chunk.artifact_id)) orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &scope.domain, &authority)) return error.CatalogGenerationChanged;
+            if (scope.fencingToken() <= request.expires_ms or scope.fencingToken() > request.expires_ms +| 3 * cache_window_ms) return null;
+        };
+        const replacement = try std.json.Stringify.valueAlloc(a, Manifest{ .request = request, .namespace = namespace, .sequence = proof.sequence, .files = manifest.files }, .{});
+        if (replacement.len > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
+        _ = try checkedManifest(a, replacement, request, namespace);
+        try cancellation.check();
+        const bridge: TokenBridge = .{ .token = cancellation };
+        var published = self.store.opened.client.putObject(self.store.opened.bucket, try self.key(a, request, namespace), replacement, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
+            try cancellation.check();
+            if (err != error.PreconditionFailed and err != error.ConditionalCheckFailed) return err;
+            if (!std.mem.eql(u8, replacement, try self.readManifest(a, request, namespace, cancellation))) return error.CatalogGenerationChanged;
+            return .{ .sequence = proof.sequence, .digest = proof.digest, .manifest_checksum = manifestChecksum(replacement) };
+        };
+        published.deinit(self.store.opened.client.allocator);
+        try cancellation.check();
+        return .{ .sequence = proof.sequence, .digest = proof.digest, .manifest_checksum = manifestChecksum(replacement) };
+    }
     fn validateManifestAuthority(self: *Repository, a: A, manifest: Manifest, request: cut.Request, namespace: Namespace) ![32]u8 {
         const expected_domain = try self.domain(a, namespace);
         // Publication may reuse the adjacent warmer epoch (one additional
@@ -583,7 +663,7 @@ pub const Repository = struct {
         };
         return expected_domain;
     }
-    fn openRead(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
+    fn openRead(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -599,11 +679,14 @@ pub const Repository = struct {
         const expected_domain = try self.validateManifestAuthority(a, manifest, request, namespace);
         const expiry = @import("antfly_platform").time.monotonicNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(expiry, @import("antfly_platform").time.monotonicNs() +| value *| std.time.ns_per_ms) else expiry };
-        const reader = try port.remote_storage.Reader.create(self.a, io, root, manifest.files, .{ .ptr = self, .read = readChunk }, control);
+        const reader = try port.remote_storage.Reader.createWithExecutor(self.a, executor, root, manifest.files, .{ .ptr = self, .read = readChunk }, control);
+        errdefer reader.release();
         reader.checkpoint_reference = try std.json.Stringify.valueAlloc(reader.arena.allocator(), port.CheckpointReference{ .authority = expected_domain, .namespace = namespace, .sequence = manifest.sequence, .files = reader.files }, .{});
         return reader.lease();
     }
-    fn recover(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+    fn recover(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         const self = from(raw);
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -662,6 +745,144 @@ pub const Repository = struct {
         if (std.fs.path.dirname(root)) |parent| try fs.syncDirPortable(io, parent);
     }
 };
+
+test "external lake native reuse avoids capture and invalidates writes metadata and ranges" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-query-reuse");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    runtime.ptr().query_cut_repository = repository.capability();
+    const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(root);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1,\"body\":\"original retained\"}" }} });
+    const first_id: [64]u8 = @splat('a');
+    const first: cut.Request = .{ .id = &first_id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
+    try db.captureQueryCut(first, .none);
+    try std.testing.expect(db.local_execution.native_query_reuse != null);
+    const second_id: [64]u8 = @splat('b');
+    const second: cut.Request = .{ .id = &second_id, .table_id = 7, .expires_ms = first.expires_ms + 1000, .timeout_ms = 5000, .create = true };
+    {
+        // Full capture cannot proceed while this lock is held. Reuse must not
+        // drain maintenance, pause workers or build a filesystem generation.
+        try std.testing.expect(db.snapshot_publication_mutex.tryLock());
+        defer db.snapshot_publication_mutex.unlock();
+        var frozen = try db.openQueryCut(second, .none);
+        defer frozen.close();
+        const bytes = (try frozen.get(a, "doc")).?;
+        defer a.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"amount\":1") != null);
+        var matches = try frozen.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "original" } } });
+        defer matches.deinit();
+        try std.testing.expectEqual(@as(u32, 1), matches.total_hits);
+    }
+    const second_root = try cut.pathAlloc(a, root, &second_id);
+    defer a.free(second_root);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, second_root, .{}));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const before = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, first, namespace, .none), first, namespace);
+    const reused = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, second, namespace, .none), second, namespace);
+    try std.testing.expectEqualStrings(before.files[0].chunks[0].artifact_id, reused.files[0].chunks[0].artifact_id);
+    var wrong = db.local_execution.native_query_reuse.?.proof();
+    wrong.sequence += 1;
+    try std.testing.expect(try repository.capability().reuse(io, second, first, namespace, wrong, .none) == null);
+    wrong.sequence -= 1;
+    wrong.manifest_checksum = @splat(0);
+    try std.testing.expect(try repository.capability().reuse(io, second, first, namespace, wrong, .none) == null);
+    try std.testing.expect(try repository.capability().reuse(io, first, second, .{ .table_id = 7, .shard_id = 2, .range_id = 2 }, wrong, .none) == null);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2,\"body\":\"replacement\"}" }} });
+    const third_id: [64]u8 = @splat('c');
+    const third: cut.Request = .{ .id = &third_id, .table_id = 7, .expires_ms = first.expires_ms + 2000, .create = true };
+    {
+        var fresh = try db.openQueryCut(third, .none);
+        defer fresh.close();
+        const bytes = (try fresh.get(a, "doc")).?;
+        defer a.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"amount\":2") != null);
+    }
+    // A primary metadata commit has no new source replay sequence, but changes
+    // the frozen primary state and must invalidate the owner-local generation.
+    const sequence = db.core.nextDerivedSequence();
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put("\x00query-reuse-fixture", "new metadata");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
+    const fourth_id: [64]u8 = @splat('d');
+    const fourth: cut.Request = .{ .id = &fourth_id, .table_id = 7, .expires_ms = first.expires_ms + 3000, .create = true };
+    try db.captureQueryCut(fourth, .none);
+    const fourth_root = try cut.pathAlloc(a, root, &fourth_id);
+    defer a.free(fourth_root);
+    try std.Io.Dir.accessAbsolute(io, fourth_root, .{});
+    try db.addIndex(.{ .name = "second_text", .kind = .full_text, .config_json = "{}" });
+    const fifth_id: [64]u8 = @splat('e');
+    const fifth: cut.Request = .{ .id = &fifth_id, .table_id = 7, .expires_ms = first.expires_ms + 4000, .create = true };
+    try db.captureQueryCut(fifth, .none);
+    const fifth_root = try cut.pathAlloc(a, root, &fifth_id);
+    defer a.free(fifth_root);
+    try std.Io.Dir.accessAbsolute(io, fifth_root, .{});
+    try db.updateRange(.{ .start = "", .end = "m" });
+    const sixth_id: [64]u8 = @splat('f');
+    const sixth: cut.Request = .{ .id = &sixth_id, .table_id = 7, .expires_ms = first.expires_ms + 5000, .create = true };
+    try db.captureQueryCut(sixth, .none);
+    const sixth_root = try cut.pathAlloc(a, root, &sixth_id);
+    defer a.free(sixth_root);
+    try std.Io.Dir.accessAbsolute(io, sixth_root, .{});
+    var old = first;
+    old.create = false;
+    var prior = try db.openQueryCut(old, .none);
+    defer prior.close();
+    const old_bytes = (try prior.get(a, "doc")).?;
+    defer a.free(old_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, old_bytes, "\"amount\":1") != null);
+}
+
+test "external lake native reuse validates physical retention before extending cursors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-reuse-horizon");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const now = cut.nowMs();
+    const previous_id: [64]u8 = @splat('a');
+    const next_id: [64]u8 = @splat('b');
+    const previous: cut.Request = .{ .id = &previous_id, .table_id = 7, .expires_ms = now + 5 * std.time.ms_per_min, .create = true };
+    var next: cut.Request = .{ .id = &next_id, .table_id = 7, .expires_ms = now + 20 * std.time.ms_per_min, .create = true };
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], now + 10 * std.time.ms_per_min, .big);
+    var store = repository.store.artifactStore();
+    var object = try store.putScoped(.{ .domain = try repository.domain(scratch, namespace), .attempt = attempt }, "bytes", .none);
+    defer object.deinit(store.allocator);
+    const chunks = [_]Ref{.{ .artifact_id = object.artifact_id, .byte_len = object.byte_len, .checksum = object.checksum }};
+    const files = [_]File{.{ .path = "fixture.sst", .size = 5, .chunks = &chunks }};
+    const bytes = try std.json.Stringify.valueAlloc(scratch, Manifest{ .request = previous, .namespace = namespace, .sequence = 123, .files = &files }, .{});
+    var committed = try repository.store.opened.client.putObject(repository.store.opened.bucket, try repository.key(scratch, previous, namespace), bytes, .{ .if_none_match = true });
+    committed.deinit(repository.store.opened.client.allocator);
+    const proof: port.ReuseProof = .{ .sequence = 123, .digest = @splat(42), .manifest_checksum = Repository.manifestChecksum(bytes) };
+    try std.testing.expect(try repository.capability().reuse(io, previous, next, namespace, proof, .none) == null);
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, next, namespace, .none));
+    next.expires_ms = now + 9 * std.time.ms_per_min;
+    const rebound = (try repository.capability().reuse(io, previous, next, namespace, proof, .none)).?;
+    const result = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, next, namespace, .none), next, namespace);
+    try std.testing.expectEqual(@as(u64, 123), rebound.sequence);
+    try std.testing.expectEqualStrings(object.artifact_id, result.files[0].chunks[0].artifact_id);
+}
 
 test "external lake native repository setup round trips protocol-specific connection fields" {
     const a = std.testing.allocator;
@@ -982,6 +1203,8 @@ test "external lake native repository honors check-only cancellation tokens" {
     try std.testing.expectError(error.Canceled, repository.capability().publish(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
     try std.testing.expectError(error.Canceled, repository.capability().recover(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
     try std.testing.expectError(error.Canceled, repository.capability().openRead(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
+    try std.testing.expectError(error.Canceled, repository.capability().publishReusable(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
+    try std.testing.expectError(error.Canceled, repository.capability().reuse(std.testing.io, request, request, .{ .table_id = 7, .shard_id = 1 }, .{ .sequence = 1, .digest = @splat(0), .manifest_checksum = @splat(0) }, token));
 }
 
 test "external lake native cut admission counts shared extents and rejects existing over-budget cuts" {

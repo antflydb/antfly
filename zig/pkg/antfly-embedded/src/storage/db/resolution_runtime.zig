@@ -28,6 +28,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
+pub const replay_read_set = @import("replay_read_set.zig");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const resolution_handoff = @import("resolution_handoff.zig");
@@ -55,6 +56,46 @@ const SourceArtifactKind = resolver_catalog.ResolverSourceArtifactKind;
 /// so resolution records survive until the worker consumes them.
 pub const scope_name = "resolution";
 
+const replay_progress_key = "\x00\x00__metadata__:resolution_replay_progress";
+const ReplayProgress = struct {
+    base_applied_sequence: u64,
+    sequence: u64,
+    next_key: usize,
+};
+const PendingReplayRecord = struct {
+    sequence: u64,
+    raw: []u8,
+    decoded: change_journal_mod.DecodedRecord,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.decoded.deinit();
+        alloc.free(self.raw);
+    }
+};
+
+// One clock domain with DB wait deadlines; injectable for deterministic yield tests.
+pub var test_replay_now_ns: ?*const fn () u64 = null;
+fn replayNowNs() u64 {
+    if (builtin.is_test) if (test_replay_now_ns) |now| return now();
+    return @import("antfly_platform").time.monotonicNs();
+}
+
+fn loadReplayProgress(alloc: Allocator, store: *backend_erased.Store, applied: u64) !?ReplayProgress {
+    var read = try store.beginRead();
+    defer read.abort();
+    const raw = read.get(replay_progress_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    var parsed = try std.json.parseFromSlice(ReplayProgress, alloc, raw, .{});
+    defer parsed.deinit();
+    const progress = parsed.value;
+    // Completion and cursor cleanup can straddle a crash. An older applied
+    // cut is authoritative only until the enclosing record is acknowledged.
+    if (progress.base_applied_sequence != applied or progress.sequence <= applied) return null;
+    return progress;
+}
+
 pub const ArtifactWrite = struct {
     key: []const u8,
     value: []const u8,
@@ -64,6 +105,14 @@ pub const ArtifactWrite = struct {
 /// one durability boundary; `target_hints` is null for hints inferred from the
 /// batch and explicit for a narrower reconciliation such as graph-only replay.
 pub const RecordWrite = struct {
+    inputs: ?replay_read_set.View = null,
+    /// Both phases derive from the same input view. Detached publication must
+    /// admit them together so phase one's own writes cannot invalidate phase
+    /// two. Each phase retains its replay hints and durable handoff semantics.
+    graph_reconciliation: ?struct {
+        keys: []const []const u8,
+        writes: []const ArtifactWrite,
+    } = null,
     batch: derived_types.DerivedBatch,
     artifact_writes: []const ArtifactWrite = &.{},
     artifact_deletes: []const []const u8 = &.{},
@@ -72,6 +121,17 @@ pub const RecordWrite = struct {
     /// split-delta, and HA handoff. The DB writer batches this metadata while
     /// it still owns the hot-standby mutation/fencing boundary.
     publish_resolution_handoff: bool = false,
+
+    pub fn graphReconciliationWrite(self: RecordWrite) ?RecordWrite {
+        const graph = self.graph_reconciliation orelse return null;
+        return .{
+            .inputs = self.inputs,
+            .batch = .{ .changed_artifact_keys = graph.keys },
+            .artifact_writes = graph.writes,
+            .publish_resolution_handoff = graph.writes.len > 0,
+            .target_hints = &.{.graph},
+        };
+    }
 };
 
 pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, write: RecordWrite) anyerror!u64;
@@ -137,7 +197,7 @@ pub fn siblingClaimedLabelsAlloc(
     var claimed = std.ArrayListUnmanaged([]const u8).empty;
     errdefer claimed.deinit(gpa);
     for (resolvers) |*sibling| {
-        if (sibling == cfg) continue;
+        if (sibling == cfg or !cfg.sharesRoutingDomain(sibling.*)) continue;
         if (!std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
         if (!sibling.source_artifact_kind.overlaps(cfg.source_artifact_kind)) continue;
         for (sibling.labels) |label| try claimed.append(gpa, label);
@@ -297,7 +357,7 @@ fn siblingResolutionsJsonAlloc(
 
     var map: std.json.ObjectMap = .empty;
     for (resolvers) |*sibling| {
-        if (sibling == cfg) continue;
+        if (sibling == cfg or !cfg.sharesRoutingDomain(sibling.*)) continue;
         if (!resolverMatchesArtifact(sibling, parsed.source_artifact_kind, parsed.artifact_name)) continue;
         const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, parsed.resolution_scope_key, sibling.resolution_artifact);
         const raw: ?[]const u8 = overlay: {
@@ -363,7 +423,7 @@ pub fn resolveQueryExtractionAlloc(
     // Resolve siblings first so identity templates can refer to their entities,
     // while retaining the durable catalog's label-routing rules.
     for (resolvers) |*sibling| {
-        if (std.mem.eql(u8, sibling.name, cfg.name)) continue;
+        if (std.mem.eql(u8, sibling.name, cfg.name) or !cfg.sharesRoutingDomain(sibling.*)) continue;
         const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse continue;
         if (outcome.resolution_value) |value| {
             overlay.append(gpa, .{ .key = outcome.resolution_key, .value = value }) catch |err| {
@@ -412,7 +472,8 @@ fn processChangedExtractionWithConfigOptions(
 
     const candidate_batch = if (candidate_source) |source| try source.beginBatch(gpa, &.{cfg.table}) else null;
     defer if (candidate_batch) |batch| batch.deinit(gpa);
-    const batch_source = if (candidate_batch) |batch| batch.source else null;
+    var receiving_source = if (candidate_batch) |batch| batch.source.receive() else null;
+    const batch_source = if (receiving_source) |*receiver| receiver.sourceView() else null;
 
     const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
     defer freeSiblingClaimedLabels(gpa, sibling_excludes);
@@ -517,7 +578,7 @@ fn processChangedExtractionWithConfigOptions(
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.effectiveGeneration(),
-        .promotion_enabled = cfg.promote,
+        .promotion_enabled = cfg.promote and cfg.replacement_index.len == 0,
         .retain_work = retain_work,
         .work_retention = cfg.retain_work,
         .max_work_bytes = cfg.max_work_bytes,
@@ -589,6 +650,14 @@ fn sameResolutionDecisions(gpa: Allocator, left: []const u8, right: []const u8) 
     var b = try std.json.parseFromSlice(std.json.Value, gpa, right, .{});
     defer b.deinit();
     if (a.value != .object or b.value != .object) return false;
+    // The previous generation's queued promotion can be fenced by catalog
+    // DDL before it reaches the sink. Its journal handoff does not prove sink
+    // completion, so a new generation must carry a promotion hint even when
+    // the decisions match. The promotion receipt still suppresses sink writes
+    // when those documents were already published.
+    const ag = a.value.object.get("config_generation") orelse return false;
+    const bg = b.value.object.get("config_generation") orelse return false;
+    if (ag != .integer or ag.integer < 0 or bg != .integer or ag.integer != bg.integer) return false;
     const aw = a.value.object.get("_resolution_work") orelse return false;
     const bw = b.value.object.get("_resolution_work") orelse return false;
     if (aw != .object or bw != .object) return false;
@@ -1390,7 +1459,7 @@ fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.Artifact
 pub fn processRecordKeys(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
-    store: resolver_lib.ArtifactStore,
+    source_store: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
     changed_artifact_keys: []const []const u8,
     write_ctx: *anyopaque,
@@ -1398,6 +1467,9 @@ pub fn processRecordKeys(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) !void {
+    var tracked: TrackingStore = .{ .inner = source_store, .reads = .init(gpa) };
+    defer tracked.reads.deinit();
+    const store = tracked.store();
     var pending: PendingRecordCommit = .{};
     defer pending.deinit(gpa);
 
@@ -1457,19 +1529,160 @@ pub fn processRecordKeys(
 
     if (pending.full_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
+            .inputs = tracked.reads.view(),
             .batch = .{ .changed_artifact_keys = pending.full_keys.items },
             .artifact_writes = pending.artifact_writes.items,
             .artifact_deletes = pending.artifact_deletes.items,
             .publish_resolution_handoff = true,
+            .graph_reconciliation = if (pending.graph_only_keys.items.len > 0) .{
+                .keys = pending.graph_only_keys.items,
+                .writes = pending.refresh_writes.items,
+            } else null,
         });
+        return;
     }
     if (pending.graph_only_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
+            .inputs = tracked.reads.view(),
             .batch = .{ .changed_artifact_keys = pending.graph_only_keys.items },
             .artifact_writes = pending.refresh_writes.items,
             .publish_resolution_handoff = pending.refresh_writes.items.len > 0,
             .target_hints = &.{.graph},
         });
+    }
+}
+
+/// Records local inputs actually observed by the resolver, including negative
+/// reads and candidate ranges. Never retain the caller's temporary key/value.
+const TrackingStore = struct {
+    inner: resolver_lib.ArtifactStore,
+    reads: replay_read_set.Capture,
+    fn store(self: *@This()) resolver_lib.ArtifactStore {
+        return .{ .ptr = self, .vtable = &.{ .get = get, .put = put, .delete = delete, .scan_prefix = scan, .materialize_row = materialize } };
+    }
+    fn get(ptr: *anyopaque, a: Allocator, key: []const u8) anyerror!?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const value = try self.inner.get(a, key);
+        errdefer if (value) |bytes| a.free(bytes);
+        try self.reads.notePoint(key, value);
+        return value;
+    }
+    fn put(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+        return error.ReadOnly;
+    }
+    fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+        return error.ReadOnly;
+    }
+    fn materialize(ptr: *anyopaque, a: Allocator, key: []const u8, value: []const u8) anyerror![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.materializeRow(a, key, value);
+    }
+    fn scan(ptr: *anyopaque, lower: []const u8, upper: []const u8, ctx: *anyopaque, consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const Scan = struct {
+            hash: std.crypto.hash.Blake3 = .init(.{}),
+            last: std.ArrayList(u8) = .empty,
+            alloc: Allocator,
+            ctx: *anyopaque,
+            consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+            fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+                const scan_ctx: *@This() = @ptrCast(@alignCast(raw));
+                replay_read_set.hashEntry(&scan_ctx.hash, key, value);
+                scan_ctx.last.clearRetainingCapacity();
+                try scan_ctx.last.appendSlice(scan_ctx.alloc, key);
+                try scan_ctx.consume(scan_ctx.ctx, key, value);
+            }
+        };
+        const a = self.reads.arena.allocator();
+        var scan_ctx: Scan = .{ .alloc = a, .ctx = ctx, .consume = consume };
+        self.inner.scanPrefix(lower, upper, &scan_ctx, Scan.visit) catch |err| {
+            // A candidate limit can stop the scan early. Validate only its
+            // observed prefix, including the entry that stopped the callback.
+            if (scan_ctx.last.items.len > 0) {
+                try scan_ctx.last.append(a, 0);
+                try self.reads.noteRange(lower, scan_ctx.last.items, replay_read_set.finish(&scan_ctx.hash));
+            }
+            return err;
+        };
+        try self.reads.noteRange(lower, upper, replay_read_set.finish(&scan_ctx.hash));
+    }
+};
+
+/// Native admission regression: negative reads, range phantoms and early-stop
+/// bounds must survive the erased store used by production resolution.
+pub fn testReplayReadTracking(source: backend_erased.Store) !void {
+    var store = source;
+    const a = std.testing.allocator;
+    const Writer = struct {
+        fn put(s: backend_erased.Store, key: []const u8, value: []const u8) !void {
+            var borrowed_store = s;
+            var txn = try borrowed_store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, value);
+            try txn.commit();
+        }
+    };
+    var borrowed = store;
+    var adapter: DbArtifactStore(backend_erased.Store) = .{ .store = &borrowed };
+    var tracked: TrackingStore = .{ .inner = adapter.artifactStore(), .reads = .init(a) };
+    defer tracked.reads.deinit();
+    try Writer.put(store, "read-range/a", "one");
+    try Writer.put(store, "read-range/c", "three");
+    const value = (try tracked.store().get(a, "read-range/a")).?;
+    defer a.free(value);
+    try std.testing.expect((try tracked.store().get(a, "read-missing")) == null);
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try tracked.reads.view().validate(&read);
+    }
+    try Writer.put(store, "unrelated", "ok");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try tracked.reads.view().validate(&read);
+    }
+    try Writer.put(store, "read-missing", "appeared");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, tracked.reads.view().validate(&read));
+    }
+    const Consume = struct {
+        fn all(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn first(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.TestScanDone;
+        }
+    };
+    var dummy: u8 = 0;
+    var full: TrackingStore = .{ .inner = adapter.artifactStore(), .reads = .init(a) };
+    defer full.reads.deinit();
+    try full.store().scanPrefix("read-range/", "read-range0", &dummy, Consume.all);
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try full.reads.view().validate(&read);
+    }
+    try Writer.put(store, "read-range/b", "phantom");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, full.reads.view().validate(&read));
+    }
+    var limited: TrackingStore = .{ .inner = adapter.artifactStore(), .reads = .init(a) };
+    defer limited.reads.deinit();
+    try std.testing.expectError(error.TestScanDone, limited.store().scanPrefix("read-range/", "read-range0", &dummy, Consume.first));
+    try Writer.put(store, "read-range/z", "outside observed prefix");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try limited.reads.view().validate(&read);
+    }
+    try Writer.put(store, "read-range/0", "new earlier candidate");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, limited.reads.view().validate(&read));
     }
 }
 
@@ -1664,6 +1877,9 @@ fn repairAssetSourceIndexWindow(
     resume_after: ?[]const u8,
     max_records: usize,
     out: *std.ArrayListUnmanaged([]const u8),
+    resolvers: []const ResolverConfig,
+    deadline_ns: ?u64,
+    marker_repairs: *std.ArrayListUnmanaged(ArtifactWrite),
 ) !ReresolveEnqueueResult {
     const limit = if (max_records > 0) max_records else default_max_reresolve_records_per_window;
     var candidate_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -1677,6 +1893,7 @@ fn repairAssetSourceIndexWindow(
         source_artifacts: []const SourceSubscription,
         resume_after: ?[]const u8,
         limit: usize,
+        deadline_ns: ?u64,
         scanned: usize = 0,
         candidates: *std.ArrayListUnmanaged([]const u8),
         last_scan_key: ?[]u8 = null,
@@ -1688,18 +1905,19 @@ fn repairAssetSourceIndexWindow(
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            if (self.scanned >= self.limit) {
+            if (self.scanned >= self.limit or backfillDeadlineReached(self.deadline_ns)) {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
             }
             self.scanned += 1;
             if (self.last_scan_key) |previous| self.gpa.free(previous);
+            self.last_scan_key = null;
             self.last_scan_key = try self.gpa.dupe(u8, key);
 
             var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, key)) orelse return;
             defer parsed.deinit(self.gpa);
             if (!sourceArtifactInSet(self.source_artifacts, parsed)) return;
-            try self.candidates.append(self.gpa, try self.gpa.dupe(u8, key));
+            try appendOwnedKey(self.gpa, self.candidates, key);
         }
     };
 
@@ -1708,6 +1926,7 @@ fn repairAssetSourceIndexWindow(
         .source_artifacts = source_artifacts,
         .resume_after = resume_after,
         .limit = limit,
+        .deadline_ns = deadline_ns,
         .candidates = &candidate_keys,
     };
     errdefer if (collector.last_scan_key) |key| gpa.free(key);
@@ -1722,13 +1941,26 @@ fn repairAssetSourceIndexWindow(
     };
 
     var queued: usize = 0;
-    for (candidate_keys.items) |asset_key| {
+    for (candidate_keys.items, 0..) |asset_key, i| {
+        // Discovery and the first candidate form one cooperative unit. Always
+        // finish that unit so a short deadline cannot repeatedly discover the
+        // same source without making progress. Later candidates remain behind
+        // the durable cursor, including any not yet queued or repaired.
+        if (i > 0 and backfillDeadlineReached(deadline_ns)) {
+            if (collector.last_scan_key) |key| gpa.free(key);
+            collector.last_scan_key = null;
+            collector.last_scan_key = try gpa.dupe(u8, candidate_keys.items[i - 1]);
+            collector.limit_reached = true;
+            break;
+        }
         var parsed = (try parseSourceArtifactKeyAlloc(gpa, asset_key)) orelse continue;
         defer parsed.deinit(gpa);
         if (parsed.source_artifact_kind == .asset) {
             const marker_key = (try assetSourceIndexMarkerKeyForAssetKeyAlloc(gpa, asset_key)) orelse {
-                try out.append(gpa, try gpa.dupe(u8, asset_key));
-                queued += 1;
+                if (try sourceNeedsReresolve(gpa, store, resolvers, asset_key)) {
+                    try appendOwnedKey(gpa, out, asset_key);
+                    queued += 1;
+                }
                 continue;
             };
             defer gpa.free(marker_key);
@@ -1737,10 +1969,18 @@ fn repairAssetSourceIndexWindow(
             if (existing) |raw| {
                 if (std.mem.eql(u8, raw, asset_key)) continue;
             }
-            try store.put(marker_key, asset_key);
+            try marker_repairs.ensureUnusedCapacity(gpa, 1);
+            const repair: ArtifactWrite = blk: {
+                const owned_key = try gpa.dupe(u8, marker_key);
+                errdefer gpa.free(owned_key);
+                break :blk .{ .key = owned_key, .value = try gpa.dupe(u8, asset_key) };
+            };
+            marker_repairs.appendAssumeCapacity(repair);
         }
-        try out.append(gpa, try gpa.dupe(u8, asset_key));
-        queued += 1;
+        if (try sourceNeedsReresolve(gpa, store, resolvers, asset_key)) {
+            try appendOwnedKey(gpa, out, asset_key);
+            queued += 1;
+        }
     }
 
     const repair_complete = !collector.limit_reached;
@@ -1802,6 +2042,15 @@ fn sourceNeedsReresolve(gpa: std.mem.Allocator, store: resolver_lib.ArtifactStor
     return false;
 }
 
+fn backfillDeadlineReached(deadline_ns: ?u64) bool {
+    return if (deadline_ns) |deadline| replayNowNs() >= deadline else false;
+}
+
+fn appendOwnedKey(gpa: Allocator, out: *std.ArrayListUnmanaged([]const u8), key: []const u8) !void {
+    try out.ensureUnusedCapacity(gpa, 1);
+    out.appendAssumeCapacity(try gpa.dupe(u8, key));
+}
+
 pub fn enqueueReresolveBacklogWindow(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
@@ -1811,6 +2060,20 @@ pub fn enqueueReresolveBacklogWindow(
     max_records: usize,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
+) !ReresolveEnqueueResult {
+    return enqueueReresolveBacklogWindowUntil(gpa, store, resolvers, resume_after, repair_resume_after, max_records, write_ctx, write_fn, null);
+}
+
+fn enqueueReresolveBacklogWindowUntil(
+    gpa: std.mem.Allocator,
+    store: resolver_lib.ArtifactStore,
+    resolvers: []const ResolverConfig,
+    resume_after: ?[]const u8,
+    repair_resume_after: ?[]const u8,
+    max_records: usize,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+    deadline_ns: ?u64,
 ) !ReresolveEnqueueResult {
     const limit = if (max_records > 0) max_records else default_max_reresolve_records_per_window;
     var asset_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -1841,6 +2104,10 @@ pub fn enqueueReresolveBacklogWindow(
         gpa: std.mem.Allocator,
         resume_after: ?[]const u8,
         limit: usize,
+        scanned: usize = 0,
+        store: resolver_lib.ArtifactStore,
+        resolvers: []const ResolverConfig,
+        deadline_ns: ?u64,
         out: *std.ArrayListUnmanaged([]const u8),
         last_index_key: ?[]u8 = null,
         limit_reached: bool = false,
@@ -1850,14 +2117,21 @@ pub fn enqueueReresolveBacklogWindow(
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, value)) orelse return;
-            defer parsed.deinit(self.gpa);
-            if (self.out.items.len >= self.limit) {
+            if (self.scanned >= self.limit or backfillDeadlineReached(self.deadline_ns)) {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
             }
-            try self.out.append(self.gpa, try self.gpa.dupe(u8, value));
+            self.scanned += 1;
+            if (try parseSourceArtifactKeyAlloc(self.gpa, value)) |source| {
+                var parsed = source;
+                defer parsed.deinit(self.gpa);
+                if (try sourceNeedsReresolve(self.gpa, self.store, self.resolvers, value))
+                    try appendOwnedKey(self.gpa, self.out, value);
+            }
+            // Advance only after checking/queuing this source. Include stale
+            // marker rows in the physical scan budget and cursor.
             if (self.last_index_key) |previous| self.gpa.free(previous);
+            self.last_index_key = null;
             self.last_index_key = try self.gpa.dupe(u8, key);
         }
     };
@@ -1866,12 +2140,19 @@ pub fn enqueueReresolveBacklogWindow(
         .gpa = gpa,
         .resume_after = resume_after,
         .limit = limit,
+        .store = store,
+        .resolvers = resolvers,
+        .deadline_ns = deadline_ns,
         .out = &asset_keys,
     };
     errdefer if (collector.last_index_key) |key| gpa.free(key);
     var source_index_complete = true;
     if (resume_after != null) {
         for (asset_source_artifacts.items) |source_artifact| {
+            if (backfillDeadlineReached(deadline_ns)) {
+                collector.limit_reached = true;
+                break;
+            }
             const prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(gpa, source_artifact);
             defer gpa.free(prefix);
             const upper = (try internal_keys.nextPrefixAlloc(gpa, prefix)) orelse continue;
@@ -1893,23 +2174,33 @@ pub fn enqueueReresolveBacklogWindow(
             };
             if (collector.limit_reached) break;
         }
-        source_index_complete = !collector.limit_reached and asset_keys.items.len < limit;
+        source_index_complete = !collector.limit_reached and collector.scanned < limit;
     }
 
-    const remaining = limit -| asset_keys.items.len;
-    var repair_result: ReresolveEnqueueResult = if (repair_resume_after != null and remaining > 0)
-        try repairAssetSourceIndexWindow(gpa, store, source_subscriptions.items, repair_resume_after, remaining, &asset_keys)
+    var marker_repairs: std.ArrayListUnmanaged(ArtifactWrite) = .empty;
+    defer {
+        for (marker_repairs.items) |write| {
+            gpa.free(write.key);
+            gpa.free(write.value);
+        }
+        marker_repairs.deinit(gpa);
+    }
+    const remaining = limit -| collector.scanned;
+    var repair_result: ReresolveEnqueueResult = if (repair_resume_after != null and remaining > 0 and !backfillDeadlineReached(deadline_ns))
+        try repairAssetSourceIndexWindow(gpa, store, source_subscriptions.items, repair_resume_after, remaining, &asset_keys, resolvers, deadline_ns, &marker_repairs)
     else
         .{ .repair_complete = repair_resume_after == null };
     errdefer repair_result.deinit(gpa);
 
-    var i: usize = 0;
-    while (i < asset_keys.items.len) {
-        if (try sourceNeedsReresolve(gpa, store, resolvers, asset_keys.items[i])) {
-            i += 1;
-        } else gpa.free(@constCast(asset_keys.orderedRemove(i)));
-    }
     const sequence = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
+    // Publish replay before repairing discovery metadata. A failed append must
+    // never leave a marker that makes the repair retry skip unqueued work.
+    // Markers are an accelerator: if time runs out, the next corpus backfill
+    // can repair them, while this window's source work is already durable.
+    for (marker_repairs.items) |write| {
+        if (backfillDeadlineReached(deadline_ns)) break;
+        try store.put(write.key, write.value);
+    }
     const complete = source_index_complete and repair_result.repair_complete;
     const repair_cursor = repair_result.repair_resume_after;
     repair_result.repair_resume_after = null;
@@ -2207,6 +2498,10 @@ pub const ResolutionRuntime = struct {
     target_sequence: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
+    replay_progress: ?ReplayProgress = null,
+    // Retain one decoded record across quanta: repeated small waits must not
+    // reparse an archive-sized batch for every source artifact.
+    pending_replay_record: ?PendingReplayRecord = null,
     /// The catalog transaction owns durability; this flag is only a wake hint.
     /// Catalog changes and cursor advancement share catch_up_mutex so an older
     /// window cannot clear a newer configuration's restart cursor.
@@ -2246,6 +2541,7 @@ pub const ResolutionRuntime = struct {
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
+            .replay_progress = try loadReplayProgress(alloc, &store_handle.store, applied),
             .target_sequence = .init(target),
             .shutdown_flag = .init(false),
             .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
@@ -2256,7 +2552,9 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn deinit(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionDeinit", .{self}) catch @panic("incompatible storage owner");
         self.stop();
+        self.clearPendingReplayRecord();
         self.store_handle.deinit();
         self.* = undefined;
     }
@@ -2306,6 +2604,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn start(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStart", .{self});
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
         const io = self.io orelse return;
@@ -2319,6 +2618,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn stop(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStop", .{self}) catch @panic("incompatible storage owner");
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.worker_mutex.lockUncancelable(io);
@@ -2349,18 +2649,137 @@ pub const ResolutionRuntime = struct {
     /// unchanged decisions use graph-only reconciliation. `applied_sequence`
     /// advances only after those durable writes.
     pub fn catchUp(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUp", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        return self.catchUpLocked(false);
+        return self.catchUpLocked(false, default_max_records_per_window);
     }
 
-    fn catchUpLocked(self: *ResolutionRuntime, single_window: bool) !void {
+    /// Cooperative maintenance checks the caller deadline between source
+    /// artifacts, preserving all sibling resolver decisions for each source.
+    pub fn catchUpOnce(self: *ResolutionRuntime, deadline_ns: u64) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{ self, deadline_ns });
+        if (!self.catch_up_mutex.tryLock()) return;
+        defer self.catch_up_mutex.unlock();
+        if (replayNowNs() >= deadline_ns) return;
+        const applied = self.applied_sequence.load(.acquire);
+        if (applied >= self.target_sequence.load(.acquire)) {
+            if (self.backfill_pending.load(.acquire)) {
+                var tick = try self.runReresolveBacklogWindowLocked(deadline_ns);
+                tick.deinit(self.alloc);
+            }
+            return;
+        }
+        try self.catchUpRecordPageLocked(deadline_ns);
+    }
+
+    fn clearPendingReplayRecord(self: *ResolutionRuntime) void {
+        if (self.pending_replay_record) |*record| record.deinit(self.alloc);
+        self.pending_replay_record = null;
+    }
+
+    fn saveReplayProgress(self: *ResolutionRuntime, progress: ?ReplayProgress) !void {
+        var write = try self.store_handle.store.beginWrite();
+        errdefer write.abort();
+        if (progress) |value| {
+            const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+            defer self.alloc.free(raw);
+            try write.put(replay_progress_key, raw);
+        } else write.delete(replay_progress_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try write.commit();
+        self.replay_progress = progress;
+    }
+
+    fn catchUpRecordPageLocked(self: *ResolutionRuntime, deadline_ns: ?u64) !void {
+        // Capture before reading replay: a later notification must never be
+        // acknowledged by an earlier empty scan.
+        const target = self.target_sequence.load(.acquire);
+        const applied = self.applied_sequence.load(.acquire);
+        if (self.pending_replay_record == null) {
+            const Capture = struct {
+                fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+                    const runtime: *ResolutionRuntime = @ptrCast(@alignCast(ptr));
+                    if (runtime.pending_replay_record != null) return;
+                    const raw = try runtime.alloc.dupe(u8, payload);
+                    errdefer runtime.alloc.free(raw);
+                    const decoded = try change_journal_mod.decodeRecord(runtime.alloc, raw);
+                    runtime.pending_replay_record = .{ .sequence = sequence, .raw = raw, .decoded = decoded };
+                }
+            };
+            _ = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+        }
+        const record = if (self.pending_replay_record) |*value| value else {
+            if (self.replay_progress != null) return error.InvalidResolutionReplayCursor;
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+            self.applied_sequence.store(target, .release);
+            return;
+        };
+        const keys = record.decoded.record.changed_artifact_keys;
+        var next: usize = 0;
+        if (self.replay_progress) |progress| {
+            if (progress.base_applied_sequence != applied or progress.sequence != record.sequence or progress.next_key > keys.len)
+                return error.InvalidResolutionReplayCursor;
+            next = progress.next_key;
+        }
+        const resolvers = try self.index_manager.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(resolvers);
+        }
+        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store, .index_manager = self.index_manager };
+        const store = das.artifactStore();
+        const end = @min(keys.len, next +| 32);
+        const initial = next;
+        if (deadline_ns == null) {
+            // Ordinary drains keep batched publication throughput when taking
+            // over a manual owner's partial record.
+            if (next < end) try self.processReplayKeys(resolvers, store, keys[next..end]);
+            next = end;
+        } else while (next < end) {
+            if (replayNowNs() >= deadline_ns.?) break;
+            // A source is the atomic unit, including label routing and sibling
+            // dependencies. Ordered publication keeps its read-set validation.
+            try self.processReplayKeys(resolvers, store, keys[next .. next + 1]);
+            next += 1;
+        }
+        if (next == keys.len) {
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, record.sequence);
+            self.applied_sequence.store(record.sequence, .release);
+            const had_progress = self.replay_progress != null;
+            self.replay_progress = null;
+            self.clearPendingReplayRecord();
+            // A stale checkpoint after a crash or failed cleanup is ignored
+            // using its base cut, including by this still-resident runtime.
+            if (had_progress) try self.saveReplayProgress(null);
+        } else if (next > initial) {
+            // Checkpoint only after the source outputs and handoff are durable.
+            // A failure can repeat this small page, but cannot skip work.
+            try self.saveReplayProgress(.{ .base_applied_sequence = applied, .sequence = record.sequence, .next_key = next });
+        }
+    }
+
+    fn processReplayKeys(self: *ResolutionRuntime, resolvers: []const ResolverConfig, store: resolver_lib.ArtifactStore, keys: []const []const u8) !void {
+        if (self.ordered_writer) |writer| {
+            if (try writer.process(writer.ptr, self.alloc, resolvers, store, null, keys, self.candidate_source, self.embedder)) return;
+        }
+        try processRecordKeys(self.alloc, resolvers, store, null, keys, self.write_ctx, self.write_fn, self.candidate_source, self.embedder);
+    }
+
+    fn catchUpLocked(self: *ResolutionRuntime, single_window: bool, max_records: usize) !void {
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
+            if (self.replay_progress != null or self.pending_replay_record != null) {
+                try self.catchUpRecordPageLocked(null);
+                if (single_window) return;
+                continue;
+            }
             if (applied >= target) {
                 if (!self.backfill_pending.load(.acquire)) return;
-                var tick = try self.runReresolveBacklogWindowLocked();
+                var tick = try self.runReresolveBacklogWindowLocked(null);
                 tick.deinit(self.alloc);
                 if (single_window) return;
                 continue;
@@ -2391,7 +2810,7 @@ pub const ResolutionRuntime = struct {
                 // from_sequence is exclusive (records with seq > from), matching
                 // the derived workers, which pass their applied_sequence.
                 applied,
-                default_max_records_per_window,
+                max_records,
                 self.write_ctx,
                 self.write_fn,
                 self.candidate_source,
@@ -2414,6 +2833,7 @@ pub const ResolutionRuntime = struct {
     /// Mark the resolver backfill dirty. `runReresolveBacklogWindow` then enqueues
     /// extraction artifacts in bounded windows into the normal replay pipeline.
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRequestReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         defer self.notifyBackfill();
@@ -2432,6 +2852,7 @@ pub const ResolutionRuntime = struct {
     /// True when a prior resolver catalog mutation has durably marked corpus
     /// backfill dirty but the bounded reresolve backlog has not fully drained.
     pub fn hasReresolveBacklog(self: *ResolutionRuntime) !bool {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionHasReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key)) or
@@ -2442,12 +2863,13 @@ pub const ResolutionRuntime = struct {
     /// re-resolution. This does not run resolver work inline; it appends a replay
     /// record and lets `catchUp` process it through the normal stage.
     pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRunReresolveBacklogWindow", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        return self.runReresolveBacklogWindowLocked();
+        return self.runReresolveBacklogWindowLocked(null);
     }
 
-    fn runReresolveBacklogWindowLocked(self: *ResolutionRuntime) !ReresolveEnqueueResult {
+    fn runReresolveBacklogWindowLocked(self: *ResolutionRuntime, deadline_ns: ?u64) !ReresolveEnqueueResult {
         const resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (resume_key_value) |key| self.alloc.free(key);
         const repair_resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
@@ -2473,7 +2895,7 @@ pub const ResolutionRuntime = struct {
             .store = &self.store_handle.store,
             .index_manager = self.index_manager,
         };
-        var result = try enqueueReresolveBacklogWindow(
+        var result = try enqueueReresolveBacklogWindowUntil(
             self.alloc,
             das.artifactStore(),
             resolvers,
@@ -2482,6 +2904,7 @@ pub const ResolutionRuntime = struct {
             default_max_reresolve_records_per_window,
             self.write_ctx,
             self.write_fn,
+            deadline_ns,
         );
         errdefer result.deinit(self.alloc);
         if (result.source_index_complete) {
@@ -2515,6 +2938,7 @@ pub const ResolutionRuntime = struct {
     /// The review queue: every stored review-band mention awaiting curation.
     /// Caller owns the result (`freePendingReviews`).
     pub fn pendingReviews(self: *ResolutionRuntime, alloc: std.mem.Allocator) ![]PendingReview {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionPendingReviews", .{ self, alloc });
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         const resolvers = try self.index_manager.listResolvers(self.alloc);
@@ -2535,7 +2959,7 @@ pub const ResolutionRuntime = struct {
             !self.backfill_pending.load(.acquire)) return null;
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
-        self.catchUpLocked(true) catch |err| {
+        self.catchUpLocked(true, default_max_records_per_window) catch |err| {
             std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
             return 50;
         };
@@ -3093,6 +3517,7 @@ const CaptureWriter = struct {
             }
         }
         self.calls += 1;
+        if (write.graphReconciliationWrite()) |graph| return writeFn(ptr, graph);
         return self.calls;
     }
 };
@@ -4738,7 +5163,7 @@ test "resolver backfill skips stale empty resolutions without routed mentions" {
     try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
 }
 
-test "incremental resolution replay commits refreshes atomically without unchanged promotion" {
+test "incremental resolution replay atomically hands off new generations and suppresses same-generation promotion" {
     const a = std.testing.allocator;
     var memory: MapStore = .{ .alloc = a };
     defer memory.deinit();
@@ -4759,19 +5184,25 @@ test "incremental resolution replay commits refreshes atomically without unchang
     defer a.free(old);
     try std.testing.expect(std.mem.indexOf(u8, old, "\"config_generation\":1") != null);
     _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
-    try std.testing.expectEqual(@as(u64, 1), writer.inferred_calls);
-    try std.testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
+    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 0), writer.graph_only_calls);
     const current = (try memory.store().get(a, resolved)).?;
     defer a.free(current);
     try std.testing.expect(std.mem.indexOf(u8, current, "\"config_generation\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, current, "_resolution_work") != null);
     try std.testing.expect(try resolution_handoff.matches(a, memory.store(), resolved, current));
+    // At the same generation, a retention-only refresh keeps the decisions
+    // and their existing promotion work, without another promotion hint.
+    configs[0].retain_work = .embeddings;
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
     // A superseding template change uses current extraction and replaces real
     // decisions via the full promotion/graph handoff, never old pending work.
     configs[0].config_generation = 3;
     configs[0].key_template = "person/{{ uslug _entity.text }}";
     _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
-    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 3), writer.inferred_calls);
     const changed = (try memory.store().get(a, resolved)).?;
     defer a.free(changed);
     var decoded = try resolver_lib.parseResolution(a, changed);
@@ -4847,4 +5278,201 @@ test "incremental resolution invalidates effective blocking and cross-table surv
     const deleted_cold_value = (try memory.store().get(a, deleted_cold.resolution_key)).?;
     defer a.free(deleted_cold_value);
     try testing.expectEqualStrings(deleted_value, deleted_cold_value);
+}
+
+test "inline resolver replacement backfill deadlines retain indexed and repair progress" {
+    const a = std.testing.allocator;
+    const ClockStore = struct {
+        map: *MapStore,
+        scan_tick: bool,
+        var now: u64 = 0;
+        fn clock() u64 {
+            return now;
+        }
+        fn get(ptr: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            now += 1;
+            return self.map.store().get(alloc, key);
+        }
+        fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.map.store().put(key, value);
+        }
+        fn delete(ptr: *anyopaque, key: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.map.store().delete(key);
+        }
+        fn scan(ptr: *anyopaque, lower: []const u8, upper: []const u8, ctx: *anyopaque, consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const Forward = struct {
+                ctx: *anyopaque,
+                consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+                scan_tick: bool,
+                fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+                    const forward: *@This() = @ptrCast(@alignCast(raw));
+                    try forward.consume(forward.ctx, key, value);
+                    if (forward.scan_tick) now += 1;
+                }
+            };
+            var forward = Forward{ .ctx = ctx, .consume = consume, .scan_tick = self.scan_tick };
+            return self.map.store().scanPrefix(lower, upper, &forward, Forward.visit);
+        }
+        fn store(self: *@This()) resolver_lib.ArtifactStore {
+            return .{ .ptr = self, .vtable = &.{ .get = get, .put = put, .delete = delete, .scan_prefix = scan } };
+        }
+    };
+    test_replay_now_ns = ClockStore.clock;
+    defer test_replay_now_ns = null;
+    const configs = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}", .resolution_generation = 1 }};
+    for ([_]bool{ true, false }) |indexed| for ([_]bool{ true, false }) |scan_tick| {
+        var map = MapStore{ .alloc = a };
+        defer map.deinit();
+        var clock_store = ClockStore{ .map = &map, .scan_tick = scan_tick };
+        const store = clock_store.store();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var keys: [3][]const u8 = undefined;
+        for (&keys, 0..) |*key, i| {
+            const doc = try std.fmt.allocPrint(scratch, "doc:{d}", .{i});
+            key.* = try internal_keys.artifactNamedPrefixAlloc(scratch, doc, "asset", "kg");
+            try store.put(key.*, test_extraction);
+            if (indexed) try store.put(try internal_keys.assetArtifactSourceIndexKeyAlloc(scratch, "kg", doc), key.*);
+        }
+        var writer = CaptureWriter{ .alloc = a };
+        defer writer.deinit();
+        ClockStore.now = 0;
+        var expired = try enqueueReresolveBacklogWindowUntil(a, store, &configs, if (indexed) "" else null, if (indexed) null else "", 256, &writer, CaptureWriter.writeFn, 0);
+        defer expired.deinit(a);
+        try testing.expect(!expired.complete);
+        try testing.expectEqual(@as(u64, 0), writer.calls);
+        try testing.expectEqual(@as(u64, 0), ClockStore.now);
+        var first = try enqueueReresolveBacklogWindowUntil(a, store, &configs, if (indexed) "" else null, if (indexed) null else "", 256, &writer, CaptureWriter.writeFn, 1);
+        defer first.deinit(a);
+        try testing.expect(!first.complete);
+        try testing.expectEqual(@as(usize, 1), first.queued);
+        try testing.expectEqualStrings(keys[0], writer.keys.items[0]);
+        if (!indexed) try testing.expectEqualStrings(keys[0], first.repair_resume_after.?);
+        // An ordinary drain takes over without repeating or skipping queued keys.
+        var rest = try enqueueReresolveBacklogWindow(a, store, &configs, first.resume_after, if (indexed) null else first.repair_resume_after, 256, &writer, CaptureWriter.writeFn);
+        defer rest.deinit(a);
+        try testing.expect(rest.complete);
+        try testing.expectEqual(@as(usize, 3), writer.keys.items.len);
+        for (keys, writer.keys.items) |expected, actual| try testing.expectEqualStrings(expected, actual);
+    };
+}
+
+test "inline resolver replacement backfill append failure cannot hide legacy repair work" {
+    const a = std.testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const store = map.store();
+    const configs = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}" }};
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(key);
+    const marker = try internal_keys.assetArtifactSourceIndexKeyAlloc(a, "kg", "doc");
+    defer a.free(marker);
+    try store.put(key, test_extraction);
+    const Fail = struct {
+        fn write(_: *anyopaque, _: RecordWrite) anyerror!u64 {
+            return error.TestWriteFailed;
+        }
+    };
+    var writer = CaptureWriter{ .alloc = a };
+    defer writer.deinit();
+    try testing.expectError(error.TestWriteFailed, enqueueReresolveBacklogWindow(a, store, &configs, null, "", 256, &writer, Fail.write));
+    try testing.expect((try store.get(a, marker)) == null);
+    var retry = try enqueueReresolveBacklogWindow(a, store, &configs, null, "", 256, &writer, CaptureWriter.writeFn);
+    defer retry.deinit(a);
+    try testing.expect(retry.complete);
+    try testing.expectEqual(@as(usize, 1), retry.queued);
+}
+
+test "inline resolver replacement backfill bounds stale marker rows without journaling" {
+    const a = std.testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const configs = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}" }};
+    for (0..5) |i| {
+        const doc = try std.fmt.allocPrint(a, "doc:{d}", .{i});
+        defer a.free(doc);
+        const marker = try internal_keys.assetArtifactSourceIndexKeyAlloc(a, "kg", doc);
+        defer a.free(marker);
+        try map.store().put(marker, "invalid-artifact-key");
+    }
+    var writer = CaptureWriter{ .alloc = a };
+    defer writer.deinit();
+    var scan_resume: ?[]u8 = try a.dupe(u8, "");
+    defer if (scan_resume) |key| a.free(key);
+    var windows: usize = 0;
+    while (true) {
+        var window = try enqueueReresolveBacklogWindow(a, map.store(), &configs, scan_resume, null, 2, &writer, CaptureWriter.writeFn);
+        defer window.deinit(a);
+        windows += 1;
+        try testing.expect(windows <= 3);
+        try testing.expectEqual(@as(usize, 0), window.queued);
+        if (window.complete) break;
+        try testing.expect(std.mem.order(u8, window.resume_after.?, scan_resume.?) == .gt);
+        a.free(scan_resume.?);
+        scan_resume = window.resume_after;
+        window.resume_after = null;
+    }
+    try testing.expectEqual(@as(usize, 3), windows);
+    try testing.expectEqual(@as(u64, 0), writer.calls);
+}
+
+test "inline resolver replacement isolates sibling labels query routing and canonical dependencies" {
+    const a = std.testing.allocator;
+    const configs = [_]ResolverConfig{
+        .{ .name = "public", .table = "entities", .source_artifact = "kg", .resolution_artifact = "public_resolved", .key_template = "public/{{ slug _entity.text }}", .promote = false },
+        .{ .name = "private_catchall", .table = "entities", .source_artifact = "kg", .resolution_artifact = "private_resolved", .key_template = "private/{{ slug _entity.text }}", .replacement_index = "new", .promote = false },
+        .{ .name = "private_people", .table = "entities", .source_artifact = "kg", .resolution_artifact = "people_resolved", .key_template = "people/{{ slug _entity.text }}", .labels = &.{"person"}, .replacement_index = "new", .promote = false },
+        .{ .name = "foreign_people", .table = "entities", .source_artifact = "kg", .resolution_artifact = "foreign_resolved", .key_template = "foreign/{{ slug _entity.text }}", .labels = &.{"person"}, .replacement_index = "other", .promote = false },
+        .{ .name = "retired_people", .table = "entities", .source_artifact = "kg", .resolution_artifact = "retired_resolved", .key_template = "retired/{{ slug _entity.text }}", .labels = &.{"person"}, .retired = true, .promote = false },
+    };
+    // Model a legacy catalog predating the new admission fence as well. Its
+    // private streams must not affect serving even before the job is rejected.
+    const labels = try siblingClaimedLabelsAlloc(a, &configs, &configs[0]);
+    defer freeSiblingClaimedLabels(a, labels);
+    try testing.expectEqual(@as(usize, 0), labels.len);
+    const private_labels = try siblingClaimedLabelsAlloc(a, &configs, &configs[1]);
+    defer freeSiblingClaimedLabels(a, private_labels);
+    try testing.expectEqual(@as(usize, 1), private_labels.len);
+    try testing.expectEqualStrings("person", private_labels[0]);
+    const extraction = "{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}";
+    const output = (try resolveExtraction(a, &configs, "kg", extraction, &.{})).?;
+    defer a.free(output.bytes);
+    var parsed_output = try std.json.parseFromSlice(std.json.Value, a, output.bytes, .{});
+    defer parsed_output.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed_output.value.object.get("entities").?.array.items.len);
+    const query = try resolveQueryExtractionAlloc(a, &configs, &configs[0], extraction, null, null);
+    defer a.free(query);
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, a, query, .{});
+    defer parsed_query.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed_query.value.object.get("entities").?.array.items.len);
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(key);
+    var source = (try parseSourceArtifactKeyAlloc(a, key)).?;
+    defer source.deinit(a);
+    for (configs, 0..) |cfg, i| {
+        const raw = try std.fmt.allocPrint(a, "{{\"entities\":[{{\"id\":\"id_{d}\",\"text\":\"Ada\",\"label\":\"person\"}}]}}", .{i});
+        defer a.free(raw);
+        // Generate each fixture independently, so all cross-domain artifacts
+        // exist and the visibility check cannot pass merely because of misses.
+        const value = (try resolveExtraction(a, &.{cfg}, "kg", raw, &.{})).?;
+        defer a.free(value.bytes);
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "doc", cfg.resolution_artifact);
+        defer a.free(resolution_key);
+        try map.store().put(resolution_key, value.bytes);
+    }
+    const serving = try siblingResolutionsJsonAlloc(a, &configs, &configs[0], map.store(), source, &.{});
+    try testing.expect(serving == null);
+    const private = (try siblingResolutionsJsonAlloc(a, &configs, &configs[1], map.store(), source, &.{})).?;
+    defer a.free(private);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, private, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try testing.expect(parsed.value.object.contains("id_2"));
 }

@@ -8,6 +8,22 @@ recursive directory walk to build jobs. Workspace and runner temp may be on the
 same filesystem; their rows then describe the same capacity rather than two
 independent allocations.
 
+On Linux with a readable cgroup v2 mount, the same sampler also records
+`memory.current`, the kernel's `memory.peak`, the visible `memory.max`,
+pressure/OOM event counters, anonymous and file-cache memory, and node
+`MemAvailable`. It retains the maximum sampled cgroup use and minimum node
+headroom, using small proc/cgroup reads rather than process walks. An unlimited
+visible limit is reported as `max`, not interpreted as a private runner budget.
+These measurements do not change admission, concurrency, requests or limits.
+
+The sampler atomically checkpoints its report every five seconds, so an
+active runner's report can be inspected before the post hook. The post hook
+prints the final measurements to the job summary. Pod deletion can still
+remove these local reports before the post hook runs; correlate such failures
+with retained Kubernetes events and Cloud Monitoring measurements. Sampled
+peaks cannot rule out a spike between samples, and node headroom is shared
+with other workloads.
+
 Use the peak and minimum-free values across several successful and failing runs
 of each job before changing a PVC or scratch limit. A PVC may also contain
 cache data left by earlier jobs, so compare the start and peak values instead

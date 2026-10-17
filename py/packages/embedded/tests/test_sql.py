@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import os
 import subprocess
 import sys
 from contextlib import closing
@@ -155,6 +156,36 @@ def test_multi_table_stable_snapshot(require_native, aflite_path, tmp_path):
             for name, value in (("one", 1), ("two", 2)):
                 with database.open_table(name) as table:
                     assert table.lookup("same") == {"value": value}
+
+
+@pytest.mark.parametrize("delete_action", ["", " ON DELETE CASCADE"])
+def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path, delete_action):
+    # The native regression forces the refresh race without background timing.
+    # Keep the complete reported stress workload available without slowing every
+    # binding test lane or accumulating hundreds of MiB of maintenance output.
+    iterations = 400 if os.environ.get("ANTFLY_EMBEDDED_SQL_STRESS") == "1" else 32
+    with closing(dbapi.connect(aflite_path, autocommit=True)) as connection:
+        cursor = connection.cursor()
+        cursor.execute("CREATE TABLE parent (id TEXT PRIMARY KEY)")
+        cursor.execute(
+            f"CREATE TABLE child (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES parent (id){delete_action})"
+        )
+        for i in range(iterations):
+            connection.autocommit = True
+            cursor.execute("INSERT INTO parent (id) VALUES ($1)", (f"p{i}",))
+            connection.autocommit = False
+            cursor.execute("INSERT INTO child (id, parent_id) VALUES ($1, $2)", (f"c{i}", f"p{i}"))
+            cursor.execute(
+                "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id = $1 ORDER BY id DESC OFFSET 8)",
+                (f"p{i}",),
+            )
+            connection.commit()
+            # Bound unrelated text-index debt between committed transactions.
+            if (i + 1) % 16 == 0:
+                connection._database.run_until_idle()
+        connection.autocommit = True
+        cursor.execute("SELECT COUNT(*) FROM child")
+        assert cursor.fetchall() == [(iterations,)]
 
 
 def test_cross_table_foreign_keys_and_failed_transaction(require_native, aflite_path):
@@ -636,3 +667,57 @@ def test_shared_storage_cursor_survives_other_connection_close(require_native, a
             assert second.sql("SELECT n FROM numbers ORDER BY n")["rows"] == [["7"], ["8"]]
     finally:
         first.close()
+
+
+@pytest.mark.parametrize(
+    "kind,value",
+    [
+        ("TEXT", "prefix\x00suffix"),
+        ("JSONB", {"output": ["prefix\x00suffix"]}),
+        ("JSONB", {"prefix\x00suffix": "value"}),
+    ],
+)
+def test_sql_nul_diagnostic_and_atomicity(require_native, aflite_path, kind, value):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql(f"CREATE TABLE items (id BIGINT PRIMARY KEY, item {kind})")
+        statement = "INSERT INTO items (id,item) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET item=excluded.item"
+        with pytest.raises(SQLStateError) as raised:
+            database.sql(statement, [1, value])
+        assert raised.value.sqlstate == "22P05"
+        assert raised.value.diagnostic["parameter_index"] == 2
+        assert "parameter $2" in str(raised.value)
+        assert "NUL" in str(raised.value)
+        detail = json.loads(database._lib.antfly_last_error_detail())
+        assert detail["error"]["parameter_index"] == 2
+        assert "parameter $2" in detail["error"]["message"]
+        assert database.sql("SELECT id FROM items")["rows"] == []
+        database.sql(statement, [1, "clean" if kind == "TEXT" else {"output": "clean"}])
+        with pytest.raises(SQLStateError) as update:
+            database.sql("UPDATE items SET item=$1 WHERE id=1", [value])
+        assert update.value.sqlstate == "22P05"
+        assert update.value.diagnostic["parameter_index"] == 1
+        # Cursor preparation uses the same parameter validation and diagnostics.
+        with pytest.raises(SQLStateError) as cursor:
+            database.sql_cursor(f"SELECT $1::{kind}", [value])
+        assert cursor.value.sqlstate == "22P05"
+        assert cursor.value.diagnostic["parameter_index"] == 1
+
+
+@pytest.mark.parametrize("payload", ['{"v":"\\u0000"}', '{"\\u0000":"v"}'])
+@pytest.mark.parametrize("bound", [False, True])
+def test_sql_jsonb_cast_rejects_nul(require_native, aflite_path, payload, bound):
+    expression = "$1::text::jsonb" if bound else f"'{payload}'::jsonb"
+    parameters = [payload] if bound else []
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, item JSONB)")
+        for statement in [f"SELECT {expression}", f"INSERT INTO items (id,item) VALUES (1,{expression})"]:
+            with pytest.raises(SQLStateError) as raised:
+                database.sql(statement, parameters)
+            assert raised.value.sqlstate == "22P05"
+            assert "NUL" in str(raised.value)
+        assert database.sql("SELECT id FROM items")["rows"] == []
+        database.sql("INSERT INTO items (id,item) VALUES (1,'{}'::jsonb)")
+        with pytest.raises(SQLStateError) as raised:
+            with closing(database.sql_cursor(f"SELECT {expression} FROM items", parameters)) as cursor:
+                cursor.fetch()
+        assert raised.value.sqlstate == "22P05"

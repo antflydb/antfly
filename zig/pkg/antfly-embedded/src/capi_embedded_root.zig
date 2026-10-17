@@ -76,4 +76,5 @@ pub const capi_dependencies = struct {
     pub const sql_scalar = @import("sql/scalar.zig");
     pub const sql_read_stream = @import("sql/read_stream.zig");
     pub const sql_runtime = @import("sql/runtime.zig");
+    pub const sql_operators = @import("sql/operators.zig");
 };

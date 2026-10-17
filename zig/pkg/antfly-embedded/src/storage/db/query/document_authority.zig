@@ -26,6 +26,32 @@ pub const Authority = struct {
 };
 pub const Envelope = struct { authority: Authority, document: ?[]const u8 = null };
 const marker = "__antfly_document_authority_v1";
+/// Capture only validated root-member ranges during the source traversal.
+/// Interpretation is deferred until response capability metadata is checked:
+/// an old provider may return arbitrary user fields with these names.
+pub const Pending = struct {
+    proof: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    unknown: bool = false,
+
+    pub fn observe(ctx: *anyopaque, name: []const u8, raw: []const u8) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, marker)) self.proof = raw else if (std.mem.eql(u8, name, "document")) self.document = raw else self.unknown = true;
+    }
+    pub fn finish(self: @This(), alloc: std.mem.Allocator) !?Envelope {
+        const raw = self.proof orelse return null;
+        if (self.unknown) return error.InvalidRemoteResponse;
+        if (self.document) |document| if (document.len == 0 or document[0] != '{') return error.InvalidRemoteResponse;
+        const parsed = std.json.parseFromSlice(struct { group: u64, version: u64, sha256: []const u8 }, alloc, raw, .{ .allocate = .alloc_if_needed }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+        defer parsed.deinit();
+        const wire = parsed.value;
+        if (wire.group == 0 or wire.sha256.len != 64) return error.InvalidRemoteResponse;
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, wire.sha256) catch return error.InvalidRemoteResponse;
+        return .{ .authority = .{ .group = wire.group, .version = wire.version, .digest = digest }, .document = self.document };
+    }
+};
+
 pub fn encode(alloc: std.mem.Allocator, authority: Authority, document: ?[]const u8) ![]u8 {
     if (authority.group == 0) return error.InvalidQueryRequest;
     if (document) |bytes| return std.fmt.allocPrint(alloc, "{{\"" ++ marker ++ "\":{{\"group\":{d},\"version\":{d},\"sha256\":\"{x}\"}},\"document\":{s}}}", .{ authority.group, authority.version, authority.digest, bytes });

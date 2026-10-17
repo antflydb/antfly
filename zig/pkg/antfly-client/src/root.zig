@@ -121,40 +121,18 @@ test "get index response timeout bounds the complete HTTP request" {
     defer client.deinit();
     try client.setBearer("test-token");
 
-    var timed_out = std.atomic.Value(bool).init(false);
-    var unexpected = std.atomic.Value(bool).init(false);
-    var succeeded = std.atomic.Value(bool).init(false);
-    var group = std.Io.Group.init;
-    const ClientTask = struct {
-        fn run(
-            _: std.Io,
-            c: *AntflyClient,
-            timeout: *std.atomic.Value(bool),
-            other_error: *std.atomic.Value(bool),
-            success: *std.atomic.Value(bool),
-        ) std.Io.Cancelable!void {
-            var resp = c.getIndexResponseWithTimeout("docs", "dense", 50) catch |err| {
-                if (err == error.Timeout) {
-                    timeout.store(true, .release);
-                } else {
-                    other_error.store(true, .release);
-                }
-                return;
-            };
-            defer resp.deinit();
-            success.store(true, .release);
-        }
+    var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+    defer serving.cancel(io) catch {};
+    try std.testing.expectError(error.Timeout, client.getIndexResponseWithTimeout("docs", "dense", 50));
+    // The deadline may expire before connect or before any request bytes reach
+    // the server. Join its cancellation after observing the client outcome;
+    // never wait indefinitely in accept or race a worker's publication flag.
+    serving.cancel(io) catch |err| switch (err) {
+        error.Canceled, error.EmptyRequest, error.MalformedRequest, error.SendFailed => {},
+        // Authentication/path assertions remain failures even during timeout.
+        else => return err,
     };
-    try group.concurrent(io, ClientTask.run, .{ io, &client, &timed_out, &unexpected, &succeeded });
-    server.handleOne() catch |err| {
-        // A timed-out client may close before the delayed response is written.
-        // Preserve request assertion failures, which happen before the delay.
-        if (!timed_out.load(.acquire)) return err;
-    };
-    try group.await(io);
-    try std.testing.expect(timed_out.load(.acquire));
-    try std.testing.expect(!unexpected.load(.acquire));
-    try std.testing.expect(!succeeded.load(.acquire));
+    try std.testing.expect(server.route_hits[0] <= 1);
 }
 
 test "SQL prepared client forbids replay and preserves exact owner identity" {
@@ -241,38 +219,18 @@ test "list indexes response timeout bounds readiness preflight" {
     defer client.deinit();
     try client.setBearer("test-token");
 
-    var timed_out = std.atomic.Value(bool).init(false);
-    var unexpected = std.atomic.Value(bool).init(false);
-    var succeeded = std.atomic.Value(bool).init(false);
-    var group = std.Io.Group.init;
-    const ClientTask = struct {
-        fn run(
-            _: std.Io,
-            c: *AntflyClient,
-            timeout: *std.atomic.Value(bool),
-            other_error: *std.atomic.Value(bool),
-            success: *std.atomic.Value(bool),
-        ) std.Io.Cancelable!void {
-            var resp = c.listIndexesResponseWithTimeout("docs", 50) catch |err| {
-                if (err == error.Timeout) {
-                    timeout.store(true, .release);
-                } else {
-                    other_error.store(true, .release);
-                }
-                return;
-            };
-            defer resp.deinit();
-            success.store(true, .release);
-        }
+    var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+    defer serving.cancel(io) catch {};
+    try std.testing.expectError(error.Timeout, client.listIndexesResponseWithTimeout("docs", 50));
+    // The deadline may expire before connect or before any request bytes reach
+    // the server. Join its cancellation after observing the client outcome;
+    // never wait indefinitely in accept or race a worker's publication flag.
+    serving.cancel(io) catch |err| switch (err) {
+        error.Canceled, error.EmptyRequest, error.MalformedRequest, error.SendFailed => {},
+        // Authentication/path assertions remain failures even during timeout.
+        else => return err,
     };
-    try group.concurrent(io, ClientTask.run, .{ io, &client, &timed_out, &unexpected, &succeeded });
-    server.handleOne() catch |err| {
-        if (!timed_out.load(.acquire)) return err;
-    };
-    try group.await(io);
-    try std.testing.expect(timed_out.load(.acquire));
-    try std.testing.expect(!unexpected.load(.acquire));
-    try std.testing.expect(!succeeded.load(.acquire));
+    try std.testing.expect(server.route_hits[0] <= 1);
 }
 
 test "personal connections polling accommodates slow status and explicit deadlines" {
@@ -306,10 +264,15 @@ test "personal connections polling accommodates slow status and explicit deadlin
             defer response.deinit();
             try std.testing.expectEqualStrings("connected", response.data.?.value.status);
             try serving.await(io);
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
         } else {
             try std.testing.expectError(error.Timeout, client.getChatGPTAttemptWithTimeout("attempt-1", 50));
+            // The deadline may expire before the server accepts the request.
+            // Join the worker before reading its counters; neither outcome
+            // may replay the attempt after the caller's budget expires.
+            serving.cancel(io) catch {};
+            try std.testing.expect(server.route_hits[0] <= 1);
         }
-        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
     }
 }
 
@@ -346,5 +309,59 @@ test "personal connections preserve owner auth and forbid replay" {
         try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
         try std.testing.expectError(error.InvalidConnectionId, client.getChatGPTAttempt("../other"));
         try std.testing.expectError(error.InvalidConnectionId, client.disconnectChatGPT("account?redirect=other"));
+    }
+}
+
+test "query builder transport keeps agent lifetime auth and explicit deadlines without replay" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        var test_io: std.Io = undefined;
+        fn request(info: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer planner-token", info.header("Authorization").?);
+            var body = try std.json.parseFromSlice(types.QueryBuilderRequest, std.testing.allocator, info.body, .{});
+            defer body.deinit();
+            try std.testing.expectEqualStrings("Find anatomy", body.value.intent);
+            try test_io.sleep(.fromMilliseconds(100), .awake);
+        }
+    };
+    Assert.test_io = io;
+    for ([_]enum { default_budget, explicit_budget, provider_failure }{ .default_budget, .explicit_budget, .provider_failure }) |mode| {
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .POST,
+            .path = "/db/v1/agents/query-builder",
+            .respond = .{ .status = if (mode == .provider_failure) 503 else 200, .body = if (mode == .provider_failure) "{\"message\":\"unavailable\"}" else "{\"status\":\"completed\",\"query\":{}}" },
+            .assert_request = Assert.request,
+        }});
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        // An aggressive ordinary-request default must not truncate model work;
+        // a permissive retry policy must not replay an ambiguous agent request.
+        var http = httpx.Client.initWithConfig(a, io, .{
+            .keep_alive = false,
+            .timeouts = .{ .request_ms = 1 },
+            .retry_policy = .{ .retry_only_idempotent = false, .max_retries = 3, .initial_delay_ms = 0 },
+        });
+        defer http.deinit();
+        var client = try AntflyClient.init(a, &http, server.baseUrl());
+        defer client.deinit();
+        try client.setBearer("planner-token");
+        const request: types.QueryBuilderRequest = .{ .intent = "Find anatomy" };
+        if (mode == .explicit_budget) {
+            try std.testing.expectError(error.Timeout, client.queryBuilderWithTimeout(request, 25));
+            serving.cancel(io) catch {};
+            try std.testing.expect(server.route_hits[0] <= 1);
+        } else {
+            if (mode == .provider_failure) {
+                try std.testing.expectError(error.ApiError, client.queryBuilderWithTimeout(request, 500));
+            } else {
+                var response = try client.queryBuilder(request);
+                defer response.deinit();
+                try std.testing.expectEqual(types.AgentStatus.completed, response.data.?.value.status.?);
+            }
+            try serving.await(io);
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+        }
     }
 }

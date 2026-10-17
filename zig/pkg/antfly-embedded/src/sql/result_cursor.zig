@@ -412,9 +412,9 @@ test "SQL no-I/O blocking cursors preserve arrays bound memory and unwind alloca
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const row = (try cursor.next(arena.allocator())).?;
-            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.elements[0].value.integer);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
             try std.testing.expectEqual(@as(i32, -2), row[0].array.?.dimensions[0].lower);
-            try std.testing.expect(row[0].array.?.elements[1].sql_null);
+            try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
             try std.testing.expect(try cursor.next(arena.allocator()) == null);
         }
     };
@@ -477,14 +477,14 @@ test "SQL sealed typed captures replay independent borrowed passes without a sec
         }
         fn verify(row: []const @import("scalar.zig").Datum) !void {
             try std.testing.expectEqual(@as(usize, 4), row.len);
-            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.elements[0].value.integer);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
             try std.testing.expectEqual(@as(i32, -2), row[0].array.?.dimensions[0].lower);
-            try std.testing.expect(row[0].array.?.elements[1].sql_null);
+            try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
             try std.testing.expect(row[1].sql_null);
             try std.testing.expect(!row[2].sql_null and row[2].value == .null);
-            try std.testing.expect(!row[3].array.?.elements[0].sql_null);
-            try std.testing.expect(row[3].array.?.elements[0].value == .null);
-            try std.testing.expect(row[3].array.?.elements[1].sql_null);
+            try std.testing.expect(!row[3].array.?.flatCell(0).sql_null);
+            try std.testing.expect(row[3].array.?.flatCell(0).value == .null);
+            try std.testing.expect(row[3].array.?.flatCell(1).sql_null);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{false});
@@ -546,14 +546,14 @@ test "SQL replay freezes resident sorted owners and seals external sort windows 
                     for (0..3) |ordinal| {
                         const value = (try second.next()).?;
                         try std.testing.expectEqual(@as(i64, @intCast(count - 3 - ordinal)), value[0].value.integer);
-                        try std.testing.expectEqual(@as(i64, 9007199254740993), value[1].array.?.elements[0].value.integer);
+                        try std.testing.expectEqual(@as(i64, 9007199254740993), value[1].array.?.flatCell(0).value.integer);
                         try std.testing.expectEqual(@as(i32, -2), value[1].array.?.dimensions[0].lower);
-                        try std.testing.expect(value[1].array.?.elements[1].sql_null);
+                        try std.testing.expect(value[1].array.?.flatCell(1).sql_null);
                     }
                     try std.testing.expect(try second.next() == null);
                 }
                 _ = (try cursor.next(scratch.allocator())).?;
-                try std.testing.expectEqual(@as(i64, 9007199254740993), row[1].array.?.elements[0].value.integer);
+                try std.testing.expectEqual(@as(i64, 9007199254740993), row[1].array.?.flatCell(0).value.integer);
             }
             try std.testing.expectEqual(@as(usize, 0), manager.files);
         }
@@ -581,9 +581,9 @@ test "SQL forward borrowed sorted rows allocate nothing and retire before the ne
         const row = (try cursor.nextBorrowed(std.testing.failing_allocator)).?;
         try std.testing.expectEqual(@as(usize, 1) + ordinal, cursor.sorted.?.released);
         try std.testing.expect(row[0].array == cursor.sorted_rows[1 + ordinal].values[0].array);
-        try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.elements[0].value.integer);
+        try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
         try std.testing.expectEqual(@as(i32, -2), row[0].array.?.dimensions[0].lower);
-        try std.testing.expect(row[0].array.?.elements[1].sql_null);
+        try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
     }
     try std.testing.expect(try cursor.nextBorrowed(std.testing.failing_allocator) == null);
     try std.testing.expectEqual(@as(usize, 4), cursor.sorted.?.released);
@@ -646,7 +646,7 @@ test "SQL array replay and no-I/O leases coexist without retiring borrowed sort 
             try std.testing.expect(try cursor.nextBorrowed(arena.allocator()) == null);
             for (0..2) |_| {
                 const row = (try replay.next()).?;
-                try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.elements[0].value.integer);
+                try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
             }
             replay.close();
             replay_live = false;
@@ -654,8 +654,8 @@ test "SQL array replay and no-I/O leases coexist without retiring borrowed sort 
             owned = false;
             const retained = try lease.values.cell(a, 0, 0);
             try std.testing.expectEqual(@as(i32, -2), retained.array.?.dimensions[0].lower);
-            try std.testing.expectEqual(@as(i64, 9007199254740993), retained.array.?.elements[0].value.integer);
-            try std.testing.expect(retained.array.?.elements[1].sql_null);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), retained.array.?.flatCell(0).value.integer);
+            try std.testing.expect(retained.array.?.flatCell(1).sql_null);
         }
     };
     for ([_]bool{ false, true }) |sorted| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{sorted});

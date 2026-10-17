@@ -11,7 +11,9 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.audio_chunk_options import AudioChunkOptions
+    from ..models.chunk_embedding_target import ChunkEmbeddingTarget
     from ..models.chunker_config_full_text_index import ChunkerConfigFullTextIndex
+    from ..models.media_chunk_policy import MediaChunkPolicy
     from ..models.text_chunk_options import TextChunkOptions
 
 
@@ -33,6 +35,9 @@ class ChunkerConfig:
         threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
         text (TextChunkOptions | Unset): Options specific to text chunking.
         audio (AudioChunkOptions | Unset): Options specific to audio chunking.
+        embedding (ChunkEmbeddingTarget | Unset):
+        policy (MediaChunkPolicy | Unset): Semantic chunk policy. Execution batch size and queue depth are deliberately
+            separate.
         api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL. Example:
             http://localhost:8080.
         model (str | Unset): The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other
@@ -53,6 +58,8 @@ class ChunkerConfig:
     threshold: float | Unset = UNSET
     text: TextChunkOptions | Unset = UNSET
     audio: AudioChunkOptions | Unset = UNSET
+    embedding: ChunkEmbeddingTarget | Unset = UNSET
+    policy: MediaChunkPolicy | Unset = UNSET
     api_url: str | Unset = UNSET
     model: str | Unset = "fixed"
     store_chunks: bool | Unset = False
@@ -73,6 +80,14 @@ class ChunkerConfig:
         audio: dict[str, Any] | Unset = UNSET
         if not isinstance(self.audio, Unset):
             audio = self.audio.to_dict()
+
+        embedding: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.embedding, Unset):
+            embedding = self.embedding.to_dict()
+
+        policy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.policy, Unset):
+            policy = self.policy.to_dict()
 
         api_url = self.api_url
 
@@ -99,6 +114,10 @@ class ChunkerConfig:
             field_dict["text"] = text
         if audio is not UNSET:
             field_dict["audio"] = audio
+        if embedding is not UNSET:
+            field_dict["embedding"] = embedding
+        if policy is not UNSET:
+            field_dict["policy"] = policy
         if api_url is not UNSET:
             field_dict["api_url"] = api_url
         if model is not UNSET:
@@ -113,7 +132,9 @@ class ChunkerConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.audio_chunk_options import AudioChunkOptions
+        from ..models.chunk_embedding_target import ChunkEmbeddingTarget
         from ..models.chunker_config_full_text_index import ChunkerConfigFullTextIndex
+        from ..models.media_chunk_policy import MediaChunkPolicy
         from ..models.text_chunk_options import TextChunkOptions
 
         d = dict(src_dict)
@@ -137,6 +158,20 @@ class ChunkerConfig:
         else:
             audio = AudioChunkOptions.from_dict(_audio)
 
+        _embedding = d.pop("embedding", UNSET)
+        embedding: ChunkEmbeddingTarget | Unset
+        if isinstance(_embedding, Unset):
+            embedding = UNSET
+        else:
+            embedding = ChunkEmbeddingTarget.from_dict(_embedding)
+
+        _policy = d.pop("policy", UNSET)
+        policy: MediaChunkPolicy | Unset
+        if isinstance(_policy, Unset):
+            policy = UNSET
+        else:
+            policy = MediaChunkPolicy.from_dict(_policy)
+
         api_url = d.pop("api_url", UNSET)
 
         model = d.pop("model", UNSET)
@@ -156,6 +191,8 @@ class ChunkerConfig:
             threshold=threshold,
             text=text,
             audio=audio,
+            embedding=embedding,
+            policy=policy,
             api_url=api_url,
             model=model,
             store_chunks=store_chunks,

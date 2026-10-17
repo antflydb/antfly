@@ -12986,14 +12986,17 @@ pub const ApiHttpServer = struct {
             };
         };
         defer if (configured_root == null) self.alloc.free(root);
-        try self.lake_cache_start_mutex.lock(self.embedding_provider_runtime.io);
+        // Queries never queue behind optional cache startup. The background
+        // owner restores inventory and publishes the disk tier independently.
+        if (!self.lake_cache_start_mutex.tryLock()) return;
         defer self.lake_cache_start_mutex.unlock(self.embedding_provider_runtime.io);
         if (self.lake_cache_io == null) {
             const io_impl = self.owner_alloc.create(std.Io.Threaded) catch |err| {
                 self.lake_read_cache.recordDiskUnavailable(err);
                 return;
             };
-            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+            // One restoration task plus the persistent write worker it starts.
+            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
             self.lake_cache_io = io_impl;
         }
         const cache_io = self.lake_cache_io.?.io();
@@ -13004,7 +13007,7 @@ pub const ApiHttpServer = struct {
             .max_write_queue_entries = config.max_write_queue_entries,
             .protected_bytes = config.protected_bytes,
         };
-        try self.lake_read_cache.ensurePersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
+        try self.lake_read_cache.startPersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
     }
 
     pub fn catalogStorageNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator) ![]u8 {
@@ -14049,6 +14052,7 @@ pub const ApiHttpServer = struct {
             error.Timeout => return error.Timeout,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
@@ -14413,6 +14417,7 @@ pub const ApiHttpServer = struct {
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
+                error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
                 error.TopologyChanged => return error.TopologyChanged,
                 error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
                 error.ModelNotFound => return error.ModelNotFound,
@@ -14510,6 +14515,7 @@ pub const ApiHttpServer = struct {
             => return err,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
             error.TopologyChanged => return error.TopologyChanged,
             error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -14600,6 +14606,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
             error.TopologyChanged => return error.TopologyChanged,
             error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
             error.ModelNotFound => return error.ModelNotFound,
@@ -16236,13 +16243,23 @@ pub const ApiHttpServer = struct {
     /// Durable definitions and pending generations are the recovery source;
     /// the in-memory queue is only an idempotent wakeup. One table per pass
     /// also rechecks external coverage after source replacement or append.
+    /// Reserve a keyed wakeup before a catalog mutation so admission needs no
+    /// allocation after the durable commit. Deinit releases unused reservations.
+    pub fn prepareLakeCommit(self: *ApiHttpServer, table_name: []const u8) !?PreparedIndexInstallation {
+        return self.prepareIndexInstallationReconcile(table_name, "__lake_publication", null);
+    }
+
+    pub fn activateLakeCommit(self: *ApiHttpServer, prepared: *PreparedIndexInstallation) void {
+        _ = self.activatePreparedIndexInstallation(prepared, true);
+    }
+
     pub fn notifyLakeCommit(self: *ApiHttpServer, table_name: []const u8) !void {
         // Catalog state remains the durable recovery source. This wakeup only
         // lowers latency; a lost response or process restart is repaired by
         // the authoritative inventory sweep.
-        var prepared = (try self.prepareIndexInstallationReconcile(table_name, "__lake_publication", null)) orelse return;
+        var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
-        _ = self.activatePreparedIndexInstallation(&prepared, true);
+        self.activateLakeCommit(&prepared);
     }
 
     fn resumeNativeLakeIndexPublication(self: *ApiHttpServer) !void {
@@ -16455,6 +16472,15 @@ pub const ApiHttpServer = struct {
         }
         const config = self.cfg.node_config;
         const Hooks = struct {
+            fn read(raw: *anyopaque, a: std.mem.Allocator, table_id: u64) !?metadata_table_manager.TableRecord {
+                const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
+                var snapshot = (try server.source.linearizableSnapshot(.{ .cancellation = .{ .ptr = server, .is_cancelled_fn = canceled } })) orelse return error.MetadataSourceUnavailable;
+                defer server.source.freeAdminSnapshot(&snapshot);
+                for (snapshot.tables) |current| if (current.table_id == table_id)
+                    return try metadata_table_manager.cloneTable(a, current);
+                return null;
+            }
+
             fn replace(raw: *anyopaque, before: metadata_table_manager.TableRecord, after: metadata_table_manager.TableRecord) !void {
                 const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
                 _ = try server.source.replaceTableDefinitionStamped(before, after);
@@ -16507,7 +16533,7 @@ pub const ApiHttpServer = struct {
                 context = reader_lease.?.readContext();
             }
         }
-        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
         @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
             std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
@@ -21760,6 +21786,9 @@ pub const ApiHttpServer = struct {
     ) !contextual_operations.OwnedResponse {
         const composed = @import("composed_query.zig");
         if (composed.hasSource(self.alloc, body) catch false) {
+            const composed_started = @import("antfly_platform").time.monotonicNs();
+            var composed_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
+            defer composed_profile.finish(&self.lake_query_metrics, composed_started);
             var source_root = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{ .allocate = .alloc_always });
             defer source_root.deinit();
             var composed_body = body;
@@ -21767,6 +21796,8 @@ pub const ApiHttpServer = struct {
             defer if (expanded_body) |bytes| self.alloc.free(bytes);
             var source_value = source_root.value.object.get("source").?;
             if (source_value == .object) if (source_value.object.get("saved")) |saved| {
+                const definition_started = @import("antfly_platform").time.monotonicNs();
+                defer composed_profile.record(&self.lake_query_metrics, .composed_definition, definition_started);
                 if (source_value.object.count() != 1 or saved != .string) return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
                 if (!admittedTablePermissionAllowed(authenticated_identity, saved.string, .read)) return contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
                 const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .cancellation = if (cancellation) |cancel| cancel.token() else .none };
@@ -21787,6 +21818,7 @@ pub const ApiHttpServer = struct {
             const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
             const Runner = struct {
                 server: *ApiHttpServer,
+                profile: *@import("lake_query_metrics.zig").ComposedProfile,
                 overlay: bool,
                 deadline: ?u64,
                 identity: ?AuthenticatedIdentity,
@@ -21798,6 +21830,8 @@ pub const ApiHttpServer = struct {
                 }
                 fn execute(raw: *anyopaque, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
+                    const leaf_started = @import("antfly_platform").time.monotonicNs();
+                    defer runner.profile.record(&runner.server.lake_query_metrics, .composed_leaf, leaf_started);
                     if (!admittedTablePermissionAllowed(runner.identity, name, .read)) return contextual_operations.jsonErrorAlloc(a, 403, "forbidden");
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
@@ -21835,7 +21869,12 @@ pub const ApiHttpServer = struct {
                             native_query = try std.json.Stringify.valueAlloc(scratch, request, .{});
                         }
                     }
-                    var response = try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+                    var response = response: {
+                        const native_started = @import("antfly_platform").time.monotonicNs();
+                        defer if (bound.storage.engine != .object and external == null)
+                            runner.profile.record(&runner.server.lake_query_metrics, .composed_native_leaf, native_started);
+                        break :response try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+                    };
                     if (response.status != 200) return response;
                     errdefer response.deinit(runner.server.alloc);
                     var after = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
@@ -21861,6 +21900,8 @@ pub const ApiHttpServer = struct {
                 }
                 fn saveCursor(raw: *anyopaque, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    defer runner.profile.record(&runner.server.lake_query_metrics, .composed_cursor, started);
                     try checkpoint(raw);
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
@@ -21869,6 +21910,8 @@ pub const ApiHttpServer = struct {
                 }
                 fn loadCursor(raw: *anyopaque, a: std.mem.Allocator, token: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    defer runner.profile.record(&runner.server.lake_query_metrics, .composed_cursor, started);
                     try checkpoint(raw);
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
@@ -21879,7 +21922,7 @@ pub const ApiHttpServer = struct {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
                 }
             };
-            var runner: Runner = .{ .server = self, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
+            var runner: Runner = .{ .server = self, .profile = &composed_profile, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
             return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
         }
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);
@@ -21991,6 +22034,7 @@ pub const ApiHttpServer = struct {
                 false,
             ),
             error.QueryEmbeddingInputTooLarge => try contextualQueryDependencyErrorResponse(self.alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false),
+            error.DocumentArtifactPublicationFailed => try contextualQueryDependencyErrorResponse(self.alloc, 409, "document_artifact_publication_failed", "document extraction failed; inspect the artifact manifest and reprocess after correcting the failure", false),
             error.EmbeddingIndexNotFound => try contextualQueryDependencyErrorResponse(self.alloc, 422, "embedding_index_not_found", "embedding index not found", false),
             error.QueryEmbeddingOverloaded => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true),
             error.EmbedRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
@@ -22348,8 +22392,8 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
         const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
-        var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try publicOperationTextResponse(self.alloc, 400, "invalid repair list request");
+        var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair list request; use kind to filter artifact kinds");
         };
         defer parsed.deinit();
         const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
@@ -22397,7 +22441,7 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
         const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
-        var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
+        var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
             return try publicOperationTextResponse(self.alloc, 400, "invalid repair request");
         };
         defer parsed.deinit();
@@ -30906,6 +30950,15 @@ pub fn runtimeSchemaDebugRequested(query: []const u8) bool {
 fn parseUnsignedQueryParam(query: []const u8, key: []const u8) !?u64 {
     const value = parseSimpleQueryParam(query, key) orelse return null;
     return try std.fmt.parseUnsigned(u64, value, 10);
+}
+
+test "artifact repair body rejects unknown kind spelling and accepts embedding filters" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(ApiHttpServer.PublicRepairListRequest, alloc, "{\"artifact_kind\":\"embedding\"}", .{}));
+    var parsed = try std.json.parseFromSlice(ApiHttpServer.PublicRepairListRequest, alloc, "{\"kind\":\"embedding\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(db_mod.types.ArtifactRepairKind.embedding, parsed.value.kind.?);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(ApiHttpServer.PublicRepairRunRequest, alloc, "{\"artifact_kind\":\"embedding\"}", .{}));
 }
 
 test "artifact repair query params decode percent encoded values" {

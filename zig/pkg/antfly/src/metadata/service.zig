@@ -1696,10 +1696,11 @@ test "metadata proposal receipt survives a post-acceptance dispatch failure" {
 }
 
 pub fn sameAdminSnapshotFence(before: AdminSnapshotFence, after: AdminSnapshotFence) bool {
+    // A newly committed entry does not change the captured projection until
+    // apply. Fence applied state and collection epochs, not pending Raft work.
     return before.metadata_group_id == after.metadata_group_id and
         std.meta.eql(before.metadata_incarnation, after.metadata_incarnation) and
         before.metadata_raft_term == after.metadata_raft_term and
-        before.metadata_raft_commit_index == after.metadata_raft_commit_index and
         before.metadata_raft_applied_index == after.metadata_raft_applied_index and
         before.projection_epoch == after.projection_epoch and
         before.catalog_epoch == after.catalog_epoch and
@@ -1718,17 +1719,26 @@ pub fn coherentLinearizableAdminSnapshot(
     svc: *Service,
     request: api_operation.RequestContext,
 ) !metadata_api.AdminSnapshot {
-    try svc.ensureLinearizableReadWithContext(request);
-    for (0..3) |_| {
+    const normalized = try request.platformDeadline();
+    const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+    const deadline_ns = @min(local_deadline_ns, normalized.deadline_ns orelse local_deadline_ns);
+    try svc.ensureLinearizableReadWithContext(normalized);
+    // Projection traffic can tear several captures while the request still
+    // has budget. Retry within the existing read deadline, yielding between
+    // captures, rather than treating three collisions as a read timeout.
+    while (platform_time.monotonicNs() < deadline_ns) {
         try request.ensureActive();
         const before = try svc.adminSnapshotFence();
         var snapshot = try svc.adminSnapshot();
         errdefer svc.freeAdminSnapshot(&snapshot);
         try request.ensureActive();
         const after = try svc.adminSnapshotFence();
+        if (platform_time.monotonicNs() >= deadline_ns) return error.MetadataLinearizableReadTimeout;
         if (sameAdminSnapshotFence(before, after)) return snapshot;
         svc.freeAdminSnapshot(&snapshot);
+        platform_clock.Clock.real().sleepMs(1);
     }
+    try request.ensureActive();
     return error.MetadataLinearizableReadTimeout;
 }
 

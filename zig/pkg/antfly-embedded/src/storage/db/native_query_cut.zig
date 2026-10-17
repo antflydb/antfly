@@ -48,6 +48,7 @@ pub const Manifest = struct {
     namespace: Namespace,
     sequence: u64,
     files: []const seal.File,
+    reuse_digest: ?[32]u8 = null,
 };
 pub fn nowMs() u64 {
     return @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
@@ -56,6 +57,9 @@ pub fn pathAlloc(a: A, db_path: []const u8, id: []const u8) ![]u8 {
     return std.fmt.allocPrint(a, "{s}.query-pins/{s}", .{ db_path, id });
 }
 pub fn finish(a: A, io: std.Io, root: []const u8, request: Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !void {
+    return finishWithReuseDigest(a, io, root, request, namespace, sequence, null, cancellation);
+}
+pub fn finishWithReuseDigest(a: A, io: std.Io, root: []const u8, request: Request, namespace: Namespace, sequence: u64, reuse_digest: ?[32]u8, cancellation: Cancellation) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const pa = arena.allocator();
@@ -65,7 +69,7 @@ pub fn finish(a: A, io: std.Io, root: []const u8, request: Request, namespace: N
         if (std.mem.eql(u8, file.path, "query-cut.json") or std.mem.eql(u8, file.path, "query-remote.json")) continue;
         try files.append(pa, file);
     }
-    const bytes = try std.json.Stringify.valueAlloc(pa, Manifest{ .request = request, .namespace = namespace, .sequence = sequence, .files = files.items }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(pa, Manifest{ .request = request, .namespace = namespace, .sequence = sequence, .files = files.items, .reuse_digest = reuse_digest }, .{});
     if (bytes.len > backup.max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
     _ = try backup.writeFileDurable(io, try std.fmt.allocPrint(pa, "{s}/query-cut.json", .{root}), bytes);
     try fs_paths.syncDirPortable(io, root);

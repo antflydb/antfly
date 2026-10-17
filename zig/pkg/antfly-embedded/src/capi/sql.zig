@@ -23,6 +23,33 @@ const ast = dependencies.sql_ast;
 pub const compiler = dependencies.sql_compiler;
 pub const runtime = dependencies.sql_runtime;
 
+/// Highlight JSON is a SQL JSONB value. Build it directly in the cursor's
+/// region, owning strings before the captured search result is released.
+pub fn highlightsValueLeaky(a: std.mem.Allocator, items: anytype) !?std.json.Value {
+    if (items.len == 0) return null;
+    var fields: std.json.ObjectMap = .empty;
+    for (items) |item| {
+        var fragments = std.json.Array.init(a);
+        for (item.fragments) |fragment| {
+            var object: std.json.ObjectMap = .empty;
+            try object.put(a, "text", .{ .string = try a.dupe(u8, fragment.text) });
+            try object.put(a, "offset", .{ .integer = fragment.offset });
+            if (fragment.item) |index| try object.put(a, "item", .{ .integer = index });
+            var spans = std.json.Array.init(a);
+            for (fragment.spans) |span| {
+                var object_span: std.json.ObjectMap = .empty;
+                try object_span.put(a, "start", .{ .integer = span.start });
+                try object_span.put(a, "end", .{ .integer = span.end });
+                try spans.append(.{ .object = object_span });
+            }
+            try object.put(a, "spans", .{ .array = spans });
+            try fragments.append(.{ .object = object });
+        }
+        try fields.put(a, try a.dupe(u8, item.field), .{ .array = fragments });
+    }
+    return .{ .object = fields };
+}
+
 pub fn Adapter(comptime native: type) type {
     return struct {
         const Self = @This();
@@ -51,6 +78,7 @@ pub fn Adapter(comptime native: type) type {
 
         fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.handle) |handle| @import("sql_ddl.zig").invalidate(handle);
             if (self.read_only) return error.SqlReadOnlyTransaction;
             const handle = self.handle orelse return error.UnsupportedSqlExecution;
             if (self.transaction) |session| if (session.active) return error.UnsupportedSqlExecution;
@@ -111,6 +139,8 @@ pub fn Adapter(comptime native: type) type {
             if (ddl_value.name.table.len == 0) {
                 if (ddl_value.schema_change.? != .drop_index) return error.InvalidSqlSyntax;
                 const name = ddl_value.schema_change.?.drop_index;
+                try tables.ensureDiscovered(handle);
+                if (handle.embedded_table_errors.count() != 0) return error.IntegrityCatalogUnavailable;
                 var found: ?[]const u8 = if (try ownsIndex(&handle.db, a, name)) "default" else null;
                 var iterator = handle.embedded_tables.valueIterator();
                 while (iterator.next()) |table| if (try ownsIndex(&table.*.db, a, name)) {
@@ -245,10 +275,33 @@ pub fn Adapter(comptime native: type) type {
             range: []const topology.RangeRecord,
         };
 
+        fn databaseRequiresCoordination(db: *DB) bool {
+            var view = db.core.acquireSchemaView() orelse return false;
+            defer view.release();
+            return view.hasCoordinatedConstraints();
+        }
+
+        pub fn localRequiresCoordination(self: *Self) !bool {
+            if (databaseRequiresCoordination(self.db)) return true;
+            if (self.handle) |handle| {
+                try @import("tables.zig").ensureDiscovered(handle);
+                // A missing namespace may contain inbound constraints. Force
+                // the complete catalog check rather than treating it as empty.
+                if (handle.embedded_table_errors.count() != 0) return true;
+                if (databaseRequiresCoordination(&handle.db)) return true;
+                var tables = handle.embedded_tables.valueIterator();
+                while (tables.next()) |table| if (databaseRequiresCoordination(&table.*.db)) return true;
+            }
+            return false;
+        }
+
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
-            if (self.handle) |handle| if (handle.embedded_table_errors.count() > 0) return error.IntegrityCatalogUnavailable;
+            if (self.handle) |handle| {
+                try @import("tables.zig").ensureDiscovered(handle);
+                if (handle.embedded_table_errors.count() > 0) return error.IntegrityCatalogUnavailable;
+            }
             const count = if (self.handle) |handle| handle.embedded_tables.count() + 1 else 1;
             const tables = try alloc.alloc(topology.TableRecord, count);
             const ranges = try alloc.alloc(topology.RangeRecord, count);
@@ -275,8 +328,9 @@ pub fn Adapter(comptime native: type) type {
                 return;
             };
             if (identity.table_id == 0) return error.CoordinatedConstraintsRequireTableIdentity;
-            const parsed = try native.public_api.tables.parseValidatedTableSchema(alloc, json);
-            if (expected) |version| if (parsed.version != version) return error.PreparedGenerationChanged;
+            var view = db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
+            defer view.release();
+            if (expected) |version| if (view.version() != version) return error.PreparedGenerationChanged;
             tables[used.*] = .{ .table_id = identity.table_id, .name = name, .schema_json = json };
             ranges[used.*] = .{ .group_id = identity.shard_id, .range_id = identity.range_id, .table_id = identity.table_id, .start_key = "", .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id };
             used.* += 1;
@@ -309,17 +363,17 @@ pub fn Adapter(comptime native: type) type {
             return error.UnsupportedSqlExecution;
         }
 
-        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
             const self = &selected_adapter;
             if (self.read_only) return error.SqlReadOnlyTransaction;
             if (!std.mem.eql(u8, table.physical_name, self.table_name)) return error.UndefinedTable;
             if (target.constraint_name == null and target.columns.len == 0 and target.expressions.len == 0) {
-                const json = (try self.db.getSchemaJson(alloc)) orelse return error.IntegrityCatalogUnavailable;
-                const parsed = try native.public_api.tables.parseValidatedTableSchema(alloc, json);
-                if (parsed.version != table.schema_version) return error.PreparedGenerationChanged;
-                if (!try integrity.requiresCoordination(alloc, json)) {
+                var view = self.db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
+                defer view.release();
+                if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+                if (!view.hasCoordinatedConstraints()) {
                     const output = try alloc.alloc(catalog.ConflictOwner, mutations.len);
                     @memset(output, .{ .key = null, .identity = null, .guard = null, .primary_only = true });
                     return output;
@@ -329,7 +383,7 @@ pub fn Adapter(comptime native: type) type {
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
             const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
-            const owners = try integrity.resolveConflictTargetOwners(alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
+            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;
@@ -432,20 +486,39 @@ pub fn Adapter(comptime native: type) type {
             var fences: [64]DB.StatementReadFence = undefined;
             var held: usize = 0;
             defer for (fences[0..held]) |*fence| fence.release();
-            while (held != owner_count) {
-                errdefer {
+            const visibility_deadline = self.db.backend_runtime.monotonicClock().nowRealtimeNs() +| 5 * std.time.ns_per_s;
+            var search_sequences: [64]u64 = undefined;
+            while (true) {
+                // Replay must run before any statement fence excludes index
+                // publication. Only the indexes used by each search are waited.
+                for (requests, prepared, 0..) |request, *search, i| if (search.*) |*owned| {
+                    var selected_adapter = try self.selected(request.table.physical_name);
+                    search_sequences[i] = try selected_adapter.waitSearchIndexes(search_arena.allocator(), owned.query.req, visibility_deadline);
+                };
+                while (held != owner_count) {
+                    errdefer {
+                        for (fences[0..held]) |*fence| fence.release();
+                        held = 0;
+                    }
+                    if (try owners[held].tryStatementReadFence()) |fence| {
+                        fences[held] = fence;
+                        held += 1;
+                        continue;
+                    }
                     for (fences[0..held]) |*fence| fence.release();
                     held = 0;
+                    if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
+                    try io.sleep(.fromMilliseconds(1), .awake);
                 }
-                if (try owners[held].tryStatementReadFence()) |fence| {
-                    fences[held] = fence;
-                    held += 1;
-                    continue;
-                }
+                const changed = for (requests, prepared, 0..) |request, *search, i| {
+                    if (search.* == null) continue;
+                    const selected_adapter = try self.selected(request.table.physical_name);
+                    if (selected_adapter.db.core.nextDerivedSequence() != search_sequences[i]) break true;
+                } else false;
+                if (!changed) break;
                 for (fences[0..held]) |*fence| fence.release();
                 held = 0;
                 if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
-                try io.sleep(.fromMilliseconds(1), .awake);
             }
             for (requests, prepared, cursors) |request, *search, *cursor| {
                 if (search.*) |*owned| {
@@ -513,9 +586,113 @@ pub fn Adapter(comptime native: type) type {
             return .{ .query = owned, .fields = fields, .highlights = highlights };
         }
 
+        pub fn waitSearchIndexes(self: *Self, alloc: std.mem.Allocator, req: types.SearchRequest, deadline_ns: u64) !u64 {
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(alloc);
+            const append = struct {
+                fn unique(a: std.mem.Allocator, list: *std.ArrayList([]const u8), name: []const u8) !void {
+                    for (list.items) |existing| if (std.mem.eql(u8, existing, name)) return;
+                    try list.append(a, name);
+                }
+            }.unique;
+            if (req.index_name) |name| try append(alloc, &names, name);
+            if (req.primary_text_index_name) |name| try append(alloc, &names, name);
+            for (req.full_text_queries) |query| try append(alloc, &names, query.index_name);
+            for (req.dense_queries) |query| try append(alloc, &names, query.index_name);
+            for (req.sparse_queries) |query| try append(alloc, &names, query.index_name);
+            for (req.graph_queries) |query| try append(alloc, &names, query.query.index_name);
+            const implicit_text = req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0;
+            if (req.filter_text != null or req.exclusion_text != null or req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0 or (req.full_text_queries.len == 0 and (req.full_text != null or implicit_text))) {
+                const name = try self.db.resolvedFilterTextIndexNameAlloc(alloc, req.primary_text_index_name, req.index_name);
+                defer if (name) |owned| alloc.free(owned);
+                if (name) |text_name| {
+                    try append(alloc, &names, text_name);
+                    return self.db.waitForCurrentIndexTargets(names.items, deadline_ns);
+                }
+            }
+            return self.db.waitForCurrentIndexTargets(names.items, deadline_ns);
+        }
+
+        const RelationalSearchCursor = struct {
+            alloc: std.mem.Allocator,
+            arena: std.heap.ArenaAllocator,
+            result: types.SearchResult,
+            reader: ?DB.RelationalRows.Reader,
+            layout: *const catalog.Row.TypedLayout,
+            projection: dependencies.sql_document_row.Projection,
+            position: usize = 0,
+            fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (limit == 0 or limit > 4096) return error.InvalidSqlLimit;
+                var page = std.heap.ArenaAllocator.init(alloc);
+                errdefer page.deinit();
+                const a = page.allocator();
+                const count = @min(self.result.hits.len - self.position, limit);
+                const rows = try a.alloc(catalog.Row, count);
+                const layout = try self.layout.clone(a);
+                const score_slot = layout.ordinals.get("score");
+                const highlight_slot = layout.ordinals.get("_highlights");
+                var produced: usize = 0;
+                var bytes: usize = 0;
+                while (produced < count and bytes < 256 * 1024) {
+                    if (self.reader) |*reader| {
+                        // Large highlight JSON is hydrated one row at a time;
+                        // ordinary rank metadata fits the native row budget.
+                        const n = @min(count - produced, if (highlight_slot != null) @as(usize, 1) else 64);
+                        var ids: [64][]const u8 = undefined;
+                        for (self.result.hits[self.position + produced ..][0..n], 0..) |hit, i| ids[i] = hit.id;
+                        const batch = try reader.lookupSqlBatch(a, ids[0..n], layout, 256 * 1024 - bytes);
+                        for (batch.rows, self.result.hits[self.position + produced ..][0..batch.consumed], rows[produced..][0..batch.consumed]) |candidate, hit, *out| {
+                            const row = candidate orelse return error.SqlStatementReadUnavailable;
+                            const cells = row.typed_cells.?;
+                            // These newly allocated page cells are unpublished
+                            // and exclusively owned until this method returns.
+                            const values = @constCast(cells.values);
+                            const presence = @constCast(cells.presence.?);
+                            if (score_slot) |slot| {
+                                values[slot] = if (hit.score) |score| catalog.Row.Cell.json(.{ .float = score }) else .{};
+                                presence[slot] = true;
+                            }
+                            if (highlight_slot) |slot| {
+                                const highlights = try highlightsValueLeaky(a, hit.highlights);
+                                values[slot] = if (highlights) |value| catalog.Row.Cell.json(value) else .{};
+                                presence[slot] = highlights != null;
+                            }
+                            out.* = .{ .id = row.key, .version = row.version, .value = .null, .typed_cells = cells, .expected_content_digest = row.expected_content_digest };
+                            bytes +|= out.id.len;
+                            for (values) |value| bytes +|= try dependencies.sql_operators.datumBytes(value);
+                        }
+                        produced += batch.consumed;
+                    } else {
+                        const hit = self.result.hits[self.position + produced];
+                        var document = if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
+                        if (document != .object) return error.InvalidSqlBackendResponse;
+                        try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
+                        if (try highlightsValueLeaky(a, hit.highlights)) |value| try document.object.put(a, "_highlights", value) else _ = document.object.swapRemove("_highlights");
+                        const out = &rows[produced];
+                        out.* = try self.projection.projectValue(a, hit.id, 0, document);
+                        bytes +|= out.id.len;
+                        for (try out.fieldNames()) |name| bytes +|= try dependencies.sql_operators.datumBytes(try out.cell(name));
+                        produced += 1;
+                    }
+                }
+                const end = self.position + produced;
+                const after = if (end < self.result.hits.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null;
+                self.position = end;
+                return .{ .rows = rows[0..produced], .after = after, .owned_arena = page };
+            }
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.reader) |*reader| reader.deinit();
+                self.result.deinit();
+                self.arena.deinit();
+                self.alloc.destroy(self);
+            }
+        };
+
         const SearchProvider = struct {
             pub const Reader = DB.RelationalRows.Reader;
-            // lookupTypedRow's projectSqlTypedAlloc contract owns every
+            // lookupSqlRow's native projection contract owns every
             // selected payload in the supplied page allocator.
             pub const typed_page_owned = true;
             pub const Result = types.SearchResult;
@@ -553,6 +730,27 @@ pub fn Adapter(comptime native: type) type {
             if (!prepared.highlights) search.highlight = null;
             var captured = try lease.search(alloc, search);
             errdefer captured.result.deinit();
+            if (table.storage_mode == .relational) {
+                const cursor = try alloc.create(RelationalSearchCursor);
+                errdefer alloc.destroy(cursor);
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                errdefer arena.deinit();
+                const a = arena.allocator();
+                var fields: std.ArrayList([]const u8) = .empty;
+                var output_names: std.StringArrayHashMapUnmanaged(void) = .empty;
+                for (request.fields) |field| {
+                    if (!std.mem.eql(u8, field, "_id")) try output_names.put(a, try a.dupe(u8, field), {});
+                    if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "score") and !std.mem.eql(u8, field, "_highlights")) try fields.append(a, field);
+                }
+                var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, fields.items, table.schema_version) else null;
+                errdefer if (reader) |*value| value.deinit();
+                const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
+                const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.init(a, table, request.fields) else .{ .columns = &.{} };
+                // Finish allocating before moving the arena: a later allocation
+                // could add a chunk that the cursor's earlier copy would not own.
+                cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .layout = layout, .projection = projection };
+                return .{ .ptr = cursor, .next = RelationalSearchCursor.next, .close = RelationalSearchCursor.close };
+            }
             var typed_reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational)
                 try lease.relationalRows(alloc, prepared.fields, table.schema_version)
             else
@@ -610,12 +808,12 @@ pub fn Adapter(comptime native: type) type {
             projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
-                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
                 const layout = try self.projection.pageLayout(owned);
-                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
                 const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
                 return .{ .rows = rows, .after = after, .owned_arena = page.arena };
             }
@@ -749,8 +947,10 @@ pub fn Adapter(comptime native: type) type {
             const request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
             var prepared: ?integrity.Prepared = null;
             defer if (prepared) |*value| value.deinit();
-            const schema_json = (try self.db.getSchemaJson(temporary)) orelse return error.IntegrityCatalogUnavailable;
-            if (try integrity.requiresCoordination(temporary, schema_json)) {
+            var view = self.db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
+            defer view.release();
+            if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+            if (view.hasCoordinatedConstraints()) {
                 const metadata = try self.localCatalog(temporary, table.schema_version);
                 var generation: ?[32]u8 = null;
                 var commands: std.ArrayList(@typeInfo(@FieldType(types.BatchRequest, "integrity_commands")).pointer.child) = .empty;

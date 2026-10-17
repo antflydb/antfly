@@ -87,6 +87,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
     const strip = shared.strip;
     const lmdb_backend = shared.lmdb_backend;
@@ -735,6 +737,54 @@ pub fn create(b: *std.Build) ?Artifacts {
         .run_raft_library_tests = run_raft_library_tests,
     });
     const antfly_test_mod = owner_tests.antfly_test_mod;
+    const model_chunk_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "model aware media", "model chunk artifact" },
+    });
+    const model_chunk_step = b.step("antfly-media-chunking-test", "Qualify typed chunk provider ownership, artifact recipes and incomplete coverage");
+    model_chunk_step.dependOn(&b.addRunArtifact(model_chunk_tests).step);
+    const chunk_capability_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("antfly_inference_remote_capabilities").?,
+        .filters = &.{"model aware media remote capability"},
+    });
+    model_chunk_step.dependOn(&b.addRunArtifact(chunk_capability_tests).step);
+    const chunk_error_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("storage_engine_errors").?,
+    });
+    const chunk_error_run = b.addRunArtifact(chunk_error_tests);
+    model_chunk_step.dependOn(&chunk_error_run.step);
+    const error_identity_step = b.step("runtime-error-identities-test", "Validate native error names and model-aware chunk failure transport");
+    error_identity_step.dependOn(&chunk_error_run.step);
+    const error_provider = b.addLibrary(.{ .name = "chunk-error-test-provider", .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const error_consumer = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    error_consumer.addImport("storage_engine_errors", antfly_test_mod.import_table.get("storage_engine_errors").?);
+    error_consumer.addImport("antfly_test_error_logs", antfly_test_mod.import_table.get("antfly_test_error_logs").?);
+    error_consumer.linkLibrary(error_provider);
+    const error_roundtrip = b.addRunArtifact(b.addTest(.{
+        .root_module = error_consumer,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }));
+    error_identity_step.dependOn(&error_roundtrip.step);
+    model_chunk_step.dependOn(&error_roundtrip.step);
+    const error_status_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_error_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) }));
+    error_identity_step.dependOn(&error_status_run.step);
+    model_chunk_step.dependOn(&error_status_run.step);
+
     const run_antfly_embedded_pkg_tests = owner_tests.run_antfly_embedded_pkg_tests;
     const run_lite_native_tests = owner_tests.run_lite_native_tests;
     const run_lite_cmd_tests = owner_tests.run_lite_cmd_tests;
@@ -783,6 +833,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_png_tests.step);
     lib_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);
     lib_test_step.dependOn(&run_hf_tokenizer_tests.step);
     lib_test_step.dependOn(platform_test_step);
@@ -896,6 +948,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .production_antfly_imports = production_antfly_imports,
         .antfly_client_pkg_mod = antfly_client_pkg_mod,
         .capi_mod = capi_mod,
+        .native_storage = embedded.native_storage,
         .native_enrichment = embedded.native_enrichment,
         .native_inference = embedded.native_inference,
     });
@@ -1205,8 +1258,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const unit_gate = b.step("unit-test", "Run and audit all four unit ownership gates");
     for ([_][]const u8{ "lib-test", "antfly-unit-test", "inference-test", "inference-finetune-test", "unit-test-inventory" }) |name|
         unit_gate.dependOn(&b.top_level_steps.get(name).?.step);
-    @import("build_support/antfly/test_cache_lifetime.zig").add(b, unit_gate);
     if (strip) @import("pkg/antfly/build/runtime.zig").stripBuildGraph(b);
+    @import("pkg/antfly/build/linked_tests.zig").finalizeNativeLinks(b);
+    @import("build_support/antfly/test_cache_lifetime.zig").add(b, unit_gate);
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }
 

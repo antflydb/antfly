@@ -29,6 +29,8 @@ const ownership_mod = @import("../ownership.zig");
 const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const graph_expiration = @import("../graph_edge_ttl_expiration.zig");
+const graph_ttl_migration = @import("graph_ttl_migration.zig");
+const resolver_catalog = @import("../catalog/resolver_catalog.zig");
 
 pub const Config = struct {
     enabled: bool = builtin.os.tag != .freestanding and !builtin.is_test,
@@ -64,7 +66,9 @@ pub const GraphExpireFn = *const fn (ctx_ptr: *anyopaque, candidates: []const gr
 
 pub const default_lease_key = "\x00\x00__metadata__:ttl_cleanup_lease";
 
-pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const TtlRuntime = if (builtin.os.tag == .freestanding) UnsupportedTtlRuntime else PlatformTtlRuntime;
+const UnsupportedTtlRuntime = struct {
     config: Config,
     defer_flag: ?*const std.atomic.Value(bool),
     stats_value: types.TTLCleanupStats = .{},
@@ -122,10 +126,15 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.config.enabled) return error.UnsupportedPlatform;
     }
 
+    pub fn needsAnotherPage(_: *@This()) bool {
+        return false;
+    }
+
     pub fn stats(self: *@This()) types.TTLCleanupStats {
         return self.stats_value;
     }
-} else struct {
+};
+const PlatformTtlRuntime = struct {
     alloc: Allocator,
     /// Borrowed backend-neutral executor. Its implementation is owned by the
     /// BackendRuntime and may be Threaded or VoprIo.
@@ -149,6 +158,7 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     scan_after: ?[]u8 = null,
     graph_scan_after: ?[]u8 = null,
+    last_pass_more: std.atomic.Value(bool) = .init(false),
 
     pub fn init(
         alloc: Allocator,
@@ -273,8 +283,15 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
         if (workDeferred(self)) return;
         const now_ns = self.config.clock.nowRealtimeNs();
         if (!ensureLease(self, now_ns)) return;
-        const summary = try collectAndDelete(self, now_ns);
+        const summary = collectAndDelete(self, now_ns) catch |err| {
+            recordRun(self, now_ns, .{}, true);
+            return err;
+        };
         recordRun(self, now_ns, summary, false);
+    }
+
+    pub fn needsAnotherPage(self: *const TtlRuntime) bool {
+        return self.last_pass_more.load(.acquire);
     }
 
     pub fn stats(self: *TtlRuntime) types.TTLCleanupStats {
@@ -454,6 +471,16 @@ fn collectAndDelete(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
 
 fn collectGraphAndExpire(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
     const callback = runtime.graph_expire_fn orelse return .{};
+    {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        // TTL graph writers publish this epoch before using the new key
+        // family. Earlier files with no graph TTL may contain only promotion
+        // companions in the legacy family; they need no expiry scan at all.
+        if (try resolver_catalog.readAuthoritativeReaderVersion(&read, resolver_catalog.supported_reader_version) < resolver_catalog.graph_expiration_namespace_reader_version)
+            return .{};
+    }
+    const migrating = try graph_ttl_migration.advance(runtime.alloc, &runtime.store, .{ .keys = runtime.config.scan_key_budget, .bytes = runtime.config.scan_byte_budget });
     const prefix = &internal_keys.graph_edge_expiration_index_prefix;
     const upper = try internal_keys.nextPrefixAlloc(runtime.alloc, prefix);
     defer if (upper) |key| runtime.alloc.free(key);
@@ -464,7 +491,7 @@ fn collectGraphAndExpire(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
     }
     var candidates = std.ArrayListUnmanaged(graph_expiration.Due).empty;
     defer candidates.deinit(runtime.alloc);
-    var summary = ScanSummary{};
+    var summary: ScanSummary = .{ .more = migrating };
     const ScanState = struct {
         runtime: *TtlRuntime,
         now_ns: u64,
@@ -546,7 +573,7 @@ fn collectGraphAndExpire(runtime: *TtlRuntime, now_ns: u64) !ScanSummary {
             runtime.graph_scan_after = next_after;
         } else if (next_after) |key| runtime.alloc.free(key);
     }
-    summary.more = state.stopped;
+    summary.more = summary.more or state.stopped;
     if (candidates.items.len == 0) return summary;
     const expired = callback(runtime.delete_ctx, candidates.items) catch |err| switch (err) {
         error.CoordinatedTtlBackpressure => {
@@ -618,6 +645,7 @@ fn recordRun(runtime: *TtlRuntime, now_ns: u64, summary: ScanSummary, failed: bo
     runtime.stats_value.expired_graph_sources += summary.expired_graph_sources;
     runtime.stats_value.expired_graph_artifacts += summary.expired_graph_artifacts;
     runtime.stats_value.last_run_ns = now_ns;
+    runtime.last_pass_more.store(!failed and summary.more, .release);
     if (failed) runtime.stats_value.error_count += 1;
 }
 
@@ -933,6 +961,7 @@ test "db graph ttl shared GC serves graphs during document admission pressure" {
     {
         var txn = try store.beginWrite();
         errdefer txn.abort();
+        try txn.put(resolver_catalog.minimum_reader_key, "4");
         try txn.put(due_key, due);
         try txn.commit();
     }

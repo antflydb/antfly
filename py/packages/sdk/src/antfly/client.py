@@ -21,6 +21,9 @@ from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
     BedrockEmbedderConfig,
+    ChunkEmbeddingContext,
+    ChunkEmbeddingObject,
+    ChunkEmbeddingResponse,
     CreateAlgebraicIndexRequest,
     CreatedAlgebraicIndex,
     CreatedEmbeddingsIndex,
@@ -179,7 +182,7 @@ def _validate_graph_edge_weight(value: Mapping[str, Any], path: str) -> None:
         if field not in raw_range:
             continue
         bound = raw_range[field]
-        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+        if isinstance(bound, bool) or not isinstance(bound, int | float):
             raise AntflyException(f"{path}.edge_weight.{field} must be a finite non-negative number")
         try:
             normalized = float(bound)
@@ -533,6 +536,81 @@ def _iter_generation_chunks(response: Response) -> Iterator[InferenceGenerateChu
         except (KeyError, TypeError, ValueError) as exc:
             raise AntflyException(f"generation stream returned invalid JSON: {exc}") from exc
     raise AntflyException("generation stream ended before [DONE]")
+
+
+def _iter_chunk_embeddings(
+    response: Response, continuation: str | None, expected_identity: str | None = None
+) -> Iterator[ChunkEmbeddingContext | ChunkEmbeddingObject | ChunkEmbeddingResponse]:
+    plan = continuation[:64] if continuation else None
+    next_ordinal = int(continuation[65:]) if continuation else 0
+    context: dict[str, Any] | None = None
+    for raw in _iter_bounded_response_lines(response, MAX_EXTRACTION_RESPONSE_BYTES):
+        if not raw.strip():
+            continue
+        event = json.loads(raw)
+        if event.get("object") == "chunk.embedding.start":
+            header = event["context"]
+            if (
+                context is not None
+                or any(
+                    not isinstance(header.get(key), str)
+                    or len(header[key]) != 64
+                    or any(c not in "0123456789abcdef" for c in header[key])
+                    for key in ("plan_id", "model_identity", "model_revision", "source_fingerprint")
+                )
+                or header.get("start_ordinal") != next_ordinal
+                or (plan is not None and plan != header["plan_id"])
+                or (expected_identity is not None and expected_identity != header["model_identity"])
+            ):
+                raise AntflyException("invalid chunk stream context")
+            context = header
+            plan = header["plan_id"]
+            yield ChunkEmbeddingContext.from_dict(header)
+        elif event.get("object") == "chunk.embedding":
+            if context is None:
+                raise AntflyException("missing chunk stream context")
+            item = event["data"]
+            descriptor = item["descriptor"]
+            prefix = descriptor["id"][:64]
+            if (
+                len(prefix) != 64
+                or descriptor["id"] != f"{prefix}:{next_ordinal}"
+                or descriptor["ordinal"] != next_ordinal
+                or (plan is not None and prefix != plan)
+            ):
+                raise AntflyException("invalid chunk stream identity or order")
+            plan = prefix
+            next_ordinal += 1
+            yield ChunkEmbeddingObject.from_dict(item)
+        elif event.get("object") == "chunk.embedding.complete":
+            terminal = event["response"]
+            if (
+                context is None
+                or any(
+                    terminal.get(key) != context.get(key)
+                    for key in (
+                        "model",
+                        "model_identity",
+                        "model_revision",
+                        "source_fingerprint",
+                        "source_version",
+                        "task_type",
+                        "start_ordinal",
+                    )
+                )
+                or (context.get("dimensions") is not None and terminal.get("dimensions") != context["dimensions"])
+                or terminal.get("object") != "chunk.embedding.list"
+                or terminal.get("covered_through_ordinal") != next_ordinal
+                or (plan is not None and terminal.get("plan_id") != plan)
+            ):
+                raise AntflyException("chunk terminal coverage mismatch")
+            yield ChunkEmbeddingResponse.from_dict(terminal)
+            return
+        elif event.get("object") == "chunk.embedding.error":
+            raise AntflyException(f"chunk stream initialization failed: {event.get('code')}")
+        else:
+            raise AntflyException("unknown chunk stream event")
+    raise AntflyException("chunk stream ended before terminal coverage")
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -986,6 +1064,50 @@ class AntflyClient:
             if content_type != "text/event-stream":
                 raise AntflyException(f"generation stream returned content type {content_type!r}")
             yield _iter_generation_chunks(response)
+
+    def chunk_and_embed(self, request: Mapping[str, Any]) -> ChunkEmbeddingResponse:
+        """Plan and embed text, PDF, image, GIF, audio or video with provenance.
+
+        Check status/gaps/next_continuation before certifying source coverage.
+        """
+        body = dict(request)
+        if not body.get("embedding"):
+            raise ValueError("chunk embedding target is required")
+        body["stream"] = False
+        with self._client.get_httpx_client().stream(
+            "POST", "/ai/v1/chunk", json=body, headers={"Accept": "application/json"}
+        ) as response:
+            if not 200 <= response.status_code < 300:
+                _raise_inference_error(response)
+            raw, truncated = _read_limited_response(response, MAX_EXTRACTION_RESPONSE_BYTES)
+            if truncated:
+                raise AntflyException("chunk embedding response exceeded 16 MiB; use streaming")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or payload.get("object") != "chunk.embedding.list":
+                raise AntflyException("unexpected chunk embedding response")
+            return ChunkEmbeddingResponse.from_dict(payload)
+
+    @contextmanager
+    def chunk_and_embed_stream(
+        self, request: Mapping[str, Any]
+    ) -> Iterator[Iterator[ChunkEmbeddingContext | ChunkEmbeddingObject | ChunkEmbeddingResponse]]:
+        """Consume with backpressure; only the final response confirms coverage.
+
+        Exiting the context early closes the source. Interrupted streams raise;
+        callers deduplicate acknowledged chunk IDs when resuming.
+        """
+        body = dict(request)
+        if not body.get("embedding"):
+            raise ValueError("chunk embedding target is required")
+        body["stream"] = True
+        with self._client.get_httpx_client().stream(
+            "POST", "/ai/v1/chunk", json=body, headers={"Accept": "application/x-ndjson"}
+        ) as response:
+            if not 200 <= response.status_code < 300:
+                _raise_inference_error(response)
+            if response.headers.get("content-type", "").partition(";")[0].strip() != "application/x-ndjson":
+                raise AntflyException("expected chunk embedding NDJSON stream")
+            yield _iter_chunk_embeddings(response, body.get("continuation"), body["embedding"].get("model_identity"))
 
     # Table operations
 

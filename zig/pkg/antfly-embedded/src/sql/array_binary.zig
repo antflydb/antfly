@@ -22,7 +22,7 @@ const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
 const output = @import("array_output.zig");
-pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024, context: ?*@import("numeric_value.zig").Context = null };
+pub const Options = struct { compact: bool = false, values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024, context: ?*@import("numeric_value.zig").Context = null };
 
 fn elementSize(kind: arrays.ElementType, element: arrays.Element, index: usize, prepared: *output.Prepared, work: *arrays.Budget) !usize {
     if (element.sql_null) return 0;
@@ -57,7 +57,7 @@ fn sharedFailure(options: Options, err: anyerror) anyerror {
 fn encodeInner(alloc: A, value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
     var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     try work.consume(0);
-    const validated = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
+    const validated = try value.validateWithBudget(options.values, &work);
     if (validated.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     for (value.dimensions) |dimension| if (dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
     var prepared: output.Prepared = undefined;
@@ -66,7 +66,8 @@ fn encodeInner(alloc: A, value: arrays.Value, writer: *std.Io.Writer, options: O
     var size: usize = 12 + value.dimensions.len * 8;
     var has_null = false;
     const before = work.remaining;
-    for (value.elements, 0..) |element, i| {
+    for (0..value.cardinality()) |i| {
+        const element = value.flatCell(i);
         try work.consume(1);
         has_null = has_null or element.sql_null;
         const length = try elementSize(value.element_type, element, i, &prepared, &work);
@@ -92,7 +93,8 @@ fn emit(value: arrays.Value, writer: *std.Io.Writer, options: Options, prepared:
         try writer.writeInt(i32, @intCast(dimension.length), .big);
         try writer.writeInt(i32, dimension.lower, .big);
     }
-    for (value.elements, 0..) |element, i| {
+    for (0..value.cardinality()) |i| {
+        const element = value.flatCell(i);
         try work.consume(1);
         if (element.sql_null) {
             try writer.writeInt(i32, -1, .big);
@@ -231,6 +233,37 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
     // Each cell requires at least its signed length prefix. Reject impossible
     // shapes before attempting a count-sized allocation.
     if (count > (bytes.len - reader.position) / 4) return error.InvalidSqlBinaryRepresentation;
+    if (options.compact and @import("array_compact.zig").supported(expected)) {
+        var probe = reader;
+        var non_null: usize = 0;
+        var payload: usize = 0;
+        for (0..count) |_| {
+            const length = try probe.int(i32);
+            if (length == -1) continue;
+            if (length < -1) return error.InvalidSqlBinaryRepresentation;
+            const raw = try probe.take(@intCast(length));
+            non_null += 1;
+            payload = try std.math.add(usize, payload, raw.len);
+        }
+        if (probe.position != bytes.len) return error.InvalidSqlBinaryRepresentation;
+        var builder = try @import("array_compact.zig").Builder.init(a, expected, dimensions[0..@intCast(rank)], count, non_null, payload, options.values);
+        for (0..count) |_| {
+            const length = try reader.int(i32);
+            if (length == -1) {
+                try builder.append(.{});
+                continue;
+            }
+            const raw = try reader.take(@intCast(length));
+            if (expected == .text) {
+                try work.consume(raw.len);
+                if (!std.unicode.utf8ValidateSlice(raw)) return error.SqlInvalidTextEncoding;
+                if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlUntranslatableCharacter;
+                try builder.append(.json(.{ .string = raw }));
+            } else try builder.append(try decodeElementLeaky(a, expected, raw, &work));
+        }
+        try work.consume(builder.bytes.len + count);
+        return .{ .value = try builder.finish(a, options.values), .work = options.values.work - work.remaining };
+    }
     const cells = try a.alloc(arrays.Element, count);
     for (cells) |*cell| {
         try work.consume(1);
@@ -345,11 +378,11 @@ test "SQL PostgreSQL array binary boundaries match receive normalization and dia
     const bool_bytes = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 2 };
     var boolean = try decode(a, .boolean, &bool_bytes, .{});
     defer boolean.deinit();
-    try std.testing.expect(boolean.value.elements[0].value.bool);
+    try std.testing.expect(boolean.value.flatCell(0).value.bool);
     var integers = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 1, 0, 0, 0, 1, 255, 255, 255, 255 };
     var nullable = try decode(a, .int32, &integers, .{});
     defer nullable.deinit();
-    try std.testing.expect(nullable.value.elements[0].sql_null);
+    try std.testing.expect(nullable.value.flatCell(0).sql_null);
     std.mem.writeInt(i32, integers[16..20], std.math.maxInt(i32), .big);
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .int32, &integers, .{}));
     std.mem.writeInt(i32, integers[16..20], std.math.maxInt(i32) - 1, .big);

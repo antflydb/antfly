@@ -435,6 +435,7 @@ const mappings = [_]Mapping{
     .{ .status = .bad_unit_input, .err = error.BadUnitInput },
     .{ .status = .document_extraction_chunk_range_missing, .err = error.DocumentExtractionChunkRangeMissing },
     .{ .status = .document_extraction_working_set_too_large, .err = error.DocumentExtractionWorkingSetTooLarge },
+    .{ .status = .document_artifact_publication_failed, .err = error.DocumentArtifactPublicationFailed },
     .{ .status = .invalid_document_extraction_manifest, .err = error.InvalidDocumentExtractionManifest },
     .{ .status = .invalid_document_extraction_state, .err = error.InvalidDocumentExtractionState },
     .{ .status = .invalid_graph_asset_state, .err = error.InvalidGraphAssetState },

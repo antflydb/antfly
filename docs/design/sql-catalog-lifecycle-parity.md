@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `7aa031f49d` in merge checkpoint `8e962ee4e2`. Earlier implementation and
+at `acf50f2f60` (2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -9,12 +9,12 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-529 implemented / 132 rejected / 113 superseded / 812 unresolved. Counts below
+531 implemented / 132 rejected / 113 superseded / 810 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
-| 1 | DDL, catalog and sessions | 305 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
+| 1 | DDL, catalog and sessions | 303 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 128 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
@@ -22,8 +22,8 @@ are unresolved family pools, not promises that one implementation closes them.
 
 ## First delivery: catalog and index lifecycle
 
-Within the 305-case DDL/catalog/session pool, the largest unresolved statement
-groups currently include 35 ALTER TABLE, 27 CREATE FUNCTION, 26 CREATE INDEX /
+At the earlier 305-case DDL/catalog/session checkpoint, the largest unresolved
+statement groups included 35 ALTER TABLE, 27 CREATE FUNCTION, 26 CREATE INDEX /
 CREATE UNIQUE INDEX, 19 CREATE TABLE, and 12 COPY cases. These are statement
 counts, not implementation estimates: CREATE FUNCTION needs a separate routine
 execution architecture, while ALTER TABLE and index/table DDL share the current

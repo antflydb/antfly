@@ -120,6 +120,12 @@ pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
     alloc.free(chunks);
 }
 
+/// The minimal/test owner has no model-aware media chunking runtime. Preserve
+/// the provider boundary without silently substituting text-only chunking.
+pub fn chunkInputWithConfigJsonAndProvider(_: Allocator, _: anytype, _: []const u8, _: anytype) error{UnsupportedPlatform}![]Chunk {
+    return error.UnsupportedPlatform;
+}
+
 fn remapChunkOffsets(sanitized: *const utf8_text.SanitizedText, chunks: []Chunk) void {
     for (chunks) |*chunk| {
         if (chunk.start_offset) |start| chunk.start_offset = mapU32Offset(sanitized, start, .start);

@@ -98,6 +98,8 @@ pub const ExtractedWrite = struct {
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
     sparse_embeddings: []SparseEmbeddingWrite,
+    /// Explicit null directives; omission leaves caller-owned vectors intact.
+    deleted_embedding_indexes: [][]u8 = &.{},
     /// Transient logical source for immediate full-text application. The tree
     /// borrows `prepared_region` and is deliberately never cloned or serialized;
     /// durable replay reconstructs the typed root from the committed AROW.
@@ -178,96 +180,101 @@ pub const ExtractedWrite = struct {
             out.cleaned_value = if (self.cleaned_value_owned or self.logical_source != null) try alloc.dupe(u8, value) else @constCast(value);
             out.cleaned_value_owned = self.cleaned_value_owned or self.logical_source != null;
         }
-        out.graph_writes = try alloc.alloc(types.GraphEdgeWrite, self.graph_writes.len);
-        var graph_initialized: usize = 0;
-        errdefer out.graph_writes = out.graph_writes[0..graph_initialized];
-        for (self.graph_writes, 0..) |write, i| {
-            out.graph_writes[i] = blk: {
-                const index_name = try alloc.dupe(u8, write.index_name);
-                errdefer alloc.free(index_name);
-                const source = try alloc.dupe(u8, write.source);
-                errdefer alloc.free(source);
-                const target = try alloc.dupe(u8, write.target);
-                errdefer alloc.free(target);
-                const edge_type = try alloc.dupe(u8, write.edge_type);
-                errdefer alloc.free(edge_type);
-                const edge_id = try alloc.dupe(u8, write.edge_id);
-                errdefer alloc.free(edge_id);
-                const owner_document = try alloc.dupe(u8, write.owner_document);
-                errdefer alloc.free(owner_document);
-                const metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "";
-                errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
-                const owner = if (write.owner.len > 0) try alloc.dupe(u8, write.owner) else "";
-                break :blk .{
-                    .index_name = index_name,
-                    .source = source,
-                    .target = target,
-                    .edge_type = edge_type,
-                    .edge_id = edge_id,
-                    .owner_document = owner_document,
-                    .weight = write.weight,
-                    .created_at = write.created_at,
-                    .updated_at = write.updated_at,
-                    .metadata_json = metadata_json,
-                    .owner = owner,
+        out.graph_writes = blk: {
+            const items = try alloc.alloc(types.GraphEdgeWrite, self.graph_writes.len);
+            errdefer alloc.free(items);
+            var initialized: usize = 0;
+            errdefer for (items[0..initialized]) |*write| write.deinit(alloc);
+            for (self.graph_writes, 0..) |write, i| {
+                items[i] = try write.cloneAlloc(alloc);
+                initialized += 1;
+            }
+            break :blk items;
+        };
+        out.mentioned_graph_indexes = try cloneNames(alloc, self.mentioned_graph_indexes);
+        out.deleted_embedding_indexes = try cloneNames(alloc, self.deleted_embedding_indexes);
+        out.dense_embeddings = entries: {
+            const items = try alloc.alloc(DenseEmbeddingWrite, self.dense_embeddings.len);
+            errdefer alloc.free(items);
+            var initialized: usize = 0;
+            errdefer for (items[0..initialized]) |embedding| freeDenseEmbedding(alloc, embedding);
+            for (self.dense_embeddings, 0..) |embedding, i| {
+                items[i] = blk: {
+                    const index_name = try alloc.dupe(u8, embedding.index_name);
+                    errdefer alloc.free(index_name);
+                    const doc_key = try alloc.dupe(u8, embedding.doc_key);
+                    errdefer alloc.free(doc_key);
+                    const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+                    errdefer if (artifact_key) |key| alloc.free(key);
+                    const vector = try alloc.dupe(f32, embedding.vector);
+                    break :blk .{
+                        .index_name = index_name,
+                        .doc_key = doc_key,
+                        .parent_doc_key = embedding.parent_doc_key,
+                        .artifact_key = artifact_key,
+                        .vector = vector,
+                    };
                 };
-            };
-            graph_initialized += 1;
-        }
-        out.mentioned_graph_indexes = try alloc.alloc([]u8, self.mentioned_graph_indexes.len);
-        var mentioned_initialized: usize = 0;
-        errdefer out.mentioned_graph_indexes = out.mentioned_graph_indexes[0..mentioned_initialized];
-        for (self.mentioned_graph_indexes, 0..) |name, i| {
-            out.mentioned_graph_indexes[i] = try alloc.dupe(u8, name);
-            mentioned_initialized += 1;
-        }
-        out.dense_embeddings = try alloc.alloc(DenseEmbeddingWrite, self.dense_embeddings.len);
-        var dense_initialized: usize = 0;
-        errdefer out.dense_embeddings = out.dense_embeddings[0..dense_initialized];
-        for (self.dense_embeddings, 0..) |embedding, i| {
-            out.dense_embeddings[i] = blk: {
-                const index_name = try alloc.dupe(u8, embedding.index_name);
-                errdefer alloc.free(index_name);
-                const doc_key = try alloc.dupe(u8, embedding.doc_key);
-                errdefer alloc.free(doc_key);
-                const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
-                errdefer if (artifact_key) |key| alloc.free(key);
-                const vector = try alloc.dupe(f32, embedding.vector);
-                break :blk .{
-                    .index_name = index_name,
-                    .doc_key = doc_key,
-                    .parent_doc_key = embedding.parent_doc_key,
-                    .artifact_key = artifact_key,
-                    .vector = vector,
+                initialized += 1;
+            }
+            break :entries items;
+        };
+        out.sparse_embeddings = entries: {
+            const items = try alloc.alloc(SparseEmbeddingWrite, self.sparse_embeddings.len);
+            errdefer alloc.free(items);
+            var initialized: usize = 0;
+            errdefer for (items[0..initialized]) |embedding| freeSparseEmbedding(alloc, embedding);
+            for (self.sparse_embeddings, 0..) |embedding, i| {
+                items[i] = blk: {
+                    const index_name = try alloc.dupe(u8, embedding.index_name);
+                    errdefer alloc.free(index_name);
+                    const doc_key = try alloc.dupe(u8, embedding.doc_key);
+                    errdefer alloc.free(doc_key);
+                    const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+                    errdefer if (artifact_key) |key| alloc.free(key);
+                    const indices = try alloc.dupe(u32, embedding.indices);
+                    errdefer alloc.free(indices);
+                    const values = try alloc.dupe(f32, embedding.values);
+                    break :blk .{
+                        .index_name = index_name,
+                        .doc_key = doc_key,
+                        .artifact_key = artifact_key,
+                        .indices = indices,
+                        .values = values,
+                    };
                 };
-            };
-            dense_initialized += 1;
-        }
-        out.sparse_embeddings = try alloc.alloc(SparseEmbeddingWrite, self.sparse_embeddings.len);
-        var sparse_initialized: usize = 0;
-        errdefer out.sparse_embeddings = out.sparse_embeddings[0..sparse_initialized];
-        for (self.sparse_embeddings, 0..) |embedding, i| {
-            out.sparse_embeddings[i] = blk: {
-                const index_name = try alloc.dupe(u8, embedding.index_name);
-                errdefer alloc.free(index_name);
-                const doc_key = try alloc.dupe(u8, embedding.doc_key);
-                errdefer alloc.free(doc_key);
-                const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
-                errdefer if (artifact_key) |key| alloc.free(key);
-                const indices = try alloc.dupe(u32, embedding.indices);
-                errdefer alloc.free(indices);
-                const values = try alloc.dupe(f32, embedding.values);
-                break :blk .{
-                    .index_name = index_name,
-                    .doc_key = doc_key,
-                    .artifact_key = artifact_key,
-                    .indices = indices,
-                    .values = values,
-                };
-            };
-            sparse_initialized += 1;
-        }
+                initialized += 1;
+            }
+            break :entries items;
+        };
         return out;
+    }
+
+    fn cloneNames(alloc: Allocator, names: []const []u8) ![][]u8 {
+        const items = try alloc.alloc([]u8, names.len);
+        errdefer alloc.free(items);
+        var initialized: usize = 0;
+        errdefer for (items[0..initialized]) |name| alloc.free(name);
+        for (names, 0..) |name, i| {
+            items[i] = try alloc.dupe(u8, name);
+            initialized += 1;
+        }
+        return items;
+    }
+
+    fn freeDenseEmbedding(alloc: Allocator, embedding: DenseEmbeddingWrite) void {
+        alloc.free(embedding.index_name);
+        alloc.free(embedding.doc_key);
+        if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+        alloc.free(embedding.vector);
+    }
+
+    fn freeSparseEmbedding(alloc: Allocator, embedding: SparseEmbeddingWrite) void {
+        alloc.free(embedding.index_name);
+        alloc.free(embedding.doc_key);
+        if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+        alloc.free(embedding.indices);
+        alloc.free(embedding.values);
     }
 
     pub fn deinit(self: *ExtractedWrite, alloc: Allocator) void {
@@ -293,33 +300,15 @@ pub const ExtractedWrite = struct {
             source.field_json.deinit(source.alloc);
             source.alloc.destroy(source);
         }
-        for (self.graph_writes) |graph_write| {
-            alloc.free(@constCast(graph_write.index_name));
-            alloc.free(@constCast(graph_write.source));
-            alloc.free(@constCast(graph_write.target));
-            alloc.free(@constCast(graph_write.edge_type));
-            if (graph_write.edge_id.len > 0) alloc.free(@constCast(graph_write.edge_id));
-            if (graph_write.owner_document.len > 0) alloc.free(@constCast(graph_write.owner_document));
-            if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
-            if (graph_write.owner.len > 0) alloc.free(@constCast(graph_write.owner));
-        }
+        for (self.graph_writes) |*write| write.deinit(alloc);
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
         for (self.mentioned_graph_indexes) |index_name| alloc.free(index_name);
         if (self.mentioned_graph_indexes.len > 0) alloc.free(self.mentioned_graph_indexes);
-        for (self.dense_embeddings) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.vector.len > 0) alloc.free(embedding.vector);
-        }
+        for (self.deleted_embedding_indexes) |name| alloc.free(name);
+        if (self.deleted_embedding_indexes.len > 0) alloc.free(self.deleted_embedding_indexes);
+        for (self.dense_embeddings) |embedding| freeDenseEmbedding(alloc, embedding);
         if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
-        for (self.sparse_embeddings) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.indices.len > 0) alloc.free(embedding.indices);
-            if (embedding.values.len > 0) alloc.free(embedding.values);
-        }
+        for (self.sparse_embeddings) |embedding| freeSparseEmbedding(alloc, embedding);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
         self.* = undefined;
     }
@@ -2241,6 +2230,11 @@ fn extractWriteFromParsedPrepared(
         }
         graph_writes.deinit(alloc);
     }
+    var deleted_embedding_indexes = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (deleted_embedding_indexes.items) |name| alloc.free(name);
+        deleted_embedding_indexes.deinit(alloc);
+    }
     var dense_embeddings = std.ArrayListUnmanaged(DenseEmbeddingWrite).empty;
     errdefer {
         for (dense_embeddings.items) |embedding| {
@@ -2324,6 +2318,10 @@ fn extractWriteFromParsedPrepared(
             const index_name = emb_entry.key_ptr.*;
             const emb_value = emb_entry.value_ptr.*;
             switch (emb_value) {
+                .null => {
+                    try deleted_embedding_indexes.ensureUnusedCapacity(alloc, 1);
+                    deleted_embedding_indexes.appendAssumeCapacity(try alloc.dupe(u8, index_name));
+                },
                 .array, .string => {
                     const vector = try parseDenseEmbeddingValue(alloc, emb_value);
                     errdefer alloc.free(vector);
@@ -2381,6 +2379,7 @@ fn extractWriteFromParsedPrepared(
     errdefer result.deinit(alloc);
     result.graph_writes = try graph_writes.toOwnedSlice(alloc);
     result.mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc);
+    result.deleted_embedding_indexes = try deleted_embedding_indexes.toOwnedSlice(alloc);
     result.dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
     result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
     return result;
@@ -6921,4 +6920,22 @@ test "default text projection retains empty primary identity without postings (#
     try builder.appendSourceDocForIndex(source, "body", false);
     try builder.appendSourceDocForIndex(source, null, false);
     try std.testing.expectEqual(@as(usize, 1), builder.text_docs.items.len);
+}
+
+test "document mapper explicit null embeddings own extraction and clone allocation failures" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var extracted = try extractWrite(alloc, "doc:a", "{\"title\":\"kept\",\"_embeddings\":{\"dense\":null,\"sparse\":null,\"dense_kept\":[1,0,0],\"sparse_kept\":{\"indices\":[7],\"values\":[1]}},\"_edges\":{\"g\":{\"links\":[{\"target\":\"doc:b\"}]}}}");
+            defer extracted.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), extracted.deleted_embedding_indexes.len);
+            try std.testing.expectEqual(@as(usize, 1), extracted.dense_embeddings.len);
+            try std.testing.expectEqual(@as(usize, 1), extracted.sparse_embeddings.len);
+            var cloned = try extracted.clone(alloc);
+            defer cloned.deinit(alloc);
+            try std.testing.expectEqualStrings("dense", cloned.deleted_embedding_indexes[0]);
+            try std.testing.expectEqualStrings("sparse", cloned.deleted_embedding_indexes[1]);
+            try std.testing.expect(std.mem.indexOf(u8, cloned.cleaned_value.?, "_embeddings") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

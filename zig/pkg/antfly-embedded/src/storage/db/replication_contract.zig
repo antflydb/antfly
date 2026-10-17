@@ -96,6 +96,10 @@ pub const AsyncMetadataMirror = AsyncEffectMirror;
 /// transport session, slot store, or fencing implementation is exposed here.
 /// All referenced runtime state and callback contexts must outlive the DB.
 pub const Publisher = struct {
+    const NativeCallbacks = struct { publish: @FieldType(Publisher.VTable, "publish"), recover: @FieldType(Publisher.VTable, "recover"), preflight: @FieldType(Publisher.VTable, "preflight"), complete: @FieldType(Publisher.VTable, "complete") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -141,52 +145,64 @@ pub const Publisher = struct {
     }
     pub fn publish(self: Publisher, mirror: AsyncEffectMirror, kind: outbox.Kind, payload: []const u8, namespace: Namespace) !u64 {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
-        return self.vtable.publish(mirror, kind, payload, namespace);
+        return NativeBoundary.call("publish", self.callback_dispatch, self.vtable.publish, .{ mirror, kind, payload, namespace });
     }
     pub fn recover(self: Publisher, mirror: AsyncEffectMirror, kind: outbox.Kind, pending: outbox.DurableReplicationOutbox, namespace: Namespace) !u64 {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
-        return self.vtable.recover(mirror, kind, pending, namespace);
+        return NativeBoundary.call("recover", self.callback_dispatch, self.vtable.recover, .{ mirror, kind, pending, namespace });
     }
     pub fn preflight(self: Publisher, mirror: AsyncEffectMirror) !void {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
-        return self.vtable.preflight(mirror, false);
+        return NativeBoundary.call("preflight", self.callback_dispatch, self.vtable.preflight, .{ mirror, false });
     }
     /// Compiled-owner admission records every preflight decision; physical DB
     /// admission historically records only rejection. Preserve both metrics.
     pub fn preflightRecordingDecision(self: Publisher, mirror: AsyncEffectMirror) !void {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
-        return self.vtable.preflight(mirror, true);
+        return NativeBoundary.call("preflight", self.callback_dispatch, self.vtable.preflight, .{ mirror, true });
     }
     pub fn complete(self: Publisher, mirror: AsyncEffectMirror, lsn: u64) !void {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
-        return self.vtable.complete(mirror, lsn);
+        return NativeBoundary.call("complete", self.callback_dispatch, self.vtable.complete, .{ mirror, lsn });
     }
 };
 
 pub const BorrowedWriteGate = struct {
+    const NativeCallbacks = struct { check_fn: @FieldType(BorrowedWriteGate, "check_fn") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *const anyopaque,
     check_fn: *const fn (*const anyopaque) anyerror!void,
     allows_background_work: bool = true,
     pub fn check(self: BorrowedWriteGate) !void {
-        try self.check_fn(self.ptr);
+        try NativeBoundary.call("check_fn", self.callback_dispatch, self.check_fn, .{self.ptr});
     }
 };
 
 /// Borrowed admission with a by-value callback capture. Equality belongs to
 /// the adapter; comparing opaque bytes would compare undefined padding.
 pub const CapturedWriteGate = struct {
+    const NativeCallbacks = struct { check_fn: @FieldType(CapturedWriteGate, "check_fn") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     capture: BorrowedCapture,
     check_fn: *const fn (CapturedWriteGate) anyerror!void,
     equal_fn: *const fn (CapturedWriteGate, CapturedWriteGate) bool,
     allows_background_work: bool = true,
     pub fn check(self: CapturedWriteGate) !void {
-        try self.check_fn(self);
+        try NativeBoundary.call("check_fn", self.callback_dispatch, self.check_fn, .{self});
     }
 };
 
 /// Atomically published write admission, including generation pinning. The
 /// engine never dereferences the server's mutable role/progress implementation.
 pub const PublishedWriteState = struct {
+    const NativeCallbacks = struct { check: @FieldType(PublishedWriteState.VTable, "check") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *const anyopaque,
     vtable: *const VTable,
     pub const VTable = struct {
@@ -195,7 +211,7 @@ pub const PublishedWriteState = struct {
         allows_background_work: *const fn (*const anyopaque) bool,
     };
     pub fn checkWrite(self: PublishedWriteState, generation: ?u64) !void {
-        try self.vtable.check(self.ptr, generation);
+        try NativeBoundary.call("check", self.callback_dispatch, self.vtable.check, .{ self.ptr, generation });
     }
     pub fn currentGeneration(self: PublishedWriteState) u64 {
         return self.vtable.generation(self.ptr);

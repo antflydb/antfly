@@ -53,6 +53,7 @@ pub const asHandle = handles.asHandle;
 pub const HandleRegistryOf = handles.HandleRegistryOf;
 pub const HandleRegistry = handles.HandleRegistry;
 pub const handle_registry = &handles.handle_registry;
+pub const handleRegistry = handles.handleRegistry;
 pub const closeHandleId = handles.closeHandleId;
 pub const handleLockIo = handles.handleLockIo;
 pub const dupBytes = handles.dupBytes;
@@ -3561,7 +3562,7 @@ pub fn storageOwnerOpen(
     // the DB and release the borrowed context exactly once, as for every
     // earlier failure. (publishHandle's close-on-failure would release the
     // context a second time.)
-    const owner_id = handle_registry.register(handle) catch |err| return storageOwnerStatusFromError(err);
+    const owner_id = handleRegistry().register(handle) catch |err| return storageOwnerStatusFromError(err);
     success = true;
     out_owner.* = owner_id;
     context_borrowed = false;
@@ -5870,7 +5871,7 @@ pub const StorageRelationalRead = struct {
 
     pub fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
         errdefer page.deinit();
         const owned = page.arena.allocator();
         const rows = try owned.alloc(View.Row, page.rows.len);
@@ -5878,7 +5879,8 @@ pub const StorageRelationalRead = struct {
             .id = row.key,
             .version = row.version,
             .schema_version = session.reader.active.version(),
-            .value = row.typed orelse return error.InvalidResponse,
+            .value = row.typed orelse .null,
+            .typed_cells = row.typed_cells,
             .sql_nulls = row.sql_nulls,
             .expected_content_digest = row.expected_content_digest,
         };

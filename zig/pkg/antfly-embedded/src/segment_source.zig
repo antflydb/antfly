@@ -37,12 +37,40 @@ pub const MappedArtifact = struct {
     }
 };
 
+// Source callbacks may belong to a caller-owned Lite storage archive. Keep
+// both read failures and visitor failures in their originating error domains.
+const callback_abi = @import("runtime_callback_abi.zig");
+pub const SourceVisitor = struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+    dispatch: callback_abi.CallbackDispatch = VisitorBoundary.local_dispatch,
+    const VisitorBoundary = callback_abi.Boundary(struct { consume: *const fn (*anyopaque, u64, []const u8) anyerror!void });
+    pub fn consume(raw: *anyopaque, offset: u64, bytes: []const u8) !void {
+        const self: *SourceVisitor = @ptrCast(@alignCast(raw));
+        return VisitorBoundary.call("consume", self.dispatch, self.callback, .{ self.context, offset, bytes });
+    }
+};
+const SourceBoundary = callback_abi.Boundary(struct {
+    read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
+    checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32,
+    read_authenticated: ?*const fn (*anyopaque, u64, u64, usize, []u8, ?u32) anyerror!void,
+    visit_range: ?*const fn (*anyopaque, u64, u64, SourceVisitor) anyerror!void,
+    bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source,
+    check_read_context: ?*const fn (*anyopaque) anyerror!void,
+});
+
 pub const Source = union(enum) {
     contiguous: []const u8,
-    ranges: struct {
+    ranges: Ranges,
+
+    // Native callback contracts include immediate field type names. Anonymous
+    // payload names contain compilation-local IDs and cannot identify the same
+    // source representation in independently compiled runtime archives.
+    pub const Ranges = struct {
         ptr: *anyopaque,
         length: u64,
         read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
+        boundary_dispatch: callback_abi.CallbackDispatch = SourceBoundary.local_dispatch,
         close: *const fn (*anyopaque) void,
         /// Advisory bounded lookahead; errors belong to subsequent required reads.
         prefetch: ?*const fn (*anyopaque, u64, u64) void = null,
@@ -53,7 +81,7 @@ pub const Source = union(enum) {
         read_authenticated: ?*const fn (*anyopaque, u64, u64, usize, []u8, ?u32) anyerror!void = null,
         /// Visit immutable range bytes in order without restarting navigation.
         /// Visitor slices are borrowed only for the duration of the callback.
-        visit_range: ?*const fn (*anyopaque, u64, u64, *anyopaque, *const fn (*anyopaque, u64, []const u8) anyerror!void) anyerror!void = null,
+        visit_range: ?*const fn (*anyopaque, u64, u64, SourceVisitor) anyerror!void = null,
         retained_bytes: ?*const fn (*anyopaque) usize = null,
         /// Bind an independent query capability without changing the shared source.
         bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source = null,
@@ -67,7 +95,20 @@ pub const Source = union(enum) {
         acquire_use: ?*const fn (*anyopaque) bool = null,
         release_use: ?*const fn (*anyopaque) void = null,
         enable_idle_expiry: ?*const fn (*anyopaque) void = null,
-    },
+    };
+
+    pub fn checkReadContext(self: Source) !void {
+        if (self == .ranges) if (self.ranges.check_read_context) |check|
+            try SourceBoundary.call("check_read_context", self.ranges.boundary_dispatch, check, .{self.ranges.ptr});
+    }
+    pub fn bindReadContext(self: Source, alloc: std.mem.Allocator, context: *anyopaque) !Source {
+        const bind = self.ranges.bind_read_context orelse return error.Unsupported;
+        return SourceBoundary.call("bind_read_context", self.ranges.boundary_dispatch, bind, .{ self.ranges.ptr, alloc, context });
+    }
+    pub fn readAuthenticated(self: Source, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        const read = self.ranges.read_authenticated orelse return error.Unsupported;
+        return SourceBoundary.call("read_authenticated", self.ranges.boundary_dispatch, read, .{ self.ranges.ptr, offset, length, within, out, expected });
+    }
 
     pub fn acquireUse(self: Source) bool {
         return if (self == .ranges) if (self.ranges.acquire_use) |acquire| acquire(self.ranges.ptr) else true else true;
@@ -105,7 +146,7 @@ pub const Source = union(enum) {
         if (out.len == 0) return;
         switch (self) {
             .contiguous => |bytes| @memcpy(out, bytes[@intCast(offset)..][0..out.len]),
-            .ranges => |range| try range.read_into(range.ptr, offset, out),
+            .ranges => |range| try SourceBoundary.call("read_into", range.boundary_dispatch, range.read_into, .{ range.ptr, offset, out }),
         }
     }
 
@@ -119,13 +160,25 @@ pub const Source = union(enum) {
             consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
             length: u64,
             position: u64 = 0,
+            failure: ?anyerror = null,
+            fn transportVisit(raw: *anyopaque, relative: u64, bytes: []const u8) !void {
+                visit(raw, relative, bytes) catch |err| {
+                    const state: *@This() = @ptrCast(@alignCast(raw));
+                    // The caller retains its exact error. Only the stable stop
+                    // marker crosses the storage provider's error domain.
+                    return if (state.failure != null) error.SourceVisitorFailed else err;
+                };
+            }
             fn visit(raw: *anyopaque, relative: u64, bytes: []const u8) !void {
                 const state: *@This() = @ptrCast(@alignCast(raw));
                 if (relative != state.position or bytes.len == 0 or bytes.len > state.length - state.position) return error.InvalidData;
                 var used: usize = 0;
                 while (used < bytes.len) {
                     const take = @min(bytes.len - used, 64 * 1024);
-                    try state.consume(state.context, state.position, bytes[used..][0..take]);
+                    state.consume(state.context, state.position, bytes[used..][0..take]) catch |err| {
+                        state.failure = err;
+                        return err;
+                    };
                     used += take;
                     state.position += take;
                 }
@@ -135,7 +188,7 @@ pub const Source = union(enum) {
         if (self == .contiguous) {
             try Checked.visit(&checked, 0, self.contiguous[@intCast(offset)..][0..@intCast(length)]);
         } else if (self.ranges.visit_range) |visit| {
-            try visit(self.ranges.ptr, offset, length, &checked, Checked.visit);
+            SourceBoundary.call("visit_range", self.ranges.boundary_dispatch, visit, .{ self.ranges.ptr, offset, length, SourceVisitor{ .context = &checked, .callback = Checked.transportVisit } }) catch |err| return checked.failure orelse err;
         } else {
             try self.visitBuffered(offset, length, &checked, Checked.visit);
         }
@@ -178,7 +231,7 @@ pub const Source = union(enum) {
         if (offset > self.len() or length > self.len() - offset) return error.EndOfStream;
         if (scratch.len == 0) return error.InvalidScratch;
         if (self == .ranges) {
-            if (self.ranges.checksum) |hash| return hash(self.ranges.ptr, offset, length);
+            if (self.ranges.checksum) |hash| return SourceBoundary.call("checksum", self.ranges.boundary_dispatch, hash, .{ self.ranges.ptr, offset, length });
         }
         var crc = Crc32.init();
         var pos: u64 = 0;
@@ -467,7 +520,7 @@ pub const ConcurrentBlockCache = struct {
     }
     fn checkAdapter(raw: *anyopaque) !void {
         const self: *ConcurrentBlockCache = @ptrCast(@alignCast(raw));
-        if (self.cache.source == .ranges) if (self.cache.source.ranges.check_read_context) |check| try check(self.cache.source.ranges.ptr);
+        try self.cache.source.checkReadContext();
     }
     // Called under mutex. A leased slab is immutable until its callback ends.
     fn victim(self: *ConcurrentBlockCache, offset: u64) ?*BlockCache.Slot {
@@ -480,7 +533,10 @@ pub const ConcurrentBlockCache = struct {
         return oldest;
     }
 
-    fn visitAdapter(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+    fn visitAdapter(raw: *anyopaque, offset: u64, length: u64, visitor_port: SourceVisitor) !void {
+        var receiving_visitor = visitor_port;
+        const context: *anyopaque = &receiving_visitor;
+        const consume = SourceVisitor.consume;
         const self: *ConcurrentBlockCache = @ptrCast(@alignCast(raw));
         return self.visitRange(offset, length, context, consume);
     }
@@ -551,16 +607,16 @@ pub const ConcurrentBlockCache = struct {
     pub fn readAuthenticated(self: *ConcurrentBlockCache, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
         if (offset > self.cache.source.len() or length > self.cache.source.len() - offset or within > length or out.len > length - within) return error.EndOfStream;
         if (expected == null) return self.readCachedInto(offset + within, out);
-        if (self.cache.source == .ranges) if (self.cache.source.ranges.visit_range) |visit| {
+        if (self.cache.source == .ranges and self.cache.source.ranges.visit_range != null) {
             const flight = try self.acquireFlight(null);
             defer self.releaseFlight(flight);
             var stream = AuthenticationStream{ .cache = self, .flight = flight, .offset = offset, .within = within, .out = out };
-            try visit(self.cache.source.ranges.ptr, offset, length, &stream, AuthenticationStream.consume);
+            try self.cache.source.visitRange(offset, length, &stream, AuthenticationStream.consume);
             if (stream.position != length) return error.EndOfStream;
             if (stream.used != 0) try self.publishFill(flight, stream.block, stream.used);
             if (stream.crc.final() != expected.?) return error.CrcMismatch;
             return;
-        };
+        }
         var scratch: [8192]u8 = undefined;
         var crc = Crc32.init();
         var position: u64 = 0;
@@ -676,7 +732,7 @@ pub const ConcurrentBlockCache = struct {
     }
 
     fn checkWaiting(self: *ConcurrentBlockCache) !void {
-        if (self.cache.source == .ranges) if (self.cache.source.ranges.check_read_context) |check| try check(self.cache.source.ranges.ptr);
+        try self.cache.source.checkReadContext();
     }
 
     fn acquireFlight(self: *ConcurrentBlockCache, key: ?u64) !*Flight {
@@ -814,7 +870,10 @@ test "range visitors preserve borrowing bound spans and reject malformed provide
             self.reads += 1;
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.mode == .short) return;
             if (self.mode == .failure) return error.TestIoFailure;
@@ -900,4 +959,42 @@ test "segment.cache leases survive reentrant fills pressure and callback errors"
     for (cache.cache.slots) |slot| try std.testing.expectEqual(@as(usize, 0), slot.pins);
     _ = ConcurrentBlockCache.reclaim(&cache, 0);
     try std.testing.expectEqual(@as(usize, 0), cache.retainedBytes());
+}
+
+test "range sources preserve storage failures and caller visitor errors across dispatch" {
+    const Foreign = struct {
+        var calls: usize = 0;
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            calls += 1;
+            return SourceBoundary.local_dispatch(contract, callback, args, output);
+        }
+        fn visitorDispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return SourceVisitor.VisitorBoundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    const Mock = struct {
+        fn close(_: *anyopaque) void {}
+        fn read(_: *anyopaque, _: u64, _: []u8) anyerror!void {
+            return error.FileNotFound;
+        }
+        fn hash(_: *anyopaque, _: u64, _: u64) anyerror!u32 {
+            return error.CrcMismatch;
+        }
+        fn visit(_: *anyopaque, _: u64, _: u64, visitor_port: SourceVisitor) anyerror!void {
+            var visitor = visitor_port;
+            visitor.dispatch = Foreign.visitorDispatch;
+            return SourceVisitor.consume(&visitor, 0, "abc");
+        }
+        fn consume(_: *anyopaque, _: u64, _: []const u8) anyerror!void {
+            return error.TestVisitorFailure;
+        }
+    };
+    var state: u8 = 0;
+    const source: Source = .{ .ranges = .{ .ptr = &state, .length = 3, .read_into = Mock.read, .checksum = Mock.hash, .visit_range = Mock.visit, .close = Mock.close, .boundary_dispatch = Foreign.dispatch } };
+    Foreign.calls = 0;
+    var bytes: [1]u8 = undefined;
+    try std.testing.expectError(error.FileNotFound, source.readInto(0, &bytes));
+    try std.testing.expectError(error.CrcMismatch, source.checksum(0, 3, &bytes));
+    try std.testing.expectError(error.TestVisitorFailure, source.visitRange(0, 3, &state, Mock.consume));
+    try std.testing.expectEqual(@as(usize, 3), Foreign.calls);
 }

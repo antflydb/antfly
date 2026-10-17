@@ -358,7 +358,9 @@ pub const PersistentObjectRangeCache = struct {
         errdefer if (state.owner_lock) |file| file.close(io);
         try state.initializeInventory();
         errdefer state.deinitInventory();
-        state.worker = try io.concurrent(persistentObjectRangeWorkerMain, .{state});
+        // Reads and startup inventory do not need a writer. Admit the
+        // optional worker lazily on the first queued write so executor
+        // pressure cannot discard an otherwise usable persisted cache.
         return .{ .state = state };
     }
 
@@ -682,6 +684,10 @@ const PersistentObjectRangeCacheState = struct {
                 }
                 continue;
             }
+            const protected = persistentCachedKeyProtected(io, self.alloc, dir, entry.name, self.policy.max_cache_key_bytes) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => false,
+            };
             const owned = try self.alloc.create(PersistentObjectRangeCacheEntry);
             const filename = self.alloc.dupe(u8, entry.name) catch |err| {
                 self.alloc.destroy(owned);
@@ -691,7 +697,7 @@ const PersistentObjectRangeCacheState = struct {
                 .filename = filename,
                 .disk_bytes = disk_bytes,
                 .modified_ns = stat.mtime.toNanoseconds(),
-                .protected = persistentCachedKeyProtected(io, self.alloc, dir, filename, self.policy.max_cache_key_bytes) catch false,
+                .protected = protected,
             };
             discovered.push(self.alloc, owned) catch |err| {
                 self.freeEntry(owned);
@@ -795,6 +801,16 @@ const PersistentObjectRangeCacheState = struct {
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
             return .dropped;
+        }
+
+        if (self.worker == null) {
+            self.worker = io.concurrent(persistentObjectRangeWorkerMain, .{self}) catch {
+                _ = self.recordDroppedLocked(bytes.len, .queue);
+                self.mutex.unlock(io);
+                self.alloc.free(owned_key);
+                releaseMemoryReservation(&memory_reservation);
+                return .dropped;
+            };
         }
 
         self.pending.put(self.alloc, owned_key, {}) catch {
@@ -10279,4 +10295,48 @@ test "parquet wide large pages retain columns without duplicate row identities" 
         try std.testing.expectEqual(@as(usize, row_count), position);
         try std.testing.expectEqual(@as(usize, chunks.len), cursor.pages_decoded);
     }
+}
+
+test "lake persistent cache keeps restart reads and retries writer admission after executor pressure" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Gate = struct {
+        var base: std.Io = undefined;
+        var denied: bool = true;
+        fn concurrent(userdata: ?*anyopaque, result_len: usize, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            if (denied) return error.ConcurrencyUnavailable;
+            return base.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writer-pressure", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var cache = try PersistentObjectRangeCache.init(io, root);
+        defer cache.deinit();
+        try std.testing.expectEqual(.enqueued, cache.enqueueWrite("existing", "data"));
+        cache.flush();
+    }
+    Gate.base = io;
+    Gate.denied = true;
+    var vtable = io.vtable.*;
+    vtable.concurrent = Gate.concurrent;
+    var cache = try PersistentObjectRangeCache.init(.{ .userdata = io.userdata, .vtable = &vtable }, root);
+    defer cache.deinit();
+    try std.testing.expect(cache.state.worker == null);
+    const bytes = (try cache.readAlloc(a, "existing", 4)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("data", bytes);
+    try std.testing.expectEqual(.dropped, cache.enqueueWrite("new", "next"));
+    cache.flush();
+    try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().queued_entries);
+    Gate.denied = false;
+    try std.testing.expectEqual(.enqueued, cache.enqueueWrite("new", "next"));
+    cache.flush();
+    try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().writes_completed);
+    const next = (try cache.readAlloc(a, "new", 4)).?;
+    defer a.free(next);
+    try std.testing.expectEqualStrings("next", next);
 }

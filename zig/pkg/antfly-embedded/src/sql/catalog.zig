@@ -425,7 +425,32 @@ pub const Row = struct {
     /// Internal relation rows retain complete, owned Datums and share a single
     /// page-local name directory, without constructing per-row JSON objects.
     /// Legacy backend rows continue to use JSON and the null/pattern channels.
-    typed_cells: ?struct { layout: TypedLayout, values: []const Cell, presence: ?[]const bool = null } = null,
+    typed_cells: ?TypedCells = null,
+
+    pub const TypedCells = struct {
+        layout: *const TypedLayout,
+        values: []const Cell = &.{},
+        presence: ?[]const bool = null,
+        /// Shared immutable column blocks, owned by the enclosing page lease.
+        columnar: ?struct { blocks: []const @import("spill.zig").ColumnarBlock, row: usize } = null,
+        pub fn count(self: TypedCells) usize {
+            if (self.columnar != null) return self.layout.names.len;
+            return self.values.len;
+        }
+        pub fn at(self: TypedCells, ordinal: usize) !Cell {
+            if (self.columnar) |source| {
+                if (self.values.len != 0 or ordinal >= self.layout.names.len) return error.InvalidSqlBackendResponse;
+                var first: usize = 0;
+                for (source.blocks) |block| {
+                    if (ordinal - first < block.values.len) return block.cell(source.row, ordinal - first);
+                    first += block.values.len;
+                }
+                return error.InvalidSqlBackendResponse;
+            }
+            if (ordinal >= self.values.len) return error.InvalidSqlBackendResponse;
+            return self.values[ordinal];
+        }
+    };
 
     pub const Cell = @import("scalar.zig").Datum;
     pub const TypedLayout = struct {
@@ -434,8 +459,9 @@ pub const Row = struct {
 
         /// Names borrow the immutable relation binding; entries belong to the
         /// page arena. Duplicate names must not silently overwrite an ordinal.
-        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !TypedLayout {
-            var result: TypedLayout = .{ .names = names };
+        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !*const TypedLayout {
+            const result = try arena.create(TypedLayout);
+            result.* = .{ .names = names };
             for (names, 0..) |name, index| {
                 const entry = try result.ordinals.getOrPut(arena, name);
                 if (entry.found_existing) return error.InvalidSqlBackendResponse;
@@ -446,7 +472,7 @@ pub const Row = struct {
 
         /// Clone once per emitted page, not once per row. No names or directory
         /// entries may borrow a cursor that can close before the page consumer.
-        pub fn clone(self: TypedLayout, alloc: std.mem.Allocator) !TypedLayout {
+        pub fn clone(self: *const TypedLayout, alloc: std.mem.Allocator) !*const TypedLayout {
             const names = try alloc.alloc([]const u8, self.names.len);
             for (self.names, names) |name, *out| out.* = try alloc.dupe(u8, name);
             return init(alloc, names);
@@ -456,7 +482,7 @@ pub const Row = struct {
     /// Clone once at the page ownership boundary; consumers borrow the typed
     /// cells until that page is released. Layout and allocations must belong
     /// to the same page owner (or a longer-lived immutable binding).
-    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: TypedLayout, values: []const Cell) !Row {
+    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: *const TypedLayout, values: []const Cell) !Row {
         if (layout.ordinals.count() != values.len) return error.InvalidSqlBackendResponse;
         const owned = try alloc.alloc(Cell, values.len);
         for (values, owned) |value, *out| out.* = try @import("operators.zig").cloneDatum(alloc, value);
@@ -470,8 +496,8 @@ pub const Row = struct {
         if (self.typed_cells) |cells| {
             try self.validateTyped();
             const index = cells.layout.ordinals.get(name) orelse return .{};
-            if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
-            const result = cells.values[index];
+            if (index >= cells.count()) return error.InvalidSqlBackendResponse;
+            const result = try cells.at(index);
             if (cells.presence) |present| if (!present[index] and !result.sql_null) return error.InvalidSqlBackendResponse;
             if (result.array != null and (result.sql_null or result.value != .null or result.patterns() != null)) return error.InvalidSqlBackendResponse;
             if (result.sql_null and result.value != .null) return error.InvalidSqlBackendResponse;
@@ -488,10 +514,10 @@ pub const Row = struct {
 
     fn validateTyped(self: Row) !void {
         const cells = self.typed_cells orelse return error.InvalidSqlBackendResponse;
-        if (cells.values.len != cells.layout.ordinals.count() or cells.values.len != cells.layout.names.len or
+        if (cells.count() != cells.layout.ordinals.count() or cells.count() != cells.layout.names.len or
             self.value != .null or self.sql_nulls != null or self.pattern_sources != null)
             return error.InvalidSqlBackendResponse;
-        if (cells.presence) |present| if (present.len != cells.values.len) return error.InvalidSqlBackendResponse;
+        if (cells.presence) |present| if (present.len != cells.count()) return error.InvalidSqlBackendResponse;
     }
 
     pub fn fieldNames(self: Row) ![]const []const u8 {
@@ -507,7 +533,7 @@ pub const Row = struct {
         if (self.typed_cells) |cells| {
             try self.validateTyped();
             const index = cells.layout.ordinals.get(name) orelse return false;
-            if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
+            if (index >= cells.count()) return error.InvalidSqlBackendResponse;
             return if (cells.presence) |present| present[index] else true;
         }
         if (self.value != .object) return error.InvalidSqlBackendResponse;
@@ -520,7 +546,7 @@ pub const Row = struct {
 
     /// Payload ownership transfer with a page-shared, owned name directory.
     /// Compiled pattern objects retain their existing statement-owner lifetime.
-    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?TypedLayout) !Row {
+    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?*const TypedLayout) !Row {
         var result = self;
         result.id = try alloc.dupe(u8, self.id);
         if (self.index_cursor) |cursor| result.index_cursor = try alloc.dupe(u8, cursor);
@@ -528,9 +554,10 @@ pub const Row = struct {
         if (self.typed_cells) |cells| {
             try self.validateTyped();
             const owned_layout = layout orelse return error.InvalidSqlBackendResponse;
-            if (owned_layout.names.len != cells.values.len) return error.InvalidSqlBackendResponse;
-            const values = try alloc.alloc(Cell, cells.values.len);
-            for (cells.values, values, cells.layout.names, owned_layout.names) |value, *out, old_name, new_name| {
+            if (owned_layout.names.len != cells.count()) return error.InvalidSqlBackendResponse;
+            const values = try alloc.alloc(Cell, cells.count());
+            for (values, cells.layout.names, owned_layout.names, 0..) |*out, old_name, new_name, ordinal| {
+                const value = try cells.at(ordinal);
                 if (!std.mem.eql(u8, old_name, new_name)) return error.InvalidSqlBackendResponse;
                 _ = try self.cell(old_name);
                 out.* = try @import("operators.zig").cloneDatum(alloc, value);
@@ -547,11 +574,16 @@ pub const Row = struct {
 pub const Page = struct {
     rows: []const Row,
     owned_arena: ?std.heap.ArenaAllocator = null,
+    storage_page: ?@import("../storage/relational_read_view.zig").View.Page = null,
     /// Exclusive native continuation; null proves exhaustion. Implementations
     /// must not report a short filtered page as exhaustion without that proof.
     after: ?[]const u8 = null,
 
     pub fn deinit(self: Page) void {
+        if (self.storage_page) |owned| {
+            var page = owned;
+            page.deinit();
+        }
         if (self.owned_arena) |owned| {
             var arena = owned;
             arena.deinit();
@@ -849,7 +881,7 @@ pub const Backend = struct {
         /// Native opaque identity, generated once before mutation admission.
         /// Providers without this capability require an explicit _id.
         generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
-        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, ConflictTarget, []const Mutation) anyerror![]const ConflictOwner = null,
+        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, std.mem.Allocator, Table, ConflictTarget, []const Mutation) anyerror![]const ConflictOwner = null,
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,
@@ -923,8 +955,8 @@ test "SQL typed rows own arrays without conflating JSON null or array null eleme
     const cell = try row.cell("array");
     try std.testing.expect(!cell.sql_null);
     try std.testing.expectEqual(@as(i32, -3), cell.array.?.dimensions[0].lower);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.elements[0].value.integer);
-    try std.testing.expect(cell.array.?.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.flatCell(0).value.integer);
+    try std.testing.expect(cell.array.?.flatCell(1).sql_null);
     try std.testing.expect(!(try row.cell("json")).sql_null);
     try std.testing.expect((try row.cell("null")).sql_null);
     try std.testing.expect((try row.cell("missing")).sql_null);
@@ -972,8 +1004,8 @@ test "SQL typed array column adapters preserve dimensions and owned index contin
     const adapter: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = page, .definitions = &definitions } };
     const cell = try adapter.cell(a, 0, 0);
     try std.testing.expectEqual(@as(i32, -3), cell.array.?.dimensions[0].lower);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.elements[0].value.integer);
-    try std.testing.expect(cell.array.?.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.flatCell(0).value.integer);
+    try std.testing.expect(cell.array.?.flatCell(1).sql_null);
     var cursor = [_]u8{ 'n', 'e', 'x', 't' };
     var row = try Row.fromDatums(a, "row", try Row.TypedLayout.init(a, &.{"a"}), &cells);
     row.index_cursor = &cursor;

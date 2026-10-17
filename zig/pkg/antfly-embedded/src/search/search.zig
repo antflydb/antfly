@@ -135,6 +135,7 @@ pub const NamedGraphResult = struct {
 };
 
 pub const SearchRequest = struct {
+    control: query_mod.ExecutionControl = .{},
     query: SearchQuery,
     k: u32 = 10,
     offset: u32 = 0,
@@ -590,10 +591,14 @@ pub fn execute(
 /// Exact snapshot count with at most one segment's filter bitmap in memory.
 /// Callers must separately prove that no primary visibility/residual check is owed.
 pub fn countMatches(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery) !u32 {
+    return countMatchesWithControl(alloc, snap, query, .{});
+}
+
+pub fn countMatchesWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, control: query_mod.ExecutionControl) !u32 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const filter = try searchQueryToFilterArena(arena.allocator(), query);
-    return std.math.cast(u32, try snap.countFilter(alloc, filter)) orelse error.CountOverflow;
+    return std.math.cast(u32, try snap.countFilter(alloc, filter.withControl(control))) orelse error.CountOverflow;
 }
 
 pub fn executeCountCandidates(
@@ -601,11 +606,20 @@ pub fn executeCountCandidates(
     snap: *const index_mod.IndexSnapshot,
     query: SearchQuery,
 ) !SearchResult {
+    return executeCountCandidatesWithControl(alloc, snap, query, .{});
+}
+
+pub fn executeCountCandidatesWithControl(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    query: SearchQuery,
+    control: query_mod.ExecutionControl,
+) !SearchResult {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
     const filter = try searchQueryToFilterArena(arena.allocator(), query);
-    const doc_ids = try snap.executeFilter(alloc, filter);
+    const doc_ids = try snap.executeFilter(alloc, filter.withControl(control));
     defer alloc.free(doc_ids);
 
     var hits = try alloc.alloc(ScoredHit, doc_ids.len);
@@ -905,11 +919,48 @@ fn executeFilterQuery(
     request: SearchRequest,
     boost: f32,
 ) !SearchResult {
-    const doc_ids = try snap.executeFilter(alloc, filter);
+    if (request.sort == null and request.aggregations.len == 0) {
+        // Expansion queries have constant scores. Keep exact membership in a
+        // bitmap and retain only the requested page prefix, rather than one
+        // document-ID array plus one ScoredHit for every matching document.
+        var matches = try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
+        defer matches.deinit();
+        try applyDocNumConstraintsToBitmap(alloc, &matches, request);
+        var scored = std.ArrayListUnmanaged(scorer_mod.ScoredHit).empty;
+        defer scored.deinit(alloc);
+        const keep = @min(snap.liveDocCount(), request.k +| request.offset);
+        const total = std.math.cast(u32, matches.cardinality()) orelse return error.CountOverflow;
+        var visited: usize = 0;
+        var iterator = matches.iterator();
+        var scan_page = true;
+        if (request.search_after) |cursor| {
+            if (boost == cursor.score) {
+                if (cursor.doc_id == std.math.maxInt(u32)) scan_page = false else iterator.seek(cursor.doc_id + 1);
+            } else scan_page = boost < cursor.score;
+        }
+        while (scan_page) {
+            if (scored.items.len >= keep) break;
+            const doc_id = iterator.next() orelse break;
+            if (visited % 256 == 0) try request.control.check();
+            visited += 1;
+            if (request.search_after) |cursor| {
+                if (!(boost < cursor.score or (boost == cursor.score and doc_id > cursor.doc_id))) continue;
+            }
+            if (scored.items.len < keep) try scored.append(alloc, .{ .doc_id = doc_id, .score = boost });
+        }
+        var bounded = request;
+        bounded.search_after = null;
+        bounded.filter_doc_bitmap = null;
+        bounded.exclude_doc_bitmap = null;
+        bounded.filter_doc_nums = &.{};
+        bounded.filter_doc_nums_positive = false;
+        bounded.exclude_doc_nums = &.{};
+        return buildResult(alloc, snap, scored.items, total, .exact, bounded);
+    }
+    const doc_ids = try snap.executeFilter(alloc, filter.withControl(request.control));
     defer alloc.free(doc_ids);
 
     var all_scored = try alloc.alloc(scorer_mod.ScoredHit, doc_ids.len);
-    errdefer alloc.free(all_scored);
     defer alloc.free(all_scored);
     for (doc_ids, 0..) |doc_id, i| {
         all_scored[i] = .{
@@ -1364,7 +1415,7 @@ fn executeMatchAll(
 ) !SearchResult {
     // Use filter to get all doc IDs
     const filter = query_mod.Filter{ .match_all = {} };
-    const raw_doc_ids = try snap.executeFilter(alloc, filter);
+    const raw_doc_ids = try snap.executeFilter(alloc, filter.withControl(request.control));
     defer alloc.free(raw_doc_ids);
 
     // Unlike every other query type, match_all never goes through the
@@ -1582,6 +1633,59 @@ fn subtractScoresFromHits(alloc: Allocator, map: *ScoreMap, hits: []const scorer
 
 fn requestHasDocNumConstraints(request: SearchRequest) bool {
     return request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
+}
+
+fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBitmap, request: SearchRequest) !void {
+    try request.control.check();
+    if (request.filter_doc_bitmap) |bitmap| matches.andWith(bitmap);
+    if (request.exclude_doc_bitmap) |bitmap| matches.andNotWith(bitmap);
+    if (request.filter_doc_nums_positive) {
+        var allowed = roaring.RoaringBitmap.init(alloc);
+        errdefer allowed.deinit();
+        // Enumerate the smaller side. A small positive filter must not scan
+        // millions of matches, and a small match set must not scan a huge filter.
+        if (request.filter_doc_nums.len <= matches.cardinality()) {
+            for (request.filter_doc_nums, 0..) |doc_id, visited| {
+                if (visited % 256 == 0) try request.control.check();
+                if (matches.contains(doc_id) and !containsSortedU32(request.exclude_doc_nums, doc_id)) try allowed.add(doc_id);
+            }
+        } else {
+            var iterator = matches.iterator();
+            var visited: usize = 0;
+            while (iterator.next()) |doc_id| : (visited += 1) {
+                if (visited % 256 == 0) try request.control.check();
+                if (requestAllowsDocNum(request, doc_id)) try allowed.add(doc_id);
+            }
+        }
+        matches.deinit();
+        matches.* = allowed;
+    } else if (request.exclude_doc_nums.len <= 64) {
+        for (request.exclude_doc_nums, 0..) |doc_id, visited| {
+            if (visited % 256 == 0) try request.control.check();
+            matches.removeRetainingStorage(doc_id);
+        }
+    } else if (request.exclude_doc_nums.len <= matches.cardinality()) {
+        // Bulk exclusion avoids repeatedly shifting sparse array containers.
+        var excluded = roaring.RoaringBitmap.init(alloc);
+        defer excluded.deinit();
+        for (request.exclude_doc_nums, 0..) |doc_id, visited| {
+            if (visited % 256 == 0) try request.control.check();
+            try excluded.add(doc_id);
+        }
+        matches.andNotWith(&excluded);
+    } else {
+        var allowed = roaring.RoaringBitmap.init(alloc);
+        errdefer allowed.deinit();
+        var iterator = matches.iterator();
+        var visited: usize = 0;
+        while (iterator.next()) |doc_id| : (visited += 1) {
+            if (visited % 256 == 0) try request.control.check();
+            if (!containsSortedU32(request.exclude_doc_nums, doc_id)) try allowed.add(doc_id);
+        }
+        matches.deinit();
+        matches.* = allowed;
+    }
+    try request.control.check();
 }
 
 fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) bool {
@@ -2661,7 +2765,7 @@ const StreamingBoolNode = struct {
     requires_positions: bool = false,
 
     fn check(self: *@This()) !void {
-        if (self.steps % 256 == 0) if (self.segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        if (self.steps % 256 == 0) if (self.segment.query_source) |source| try source.checkReadContext();
         self.steps +%= 1;
     }
 
@@ -3844,7 +3948,7 @@ const StreamingBoolPreparedCache = struct {
     /// for this cache; warm bounds still check this facade's current authority.
     fn checkBoundContext(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan) !void {
         try self.snap.checkScoringReadContext();
-        if (self.snap.segments[plan.segment_idx].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        if (self.snap.segments[plan.segment_idx].query_source) |source| try source.checkReadContext();
     }
     fn buildExactBound(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
         const upper = try exactStreamingBoolBound(self.snap, self.bq, self.request, self.stats, self.producers, plan, a);
@@ -3906,7 +4010,7 @@ const StreamingBoolPreparedCache = struct {
         var selected_segment = try self.snap.leaseSegment(plan.segment_idx);
         defer selected_segment.deinit();
         const segment = selected_segment.entry;
-        if (segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        if (segment.query_source) |source| try source.checkReadContext();
         try self.mutex.lock(self.io);
         while (true) {
             var found: ?*Slot = null;
@@ -4561,7 +4665,7 @@ fn executeBool(
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const filter = try searchQueryToFilterArena(arena.allocator(), .{ .bool_query = bq });
-            var membership = try snap.executeFilterBitmap(alloc, filter);
+            var membership = try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
             defer membership.deinit();
             constrained = request;
             constrained.query = bq.must[0];
@@ -5054,7 +5158,7 @@ fn executeSort(
     // Get matching doc IDs via filter
     const owned_filter = try queryToFilter(alloc, request.query);
     defer owned_filter.deinit(alloc);
-    const doc_ids = try snap.executeFilter(alloc, owned_filter.filter);
+    const doc_ids = try snap.executeFilter(alloc, owned_filter.filter.withControl(request.control));
     defer alloc.free(doc_ids);
 
     // Read sort field values and pair with doc IDs
@@ -6088,6 +6192,184 @@ test "match_all applies native doc number constraints (#931)" {
     try std.testing.expectEqual(@as(u32, 2), paged.total_hits);
     try std.testing.expectEqual(@as(usize, 1), paged.hits.len);
     try std.testing.expectEqual(@as(u32, 2), paged.hits[0].doc_id);
+}
+
+test "constant score pages remain bounded after a cursor and cancel while excluding candidates" {
+    const alloc = std.testing.allocator;
+    var title = inverted.InvertedIndexBuilder.init(alloc, .{});
+    defer title.deinit();
+    var segment = segment_mod.SegmentWriter.init(alloc);
+    defer segment.deinit();
+    var doc_nums: [16384]u32 = undefined;
+    for (&doc_nums, 0..) |*doc_num, i| {
+        doc_num.* = @intCast(i);
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try title.addDocument(doc_num.*, &.{.{ .term = "common", .freq = 1, .norm = 10 }});
+    }
+    const title_bytes = try title.build();
+    defer alloc.free(title_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, title_bytes);
+    const bytes = try segment.build();
+    defer alloc.free(bytes);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    var cancel = Cancel{};
+    try std.testing.expectError(error.Canceled, execute(alloc, writer.snapshot(), .{
+        .query = .{ .doc_num = .{ .ids = &doc_nums } },
+        .k = 1,
+        .include_stored = false,
+        .filter_doc_nums = &.{0},
+        .filter_doc_nums_positive = true,
+        .control = .{ .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check } },
+    }));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+
+    // minimum_should_match counts potentially millions of bitmap members
+    // after clause evaluation. Cancellation must interrupt that counting,
+    // before its hash table exhausts a bounded request allocator.
+    var boolean_scratch: [64 * 1024]u8 = undefined;
+    var boolean_alloc = std.heap.FixedBufferAllocator.init(&boolean_scratch);
+    cancel.calls = 0;
+    const should = [_]query_mod.Filter{
+        .{ .doc_num = .{ .doc_nums = &doc_nums } },
+        .{ .doc_num = .{ .doc_nums = &doc_nums } },
+    };
+    const boolean_filter: query_mod.Filter = .{ .bool_filter = .{ .must = &.{}, .must_not = &.{}, .should = &should, .min_should_match = 2 } };
+    try std.testing.expectError(error.Canceled, boolean_filter.withControl(.{
+        .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check },
+    }).execute(boolean_alloc.allocator(), &writer.snapshot().segments[0]));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+
+    const LimitedChecks = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 12;
+        }
+    };
+    var limited = LimitedChecks{};
+    var selective = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .doc_num = .{ .ids = &doc_nums } },
+        .k = 1,
+        .include_stored = false,
+        .filter_doc_nums = &.{16383},
+        .filter_doc_nums_positive = true,
+        .control = .{ .cancellation = .{ .ptr = &limited, .is_cancelled_fn = LimitedChecks.check } },
+    });
+    defer selective.deinit();
+    try std.testing.expectEqual(@as(u32, 1), selective.total_hits);
+    try std.testing.expectEqual(@as(u32, 16383), selective.hits[0].doc_id);
+    try std.testing.expect(limited.calls < 12);
+
+    limited.calls = 0;
+    var exclusion = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .doc_num = .{ .ids = &doc_nums } },
+        .k = 1,
+        .include_stored = false,
+        .exclude_doc_nums = &.{16383},
+        .control = .{ .cancellation = .{ .ptr = &limited, .is_cancelled_fn = LimitedChecks.check } },
+    });
+    defer exclusion.deinit();
+    try std.testing.expectEqual(@as(u32, 16383), exclusion.total_hits);
+    try std.testing.expectEqual(@as(u32, 0), exclusion.hits[0].doc_id);
+    try std.testing.expect(limited.calls < 12);
+
+    const allowed = [_]u32{ 0, 100, 1000, 2002, 2004, 2006, 2008, 2010, 4094 };
+    var scratch: [64 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    var request: SearchRequest = .{
+        .query = .{ .prefix = .{ .field = "title", .prefix = "com", .boost = 2.5 } },
+        .k = 3,
+        .offset = 2,
+        .include_stored = false,
+        .filter_doc_nums = &allowed,
+        .filter_doc_nums_positive = true,
+        .search_after = .{ .score = 2.5, .doc_id = 2000 },
+    };
+    var page = try execute(bounded.allocator(), writer.snapshot(), request);
+    try std.testing.expectEqual(@as(u32, allowed.len), page.total_hits);
+    try std.testing.expectEqual(TotalHitsRelation.exact, page.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 3), page.hits.len);
+    for (page.hits, [_]u32{ 2006, 2008, 2010 }) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+    request.search_after = page.cursor;
+    request.offset = 0;
+    page.deinit();
+    bounded.reset();
+    var next = try execute(bounded.allocator(), writer.snapshot(), request);
+    try std.testing.expectEqual(@as(u32, allowed.len), next.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), next.hits.len);
+    try std.testing.expectEqual(@as(u32, 4094), next.hits[0].doc_id);
+    next.deinit();
+    for ([_]f32{ 2.4, 2.6 }) |score| {
+        bounded.reset();
+        request.search_after = .{ .score = score, .doc_id = 2000 };
+        var result = try execute(bounded.allocator(), writer.snapshot(), request);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, allowed.len), result.total_hits);
+        try std.testing.expectEqual(@as(usize, if (score < 2.5) 0 else 3), result.hits.len);
+        if (score > 2.5) try std.testing.expectEqual(@as(u32, 0), result.hits[0].doc_id);
+    }
+    bounded.reset();
+    request.filter_doc_nums = &.{};
+    request.filter_doc_nums_positive = false;
+    request.search_after = .{ .score = 2.5, .doc_id = 15000 };
+    var deep_page = try execute(bounded.allocator(), writer.snapshot(), request);
+    defer deep_page.deinit();
+    try std.testing.expectEqual(@as(u32, doc_nums.len), deep_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), deep_page.hits.len);
+    for (deep_page.hits, [_]u32{ 15001, 15002, 15003 }) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+
+    var positive = roaring.RoaringBitmap.init(alloc);
+    defer positive.deinit();
+    for ([_]u32{ 1000, 2002, 2004, 2006, 2008, 2010, 4094 }) |doc_id| try positive.add(doc_id);
+    var negative = roaring.RoaringBitmap.init(alloc);
+    defer negative.deinit();
+    try negative.add(2004);
+    request.filter_doc_bitmap = &positive;
+    request.exclude_doc_bitmap = &negative;
+    request.filter_doc_nums = &allowed;
+    request.filter_doc_nums_positive = true;
+    request.exclude_doc_nums = &.{2006};
+    request.search_after = .{ .score = 2.5, .doc_id = 2000 };
+    request.offset = 2;
+    var composed = try execute(alloc, writer.snapshot(), request);
+    defer composed.deinit();
+    try std.testing.expectEqual(@as(u32, 5), composed.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), composed.hits.len);
+    try std.testing.expectEqual(@as(u32, 2010), composed.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 4094), composed.hits[1].doc_id);
+    try std.testing.expectEqual(@as(u64, 7), positive.cardinality());
+    try std.testing.expectEqual(@as(u64, 1), negative.cardinality());
+
+    request.filter_doc_bitmap = null;
+    request.exclude_doc_bitmap = null;
+    request.filter_doc_nums_positive = false;
+    request.exclude_doc_nums = doc_nums[1 .. doc_nums.len - 1];
+    request.search_after = null;
+    request.offset = 0;
+    var bulk_excluded = try execute(alloc, writer.snapshot(), request);
+    defer bulk_excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 2), bulk_excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), bulk_excluded.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), bulk_excluded.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 16383), bulk_excluded.hits[1].doc_id);
+    request.filter_doc_bitmap = &positive;
+    var small_match_set = try execute(alloc, writer.snapshot(), request);
+    defer small_match_set.deinit();
+    try std.testing.expectEqual(@as(u32, 0), small_match_set.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), small_match_set.hits.len);
 }
 
 test "exact inclusive term range preserves prefix constant scores" {

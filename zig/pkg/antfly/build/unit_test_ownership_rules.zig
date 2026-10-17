@@ -23,28 +23,6 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "compiled CHECK",
         .skip = &.{
-            // Query helpers shared with the introducer keep one execution owner.
-            "search.query.test.fuzzy filter finds similar terms",
-            "search.query.test.fuzzy filter prunes dead dictionary prefixes without decoding them",
-            "search.query.test.fuzzy filter pruning matches the unpruned reference on a mixed dictionary",
-            "search.query.test.geo bbox coarse candidates expand max precision geohash terms",
-            "search.query.test.geo bbox dense coarse candidates fall back to exact doc values",
-            "search.query.test.geo bbox filter refines indexed geohash candidates",
-            "search.query.test.geo bbox filter supports antimeridian wrapped longitude ranges",
-            "search.query.test.geo distance filter",
-            "search.query.test.geo distance filter uses indexed candidates across antimeridian",
-            "search.query.test.geo filter candidate precision adapts to selective boxes",
-            "search.query.test.geo shape filter point in polygon",
-            "search.query.test.regexp filter prunes dead dictionary prefixes without decoding them",
-            "search.query.test.wildcard filter seeks by literal prefix in large term dictionary",
-            "search.query.test.wildcard filter with leading operator still scans the whole dictionary",
-            "search.query.test.wildcard filter with prefix star",
-            "search.query.test.wildcard filter with question mark",
-            "search.query.test.wildcard filter with suffix star",
-            "search.query.test.wildcard filter without operators uses one exact lookup",
-            "search.wildcard.test.wildcard literal escaping round trips metacharacters",
-            "search.wildcard.test.wildcard matching distinguishes operators from escaped literals",
-            "search.wildcard.test.wildcard search plans preserve escaped exact literals and prefixes",
             "api.runtime_status.consumerTests.Suite.test.",
             "api.http_server.test.authoritative catalog mutation boundaries reject orphaned semantic producers",
             "api.indexes.consumerTests.Suite.test.actionable repair remains visible while retained generation stays queryable",
@@ -76,7 +54,6 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "graph.graph.test.graph durable writes reject invalid edge types before mutation",
             "graph.graph.test.graph edge encoding round-trip",
             "graph.query.test.",
-            "index.test.typed doc values coverage admission honors cancellation deadline and contention",
             "inference.managed_embedder.test.managed embedder admission follows the selected attachment transport",
             "inference.managed_embedder.test.managed embedder binds execution to catalog semantic producer identity",
             "inference.managed_embedder.test.managed embedder catalog ownership rejects orphaned semantic producers",
@@ -99,8 +76,6 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "inference.mod.test.managed embedder rejects malformed provider vectors",
             "inference.mod.test.managed embedder sends antfly media parts when local provider is configured",
             "runtime_callback_abi.test.",
-            "search.geo.test.",
-            "section.typed_doc_values.test.",
             "segment.test.",
             "standalone.runtime.test.",
             "storage.background_runtime.test.",
@@ -117,7 +92,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/api_derived_coverage_test_root.zig",
-        .artifact = "test",
+        .artifact = "api-derived-coverage-tests",
         .selection = "live repair admission supersedes cached vector serviceability",
         .skip = &.{
             "api.http_client.consumerTests.Suite.test.",
@@ -159,8 +134,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
             "metadata.storage.raft_apply_store.test.",
-            "storage.db.query.graph_exec.test.",
-            "storage.db.types.test.",
+            // The storage collection owns physical source tests, including
+            // borrowed-wire helpers imported by this protocol consumer. Keep
+            // focused graph targets intact; only the aggregate skips them.
+            "storage.",
         },
     },
     .{
@@ -300,8 +277,6 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "graph.query.",
         .skip = &.{
-            // Introducer owns physical-score read helper regressions.
-            "graph.score_read.test.",
             "storage.hot_standby.native_topology_receipt_integration_test.test.",
             "storage.backend_erased.test.",
             "storage.db.db.test.",
@@ -329,15 +304,13 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "issue1015",
         .skip = &.{
             // C ABI regressions borrow the implementation; storage owns its tests.
-            "storage.db.db.test.",
-            "storage.db.derived.catch_up_policy.test.",
-            "storage.db.derived.io_threaded_runtime.test.",
+            "storage.",
         },
     },
     .{
-        .source = "pkg/antfly-embedded/src/introducer.zig",
+        .source = "pkg/antfly/src/introducer_test_root.zig",
         .artifact = "test",
-        .selection = "all",
+        .selection = "introducer.",
         .skip = &.{
             "common.cancellation.test.",
             "runtime_callback_abi.test.",
@@ -357,10 +330,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "lake",
         .skip = &.{
             "common.config.",
-            "^index.",
             "introducer.",
-            // Sidecar terminology does not make engine or segment contracts Lake-owned.
-            "segment.test.",
+            // External physical readers stay here; generic segment serialization
+            // remains with the explicit DocID/index-sort contract collection.
+            "segment.test.segment ",
             "sparse.sparse.test.",
             "storage.db.",
             "storage.hbc_adapter.test.",
@@ -423,7 +396,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = "api-docid-tests",
         .selection = "api table reads reject stale doc identity before multigroup fanout",
         .skip = &.{
             "api.distributed_graph.test.distributed graph edge reader routes outgoing and fans out incoming adjacency",
@@ -438,7 +411,6 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "metadata.reconciler.test.",
             "metadata.state.test.",
             "metadata.table_workflow.test.",
-            "segment.test.",
             "storage.db.aggregations.test.",
             "storage.db.algebraic.index.test.",
             "storage.db.algebraic.planner.test.",
@@ -615,7 +587,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = "raft-unit-tests",
         .selection = "raft.",
         .skip = &.{
             // The explicit transport owner includes its reachability contracts.
@@ -652,7 +624,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = "api-auth-tests",
         .selection = "storage migration job observation preserves admitted and unpublished catalog state",
         .skip = &.{
             "api.http_server.test.api http server cluster backup succeeds after load balanced metadata timeout retry",
