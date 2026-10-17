@@ -307,7 +307,7 @@ test "relational index system JSONB physical display is distinct from streaming 
         var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
         try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ case.input, case.physical });
     }
-    try std.testing.expectError(error.InvalidBatchRequest, content.canonicalJsonStorageValueAlloc(a, .{ .string = "\x00" }));
+    try std.testing.expectError(error.SqlUntranslatableCharacter, content.canonicalJsonStorageValueAlloc(a, .{ .string = "\x00" }));
     try std.testing.expectError(error.InvalidBatchRequest, content.canonicalJsonStorageValueAlloc(a, .{ .number_string = "1e131072" }));
 }
 

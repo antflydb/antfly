@@ -5200,9 +5200,13 @@ test "relational index system JSON literal ownership and display identity requir
     for ([_][]const u8{
         "{\"op\":\"literal\",\"type\":\"json\",\"value\":null,\"json_null\":1}",
         "{\"op\":\"literal\",\"type\":\"integer\",\"value\":1,\"json_null\":false}",
-        "{\"op\":\"literal\",\"type\":\"json\",\"value\":\"\\u0000\"}",
         "{\"op\":\"literal\",\"type\":\"json\",\"value\":1e131072}",
     }) |invalid| try std.testing.expectError(error.InvalidRelationalExpressionType, Compile.run(a, table, invalid));
+    for ([_][]const u8{
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":\"\\u0000\"}",
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":{\"\\u0000\":1}}",
+        "{\"op\":\"literal\",\"type\":\"json\",\"value\":[{\"k\":\"\\u0000\"}]}",
+    }) |invalid| try std.testing.expectError(error.SqlUntranslatableCharacter, Compile.run(a, table, invalid));
 }
 
 test "relational index system legacy expression results survive prepared input and ingress retirement" {

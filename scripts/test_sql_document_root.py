@@ -18,10 +18,23 @@
 import json
 import unittest
 
+import psycopg
+
 from generate_sql_postgres_reference import FIXTURES, postgres
 
 
 class DocumentRootTest(unittest.TestCase):
+    def test_jsonb_nul_preserves_untranslatable_character_diagnostic(self):
+        with postgres() as db:
+            for value in ("\x00", {"\x00": 1}, [{"k": "\x00"}]):
+                with self.subTest(value=repr(value)):
+                    try:
+                        db.execute("SELECT %s::jsonb", (json.dumps(value),))
+                    except psycopg.Error as exc:
+                        self.assertEqual("22P05", exc.sqlstate)
+                    else:
+                        self.fail("PostgreSQL accepted a NUL in JSONB")
+
     def test_original_document_root_insertions(self):
         originals = {
             entry["id"]: entry
