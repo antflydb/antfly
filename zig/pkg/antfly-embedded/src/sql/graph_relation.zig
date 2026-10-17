@@ -343,7 +343,15 @@ pub const Cursor = struct {
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
         if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;
         self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .empty = empty };
-        return .{ .ptr = self, .next = next, .close = close, .count_rows = countRows, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+        return .{ .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+    }
+    fn enableWeights(ptr: *anyopaque) !bool {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        if (self.position != 0 or self.resume_position != 0 or self.request.primary_key != null or self.request.graph_source_ordinals) return false;
+        for (self.request.fields) |field| if (std.mem.eql(u8, field, "_id")) return false;
+        for (self.request.conditions) |condition| if (std.mem.eql(u8, condition.column, "_id")) return false;
+        if (self.stream) |stream| return stream.enableWeights();
+        return false;
     }
     fn countRows(ptr: *anyopaque) anyerror!?u64 {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -388,7 +396,7 @@ pub const Cursor = struct {
                 if (self.position < self.resume_position) return error.InvalidSqlBackendResponse;
                 break;
             }
-            for (rows) |values| {
+            for (rows, 0..) |values, row_index| {
                 const index = self.position;
                 self.position += 1;
                 if (index < self.resume_position) continue;
@@ -426,7 +434,11 @@ pub const Cursor = struct {
                 if (!accepted) continue;
                 const cells = try owned.alloc(scalar.Datum, self.request.fields.len);
                 for (self.request.fields, cells) |field, *out| out.* = try @import("operators.zig").cloneDatum(owned, try row.cell(field));
-                try output.append(owned, try catalog.Row.fromDatums(owned, try owned.dupe(u8, row_id), layout, cells));
+                var typed = try catalog.Row.fromDatums(owned, try owned.dupe(u8, row_id), layout, cells);
+                if (self.stream) |stream| if (stream.weighted) {
+                    typed.multiplicity = stream.last_weights.items[row_index];
+                };
+                try output.append(owned, typed);
             }
         }
         const more = if (self.empty) false else if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
@@ -549,6 +561,15 @@ test "graph cursor resumes pushed pages and preserves observable source ordinals
     const binding: Binding = .{ .definition = .{ .name = .{ .table = "g" }, .query = compiled.query, .parameters = compiled.parameters }, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs", .table_id = 7 }}, .relationships = &.{} }, .catalog_json = "{}", .dependencies = &.{.{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "rank", .path = "rank", .type = .integer } } }} };
     var marker: u8 = 0;
     const backend: cypher.backend.Backend = .{ .ptr = &marker, .vtable = &.{ .bind = Fixture.bind, .checkpoint = Fixture.checkpoint, .scan = Fixture.scan, .get = Fixture.get, .expand = Fixture.expand } };
+    const paths = try cypher.compiler.compileInto(a, "MATCH (n:D)-[:R*0..2]->(m:D) RETURN n.id AS id", .{}, &diagnostic);
+    var path_binding = binding;
+    path_binding.definition.query = paths.query;
+    path_binding.graph.relationships = &.{.{ .name = "R", .index = "links", .source_label = "D", .target_label = "D", .stored_type = "R" }};
+    for ([_]bool{ false, true }) |ordinals| {
+        const weighted = try Cursor.open(std.testing.allocator, path_binding, backend, &.{}, .{ .fields = &.{"id"}, .graph_source_ordinals = ordinals, .limit = 128 }, .{});
+        defer weighted.close(weighted.ptr);
+        try std.testing.expectEqual(!ordinals, try weighted.enable_weights.?(weighted.ptr));
+    }
     var request: catalog.Scan = .{ .fields = &.{"id"}, .conditions = &.{.{ .column = "rank", .op = .gte, .value = .{ .integer = 1 } }}, .limit = 1, .row_goal = 1 };
     const first = try Cursor.open(std.testing.allocator, binding, backend, &.{}, request, .{});
     const page = try first.next(first.ptr, std.testing.allocator, 2);

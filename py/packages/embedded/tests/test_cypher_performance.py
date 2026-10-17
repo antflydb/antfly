@@ -1094,6 +1094,13 @@ def test_all_paths_count_uses_dag_states_for_native_and_sql(graph_db):
         [str(expected)]
     ]
     assert time.monotonic() - start < 5
+    start = time.monotonic()
+    aggregate = db.sql(
+        f"SELECT sum(q.score),min(q.score),max(q.score),sum(DISTINCT q.score) "
+        f"FROM GRAPH_TABLE(g MATCH {sql_pattern} COLUMNS(b.score AS score)) q"
+    )
+    assert [int(cell) for cell in aggregate["rows"][0]] == [total, 6, 17, sum(range(6, size))]
+    assert time.monotonic() - start < 5
 
 
 def test_all_path_product_states_preserve_endpoint_constraints_and_bags(graph_db):
@@ -1210,3 +1217,69 @@ def test_relationship_merge_indexes_bound_pairs_and_reuses_native_adjacency(grap
     assert db.cypher_json("g", {"query": "MATCH ()-[:R]->() RETURN count(*)"})["rows"] == [
         [{"type": "integer", "value": "800"}]
     ]
+
+
+def test_mixed_and_unbounded_dag_domains_keep_physical_work_bounded(graph_db):
+    from math import comb
+
+    db = graph_db
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "mixed",
+            "definition": {
+                "labels": [{"name": "D", "table": "docs"}],
+                "relationships": [
+                    {
+                        "name": name,
+                        "index": "links",
+                        "source_label": "D",
+                        "target_label": "D",
+                        "stored_type": name.lower(),
+                    }
+                    for name in ("R", "S")
+                ],
+            },
+        }
+    )
+    size = 18
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:{kind}]->(n{j})" for kind in ("R", "S") for i in range(size) for j in range(i + 1, size)]
+    db.cypher_json("mixed", {"query": "CREATE " + ",".join(patterns)})
+    for pattern, expected in (
+        ("(a:D)-[:R*3..3]->()-[:S*3..3]->(b:D)", comb(size, 7)),
+        ("(a:D)-[:R*6..]->(b:D)", sum(comb(size, depth + 1) for depth in range(6, size))),
+    ):
+        result = db.cypher_json(
+            "mixed",
+            {
+                "query": f"MATCH {pattern} RETURN count(*)",
+                "limits": {"explored_edges": 2000, "intermediate_states": 40000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+        assert result["stats"]["explored_edges"] < 2000
+
+
+def test_bound_endpoint_read_and_count_seek_native_hub_pairs(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    db.cypher_json("g", {"query": "CREATE (:D {id:'root'})"})
+    db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D {id:'root'}) UNWIND $ids AS id CREATE (b:D {id:id}) CREATE (a)-[:R]->(b)",
+            "parameters": {"ids": [f"n{i}" for i in range(800)]},
+        },
+    )
+    prefix = "MATCH (a:D {id:'root'}),(b:D {id:'n799'}) MATCH "
+    for pattern in ("(a)-[:R]->(b)", "(b)<-[:R]-(a)"):
+        for projection, expected in (
+            ("count(*)", [[{"type": "integer", "value": "1"}]]),
+            ("a.id LIMIT 1", [[{"type": "string", "value": "root"}]]),
+        ):
+            result = db.cypher_json(
+                "g", {"query": prefix + pattern + " RETURN " + projection, "limits": {"explored_edges": 10}}
+            )
+            assert result["rows"] == expected
+            assert result["stats"]["explored_edges"] <= 2

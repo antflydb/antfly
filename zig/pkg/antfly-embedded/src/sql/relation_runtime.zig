@@ -2113,6 +2113,7 @@ fn Engine(comptime Context: type) type {
             ordinal: u64 = 0,
             opened: bool = false,
             pending_failure: ?anyerror = null,
+            weighted: bool = false,
 
             fn iface(self: *Adapter) catalog.Backend {
                 return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
@@ -2181,6 +2182,39 @@ fn Engine(comptime Context: type) type {
                 self.ordinal += batch.len();
                 return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = if (batch.len() != 0) try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) else null };
             }
+            fn enableWeights(ptr: *anyopaque) !bool {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.ordinal != 0 or self.pending_failure != null or self.iterator.pages != 0 or self.iterator.apply_mode or self.iterator.recursive_id != null or self.iterator.node.operation != .scan) return false;
+                const cursor = self.engine.cursors[self.iterator.node.operation.scan.index];
+                self.weighted = if (cursor.enable_weights) |enable| try enable(cursor.ptr) else false;
+                return self.weighted;
+            }
+            fn nextWeighted(self: *Adapter, a: Allocator, limit: u32) !catalog.Page {
+                const scan_source = self.iterator.node.operation.scan;
+                const cursor = self.engine.cursors[scan_source.index];
+                try self.engine.context.checkpoint();
+                self.iterator.pages += 1;
+                if (self.iterator.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+                var page = try cursor.next(cursor.ptr, a, limit);
+                defer page.deinit();
+                if (page.rows.len > limit or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.InvalidSqlBackendResponse;
+                self.engine.visited += page.rows.len;
+                const names = try a.alloc([]const u8, self.iterator.node.columns.len);
+                for (self.iterator.node.columns, names) |column, *name| name.* = column.internal;
+                const layout = try catalog.Row.TypedLayout.init(a, names);
+                const rows = try a.alloc(catalog.Row, page.rows.len);
+                for (page.rows, rows) |row, *out| {
+                    const values = try a.alloc(Datum, names.len);
+                    for (scan_source.source_columns, self.iterator.node.columns, values) |name, column, *value| {
+                        const cell = try @import("joined_mutation.zig").cell(a, row, name);
+                        value.* = try operators.cloneDatum(a, try describe.coerceDatum(a, cell, column.type, column.element_type));
+                    }
+                    self.ordinal += 1;
+                    out.* = try catalog.Row.fromDatums(a, try std.fmt.allocPrint(a, "{d}", .{self.ordinal}), layout, values);
+                    out.multiplicity = row.multiplicity;
+                }
+                return .{ .rows = rows, .after = if (page.after) |after| try a.dupe(u8, after) else null };
+            }
             fn countRows(ptr: *anyopaque) !?u64 {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 // Only an untouched physical scan is transparent to exact
@@ -2195,11 +2229,12 @@ fn Engine(comptime Context: type) type {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.opened) return error.InvalidSqlBackendResponse;
                 self.opened = true;
-                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .close = close };
+                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .close = close };
             }
             fn close(_: *anyopaque) void {}
             fn next(ptr: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.weighted) return self.nextWeighted(alloc, limit);
                 // Row adapters share the same memory-aware demand ceiling as
                 // typed pages; an aggregate does not need oversized row pages.
                 const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
@@ -2282,6 +2317,10 @@ fn Source(comptime Context: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.nextColumns(&self.adapter, alloc, limit);
         }
+        fn enableWeights(raw: *anyopaque) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.enableWeights(&self.adapter);
+        }
         fn countRows(raw: *anyopaque) !?u64 {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.countRows(&self.adapter);
@@ -2295,7 +2334,7 @@ fn Source(comptime Context: type) type {
 
 pub fn openCursor(context: anytype) !catalog.Cursor {
     const owner = try Source(@TypeOf(context)).create(context);
-    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .close = @TypeOf(owner.*).closeCursor };
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .enable_weights = @TypeOf(owner.*).enableWeights, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {

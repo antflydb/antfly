@@ -57,7 +57,7 @@ pub fn Host(comptime DB: type) type {
             proofs: []const tracking.Proof = &.{},
             next_entity: u64 = 0,
             pub fn pinnedBackend(self: *Statement) cypher.backend.Backend {
-                return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .get = pinnedGet, .expand = pinnedExpand, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
+                return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
             }
             fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
                 const backend = cast(ptr).adapter.backend();
@@ -82,6 +82,10 @@ pub fn Host(comptime DB: type) type {
             fn pinnedGet(ptr: *anyopaque, a: A, identity: cypher.value.Identity) !?*const cypher.value.Node {
                 const backend = cast(ptr).adapter.backend();
                 return backend.vtable.get(backend.ptr, a, identity);
+            }
+            fn pinnedExpandBetween(ptr: *anyopaque, a: A, mapping: cypher.catalog.Relationship, identity: cypher.value.Identity, peer: cypher.value.Identity, direction: cypher.ast.Direction, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
+                const backend = cast(ptr).adapter.backend();
+                return backend.vtable.expand_between.?(backend.ptr, a, mapping, identity, peer, direction, filters, after, limit, max_examined);
             }
             fn pinnedExpand(ptr: *anyopaque, a: A, mapping: cypher.catalog.Relationship, identity: cypher.value.Identity, direction: cypher.ast.Direction, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
                 const backend = cast(ptr).adapter.backend();

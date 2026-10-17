@@ -106,6 +106,11 @@ pub const Collector = struct {
         try self.grouped.add(keys, inputs);
         try self.capture(keys, inputs);
     }
+    pub fn addWeighted(self: *Collector, keys: []const Datum, inputs: []const Datum, weight: u64) !void {
+        if (weight == 1) return self.add(keys, inputs);
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addWeighted(keys, inputs, weight);
+    }
     pub fn addGlobalBatch(self: *Collector, inputs: []const []const Datum) !void {
         try self.grouped.addGlobalBatch(inputs);
         for (inputs) |row| try self.capture(&.{}, row);

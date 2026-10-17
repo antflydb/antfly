@@ -61,6 +61,13 @@ const Cursor = struct {
         try self.read.validate();
         return page;
     }
+    fn enableWeights(ptr: *anyopaque) !bool {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        try self.read.validate();
+        const enabled = if (self.child.enable_weights) |enable| try enable(self.child.ptr) else false;
+        try self.read.validate();
+        return enabled;
+    }
     fn countRows(ptr: *anyopaque) !?u64 {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         try self.read.validate();
@@ -151,5 +158,5 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
         parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(temporary.allocator(), adapter.graph_parameters[index - 1]) };
     }
     self.child = try catalog.graph_relation.Cursor.open(a, binding, provider, parameters, request, .{});
-    return .{ .ptr = self, .next = Cursor.next, .close = Cursor.close, .count_rows = Cursor.countRows, .estimated_rows = self.child.estimated_rows };
+    return .{ .ptr = self, .next = Cursor.next, .close = Cursor.close, .count_rows = Cursor.countRows, .enable_weights = Cursor.enableWeights, .estimated_rows = self.child.estimated_rows };
 }

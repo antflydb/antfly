@@ -225,6 +225,8 @@ pub const Scan = struct {
     limit: u32,
 };
 pub const Row = struct {
+    /// Internal bag weight, enabled only by an aggregate consumer.
+    multiplicity: u64 = 1,
     id: []const u8,
     version: u64,
     value: std.json.Value,
@@ -459,6 +461,9 @@ pub const Cursor = struct {
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
+    /// Before the first pull, opt into compressed bag rows. Other consumers
+    /// always receive one physical row per logical row.
+    enable_weights: ?*const fn (*anyopaque) anyerror!bool = null,
 };
 
 pub const StatementScan = struct { table: Table, request: Scan };

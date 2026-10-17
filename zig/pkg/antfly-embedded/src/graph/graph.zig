@@ -219,6 +219,8 @@ pub const CypherEdgePage = struct {
 };
 
 pub const EdgePageLimits = struct {
+    /// Restrict the physical key range to one adjacent identity.
+    peer_key: ?[]const u8 = null,
     max_edges: usize,
     max_owned_bytes: usize,
     max_scanned_rows: usize = 4096,
@@ -8630,7 +8632,7 @@ pub const GraphIndex = struct {
         const read = &context.reads.incoming.?;
         page: while (scanned < limits.max_scanned_rows and output.items.len < limits.max_edges) {
             if (state.edge == null) {
-                var physical = try self.getEdgesByTypesPageInRead(temporary, key, edge_types, direction, state.physical, .{ .max_edges = 1, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows - scanned }, now_ns, null, &context.reads, false);
+                var physical = try self.getEdgesByTypesPageInRead(temporary, key, edge_types, direction, state.physical, .{ .max_edges = 1, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows - scanned, .peer_key = limits.peer_key }, now_ns, null, &context.reads, false);
                 defer physical.deinit(temporary);
                 scanned += physical.scanned_rows;
                 state.physical = if (physical.next_cursor) |cursor| try cursor.clone(temporary) else null;
@@ -9238,7 +9240,10 @@ pub const GraphIndex = struct {
     ) !?EdgeScanCursor {
         std.debug.assert(phase != .both);
         const phase_start_len = results.items.len;
-        const prefix = if (phase == .out)
+        if (limits.peer_key != null and requested_type.len == 0) return error.InvalidArgument;
+        const prefix = if (limits.peer_key) |peer|
+            try graphIndexEdgeKeyAlloc(alloc, key, self.index_name, requested_type, peer)
+        else if (phase == .out)
             try edgePrefixAlloc(alloc, key, self.index_name, requested_type)
         else
             try reverseEdgePrefixAlloc(alloc, key, self.index_name, requested_type);
@@ -40229,4 +40234,42 @@ test "graph committed intents survive canceled durability fences" {
     test_intent_sync_hook = null;
     try g.batchApply(&.{}, &.{.{ .source = "source", .target = "target", .edge_type = "link", .clear_all_private_state = true }});
     try std.testing.expectEqual(@as(usize, 0), (try g.getEdges(a, "source", "link", .out)).len);
+}
+
+test "graph pair prefixes seek hubs and preserve parallel IDs across assertion pages" {
+    const a = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "links", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const writes = try pa.alloc(BatchWrite, 1002);
+    for (writes[0..1000], 0..) |*write, index| write.* = .{ .source = "hub", .target = try std.fmt.allocPrint(pa, "n{d}", .{index}), .edge_type = "R", .weight = 1 };
+    writes[1000] = .{ .source = "hub", .target = "selected", .edge_type = "R", .edge_id = "first", .weight = 2 };
+    writes[1001] = .{ .source = "hub", .target = "selected", .edge_type = "R", .edge_id = "second", .weight = 3 };
+    try graph.batchApply(writes, &.{});
+    for ([_]EdgeDirection{ .out, .in }) |direction| {
+        var continuation: ?CypherEdgeScanCursor = null;
+        var total: usize = 0;
+        var examined: usize = 0;
+        var pages: usize = 0;
+        while (true) {
+            var page = try graph.getCypherEdgesByTypesPageAt(a, if (direction == .out) "hub" else "selected", &.{"R"}, direction, continuation, .{ .peer_key = if (direction == .out) "selected" else "hub", .max_edges = 1, .max_owned_bytes = 4096, .max_scanned_rows = 2 }, 1);
+            defer page.deinit(a);
+            if (continuation) |*cursor| cursor.deinit(a);
+            continuation = null;
+            for (page.edges) |edge| {
+                try std.testing.expectEqualStrings("hub", edge.source);
+                try std.testing.expectEqualStrings("selected", edge.target);
+                try std.testing.expect(edge.edge_id.len != 0);
+                total += 1;
+            }
+            examined += page.scanned_rows;
+            pages += 1;
+            try std.testing.expect(pages < 10);
+            if (page.next_cursor) |cursor| continuation = try cursor.clone(a) else break;
+        }
+        try std.testing.expectEqual(@as(usize, 2), total);
+        try std.testing.expect(examined <= 6);
+    }
 }

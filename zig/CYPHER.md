@@ -1300,16 +1300,26 @@ compression nor early deduplication may discard valid qualifying trails.
 Eligible ALL-path endpoint reductions discover authorized adjacency from sparse
 (pattern edge, hop, identity) states. Rejected intermediate node predicates leave
 the branches behind those nodes unopened. Finite bounds and a DAG proof permit prefix
-compression under trail and node uniqueness; repeatable walks admit bounded
+compression under trail and node uniqueness. Unbounded segments first discover
+the authorized, property-qualified closure and prove its maximum depth with a
+topological pass; cyclic segments retain exact traversal. Repeatable walks admit bounded
 product states directly. Pattern labels, directions, relationship types,
 constant properties and parallel-edge multiplicities remain exact. Edge patterns
-sharing a mapping/direction domain reuse one capture; heterogeneous domains, rebound
+sharing a mapping/direction domain reuse one capture; mixed types and directions
+use separate cached domains and a union proof for route uniqueness. Rebound
 route aliases, repeated node aliases, path-sensitive constraints and unproven cyclic
 trails retain exact enumeration, reusing captured adjacency where applicable.
 Intermediate counts saturate above the result range, so only qualifying endpoint
 counts can report overflow. SQL GRAPH_TABLE exposes this through the exact-count
 cursor hook under the same owner cut, with SQL residuals and ordinal selection
-retaining ordinary pulls.
+retaining ordinary pulls. SQL aggregates can additionally negotiate a weighted
+endpoint cursor before their first pull. Only endpoint-local graph projections
+and deterministic SQL inputs qualify. Multiplicities reach SQL reducers through
+transparent scan adapters: checked wide integer and exact NUMERIC states, NULLs,
+DISTINCT, grouping, filters and spill retain their SQL behavior. Floating SUM/AVG,
+ordered aggregates, observable source ordinals, route-sensitive expressions and
+nontransparent relational operators retain ordinary rows. The cursor buffers
+endpoint contributions for one anchor, never the complete result or route bag.
 
 Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
 DISTINCT variants consume weighted endpoint rows from those same states.
@@ -1341,8 +1351,13 @@ constant folding shares checked runtime arithmetic when constructing seeks;
 failed folds remain residuals so overflow and division errors keep their runtime
 semantics.
 
-Fixed-edge matches with two bound endpoints use transaction-local relationship
-pair postings, with lazy scalar-property indexes and collision residuals. Native
+Fixed-edge matches with two bound endpoints seek the complete encoded
+(source, index, type, peer) key prefix in native outgoing or incoming storage.
+Parallel IDs, contributor selection, TTL, ownership, authorization and physical
+continuation budgets retain the ordinary adjacency rules. Counts and pull
+queries share this capability through RPC and distributed source owners.
+Transaction overlays merge captured native pairs with transaction-local pair
+postings, lazy scalar-property indexes and collision residuals. Native
 backends without pair seeks populate a retained adjacency domain once under the
 same statement cut and physical/work quotas. Later MERGE probes reuse that index;
 new relationships and postimage changes maintain it incrementally. Pair indexes

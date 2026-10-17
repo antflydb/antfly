@@ -28,6 +28,7 @@ pub const Request = struct {
     graph_revision: u64,
     table: []const u8 = "",
     identity: ?v.Identity = null,
+    peer: ?v.Identity = null,
     identities: []const v.Identity = &.{},
     relationship: []const u8 = "",
     direction: ast.Direction = .out,
@@ -56,7 +57,7 @@ pub const Client = struct {
     work: ?b.Work = null,
     read_fields: ?[]const []const u8 = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         cast(ptr).read_fields = fields;
@@ -213,11 +214,17 @@ pub const Client = struct {
         return .{ .seeds = seeds, .examined = reply.examined orelse return error.CypherInvalidSearchResult, .approximate = reply.approximate };
     }
     fn expand(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+        return expandPair(ptr, a, mapping, identity, null, direction, after, limit, 1_000_000);
+    }
+    fn expandBetween(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, peer: v.Identity, direction: ast.Direction, _: []const b.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
+        return expandPair(ptr, a, mapping, identity, peer, direction, after, limit, max_examined);
+    }
+    fn expandPair(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: ast.Direction, after: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
         const self = cast(ptr);
         var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const reply = try self.invoke(temporary, .{ .operation = .expand, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identity = identity, .relationship = mapping.name, .direction = direction, .after = after, .limit = limit });
+        const reply = try self.invoke(temporary, .{ .operation = .expand, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identity = identity, .peer = peer, .max_examined = max_examined, .relationship = mapping.name, .direction = direction, .after = after, .limit = limit });
         const relationships = try a.alloc(*const v.Relationship, reply.values.len);
         for (reply.values, relationships) |input, *out| {
             const value = try wire.transport(a, input);
@@ -300,7 +307,12 @@ pub const Owner = struct {
             .expand => {
                 const mapping = self.graph.relationship(request.relationship) orelse return error.UndefinedGraphRelationship;
                 if (!self.permitsTable(self.graph.label(mapping.source_label).?.table)) return error.Forbidden;
-                const page = try self.backend.vtable.expand(self.backend.ptr, scratch, mapping, request.identity orelse return error.InvalidCypherWireValue, request.direction, request.after, request.limit);
+                const identity = request.identity orelse return error.InvalidCypherWireValue;
+                const page = pair: {
+                    if (request.peer) |peer| if (self.backend.vtable.expand_between) |between|
+                        break :pair try between(self.backend.ptr, scratch, mapping, identity, peer, request.direction, &.{}, request.after, request.limit, request.max_examined);
+                    break :pair try self.backend.vtable.expand(self.backend.ptr, scratch, mapping, identity, request.direction, request.after, request.limit);
+                };
                 for (page.items) |relationship| try values.append(scratch, .{ .value = .{ .relationship = relationship }, .include_native = true });
                 next = page.next;
                 examined = page.examined;

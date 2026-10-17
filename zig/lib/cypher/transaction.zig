@@ -79,16 +79,17 @@ pub const Overlay = struct {
     };
     const PairBucket = struct { positions: Positions = .empty, properties: std.StringHashMapUnmanaged(StagedIndex) = .empty };
     const Adjacency = struct {
+        peer: ?v.Identity = null,
         identity: v.Identity,
         index: []const u8,
         type: []const u8,
         direction: ast.Direction,
         const Context = struct {
             pub fn hash(_: @This(), key: Adjacency) u64 {
-                return std.hash.Wyhash.hash(std.hash.Wyhash.hash((v.Identity.Context{}).hash(key.identity), key.index), key.type) ^ @backingInt(key.direction);
+                return std.hash.Wyhash.hash(std.hash.Wyhash.hash((v.Identity.Context{}).hash(key.identity), key.index), key.type) ^ @backingInt(key.direction) ^ (if (key.peer) |peer| (v.Identity.Context{}).hash(peer) else 0);
             }
             pub fn eql(_: @This(), left: Adjacency, right: Adjacency) bool {
-                return left.identity.eql(right.identity) and left.direction == right.direction and std.mem.eql(u8, left.index, right.index) and std.mem.eql(u8, left.type, right.type);
+                return (if (left.peer) |peer| right.peer != null and peer.eql(right.peer.?) else right.peer == null) and left.identity.eql(right.identity) and left.direction == right.direction and std.mem.eql(u8, left.index, right.index) and std.mem.eql(u8, left.type, right.type);
             }
         };
     };
@@ -154,7 +155,7 @@ pub const Overlay = struct {
             for (0..self.relationships.items.len) |position| try self.indexPair(position);
         }
         var examined: usize = 0;
-        const adjacency: Adjacency = .{ .identity = identity, .index = mapping.index, .type = mapping.name, .direction = direction };
+        const adjacency: Adjacency = .{ .peer = if (self.base.vtable.expand_between != null) peer else null, .identity = identity, .index = mapping.index, .type = mapping.name, .direction = direction };
         if (self.lazy and !self.captured_adjacency.contains(adjacency)) {
             // Native stores without a pair seek are indexed once per retained
             // adjacency domain. Staged edges join the same postings incrementally.
@@ -166,21 +167,35 @@ pub const Overlay = struct {
             defer cursor_bytes.deinit(cursor_allocator);
             while (true) {
                 _ = scratch.reset(.retain_capacity);
-                const page = try self.lazyExpand(scratch.allocator(), mapping, identity, direction, cursor, @min(128, @max(1, max_examined -| examined)));
+                const page = if (self.base.vtable.expand_between) |between|
+                    try between(self.base.ptr, scratch.allocator(), mapping, identity, peer, direction, &.{}, cursor, @min(128, @max(1, max_examined -| examined)), max_examined -| examined)
+                else
+                    try self.lazyExpand(scratch.allocator(), mapping, identity, direction, cursor, @min(128, @max(1, max_examined -| examined)));
+                if (self.base.vtable.expand_between != null) for (page.items) |value| {
+                    if (self.findRelationship(.{ .identity = value.identity, .index = value.index }) != null) continue;
+                    if (value.ownership == .field) {
+                        if (try value.producingDocument(scratch.allocator())) |producer| if (self.replaced_producers.contains(producer)) continue;
+                    }
+                    try self.capacity();
+                    const copy = @constCast((try (v.Value{ .relationship = value }).clone(self.alloc.?)).relationship);
+                    try self.appendRelationship(self.alloc.?, .{ .value = copy, .from_base = true });
+                };
                 const count = page.examined orelse page.items.len;
                 if (count > @min(self.max_edges, max_examined) -| examined) return error.CypherEdgeBudgetExceeded;
                 examined += count;
                 // lazyExpand has retained native identities and pair postings.
                 const next = page.next orelse break;
-                const continuation = try std.json.parseFromSliceLeaky(LazyCursor, scratch.allocator(), next, .{});
-                if (continuation.staged) break;
+                if (self.base.vtable.expand_between == null) {
+                    const continuation = try std.json.parseFromSliceLeaky(LazyCursor, scratch.allocator(), next, .{});
+                    if (continuation.staged) break;
+                }
                 if (examined == max_examined) return error.CypherEdgeBudgetExceeded;
                 cursor_bytes.clearRetainingCapacity();
                 try cursor_bytes.appendSlice(cursor_allocator, next);
                 cursor = cursor_bytes.items;
             }
             const retained = self.alloc.?;
-            try self.captured_adjacency.put(retained, .{ .identity = .{ .table = try retained.dupe(u8, identity.table), .key = try retained.dupe(u8, identity.key) }, .index = try retained.dupe(u8, mapping.index), .type = try retained.dupe(u8, mapping.name), .direction = direction }, {});
+            try self.captured_adjacency.put(retained, .{ .peer = if (adjacency.peer) |value| .{ .table = try retained.dupe(u8, value.table), .key = try retained.dupe(u8, value.key) } else null, .identity = .{ .table = try retained.dupe(u8, identity.table), .key = try retained.dupe(u8, identity.key) }, .index = try retained.dupe(u8, mapping.index), .type = try retained.dupe(u8, mapping.name), .direction = direction }, {});
         }
         const outgoing = if (direction != .in) try self.pairCandidates(a, .{ .source = identity, .target = peer, .index = mapping.index, .type = mapping.name }, filters) else &.{};
         const incoming = if (direction != .out and (!identity.eql(peer) or direction == .in)) try self.pairCandidates(a, .{ .source = peer, .target = identity, .index = mapping.index, .type = mapping.name }, filters) else &.{};

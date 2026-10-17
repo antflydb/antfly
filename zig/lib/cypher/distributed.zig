@@ -150,7 +150,7 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_read_fields) |configure| configure(snapshot.backend.ptr, fields);
@@ -262,6 +262,19 @@ pub const ReadSet = struct {
         const position = try self.cursor(a, table, encoded);
         const owner = self.snapshots[position.owner].backend;
         const page = try owner.vtable.expand(owner.ptr, a, mapping, identity, direction, position.after, limit);
+        try checkpoint(ptr);
+        return .{ .items = page.items, .examined = page.examined, .next = try self.next(a, table, position, page.next) };
+    }
+    fn expandBetween(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, peer: v.Identity, direction: ast.Direction, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
+        const self = cast(ptr);
+        const table = self.mappingSource(mapping) orelse return error.UndefinedGraphTable;
+        try checkpoint(ptr);
+        const position = try self.cursor(a, table, encoded);
+        const owner = self.snapshots[position.owner].backend;
+        const page = if (owner.vtable.expand_between) |between|
+            try between(owner.ptr, a, mapping, identity, peer, direction, filters, position.after, limit, max_examined)
+        else
+            try owner.vtable.expand(owner.ptr, a, mapping, identity, direction, position.after, limit);
         try checkpoint(ptr);
         return .{ .items = page.items, .examined = page.examined, .next = try self.next(a, table, position, page.next) };
     }

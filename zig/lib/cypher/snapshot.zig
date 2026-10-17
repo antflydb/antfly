@@ -71,7 +71,7 @@ pub const Materialized = struct {
         return result;
     }
     pub fn backend(self: *Materialized) root.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .startup_work = startupWork, .normalize_node = normalizeNode, .document_relationships = documentRelationships, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .expand_between = expandBetween, .startup_work = startupWork, .normalize_node = normalizeNode, .document_relationships = documentRelationships, .set_work = setWork } };
     }
     fn setWork(ptr: *anyopaque, work: ?root.backend.Work) void {
         cast(ptr).overlay.setExecutionWork(work);
@@ -112,6 +112,10 @@ pub const Materialized = struct {
     fn get(ptr: *anyopaque, a: A, id: root.value.Identity) !?*const root.value.Node {
         const provider = cast(ptr).overlay.backend();
         return provider.vtable.get(provider.ptr, a, id);
+    }
+    fn expandBetween(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, id: root.value.Identity, peer: root.value.Identity, direction: root.ast.Direction, filters: []const root.backend.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize) !root.backend.Page(*const root.value.Relationship) {
+        const provider = cast(ptr).overlay.backend();
+        return provider.vtable.expand_between.?(provider.ptr, a, mapping, id, peer, direction, filters, after, limit, max_examined);
     }
     fn expand(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, id: root.value.Identity, direction: root.ast.Direction, after: ?[]const u8, limit: usize) !root.backend.Page(*const root.value.Relationship) {
         const provider = cast(ptr).overlay.backend();

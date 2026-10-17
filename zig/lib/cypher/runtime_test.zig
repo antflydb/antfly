@@ -1684,3 +1684,131 @@ test "mutation RPC scratch is bounded across large postimages and returns owned 
     }
     try std.testing.expect(budget.peak < 2 << 20);
 }
+
+test "mixed domains and unbounded DAG reductions preserve exact path bags" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |dag| for ([_][]const u8{
+        "(a:Document)-[:CITES*0..2]->()-[:MENTIONS*0..1]->(b)",
+        "(a:Document)-[:CITES|MENTIONS*0..1]->()-[:CITES*0..2]->(b)",
+        "(a:Document)-[:CITES*0..1]->()<-[:CITES*0..1]-(b)",
+        "(a:Document)-[:CITES*0..]->(b)",
+        "(a:Document)-[:CITES*1..]->()-[:MENTIONS*0..]->(b)",
+    }) |pattern| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: Fixture = .{};
+        const base = fixture.backend();
+        var callbacks = base.vtable.*;
+        if (dag) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = base.ptr, .vtable = &callbacks };
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "MATCH {s} RETURN b.rank,count(*),sum(b.rank) ORDER BY b.rank", .{pattern}), .{}, &diagnostic);
+        defer compiled.deinit();
+        var exact = try c.compile(a, try std.fmt.allocPrint(a, "MATCH {s} UNWIND [1] AS ignored RETURN b.rank,count(*),sum(b.rank) ORDER BY b.rank", .{pattern}), .{}, &diagnostic);
+        defer exact.deinit();
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var reference = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
+        defer reference.deinit();
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, reference.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
+    };
+}
+
+test "weighted cursor negotiates endpoint bags and falls back for cyclic trails" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |dag| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, "MATCH (a:Document)-[:CITES*0..3]->(b:Document) RETURN b.rank AS r", .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        const base = fixture.backend();
+        var callbacks = base.vtable.*;
+        if (dag) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = base.ptr, .vtable = &callbacks };
+        var reference = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer reference.deinit();
+        const cursor = (try runtime.NodeCursor.open(a, backend, graph, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        try std.testing.expect(try cursor.enableWeights());
+        var weights = [_]u64{ 0, 0, 0 };
+        var compressed = false;
+        while (!cursor.done) {
+            const rows = try cursor.next(a, 128);
+            try std.testing.expectEqual(rows.len, cursor.last_weights.items.len);
+            for (rows, cursor.last_weights.items) |row, weight| {
+                weights[@intCast(row[0].value.integer - 1)] += weight;
+                compressed = compressed or weight > 1;
+            }
+        }
+        var expected = [_]u64{ 0, 0, 0 };
+        for (reference.rows) |row| expected[@intCast(row[0].integer - 1)] += 1;
+        try std.testing.expectEqualSlices(u64, &expected, &weights);
+        if (dag) try std.testing.expect(compressed);
+    }
+}
+
+test "bound pair reads and counts use seeks through owner RPC and pull cursors" {
+    const rpc = @import("rpc.zig");
+    const Pair = struct {
+        fn broad(_: *anyopaque, _: std.mem.Allocator, _: catalog.Relationship, _: v.Identity, _: c.ast.Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+            return error.UnexpectedAdjacencyScan;
+        }
+        fn between(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, peer: v.Identity, direction: c.ast.Direction, _: []const b.PropertyFilter, after: ?[]const u8, demand: usize, max_examined: usize) !b.Page(*const v.Relationship) {
+            const all = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (all.items) |edge| if ((edge.source.eql(identity) and edge.target.eql(peer)) or (edge.target.eql(identity) and edge.source.eql(peer))) try out.append(a, edge);
+            const offset = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(out.items.len, offset + demand);
+            if (end - offset > max_examined) return error.CypherEdgeBudgetExceeded;
+            return .{ .items = out.items[offset..end], .examined = end - offset, .next = if (end < out.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
+            const backend: *b.Backend = @ptrCast(@alignCast(ptr));
+            return (rpc.Owner{ .backend = backend.*, .graph = graph, .table = "docs" }).execute(a, body);
+        }
+    };
+    var fixture: Fixture = .{};
+    const base = fixture.backend();
+    var callbacks = base.vtable.*;
+    callbacks.expand = Pair.broad;
+    callbacks.expand_between = Pair.between;
+    var backend: b.Backend = .{ .ptr = base.ptr, .vtable = &callbacks };
+    var client: rpc.Client = .{ .channel = .{ .ptr = &backend, .call = Pair.call }, .incarnation = graph.incarnation, .revision = graph.revision };
+    for ([_]b.Backend{ backend, client.backend() }) |source| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, "MATCH (a:Document {title:'Alpha'}),(b:Document {title:'Beta'}) MATCH (a)-[:CITES]->(b) RETURN count(*)", .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(a, source, graph, &compiled, &.{}, .{ .explored_edges = 2 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 2), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(usize, 2), result.stats.explored_edges);
+        var pull = try c.compile(a, "MATCH (a:Document {title:'Alpha'}),(b:Document {title:'Beta'}),(a)-[:CITES]->(b) RETURN b.rank", .{}, &diagnostic);
+        defer pull.deinit();
+        const cursor = (try runtime.NodeCursor.open(a, source, graph, pull.query, &.{}, .{ .explored_edges = 2 })).?;
+        defer cursor.close();
+        var total: usize = 0;
+        while (!cursor.done) total += (try cursor.next(a, 1)).len;
+        try std.testing.expectEqual(@as(usize, 2), total);
+    }
+}

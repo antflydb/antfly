@@ -198,7 +198,7 @@ pub fn Database(comptime DB: type) type {
                 .out => .out,
                 .in => .in,
                 .both => .both,
-            }, cursor, .{ .max_edges = limits.max_edges, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows });
+            }, cursor, .{ .max_edges = limits.max_edges, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows, .peer_key = limits.peer_key });
         }
     };
 }

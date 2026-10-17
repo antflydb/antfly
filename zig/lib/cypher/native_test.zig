@@ -87,7 +87,7 @@ const Database = struct {
             a.free(page.edges);
         }
     };
-    const Limits = struct { max_edges: usize, max_owned_bytes: usize, max_scanned_rows: usize };
+    const Limits = struct { peer_key: ?[]const u8 = null, max_edges: usize, max_owned_bytes: usize, max_scanned_rows: usize };
     pub fn graphEdgesForCypherPageAt(db: *@This(), a: A, _: []const u8, key: []const u8, kinds: []const []const u8, direction: root.ast.Direction, cursor: ?Cursor, limits: Limits, _: u64) !Page {
         if (!std.mem.eql(u8, db.name, "docs")) return error.WrongPhysicalSource;
         var output: std.ArrayList(Edge) = .empty;
@@ -98,6 +98,7 @@ const Database = struct {
             const edge = edges[offset];
             if (!std.mem.eql(u8, kinds[0], edge.edge_type)) continue;
             if (!std.mem.eql(u8, if (direction == .in) edge.target else edge.source, key)) continue;
+            if (limits.peer_key) |peer| if (!std.mem.eql(u8, if (direction == .in) edge.source else edge.target, peer)) continue;
             try output.append(a, edge);
         }
         const examined = output.items.len;
@@ -301,4 +302,32 @@ test "native required fields prune after full policy checks and own projected va
     try std.testing.expectEqualStrings("Alpha", (v.Value{ .node = projected }).property("title").string);
     authority.deny_b = true;
     try std.testing.expect((try backend.vtable.get(backend.ptr, a, .{ .table = "docs", .key = "b" })) == null);
+}
+
+test "native pair seeks preserve parallel cross-table identities and self-loop direction phases" {
+    var docs: Database = .{ .name = "docs" };
+    var people: Database = .{ .name = "people" };
+    var authority: Authority = .{};
+    var native: Native = .{ .tables = &.{ .{ .name = "docs", .db = &docs }, .{ .name = "people", .db = &people } }, .authority = authority.callbacks(), .ttl_now_ns = 1 };
+    const backend = native.backend();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try backend.vtable.bind(backend.ptr, a, graph);
+    for ([_]bool{ false, true }) |self_loop| {
+        const mapping = graph.relationships[if (self_loop) @as(usize, 1) else 0];
+        const peer: v.Identity = .{ .table = if (self_loop) "docs" else "people", .key = "a" };
+        var after: ?[]const u8 = null;
+        var total: usize = 0;
+        while (true) {
+            const page = try backend.vtable.expand_between.?(backend.ptr, a, mapping, .{ .table = "docs", .key = "a" }, peer, .both, &.{}, after, 1, 10);
+            for (page.items) |edge| {
+                try std.testing.expect(edge.target.eql(peer));
+                try std.testing.expectEqualStrings("docs", edge.source.table);
+                total += 1;
+            }
+            after = page.next orelse break;
+        }
+        try std.testing.expectEqual(@as(usize, if (self_loop) 1 else 2), total);
+    }
 }

@@ -398,6 +398,15 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert counted_sql["rows"] == [["31824"]], counted_sql
         assert time.monotonic() - start < 10
+        start = time.monotonic()
+        weighted_sql = call(
+            "/sql",
+            {
+                "statement": f"SELECT sum(q.score),min(q.score),max(q.score),sum(DISTINCT q.score) FROM GRAPH_TABLE({hops} MATCH {path} COLUMNS(b.score AS score)) q"
+            },
+        )
+        assert weighted_sql["rows"] == [["497250", "6", "17", "138"]], weighted_sql
+        assert time.monotonic() - start < 10
         comma = call(
             "/sql",
             {
@@ -499,6 +508,17 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert related["rows"] == [[{"type": "integer", "value": "800"}]], related
         assert related["stats"]["explored_edges"] < 1000, related
+        for pattern in ("(a)-[:R]->(b)", "(b)<-[:R]-(a)"):
+            pair = call(
+                f"/graphs/{hops}/query",
+                {
+                    "query": f"MATCH (a:H {{id:'n0'}}),(b:H {{id:'fresh799'}}) MATCH {pattern} RETURN count(*)",
+                    "limits": {"explored_edges": 10},
+                },
+                wait_for_index=True,
+            )
+            assert pair["rows"] == [[{"type": "integer", "value": "1"}]], pair
+            assert pair["stats"]["explored_edges"] <= 2, pair
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

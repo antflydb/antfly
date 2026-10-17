@@ -62,7 +62,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -392,6 +392,12 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return if (self.authority.read_authorization) |resolve| try resolve(self.authority.ptr, a, table) else .{};
         }
         fn expand(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, direction: root.ast.Direction, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            return expandPair(ptr, a, mapping, identity, null, direction, encoded, limit, 4096);
+        }
+        fn expandBetween(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, peer: v.Identity, direction: root.ast.Direction, _: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
+            return expandPair(ptr, a, mapping, identity, peer, direction, encoded, limit, max_examined);
+        }
+        fn expandPair(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, peer: ?v.Identity, direction: root.ast.Direction, encoded: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
             const self = cast(ptr);
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
             defer scratch.deinit();
@@ -411,14 +417,14 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var page = captured: {
                 if (comptime @hasDecl(DB, "graphEdgesForCypherCapturePageAuthorizedAt")) {
                     for (self.tables) |table| if (table.db == db and std.mem.eql(u8, table.name, source_table)) {
-                        if (table.capture_fence) |fence| break :captured try db.graphEdgesForCypherCapturePageAuthorizedAt(fence, temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns, authorization.proof, authorization.database);
+                        if (table.capture_fence) |fence| break :captured try db.graphEdgesForCypherCapturePageAuthorizedAt(fence, temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = @min(4096, @max(1, max_examined)), .peer_key = if (peer) |value| value.key else null }, self.ttl_now_ns, authorization.proof, authorization.database);
                     };
                 }
                 break :captured if (comptime @hasDecl(DB, "graphEdgesForCypherPageAuthorizedAt"))
-                    try db.graphEdgesForCypherPageAuthorizedAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns, authorization.proof, authorization.database)
+                    try db.graphEdgesForCypherPageAuthorizedAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = @min(4096, @max(1, max_examined)), .peer_key = if (peer) |value| value.key else null }, self.ttl_now_ns, authorization.proof, authorization.database)
                 else blk: {
                     if (authorization.proof.len != 0) return error.CypherRowPolicyUnsupported;
-                    break :blk try db.graphEdgesForCypherPageAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns);
+                    break :blk try db.graphEdgesForCypherPageAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = @min(4096, @max(1, max_examined)), .peer_key = if (peer) |value| value.key else null }, self.ttl_now_ns);
                 };
             };
             defer page.deinit(temporary);
@@ -433,6 +439,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 const source: v.Identity = .{ .table = source_table, .key = edge.source };
                 const target: v.Identity = .{ .table = target_table, .key = edge.target };
                 if (!(if (position.incoming) target else source).eql(identity)) continue;
+                if (peer) |value| if (!(if (position.incoming) source else target).eql(value)) continue;
                 // Native in/out scans both contain a self-loop. Return it once
                 // for an undirected pattern, preserving parallel IDs.
                 if (position.incoming and outgoing_possible and source.eql(target)) continue;
