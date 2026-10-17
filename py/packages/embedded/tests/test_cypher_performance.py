@@ -1427,6 +1427,8 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
         ("RETURN DISTINCT b.score ORDER BY b.score DESC LIMIT 1", ["64"]),
         ("RETURN DISTINCT b.score AS b ORDER BY b.score", ["64"]),
         ("RETURN DISTINCT b.score,b.missing ORDER BY b.score", ["64", None]),
+        ("WITH DISTINCT b.score AS score RETURN count(*),sum(score)", ["1", "64"]),
+        ("WITH DISTINCT b RETURN count(*),sum(b.score)", ["2", "128"]),
     ):
         result = db.cypher_json(
             "g",
@@ -1470,6 +1472,8 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
 
 
 def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
+    from math import comb
+
     db = graph_db
     size = 16
     patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
@@ -1489,6 +1493,32 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
             },
         )
         assert result["rows"] == [[{"type": "integer", "value": "6"}]]
+    paths = comb(size, 7)
+    total = sum(i * comb(i, 6) for i in range(6, size))
+    for tail, expected in (
+        ("WITH b RETURN count(*),sum(b.score)", [paths, total]),
+        ("WITH * RETURN count(*),sum(b.score)", [paths, total]),
+        ("WITH b.score AS score RETURN count(*),sum(score)", [paths, total]),
+        ("WITH b AS a WITH a.score AS b WHERE b>0 RETURN count(*),sum(b)", [paths, total]),
+        ("WITH DISTINCT b RETURN count(*),sum(b.score)", [size - 6, sum(range(6, size))]),
+        ("WITH b WHERE b.score>0 RETURN count(*),sum(b.score)", [paths, total]),
+        (
+            "UNWIND [b.score,b.score,null] AS score RETURN count(*),count(score),sum(score)",
+            [3 * paths, 2 * paths, 2 * total],
+        ),
+        (
+            "UNWIND [b.score,b.score] AS score WITH DISTINCT score RETURN count(*),sum(score)",
+            [size - 6, sum(range(6, size))],
+        ),
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D)-[:R*6..6]->(b:D) " + tail,
+                "limits": {"explored_edges": 120, "intermediate_states": 10000},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == [str(value) for value in expected]
     distinct = db.cypher_json(
         "g",
         {
@@ -1543,6 +1573,21 @@ def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
         },
     )
     assert root_sum["rows"] == [[{"type": "integer", "value": str(sum(i * (size - i - 1) for i in range(size)))}]]
+    start_sum = sum(i * (size - i - 1) for i in range(size))
+    end_sum = sum(i * i for i in range(size))
+    for projection, expected in (
+        ("sum(a.score),sum(b.score),count(*)", [start_sum, end_sum, size * (size - 1) // 2]),
+        ("sum(a.score)+sum(b.score) AS total ORDER BY total", [start_sum + end_sum]),
+        ("sum(a.missing),sum(b.missing),count(a.missing),count(b.missing)", [0, 0, 0, 0]),
+    ):
+        mixed = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D)-[:R*1..]->(b:D) RETURN " + projection,
+                "limits": {"explored_edges": 2 * (size - 1), "intermediate_states": 100000},
+            },
+        )
+        assert [cell["value"] for cell in mixed["rows"][0]] == [str(value) for value in expected]
     grouped = db.cypher_json(
         "g",
         {
@@ -1553,6 +1598,31 @@ def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
     assert [[cell["value"] for cell in row] for row in grouped["rows"]] == [
         [str(i), str(size - i - 1)] for i in range(size - 1)
     ]
+
+
+def test_bounded_singleton_dag_reductions_use_proven_depth(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    size = 200
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:R]->(n{i + step})" for i in range(size) for step in (1, 2) if i + step < size]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    for bounds in ("1..", f"1..{size}", "1..1000", f"2..{size}"):
+        minimum = int(bounds.split("..")[0])
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (a:D {{id:'n0'}})-[:R*{bounds}]->(b:D) RETURN min(b.score),max(b.score)",
+                "limits": {"intermediate_states": 15000, "explored_edges": 2 * size - 3},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == [str(minimum), str(size - 1)]
+    # A cap which clips legal routes must retain exact hop states.
+    clipped = db.cypher_json(
+        "g",
+        {"query": "MATCH (a:D {id:'n0'})-[:R*1..3]->(b:D) RETURN count(*),min(b.score),max(b.score)"},
+    )
+    assert [cell["value"] for cell in clipped["rows"][0]] == ["14", "1", "6"]
 
 
 def test_sql_weighted_reductions_batch_starting_nodes(graph_db):

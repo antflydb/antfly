@@ -1630,7 +1630,7 @@ test "weighted endpoint reductions agree with exact cyclic and acyclic route bag
         const a = arena.allocator();
         const text = try std.fmt.allocPrint(a, "MATCH {s}(a:Document)-[:CITES*0..3]->(b:Document) {s}", .{ mode, tail });
         const split = std.mem.indexOf(u8, tail, "RETURN").?;
-        const exact = try std.fmt.allocPrint(a, "MATCH {s}(a:Document)-[:CITES*0..3]->(b:Document) {s} UNWIND [1] AS ignored {s}", .{ mode, tail[0..split], tail[split..] });
+        const exact = try std.fmt.allocPrint(a, "MATCH {s}(a:Document)-[:CITES*0..3]->(b:Document) {s} WITH * ORDER BY b.rank {s}", .{ mode, tail[0..split], tail[split..] });
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, text, .{}, &diagnostic);
         defer compiled.deinit();
@@ -1769,7 +1769,7 @@ test "mixed domains and unbounded DAG reductions preserve exact path bags" {
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, try std.fmt.allocPrint(a, "MATCH {s} RETURN b.rank,count(*),sum(b.rank) ORDER BY b.rank", .{pattern}), .{}, &diagnostic);
         defer compiled.deinit();
-        var exact = try c.compile(a, try std.fmt.allocPrint(a, "MATCH {s} UNWIND [1] AS ignored RETURN b.rank,count(*),sum(b.rank) ORDER BY b.rank", .{pattern}), .{}, &diagnostic);
+        var exact = try c.compile(a, try std.fmt.allocPrint(a, "MATCH {s} WITH * ORDER BY b.rank RETURN b.rank,count(*),sum(b.rank) ORDER BY b.rank", .{pattern}), .{}, &diagnostic);
         defer exact.deinit();
         var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
         defer result.deinit();
@@ -1943,6 +1943,67 @@ test "DISTINCT ordering resolves projected expressions without exposing discarde
     }
 }
 
+test "endpoint pipeline bags and aggregate partitions agree with ordered route execution" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |acyclic| for ([_][]const u8{ "", "REPEATABLE ELEMENTS " }) |mode| for ([_][]const u8{
+        "WITH b RETURN count(*),sum(b.rank),avg(b.rank)",
+        "WITH b.rank AS score RETURN count(*),sum(score),avg(score)",
+        "WITH b AS a WITH a.rank AS b WHERE b>=2 RETURN count(*),sum(b)",
+        "WITH * RETURN min(b.rank),max(b.rank)",
+        "WITH DISTINCT b RETURN count(*),sum(b.rank),avg(b.rank)",
+        "WITH DISTINCT * RETURN count(*),sum(b.rank)",
+        "WITH b WHERE b.rank>1 RETURN count(*),sum(b.rank)",
+        "UNWIND [b.rank,b.rank,null] AS score RETURN count(*),count(score),sum(score)",
+        "UNWIND [b.rank,b.rank] AS score WITH DISTINCT score RETURN count(*),sum(score)",
+        "WITH DISTINCT b UNWIND [b.rank,b.rank] AS score RETURN count(*),sum(score)",
+        "WITH b RETURN b.rank,count(*) ORDER BY b.rank",
+        "WITH b RETURN min(CASE WHEN b.rank>0 THEN b.rank ELSE 1/0 END)",
+        "WITH b WHERE false RETURN count(*),sum(b.rank),avg(b.rank)",
+        "RETURN sum(a.rank),sum(b.rank),count(*),avg(a.rank),avg(b.rank)",
+        "RETURN sum(a.missing),sum(b.missing),count(a.missing),count(b.missing)",
+        "RETURN sum(a.rank)+sum(b.rank) AS total ORDER BY total",
+        "RETURN count(DISTINCT a),sum(DISTINCT b.rank),min(a.rank),max(b.rank)",
+        "RETURN sum(a.rank+b.rank)",
+    }) |tail| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const prefix = try std.fmt.allocPrint(a, "MATCH {s}p=(a:Document)-[:CITES*0..3]->(b:Document) ", .{mode});
+        const text = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, tail });
+        // ORDER BY is an intentional materialization barrier, so this remains
+        // an independent exact route oracle after UNWIND becomes compressible.
+        const reference = try std.fmt.allocPrint(a, "{s}WITH * ORDER BY a.rank,b.rank {s}", .{ prefix, tail });
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var exact = try c.compile(a, reference, .{}, &diagnostic);
+        defer exact.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        if (acyclic) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var expected = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqual(expected.rows.len, result.rows.len);
+        for (expected.rows, result.rows) |expected_row, actual_row| {
+            for (expected_row, actual_row) |expected_value, actual_value| {
+                if (expected_value == .number) {
+                    try std.testing.expectApproxEqAbs(expected_value.number, actual_value.number, 1e-12);
+                } else try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected_value, .{}), try std.json.Stringify.valueAlloc(a, actual_value, .{}));
+            }
+        }
+    };
+}
+
 test "multi-root DAG reductions share physical pages and preserve zero-hop bags" {
     const Dag = struct {
         fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
@@ -1960,6 +2021,10 @@ test "multi-root DAG reductions share physical pages and preserve zero-hop bags"
         "(a:Document)-[:CITES*2..3]->(b:Document)",
         "(a:Document)-[:CITES*0..3]->(b:Document)",
         "(a:Document)-[:CITES*1..3]->(b:Document)",
+        "(a:Document {id:'a'})-[:CITES*0..3]->(b:Document)",
+        "(a:Document {id:'a'})-[:CITES*1..3]->(b:Document)",
+        "(a:Document {id:'a'})-[:CITES*2..3]->(b:Document)",
+        "(a:Document {id:'a'})-[:CITES*1..1]->(b:Document)",
         "(a:Document)-[:CITES]->(middle:Document)-[:CITES]->(b:Document)",
         "(a:Document)-[:CITES*0..1]->(middle:Document)-[:CITES*0..1]->(b:Document)",
     }) |pattern| for ([_][]const u8{
@@ -1975,7 +2040,7 @@ test "multi-root DAG reductions share physical pages and preserve zero-hop bags"
         const a = arena.allocator();
         const split = std.mem.indexOf(u8, tail, "RETURN").?;
         const text = try std.fmt.allocPrint(a, "MATCH {s} {s}", .{ pattern, tail });
-        const exact = try std.fmt.allocPrint(a, "MATCH {s} {s} UNWIND [1] AS ignored {s}", .{ pattern, tail[0..split], tail[split..] });
+        const exact = try std.fmt.allocPrint(a, "MATCH {s} {s} WITH * ORDER BY b.rank {s}", .{ pattern, tail[0..split], tail[split..] });
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, text, .{}, &diagnostic);
         defer compiled.deinit();

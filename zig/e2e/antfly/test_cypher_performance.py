@@ -450,6 +450,34 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         assert pure_endpoint["rows"] == [[{"type": "integer", "value": "6"}]], (
             pure_endpoint
         )
+        for tail, expected in (
+            ("WITH b RETURN count(*),sum(b.score)", ["31824", "497250"]),
+            ("WITH b.score AS score RETURN count(*),sum(score)", ["31824", "497250"]),
+            ("WITH DISTINCT b RETURN count(*),sum(b.score)", ["12", "138"]),
+            (
+                "UNWIND [b.score,b.score] AS score RETURN count(*),sum(score)",
+                ["63648", "994500"],
+            ),
+        ):
+            pipeline = call(
+                f"/graphs/{hops}/query",
+                {
+                    "query": "MATCH (a:H)-[:R*6..6]->(b:H) " + tail,
+                    "limits": {"explored_edges": 153, "intermediate_states": 20000},
+                },
+            )
+            assert [cell["value"] for cell in pipeline["rows"][0]] == expected, pipeline
+        singleton = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H {score:0})-[:R*1..18]->(b:H) RETURN min(b.score),max(b.score)",
+                "limits": {"explored_edges": 153, "intermediate_states": 10000},
+            },
+            wait_for_index=True,
+        )
+        assert [cell["value"] for cell in singleton["rows"][0]] == ["1", "17"], (
+            singleton
+        )
         for bounds, expected in (
             ("1..", 2**18 - 19),
             ("2..", 2**18 - 19 - 153),
@@ -476,6 +504,18 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         assert start_only["rows"] == [
             [{"type": "integer", "value": str(expected_start_sum)}]
         ], start_only
+        mixed = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*1..]->(b:H) RETURN sum(a.score),sum(b.score),count(*)",
+                "limits": {"explored_edges": 306, "intermediate_states": 20000},
+            },
+        )
+        assert [cell["value"] for cell in mixed["rows"][0]] == [
+            str(expected_start_sum),
+            str(sum(i * (2**i - 1) for i in range(18))),
+            str(2**18 - 19),
+        ], mixed
         pure_columns = call(
             "/sql",
             {

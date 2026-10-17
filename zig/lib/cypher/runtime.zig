@@ -135,11 +135,11 @@ pub const NodeCursor = struct {
         for (projection.items) |item| if (!Engine.endpointExpression(item.expression, path, &.{})) return false;
         for (path.nodes) |node| for (node.properties) |entry| if (self.engine.constant(entry.value, &.{}) == null) return false;
         for (path.edges) |edge| for (edge.properties) |entry| if (self.engine.constant(entry.value, &.{}) == null) return false;
-        const planned = try self.engine.reductionPath(path, &.{}, operation, projection);
+        const planned = try self.engine.reductionPath(path, &.{}, operation, projection, &.{});
         const clauses = try self.engine.a.dupe(ast.Clause, self.query.clauses);
         clauses[0].operation.match.paths = try self.engine.a.dupe(ast.Path, &.{planned});
         self.query.clauses = clauses;
-        if (try self.engine.batchEligible(planned, &.{}, operation, projection)) {
+        if (try self.engine.batchEligible(planned, &.{}, operation, projection, &.{})) {
             self.weighted_seeds = .{ .path = planned, .input = .{ .row = &.{} }, .mode = operation.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
         }
         self.weighted = true;
@@ -1137,10 +1137,14 @@ const Engine = struct {
         distinct_goal: ?usize = null,
         accepted: usize = 0,
         weight: u64 = 1,
+        active_calls: ?[]const bool = null,
+        record_rows: bool = true,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
-            fold.accepted +|= weight;
-            fold.stage_counts[0] +|= weight;
+            if (fold.record_rows) {
+                fold.accepted +|= weight;
+                fold.stage_counts[0] +|= weight;
+            }
             return fold.expand(engine, initial, 0);
         }
         fn expand(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!void {
@@ -1158,7 +1162,7 @@ const Engine = struct {
                             const scope = EvalScope.enter(engine, arena.allocator());
                             defer scope.leave(engine);
                             try engine.state();
-                            fold.stage_counts[index + 1] += 1;
+                            if (fold.record_rows) fold.stage_counts[index + 1] +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
                             try fold.expand(engine, try engine.replace(row, unwind.alias, item), index + 1);
                         }
                     },
@@ -1166,7 +1170,10 @@ const Engine = struct {
                         const projected = try engine.projectUnordered(&.{row}, step.value, false);
                         if (projected.len == 0) return;
                         if (step.value.distinct and !try fold.distinct[index].accept(engine, fold.retained, projected[0])) return;
-                        fold.stage_counts[index + 1] += 1;
+                        const prior_weight = fold.weight;
+                        defer fold.weight = prior_weight;
+                        if (step.value.distinct) fold.weight = 1;
+                        if (fold.record_rows) fold.stage_counts[index + 1] +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
                         try fold.expand(engine, projected[0], index + 1);
                     },
                     else => unreachable,
@@ -1174,7 +1181,7 @@ const Engine = struct {
                 return;
             }
             try engine.state();
-            fold.matched.* +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
+            if (fold.record_rows) fold.matched.* +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
             if (fold.top.*) |*top| {
                 try top.add(row);
                 if (fold.projection.order.len == 0 and top.picks.items.len == top.capacity) return error.CypherStreamComplete;
@@ -1200,7 +1207,10 @@ const Engine = struct {
             } else if (!fold.has_keys and fold.groups.items[0].source.len == 0) {
                 fold.groups.items[0].source = (try (v.Value{ .map = row }).clone(fold.retained)).map;
             }
-            for (fold.groups.items[found.?].states) |*accumulator| try accumulator.addWeighted(engine, row, fold.weight);
+            for (fold.groups.items[found.?].states, 0..) |*accumulator, i| {
+                if (fold.active_calls) |active| if (!active[i]) continue;
+                try accumulator.addWeighted(engine, row, fold.weight);
+            }
             if (fold.distinct_goal) |goal| if (fold.groups.items.len >= goal) return error.CypherStreamComplete;
         }
         fn demand(fold: *@This()) usize {
@@ -1209,6 +1219,41 @@ const Engine = struct {
             return 128;
         }
     };
+    const ReductionPass = struct { projection: ast.Projection, active_calls: ?[]const bool = null };
+    /// Partition independent aggregate calls by their efficient orientation.
+    /// Every pass consumes the same immutable bag; the original expressions
+    /// are evaluated once over the completed states. Never rewrite SUM(a+b),
+    /// combine arithmetic states, or divide an aggregate across passes.
+    fn reductionPasses(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, calls: []const *const ast.Expr) ![]const ReductionPass {
+        const ordinary = try self.a.dupe(ReductionPass, &.{.{ .projection = projection }});
+        if (calls.len < 2 or input.len == 0) return ordinary;
+        for (projection.items) |item| if (!aggregates(item.expression)) return ordinary;
+        const path = operation.paths[0];
+        var items: [2]std.ArrayList(ast.Item) = .{ .empty, .empty };
+        var active: [2][]bool = undefined;
+        for (&active) |*mask| {
+            mask.* = try self.a.alloc(bool, calls.len);
+            @memset(mask.*, false);
+        }
+        for (calls, 0..) |expression, index| {
+            const single: ast.Projection = .{ .items = &.{.{ .expression = expression }} };
+            var direction: ?usize = null;
+            for (input) |row| {
+                const planned = try self.reductionPath(path, row, operation, single, middle);
+                if (!try self.batchEligible(planned, row, operation, single, middle)) return ordinary;
+                const next: usize = if (planned.execution_reversed == path.execution_reversed) 0 else 1;
+                if (direction) |prior| if (prior != next) return ordinary;
+                direction = next;
+            }
+            const selected = direction.?;
+            try items[selected].append(self.a, .{ .expression = expression });
+            active[selected][index] = true;
+        }
+        if (items[0].items.len == 0 or items[1].items.len == 0) return ordinary;
+        const passes = try self.a.alloc(ReductionPass, 2);
+        for (passes, items, active) |*pass, group, mask| pass.* = .{ .projection = .{ .items = group.items }, .active_calls = mask };
+        return passes;
+    }
     fn streamMatchProjection(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
@@ -1278,7 +1323,7 @@ const Engine = struct {
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
-        const count_endpoints = !count_shortest and !operation.optional and operation.paths.len == 1 and path.selector == .all and grouped and middle.len == 0 and blk: {
+        const count_endpoints = !count_shortest and !operation.optional and operation.paths.len == 1 and path.selector == .all and grouped and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
             if (calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
@@ -1291,12 +1336,7 @@ const Engine = struct {
             }
             for (input) |row| {
                 if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) break :blk false;
-                for (projection.items) |item| if (!endpointExpression(item.expression, path, row)) break :blk false;
-                var order_scope = row;
-                for (projection.items) |item| if (item.alias) |alias| {
-                    order_scope = try self.replace(order_scope, alias, .null);
-                };
-                for (projection.order) |order| if (!endpointExpression(order.expression, path, order_scope)) break :blk false;
+                if (!try self.pipelineLocal(path, row, middle, projection, true)) break :blk false;
             }
             break :blk true;
         };
@@ -1387,46 +1427,52 @@ const Engine = struct {
         self.collect_match_paths = false;
         self.stream_fold = if (count_shortest) null else &fold;
         self.stream_predicate = operation.predicate;
-        produce: for (input) |row| {
-            if (fold.distinct_goal == 0 or (projection.limit != null and try self.count(projection.limit.?) == 0)) break :produce;
-            if (top) |value| if (value.capacity == 0 and projection.order.len == 0) break :produce;
-            var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
-            defer scratch.deinit();
-            const scope = EvalScope.enter(self, scratch.allocator());
-            defer scope.leave(self);
-            var ignored: std.ArrayList(MatchState) = .empty;
-            const accepted_before = fold.accepted;
-            var count_paths: u64 = 0;
-            self.shortest_count = if (count_shortest) &count_paths else null;
-            const planned_path = if (count_shortest or count_endpoints) try self.reductionPath(path, row, operation, projection) else path;
-            var planned = operation;
-            if (count_shortest or count_endpoints) planned.paths = &.{planned_path};
-            var batch: AnchorBatch = .{ .path = planned_path, .input = .{ .row = row }, .mode = operation.mode, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
-            defer if (batch.arena) |*arena| arena.deinit();
-            const saved_batch = self.anchor_batch;
-            self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(planned_path, row, planned, projection)) &batch else null;
-            defer self.anchor_batch = saved_batch;
-            self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |err| switch (err) {
-                error.CypherStreamComplete => break :produce,
-                else => return err,
-            };
-            try batch.flush(self, &ignored);
-            if (operation.optional and fold.accepted == accepted_before) {
-                var extended = row;
-                for (self.match_aliases) |alias| if (lookup(extended, alias) == null) {
-                    extended = (try self.bind(extended, alias, .null)).?;
-                };
-                fold.add(self, extended) catch |err| switch (err) {
+        const passes = if (count_endpoints) try self.reductionPasses(input, operation, projection, middle, calls.items) else try retained.dupe(ReductionPass, &.{.{ .projection = projection }});
+        for (passes, 0..) |pass, pass_index| {
+            fold.active_calls = pass.active_calls;
+            fold.record_rows = pass_index == 0;
+            @memset(distinct_stages, .{});
+            produce: for (input) |row| {
+                if (fold.distinct_goal == 0 or (projection.limit != null and try self.count(projection.limit.?) == 0)) break :produce;
+                if (top) |value| if (value.capacity == 0 and projection.order.len == 0) break :produce;
+                var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+                defer scratch.deinit();
+                const scope = EvalScope.enter(self, scratch.allocator());
+                defer scope.leave(self);
+                var ignored: std.ArrayList(MatchState) = .empty;
+                const accepted_before = fold.accepted;
+                var count_paths: u64 = 0;
+                self.shortest_count = if (count_shortest) &count_paths else null;
+                const planned_path = if (count_shortest or count_endpoints) try self.reductionPath(path, row, operation, pass.projection, middle) else path;
+                var planned = operation;
+                if (count_shortest or count_endpoints) planned.paths = &.{planned_path};
+                var batch: AnchorBatch = .{ .path = planned_path, .input = .{ .row = row }, .mode = operation.mode, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+                defer if (batch.arena) |*arena| arena.deinit();
+                const saved_batch = self.anchor_batch;
+                self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(planned_path, row, planned, pass.projection, middle)) &batch else null;
+                defer self.anchor_batch = saved_batch;
+                self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |err| switch (err) {
                     error.CypherStreamComplete => break :produce,
                     else => return err,
                 };
-            }
-            if (count_shortest) {
-                matched +|= std.math.cast(usize, count_paths) orelse std.math.maxInt(usize);
-                stage_counts[0] = matched;
-                for (groups.items[0].states) |*accumulator| {
-                    accumulator.count = std.math.add(u64, accumulator.count, count_paths) catch return error.CypherNumericOverflow;
-                    if (accumulator.count > std.math.maxInt(i64)) return error.CypherNumericOverflow;
+                try batch.flush(self, &ignored);
+                if (operation.optional and fold.accepted == accepted_before) {
+                    var extended = row;
+                    for (self.match_aliases) |alias| if (lookup(extended, alias) == null) {
+                        extended = (try self.bind(extended, alias, .null)).?;
+                    };
+                    fold.add(self, extended) catch |err| switch (err) {
+                        error.CypherStreamComplete => break :produce,
+                        else => return err,
+                    };
+                }
+                if (count_shortest) {
+                    matched +|= std.math.cast(usize, count_paths) orelse std.math.maxInt(usize);
+                    stage_counts[0] = matched;
+                    for (groups.items[0].states) |*accumulator| {
+                        accumulator.count = std.math.add(u64, accumulator.count, count_paths) catch return error.CypherNumericOverflow;
+                        if (accumulator.count > std.math.maxInt(i64)) return error.CypherNumericOverflow;
+                    }
                 }
             }
         }
@@ -2392,8 +2438,8 @@ const Engine = struct {
             };
             effective_maximum = std.math.add(usize, effective_maximum, upper) catch return false;
             if (effective_maximum > self.limits.path_depth) return false;
-            if (topological == null and path.edges.len == 1 and starts.len > 1 and upper >= starts.len) {
-                // A wide, long-range batch often covers an entire DAG. Probe
+            if (topological == null and path.edges.len == 1 and upper > 1 and upper >= starts.len) {
+                // A long-range reduction often covers an entire DAG. Probe
                 // only nodes reachable within the requested upper bound. If
                 // its longest captured route fits, the same linear reduction
                 // is exact for bounded ranges too; otherwise retain hop states.
@@ -2473,7 +2519,13 @@ const Engine = struct {
         // Never approximate SUM/AVG with the overflow sentinel.
         var exact_weights = true;
         if (self.count_endpoints or self.weighted_sink != null) {
-            const needs_weights = if (self.weighted_sink) |sink| sink.multiplicity == .exact else for (self.stream_fold.?.calls) |expression| {
+            // An intermediate DISTINCT replaces every surviving bag weight
+            // with one before any aggregate consumes it.
+            const distinct_barrier = if (self.stream_fold) |fold| for (fold.middle) |clause| {
+                if (clause.operation == .project and clause.operation.project.value.distinct) break true;
+            } else false else false;
+            const needs_weights = if (self.weighted_sink) |sink| sink.multiplicity == .exact else !distinct_barrier and for (self.stream_fold.?.calls, 0..) |expression, index| {
+                if (self.stream_fold.?.active_calls) |active| if (!active[index]) continue;
                 const aggregate_call = expression.value.call;
                 if (!aggregate_call.distinct and (std.ascii.eqlIgnoreCase(aggregate_call.name, "sum") or std.ascii.eqlIgnoreCase(aggregate_call.name, "avg"))) break true;
             } else false;
@@ -2564,6 +2616,58 @@ const Engine = struct {
     fn endpointExpression(expression: *const ast.Expr, path: ast.Path, row: Row) bool {
         return @import("expressions.zig").rowLocal(expression, EndpointScope{ .path = path, .row = row });
     }
+    /// Track available bindings through row-local stages without substituting
+    /// expression trees or evaluating lazy branches. Unavailable path/interior
+    /// bindings stay in wildcard shapes so DISTINCT cannot silently omit keys.
+    const PipelineScope = struct {
+        bindings: Row,
+        pub fn permits(self: @This(), name: []const u8) bool {
+            const value = lookup(self.bindings, name) orelse return false;
+            return value == .boolean and value.boolean;
+        }
+    };
+    fn pipelineLocal(self: *Engine, path: ast.Path, row: Row, middle: []const ast.Clause, projection: ast.Projection, include_start: bool) !bool {
+        const rules = @import("expressions.zig");
+        var shape: Row = &.{};
+        for (row) |entry| shape = try self.replace(shape, entry.name, .{ .boolean = true });
+        for (path.nodes, 0..) |node, i| if (node.alias) |alias| {
+            if (lookup(shape, alias) == null) shape = try self.replace(shape, alias, .{ .boolean = (i == 0 and include_start) or i == path.nodes.len - 1 });
+        };
+        for (path.edges) |edge| if (edge.alias) |alias| {
+            if (lookup(shape, alias) == null) shape = try self.replace(shape, alias, .{ .boolean = false });
+        };
+        if (path.alias) |alias| if (lookup(shape, alias) == null) {
+            shape = try self.replace(shape, alias, .{ .boolean = false });
+        };
+        for (middle) |clause| switch (clause.operation) {
+            .unwind => |step| {
+                if (!rules.rowLocal(step.expression, PipelineScope{ .bindings = shape })) return false;
+                shape = try self.replace(shape, step.alias, .{ .boolean = true });
+            },
+            .project => |step| {
+                const p = step.value;
+                if (p.order.len != 0 or p.skip != null or p.limit != null) return false;
+                var next: Row = if (p.wildcard) shape else &.{};
+                for (p.items) |item| {
+                    if (aggregates(item.expression) or !rules.rowLocal(item.expression, PipelineScope{ .bindings = shape })) return false;
+                    next = try self.replace(next, item.alias orelse try self.expressionName(item.expression), .{ .boolean = true });
+                }
+                if (p.distinct) for (next) |entry| if (!entry.value.boolean) return false;
+                var predicate_shape = shape;
+                for (next) |entry| predicate_shape = try self.replace(predicate_shape, entry.name, entry.value);
+                if (p.predicate) |predicate| if (!rules.rowLocal(predicate, PipelineScope{ .bindings = predicate_shape })) return false;
+                shape = next;
+            },
+            else => return false,
+        };
+        for (projection.items) |item| if (!rules.rowLocal(item.expression, PipelineScope{ .bindings = shape })) return false;
+        for (projection.items) |item| if (item.alias) |alias| {
+            shape = try self.replace(shape, alias, .{ .boolean = true });
+        };
+        for (projection.order) |order| if (!rules.rowLocal(order.expression, PipelineScope{ .bindings = shape })) return false;
+        if (projection.predicate) |predicate| if (!rules.rowLocal(predicate, PipelineScope{ .bindings = shape })) return false;
+        return true;
+    }
     fn sameTypeSet(left: []const []const u8, right: []const []const u8) bool {
         for (left) |name| {
             const found = for (right) |other| {
@@ -2632,8 +2736,8 @@ const Engine = struct {
             try self.nodes.append(a, owned);
         }
     };
-    fn reductionPath(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection) !ast.Path {
-        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix or try self.batchEligible(path, row, operation, projection)) return path;
+    fn reductionPath(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !ast.Path {
+        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix or try self.batchEligible(path, row, operation, projection, middle)) return path;
         // Without cardinality estimates, equal filter scores do not prove a
         // different table or label population costs the same to scan. Only
         // reorient equivalent anchor admissions; selective point/interior
@@ -2662,9 +2766,9 @@ const Engine = struct {
         reversed.nodes = nodes;
         reversed.edges = edges;
         reversed.execution_reversed = !path.execution_reversed;
-        return if (try self.batchEligible(reversed, row, operation, projection)) reversed else path;
+        return if (try self.batchEligible(reversed, row, operation, projection, middle)) reversed else path;
     }
-    fn batchEligible(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection) !bool {
+    fn batchEligible(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !bool {
         if (path.selector != .all or path.edges.len == 0 or path.execution_prefix) return false;
         if (path.nodes[0].alias) |alias| if (lookup(row, alias) != null) return false;
         for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, row) == null) return false;
@@ -2673,17 +2777,7 @@ const Engine = struct {
         for (path.nodes[1..]) |node| if (try self.anchorScore(node, operation.predicate, row) > score) return false;
         const independent: EndpointScope = .{ .path = path, .row = row, .include_start = false };
         if (operation.predicate) |predicate| if (!@import("expressions.zig").rowLocal(predicate, independent)) return false;
-        for (projection.items) |item| if (!@import("expressions.zig").rowLocal(item.expression, independent)) return false;
-        // Ordering uses projected aliases. The projection dependency check
-        // already proves those values independent of the root.
-        var shape = row;
-        for (projection.items) |item| if (item.alias) |alias| {
-            shape = try self.replace(shape, alias, .null);
-        };
-        const projected: EndpointScope = .{ .path = path, .row = shape, .include_start = false };
-        if (projection.predicate) |predicate| if (!@import("expressions.zig").rowLocal(predicate, projected)) return false;
-        for (projection.order) |order| if (!@import("expressions.zig").rowLocal(order.expression, projected)) return false;
-        return true;
+        return self.pipelineLocal(path, row, middle, projection, false);
     }
     fn startPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, node: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!void {
         if (self.anchor_batch) |batch| {

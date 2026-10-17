@@ -1366,17 +1366,31 @@ or reductions can run backward and combine independent roots when endpoint label
 and property admissions describe the same anchor population. Equal filter scores
 alone cannot justify scanning a different table or label population without cardinality
 estimates. Selective point and interior anchors still take precedence; route-observing
-consumers keep their ordinary plans. A declined proof resumes each original anchor before emitting compressed rows;
+consumers keep their ordinary plans. Independent aggregate calls with different endpoint dependencies use at most two
+orientation-specific passes over the same read cut and adjacency cache. Each call
+retains its own complete accumulator; the original projection, ordering and
+pagination run once over the completed states. Grouped or coupled endpoint
+consumers keep their ordinary plan; no algebraic SUM rewrite changes NULL,
+overflow or arithmetic behavior.
+A declined proof resumes each original anchor before emitting compressed rows;
 soft batch allocation failure flushes retained roots and disables admission.
 Unbounded DAG segments first form the exact mandatory minimum-hop frontier,
 then sum all remaining path lengths in one topological pass. The same transition
 operator applies relationship properties and multiplicities in both phases; no
-subtraction from saturated counts can conceal a qualifying overflow. Long bounded ranges on wide anchor batches
+subtraction from saturated counts can conceal a qualifying overflow. Long bounded ranges, including selective singleton anchors,
 can use the same reduction when a bounded closure proof shows every captured
 route fits the upper bound; other ranges retain the product-state reducer.
 
 Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
 DISTINCT variants consume weighted endpoint rows from those same states.
+Scope-aware analysis also carries these bags through repeatable row-local WITH
+projections, filters and UNWIND, including alias shadowing and lexical locals.
+UNWIND preserves the incoming weight for each emitted list item. Intermediate
+DISTINCT deduplicates the projected keys globally and resets each surviving
+weight to one, so subsequent SUM/AVG need no exact upstream multiplicity.
+Wildcard DISTINCT includes every binding in its dependency proof; observing
+an interior node or route retains exact production. Ordering, pagination,
+aggregation, writes and non-repeatable expressions remain pipeline barriers.
 Endpoint-only RETURN DISTINCT also reduces the path product states directly,
 including saturated counts, while preserving the existing uniqueness proofs and
 exact cyclic fallback. Unordered DISTINCT with LIMIT retains demand-driven route
