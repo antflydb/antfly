@@ -90,7 +90,11 @@ pub const Value = struct {
                 const expected = try stored.dimension(index);
                 if (axis.length != expected.length or axis.lower != expected.lower) return error.InvalidSqlArrayShape;
             }
-            for (0..stored.count) |index| try validateElement(self.element_type, self.flatCell(index), work);
+            if (stored.validation) |proof| {
+                // Recheck the caller's quota and cancellation owner without
+                // rescanning immutable bytes admitted by the storage codec.
+                try work.consume(proof.element_work);
+            } else for (0..stored.count) |index| try validateElement(self.element_type, self.flatCell(index), work);
             return self;
         }
         return initWithBudget(self.element_type, self.dimensions, self.elements, limits, work);

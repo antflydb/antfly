@@ -97,14 +97,56 @@ pub const Builder = struct {
         }
     }
 
-    pub fn finish(self: *Builder, a: A, limits: arrays.Limits) !arrays.Value {
+    fn finishHeaders(self: *Builder) !void {
         if (self.index != self.count) return error.InvalidSqlArrayShape;
         if (self.compact) std.mem.writeInt(u32, self.bytes[self.slots + (self.count + 63) / 64 * 4 ..][0..4], @intCast(self.non_null), .little);
         if (self.kind == .text and self.count != 0) {
             std.mem.writeInt(u32, self.bytes[self.slots + self.count * 4 ..][0..4], @intCast(self.payload_at), .little);
             if (self.payload + self.payload_at != self.bytes.len) return error.InvalidSqlArrayShape;
         }
+    }
+    pub fn finish(self: *Builder, a: A, limits: arrays.Limits) !arrays.Value {
+        try self.finishHeaders();
         return @import("array_storage.zig").borrowLeaky(a, self.kind, self.bytes, .{ .values = limits, .wire_bytes = limits.bytes });
+    }
+};
+
+/// A separate producer type keeps unchecked codecs unchanged. Every append
+/// validates under the caller's work owner; proof summaries reuse the format
+/// counters instead of adding bookkeeping to each emitted fixed-width cell.
+pub const CheckedBuilder = struct {
+    state: Builder,
+    pub fn init(a: A, kind: arrays.ElementType, dimensions: []const arrays.Dimension, count: usize, non_null: usize, text_bytes: usize, limits: arrays.Limits) !CheckedBuilder {
+        return .{ .state = try Builder.init(a, kind, dimensions, count, non_null, text_bytes, limits) };
+    }
+    pub inline fn appendChecked(self: *CheckedBuilder, cell: arrays.Element, kind: arrays.ElementType, limits: arrays.Limits, work: *arrays.Budget) !void {
+        // Keep the immutable schema kind separate from the mutable emitter so
+        // scalar admission can specialize without reloading an aliased field.
+        if (kind != self.state.kind) return error.SqlTypeMismatch;
+        _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, limits, work);
+        try self.state.append(cell);
+    }
+    pub fn finish(self: *CheckedBuilder, a: A, limits: arrays.Limits) !arrays.Value {
+        const state = &self.state;
+        try state.finishHeaders();
+        // Header/shape checks and the constructor's size promises remain
+        // mandatory. The text NULL count scans only its tiny validity bitmap.
+        var view = try layout.View.openAuthenticated(state.kind, state.bytes, .{ .bytes = limits.bytes, .elements = limits.elements });
+        var present = state.non_null;
+        if (state.kind == .text) {
+            var nulls: usize = 0;
+            for (state.bytes[state.bitmap..][0..layout.bitmapSize(state.count)]) |byte| nulls += @popCount(byte);
+            present = state.count - nulls;
+        }
+        const text_bytes = if (state.kind == .text) state.payload_at else 0;
+        const expected = try std.math.add(usize, try layout.encodedSectionSize(state.kind, view.rank, state.count, present), text_bytes);
+        if (expected != state.bytes.len or state.compact != layout.usesCompact(state.kind, state.count, present)) return error.InvalidSqlArrayShape;
+        view.validation = .{
+            .element_work = state.count + text_bytes,
+            .non_null = present,
+            .binary_wire_bytes = 12 + @as(usize, view.rank) * 8 + state.count * 4 + if (state.kind == .text) text_bytes else present * layout.width(state.kind),
+        };
+        return @import("array_storage.zig").borrowValidatedLeaky(a, view);
     }
 };
 
@@ -169,4 +211,98 @@ test "SQL compact ingress rejects truncation and unwinds allocation failures" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "SQL compact validation proof preserves quota work cancellation and binary wire size" {
+    const a = std.testing.allocator;
+    const binary = @import("array_binary.zig");
+    for ([_]struct { kind: arrays.ElementType, text: []const u8 }{
+        .{ .kind = .text, .text = "[-1:1]={\"é\\\"x\",NULL,\"kept\"}" },
+        .{ .kind = .int64, .text = "{1,NULL,9007199254740993}" },
+        .{ .kind = .float32, .text = "{NaN,Infinity,NULL,1.25}" },
+        .{ .kind = .boolean, .text = "{t,NULL,f}" },
+        .{ .kind = .int16, .text = "{}" },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = (try @import("array_text.zig").decodeLeaky(arena.allocator(), case.kind, case.text, .{ .compact = true })).value;
+        const proof = value.stored.?.validation.?;
+        var copy = value.stored.?.*;
+        copy.validation = null;
+        var fallback = value;
+        fallback.stored = &copy;
+        var fast_work: arrays.Budget = .{ .remaining = 10000 };
+        var slow_work = fast_work;
+        _ = try value.validateWithBudget(.{}, &fast_work);
+        _ = try fallback.validateWithBudget(.{}, &slow_work);
+        try std.testing.expectEqual(slow_work.remaining, fast_work.remaining);
+        if (proof.element_work > 0) {
+            var denied: arrays.Budget = .{ .remaining = proof.element_work - 1 };
+            try std.testing.expectError(error.SqlProgramLimitExceeded, value.validateWithBudget(.{}, &denied));
+        }
+        const Cancel = struct {
+            fn poll(_: ?*anyopaque) !void {
+                return error.Canceled;
+            }
+        };
+        var parent: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.poll };
+        var canceled: arrays.Budget = .{ .remaining = 10000, .shared = &parent };
+        try std.testing.expectError(error.Canceled, value.validateWithBudget(.{}, &canceled));
+        var fast: std.Io.Writer.Allocating = .init(a);
+        defer fast.deinit();
+        var slow: std.Io.Writer.Allocating = .init(a);
+        defer slow.deinit();
+        try binary.encode(value, &fast.writer, .{});
+        try binary.encode(fallback, &slow.writer, .{});
+        try std.testing.expectEqualSlices(u8, slow.written(), fast.written());
+        try std.testing.expectEqual(proof.binary_wire_bytes, fast.written().len);
+        var denied_output: std.Io.Writer = .fixed(&.{});
+        try std.testing.expectError(error.SqlProgramLimitExceeded, binary.encode(value, &denied_output, .{ .wire_bytes = proof.binary_wire_bytes - 1 }));
+        try std.testing.expectEqual(@as(usize, 0), denied_output.end);
+        const authenticated = try layout.View.openAuthenticated(case.kind, value.stored.?.bytes, .{});
+        try std.testing.expect(authenticated.validation == null);
+    }
+}
+
+test "SQL checked array builders publish exact proofs and preserve unchecked validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { kind: arrays.ElementType, text: []const u8 }{
+        .{ .kind = .int64, .text = "{9007199254740993,NULL,-7}" },
+        .{ .kind = .float32, .text = "{NaN,NULL,Infinity,1.25}" },
+        .{ .kind = .boolean, .text = "{t,NULL,f}" },
+        .{ .kind = .text, .text = "{hello,NULL,world}" },
+        .{ .kind = .int16, .text = "{}" },
+    }) |case| {
+        const original = (try @import("array_text.zig").decodeLeaky(a, case.kind, case.text, .{})).value;
+        var present: usize = 0;
+        var text_bytes: usize = 0;
+        for (original.elements) |cell| if (!cell.sql_null) {
+            present += 1;
+            if (case.kind == .text) text_bytes += cell.value.string.len;
+        };
+        var builder = try CheckedBuilder.init(a, case.kind, original.dimensions, original.cardinality(), present, text_bytes, .{});
+        var work: arrays.Budget = .{};
+        for (original.elements) |cell| try builder.appendChecked(cell, case.kind, .{}, &work);
+        const result = try builder.finish(a, .{});
+        const scanned = try @import("array_storage.zig").validateCanonical(a, case.kind, result.stored.?.bytes, .{});
+        try std.testing.expectEqual(scanned.validation.?, result.stored.?.validation.?);
+        try std.testing.expectEqualSlices(u8, try @import("array_storage.zig").encodeAlloc(a, original, .{}), result.stored.?.bytes);
+    }
+    var wrong_kind = try CheckedBuilder.init(a, .int64, &.{.{ .length = 1 }}, 1, 1, 0, .{});
+    var kind_work: arrays.Budget = .{};
+    try std.testing.expectError(error.SqlTypeMismatch, wrong_kind.appendChecked(.json(.{ .bool = true }), .boolean, .{}, &kind_work));
+    try std.testing.expectEqual(@as(usize, 0), wrong_kind.state.index);
+    var dense_hint = try CheckedBuilder.init(a, .int64, &.{.{ .length = 65 }}, 65, 65, 0, .{});
+    var dense_work: arrays.Budget = .{};
+    for (0..65) |_| try dense_hint.appendChecked(.{}, .int64, .{}, &dense_work);
+    try std.testing.expectError(error.InvalidSqlArrayShape, dense_hint.finish(a, .{}));
+    var wrong_hint = try CheckedBuilder.init(a, .int64, &.{.{ .length = 65 }}, 65, 2, 0, .{});
+    var hint_work: arrays.Budget = .{};
+    for (0..65) |_| try wrong_hint.appendChecked(.{}, .int64, .{}, &hint_work);
+    try std.testing.expectError(error.NonCanonicalSqlArrayStorage, wrong_hint.finish(a, .{}));
+    var invalid = try Builder.init(a, .text, &.{.{ .length = 1 }}, 1, 1, 1, .{});
+    try invalid.append(.json(.{ .string = "\x00" }));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, invalid.finish(a, .{}));
 }

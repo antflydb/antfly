@@ -170,6 +170,12 @@ pub const Result = struct {
 };
 
 pub const Cell = struct {
+    /// Canonical JSONB bytes owned by the result lease. JSON null remains a
+    /// non-NULL value; ordinary scalars keep their existing representation.
+    json_bytes: ?[]const u8 = null,
+    /// Validated immutable tokens borrow the result lease; pgwire streams them
+    /// directly into DataRow frames without an intermediate JSON string.
+    frozen_json: ?@import("antfly_local_sources").sql_execution_batch.FrozenJson = null,
     value: std.json.Value = .null,
     sql_null: bool,
     array: ?*const @import("antfly_local_sources").sql_array_value.Value = null,

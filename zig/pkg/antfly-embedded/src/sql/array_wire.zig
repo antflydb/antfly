@@ -387,6 +387,215 @@ fn decodeOwned(backing: A, kind: arrays.ElementType, input: Json, modifier: ?@im
     return .{ .arena = arena, .budget = budget, .value = decoded.value };
 }
 
+/// Decode an ordinal envelope without a whole-envelope DOM or a primitive
+/// Datum vector. Only one element has temporary JSON ownership at a time.
+/// Preserve the parsed-envelope codec's shape, wire and logical work admission.
+pub noinline fn decodeBytesLeakyMeasured(a: A, kind: arrays.ElementType, input: []const u8, options: Options) !Decoded {
+    return decodeBytesImpl(a, kind, input, options) catch |err| return if (err == error.SqlProgramLimitExceeded) options.limit() else err;
+}
+fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: Options) !Decoded {
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    try work.consume(0);
+    const scratch = MemoryBudget.reclaimingAllocator(a);
+    var metadata = std.heap.ArenaAllocator.init(scratch);
+    defer metadata.deinit();
+    const Envelope = struct {
+        dimensions: ?[]const u8 = null,
+        values: ?[]const u8 = null,
+        nulls: ?[]const u8 = null,
+        fn member(raw: *anyopaque, name: []const u8, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const slot = if (std.mem.eql(u8, name, "dimensions")) &self.dimensions else if (std.mem.eql(u8, name, "values")) &self.values else if (std.mem.eql(u8, name, "sql_nulls")) &self.nulls else return error.InvalidSqlArrayShape;
+            if (slot.* != null) return error.DuplicateField;
+            slot.* = bytes;
+        }
+    };
+    var envelope: Envelope = .{};
+    var root = std.json.Scanner.initCompleteInput(scratch, input);
+    defer root.deinit();
+    if (try root.next() != .object_begin) return error.InvalidSqlArrayShape;
+    // Capture only the three envelope ranges. Nested JSONB and axis objects
+    // receive strict duplicate-key validation in their own bounded decoders.
+    while (try root.peekNextTokenType() != .object_end) {
+        const token = try root.nextAllocMax(scratch, .alloc_if_needed, input.len);
+        defer switch (token) {
+            .allocated_string => |text| scratch.free(text),
+            else => {},
+        };
+        const name = switch (token) {
+            .string, .allocated_string => |text| text,
+            else => return error.UnexpectedToken,
+        };
+        var begin = root.cursor;
+        while (begin < input.len and (std.ascii.isWhitespace(input[begin]) or input[begin] == ':')) : (begin += 1) {}
+        try root.skipValue();
+        try Envelope.member(&envelope, name, input[begin..root.cursor]);
+    }
+    _ = try root.next();
+    if (try root.next() != .end_of_document) return error.UnexpectedToken;
+    var axes = try RawArray.init(scratch, envelope.dimensions orelse return error.InvalidSqlArrayShape);
+    defer axes.deinit();
+    var dimensions: [6]arrays.Dimension = undefined;
+    var rank: usize = 0;
+    var count: usize = 1;
+    var dimensions_wire: usize = 2;
+    while (try axes.next()) |raw| {
+        if (rank == dimensions.len) return options.limit();
+        const axis = std.json.parseFromSliceLeaky(struct { length: Json, lower_bound: Json }, metadata.allocator(), raw, .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory or err == error.DuplicateField) err else error.InvalidSqlArrayShape;
+        const length = std.math.cast(u32, try dimensionInteger(axis.length)) orelse return error.InvalidSqlArrayShape;
+        const lower = std.math.cast(i32, try dimensionInteger(axis.lower_bound)) orelse return error.InvalidSqlArrayShape;
+        if (length == 0) return error.InvalidSqlArrayShape;
+        if (length > std.math.maxInt(i32) or @as(i64, lower) + length > std.math.maxInt(i32)) return options.limit();
+        count = std.math.mul(usize, count, length) catch return options.limit();
+        if (count > options.values.elements) return options.limit();
+        dimensions[rank] = .{ .length = length, .lower = lower };
+        dimensions_wire += @intFromBool(rank != 0) + "{\"length\":,\"lower_bound\":}".len + try jsonSize(axis.length) + try jsonSize(axis.lower_bound);
+        rank += 1;
+    }
+    if (rank == 0) count = 0;
+    var bytes: usize = @sizeOf(arrays.Value) + rank * @sizeOf(arrays.Dimension);
+    if (bytes > options.values.bytes) return options.limit();
+    const fixed = @import("array_compact.zig").supported(kind) and kind != .text;
+    var fixed_builder: @import("array_compact.zig").CheckedBuilder = undefined;
+    if (fixed) {
+        var flags = try RawArray.init(scratch, envelope.nulls orelse return error.InvalidSqlArrayShape);
+        defer flags.deinit();
+        var seen: usize = 0;
+        var present: usize = 0;
+        while (try flags.next()) |raw| {
+            seen += 1;
+            if (seen > count) return error.InvalidSqlArrayShape;
+            if (!try nullFlag(raw)) present += 1;
+        }
+        if (seen != count) return error.InvalidSqlArrayShape;
+        fixed_builder = try @import("array_compact.zig").CheckedBuilder.init(a, kind, dimensions[0..rank], count, present, 0, options.values);
+    }
+    var counter_buffer: [4096]u8 = undefined;
+    var counter: std.Io.Writer.Discarding = .init(&counter_buffer);
+    var non_null: usize = 0;
+    var text_bytes: usize = 0;
+    var values_wire: usize = 2;
+    var nulls_wire: usize = 2;
+    var temporary = std.heap.ArenaAllocator.init(scratch);
+    defer temporary.deinit();
+    {
+        var values = try RawArray.init(scratch, envelope.values orelse return error.InvalidSqlArrayShape);
+        defer values.deinit();
+        var nulls = try RawArray.init(scratch, envelope.nulls orelse return error.InvalidSqlArrayShape);
+        defer nulls.deinit();
+        var index: usize = 0;
+        while (try values.next()) |raw| : (index += 1) {
+            if (index >= count) return error.InvalidSqlArrayShape;
+            _ = temporary.reset(.{ .retain_with_limit = 64 * 1024 });
+            const flag = try nullFlag((try nulls.next()) orelse return error.InvalidSqlArrayShape);
+            if (flag and !std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "null")) return error.InvalidSqlArrayShape;
+            const value = try elementJson(temporary.allocator(), kind, raw);
+            const token_bytes = std.mem.trim(u8, raw, " \t\r\n");
+            if (kind != .jsonb and std.mem.indexOfScalar(u8, token_bytes, '\\') == null) {
+                // Strict scalar spans without escapes are already exactly
+                // the bytes the legacy JSON counter would emit.
+                values_wire += token_bytes.len;
+            } else try std.json.Stringify.value(value, .{}, &counter.writer);
+            values_wire += @intFromBool(index != 0);
+            nulls_wire += @intFromBool(index != 0) + @as(usize, if (flag) 4 else 5);
+            if (kind == .numeric and !flag) {
+                if (value != .string) return error.SqlTypeMismatch;
+                try work.consume(value.string.len);
+                bytes = std.math.add(usize, bytes, @sizeOf(arrays.Element) + @sizeOf(@import("numeric_value.zig").Value)) catch return options.limit();
+            } else {
+                if (casts.integral(kind) or casts.floating(kind)) switch (value) {
+                    .string, .number_string => |text| try work.consume(text.len),
+                    else => {},
+                };
+                const cell = try readElement(kind, value, flag);
+                if (fixed) try fixed_builder.appendChecked(cell, kind, options.values, &work) else _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, options.values, &work);
+                bytes = std.math.add(usize, bytes, try operators.datumBytes(cell)) catch return options.limit();
+                if (!flag and kind == .text) text_bytes += cell.value.string.len;
+            }
+            if (!flag) non_null += 1;
+            if (bytes > options.values.bytes) return options.limit();
+        }
+        if (index != count or try nulls.next() != null) return error.InvalidSqlArrayShape;
+    }
+    try counter.writer.flush();
+    values_wire += @intCast(counter.count);
+    const wire_size = "{\"dimensions\":,\"values\":,\"sql_nulls\":}".len + dimensions_wire + values_wire + nulls_wire;
+    if (wire_size > options.wire_bytes or wire_size > work.remaining / 2) return options.limit();
+    try work.consume(wire_size * 2);
+    if (fixed) return .{ .value = try fixed_builder.finish(a, options.values), .work = options.values.work - work.remaining, .wire_bytes = wire_size };
+    const compact = @import("array_compact.zig").supported(kind);
+    var builder = if (compact) try @import("array_compact.zig").Builder.init(a, kind, dimensions[0..rank], count, non_null, text_bytes, options.values) else undefined;
+    const cells: []arrays.Element = if (!compact) try a.alloc(arrays.Element, count) else &.{};
+    var values = try RawArray.init(scratch, envelope.values.?);
+    defer values.deinit();
+    var nulls = try RawArray.init(scratch, envelope.nulls.?);
+    defer nulls.deinit();
+    var index: usize = 0;
+    while (try values.next()) |raw| : (index += 1) {
+        _ = temporary.reset(.{ .retain_with_limit = 64 * 1024 });
+        try work.consume(0);
+        const flag = try nullFlag((try nulls.next()).?);
+        const value = try elementJson(temporary.allocator(), kind, raw);
+        if (compact) try builder.append(try readElement(kind, value, flag)) else {
+            cells[index] = if (kind == .numeric and !flag) try @import("scalar.zig").numericTextLeaky(a, value.string, &work) else try operators.cloneDatum(a, try readElement(kind, value, flag));
+        }
+    }
+    const result = if (compact) try builder.finish(a, options.values) else arrays.Value{ .element_type = kind, .dimensions = try a.dupe(arrays.Dimension, dimensions[0..rank]), .elements = cells };
+    if (kind == .numeric) _ = try arrays.Value.initWithBudget(kind, result.dimensions, result.elements, options.values, &work);
+    return .{ .value = result, .work = options.values.work - work.remaining, .wire_bytes = wire_size };
+}
+fn jsonSize(value: Json) !usize {
+    var count: std.Io.Writer.Discarding = .init(&.{});
+    try std.json.Stringify.value(value, .{}, &count.writer);
+    return @intCast(count.count);
+}
+fn nullFlag(raw: []const u8) !bool {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidSqlArrayShape;
+}
+fn elementJson(a: A, kind: arrays.ElementType, raw: []const u8) !Json {
+    const bytes = std.mem.trim(u8, raw, " \t\r\n");
+    // The envelope scanner already validated this exact token span. Borrow
+    // ordinary scalars directly; only escaped strings and JSONB need parsing.
+    if (kind != .jsonb) {
+        if (bytes[0] == '[' or bytes[0] == '{') return error.SqlTypeMismatch;
+        if (bytes[0] == '"') {
+            const text = bytes[1 .. bytes.len - 1];
+            if (std.mem.indexOfScalar(u8, text, '\\') == null) return .{ .string = text };
+        } else {
+            if (std.mem.eql(u8, bytes, "null")) return .null;
+            if (std.mem.eql(u8, bytes, "true")) return .{ .bool = true };
+            if (std.mem.eql(u8, bytes, "false")) return .{ .bool = false };
+            return .{ .number_string = bytes };
+        }
+    }
+    return std.json.parseFromSliceLeaky(Json, a, bytes, .{ .parse_numbers = false });
+}
+const RawArray = struct {
+    scanner: std.json.Scanner,
+    fn init(a: A, bytes: []const u8) !@This() {
+        var scanner = std.json.Scanner.initCompleteInput(a, bytes);
+        errdefer scanner.deinit();
+        if (try scanner.next() != .array_begin) return error.InvalidSqlArrayShape;
+        return .{ .scanner = scanner };
+    }
+    fn deinit(self: *@This()) void {
+        self.scanner.deinit();
+    }
+    fn next(self: *@This()) !?[]const u8 {
+        if (try self.scanner.peekNextTokenType() == .array_end) {
+            _ = try self.scanner.next();
+            if (try self.scanner.next() != .end_of_document) return error.UnexpectedToken;
+            return null;
+        }
+        const begin = self.scanner.cursor;
+        try self.scanner.skipValue();
+        return self.scanner.input[begin..self.scanner.cursor];
+    }
+};
+
 fn quotaError(budget: *MemoryBudget, err: anyerror, options: Options) anyerror {
     return if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and budget.exhausted)) options.limit() else err;
 }
@@ -774,4 +983,84 @@ test "SQL array parsed admission benchmark retains no cell vectors at maximum ca
         for (0..4) |_| total_work += (try validate(.int64, input, options)).work;
         std.debug.print("SQL array parsed admission: cells={} passes=4 elapsed_ns={} work={} materialized_cells=0 allocations=0\n", .{ count, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start, total_work });
     }
+}
+
+test "SQL streaming document arrays preserve legacy admission cells and failure cleanup" {
+    const Fixture = struct {
+        fn run(a: A, quotas: bool) !void {
+            const cases = [_]struct { kind: arrays.ElementType, text: []const u8 }{
+                .{ .kind = .int64, .text = "[-1:1]={9007199254740993,NULL,-7}" },
+                .{ .kind = .int16, .text = "{-32768,NULL,32767}" },
+                .{ .kind = .int32, .text = "[0:1][2:3]={{1,NULL},{3,-2147483648}}" },
+                .{ .kind = .float32, .text = "{1.25,NaN,Infinity,-Infinity,NULL}" },
+                .{ .kind = .float64, .text = "{1.25,NaN,Infinity,-Infinity,NULL}" },
+                .{ .kind = .text, .text = "[-2:0]={\"é\\\"x\",NULL,\"\"}" },
+                .{ .kind = .boolean, .text = "{t,NULL,f}" },
+                .{ .kind = .numeric, .text = "{1.200,NULL,NaN,9007199254740993.12}" },
+                .{ .kind = .uuid, .text = "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,NULL}" },
+                .{ .kind = .jsonb, .text = "{\"{\\\"x\\\":9007199254740993}\",\"null\",NULL}" },
+                .{ .kind = .int64, .text = "{}" },
+            };
+            for (cases) |case| {
+                var owner = std.heap.ArenaAllocator.init(a);
+                defer owner.deinit();
+                const alloc = owner.allocator();
+                const source = try @import("array_text.zig").decodeLeaky(alloc, case.kind, case.text, .{});
+                const encoded = try encodeAlloc(alloc, source.value, .{});
+                const root = try std.json.parseFromSliceLeaky(Json, alloc, encoded, .{ .parse_numbers = false });
+                const expected = try decodeLeakyMeasured(alloc, case.kind, root, .{});
+                const actual = try decodeBytesLeakyMeasured(alloc, case.kind, encoded, .{});
+                try std.testing.expectEqual(expected.work, actual.work);
+                try std.testing.expectEqual(expected.wire_bytes, actual.wire_bytes);
+                const old_wire = try @import("array_storage.zig").encodeAlloc(alloc, expected.value, .{});
+                const new_wire = try @import("array_storage.zig").encodeAlloc(alloc, actual.value, .{});
+                try std.testing.expectEqualSlices(u8, old_wire, new_wire);
+                if (quotas) {
+                    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeBytesLeakyMeasured(alloc, case.kind, encoded, .{ .wire_bytes = actual.wire_bytes - 1 }));
+                    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeBytesLeakyMeasured(alloc, case.kind, encoded, .{ .values = .{ .work = actual.work - 1 } }));
+                }
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
+}
+
+test "SQL streaming document array malformed envelopes preserve legacy diagnostics and cancellation" {
+    const a = std.testing.allocator;
+    const base = "{{\"dimensions\":[{{\"length\":1,\"lower_bound\":-3}}],\"values\":[{s}],\"sql_nulls\":[{s}]}}";
+    for ([_]struct { kind: arrays.ElementType, value: []const u8, flag: []const u8 }{
+        .{ .kind = .int64, .value = "7", .flag = "false" },
+        .{ .kind = .int16, .value = "\"32768\"", .flag = "false" },
+        .{ .kind = .text, .value = "\"\\u0000\"", .flag = "false" },
+        .{ .kind = .boolean, .value = "false", .flag = "true" },
+        .{ .kind = .numeric, .value = "\"bad\"", .flag = "false" },
+        .{ .kind = .jsonb, .value = "{\"x\":1,\"x\":2}", .flag = "false" },
+        .{ .kind = .text, .value = "null", .flag = "null" },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const input = try std.fmt.allocPrint(aa, base, .{ case.value, case.flag });
+        const Legacy = struct {
+            fn decode(alloc: A, kind: arrays.ElementType, bytes: []const u8) !void {
+                const json = try std.json.parseFromSliceLeaky(Json, alloc, bytes, .{ .parse_numbers = false });
+                _ = try decodeLeakyMeasured(alloc, kind, json, .{});
+            }
+        };
+        var expected: anyerror = error.UnexpectedSuccess;
+        Legacy.decode(aa, case.kind, input) catch |err| {
+            expected = err;
+        };
+        try std.testing.expect(expected != error.UnexpectedSuccess);
+        try std.testing.expectError(expected, decodeBytesLeakyMeasured(aa, case.kind, input, .{}));
+    }
+    const Cancel = struct {
+        fn poll(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .checkpoint = Cancel.poll };
+    try std.testing.expectError(error.Canceled, decodeBytesLeakyMeasured(none.allocator(), .int64, "", .{ .context = &context }));
 }
