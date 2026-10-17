@@ -48,7 +48,6 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
         .antfly_imports = shared.production_antfly_imports,
         .antfly_mod = local_module,
     });
-    shared.build_info.link(embedded.libantfly_link_mod);
     const lite_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lite_main.zig"),
         .target = shared.target,
