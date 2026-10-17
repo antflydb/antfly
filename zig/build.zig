@@ -62,6 +62,10 @@ const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
 pub fn build(b: *std.Build) void {
+    if (b.option(bool, "grep-only", "Compose only the standalone native grep CLI") orelse false) {
+        @import("pkg/antfly-grep/build.zig").add(b, b.standardTargetOptions(.{}), b.standardOptimizeOption(.{}));
+        return;
+    }
     if (b.option(bool, "embedded-only", "Compose only the Apache embedded products") orelse false) {
         return @import("embedded.build.zig").buildDependency(b, @This());
     }
@@ -125,6 +129,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const usermgr_mod = shared.usermgr_mod;
     const fst_mod = shared.fst_mod;
     const regex_mod = shared.regex_mod;
+    @import("pkg/antfly-grep/build.zig").add(b, target, optimize);
     const jsonschema_mod = shared.jsonschema_mod;
     const toon_mod = shared.toon_mod;
     const mcp_mod = shared.mcp_mod;
@@ -746,6 +751,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_test_step = b.step("conformance-test", "Fetch and run conformance suites");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
     const lib_test_step = b.step("lib-test", "Run default standalone library tests");
+    lib_test_step.dependOn(&b.top_level_steps.get("grep-test").?.step);
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
     lib_test_step.dependOn(&run_yacc_tests.step);
     lib_test_step.dependOn(&yacc_steps.run_parser_tests.step);
