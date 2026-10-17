@@ -18,7 +18,29 @@ const httpx = @import("httpx");
 const Options = @import("options.zig").Options;
 const Allocator = std.mem.Allocator;
 
-pub const Input = struct { id: []const u8, input: []const u8 };
+/// Context is borrowed once per region, rather than copied for each target.
+/// The legacy decision wire format is preserved; Typesafe shares context in state.
+pub const Input = struct {
+    id: []const u8,
+    input: []const u8,
+    context: []const u8 = "",
+    pub fn jsonStringify(self: Input, json: *std.json.Stringify) !void {
+        try json.beginObject();
+        try json.objectField("id");
+        try json.write(self.id);
+        try json.objectField("input");
+        try json.beginWriteRaw();
+        try json.writer.writeByte('"');
+        if (self.context.len != 0) {
+            try std.json.Stringify.encodeJsonStringChars(self.context, json.options, json.writer);
+            try json.writer.writeAll("\\n");
+        }
+        try std.json.Stringify.encodeJsonStringChars(self.input, json.options, json.writer);
+        try json.writer.writeByte('"');
+        json.endWriteRaw();
+        try json.endObject();
+    }
+};
 pub const Client = struct {
     a: Allocator,
     http: httpx.Client,
@@ -125,7 +147,7 @@ pub const Client = struct {
         var missing: std.ArrayList(Input) = .empty;
         var indices: std.ArrayList(usize) = .empty;
         for (inputs, 0..) |input, i| {
-            if (try self.cached(a, input.input)) |score| {
+            if (try self.cached(a, input)) |score| {
                 probabilities[i] = score;
                 self.cache_hits += 1;
             } else {
@@ -143,15 +165,15 @@ pub const Client = struct {
         for (scores, indices.items, missing.items) |score, index, input| {
             if (!std.math.isFinite(score)) continue;
             probabilities[index] = score;
-            try self.store(a, input.input, score);
+            try self.store(a, input, score);
         }
         if (failure) |err| return err;
     }
-    fn key(self: *Client, input: []const u8) [64]u8 {
+    fn key(self: *Client, input: Input) [64]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         // Include credential scope, endpoint, model and complete effective
         // question and input. Cached scores contain no source text or token.
-        for ([_][]const u8{ "antfly-grep-decisions-v3", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), input }) |part| {
+        for ([_][]const u8{ "antfly-grep-decisions-v4", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), if (self.options.broad) "broad" else "direct", input.context, input.input }) |part| {
             var len: [8]u8 = undefined;
             std.mem.writeInt(u64, &len, part.len, .little);
             hash.update(&len);
@@ -176,7 +198,7 @@ pub const Client = struct {
         hash.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
     }
-    fn cached(self: *Client, a: Allocator, input: []const u8) !?f64 {
+    fn cached(self: *Client, a: Allocator, input: Input) !?f64 {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return null;
         const key_hex = self.key(input);
         const path = try std.fs.path.join(a, &.{ self.options.cache_dir.?, &key_hex });
@@ -189,7 +211,7 @@ pub const Client = struct {
         if (!std.math.isFinite(score) or (score < 0 and score != -1) or score > 1) return null;
         return score;
     }
-    fn store(self: *Client, a: Allocator, input: []const u8, score: f64) !void {
+    fn store(self: *Client, a: Allocator, input: Input, score: f64) !void {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return;
         // Corrupt/partial cache records are misses. A failed cache write cannot
         // turn an otherwise valid decision into a failed search.
@@ -224,8 +246,8 @@ pub const Client = struct {
                         if (split == input.input.len or split == 0) return err;
                         split += 1;
                         if (split == input.input.len) return err;
-                        const left = Input{ .id = input.id, .input = input.input[0..split] };
-                        const right = Input{ .id = input.id, .input = input.input[split..] };
+                        const left = Input{ .id = input.id, .input = input.input[0..split], .context = input.context };
+                        const right = Input{ .id = input.id, .input = input.input[split..], .context = input.context };
                         var scores: [2]f64 = @splat(std.math.nan(f64));
                         self.request(&.{left}, scores[0..1]) catch |failure| {
                             return failure;
@@ -288,8 +310,15 @@ pub const Client = struct {
             questions[policy_index] = .{ .name = name, .instructions = prompt };
             policy_index += 1;
         };
-        const body = if (self.options.backend == .typesafe) try typesafeBody(self.a, inputs, questions, self.options.model.?) else try std.json.Stringify.valueAlloc(self.a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{});
-        defer self.a.free(body);
+        // Bound serialization scratch as well as the final payload. Oversized
+        // batches split through the existing retry path before allocating the
+        // entire expanded request (including JSON escaping and shared state).
+        var body_budget = @import("antfly_regex").Budget{ .backing = self.a, .limit = 32 * 1024 * 1024 };
+        const body_a = body_budget.allocator();
+        const body = (if (self.options.backend == .typesafe) typesafeBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
+            return if (body_budget.denied) error.DecisionRequestTooLarge else err;
+        };
+        defer body_a.free(body);
         if (body.len > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
         const auth = if (self.options.token) |token| try std.fmt.allocPrint(self.a, "Bearer {s}", .{token}) else null;
         defer if (auth) |h| self.a.free(h);
@@ -345,7 +374,19 @@ fn typesafeBody(a: Allocator, inputs: []const Input, questions: anytype, model: 
     const scratch = arena.allocator();
     var state: std.Io.Writer.Allocating = .init(scratch);
     var map: std.json.ObjectMap = .empty;
+    // Context slices are immutable and borrowed for the request lifetime.
+    // Intern by identity so a large declaration is not rehashed per target.
+    const ContextKey = struct { address: usize, len: usize };
+    var contexts: std.AutoHashMap(ContextKey, usize) = .init(scratch);
     for (inputs, 0..) |input, i| {
+        if (input.context.len != 0) {
+            const entry = try contexts.getOrPut(.{ .address = @intFromPtr(input.context.ptr), .len = input.context.len });
+            if (!entry.found_existing) {
+                entry.value_ptr.* = contexts.count() - 1;
+                try state.writer.print("\nBEGIN SHARED CONTEXT {d}\n{s}\nEND SHARED CONTEXT {d}\n", .{ entry.value_ptr.*, input.context, entry.value_ptr.* });
+            }
+            try state.writer.print("TARGET INPUT {d} uses SHARED CONTEXT {d} for interpretation only.\n", .{ i, entry.value_ptr.* });
+        }
         try state.writer.print("\nBEGIN TARGET INPUT {d} ({s})\n{s}\nEND TARGET INPUT {d}\n", .{ i, input.id, input.input, i });
         for (questions) |question| {
             const id = try std.fmt.allocPrint(scratch, "input_{d}_{s}", .{ i, question.name });

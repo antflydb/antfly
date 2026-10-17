@@ -95,7 +95,11 @@ def main():
                 pass
 
             def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.loads(raw)
+                with self.server.measurement_lock:
+                    self.server.request_bytes += len(raw)
+                    self.server.targets += len(body["inputs"])
                 data = []
                 for index, item in enumerate(body["inputs"]):
                     text = item["input"]
@@ -147,6 +151,8 @@ def main():
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.daemon_threads = True
+        server.measurement_lock = threading.Lock()
+        server.request_bytes = server.targets = 0
         threading.Thread(target=server.serve_forever, daemon=True).start()
         endpoint = f"http://127.0.0.1:{server.server_port}/decisions"
     binary = str(args.binary.resolve())
@@ -227,7 +233,16 @@ def main():
                     for line in lines
                 }
                 summary = next(e for e in events if e["type"] == "summary")
+                wire = {}
+                if server:
+                    with server.measurement_lock:
+                        wire = {
+                            "fixture_request_bytes": server.request_bytes,
+                            "fixture_target_evaluations": server.targets,
+                        }
+                        server.request_bytes = server.targets = 0
                 row = {
+                    **wire,
                     "id": question["id"],
                     **metrics(expected, scored),
                     "complete": summary["stats"]["complete"],

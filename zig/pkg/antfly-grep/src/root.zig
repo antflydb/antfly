@@ -344,16 +344,6 @@ pub const Search = struct {
         mutex: std.Io.Mutex = .init,
         readable: std.Io.Condition = .init,
         writable: std.Io.Condition = .init,
-        fn push(self: *Queue, io: std.Io, task: Task) bool {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            while (self.count == self.slots.len and !self.closed) self.writable.waitUncancelable(io, &self.mutex);
-            if (self.closed) return false;
-            self.slots[(self.head + self.count) % self.slots.len] = task;
-            self.count += 1;
-            self.readable.signal(io);
-            return true;
-        }
         fn pop(self: *Queue, io: std.Io) ?Task {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
@@ -392,11 +382,28 @@ pub const Search = struct {
                 self.queue.close(root.io);
                 for (threads[0..self.started]) |thread| thread.join();
             }
-            for (threads) |*thread| {
+            for (threads[0..if (root.options.jobs_auto) @min(2, jobs) else jobs]) |*thread| {
                 thread.* = try std.Thread.spawn(.{}, Parallel.worker, .{&self.context});
                 self.started += 1;
             }
             return self;
+        }
+        fn submit(self: *Pipeline, task: Task) !bool {
+            const root = self.context.search;
+            // Growth and enqueue share the queue lock: steady-state producers
+            // pay exactly one lock, without a second scheduling mutex per file.
+            self.queue.mutex.lockUncancelable(root.io);
+            defer self.queue.mutex.unlock(root.io);
+            while (self.queue.count == self.queue.slots.len and !self.queue.closed) self.queue.writable.waitUncancelable(root.io, &self.queue.mutex);
+            if (self.queue.closed) return false;
+            if (self.started < self.threads.len and self.queue.count >= self.started * 2) {
+                self.threads[self.started] = try std.Thread.spawn(.{}, Parallel.worker, .{&self.context});
+                self.started += 1;
+            }
+            self.queue.slots[(self.queue.head + self.queue.count) % self.queue.slots.len] = task;
+            self.queue.count += 1;
+            self.queue.readable.signal(root.io);
+            return true;
         }
         fn finish(self: *Pipeline) !void {
             const root = self.context.search;
@@ -605,7 +612,7 @@ pub const Search = struct {
     }
     pub fn concurrentFile(self: *Search, path: []const u8, display: []const u8) !bool {
         // During a directory walk these producer settings are immutable. Each
-        // task owns its strings and Queue.push handles concurrent producers.
+        // task owns its strings and Pipeline.submit handles concurrent producers.
         if (!self.collecting or self.pipeline == null) return false;
         try self.file(path, display);
         return true;
@@ -633,7 +640,7 @@ pub const Search = struct {
             }
             const task: Task = .{ .path = path, .display = shown, .filename = self.render_filename, .timestamp = timestamp, .explicit_file = self.explicit_file };
             if (self.pipeline) |pool| {
-                if (!pool.queue.push(self.io, task)) {
+                if (!try pool.submit(task)) {
                     self.a.free(path);
                     self.a.free(shown);
                     return;
@@ -1821,54 +1828,78 @@ pub const Search = struct {
             self.decider.search(inputs, scores) catch |err| {
                 failure = err;
             };
-            for (regions.items[offset..][0..n], scores, 0..) |region, score, region_index| {
+            // Build one refinement work set across this bounded region window.
+            // Each region owns one context; target text and score slices retain
+            // independent line evidence even when the coarse region rejected it.
+            var target_count: usize = 0;
+            const contexts = try ba.alloc([]const u8, n);
+            const starts = try ba.alloc(usize, n + 1);
+            for (regions.items[offset..][0..n], scores, 0..) |region, score, i| {
+                starts[i] = target_count;
                 if (!std.math.isFinite(score)) continue;
                 self.summary.regions_evaluated += 1;
-
-                if (!try self.decider.passes(inputs[region_index])) continue;
                 self.best_probability = @max(self.best_probability, score);
                 if (score >= 0) if (self.evidence) |evidence| try evidence.regions.append(a, .{ .start = region.start + 1, .end = region.end, .p = score, .label = region.label, .label_line = region.label_line });
                 if (region.end - region.start == 1) if (self.evidence) |evidence| {
                     evidence.line_scores[region.start] = score;
                 };
-                const yes = score >= 0 and ((score >= self.options.threshold) != self.options.invert);
-                var fine: ?[]f64 = null;
-                if (self.options.refine and region.end - region.start > 1) {
-                    const count = region.end - region.start;
-                    self.summary.regions_considered += count;
-                    if (self.shared_limits) |limits| if (!Limits.reserve(&limits.regions, count, self.options.max_regions)) return error.RegionBudgetExceeded;
-                    const line_inputs = try ba.alloc(decision.Input, count);
-                    const line_scores = try ba.alloc(f64, count);
-                    for (region.start..region.end, 0..) |j, k| {
-                        const id = try std.fmt.allocPrint(ba, "refine-{d}", .{j});
-                        const listing = try std.fmt.allocPrint(ba, "File: {s}\nCONTEXT region lines {d}-{d}:\n{s}\nTARGET {d}: {s}\n", .{ path_name, region.start + 1, region.end, bytes[lines[region.start].start..lines[region.end - 1].end], j + 1, bytes[lines[j].start..lines[j].end] });
-                        line_inputs[k] = .{ .id = id, .input = listing };
-                    }
-                    self.decider.stage = .line;
-                    defer self.decider.stage = .region;
-                    self.decider.search(line_inputs, line_scores) catch |err| {
-                        failure = err;
-                    };
-                    if (self.evidence) |evidence| {
-                        for (line_scores, region.start..) |p, j| {
-                            evidence.line_scores[j] = if (std.math.isNan(evidence.line_scores[j])) p else @max(evidence.line_scores[j], p);
-                            if (p >= 0) self.best_probability = @max(self.best_probability, p);
-                        }
-                    }
-                    for (line_scores) |line_score| if (std.math.isFinite(line_score)) {
-                        self.summary.regions_evaluated += 1;
-                    };
-                    var any = false;
-                    for (line_scores) |p| if (p >= 0 and ((p >= self.options.threshold) != self.options.invert)) {
-                        any = true;
-                        break;
-                    };
-                    if (any or failure != null) fine = line_scores;
+                if (!self.options.refine or region.end - region.start <= 1) continue;
+                const count = region.end - region.start;
+                self.summary.regions_considered += count;
+                contexts[i] = try std.fmt.allocPrint(ba, "File: {s}\nCONTEXT region lines {d}-{d}:\n{s}\n", .{ path_name, region.start + 1, region.end, bytes[lines[region.start].start..lines[region.end - 1].end] });
+                target_count += count;
+            }
+            starts[n] = target_count;
+            const line_scores = try ba.alloc(f64, target_count);
+            @memset(line_scores, std.math.nan(f64));
+            var target_offset: usize = 0;
+            var region_index: usize = 0;
+            const target_window = self.options.batch_size * (if (self.decider.allow_parallel) @max(1, self.options.jobs) else @as(usize, 1));
+            while (target_offset < target_count) {
+                // Materialize only one request window, even for declarations
+                // spanning millions of lines. Context stays shared and scores
+                // retain stable offsets for coarse-result fallback semantics.
+                var target_arena = std.heap.ArenaAllocator.init(self.a);
+                defer target_arena.deinit();
+                const ta = target_arena.allocator();
+                const remaining_lines = self.options.max_regions -| (if (self.shared_limits) |limits| limits.regions.load(.monotonic) else self.summary.regions_evaluated);
+                const m = @min(@min(target_window, target_count - target_offset), remaining_lines);
+                if (m == 0) {
+                    failure = error.RegionBudgetExceeded;
+                    break;
                 }
+                if (self.shared_limits) |limits| if (!Limits.reserve(&limits.regions, m, self.options.max_regions)) {
+                    failure = error.RegionBudgetExceeded;
+                    break;
+                };
+                const targets = try ta.alloc(decision.Input, m);
+                for (targets, target_offset..) |*target, flat| {
+                    while (flat >= starts[region_index + 1]) region_index += 1;
+                    const region = regions.items[offset + region_index];
+                    const j = region.start + flat - starts[region_index];
+                    target.* = .{ .id = try std.fmt.allocPrint(ta, "refine-{d}-{d}", .{ offset + region_index, j }), .input = try std.fmt.allocPrint(ta, "TARGET {d}: {s}\n", .{ j + 1, bytes[lines[j].start..lines[j].end] }), .context = contexts[region_index] };
+                }
+                self.decider.stage = .line;
+                self.decider.search(targets, line_scores[target_offset..][0..m]) catch |err| {
+                    failure = err;
+                    break;
+                };
+                target_offset += m;
+            }
+            for (regions.items[offset..][0..n], scores, 0..) |region, score, i| {
+                if (!std.math.isFinite(score)) continue;
+                const fine_scores = line_scores[starts[i]..starts[i + 1]];
+                var any = false;
+                for (fine_scores, region.start..) |p, j| {
+                    if (std.math.isFinite(p)) self.summary.regions_evaluated += 1;
+                    if (p >= 0) self.best_probability = @max(self.best_probability, p);
+                    if (p >= 0 and ((p >= self.options.threshold) != self.options.invert)) any = true;
+                    if (self.evidence) |evidence| evidence.line_scores[j] = if (std.math.isNan(evidence.line_scores[j])) p else @max(evidence.line_scores[j], p);
+                }
+                const fine = fine_scores.len > 0 and (any or failure != null);
                 for (region.start..region.end, 0..) |j, k| {
-                    const p = if (fine) |scores_by_line| scores_by_line[k] else score;
-                    const accepted = if (fine != null) p >= 0 and ((p >= self.options.threshold) != self.options.invert) else yes;
-                    if (accepted) {
+                    const p = if (fine) fine_scores[k] else score;
+                    if (p >= 0 and ((p >= self.options.threshold) != self.options.invert)) {
                         selected[j] = true;
                         probabilities[j] = if (std.math.isNan(probabilities[j])) p else @max(probabilities[j], p);
                     }

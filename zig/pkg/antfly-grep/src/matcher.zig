@@ -262,17 +262,45 @@ pub const Matcher = struct {
     /// A successful proof also excludes NUL, so binary classification and
     /// literal rejection can share one pass over an input window.
     pub fn rejectLiteralAndBinary(self: *const Matcher, text: []const u8) bool {
-        if (self.program.direct.items.len != 1 or self.program.regular.items.len != 0 or self.program.advanced.items.len != 0) return false;
-        const item = self.program.direct.items[0];
-        return !item.insensitive and !regex.literal.mayContainOrByte(text, item.bytes, 0);
+        if (self.program.advanced.items.len != 0) return false;
+        const bytes = if (self.program.direct.items.len == 1 and self.program.regular.items.len == 0) blk: {
+            const item = self.program.direct.items[0];
+            if (item.insensitive) return false;
+            break :blk item.bytes;
+        } else if (self.program.direct.items.len == 0 and self.program.regular.items.len == 1)
+            self.program.regular.items[0].pattern.prefilter
+        else
+            return false;
+        return bytes.len > 0 and !regex.literal.mayContainOrByte(text, bytes, 0);
     }
-    /// A necessary raw byte substring, never an approximation of relevance.
-    /// Broader pattern sets can add proven literals here without changing the
-    /// indexed candidate contract.
-    pub fn requiredLiteral(self: *const Matcher) ?[]const u8 {
-        if (!self.isLiteralSearch() or self.program.direct.items.len != 1) return null;
-        const bytes = self.program.direct.items[0].bytes;
-        return if (bytes.len >= 3) bytes else null;
+    /// Every alternative must supply a mandatory raw byte substring. An OR of
+    /// their candidate filters is conservative; one unprovable branch disables
+    /// pushdown. Bound query size independently of the user's pattern count.
+    pub fn requiredLiterals(self: *const Matcher, a: Allocator) !?[]const []const u8 {
+        const n = self.program.direct.items.len + self.program.regular.items.len;
+        if (n == 0 or n > 64 or self.program.advanced.items.len != 0) return null;
+        for (self.program.direct.items) |item| if (item.insensitive or item.bytes.len < 3) return null;
+        for (self.program.regular.items) |item| if (item.pattern.prefilter.len < 3) return null;
+        const result = try a.alloc([]const u8, n);
+        errdefer a.free(result);
+        var i: usize = 0;
+        for (self.program.direct.items) |item| {
+            for (result[0..i]) |prior| {
+                if (std.mem.eql(u8, prior, item.bytes)) break;
+            } else {
+                result[i] = item.bytes;
+                i += 1;
+            }
+        }
+        for (self.program.regular.items) |item| {
+            for (result[0..i]) |prior| {
+                if (std.mem.eql(u8, prior, item.pattern.prefilter)) break;
+            } else {
+                result[i] = item.pattern.prefilter;
+                i += 1;
+            }
+        }
+        return try a.realloc(result, i);
     }
     pub fn isLiteralSearch(self: *const Matcher) bool {
         if (self.program.direct.items.len == 0 or self.program.regular.items.len != 0 or self.program.advanced.items.len != 0) return false;

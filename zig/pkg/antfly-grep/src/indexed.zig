@@ -133,13 +133,27 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 attempt += 1;
                 continue;
             }
-            break :retry std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.EmptyIndexResponse, .{ .allocate = .alloc_always }) catch |err| {
+            const decoded = std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.EmptyIndexResponse, .{ .allocate = .alloc_always }) catch |err| {
                 if (memory.denied and page_size > 1) {
                     page_size = @max(1, page_size / 2);
                     continue :pages;
                 }
                 return if (memory.denied) error.IndexPageMemoryExceeded else err;
             };
+            const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
+            if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
+            const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
+            if (result_status == 413 and page_size > 1) {
+                page_size = @max(1, page_size / 2);
+                continue :pages;
+            }
+            if ((result_status == 408 or result_status == 429 or result_status >= 500) and attempt < search.options.retries) {
+                const delay = if (response.header("retry-after")) |raw| @import("http_date.zig").retryMilliseconds(raw, std.Io.Clock.real.now(search.io).toSeconds(), 30000) orelse 0 else 0;
+                try backoff(search, attempt, delay);
+                attempt += 1;
+                continue;
+            }
+            break :retry decoded;
         };
         const responses = document.field(parsed.value, "responses") orelse return error.InvalidIndexResponse;
         if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
@@ -211,23 +225,40 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
     const index = table.candidate_index orelse return user_filter;
     const o = search.options;
     if (o.ask != null or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats) return user_filter;
-    const literal = search.matcher.requiredLiteral() orelse return user_filter;
+    const literals = (try search.matcher.requiredLiterals(a)) orelse return user_filter;
     var grams: std.ArrayList(std.json.Value) = .empty;
     const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .term = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
     const certificate = (try std.json.parseFromSlice(std.json.Value, a, certificate_bytes, .{ .allocate = .alloc_always })).value;
-    try grams.append(a, certificate);
-    const n = @min(@as(usize, 8), literal.len - 2);
-    for (0..n) |i| {
-        const position = if (n == 1) 0 else i * (literal.len - 3) / (n - 1);
-        const gram = std.fmt.bytesToHex(literal[position..][0..3].*, .lower);
-        const encoded = try std.json.Stringify.valueAlloc(a, .{ .term = gram[0..], .field = index.field }, .{});
-        const term = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
-        try grams.append(a, term.value);
+    var alternatives: std.ArrayList(std.json.Value) = .empty;
+    for (literals) |literal| {
+        grams.clearRetainingCapacity();
+        const n = @min(@as(usize, 8), literal.len - 2);
+        var seen: [8][6]u8 = undefined;
+        var seen_count: usize = 0;
+        for (0..n) |i| {
+            const position = if (n == 1) 0 else i * (literal.len - 3) / (n - 1);
+            const gram = std.fmt.bytesToHex(literal[position..][0..3].*, .lower);
+            var duplicate = false;
+            for (seen[0..seen_count]) |prior| if (std.mem.eql(u8, &prior, &gram)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            seen[seen_count] = gram;
+            seen_count += 1;
+            const encoded = try std.json.Stringify.valueAlloc(a, .{ .term = gram[0..], .field = index.field }, .{});
+            const term = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
+            try grams.append(a, term.value);
+        }
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = grams.items }, .{});
+        try alternatives.append(a, (try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always })).value);
     }
+    const union_bytes = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = alternatives.items }, .{});
+    const union_value = (try std.json.parseFromSlice(std.json.Value, a, union_bytes, .{ .allocate = .alloc_always })).value;
     // Documents without a completeness certificate must remain candidates.
     // This permits incremental backfills without dropping legacy revisions.
     const candidates_bytes = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = .{
-        .{ .conjuncts = grams.items },
+        .{ .conjuncts = .{ certificate, union_value } },
         .{ .must_not = .{ .disjuncts = .{certificate} } },
     } }, .{});
     const candidates = (try std.json.parseFromSlice(std.json.Value, a, candidates_bytes, .{ .allocate = .alloc_always })).value;

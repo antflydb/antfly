@@ -109,6 +109,11 @@ pub fn decode(a: A, data: []const u8, limit: usize) E![]u8 {
 pub fn decodeTo(a: A, input: *std.Io.Reader, output: *std.Io.Writer, limit: usize) E!void {
     var bits = Bits{ .input = input };
     var produced: usize = 0;
+    // Reuse bounded block workspaces across blocks and concatenated streams.
+    var last: std.ArrayList(u8) = .empty;
+    defer last.deinit(a);
+    var workspace: std.ArrayList(u32) = .empty;
+    defer workspace.deinit(a);
     while (try bits.more()) {
         if (try bits.read(24) != 0x425a68) return error.InvalidBzip2;
         const size = try bits.read(8);
@@ -167,8 +172,7 @@ pub fn decodeTo(a: A, input: *std.Io.Reader, output: *std.Io.Writer, limit: usiz
                 table.* = try Table.init(lengths[0 .. n + 2]);
             }
             var symbols = Symbols{ .bits = &bits, .tables = tables[0..groups], .selectors = selectors };
-            var last: std.ArrayList(u8) = .empty;
-            defer last.deinit(a);
+            last.clearRetainingCapacity();
             var sym = try symbols.next();
             while (sym != n + 1) {
                 if (sym < 2) {
@@ -201,62 +205,136 @@ pub fn decodeTo(a: A, input: *std.Io.Reader, output: *std.Io.Writer, limit: usiz
                 c.* = total;
                 total += tmp;
             }
-            const links = try a.alloc(u32, last.items.len);
-            defer a.free(links);
+            // A link uses four bytes. Geometric growth would retain up to
+            // 50% unnecessary capacity for the dominant decoder workspace.
+            try workspace.ensureTotalCapacityPrecise(a, last.items.len);
+            workspace.items.len = last.items.len;
+            const links = workspace.items;
             for (last.items, 0..) |ch, i| {
                 links[counts[ch]] = @intCast(i);
                 counts[ch] += 1;
             }
             const block_len = last.items.len;
-            var pos: usize = links[origin];
+            const pos: usize = links[origin];
             // One dependent lookup supplies both the byte and its successor.
             // The temporary last-column bytes are no longer needed afterwards.
             for (links, last.items) |*entry, byte| entry.* = (entry.* << 8) | byte;
-            last.deinit(a);
-            last = .empty;
-            var previous: ?u8 = null;
-            var repeated: usize = 0;
-            var crc = @import("antfly_hash").Crc32Bzip2.init();
-            var decoded: [16384]u8 = undefined;
-            var decoded_len: usize = 0;
-            var random_left: usize = 0;
-            var random_index: usize = 0;
-            for (0..block_len) |_| {
-                const entry = links[pos];
-                var ch: u8 = @truncate(entry);
-                if (randomized) {
-                    if (random_left == 0) {
-                        random_left = @import("bzip2_random.zig").numbers[random_index];
-                        random_index = (random_index + 1) % 512;
-                    }
-                    random_left -= 1;
-                    if (random_left == 1) ch ^= 1;
-                }
-                pos = entry >> 8;
-                const count: usize = if (repeated == 4) ch else 1;
-                const byte = if (repeated == 4) previous.? else ch;
-                if (count > limit - produced) return error.StreamTooLong;
+            const actual_crc = if (randomized)
+                try inverse(true, links, pos, block_len, output, &produced, limit)
+            else
+                try inverse(false, links, pos, block_len, output, &produced, limit);
+            if (actual_crc != checksum) return error.InvalidBzip2;
+            combined = std.math.rotl(u32, combined, 1) ^ checksum;
+        }
+    }
+}
+
+/// Specializing randomization keeps its legacy counters off the common path.
+/// Inverse BWT pointer chasing and RLE output run in separate cache-sized loops,
+/// so per-byte output bookkeeping does not lengthen the dependency chain.
+fn inverse(comptime randomized: bool, links: []const u32, start: usize, block_len: usize, output: *std.Io.Writer, produced: *usize, limit: usize) E!u32 {
+    var pos = start;
+    var previous: u8 = 0;
+    var repeated: usize = 0;
+    var crc = @import("antfly_hash").Crc32Bzip2.init();
+    var decoded: [16384]u8 = undefined;
+    var decoded_len: usize = 0;
+    var random_left: usize = 0;
+    var random_index: usize = 0;
+    var column: [4096]u8 = undefined;
+    var left = block_len;
+    while (left > 0) {
+        const n = @min(left, column.len);
+        for (column[0..n]) |*byte| {
+            const entry = links[pos];
+            byte.* = @truncate(entry);
+            pos = entry >> 8;
+        }
+        if (randomized) for (column[0..n]) |*ch| {
+            if (random_left == 0) {
+                random_left = @import("bzip2_random.zig").numbers[random_index];
+                random_index = (random_index + 1) % 512;
+            }
+            random_left -= 1;
+            if (random_left == 1) ch.* ^= 1;
+        };
+        var at: usize = 0;
+        while (at < n) {
+            const ch = column[at];
+            if (repeated == 4) {
+                const count: usize = ch;
+                if (count > limit - produced.*) return error.StreamTooLong;
                 if (count > decoded.len - decoded_len) {
                     try output.writeAll(decoded[0..decoded_len]);
                     crc.update(decoded[0..decoded_len]);
                     decoded_len = 0;
                 }
-                @memset(decoded[decoded_len..][0..count], byte);
+                @memset(decoded[decoded_len..][0..count], previous);
                 decoded_len += count;
-                produced += count;
-                if (repeated == 4) {
-                    repeated = 0;
-                    previous = null;
-                } else {
-                    repeated = if (previous != null and previous.? == ch) repeated + 1 else 1;
-                    previous = ch;
-                }
+                produced.* += count;
+                repeated = 0;
+                at += 1;
+                continue;
             }
-            if (repeated == 4) return error.InvalidBzip2;
-            try output.writeAll(decoded[0..decoded_len]);
-            crc.update(decoded[0..decoded_len]);
-            if (crc.final() != checksum) return error.InvalidBzip2;
-            combined = std.math.rotl(u32, combined, 1) ^ checksum;
+            // Complete runs crossing BWT chunks before entering the bulk path.
+            if (repeated > 0 and previous == ch) {
+                if (produced.* == limit) return error.StreamTooLong;
+                if (decoded_len == decoded.len) {
+                    try output.writeAll(decoded[0..decoded_len]);
+                    crc.update(decoded[0..decoded_len]);
+                    decoded_len = 0;
+                }
+                decoded[decoded_len] = ch;
+                decoded_len += 1;
+                produced.* += 1;
+                repeated += 1;
+                at += 1;
+                continue;
+            }
+            const run = fourEqual(column[at..n]);
+            const count = if (run) |index| index + 4 else n - at;
+            if (count > limit - produced.*) return error.StreamTooLong;
+            if (count > decoded.len - decoded_len) {
+                try output.writeAll(decoded[0..decoded_len]);
+                crc.update(decoded[0..decoded_len]);
+                decoded_len = 0;
+            }
+            @memcpy(decoded[decoded_len..][0..count], column[at..][0..count]);
+            decoded_len += count;
+            produced.* += count;
+            at += count;
+            previous = column[at - 1];
+            repeated = if (run != null) 4 else 1;
+            if (run == null) while (repeated < @min(count, 3) and column[at - 1 - repeated] == previous) {
+                repeated += 1;
+            };
+        }
+        left -= n;
+    }
+    if (repeated == 4) return error.InvalidBzip2;
+    try output.writeAll(decoded[0..decoded_len]);
+    crc.update(decoded[0..decoded_len]);
+    return crc.final();
+}
+
+/// Locate the next RLE escape using SIMD; ordinary bytes can then be copied,
+/// bounded and checksummed in blocks rather than individually.
+fn fourEqual(bytes: []const u8) ?usize {
+    const width = std.simd.suggestVectorLength(u8) orelse 16;
+    var at: usize = 0;
+    while (bytes.len - at >= width + 3) : (at += width) {
+        const a: @Vector(width, u8) = bytes[at..][0..width].*;
+        const b: @Vector(width, u8) = bytes[at + 1 ..][0..width].*;
+        const c: @Vector(width, u8) = bytes[at + 2 ..][0..width].*;
+        const d: @Vector(width, u8) = bytes[at + 3 ..][0..width].*;
+        const mask = (a == b) & (b == c) & (c == d);
+        if (@reduce(.Or, mask)) {
+            const bits: @Int(.unsigned, width) = @bitCast(mask);
+            return at + @ctz(bits);
         }
     }
+    while (bytes.len - at >= 4) : (at += 1) {
+        if (bytes[at] == bytes[at + 1] and bytes[at] == bytes[at + 2] and bytes[at] == bytes[at + 3]) return at;
+    }
+    return null;
 }

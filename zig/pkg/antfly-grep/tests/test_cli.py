@@ -83,6 +83,19 @@ class DecisionHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if mode.startswith("embedded-retry-") and len(self.server.index_requests) == 2:
+            encoded = json.dumps(
+                {
+                    "responses": [
+                        {"status": int(mode.rsplit("-", 1)[1]), "error": "transient"}
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
         if mode == "oversized" and body["limit"] > 1:
             self.send_response(413)
             self.send_header("Content-Length", "0")
@@ -347,7 +360,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(self.server.index_requests), 2)
         filters = self.server.index_requests[0][2]["filter_query"]["disjuncts"][0][
             "conjuncts"
-        ][1:]
+        ][1]["disjuncts"][0]["conjuncts"]
         self.assertTrue(all(term["field"] == "grep_trigrams" for term in filters))
         self.server.index_documents[1]["_source"].pop("grep_trigrams_version")
         self.server.index_requests = []
@@ -359,7 +372,7 @@ class CliTests(unittest.TestCase):
             ["-F", "--files-without-match", "TARGET"],
             ["-F", "--include-zero", "-c", "TARGET"],
             ["-Fi", "TARGET"],
-            ["-F", "-e", "TARGET", "-e", "irrelevant"],
+            ["-F", "-e", "TARGET", "-e", "TA"],
             ["-F", "TA"],
             ["--json", "-F", "TARGET"],
             ["--stats", "-F", "TARGET"],
@@ -438,6 +451,86 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(len(self.server.index_requests), 4)
         self.raw_cli("--table-config", config, "--table", "unknown", "STOP", code=2)
+
+    def test_indexed_embedded_transients_retry_same_snapshot_and_cursor(self):
+        for status in (408, 429, 500, 503):
+            with self.subTest(status=status):
+                config = self.table_config(
+                    [self.indexed_doc("a.py"), self.indexed_doc("b.py")]
+                )
+                self.server.index_mode = f"embedded-retry-{status}"
+                self.server.index_requests = []
+                result = self.raw_cli(
+                    "--table-config", config, "--retries", "2", "-l", "STOP"
+                )
+                self.assertEqual(result.stdout, b"a.py\nb.py\n")
+                self.assertEqual(len(self.server.index_requests), 4)
+                self.assertEqual(
+                    self.server.index_requests[1][2], self.server.index_requests[2][2]
+                )
+        self.server.index_mode = "embedded-retry-503"
+        self.server.index_requests = []
+        result = self.raw_cli(
+            "--table-config", config, "--retries", "0", "-l", "STOP", code=2
+        )
+        self.assertEqual(result.stdout, b"a.py\n")
+        self.assertEqual(len(self.server.index_requests), 2)
+
+        config = self.table_config(
+            [self.indexed_doc(f"{i}.py") for i in range(4)], page_size=2
+        )
+        self.server.index_mode = "embedded-retry-413"
+        self.server.index_requests = []
+        result = self.raw_cli("--table-config", config, "-l", "STOP")
+        self.assertEqual(result.stdout, b"0.py\n1.py\n2.py\n3.py\n")
+        failed, retried = [r[2] for r in self.server.index_requests[1:3]]
+        self.assertEqual(failed["search_after"], retried["search_after"])
+        self.assertEqual(failed["remote_snapshot"], retried["remote_snapshot"])
+        self.assertEqual((failed["limit"], retried["limit"]), (2, 1))
+
+    def test_indexed_regex_and_union_candidates_are_conservative(self):
+        documents = [
+            self.indexed_doc("a", "TARGET 42\n"),
+            self.indexed_doc("b", "other value\n"),
+            self.indexed_doc("c", "irrelevant\n"),
+        ]
+        config = self.table_config(
+            documents,
+            tables=[
+                {
+                    "name": "source files",
+                    "candidate_index": {"version": 1, "field": "grep_trigrams"},
+                }
+            ],
+        )
+        for args in (
+            [r"TARGET \d+"],
+            ["-F", "-e", "TARGET", "-e", "other"],
+            ["-e", r"TARGET \d+", "-e", "other.*value"],
+        ):
+            with self.subTest(args=args):
+                self.server.index_requests = []
+                optimized = self.raw_cli("--table-config", config, *args).stdout
+                self.assertIn("filter_query", self.server.index_requests[0][2])
+                self.assertEqual(
+                    len(self.server.index_requests), 2 if len(args) == 1 else 3
+                )
+                for d in self.server.index_documents:
+                    d["_source"].pop("grep_trigrams_version", None)
+                self.server.index_requests = []
+                self.assertEqual(
+                    self.raw_cli("--table-config", config, *args).stdout, optimized
+                )
+                self.assertEqual(len(self.server.index_requests), 4)
+                config = self.table_config(
+                    documents,
+                    tables=[
+                        {
+                            "name": "source files",
+                            "candidate_index": {"version": 1, "field": "grep_trigrams"},
+                        }
+                    ],
+                )
 
     def test_indexed_and_local_decision_results_share_ranking_and_evidence(self):
         self.server.mode = "exploration"
@@ -2016,6 +2109,145 @@ class CliTests(unittest.TestCase):
                     os.close(master)
                     os.close(slave)
 
+    @unittest.skipUnless(shutil.which("rg"), "optional ripgrep differential oracle")
+    def test_buffered_regex_proof_preserves_boundaries_and_late_binary(self):
+        for position in (65530, 65535, 65536, 131070):
+            for suffix in (b"\n", b"\n" + b"x" * 65536 + b"\0late\n"):
+                self.write("proof", b"x\n" * (position // 2) + b"TARGET42\n" + suffix)
+                for flags in (
+                    ["--no-mmap", "-a", "-n"],
+                    ["--no-mmap", "-I"],
+                    ["--no-mmap", "-c"],
+                ):
+                    args = [*flags, r"TARGET\d+", "proof"]
+                    expected = subprocess.run(
+                        ["rg", *args], cwd=self.root, env=self.env, capture_output=True
+                    )
+                    result = self.raw_cli(*args, code=expected.returncode)
+                    self.assertEqual(
+                        result.stdout, expected.stdout, (position, suffix[-8:], flags)
+                    )
+
+    def test_refinement_batches_lines_across_rejected_regions(self):
+        self.server.mode = "reject_blocks"
+        self.write(
+            "a.txt",
+            "STOP one\nnoise\nSTOP two\nnoise\nSTOP three\nnoise\nSTOP four\nnoise\n",
+        )
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--no-cache",
+            "--refine",
+            "--chunk-lines",
+            "2",
+            "--batch-size",
+            "8",
+            "-j1",
+            "a.txt",
+        )
+        self.assertIn(b"STOP one", result.stdout)
+        self.assertIn(b"STOP four", result.stdout)
+        refined = [
+            body
+            for _, _, body in self.server.requests
+            if any(i["id"].startswith("refine-") for i in body.get("inputs", []))
+        ]
+        self.assertEqual(len(refined), 1)
+        self.assertEqual(len(refined[0]["inputs"]), 8)
+        self.assertEqual(len({i["id"] for i in refined[0]["inputs"]}), 8)
+        self.assertTrue(
+            all("CONTEXT region lines" in i["input"] for i in refined[0]["inputs"])
+        )
+        self.assertTrue(all(set(i) == {"id", "input"} for i in refined[0]["inputs"]))
+
+    def test_escaped_decision_payload_splits_before_exceeding_body_budget(self):
+        line = "STOP " + '\\"' * 65536 + "\n"
+        self.write("large.txt", line * 64)
+        self.raw_cli(
+            *self.decision_args(),
+            "--no-cache",
+            "--unit",
+            "line",
+            "--context-lines",
+            "0",
+            "--batch-size",
+            "64",
+            "-j1",
+            "-l",
+            "large.txt",
+        )
+        bodies = [body for _, _, body in self.server.requests]
+        self.assertGreater(len(bodies), 1)
+        self.assertEqual(sum(len(body["inputs"]) for body in bodies), 64)
+        self.assertTrue(
+            all(
+                item["input"].endswith(line)
+                for body in bodies
+                for item in body["inputs"]
+            )
+        )
+        self.assertTrue(
+            all(len(json.dumps(body).encode()) <= 16 * 1024 * 1024 for body in bodies)
+        )
+
+    def test_refinement_partial_budget_keeps_independent_evidence(self):
+        self.server.mode = "reject_blocks"
+        self.write(
+            "a.txt",
+            "STOP one\nnoise\nSTOP two\nnoise\nSTOP three\nnoise\nSTOP four\nnoise\n",
+        )
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--no-cache",
+            "--refine",
+            "--chunk-lines",
+            "2",
+            "--batch-size",
+            "8",
+            "--max-regions",
+            "7",
+            "-j1",
+            "a.txt",
+            code=2,
+        )
+        self.assertIn(b"STOP one", result.stdout)
+        self.assertIn(b"STOP two", result.stdout)
+        self.assertNotIn(b"STOP four", result.stdout)
+        self.assertIn(b"RegionBudgetExceeded", result.stderr)
+        refined = [
+            body
+            for _, _, body in self.server.requests
+            if any(i["id"].startswith("refine-") for i in body.get("inputs", []))
+        ]
+        self.assertEqual(sum(len(b["inputs"]) for b in refined), 3)
+
+    def test_typesafe_refinement_shares_context_and_retains_all_targets(self):
+        self.write("a.txt", "STOP one\nnoise\nSTOP two\nnoise\n")
+        self.raw_cli(
+            *self.decision_args(),
+            "--backend",
+            "typesafe",
+            "--no-cache",
+            "--refine",
+            "--chunk-lines",
+            "2",
+            "--batch-size",
+            "8",
+            "-j1",
+            "a.txt",
+        )
+        refined = [
+            body
+            for _, _, body in self.server.requests
+            if "BEGIN SHARED CONTEXT" in body.get("state", "")
+        ]
+        self.assertEqual(len(refined), 1)
+        state = refined[0]["state"]
+        self.assertEqual(state.count("BEGIN SHARED CONTEXT"), 2)
+        self.assertEqual(state.count("CONTEXT region lines"), 2)
+        self.assertEqual(state.count("BEGIN TARGET INPUT"), 4)
+        self.assertEqual(len(refined[0]["questions"]), 4)
+
     def test_typesafe_protocol_shares_multiquery_source(self):
         self.write("a", "STOP\n")
         self.raw_cli(
@@ -2981,17 +3213,20 @@ class CliTests(unittest.TestCase):
             ),
             serial,
         )
-        for jobs in (2, 4, 12):
+        for jobs in (None, 2, 4, 12):
             with self.subTest(jobs=jobs):
                 parallel = self.raw_cli(
-                    "--files", f"-j{jobs}", "tree"
+                    "--files", *([] if jobs is None else [f"-j{jobs}"]), "tree"
                 ).stdout.splitlines()
                 self.assertEqual(len(parallel), len(serial))
                 self.assertEqual(set(parallel), serial)
                 self.assertEqual(
                     set(
                         self.raw_cli(
-                            "-l", f"-j{jobs}", "hit", "tree"
+                            "-l",
+                            *([] if jobs is None else [f"-j{jobs}"]),
+                            "hit",
+                            "tree",
                         ).stdout.splitlines()
                     ),
                     serial,

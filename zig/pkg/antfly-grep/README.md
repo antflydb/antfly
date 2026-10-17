@@ -716,19 +716,24 @@ is an ingestion guarantee, not a user-supplied relevance score. Without a
 certificate, documents remain candidates, allowing online incremental backfills.
 Do not certify partial or stale term arrays.
 
-The CLI selects at most eight necessary grams for a single case-sensitive literal,
-combines them with any user filter, and verifies all returned content with the
-shared matcher. Missing certificates use the exact-scan fallback. Queries needing
-nonmatching files, inverted selection, passthrough, zero counts, full JSON/statistics,
-or decision evaluation bypass candidate filtering. Case-insensitive, short and
-multiple-pattern searches currently fall back too. Existing tables without
+The CLI selects at most eight necessary grams per proven case-sensitive literal
+or mandatory regex substring. Up to 64 alternatives are combined with OR, then
+intersected with any user filter. Every alternative must supply a substring of
+at least three bytes; otherwise the entire query falls back to an exact scan.
+All returned content is verified with the shared matcher. Missing certificates
+use the exact-scan fallback. Queries needing nonmatching files, inverted selection,
+passthrough, zero counts, full JSON/statistics, or decision evaluation bypass
+candidate filtering. Unprovable case-insensitive, short, advanced-PCRE and
+oversized pattern sets fall back too. Existing tables without
 `candidate_index` keep the original exact scan. Approximate semantic retrieval is
 not substituted for an exact grep query.
 
 Automatic local workers respect Linux scheduler affinity and hierarchical cgroup
 v2 CPU quotas; explicit `-j` remains authoritative. Storage-sensitive defaults
-retain the measured caps. Use benchmark worker sweeps on the deployment's actual
-storage rather than assuming one cap is optimal everywhere.
+retain the measured caps. Automatic file scans start with at most two workers
+and grow only when the bounded queue backs up; directory workers start only
+when subtrees can be shared. Explicit worker counts retain eager startup. Use benchmark worker sweeps on the
+deployment's actual storage rather than assuming one cap is optimal everywhere.
 
 `bench/compare.py` accepts `--threads N`, Linux `--cpus N`, and
 `--cache-mode cold-advice`. Cold advice fsyncs each corpus file and calls
@@ -767,3 +772,28 @@ GNU `time` reports the command's accounted RSS maximum, including waited
 children by maximum rather than sum. Codec/preprocessor comparisons therefore
 do not establish concurrent process-tree peak memory; external rg helper
 processes can overlap. Single-process cases avoid that ambiguity.
+
+Decision refinement batches independent line targets across each bounded region
+window, including lines in rejected regions. Target prompts are materialized only
+for the current request window, and partial budget exhaustion retains completed
+line evidence. Typesafe requests share each immutable region context once in
+`state`. Decision API serialization preserves the existing `inputs` wire format
+and writes context directly into JSON without a temporary joined string. JSON
+serialization uses a 32 MiB allocation budget and a 16 MiB payload limit; oversized
+batches split through the existing retry path. Cache keys include context and broad/direct prompt mode. Fixture request bytes are recorded
+separately from provider token usage; fixture results do not establish model
+quality or actual provider cost.
+
+`bench/decision_transport.py` compares a saved baseline with the current binary
+using synthetic source and a local constant-score Typesafe fixture. The recorded
+512-line case sends the same 513 questions in 65 requests and produces identical
+output, while request-body bytes fall from 10,719,928 to 1,609,144 (85% less).
+See `bench/results/followup-typesafe-transport.json`. The labeled repository
+fixture separately reduces requests from 52 to 45 per question while preserving
+all 304 evaluated targets and expected results. These are transport/orchestration
+measurements, not provider token costs or model-quality evidence.
+
+The bzip2 decoder reuses block workspaces with precise link-buffer capacity,
+separates inverse-BWT traversal from RLE output, and uses SIMD to locate RLE
+escapes before copying ordinary bytes in bulk. Randomized legacy blocks, CRCs,
+output limits and streaming backpressure retain their checked paths.

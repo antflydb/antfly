@@ -276,15 +276,15 @@ pub const Discovery = struct {
         pool.dispatcher = .{ .ptr = &pool, .submit = Pool.submit };
         var threads: [11]std.Thread = undefined;
         const worker_limit = if (self.options.files) threads.len else 3;
-        var started: usize = 0;
-        defer for (threads[0..started]) |thread| thread.join();
+        pool.threads = threads[0..@min(worker_limit, self.options.jobs - 1)];
+        defer for (pool.threads[0..pool.started]) |thread| thread.join();
         // Root counts as one pending job, including when thread creation fails.
         var root_done = false;
         defer if (!root_done) pool.finish();
-        for (threads[0..@min(worker_limit, self.options.jobs - 1)]) |*thread| {
+        if (!self.options.jobs_auto) for (pool.threads) |*thread| {
             thread.* = try std.Thread.spawn(.{}, Pool.worker, .{&pool});
-            started += 1;
-        }
+            pool.started += 1;
+        };
         const previous = self.dispatcher;
         self.dispatcher = &pool.dispatcher;
         defer self.dispatcher = previous;
@@ -677,6 +677,8 @@ fn WalkPool(comptime Context: type) type {
         pending: usize = 1,
         failure: ?anyerror = null,
         batch_files: bool = false,
+        threads: []std.Thread = &.{},
+        started: usize = 0,
         idle: std.atomic.Value(usize) = .init(0),
         stop: std.atomic.Value(bool) = .init(false),
         mutex: std.Io.Mutex = .init,
@@ -756,13 +758,19 @@ fn WalkPool(comptime Context: type) type {
             // Share subtrees only with idle workers. Keeping active producers
             // in their own DFS avoids path/rule copies and queue contention for
             // every directory, while idle workers can still steal later work.
-            if (self.idle.load(.monotonic) == 0) return false;
+            if (!self.root.options.jobs_auto and self.idle.load(.monotonic) == 0) return false;
             const a = self.root.a;
             const io = self.root.io;
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             if (self.stop.load(.acquire)) return true;
-            if (self.count == self.slots.len or self.count >= self.idle.load(.monotonic)) return false;
+            const idle = self.idle.load(.monotonic);
+            if (self.count == self.slots.len or self.count >= @max(1, idle)) return false;
+            if (idle == 0) {
+                if (!self.root.options.jobs_auto or self.started == self.threads.len) return false;
+                self.threads[self.started] = try std.Thread.spawn(.{}, Self.worker, .{self});
+                self.started += 1;
+            }
             const owned_path = try a.dupe(u8, path);
             errdefer a.free(owned_path);
             const owned_display = try a.dupe(u8, display);

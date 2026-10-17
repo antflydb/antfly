@@ -299,6 +299,7 @@ def main():
             "small-files-unsorted": ["-l", "ERROR[0-9]+", "small"],
             "buffered-literal": ["--no-mmap", "-F", "unfindable-literal", "large.log"],
             "buffered-regex": ["--no-mmap", "ERROR[a-zA-Z0-9]+", "large.log"],
+            "buffered-regex-prefix-miss": ["--no-mmap", "absent[A-Z]+", "large.log"],
             "boolean-dfa": ["(?:worker|request)[a-z =]+[0-9]+", "large.log"],
             "mmap-literal": ["--mmap", "-F", "unfindable-literal", "large.log"],
         }

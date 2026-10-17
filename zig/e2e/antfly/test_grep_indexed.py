@@ -344,3 +344,15 @@ def test_native_grep_certified_candidates_and_legacy_fallback(stateful_api, tmp_
         accelerated.stderr.decode()
     )
     assert baseline.stdout == accelerated.stdout == b"a.py\nc.py\n"
+
+    for flags in (["-l", "TARGET.*first"], ["-Fl", "-e", "TARGET", "-e", "irrelevant"]):
+        ordinary = run_grep(tmp_path, stateful_api.url, table, *flags)
+        candidates = run_grep(
+            tmp_path,
+            stateful_api.url,
+            table,
+            *flags,
+            candidate_index={"version": 1, "field": "grep_trigrams"},
+        )
+        assert ordinary.returncode == candidates.returncode == 0
+        assert ordinary.stdout == candidates.stdout
