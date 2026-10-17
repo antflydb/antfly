@@ -8190,14 +8190,25 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     try Test.checkRow(try Test.execute(a, first_id, "SELECT amount FROM invoices"), "9007199254740993.1250");
     _ = try Test.execute(a, first_id, "CREATE INDEX tenant_idx ON invoices(tenant)");
     _ = try Test.execute(a, first_id, "CREATE INDEX mixed_idx ON invoices(tenant DESC NULLS FIRST,lower(label)) INCLUDE(amount) WHERE tenant>0");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
     const table = blk: {
         const guard = enterHandle(first_id, .exclusive).?;
         defer guard.leave();
         try std.testing.expect(guard.entry_error == null);
         var adapter = @import("sql.zig").Adapter(antfly){ .handle = guard.handle, .db = &guard.handle.db, .table_name = "default" };
         const backend = adapter.backend();
-        break :blk try backend.vtable.resolve(backend.ptr, a, .{ .table = "invoices" }, .read);
+        const resolved = try backend.vtable.resolve(backend.ptr, a, .{ .table = "invoices" }, .read);
+        const indexed_db = try @import("tables.zig").get(guard.handle, "invoices");
+        for (0..256) |_| {
+            if ((try indexed_db.relationalIndexBuildStatus("mixed_idx")).state == .ready) break;
+            _ = try indexed_db.buildRelationalIndexStep("mixed_idx", .{});
+        }
+        try std.testing.expectEqual(.ready, (try indexed_db.relationalIndexBuildStatus("mixed_idx")).state);
+        break :blk resolved;
     };
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
+    const no_match = try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "missing" }});
+    try std.testing.expectEqual(@as(usize, 0), no_match.object.get("rows").?.array.items.len);
     const amount = try table.column("amount");
     try std.testing.expectEqual(.numeric, amount.element_type.?);
     try std.testing.expectEqual(@as(u16, 20), amount.numeric_modifier.?.precision);
@@ -8234,6 +8245,7 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     const final_id = try publishHandle(final_owner);
     defer antfly_db_close(final_id);
     try Test.checkRow(try Test.execute(a, final_id, "SELECT amount FROM invoices"), "9007199254740993.1253");
+    try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1253");
 }
 
 test "capi SQL connections share storage while session IDs and close remain independent" {

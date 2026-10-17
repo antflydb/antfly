@@ -40,7 +40,7 @@ pub fn Adapter(comptime native: type) type {
         outcome_transaction_id: ?types.TxnId = null,
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .supports_expression_access_hints = self.transaction == null or !self.transaction.?.active, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
@@ -673,7 +673,7 @@ pub fn Adapter(comptime native: type) type {
                 .inclusive_from = request.primary_key != null,
                 .exclusive_to = true,
                 .limit = request.limit,
-                .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order and self.transaction == null },
+                .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .expression_equalities = request.expression_equalities, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order and (self.transaction == null or !self.transaction.?.active) },
             });
             errdefer session.deinit();
             const projection = try dependencies.sql_document_row.Projection.init(alloc, table, request.fields);

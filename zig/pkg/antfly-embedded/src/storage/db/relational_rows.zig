@@ -36,6 +36,11 @@ const Allocator = std.mem.Allocator;
 
 pub const Value = tuples.Value;
 pub const Condition = predicates.Condition;
+pub const ExpressionEquality = struct {
+    identity: @import("../relational_index.zig").ExpressionKeyIdentity,
+    fold_ascii: bool = false,
+    value: Value,
+};
 /// Bounds use index order, including descending components. A partial tuple
 /// denotes the whole matching left prefix, not an implicit NULL suffix.
 pub const Bound = struct { values: []const Value, inclusive: bool = true };
@@ -68,6 +73,9 @@ pub const Request = struct {
     fields: []const []const u8 = &.{},
     /// Conjunction of typed comparisons; SQL UNKNOWN does not match WHERE.
     conditions: []const Condition = &.{},
+    /// Access hints only. Caller-owned residual predicates remain required on
+    /// both index and primary fallback paths; these never certify membership.
+    expression_equalities: []const ExpressionEquality = &.{},
 };
 
 pub const Budget = struct {
@@ -195,7 +203,7 @@ pub const Reader = struct {
         errdefer read.abort();
         if (active_view.storageMode() != .relational) return error.RelationalTableRequired;
         if (request.expected_schema_version) |version| if (version != active_view.version()) return error.PreparedGenerationChanged;
-        if (request.fields.len > 256 or request.conditions.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
+        if (request.fields.len > 256 or request.conditions.len > 256 or request.expression_equalities.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
             return error.InvalidRelationalRowsRequest;
         if (request.index != null and (request.primary_lower != null or request.primary_upper != null)) return error.InvalidRelationalRowsRequest;
         if (request.after != null and request.index == null) return error.InvalidRelationalRowsRequest;
@@ -283,6 +291,13 @@ pub const Reader = struct {
                 const implication = try owned.alloc(bool, conditions.len);
                 const KeyConditions = struct { equality: ?Value = null, has_range: bool = false };
                 var keyed: std.AutoHashMapUnmanaged(u64, KeyConditions) = .empty;
+                const ExpressionKey = struct { identity: @import("../relational_index.zig").ExpressionKeyIdentity, fold_ascii: bool };
+                var expression_keyed: std.AutoHashMapUnmanaged(ExpressionKey, Value) = .empty;
+                try expression_keyed.ensureTotalCapacity(owned, @intCast(request.expression_equalities.len));
+                for (request.expression_equalities) |hint| {
+                    const entry = expression_keyed.getOrPutAssumeCapacity(.{ .identity = hint.identity, .fold_ascii = hint.fold_ascii });
+                    if (!entry.found_existing) entry.value_ptr.* = hint.value;
+                }
                 try keyed.ensureTotalCapacity(owned, @intCast(conditions.len));
                 for (request.conditions, conditions) |condition, compiled| {
                     const identity = @as(u64, compiled.tuple.keys[0].ordinal) * 2 + @intFromBool(compiled.tuple.keys[0].fold_ascii);
@@ -303,9 +318,13 @@ pub const Reader = struct {
                     var equality_count: usize = 0;
                     var candidate_values: [32]Value = @splat(.null);
                     for (candidate.tuple.keys) |key| {
-                        if (equality_count == candidate_values.len or key.expression != null) break;
-                        const operand = keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii)) orelse break;
-                        candidate_values[equality_count] = operand.equality orelse break;
+                        if (equality_count == candidate_values.len) break;
+                        candidate_values[equality_count] = if (key.expression) |expression|
+                            expression_keyed.get(.{ .identity = .{ .fingerprint = expression.plan.fingerprint, .kind = key.column_type, .builtin = expression.plan.result_sql_type }, .fold_ascii = key.fold_ascii }) orelse break
+                        else blk: {
+                            const operand = keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii)) orelse break;
+                            break :blk operand.equality orelse break;
+                        };
                         equality_count += 1;
                     }
                     var has_range = false;

@@ -1494,6 +1494,7 @@ pub const ColumnarScanStats = struct {
 /// Borrowed typed request for native callers. Encoded only at an archive or
 /// network boundary; fields and JSON operands must outlive the synchronous scan.
 pub const RelationalRowQuery = struct {
+    pub const ExpressionEquality = @import("../relational_index.zig").ExpressionEqualityHint;
     pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
     pub const Condition = struct {
         column: []const u8,
@@ -1514,6 +1515,10 @@ pub const RelationalRowQuery = struct {
     lower: ?Bound = null,
     upper: ?Bound = null,
     conditions: []const Condition = &.{},
+    /// Internal access hints, not filters. The caller must retain the logical
+    /// predicate, including when no READY matching index exists. Ignoring a
+    /// hint always leaves a correct primary scan with that residual predicate.
+    expression_equalities: []const ExpressionEquality = &.{},
     schema_version: ?u32 = null,
 };
 

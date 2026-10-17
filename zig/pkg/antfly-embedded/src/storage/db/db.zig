@@ -39466,7 +39466,7 @@ pub const DB = struct {
         const parsed = .{ .value = opts.relational_query orelse parsed_json.?.value };
         if (parsed.value.page_bytes == 0 or parsed.value.page_bytes > 16 * 1024 * 1024) return error.InvalidRelationalRowsRequest;
         session.page_bytes = parsed.value.page_bytes;
-        if (parsed.value.conditions.len > 256 or parsed.value.fields.len > 256) return error.InvalidRelationalRowsRequest;
+        if (parsed.value.conditions.len > 256 or parsed.value.fields.len > 256 or parsed.value.expression_equalities.len > 256) return error.InvalidRelationalRowsRequest;
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         if (view.storageMode() != .relational) return error.RelationalTableRequired;
@@ -39507,6 +39507,15 @@ pub const DB = struct {
                 .collation = condition.collation,
             };
         }
+        const expression_equalities = try scratch.alloc(RelationalRows.ExpressionEquality, parsed.value.expression_equalities.len);
+        for (parsed.value.expression_equalities, expression_equalities) |hint, *compiled| compiled.* = .{
+            .identity = hint.identity,
+            .fold_ascii = hint.fold_ascii,
+            // The request and decode region outlive reader preparation. Tuple
+            // bounds are owned before this region retires; do not clone wide
+            // input strings solely for an optional access hint.
+            .value = try @import("../../schema/relational_checks.zig").valueFromJson(scratch, hint.identity.kind, hint.value, true),
+        };
         const Filter = struct {
             alloc: Allocator,
             source: ?db_query_graph.PreparedPatternFilter = null,
@@ -39570,6 +39579,7 @@ pub const DB = struct {
             .upper = upper,
             .fields = parsed.value.fields,
             .conditions = conditions,
+            .expression_equalities = expression_equalities,
             .primary_lower = if (from_key.len != 0) .{ .key = from_key, .inclusive = opts.inclusive_from } else null,
             .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
             .expected_schema_version = parsed.value.schema_version orelse view.version(),
@@ -62689,6 +62699,106 @@ fn expectTestRelationalIndexRow(db: *DB, document: []const u8, json: []const u8,
             try std.testing.expectEqualStrings("", try txn.get(forward.items));
         } else try std.testing.expectError(error.NotFound, txn.get(forward.items));
     }
+}
+
+test "relational rows snapshot automatically binds expression prefixes without bypassing partial membership" {
+    const RelationalRows = DB.RelationalRows;
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("relational-expression-auto-prefix");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+    defer db.close();
+    const properties =
+        \\"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"email":{"type":"keyword"},"active":{"type":"boolean"}},"additionalProperties":false}}}
+    ;
+    const initial = try std.fmt.allocPrint(alloc, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",{s}}}", .{properties});
+    defer alloc.free(initial);
+    try db.setSchemaJson(alloc, initial);
+    try db.batch(.{ .timestamp_ns = 100, .writes = &.{
+        .{ .key = "a", .value = "{\"tenant\":7,\"email\":\"Owner\",\"active\":true}" },
+        .{ .key = "b", .value = "{\"tenant\":7,\"email\":\"OWNER\",\"active\":false}" },
+        .{ .key = "c", .value = "{\"tenant\":7,\"email\":\"Else\",\"active\":true}" },
+        .{ .key = "d", .value = "{\"tenant\":8,\"email\":\"Owner\",\"active\":true}" },
+    } });
+    const indexed = try std.fmt.allocPrint(alloc,
+        \\{{"version":2,"storage_mode":"relational","default_type":"row","relational_indexes":[{{"name":"mixed","keys":[{{"column":"tenant","direction":"desc"}},{{"expression":{{"op":"lower_ascii","args":[{{"op":"column","column":"email"}}]}},"result_type":"string"}}],"include_columns":["email"],"where":[{{"column":"active","op":"eq","value":true}}]}}],{s}}}
+    , .{properties});
+    defer alloc.free(indexed);
+    try db.setSchemaJson(alloc, indexed);
+    const identity = blk: {
+        var pinned = db.core.relational_indexes.acquire().?;
+        defer pinned.deinit();
+        const index = for (pinned.plan.boundIndexes()) |candidate| {
+            if (std.mem.eql(u8, candidate.name, "mixed")) break candidate;
+        } else return error.TestUnexpectedResult;
+        const expression = index.tuple.keys[1].expression.?;
+        break :blk @import("../relational_index.zig").ExpressionKeyIdentity{ .fingerprint = expression.plan.fingerprint, .kind = .string, .builtin = expression.plan.result_sql_type };
+    };
+    const hints = [_]RelationalRows.ExpressionEquality{.{ .identity = identity, .value = .{ .string = "owner" } }};
+    var request: RelationalRows.Request = .{ .auto_index = true, .fields = &.{"email"}, .expected_schema_version = 2, .expression_equalities = &hints, .conditions = &.{
+        .{ .column = "tenant", .op = .eq, .value = .{ .integer = 7 } },
+        .{ .column = "active", .op = .eq, .value = .{ .boolean = true } },
+    } };
+    const Check = struct {
+        fn fallback(database: *DB, input: RelationalRows.Request, count: usize) !void {
+            var reader = try database.beginRelationalRows(std.testing.allocator, input);
+            defer reader.deinit();
+            try std.testing.expect(reader.index == null);
+            var page = try reader.nextTypedPage(std.testing.allocator, null, .{});
+            defer page.deinit();
+            // Hints do not own logical filtering. The caller must retain its
+            // expression residual when this correct primary fallback is used.
+            try std.testing.expectEqual(count, page.rows.len);
+        }
+        fn broadPrefix(database: *DB, input: RelationalRows.Request) !void {
+            var reader = try database.beginRelationalRows(std.testing.allocator, input);
+            defer reader.deinit();
+            // A nonmatching second key must not discard a useful first-key
+            // prefix, nor narrow that prefix using an unproven expression.
+            try std.testing.expectEqualStrings("mixed", reader.index.?.name);
+            var page = try reader.nextTypedPage(std.testing.allocator, null, .{});
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+        }
+    };
+    try Check.fallback(&db, request, 2);
+    for (0..256) |_| {
+        if ((try db.relationalIndexBuildStatus("mixed")).state == .ready) break;
+        _ = try db.buildRelationalIndexStep("mixed", .{});
+    }
+    try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus("mixed")).state);
+    {
+        var missing_membership = request;
+        missing_membership.conditions = request.conditions[0..1];
+        try Check.fallback(&db, missing_membership, 3);
+        var missing_prefix = request;
+        missing_prefix.conditions = request.conditions[1..];
+        try Check.fallback(&db, missing_prefix, 3);
+        var wrong_hints = hints;
+        wrong_hints[0].identity.fingerprint[0] ^= 1;
+        var wrong = request;
+        wrong.expression_equalities = &wrong_hints;
+        try Check.broadPrefix(&db, wrong);
+        wrong_hints = hints;
+        wrong_hints[0].fold_ascii = true;
+        try Check.broadPrefix(&db, wrong);
+    }
+    var reader = try db.beginRelationalRows(alloc, request);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("mixed", reader.index.?.name);
+    try db.batch(.{ .timestamp_ns = 200, .writes = &.{.{ .key = "a", .value = "{\"tenant\":7,\"email\":\"Changed\",\"active\":true}" }} });
+    const dropped = try std.fmt.allocPrint(alloc, "{{\"version\":3,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"relational_indexes\":[],{s}}}", .{properties});
+    defer alloc.free(dropped);
+    try db.setSchemaJson(alloc, dropped);
+    for (0..256) |_| if (!try db.collectRelationalIndexGarbageStep()) break;
+    var page = try reader.nextTypedPage(alloc, null, .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("a", page.rows[0].key);
+    try std.testing.expectEqualStrings("Owner", page.rows[0].typed.?.object.get("email").?.string);
+    try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+    request.expected_schema_version = 3;
+    try Check.fallback(&db, request, 2);
 }
 
 test "relational rows snapshot streams flushed companion families without point probes" {

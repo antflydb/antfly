@@ -719,7 +719,12 @@ pub const Program = struct {
     /// NULL placeholders. Borrowed scalar results remain valid while the
     /// program, cells and parameters live; computed strings use alloc.
     pub fn evaluateInstruction(self: *const Program, alloc: Allocator, index: u32, parameters: []const Json) !Datum {
-        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = .{} };
+        return self.evaluateInstructionWithLimits(alloc, index, parameters, .{});
+    }
+
+    pub fn evaluateInstructionWithLimits(self: *const Program, alloc: Allocator, index: u32, parameters: []const Json, limits: EvalLimits) !Datum {
+        if (index >= self.instructions.len) return error.InvalidSqlProgram;
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
         return context.runDatum(index, 0);
     }
 

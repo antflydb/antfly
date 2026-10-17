@@ -316,6 +316,17 @@ pub const Context = struct {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
 
+    fn expressionAccessCheckpoint(raw: ?*anyopaque) !void {
+        const self: *const Context = @ptrCast(@alignCast(raw.?));
+        try self.checkpoint();
+    }
+
+    pub fn expressionEqualities(self: Context, table: catalog.Table, eligible: bool) ![]const @import("../storage/relational_index.zig").ExpressionEqualityHint {
+        if (!eligible or !self.backend.supports_expression_access_hints) return &.{};
+        const program = if (self.binding.scalars.predicate) |*predicate| predicate else return &.{};
+        return @import("index_access.zig").prepareEqualities(self.arena, self.alloc, table, program, self.binding.scalars.columns, self.parameters, .{ .ptr = @constCast(&self), .checkpoint = expressionAccessCheckpoint, .clock_values = self.backend.clock_values });
+    }
+
     /// Evaluate one owner-demanded scalar on the active statement cut. The
     /// native backend owns the cut and accumulates every point/range proof in
     /// the same transaction as the eventual mutation. Bound output is typed;
@@ -713,7 +724,8 @@ pub const Context = struct {
         var scan_state: ScanState = .{};
         defer scan_state.deinit();
         const requested_order = if (!self.binding.primary_order and !statement.count_all) try @import("describe.zig").scanOrder(self.arena, self.binding, statement) else &.{};
-        const scan_request: catalog.Scan = .{ .row_goal = if (statement.limit != null and predicates.complete and !statement.count_all) offset +| limit else null, .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
+        const expression_equalities = try self.expressionEqualities(table_def, !self.binding.primary_order and predicates.primary_key == null and !predicates.empty and limit != 0);
+        const scan_request: catalog.Scan = .{ .row_goal = if (statement.limit != null and predicates.complete and !statement.count_all) offset +| limit else null, .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .expression_equalities = expression_equalities, .limit = @intCast(self.limits.page_rows) };
         var ordered_source = false;
         if (self.backend.vtable.supports_scan_order and requested_order.len != 0 and limit != 0 and !predicates.empty) {
             try scan_state.open(self, table_def, scan_request);
@@ -1817,6 +1829,85 @@ test "SQL NUMERIC executes exact scalar projections through public result metada
     for (result.output.columns) |column| {
         try std.testing.expectEqual(ast.ColumnType.number, column.type);
         try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+    }
+}
+
+test "SQL expression access shares materialized and streaming hints while preserving residual row goals" {
+    const Fixture = struct {
+        table: catalog.Table,
+        hinted: bool,
+        scans: usize = 0,
+        offset: usize = 0,
+        request: catalog.Scan = undefined,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.table;
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scans += 1;
+            try std.testing.expectEqual(@as(usize, @intFromBool(self.hinted)), request.expression_equalities.len);
+            try std.testing.expect(request.row_goal == null);
+            if (self.hinted) try std.testing.expectEqualStrings("owner", request.expression_equalities[0].value.string);
+            const rows = try a.alloc(catalog.Row, 2);
+            // Simulate the legitimate unavailable-index fallback. SQL must
+            // reject its first row before applying LIMIT, not trust the hint.
+            for (rows, [_][]const u8{ "Other", "Owner" }) |*row, label| {
+                var object: std.json.ObjectMap = .empty;
+                try object.put(a, "email", .{ .string = label });
+                row.* = .{ .id = label, .version = 1, .value = .{ .object = object } };
+            }
+            return .{ .rows = rows };
+        }
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.request = request;
+            self.offset = 0;
+            return .{ .ptr = raw, .next = next, .close = close };
+        }
+        fn next(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var page = try scan(raw, a, self.table, self.request);
+            const end = @min(page.rows.len, self.offset + limit);
+            const total = page.rows.len;
+            page.rows = page.rows[self.offset..end];
+            self.offset = end;
+            page.after = if (end < total) "Other" else null;
+            return page;
+        }
+        fn close(_: *anyopaque) void {}
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "email", .path = "email", .type = .string, .element_type = .text }} };
+    var key: catalog.IndexDefinition.Key = .{ .column = "", .expression = try std.json.parseFromSliceLeaky(Json, owned,
+        \\{"op":"lower_ascii","args":[{"op":"column","column":"email"}]}
+    , .{}), .result_type = .string, .collation = null, .direction = .asc, .nulls = .default };
+    key.identity = try key.bindIdentity(owned, try table.expressionSchemaLeaky(owned));
+    const keys = [_]catalog.IndexDefinition.Key{key};
+    table.index_definitions = &.{.{ .name = "email_lower", .keys = &keys, .include_columns = &.{}, .where = &.{} }};
+    var compiled = try compiler.compile(a, "SELECT email FROM items WHERE lower(email)=$1 LIMIT 1", .{});
+    defer compiled.deinit();
+    for ([_]bool{ false, true }) |enabled| {
+        var fixture: Fixture = .{ .table = table, .hinted = enabled };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .supports_expression_access_hints = enabled, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .open_scan = Fixture.open, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+        var result = try execute(a, backend, &compiled, &.{.{ .string = "owner" }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("Owner", result.output.rows[0][0].string);
+        const stream = (try @import("read_stream.zig").Stream.open(a, backend, &compiled, &.{.{ .string = "owner" }}, .{})).?;
+        defer stream.close();
+        var matched_page = try stream.next(32);
+        defer matched_page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), matched_page.output.rows.len);
+        try std.testing.expectEqualStrings("Owner", matched_page.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 3), fixture.scans);
     }
 }
 

@@ -55,11 +55,7 @@ pub const Index = struct {
 /// must not accidentally treat a partial or expression index as total.
 pub const IndexDefinition = struct {
     const native = @import("../storage/relational_index.zig");
-    pub const KeyIdentity = struct {
-        fingerprint: [32]u8,
-        kind: @import("../storage/schema.zig").RelationalColumnType,
-        builtin: ?@import("array_value.zig").ElementType,
-    };
+    pub const KeyIdentity = native.ExpressionKeyIdentity;
     pub const Key = struct {
         column: []const u8,
         expression: ?std.json.Value,
@@ -407,6 +403,7 @@ pub const Scan = struct {
     /// closed; the coordinated owner read returns one exact-span proof.
     index_equality: ?IndexEquality = null,
     conditions: []const Condition = &.{},
+    expression_equalities: []const @import("../storage/relational_index.zig").ExpressionEqualityHint = &.{},
     after: ?[]const u8 = null,
     /// External scan upper bound, validated against the opened snapshot.
     before: ?[]const u8 = null,
@@ -775,6 +772,9 @@ pub const Backend = struct {
     /// Carry an explicit context so lowering can change Backend.ptr safely.
     scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     supports_search_relations: bool = false,
+    /// Advisory expression probes with mandatory SQL residual evaluation.
+    /// This is an execution optimization, never a readiness/capability proof.
+    supports_expression_access_hints: bool = false,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,

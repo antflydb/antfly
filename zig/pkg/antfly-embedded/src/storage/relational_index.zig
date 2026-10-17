@@ -20,6 +20,22 @@
 
 const std = @import("std");
 
+/// Typed comparison shape, independent of physical index generation or
+/// readiness. Prepared query keys and immutable index expressions share it.
+pub const ExpressionKeyIdentity = struct {
+    fingerprint: [32]u8,
+    kind: @import("schema.zig").RelationalColumnType,
+    builtin: ?@import("../common/sql_builtin_type.zig").Type,
+};
+
+/// Transportable access hint. The caller retains its logical residual on both
+/// the READY index and primary fallback paths; this is never a filter/proof.
+pub const ExpressionEqualityHint = struct {
+    identity: ExpressionKeyIdentity,
+    fold_ascii: bool = false,
+    value: std.json.Value,
+};
+
 /// Canonical declaration identity, streamed without an intermediate JSON copy.
 /// This is separate from typed comparison identity and from a physical tuple ID.
 pub fn definitionDigest(definition: RelationalIndexDefinition) ![32]u8 {

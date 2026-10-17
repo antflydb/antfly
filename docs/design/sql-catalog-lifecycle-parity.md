@@ -10110,3 +10110,74 @@ Final checkpoint evidence:
 - The two PostgreSQL oracle tests (including ten original DDL subcases) pass
   against 180006. Formatting, licensing, the 2,062-source Apache boundary and
   original-inventory audits pass. No original cases are newly qualified.
+
+### Shared bound expression equality access
+
+Materialized and streaming single-table SQL reads now share preparation of
+expression-equality hints over their already-authorized scalar programs. Native
+key identities are matched without rebinding declarations or source SQL. Only
+row-independent immutable probe operands are evaluated; unrelated predicate
+errors, stable/volatile calls, disjunctions and mismatched typed domains do not
+become eager query work. Unknown text literals acquire their comparison domain
+losslessly, while explicitly different domains are not narrowed to manufacture
+an index point. Exact integral-to-NUMERIC conversion remains lossless.
+
+Probe preparation owns a bounded temporary region per needed key, polls the
+statement cancellation owner and copies only admitted typed operands into the
+request region. Optional preparation-limit exhaustion falls back to the normal
+access path; actual backing allocation failures and cancellation propagate.
+Exhaustive allocation cuts cover the new preparation owner. No-index tables
+return before allocating this preparation state.
+Temporary caps also reserve enclosing request headroom. A 256-byte parent-budget
+regression proves optional preparation can decline the hint without marking the
+parent exhausted or retaining allocations. Fault enumeration forces growing
+arenas through allocate/copy paths rather than depending on the debug heap's
+address-dependent in-place resize availability.
+
+The server and embedded adapters transport these advisory hints to the existing
+native snapshot-local planner. Expression keys can extend a mixed direct/key
+equality prefix, preserving independent direction and NULL ordering. Existing
+READY checks, schema/head fences, partial membership implication, bounded
+candidate/cardinality work and covering checks still select the actual access
+path. SQL retains the complete predicate and does not push LIMIT through an
+incomplete residual. An unavailable expression key can still leave a useful
+leading-column prefix; it must neither force a needless primary scan nor narrow
+that prefix using an unproven key.
+
+Read-only access does not enable staged-write overlays accidentally: embedded
+active transactions keep their existing guarded path, and server staged writes
+disable this hint preparation. Existing coordinated primary-range proofs remain
+conservative for automatic access; this work does not claim precise indexed
+phantom protection or a new capability/readiness proof.
+
+Remaining activation includes relation/join lineage-aware preparation before
+snapshot capture, additional range/temporal probe domains, one EXPLAIN/execution
+access plan, bounded embedded immutable-layout reuse, and genuine Raft-backed
+index publication authority. Per-constraint NOT VALID/VALIDATE intent is also
+unfinished. Original dispositions remain 531 implemented / 810 unresolved.
+
+Checkpoint validation (Debug):
+
+- Full SQL: 880 core plus 234 server tests pass, four existing opt-in skips,
+  zero failures/leaks, 21/21 steps in
+  `/private/tmp/antfly-sql-expression-access-headroom-final-debug.log`.
+- Native LSM/index lifecycle: 271 contracts plus the native Raft snapshot
+  companion pass without skips/failures/leaks, 51/51 steps in
+  `/private/tmp/antfly-sql-native-expression-access-system-final-debug.log`.
+  This includes the new mixed expression-prefix snapshot test; the existing
+  cost benchmark still examines seven planner records and one selected record
+  with zero primary probes over its 96-row fixture. This is work-count evidence,
+  not a new expression-index latency claim.
+- Real Lite/C: the exact NUMERIC/index declaration contract now also runs
+  expression/partial queries before readiness, after readiness and after cold
+  restart; it and companion gates pass, 58/58 steps in
+  `/private/tmp/antfly-sql-capi-expression-access-final-debug.log`.
+- Mounted immutable-layout and definite unsupported-owner admission: 14 tests
+  pass without skips/failures/leaks, 75/75 steps in
+  `/private/tmp/antfly-sql-expression-access-mounted-final-debug.log`.
+  The initial sandbox-denied loopback bind was not counted as qualification;
+  this final run used a real local listener.
+- The focused preparation/residual/headroom/allocation-fault contracts pass in
+  `/private/tmp/antfly-sql-expression-access-headroom-debug.log`. Formatting,
+  licensing, the 2,063-source Apache boundary and immutable inventory checks
+  pass. No original cases are newly qualified by these component contracts.
