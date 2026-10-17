@@ -22483,10 +22483,35 @@ pub const IndexManager = struct {
         }
     }
 
-    pub fn alignRowDerivedArtifactCatalog(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !void {
-        self.catalog_mutex.lockExclusive();
-        defer self.catalog_mutex.unlockExclusive();
+    /// The caller holds catalog_mutex from before opening txn through commit
+    /// and publication of the returned reader/envelope stamp.
+    pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
         if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
+        const desired_format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers);
+        const current_reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
+        const current_resolvers = txn.get(resolver_catalog_key) catch |err| switch (err) {
+            error.NotFound => "[]",
+            else => return err,
+        };
+        const current_format = try resolver_catalog.catalogReaderVersion(self.alloc, current_resolvers);
+        if (desired_format < current_format or (current_reader >= resolver_catalog.graph_expiration_namespace_reader_version and desired_format < current_reader))
+            return error.ArtifactCatalogDrift;
+        const reservation = txn.get(replacement_reader_base_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        // Row-only reconciliation does not own private graph reservations.
+        if (reservation != null) return error.ArtifactCatalogDrift;
+        if (expected.resolvers.len == 0) {
+            if (self.retired_resolvers.items.len != 0) return error.ArtifactCatalogDrift;
+        } else {
+            // Retired definitions remain part of the durable identity. This
+            // path may align their envelope, never replace unloaded contracts.
+            const loaded = try resolver_catalog.serializeCatalogWithMinimumVersion(self.alloc, self.retired_resolvers.items, desired_format);
+            defer self.alloc.free(loaded);
+            if (!std.mem.eql(u8, expected.resolvers, loaded)) return error.ArtifactCatalogDrift;
+        }
+        const reader_version = @max(current_reader, desired_format);
         const desired_producers = if (expected.enrichments.len == 0) try self.alloc.alloc(enrichment_catalog.EnrichmentConfig, 0) else try enrichment_catalog.deserializeCatalog(self.alloc, expected.enrichments);
         defer {
             for (desired_producers) |*producer| producer.deinit(self.alloc);
@@ -22515,6 +22540,7 @@ pub const IndexManager = struct {
             }
             if (!matched) return error.ArtifactCatalogDrift;
         }
+        if (reader_version != current_reader) try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(reader_version));
         inline for (.{ &self.text_indexes, &self.dense_indexes, &self.sparse_indexes }, .{ types.IndexKind.full_text, types.IndexKind.dense_vector, types.IndexKind.sparse_vector }) |entries, kind| {
             var i: usize = 0;
             for (configs) |config| {
@@ -22542,6 +22568,7 @@ pub const IndexManager = struct {
             };
         }
         try @import("../artifact_inventory.zig").refresh(txn);
+        return .{ .reader = reader_version, .format = desired_format };
     }
 
     pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
@@ -23090,7 +23117,8 @@ pub const IndexManager = struct {
 
     const CatalogReaderStamp = struct { reader: u32, format: u32 };
 
-    fn publishCatalogReaderStamp(self: *IndexManager, stamp: CatalogReaderStamp) void {
+    /// Publish only after durability, while retaining the catalog publication fence.
+    pub fn publishCatalogReaderStamp(self: *IndexManager, stamp: CatalogReaderStamp) void {
         self.resolver_catalog_format_version.store(stamp.format, .release);
         self.minimum_reader_version.store(stamp.reader, .release);
     }
