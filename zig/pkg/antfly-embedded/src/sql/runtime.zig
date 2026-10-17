@@ -1290,10 +1290,10 @@ pub const Context = struct {
             var program = if (i < self.binding.scalars.assignments.len) self.binding.scalars.assignments[i] else null;
             var typed: Json = .null;
             var sql_null = true;
-            if (program != null and item.expression == null and (item.value == .parameter or (column.type == .array and item.value == .string))) {
-                // A direct parameter assignment borrows the invocation frame,
-                // not row scratch. Retain it once, as on the literal path;
-                // do not clone a wide prepared payload for every target row.
+            if (program != null and item.expression == null) {
+                // Prepared literals and direct parameters are statement
+                // constants. Retain their typed value once, not per row;
+                // exact NUMERIC literals must never use coarse JSON coercion.
                 const value_ = try self.evaluate(self.arena, program.?, &.{});
                 typed = try self.storageDatumTyped(value_, column, program.?.output_type.element_type);
                 sql_null = value_.sql_null;

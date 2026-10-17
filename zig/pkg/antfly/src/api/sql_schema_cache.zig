@@ -241,10 +241,7 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
         return;
     }
     var indexes: std.ArrayList(catalog.Index) = .empty;
-    const declared = (try parsed.relationalIndexDefinitions(alloc)) orelse &.{};
-    const definitions = try owned.alloc(catalog.IndexDefinition, declared.len);
-    for (declared, definitions) |definition, *out| out.* = try catalog.IndexDefinition.fromNativeLeaky(owned, definition);
-    layout.index_definitions = definitions;
+    layout.index_definitions = try catalog.IndexDefinition.deriveLeaky(owned, alloc, parsed, native);
     if (parsed.relational_indexes) |declarations| for (declarations.value) |index| {
         // SQL DDL emits an empty predicate list for total indexes. Presence
         // alone is not partiality; only a nonempty predicate needs implication.
@@ -372,7 +369,7 @@ test "SQL schema cache owns complete index shapes across eviction fallback and a
         \\{"version":7,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"mixed","keys":[{"column":"tenant","direction":"desc","nulls":"first"},{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"label"}]},"result_type":"string","collation":"binary","direction":"asc","nulls":"last"}],"include_columns":["label"],"where":[{"column":"tenant","op":"gte","value":9007199254740993},{"column":"label","op":"is_not_null"}]},{"name":"empty","keys":[{"column":"label"}],"where":[{"constant":false}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"},"tenant":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     const Faults = struct {
-        fn check(table: catalog.Table) !void {
+        fn check(a: std.mem.Allocator, table: catalog.Table) !void {
             try std.testing.expectEqual(@as(u32, 7), table.schema_version);
             // Neither declaration is a direct-total probe, even when all
             // physical keys happen to be direct columns (constant FALSE).
@@ -393,6 +390,7 @@ test "SQL schema cache owns complete index shapes across eviction fallback and a
             const tree = expression.expression.?;
             try std.testing.expectEqualStrings("lower_ascii", tree.object.get("op").?.string);
             try std.testing.expectEqualStrings("label", tree.object.get("args").?.array.items[0].object.get("column").?.string);
+            try std.testing.expectEqualDeep(expression.identity.?, try expression.bindIdentity(a, try table.expressionSchemaLeaky(a)));
             try std.testing.expectEqualStrings("label", mixed.include_columns[0]);
             try std.testing.expectEqualStrings("tenant", mixed.where[0].column);
             try std.testing.expectEqual(.gte, mixed.where[0].op);
@@ -415,9 +413,9 @@ test "SQL schema cache owns complete index shapes across eviction fallback and a
                 cache.destroy(entry);
                 slot.* = .{};
             };
-            try check(first);
-            try check(hit);
-            try check(fallback);
+            try check(alloc, first);
+            try check(alloc, hit);
+            try check(alloc, fallback);
             try std.testing.expectEqual(@as(u64, 2), hit.id);
             try std.testing.expectEqualStrings("other_rows", hit.physical_name);
         }

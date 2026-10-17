@@ -5476,7 +5476,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         database: ?[]const u8 = null,
         namespace: ?[]const u8 = null,
     };
-    var parsed = std.json.parseFromSlice(Request, temporary, request_json, .{ .allocate = .alloc_always }) catch |err| {
+    var parsed = std.json.parseFromSlice(Request, temporary, request_json, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| {
         if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return error.InvalidSqlParameters;
     };
@@ -8143,6 +8143,97 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
     spawned = 0;
     defer for (workers[0..joined]) |worker| alloc.free(worker.path);
     for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}
+
+test "capi SQL owns composite expression partial declarations and exact NUMERIC domains across restart" {
+    const Test = struct {
+        fn execute(a: Allocator, id: ?*anyopaque, statement: []const u8) !std.json.Value {
+            return executeParameters(a, id, statement, &.{});
+        }
+        fn executeParameters(a: Allocator, id: ?*anyopaque, statement: []const u8, parameters: []const std.json.Value) !std.json.Value {
+            const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .parameters = parameters }, .{});
+            var output: capi.Buffer = .{};
+            defer antfly_buffer_free(&output);
+            const code = antfly_db_sql_json(id, .fromSlice(request), &output);
+            if (code != .ok) std.debug.print("SQL fixture failed: {s}: {s}\n", .{ statement, if (output.ptr) |bytes| bytes[0..output.len] else "no diagnostic" });
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+            return std.json.parseFromSliceLeaky(std.json.Value, a, output.ptr.?[0..output.len], .{ .allocate = .alloc_always });
+        }
+        fn reject(a: Allocator, id: ?*anyopaque, statement: []const u8, expected_code: []const u8) !void {
+            const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement }, .{});
+            var output: capi.Buffer = .{};
+            defer antfly_buffer_free(&output);
+            try std.testing.expect(antfly_db_sql_json(id, .fromSlice(request), &output) != .ok);
+            const diagnostic = try std.json.parseFromSliceLeaky(std.json.Value, a, output.ptr.?[0..output.len], .{ .allocate = .alloc_always });
+            try std.testing.expectEqualStrings(expected_code, diagnostic.object.get("error").?.object.get("code").?.string);
+        }
+        fn checkRow(result: std.json.Value, expected: []const u8) !void {
+            const rows = result.object.get("rows").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), rows.len);
+            try std.testing.expectEqualStrings(expected, rows[0].array.items[0].string);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try TestDirectory.init("sql-index-numeric-binding");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    const options: LiteResolvedOpenOptions = .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 };
+    const first = try openLiteHandleAlloc(path, options, true);
+    const first_id = try publishHandle(first);
+    defer antfly_db_close(first_id);
+    _ = try Test.execute(a, first_id, "CREATE TABLE invoices (amount NUMERIC(20,4), label TEXT, tenant BIGINT)");
+    _ = try Test.execute(a, first_id, "INSERT INTO invoices (_id,amount,label,tenant) VALUES ('one',9007199254740993.1250,'READY',7)");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT amount FROM invoices"), "9007199254740993.1250");
+    _ = try Test.execute(a, first_id, "CREATE INDEX tenant_idx ON invoices(tenant)");
+    _ = try Test.execute(a, first_id, "CREATE INDEX mixed_idx ON invoices(tenant DESC NULLS FIRST,lower(label)) INCLUDE(amount) WHERE tenant>0");
+    const table = blk: {
+        const guard = enterHandle(first_id, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        var adapter = @import("sql.zig").Adapter(antfly){ .handle = guard.handle, .db = &guard.handle.db, .table_name = "default" };
+        const backend = adapter.backend();
+        break :blk try backend.vtable.resolve(backend.ptr, a, .{ .table = "invoices" }, .read);
+    };
+    const amount = try table.column("amount");
+    try std.testing.expectEqual(.numeric, amount.element_type.?);
+    try std.testing.expectEqual(@as(u16, 20), amount.numeric_modifier.?.precision);
+    try std.testing.expectEqual(@as(i16, 4), amount.numeric_modifier.?.scale);
+    try std.testing.expectEqual(@as(usize, 2), table.index_definitions.len);
+    const mixed = table.index_definitions[1];
+    try std.testing.expectEqualStrings("mixed_idx", mixed.name);
+    try std.testing.expectEqualStrings("tenant", mixed.keys[0].column);
+    try std.testing.expectEqual(.desc, mixed.keys[0].direction);
+    try std.testing.expectEqual(.first, mixed.keys[0].nulls);
+    try std.testing.expectEqualStrings("lower_ascii", mixed.keys[1].expression.?.object.get("op").?.string);
+    try std.testing.expectEqualDeep(mixed.keys[1].identity.?, try mixed.keys[1].bindIdentity(a, try table.expressionSchemaLeaky(a)));
+    try std.testing.expectEqualStrings("amount", mixed.include_columns[0]);
+    try std.testing.expectEqualStrings("tenant", mixed.where[0].column);
+    try std.testing.expectEqual(.gt, mixed.where[0].op);
+    try Test.checkRow(try Test.execute(a, first_id, "UPDATE invoices SET amount=amount+0.0001 RETURNING amount"), "9007199254740993.1251");
+    antfly_db_close(first_id);
+    // Retained bindings must not borrow the retired database/schema parser.
+    try std.testing.expectEqualStrings("label", mixed.keys[1].expression.?.object.get("args").?.array.items[0].object.get("column").?.string);
+    const reopened = try openLiteHandleAlloc(path, options, false);
+    const reopened_id = try publishHandle(reopened);
+    defer antfly_db_close(reopened_id);
+    try Test.checkRow(try Test.execute(a, reopened_id, "SELECT amount FROM invoices"), "9007199254740993.1251");
+    try Test.checkRow(try Test.execute(a, reopened_id, "UPDATE invoices SET amount=amount+0.0001 RETURNING amount"), "9007199254740993.1252");
+    try Test.reject(a, reopened_id, "UPDATE invoices SET amount=abs('-9223372036854775808'::bigint)", "22003");
+    try Test.checkRow(try Test.execute(a, reopened_id, "SELECT amount FROM invoices"), "9007199254740993.1252");
+    try Test.reject(a, reopened_id, "UPDATE invoices SET amount='1.2300'::text", "42804");
+    try Test.checkRow(try Test.execute(a, reopened_id, "SELECT amount FROM invoices"), "9007199254740993.1252");
+    // JSON numeric tokens must reach the contextual NUMERIC frame directly,
+    // rather than acquiring binary64 rounding before parameter preparation.
+    try Test.checkRow(try Test.executeParameters(a, reopened_id, "UPDATE invoices SET amount=$1 RETURNING amount", &.{.{ .number_string = "9007199254740993.1253" }}), "9007199254740993.1253");
+    antfly_db_close(reopened_id);
+    const final_owner = try openLiteHandleAlloc(path, options, false);
+    const final_id = try publishHandle(final_owner);
+    defer antfly_db_close(final_id);
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT amount FROM invoices"), "9007199254740993.1253");
 }
 
 test "capi SQL connections share storage while session IDs and close remain independent" {

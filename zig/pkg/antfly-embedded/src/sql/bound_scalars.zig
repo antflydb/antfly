@@ -365,6 +365,12 @@ fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.State
     return bindDescriptorsWithInvocation(alloc, table, statement, parameters, settings, fallbacks, typed_parameters, null);
 }
 
+fn needsAssignmentProgram(column: catalog.Column, literal: ast.Value, expression: ?*const ast.Scalar, typed_parameters: bool) bool {
+    return expression != null or (typed_parameters and literal == .parameter) or
+        (column.type == .array and literal == .string) or
+        (column.type == .number and column.element_type == .numeric);
+}
+
 fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool, invocation: ?*@import("parameter_binding.zig").Invocation) !Bound {
     if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings, fallbacks, typed_parameters, invocation);
     const needed = switch (statement) {
@@ -378,7 +384,10 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             if (needsResidual(table, update.predicate)) break :blk true;
             for (update.assignments) |assignment| {
                 if (assignment.expression != null) break :blk true;
-                if (table) |definition| if ((try definition.column(assignment.field)).type == .array and (assignment.value == .string or assignment.value == .parameter)) break :blk true;
+                if (table) |definition| {
+                    const column = try definition.column(assignment.field);
+                    if (needsAssignmentProgram(column, assignment.value, assignment.expression, false) or (column.type == .array and assignment.value == .parameter)) break :blk true;
+                }
             }
             break :blk false;
         },
@@ -457,7 +466,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             },
             .update => |update| for (update.assignments) |assignment| {
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
-                if (assignment.expression == null and assignment.value != .parameter and !(column.type == .array and assignment.value == .string)) continue;
+                if (!needsAssignmentProgram(column, assignment.value, assignment.expression, true)) continue;
                 const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
                 changed = try builder.inferAssignment(expression, column) or changed;
             },
@@ -494,7 +503,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             @memset(programs, null);
             for (update.assignments, programs) |assignment, *program| {
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
-                if (assignment.expression == null and !(typed_parameters and assignment.value == .parameter) and !(column.type == .array and assignment.value == .string)) continue;
+                if (!needsAssignmentProgram(column, assignment.value, assignment.expression, typed_parameters)) continue;
                 const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
                 program.* = try builder.assignmentProgram(expression, column);
                 const kind = program.*.?.output_type.kind;
@@ -539,7 +548,7 @@ fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, par
         @memset(programs, null);
         for (expressions, literals, statement.columns, programs) |expression, literal, name, *program| {
             const column = try table.column(name);
-            if (expression == null and !(typed_parameters and literal == .parameter) and !(column.type == .array and literal == .string)) continue;
+            if (!needsAssignmentProgram(column, literal, expression, typed_parameters)) continue;
             const node = try builder.assignmentNode(expression, literal, column);
             program.* = try builder.assignmentProgram(node, column);
             const kind = program.*.?.output_type.kind;
@@ -572,6 +581,69 @@ fn arrayAssignmentBindingScenario(backing: Allocator) !void {
         try std.testing.expect(literal.array.?.elements[1].sql_null);
         const parameter = try prepared.insert_rows[0][2].?.evaluate(none.allocator(), &.{}, .{});
         try std.testing.expect(parameter.array == prepared.frame.values[0].array);
+    }
+}
+
+test "SQL exact NUMERIC assignments prepare plain literals once without floating conversion" {
+    const Scenario = struct {
+        fn run(backing: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{
+                .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 20, .scale = 4 } },
+            } };
+            for ([_]struct { sql: []const u8, expected: ?[]const u8 }{
+                .{ .sql = "INSERT INTO items (_id,n) VALUES ('x',9007199254740993.1250)", .expected = "9007199254740993.1250" },
+                .{ .sql = "INSERT INTO items (_id,n) VALUES ('x','1.2300')", .expected = "1.2300" },
+                .{ .sql = "INSERT INTO items (_id,n) VALUES ('x',9007199254740993)", .expected = "9007199254740993" },
+                .{ .sql = "UPDATE items SET n=9007199254740993.1250", .expected = "9007199254740993.1250" },
+                .{ .sql = "UPDATE items SET n='1.2300'", .expected = "1.2300" },
+                .{ .sql = "UPDATE items SET n=NULL", .expected = null },
+            }) |case| {
+                var compiled = try @import("compiler.zig").compile(backing, case.sql, .{});
+                defer compiled.deinit();
+                const bound = try bind(a, table, compiled.statement, &.{});
+                const program = if (compiled.statement == .insert) &bound.insert_rows[0][1].? else &bound.assignments[0].?;
+                var none = std.heap.FixedBufferAllocator.init(&.{});
+                const value = try program.evaluate(none.allocator(), &.{}, &.{}, .{});
+                if (case.expected) |expected| {
+                    try std.testing.expect(value.numeric != null);
+                    var work: @import("numeric_value.zig").Context = .{ .alloc = a };
+                    try std.testing.expectEqualStrings(expected, try @import("numeric_value.zig").format(&work, value.numeric.?.*));
+                    for (0..1000) |_| try std.testing.expect((try program.evaluate(none.allocator(), &.{}, &.{}, .{})).numeric == value.numeric);
+                } else try std.testing.expect(value.sql_null);
+            }
+            var typed_text = try @import("compiler.zig").compile(backing, "UPDATE items SET n='1.2300'::text", .{});
+            defer typed_text.deinit();
+            if (bind(a, table, typed_text.statement, &.{})) |_| {
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expect(err == error.SqlAssignmentTypeMismatch);
+            }
+        }
+    };
+    try Scenario.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "SQL NUMERIC target context preserves integral expression errors before assignment" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{
+        .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric },
+    } };
+    for ([_][]const u8{
+        "INSERT INTO items (_id,n) VALUES ('x',abs('-9223372036854775808'::bigint))",
+        "UPDATE items SET n=abs('-9223372036854775808'::bigint)",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        const bound = try bind(arena.allocator(), table, compiled.statement, &.{});
+        const program = if (compiled.statement == .insert) &bound.insert_rows[0][1].? else &bound.assignments[0].?;
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
     }
 }
 
@@ -618,7 +690,7 @@ const Builder = struct {
         // Actual input kinds resolve polymorphic holes, not known SQL types.
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
-        const result = if (self.typed_parameters or (self.parameters.len == 0 and expected != null and expected.?.kind == .array)) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{ .invocation = self.invocation, .assignment = assignment }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment }, self.settings);
+        const result = if (self.typedExpected(expected)) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{ .invocation = self.invocation, .assignment = assignment }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment }, self.settings);
         if (result.parameter_types.len > self.parameters.len) return error.InvalidSqlParameters;
         for (result.parameter_descriptors, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
             if (inferred.kind) |kind| {
@@ -645,8 +717,13 @@ const Builder = struct {
         return self.inferType(expression, if (expected) |kind| .{ .kind = kind } else null, false);
     }
 
+    fn typedExpected(self: *const Builder, expected: ?scalar.Type) bool {
+        return self.typed_parameters or (self.parameters.len == 0 and expected != null and
+            (expected.?.kind == .array or (expected.?.kind == .number and expected.?.element_type == .numeric)));
+    }
+
     fn inferType(self: *Builder, expression: *const ast.Scalar, expected: ?scalar.Type, assignment: bool) !bool {
-        if (self.typed_parameters or (self.parameters.len == 0 and expected != null and expected.?.kind == .array)) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, expected, .{ .assignment = assignment });
+        if (self.typedExpected(expected)) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, expected, .{ .assignment = assignment });
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
         const changed = try scalar.inferParameters(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment });

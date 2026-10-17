@@ -17,6 +17,7 @@
 
 import json
 import unittest
+from decimal import Decimal
 import psycopg
 from generate_sql_postgres_reference import FIXTURES, postgres
 
@@ -42,6 +43,77 @@ def row(number, email, status):
 
 
 class ExpressionIndexTest(unittest.TestCase):
+    def test_exact_numeric_literals_with_composite_expression_indexes(self):
+        with postgres() as db:
+            print(
+                "PostgreSQL NUMERIC oracle:",
+                db.execute("SHOW server_version_num").fetchone()[0],
+            )
+            db.execute(
+                "CREATE TABLE invoices (_id TEXT PRIMARY KEY, amount NUMERIC(20,4), label TEXT, tenant BIGINT)"
+            )
+            db.execute(
+                "INSERT INTO invoices (_id,amount,label,tenant) VALUES ('one',9007199254740993.1250,'READY',7)"
+            )
+
+            def verify(expected):
+                self.assertEqual(
+                    [(expected,)],
+                    db.execute("SELECT amount::text FROM invoices").fetchall(),
+                )
+
+            verify("9007199254740993.1250")
+            self.assertEqual(
+                (None,),
+                db.execute(
+                    "SELECT 1.5 < ALL (SELECT 2 UNION ALL SELECT NULL)"
+                ).fetchone(),
+            )
+            db.execute("CREATE INDEX tenant_idx ON invoices(tenant)")
+            db.execute(
+                "CREATE INDEX mixed_idx ON invoices(tenant DESC NULLS FIRST,lower(label)) INCLUDE(amount) WHERE tenant>0"
+            )
+            for expected in ("9007199254740993.1251", "9007199254740993.1252"):
+                self.assertEqual(
+                    [(expected,)],
+                    db.execute(
+                        "UPDATE invoices SET amount=amount+0.0001 RETURNING amount::text"
+                    ).fetchall(),
+                )
+                verify(expected)
+            self.assertEqual(
+                [("9007199254740993.1253",)],
+                db.execute(
+                    "UPDATE invoices SET amount=%s RETURNING amount::text",
+                    (Decimal("9007199254740993.1253"),),
+                ).fetchall(),
+            )
+            verify("9007199254740993.1253")
+            for literal, expected in (
+                ("'1.2300'", "1.2300"),
+                ("9007199254740993", "9007199254740993.0000"),
+                ("NULL", None),
+            ):
+                self.assertEqual(
+                    [(expected,)],
+                    db.execute(
+                        f"UPDATE invoices SET amount={literal} RETURNING amount::text"
+                    ).fetchall(),
+                )
+                verify(expected)
+            for statement, code in (
+                ("UPDATE invoices SET amount='1.2300'::text", "42804"),
+                ("UPDATE invoices SET amount=99999999999999999", "22003"),
+                (
+                    "UPDATE invoices SET amount=abs('-9223372036854775808'::bigint)",
+                    "22003",
+                ),
+            ):
+                with self.assertRaises(psycopg.Error) as failure:
+                    db.execute(statement)
+                self.assertEqual(code, failure.exception.sqlstate)
+                verify(None)
+
     def test_original_expression_index_lifecycles(self):
         originals = {
             entry["id"]: entry

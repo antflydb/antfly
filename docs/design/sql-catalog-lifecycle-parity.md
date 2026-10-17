@@ -10027,3 +10027,86 @@ fresh generation/owner-coverage authority, coordinated snapshot/range proofs,
 and one EXPLAIN/execution plan. Raft-backed index publication and per-constraint
 NOT VALID/VALIDATE intent remain incomplete. No additional original cases are
 qualified: 531 implemented / 810 unresolved.
+
+### Typed native-key matching and lossless NUMERIC ingress
+
+Both server and Lite/C resolvers now derive complete index declarations through
+the same schema vocabulary. Each declared key is prepared with the native
+expression compiler's semantic fingerprint, result kind and precise builtin
+identity. Server cache hits copy these fixed-width identities along with owned
+trees; they do not rebind declarations. Query preparation can lower a selected
+already-bound instruction into the same native key language once and reuse its
+identity for candidate comparisons. Equality matching preserves NUMERIC
+modifiers, implicit casts and collation domains: binary/C/POSIX agree, while
+case-insensitive versus binary comparisons do not silently match. Unprepared
+keys fail closed. Direction and NULL placement remain separate tuple properties.
+
+The compiler-only typed table view borrows names from the authorized pinned
+table and owns its column vector in the preparation region. It is not a storage
+schema, native capability grant, readiness record, partial-membership proof or
+snapshot/range proof. Qualification/ordinal authority belongs to the bound scan;
+the matcher does not strip arbitrary aliases. Cached declarations are checked
+against this typed view after eviction and on uncached fallback, including
+exhaustive allocation cuts. Native key identity preparation also unwinds every
+allocation failure without retaining the borrowed source table or VM arena.
+
+The real C ABI regression exposed two existing ingress gaps: its resolver
+rejected native NUMERIC columns and dropped NUMERIC modifiers, and plain numeric
+assignments used coarse JSON coercion before typed storage admission. The
+resolver now preserves those domains. Plain NUMERIC literals, SQL NULL and
+unknown string inputs enter the shared scalar preparation pipeline. Constant
+UPDATE values are evaluated/owned once per statement, not per target row.
+The prepared literal test repeatedly evaluates cached exact values with a
+zero-byte scratch allocator; this is a component allocation result, not an
+end-to-end query latency claim.
+
+An assignment-context regression then demonstrated why outer expectations must
+not substitute an operator overload: ABS(bigint_min) must overflow before a
+NUMERIC target receives its result. Integral expressions retain their original
+kernel and use an explicit conversion instruction at the contextual boundary.
+This also preserves typed quantified/set producers and SQL NULL propagation;
+the unchanged nullable quantified-query regression passes alongside the
+assignment overflow contract. Explicitly typed text remains an assignment error.
+
+The C ABI request parser now preserves JSON numeric tokens until contextual
+parameter preparation rather than first rounding decimal input through f64.
+The real database test covers values above binary64 precision, declared scale,
+composite expression/partial indexes with included columns, binding ownership
+after database retirement, exact UPDATE postimages, rejected-assignment
+postimages, and an unquoted high-precision JSON parameter across another cold
+restart. Temporary diagnostic tracing has been removed.
+
+PostgreSQL 18.6 (180006) independently verifies these literal, parameter,
+overflow, assignment and quantified expectations as well as the ten original
+expression-index lifecycle subcases. This oracle is not native owner-recovery
+or indexed-read qualification. Validation logs are retained under
+`/private/tmp/antfly-sql-index-numeric-parameter-postgres-final.log` and the
+`antfly-sql-numeric-explicit-boundary-*` / `antfly-sql-native-index-*` /
+`antfly-sql-embedded-index-*` Debug logs; final gate totals are recorded below.
+
+Indexed-read activation is still unfinished. It needs shared access-plan
+selection and partial implication, invocation-owned probes, fresh generation and
+complete-owner authority, coordinated snapshot/range proofs and one execution/
+EXPLAIN plan. Lite also needs bounded immutable-layout reuse per database owner
+instead of deriving the view for each resolve. Raft-backed index publication and
+per-constraint NOT VALID/VALIDATE intent remain incomplete. No original
+dispositions change: 531 implemented / 810 unresolved.
+
+Final checkpoint evidence:
+
+- Full SQL Debug: 878 core plus 234 server tests pass, four existing opt-in
+  skips, zero failures/leaks, 21/21 steps in
+  `/private/tmp/antfly-sql-native-index-numeric-boundary-full-debug.log`.
+- Real Lite/C SQL Debug: all four SQL contracts, including exact JSON numeric
+  parameters and cold restart, pass without skips/failures/leaks; the companion
+  C ABI gates also pass, 58/58 steps in
+  `/private/tmp/antfly-sql-embedded-index-numeric-token-final-debug.log`.
+- Mounted cache/owner admission Debug: all 14 contracts pass without skips,
+  failures or leaks, 75/75 steps in
+  `/private/tmp/antfly-sql-native-index-key-cache-boundary-mounted-debug.log`.
+- Focused literal/context/array/key tests and the unchanged nullable quantified
+  regression all pass in
+  `/private/tmp/antfly-sql-numeric-explicit-boundary-focused-debug.log`.
+- The two PostgreSQL oracle tests (including ten original DDL subcases) pass
+  against 180006. Formatting, licensing, the 2,062-source Apache boundary and
+  original-inventory audits pass. No original cases are newly qualified.

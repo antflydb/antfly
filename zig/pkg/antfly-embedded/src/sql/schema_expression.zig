@@ -181,6 +181,32 @@ pub fn lowerIndexInstruction(alloc: std.mem.Allocator, program: *const scalar.Pr
     return lowerProgramPolicy(alloc, &selected, columns, .index_key, limits);
 }
 
+/// Prepare each needed bound subtree once, then compare the fixed-width
+/// identity against every candidate. No source SQL or declaration is rebound.
+/// Canonical column authority belongs to the caller's already-bound scan.
+pub fn indexInstructionIdentity(alloc: std.mem.Allocator, program: *const scalar.Program, root: u32, columns: []const scalar.Column, table: @import("../storage/schema.zig").TableSchema, limits: @import("immutable_plan.zig").Limits) !@import("catalog.zig").IndexDefinition.KeyIdentity {
+    const lowered = try lowerIndexInstruction(alloc, program, root, columns, limits);
+    const key: @import("catalog.zig").IndexDefinition.Key = .{
+        .column = "",
+        .expression = lowered.expression,
+        .result_type = switch (lowered.type) {
+            .string, .uuid => .string,
+            .integer => .integer,
+            .number => if (lowered.element_type == .numeric) .numeric else .number,
+            .array => .sql_array,
+            .boolean => .boolean,
+            .datetime => .datetime,
+            .json => .json,
+        },
+        .collation = null,
+        .direction = .asc,
+        .nulls = .default,
+    };
+    const result = try key.bindIdentity(alloc, table);
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+    return result;
+}
+
 fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, columns: []const scalar.Column, immutable: ?ImmutableContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
     var plan: ?@import("immutable_plan.zig") = if (immutable != null) try .initWithLimits(alloc, program, limits) else null;
     defer if (plan) |*value| value.deinit();
@@ -448,6 +474,75 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
         };
     }
     return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch, .element_type = program.output_type.element_type };
+}
+
+test "SQL index key identities share native domains without narrowing or collation guesses" {
+    const catalog = @import("catalog.zig");
+    const native = @import("../storage/schema.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const table: catalog.Table = .{ .id = 17, .physical_name = "items", .schema_version = 4, .columns = &.{
+        .{ .name = "email", .path = "email", .type = .string, .element_type = .text },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 20, .scale = 4 } },
+    } };
+    const actual: native.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "email", .path = "email", .column_type = .string, .sql_element_type = .text },
+        .{ .name = "amount", .path = "amount", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 20, .scale = 4 } },
+    } };
+    const view = try table.expressionSchemaLeaky(alloc);
+    const canonical = [_]scalar.Column{
+        .{ .name = "email", .type = .string, .element_type = .text },
+        .{ .name = "amount", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 20, .scale = 4 } },
+    };
+    var lower_key: catalog.IndexDefinition.Key = .{ .column = "", .expression = try std.json.parseFromSliceLeaky(Json, alloc,
+        \\{"op":"lower_ascii","args":[{"op":"column","column":"email"}]}
+    , .{}), .result_type = .string, .collation = "C", .direction = .desc, .nulls = .first };
+    lower_key.identity = try lower_key.bindIdentity(alloc, actual);
+    for ([_][]const u8{ "lower(q.email)=$1 AND 1/0=0", "upper(q.email)=$1" }, 0..) |sql, index| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        var columns = canonical;
+        columns[0].name = "q\x00email";
+        var program = try scalar.bindExpected(a, parsed.expression, &columns, &.{.string}, .boolean, .{});
+        defer program.deinit();
+        const comparison = if (index == 0) program.instructions[program.root].operation.binary.left else program.root;
+        const root = program.instructions[comparison].operation.binary.left;
+        const query = try indexInstructionIdentity(alloc, &program, root, &canonical, view, .{});
+        try std.testing.expectEqual(index == 0, try lower_key.matchesEquality(query, "binary"));
+        if (index == 0) {
+            try std.testing.expect(!try lower_key.matchesEquality(query, "ci"));
+            try std.testing.expectError(error.UnsupportedRelationalIndexCollation, lower_key.matchesEquality(query, "unknown"));
+            var unbound = lower_key;
+            unbound.identity = null;
+            try std.testing.expect(!try unbound.matchesEquality(query, null));
+        }
+    }
+    var numeric: catalog.IndexDefinition.Key = .{ .column = "amount", .expression = null, .result_type = null, .collation = null, .direction = .asc, .nulls = .default };
+    numeric.identity = try numeric.bindIdentity(alloc, actual);
+    for ([_][]const u8{ "amount=CAST(1 AS NUMERIC)", "amount=CAST(1 AS DOUBLE PRECISION)" }, 0..) |sql, index| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        var program = try scalar.bindExpected(a, parsed.expression, &canonical, &.{}, .boolean, .{});
+        defer program.deinit();
+        const root = program.instructions[program.root].operation.binary.left;
+        const query = try indexInstructionIdentity(alloc, &program, root, &canonical, view, .{});
+        try std.testing.expectEqual(index == 0, try numeric.matchesEquality(query, null));
+    }
+    var changed = table;
+    const changed_columns = try alloc.dupe(catalog.Column, table.columns);
+    changed_columns[1].numeric_modifier = .{ .precision = 19, .scale = 4 };
+    changed.columns = changed_columns;
+    const changed_identity = try numeric.bindIdentity(alloc, try changed.expressionSchemaLeaky(alloc));
+    try std.testing.expect(!try numeric.matchesEquality(changed_identity, null));
+    const Faults = struct {
+        fn run(allocator: std.mem.Allocator, key: catalog.IndexDefinition.Key, source: native.TableSchema) !void {
+            const result = try key.bindIdentity(allocator, source);
+            try std.testing.expectEqualDeep(key.identity.?, result);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{ numeric, actual });
 }
 
 test "SQL index key lowering reuses bound instructions without demanding unrelated predicates" {

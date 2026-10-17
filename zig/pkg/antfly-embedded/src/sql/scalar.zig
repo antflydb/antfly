@@ -2892,7 +2892,24 @@ const Binder = struct {
         const empty_constructor = expression.* == .call and std.mem.eql(u8, expression.call.name, "$array") and expression.call.args.len == 0;
         if (depth == 0 and empty_constructor and self.limits.assignment) return error.UnknownSqlArrayType;
         var kind = if (empty_constructor and array_element != null) Type{ .kind = .array, .element_type = array_element, .nullable = false } else try self.infer(expression, depth);
-        if (expected == .number and array_element == .numeric and (kind.kind == .integer or (expression.* == .literal and expression.literal == .string))) kind = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable };
+        if (expected == .number and array_element == .numeric and kind.kind == .integer and expression.* != .literal) {
+            // Context conversion is a boundary instruction, not an overload
+            // substitution. Quantified/set producers still deliver NUMERIC,
+            // while their integral computation retains its own overflow rules.
+            const operand = try self.compileArrayContext(expression, null, null, depth + 1);
+            if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+            const index: u32 = @intCast(self.instructions.items.len);
+            try self.instructions.append(self.alloc, .{
+                .type = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable },
+                .operation = .{ .cast = .{ .operand = operand, .type = .number, .element_type = .numeric } },
+            });
+            return index;
+        }
+        // Assignment context may resolve a literal's input domain, but must
+        // not select a different overload for an already-typed expression.
+        // For example ABS(bigint_min) overflows before assignment to NUMERIC.
+        if (expected == .number and array_element == .numeric and expression.* == .literal and
+            (kind.kind == .integer or expression.literal == .string)) kind = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable };
         if (expression.* == .literal and expression.literal == .parameter) kind = self.parameters[expression.literal.parameter - 1];
         if (kind.kind == null) kind.kind = expected;
         if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter and self.parameters[expression.literal.parameter - 1].kind == null) kind.element_type = array_element;

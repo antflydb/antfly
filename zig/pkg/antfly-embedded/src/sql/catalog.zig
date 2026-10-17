@@ -55,6 +55,11 @@ pub const Index = struct {
 /// must not accidentally treat a partial or expression index as total.
 pub const IndexDefinition = struct {
     const native = @import("../storage/relational_index.zig");
+    pub const KeyIdentity = struct {
+        fingerprint: [32]u8,
+        kind: @import("../storage/schema.zig").RelationalColumnType,
+        builtin: ?@import("array_value.zig").ElementType,
+    };
     pub const Key = struct {
         column: []const u8,
         expression: ?std.json.Value,
@@ -62,6 +67,35 @@ pub const IndexDefinition = struct {
         collation: ?[]const u8,
         direction: native.RelationalIndexKeyDirection,
         nulls: native.RelationalIndexKeyNulls,
+        identity: ?KeyIdentity = null,
+
+        pub fn bindIdentity(self: Key, temporary: std.mem.Allocator, table: @import("../storage/schema.zig").TableSchema) !KeyIdentity {
+            var column: std.json.ObjectMap = .empty;
+            defer column.deinit(temporary);
+            const expression = self.expression orelse blk: {
+                try column.put(temporary, "op", .{ .string = "column" });
+                try column.put(temporary, "column", .{ .string = self.column });
+                break :blk std.json.Value{ .object = column };
+            };
+            const expected = self.result_type orelse for (table.relational_columns) |item| {
+                if (std.mem.eql(u8, item.name, self.column)) break item.column_type;
+            } else return error.RelationalIndexColumnNotFound;
+            var plan = try @import("../schema/relational_expression.zig").Plan.init(temporary, table, expression, expected);
+            defer plan.deinit();
+            return .{ .fingerprint = plan.fingerprint, .kind = plan.result_kind, .builtin = plan.result_sql_type };
+        }
+
+        /// Equality shape only, not readiness, membership or a range proof.
+        /// Collation is part of the comparison domain; direction/NULL ordering
+        /// remain tuple-encoding properties owned by the selected index.
+        pub fn matchesEquality(self: Key, query: KeyIdentity, collation: ?[]const u8) !bool {
+            const stored = self.identity orelse return false;
+            if (stored.kind != query.kind or stored.builtin != query.builtin or !std.mem.eql(u8, &stored.fingerprint, &query.fingerprint)) return false;
+            const expressions = @import("../schema/relational_expression.zig");
+            const stored_fold = if (self.collation) |name| try expressions.foldAsciiCollation(stored.kind, name) else false;
+            const query_fold = if (collation) |name| try expressions.foldAsciiCollation(query.kind, name) else false;
+            return stored_fold == query_fold;
+        }
     };
     pub const Predicate = struct {
         constant: ?bool,
@@ -77,6 +111,18 @@ pub const IndexDefinition = struct {
 
     fn copyOptional(a: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
         return if (value) |bytes| try a.dupe(u8, bytes) else null;
+    }
+
+    /// Both embedded and server resolvers consume the same validated schema
+    /// vocabulary. Temporary wire conversion never escapes into a binding.
+    pub fn deriveLeaky(a: std.mem.Allocator, temporary: std.mem.Allocator, parsed: anytype, table: @import("../storage/schema.zig").TableSchema) ![]const IndexDefinition {
+        const declared = (try parsed.relationalIndexDefinitions(temporary)) orelse return &.{};
+        const output = try a.alloc(IndexDefinition, declared.len);
+        for (declared, output) |definition, *out| {
+            out.* = try fromNativeLeaky(a, definition);
+            for (@constCast(out.keys)) |*key| key.identity = try key.bindIdentity(temporary, table);
+        }
+        return output;
     }
 
     /// All allocations, including partial failure, belong to the caller's
@@ -267,6 +313,34 @@ pub const Table = struct {
         if (std.mem.eql(u8, column_name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
         for (self.columns) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         return error.UndefinedColumn;
+    }
+
+    /// Compiler-only typed input view. It grants no native capability or
+    /// storage authority and must never be published as a storage schema.
+    /// Identity is compared only within this already-authorized pinned table.
+    /// The region owns the column vector; names/paths borrow that pinned table.
+    pub fn expressionSchemaLeaky(self: Table, a: std.mem.Allocator) !@import("../storage/schema.zig").TableSchema {
+        if (self.storage_mode != .relational) return error.UnsupportedSqlShape;
+        const native_schema = @import("../storage/schema.zig");
+        const columns = try a.alloc(native_schema.RelationalColumn, self.columns.len);
+        for (self.columns, columns) |column_, *out| out.* = .{
+            .name = column_.name,
+            .path = column_.path,
+            .column_type = switch (column_.type) {
+                .string, .uuid => .string,
+                .integer => .integer,
+                .number => if (column_.element_type == .numeric) .numeric else .number,
+                .array => .sql_array,
+                .boolean => .boolean,
+                .datetime => .datetime,
+                .json => .json,
+            },
+            .required = !column_.nullable,
+            .allows_null = column_.nullable,
+            .sql_element_type = column_.element_type,
+            .numeric_modifier = column_.numeric_modifier,
+        };
+        return .{ .storage_mode = .relational, .version = self.schema_version, .relational_columns = columns, .requires_json_expressions = true };
     }
 
     pub fn columnAliases(self: Table, alloc: std.mem.Allocator, name: []const u8) ![]const []const u8 {

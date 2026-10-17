@@ -585,10 +585,10 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .defaulted = catalog.hasColumnDefault(parsed, column.name), .element_type = column.sql_element_type, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
+                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .defaulted = catalog.hasColumnDefault(parsed, column.name), .element_type = column.sql_element_type, .numeric_modifier = column.numeric_modifier, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
                     .string => .string,
                     .integer => .integer,
-                    .number => .number,
+                    .number, .numeric => .number,
                     .boolean => .boolean,
                     .datetime => .datetime,
                     .json => .json,
@@ -596,7 +596,7 @@ pub fn Adapter(comptime native: type) type {
                     else => return error.UnsupportedSqlExecution,
                 }) };
             }
-            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns, .constraints = try catalog.Constraint.derive(alloc, parsed) };
+            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns, .index_definitions = try catalog.IndexDefinition.deriveLeaky(alloc, scratch.allocator(), parsed, schema), .constraints = try catalog.Constraint.derive(alloc, parsed) };
         }
 
         const Cursor = struct {
