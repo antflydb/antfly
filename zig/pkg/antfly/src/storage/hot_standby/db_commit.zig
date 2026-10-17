@@ -123,22 +123,32 @@ fn identity(ptr: *anyopaque) replication_contract.Publisher.Identity {
 }
 
 fn publish(mirror: ReplicationAsyncEffectMirror, kind: outbox.Kind, payload: []const u8, namespace: Namespace) !u64 {
+    if (kind == .metadata_control) try validateMetadataControl(payload, namespace);
     const primary = try runtimePrimary(mirror);
     return switch (kind) {
         .batch, .restore_batch => replication_effects_mod.appendEncodedBatchMutationRequest(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
         .replay, .primary_effect => replication_effects_mod.appendEncodedDerivedChangeRecord(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
-        .schema, .row_policy => replication_effects_mod.appendEncodedSchemaMetadataMutation(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
+        .schema, .row_policy, .metadata_control => replication_effects_mod.appendEncodedSchemaMetadataMutation(primary, payload, .{ .shard_id = namespace.shard_id, .table_id = namespace.table_id }),
     };
 }
 
 fn recover(mirror: ReplicationAsyncEffectMirror, kind: outbox.Kind, pending: outbox.DurableReplicationOutbox, namespace: Namespace) !u64 {
+    if (kind == .metadata_control) try validateMetadataControl(pending.payload, namespace);
     const primary = try runtimePrimary(mirror);
-    if (try primary.findMatchingRecordFrom(pending.from_lsn, switch (kind) {
+    if (try primary.findMatchingRecordFromWithCodec(pending.from_lsn, switch (kind) {
         .batch, .restore_batch => .batch_mutation,
         .replay, .primary_effect => .derived_effect,
-        .schema, .row_policy => .metadata_mutation,
+        .schema, .row_policy, .metadata_control => .metadata_mutation,
+    }, switch (kind) {
+        .batch, .restore_batch, .schema, .row_policy => .json,
+        .replay, .primary_effect, .metadata_control => .binary,
     }, pending.payload, namespace.shard_id, namespace.table_id)) |existing| return existing;
     return try publish(mirror, kind, pending.payload, namespace);
+}
+
+fn validateMetadataControl(payload: []const u8, namespace: Namespace) !void {
+    const frame = try replication_effects_mod.schema_owner_control.Frame.decode(payload);
+    if (!frame.position.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
 }
 
 fn preflight(mirror: ReplicationAsyncEffectMirror, record_decision: bool) !void {

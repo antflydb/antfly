@@ -66,6 +66,7 @@ fn digestAt(txn: anytype, name: []const u8) !Digest {
 /// Owned immutable preparation. Compilation is outside serialized apply;
 /// admission checks exact bytes/hashes, not a caller's asserted column types.
 pub const Candidate = struct {
+    pub const max_input_bytes = 56 + 2 * max_schema + integrity.max_catalog_bytes + max_names;
     alloc: A,
     inputs: []u8,
     native_before: []u8,
@@ -142,7 +143,7 @@ pub const Candidate = struct {
         return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version };
     }
     pub fn parts(bytes: []const u8) ![4][]const u8 {
-        if (bytes.len < 56 or bytes.len > 56 + 2 * max_schema + integrity.max_catalog_bytes + max_names or !std.mem.eql(u8, bytes[0..8], "ASVI\x01\x00\x00\x00") or !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*))
+        if (bytes.len < 56 or bytes.len > max_input_bytes or !std.mem.eql(u8, bytes[0..8], "ASVI\x01\x00\x00\x00") or !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*))
             return error.InvalidSchemaValidationJob;
         var result: [4][]const u8 = undefined;
         var offset: usize = 24;
@@ -485,6 +486,21 @@ pub fn requireInstalled(a: A, txn: anytype, binding: Binding, decision: Digest) 
     return header;
 }
 
+/// Durable progress observation for trusted owner retry/replay. No signature
+/// or physical-root adoption authority is obtained from this local record.
+pub fn observe(a: A, txn: anytype, binding: Binding) !Header {
+    const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
+    if (!std.meta.eql(header.binding, binding)) return error.SchemaValidationJobChanged;
+    try requireCommitted(txn, header);
+    if (header.phase == .installed) return requireInstalled(a, txn, binding, header.installation.?.decision);
+    if (header.phase == .canceled) {
+        const done = (try topology.completed(txn)) orelse return error.SchemaValidationJobChanged;
+        if (done.admission_epoch < binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
+        return header;
+    }
+    return workHeader(txn, binding);
+}
+
 pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candidate, entry: ?receipts.OrderedApplyReceipt) !Header {
     try binding.validate();
     try binding.requireCandidate(candidate);
@@ -543,6 +559,22 @@ pub const PageCommand = struct {
         try self.boundary.validate();
         if (std.mem.allEqual(u8, &self.expected, 0) or
             (self.boundary.violation_column != null and self.boundary.violation_column.? >= self.binding.columns)) return error.InvalidSchemaValidationPageCommand;
+    }
+    pub fn effect(self: @This()) !Digest {
+        try self.validate();
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("schema-validation-page/v1");
+        state.update(&self.expected);
+        state.update(&hash(self.boundary.after));
+        var numbers: [25]u8 = undefined;
+        std.mem.writeInt(u64, numbers[0..8], self.boundary.rows_examined, .little);
+        std.mem.writeInt(u64, numbers[8..16], self.boundary.records_examined, .little);
+        std.mem.writeInt(u64, numbers[16..24], if (self.boundary.violation_column) |column| column else std.math.maxInt(u64), .little);
+        numbers[24] = @intFromBool(self.boundary.more);
+        state.update(&numbers);
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
     }
     pub fn encode(self: @This(), a: A) ![]u8 {
         try self.validate();
@@ -633,19 +665,7 @@ pub const PreparedPage = struct {
         return .{ .page = page, .expected = header };
     }
     fn effect(self: *const PreparedPage) !Digest {
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("schema-validation-page/v1");
-        state.update(&try self.expected.digest());
-        state.update(&hash(self.page.after));
-        var numbers: [25]u8 = undefined;
-        std.mem.writeInt(u64, numbers[0..8], self.page.rows_examined, .little);
-        std.mem.writeInt(u64, numbers[8..16], self.page.page.records_examined, .little);
-        std.mem.writeInt(u64, numbers[16..24], if (self.page.violation_column) |column| column else std.math.maxInt(u64), .little);
-        numbers[24] = @intFromBool(self.page.page.more);
-        state.update(&numbers);
-        var result: Digest = undefined;
-        state.final(&result);
-        return result;
+        return (try self.command()).effect();
     }
 };
 

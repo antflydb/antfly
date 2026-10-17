@@ -11254,3 +11254,67 @@ pass. Inventory stays 531 implemented / 132 rejected / 113 superseded /
 test binaries/objects were removed from this worktree's cache for headroom;
 current verified outputs, logs, source, unrelated changes and other worktrees
 were retained. These build outputs can be regenerated; no global GC ran.
+
+### Native validation owner, metadata journal and standby execution
+
+The trusted native storage adapter now executes begin, freeze, bounded page,
+cancel and atomic installation through the existing owner commit machinery.
+It uses the existing metadata journal kind with a versioned ASVC binary frame,
+not a separate schema journal. Immutable candidate/page bytes are owned before
+apply, and the schema-sized frame prefix is hashed off-lock; finalizing the
+actual native commit position hashes only its fixed-size trailer. A local page
+is scanned once; a standby independently re-executes its recorded bounded
+prefix. Neither a caller's success assertion nor a journal LSN becomes native
+or Raft authority.
+
+The durable outbox has a distinct metadata-control subtype, including in async
+mode. The owner effect, source clock, outbox and standby applied-LSN marker
+participate in the same local transaction. Recovery matches codec as well as
+kind, scope and bytes, so JSON metadata cannot falsely satisfy binary-control
+recovery. The server checks the frame and exact namespace before publication
+or recovery matching. Ordinary batch/API inputs cannot select this adapter.
+
+Cancellation can release a local table fence before its journal append has
+completed. A foreground append-admission flag is therefore set under apply
+before the control transaction becomes visible. Later mutations cannot
+overtake that control. Bounded outbox recovery makes a fresh durable truth scan
+even with stale hints, and runs before acquiring shared mutation leases;
+checkpoint-exclusive completion must not wait on the recovering caller itself.
+Read-only owner status/completion retains live role authority and checks debt
+in its exact snapshot, but does not treat the closed write-admission flag as
+an inability to report pending progress. No pending result mints a publication
+receipt, retries do not advance the original native cut, and append/ack errors
+after commit are explicit pending outcomes rather than rollback-looking errors.
+
+This closes the native owner/journal/replay prerequisite only. The public
+validation-only producer remains guarded: metadata/root/cohort authorization,
+capability/record-size admission, deterministic Raft adapters, authenticated
+root adoption, all-owner publication and fence release are not yet complete.
+An installed durable state with mismatched resident runtime fails closed;
+automatic in-process rehydration is still required. Topology protocol stays
+54, no source disposition is reclassified, and the native index reporter
+remains unadvertised pending its separate activation authority.
+
+Verification: the combined native Debug job/index gate passes seven validation
+job tests, 13 index integration tests and 14 index component tests, zero
+skips/leaks and 62/62 build steps, in
+`/private/tmp/antfly-sql-native-owner-regression-final-debug.log`. It covers all
+five actual journal actions, async-mode obligations, restart with an unappended
+outbox, append-before-ack failure without duplicate records, independently
+executed binary-cursor pages, counter gaps, wrong namespaces/codecs, duplicate
+cuts, cold standby installation and cancellation recovery initiated by ordinary
+row admission. Completion probes acquire checkpoint-exclusive, proving no
+shared mutation lease survives the recovery wait. The initial shared index
+regression exposed the status/write-admission distinction described above;
+the final gate passes without exclusions or weaker write guards.
+
+The full Debug SQL gate before the final status/lease-order corrections passes
+896 portable plus 234 native tests, four existing opt-in benchmarks skipped,
+21/21 build steps, in
+`/private/tmp/antfly-sql-native-schema-owner-full-debug.log`. A fresh full gate
+against the final corrections is tracked separately. Formatting, control
+catalog, Apache boundary (2,072 sources), license and inventory checks pass.
+Inventory remains 531 implemented / 132 rejected / 113 superseded /
+810 unresolved. About 700 MiB of inspected, inactive, superseded local test
+binaries/objects were reclaimed during final regression verification; these
+are regenerable cache outputs, not source, logs or current verified artifacts.

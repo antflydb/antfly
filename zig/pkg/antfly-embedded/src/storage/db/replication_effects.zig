@@ -24,6 +24,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal = @import("derived/change_journal.zig");
 pub const primary_effect = @import("primary_effect.zig");
+pub const schema_owner_control = @import("relational_schema_owner_control.zig");
 const db_types = @import("types.zig");
 
 const replication_record = @import("replication_record.zig");

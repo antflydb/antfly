@@ -37,6 +37,10 @@ pub fn applyRecord(db: *DB, record: record_mod.RecordView) !void {
             try db.applyReplicatedBatch(mutation, record.lsn);
         },
         .metadata_mutation => {
+            if (record.payload_codec == .binary) {
+                try db.applyReplicatedSchemaOwnerControl(record);
+                return;
+            }
             var metadata = try effects.decodeMetadataMutation(db.alloc, record);
             defer metadata.deinit();
             switch (metadata.value.kind) {

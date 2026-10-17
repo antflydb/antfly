@@ -674,6 +674,236 @@ test "relational index system nullability job replay independently verifies boun
     try std.testing.expect(binary_cursor_seen and eof_page_seen);
 }
 
+test "relational index system nullability job native metadata journal preserves owner cuts through recovery and standby replay" {
+    const F = NullabilityJobFixture;
+    const owner = @import("relational_schema_owner_control.zig");
+    const contract = @import("replication_contract.zig");
+    const outboxes = @import("durable_outbox.zig");
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Publisher = struct {
+        base: contract.AsyncEffectMirror,
+        barrier: *Barrier,
+        fail_before: bool = true,
+        fail_after: bool = false,
+        async_only: bool = false,
+        completions: usize = 0,
+        fn selfOf(mirror: contract.AsyncEffectMirror) *@This() {
+            return @ptrCast(@alignCast(mirror.publisher.ptr));
+        }
+        fn next(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.base.publisher.nextLsn();
+        }
+        fn identity(ptr: *anyopaque) contract.Publisher.Identity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.base.publisher.identity();
+        }
+        fn publish(mirror: contract.AsyncEffectMirror, kind: outboxes.Kind, payload: []const u8, namespace: @FieldType(owner.Native, "namespace")) !u64 {
+            const self = selfOf(mirror);
+            return self.base.publisher.publish(self.base, kind, payload, namespace);
+        }
+        fn recover(mirror: contract.AsyncEffectMirror, kind: outboxes.Kind, pending: outboxes.DurableReplicationOutbox, namespace: @FieldType(owner.Native, "namespace")) !u64 {
+            const self = selfOf(mirror);
+            if (self.fail_before) return error.InjectedSchemaJournalUnavailable;
+            const result = try self.base.publisher.recover(self.base, kind, pending, namespace);
+            if (self.fail_after) {
+                self.fail_after = false;
+                return error.InjectedSchemaJournalAcknowledgement;
+            }
+            return result;
+        }
+        fn preflight(mirror: contract.AsyncEffectMirror, _: bool) !void {
+            const self = selfOf(mirror);
+            try self.base.publisher.preflight(self.base);
+        }
+        fn complete(mirror: contract.AsyncEffectMirror, lsn: u64) !void {
+            const self = selfOf(mirror);
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
+            capture.release();
+            try self.base.publisher.complete(self.base, lsn);
+            self.completions += 1;
+        }
+        fn asMirror(self: *@This()) contract.AsyncEffectMirror {
+            return .{ .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } }, .mutation_barrier = self.barrier, .requirements = .{ .synchronous = !self.async_only, .durable_outbox = !self.async_only, .preflight = !self.async_only } };
+        }
+    };
+    const Driver = struct {
+        fn command(database: *db_mod.DB, value: owner.Command) !owner.Outcome {
+            var prepared = try database.prepareNativeSchemaOwnerControl(value, .{});
+            defer prepared.deinit();
+            return database.applyPreparedNativeSchemaOwnerControl(&prepared, null);
+        }
+        fn replayTo(journal: *primary_mod.Primary, database: *db_mod.DB, next_lsn: *u64) !void {
+            while (next_lsn.* <= journal.lastLsn()) : (next_lsn.* += 1) {
+                var entry = (try journal.log.entryAt(alloc, next_lsn.*)) orelse return error.MissingReplicationRecord;
+                defer entry.deinit(alloc);
+                if (entry.record.kind == .metadata_mutation) {
+                    try std.testing.expectEqual(@import("replication_record.zig").PayloadCodec.binary, entry.record.payload_codec);
+                    const frame = try owner.Frame.decode(entry.record.payload);
+                    try std.testing.expectEqualDeep(F.namespace, frame.position.namespace);
+                }
+                try replication_ingress.applyRecord(database, entry.record);
+                const clock = try F.clock(database);
+                try replication_ingress.applyRecord(database, entry.record);
+                try std.testing.expectEqual(clock, try F.clock(database));
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |cancel_only| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("native-schema-journal");
+        defer directory.cleanup();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const source_path = try std.fmt.allocPrint(owned, "{s}/source", .{directory.path()});
+        const peer_path = try std.fmt.allocPrint(owned, "{s}/peer", .{directory.path()});
+        var journal = try primary_mod.Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, "{s}/log", .{directory.path()}, 0), try std.fmt.allocPrintSentinel(owned, "{s}/slots", .{directory.path()}, 0), .{ .cluster_id = 71, .table_id = F.namespace.table_id, .shard_id = F.namespace.shard_id, .timeline_id = 1, .epoch = 1 }, .{});
+        defer journal.close();
+        // A real non-owner record separates journal ordering from the native
+        // authority clock; equality by coincidence is not domain identity.
+        _ = try journal.append(.{ .kind = .checkpoint, .payload_codec = .raw, .payload = "" });
+        var barrier: Barrier = .{};
+        var publisher: Publisher = .{ .base = hot_standby_publisher_adapter.bindMirror(&journal, .{}), .barrier = &barrier, .async_only = cancel_only };
+        var primary_db = try db_mod.DB.open(alloc, source_path, F.options);
+        var primary_live = true;
+        defer if (primary_live) primary_db.close();
+        var peer_db = try db_mod.DB.open(alloc, peer_path, F.options);
+        var peer_live = true;
+        defer if (peer_live) peer_db.close();
+        // Same pre-control snapshot. This qualifies owner-control replication,
+        // not uncoordinated bootstrap/adoption of independently written roots.
+        for ([_]*db_mod.DB{ &primary_db, &peer_db }) |database| {
+            try database.setSchemaJson(alloc, F.before);
+            try database.batch(.{ .timestamp_ns = 100, .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" }, .{ .key = "c", .value = "{\"n\":3}" } } });
+            const orphan = try internal.ttlKeyAlloc(alloc, "orphan-\xff");
+            defer alloc.free(orphan);
+            const stamp: [8]u8 = @splat(0);
+            try database.core.store.put(orphan, &stamp);
+        }
+        var candidate = try F.candidate(&primary_db);
+        defer candidate.deinit();
+        const binding = try F.binding(&primary_db, &candidate, 61);
+        var mirrored = F.options;
+        mirrored.replication_async_metadata_mirror = publisher.asMirror();
+        mirrored.replication_async_batch_mirror = publisher.asMirror();
+        primary_db.local_execution.replication_async_metadata_mirror = publisher.asMirror();
+        primary_db.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        const begin: owner.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
+        const admitted = try Driver.command(&primary_db, begin);
+        try std.testing.expect(admitted.replication_pending and !admitted.duplicate);
+        try std.testing.expectEqualStrings("InjectedSchemaJournalUnavailable", admitted.error_name.?);
+        try std.testing.expectEqual(@as(u64, 1), journal.lastLsn());
+        const original_cut = admitted.position;
+        primary_db.close();
+        primary_live = false;
+        primary_db = try db_mod.DB.open(alloc, source_path, mirrored);
+        primary_live = true;
+        publisher.fail_before = false;
+        try primary_db.flushDurableReplicationOutboxes();
+        try std.testing.expectEqual(@as(u64, 2), journal.lastLsn());
+        const duplicate = try Driver.command(&primary_db, begin);
+        try std.testing.expect(duplicate.duplicate and !duplicate.replication_pending);
+        try std.testing.expectEqualDeep(original_cut, duplicate.position);
+        try std.testing.expectEqual(@as(u64, 2), journal.lastLsn());
+        var next_lsn: u64 = 1;
+        try Driver.replayTo(&journal, &peer_db, &next_lsn);
+        try std.testing.expectEqualDeep(try F.current(&primary_db), try F.current(&peer_db));
+        try std.testing.expect(original_cut.sequence != journal.lastLsn());
+        const frozen = try Driver.command(&primary_db, .{ .binding = binding, .action = .freeze });
+        try std.testing.expect(!frozen.duplicate and !frozen.replication_pending);
+        // A committed frame cannot skip a native clock cut or change routes.
+        var original_entry = (try journal.log.entryAt(alloc, journal.lastLsn())).?;
+        defer original_entry.deinit(alloc);
+        const original_frame = try owner.Frame.decode(original_entry.record.payload);
+        try std.testing.expect(try journal.findMatchingRecordFromWithCodec(1, .metadata_mutation, .json, original_entry.record.payload, F.namespace.shard_id, F.namespace.table_id) == null);
+        try std.testing.expectEqual(@as(?u64, original_entry.record.lsn), try journal.findMatchingRecordFromWithCodec(1, .metadata_mutation, .binary, original_entry.record.payload, F.namespace.shard_id, F.namespace.table_id));
+        var gap = original_frame;
+        gap.position.sequence += 7;
+        const gap_bytes = try gap.encode(alloc);
+        defer alloc.free(gap_bytes);
+        var bad_record = original_entry.record;
+        bad_record.payload = gap_bytes;
+        const prior_clock = try F.clock(&peer_db);
+        try std.testing.expectError(error.InvalidControlReceiptPosition, peer_db.applyReplicatedSchemaOwnerControl(bad_record));
+        try std.testing.expectEqual(prior_clock, try F.clock(&peer_db));
+        bad_record = original_entry.record;
+        bad_record.table_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, peer_db.applyReplicatedSchemaOwnerControl(bad_record));
+        try Driver.replayTo(&journal, &peer_db, &next_lsn);
+        for (0..8) |turn| {
+            var page = try primary_db.prepareNativeSchemaOwnerPage(binding, .{ .records = 2, .time_ns = std.time.ns_per_s }, .{});
+            defer page.deinit();
+            publisher.fail_after = turn == 0;
+            const advanced = try primary_db.applyPreparedNativeSchemaOwnerControl(&page, null);
+            if (turn == 0) {
+                try std.testing.expect(advanced.replication_pending);
+                const recorded = journal.lastLsn();
+                const clock = try F.clock(&primary_db);
+                try primary_db.flushDurableReplicationOutboxes();
+                try std.testing.expectEqual(recorded, journal.lastLsn());
+                try std.testing.expectEqual(clock, try F.clock(&primary_db));
+            } else try std.testing.expect(!advanced.replication_pending);
+            try Driver.replayTo(&journal, &peer_db, &next_lsn);
+            try std.testing.expectEqualDeep(try F.current(&primary_db), try F.current(&peer_db));
+            if (cancel_only or advanced.header.?.phase == .ready) break;
+        } else return error.NativeSchemaValidationDidNotFinish;
+        if (cancel_only) {
+            publisher.fail_before = true;
+            const canceled = try Driver.command(&primary_db, .{ .binding = binding, .action = .cancel });
+            try std.testing.expectEqual(F.job.Phase.canceled, canceled.header.?.phase);
+            try std.testing.expect(canceled.replication_pending);
+            // Local cancellation released the table fence, but an unappended
+            // control must still close foreground writes until journal order
+            // is durable. No later row may overtake this cancellation.
+            var blocked = false;
+            primary_db.batch(.{ .writes = &.{.{ .key = "z", .value = "{\"n\":null}" }} }) catch |err| {
+                try std.testing.expect(err == error.InjectedSchemaJournalUnavailable or err == error.ReplicationPublisherUnavailable);
+                blocked = true;
+            };
+            try std.testing.expect(blocked);
+            const absent = try internal.relationalRowKeyAlloc(alloc, "z");
+            defer alloc.free(absent);
+            try std.testing.expectError(error.NotFound, primary_db.core.store.get(alloc, absent));
+            publisher.fail_before = false;
+            // Ordinary row admission must recover before taking its shared
+            // mutation lease: completion above needs checkpoint-exclusive.
+            try primary_db.batch(.{ .timestamp_ns = 200, .writes = &.{.{ .key = "z", .value = "{\"n\":null}" }} });
+            const retried_cancel = try Driver.command(&primary_db, .{ .binding = binding, .action = .cancel });
+            try std.testing.expect(retried_cancel.duplicate and !retried_cancel.replication_pending);
+            try std.testing.expectEqualDeep(canceled.position, retried_cancel.position);
+            try Driver.replayTo(&journal, &peer_db, &next_lsn);
+            try std.testing.expectError(error.SchemaValidationCanceled, Driver.command(&primary_db, begin));
+        } else {
+            const validated = try F.current(&primary_db);
+            var install_body: [64]u8 = undefined;
+            @memset(install_body[0..32], 91);
+            @memcpy(install_body[32..64], &try validated.digest());
+            const install_command: owner.Command = .{ .binding = binding, .action = .install, .payload = &install_body };
+            const installed = try Driver.command(&primary_db, install_command);
+            try std.testing.expectEqual(F.job.Phase.installed, installed.header.?.phase);
+            try Driver.replayTo(&journal, &peer_db, &next_lsn);
+            const end_lsn = journal.lastLsn();
+            const repeated = try Driver.command(&primary_db, install_command);
+            try std.testing.expect(repeated.duplicate and !repeated.replication_pending);
+            try std.testing.expectEqualDeep(installed.position, repeated.position);
+            try std.testing.expectEqual(end_lsn, journal.lastLsn());
+            try std.testing.expectError(error.SchemaValidationPublicationRequired, Driver.command(&primary_db, .{ .binding = binding, .action = .cancel }));
+            try std.testing.expectEqual(@as(u32, 2), peer_db.core.schema.?.version);
+        }
+        try std.testing.expectEqualDeep(try F.current(&primary_db), try F.current(&peer_db));
+        try std.testing.expectEqual(try F.clock(&primary_db), try F.clock(&peer_db));
+        try std.testing.expect(try primary_db.orderedApplyReceipt() == null);
+        try std.testing.expect(try peer_db.orderedApplyReceipt() == null);
+        peer_db.close();
+        peer_live = false;
+        peer_db = try db_mod.DB.open(alloc, peer_path, F.options);
+        peer_live = true;
+        try std.testing.expectEqualDeep(try F.current(&primary_db), try F.current(&peer_db));
+        try std.testing.expectEqual(try F.clock(&primary_db), try F.clock(&peer_db));
+        try std.testing.expect(publisher.completions > 0);
+    }
+}
+
 const NullabilityScanFixture = struct {
     const validation = @import("relational_nullability.zig");
     fn open(database: *db_mod.DB, a: std.mem.Allocator, request: rows.Request, now_ns: u64) !rows.Reader {

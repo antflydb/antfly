@@ -7597,8 +7597,8 @@ pub const DB = struct {
         var replication_mutation: ?MutationBarrier.ExclusiveLease = null;
         defer if (replication_mutation) |*lease| lease.release();
         if (replication_lsn == null) {
-            try self.enforceReplicationWriteGate();
             try self.ensureDurableReplicationStartupBarrier();
+            try self.enforceReplicationWriteGate();
             try self.preflightReplicationMetadataSyncCommit();
             if (self.local_execution.replication_async_metadata_mirror) |mirror|
                 replication_mutation = mirror.mutation_barrier.?.acquireExclusive();
@@ -7987,7 +7987,7 @@ pub const DB = struct {
                         break :blk native_index_control.PreparedInventoryValidation{ .alloc = self.alloc, .batch = page };
                     };
                     defer prepared.deinit();
-                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                    _ = try self.applyPreparedNativeOwnerEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
                 .generation_validation => |command| {
                     var prepared = native_index_control.PreparedGenerationValidation.replay(self.alloc, self.core, command) catch |err| {
@@ -7995,12 +7995,12 @@ pub const DB = struct {
                         return err;
                     };
                     defer prepared.deinit();
-                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                    _ = try self.applyPreparedNativeOwnerEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
                 .validation_seal => |command| {
                     var prepared: native_index_control.PreparedValidationSeal = .{ .alloc = self.alloc, .command = command };
                     defer prepared.deinit();
-                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                    _ = try self.applyPreparedNativeOwnerEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
                 .install => |command| {
                     var prepared = self.prepareNativeIndexOwnerInstallation(command, .{}) catch |err| {
@@ -8021,7 +8021,7 @@ pub const DB = struct {
                 .release_gc => |command| {
                     var prepared: native_index_control.PreparedReleaseGc = .{ .alloc = self.alloc, .command = command };
                     defer prepared.deinit();
-                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                    _ = try self.applyPreparedNativeOwnerEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
                 .cancel_complete => |binding| {
                     var prepared: native_index_control.PreparedCancellationCompletion = .{ .alloc = self.alloc, .binding = binding };
@@ -8197,6 +8197,15 @@ pub const DB = struct {
     pub const NativeIndexOwnerIdentity = native_index_control.Identity;
     pub const NativeIndexOwnerReceiptRequest = native_index_control.ReceiptRequest;
 
+    /// Status/completion snapshots may report durable mirror debt. They still
+    /// require live owner authority, but must not reject that very observation
+    /// because the foreground append-admission gate is closed. Mutation paths
+    /// independently retain the stronger gate inside apply-exclusive.
+    fn enforceNativeOwnerReadAuthority(self: *DB) !void {
+        try self.enforcePortableRuntimeGate();
+        try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
+    }
+
     pub fn nativeIndexOwnerState(self: *DB, expected: NativeIndexOwnerIdentity) !?@import("relational_index_owner_job.zig").Binding {
         try expected.validate();
         if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
@@ -8213,7 +8222,7 @@ pub const DB = struct {
         try context.ensureActive();
         try identity.validate();
         if (!identity.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        try self.enforceReplicationWriteGate();
+        try self.enforceNativeOwnerReadAuthority();
         var needs_recovery = false;
         defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
         var read = try self.core.store.beginReadTxn();
@@ -8251,17 +8260,26 @@ pub const DB = struct {
         // recovery. Recheck in the final snapshot after the publication wait.
         if (try self.nativeIndexOwnerState(request.identity) == null) return null;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.enforceReplicationWriteGate();
+        try self.enforceNativeOwnerReadAuthority();
         var recovery_error: ?[]const u8 = null;
-        self.ensureDurableReplicationStartupBarrier() catch |err| {
-            recovery_error = @errorName(err);
-        };
-        if (recovery_error == null) self.flushDurableReplicationOutboxes() catch |err| {
-            recovery_error = @errorName(err);
-        };
+        // Hints can be stale. A read-only probe must still inspect its exact
+        // snapshot without manufacturing another append attempt/cut. If debt
+        // is found below, recovery is rescheduled and no receipt is exposed.
+        if (self.local_execution.durable_replication_outbox_maybe.load(.acquire) or
+            self.async_context.primary_replication_outbox_pending.load(.acquire) or
+            self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) or
+            self.local_execution.row_policy_replication_outbox_pending.load(.acquire))
+        {
+            self.ensureDurableReplicationStartupBarrier() catch |err| {
+                recovery_error = @errorName(err);
+            };
+            if (recovery_error == null) self.flushDurableReplicationOutboxes() catch |err| {
+                recovery_error = @errorName(err);
+            };
+        }
         var needs_recovery = false;
         defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
-        try self.enforceReplicationWriteGate();
+        try self.enforceNativeOwnerReadAuthority();
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         const jobs = @import("relational_index_owner_job.zig");
@@ -8313,7 +8331,7 @@ pub const DB = struct {
         try context.ensureActive();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.enforceReplicationWriteGate();
+        try self.enforceNativeOwnerReadAuthority();
         const binding = (try self.nativeIndexOwnerState(request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
         try request.requireBinding(binding);
         if (request.target_expectation != null) return self.stepNativeIndexInventoryValidation(table_name, request, binding, context);
@@ -8336,7 +8354,7 @@ pub const DB = struct {
             break :blk .{ .advanced = outcome };
         } else blk: {
             try context.ensureActive();
-            try self.enforceReplicationWriteGate();
+            try self.enforceNativeOwnerReadAuthority();
             var needs_recovery = false;
             defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
             var read = try self.core.store.beginReadTxn();
@@ -8498,13 +8516,13 @@ pub const DB = struct {
         const outcome: native_index_control.InventoryOutcome = if (inventory_page) |value| blk: {
             var prepared: native_index_control.PreparedInventoryValidation = .{ .alloc = alloc, .batch = value };
             defer prepared.deinit();
-            break :blk self.applyPreparedNativeIndexEffect(&prepared, null) catch |err| {
+            break :blk self.applyPreparedNativeOwnerEffect(&prepared, null) catch |err| {
                 if (budget) |working| if (working.denied()) return error.ResourceBudgetExceeded;
                 return err;
             };
         } else blk: {
             try context.ensureActive();
-            try self.enforceReplicationWriteGate();
+            try self.enforceNativeOwnerReadAuthority();
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             const record = (try claims.InventoryValidation.load(alloc, &read, binding)) orelse return error.InvalidPrivateIndexClaimInventory;
@@ -8536,12 +8554,12 @@ pub const DB = struct {
             return err;
         };
         defer if (prepared) |*value| value.deinit();
-        const outcome: native_index_control.GenerationOutcome = if (prepared) |*value| self.applyPreparedNativeIndexEffect(value, null) catch |err| {
+        const outcome: native_index_control.GenerationOutcome = if (prepared) |*value| self.applyPreparedNativeOwnerEffect(value, null) catch |err| {
             if (budget) |working| if (working.denied()) return error.ResourceBudgetExceeded;
             return err;
         } else blk: {
             try context.ensureActive();
-            try self.enforceReplicationWriteGate();
+            try self.enforceNativeOwnerReadAuthority();
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             var loaded = (try @import("relational_index_validation.zig").load(alloc, &read, binding)) orelse return error.InvalidRelationalIndexValidation;
@@ -8596,7 +8614,7 @@ pub const DB = struct {
             };
         }, .context = context };
         defer prepared.deinit();
-        return self.applyPreparedNativeIndexEffect(&prepared, null) catch |err| {
+        return self.applyPreparedNativeOwnerEffect(&prepared, null) catch |err| {
             if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
@@ -8609,7 +8627,7 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerBuild(self: *DB, prepared: *PreparedNativeIndexOwnerBuild, replay: ?NativeIndexReplay) !native_index_control.BuildOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
     pub const NativeIndexOwnerClaimCommand = native_index_control.ClaimCommand;
@@ -8623,7 +8641,7 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerClaims(self: *DB, prepared: *PreparedNativeIndexOwnerClaims, replay: ?NativeIndexReplay) !NativeIndexOwnerClaimOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
     pub const PreparedNativeIndexOwnerCancellationControl = native_index_control.PreparedCancellationControl;
@@ -8655,7 +8673,7 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerCancellationControl(self: *DB, prepared: *PreparedNativeIndexOwnerCancellationControl, replay: ?NativeIndexReplay) !NativeIndexOwnerCleanupOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
     pub fn prepareNativeIndexOwnerCancellation(self: *DB, intent: NativeIndexOwnerAdmission) !PreparedNativeIndexOwnerCancellation {
@@ -8676,7 +8694,7 @@ pub const DB = struct {
         return PreparedNativeIndexSourceConsumption.initControlled(alloc, &read, command, context);
     }
     pub fn applyPreparedNativeIndexSourceConsumption(self: *DB, prepared: *PreparedNativeIndexSourceConsumption, replay: ?NativeIndexReplay) !NativeIndexSourceConsumptionOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
     pub const PreparedNativeIndexOwnerCleanup = native_index_control.PreparedCleanup;
@@ -8691,13 +8709,13 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerCleanup(self: *DB, prepared: *PreparedNativeIndexOwnerCleanup, replay: ?NativeIndexReplay) !NativeIndexOwnerCleanupOutcome {
-        const result = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        const result = try self.applyPreparedNativeOwnerEffect(prepared, replay);
         self.native_index_build_cache.evict(self.backend_runtime.io() orelse std.Options.debug_io);
         return result;
     }
 
     pub fn applyPreparedNativeIndexOwnerCancellation(self: *DB, prepared: *PreparedNativeIndexOwnerCancellation, replay: ?NativeIndexReplay) !NativeIndexOwnerCancellationOutcome {
-        const result = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        const result = try self.applyPreparedNativeOwnerEffect(prepared, replay);
         self.native_index_build_cache.evict(self.backend_runtime.io() orelse std.Options.debug_io);
         return result;
     }
@@ -8706,7 +8724,7 @@ pub const DB = struct {
     /// server, not to a caller-set flag. The replay capability is supplied only
     /// by committed standby ingress, never by ordinary batch decoding.
     pub fn applyPreparedNativeIndexOwnerControl(self: *DB, prepared: *PreparedNativeIndexOwnerControl, replay: ?NativeIndexReplay) !NativeIndexOwnerOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
     /// One commit/replication machinery for native index controls and intent.
@@ -8721,7 +8739,7 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerInstallation(self: *DB, prepared: *native_index_control.PreparedInstall, replay: ?NativeIndexReplay) !native_index_control.InstallOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
     /// Trusted owner adapter only: metadata must independently grant release
@@ -8731,7 +8749,7 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerRelease(self: *DB, prepared: *native_index_control.PreparedRelease, replay: ?NativeIndexReplay) !native_index_control.ReleaseOutcome {
-        const outcome = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        const outcome = try self.applyPreparedNativeOwnerEffect(prepared, replay);
         if (self.backend_runtime.io()) |io| self.native_index_build_cache.evict(io);
         return outcome;
     }
@@ -8746,7 +8764,7 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerCancellationCompletion(self: *DB, prepared: *native_index_control.PreparedCancellationCompletion, replay: ?NativeIndexReplay) !native_index_control.CancellationCompletionOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
     /// Trusted owner adapter only. The receiving server must pin the accepted
@@ -8756,7 +8774,7 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerCancellationRelease(self: *DB, prepared: *native_index_control.PreparedCancellationRelease, replay: ?NativeIndexReplay) !native_index_control.CancellationReleaseOutcome {
-        const outcome = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        const outcome = try self.applyPreparedNativeOwnerEffect(prepared, replay);
         if (self.backend_runtime.io()) |io| self.native_index_build_cache.evict(io);
         return outcome;
     }
@@ -8781,7 +8799,7 @@ pub const DB = struct {
         defer page.deinit();
         var prepared: native_index_control.PreparedReleaseGc = .{ .alloc = alloc, .command = page.command };
         defer prepared.deinit();
-        return self.applyPreparedNativeIndexEffect(&prepared, null) catch |err| {
+        return self.applyPreparedNativeOwnerEffect(&prepared, null) catch |err| {
             if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
@@ -8823,7 +8841,40 @@ pub const DB = struct {
 
     /// Preparation owns its off-lock payload; only its bounded effect stages
     /// under apply-exclusive, together with the transport marker and outbox.
-    fn applyPreparedNativeIndexEffect(self: *DB, prepared: anytype, replay: ?NativeIndexReplay) !@TypeOf(prepared.*).ApplyOutcome {
+    pub const NativeSchemaOwnerControl = @import("relational_schema_owner_control.zig");
+
+    /// Trusted owner adapter, not ordinary RPC/batch admission. The receiving
+    /// service authenticates metadata/root/cohort and capability authority.
+    pub fn prepareNativeSchemaOwnerControl(self: *DB, command: NativeSchemaOwnerControl.Command, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
+        return NativeSchemaOwnerControl.Prepared.init(self.alloc, self.core, command, context);
+    }
+
+    pub fn applyPreparedNativeSchemaOwnerControl(self: *DB, prepared: *NativeSchemaOwnerControl.Prepared, replay: ?NativeIndexReplay) !NativeSchemaOwnerControl.Outcome {
+        return self.applyPreparedNativeOwnerEffect(prepared, replay);
+    }
+
+    pub fn prepareNativeSchemaOwnerPage(self: *DB, binding: @import("relational_nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
+        return NativeSchemaOwnerControl.Prepared.preparePage(self.alloc, self.core, binding, budget, context);
+    }
+
+    /// Called only by committed standby ingress, preserving the native owner
+    /// clock separately from the journal's LSN. Never accepted as a row batch.
+    pub fn applyReplicatedSchemaOwnerControl(self: *DB, record: @import("replication_record.zig").RecordView) !void {
+        if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.lsn == 0) return error.InvalidSchemaOwnerControl;
+        const frame = try NativeSchemaOwnerControl.Frame.decode(record.payload);
+        if (record.table_id != frame.position.namespace.table_id or record.shard_id != frame.position.namespace.shard_id or
+            !frame.position.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        if (try self.replicationMutationAlreadyApplied(record.lsn)) return;
+        var prepared = self.prepareNativeSchemaOwnerControl(frame.command, .{}) catch |err| {
+            if (try self.replicationMutationAlreadyApplied(record.lsn)) return;
+            return err;
+        };
+        defer prepared.deinit();
+        _ = try self.applyPreparedNativeSchemaOwnerControl(&prepared, .{ .position = frame.position, .lsn = record.lsn });
+    }
+
+    fn applyPreparedNativeOwnerEffect(self: *DB, prepared: anytype, replay: ?NativeIndexReplay) !@TypeOf(prepared.*).ApplyOutcome {
+        const metadata_control = comptime if (@hasDecl(@TypeOf(prepared.*), "metadata_control")) @TypeOf(prepared.*).metadata_control else false;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try prepared.validate();
         if (!prepared.namespace().eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
@@ -8831,22 +8882,31 @@ pub const DB = struct {
             if (value.lsn == 0) return error.InvalidControlReceiptPosition;
             try prepared.validateReplay(value.position);
         }
+        const selected_mirror = if (metadata_control) self.local_execution.replication_async_metadata_mirror else self.local_execution.replication_async_batch_mirror;
+        const other_mirror = if (metadata_control) self.local_execution.replication_async_batch_mirror else self.local_execution.replication_async_metadata_mirror;
+        if (metadata_control and replay == null and selected_mirror != null and other_mirror != null) {
+            const selected = selected_mirror.?;
+            const other = other_mirror.?;
+            if (selected.publisher.ptr != other.publisher.ptr or selected.publisher.vtable != other.publisher.vtable or
+                selected.mutation_barrier != other.mutation_barrier or selected.transition_mutex != other.transition_mutex)
+                return error.ConflictingReplicationPublishers;
+        }
         // Recovering an old outbox may wait for a standby/checkpoint capture.
         // Do not hold the shared mutation lease across that completion wait.
         // No new native effect has started; recheck write authority once the
         // lease is acquired below, and again under apply-exclusive.
         if (replay == null) {
-            try self.enforceReplicationWriteGate();
             try self.ensureDurableReplicationStartupBarrier();
+            try self.enforceReplicationWriteGate();
             try self.flushDurableReplicationOutboxes();
         }
         var replication_mutation = if (replay == null) self.acquireReplicationMutationShared() else null;
         defer if (replication_mutation) |*lease| lease.release();
-        const mirrored = replay == null and self.local_execution.replication_async_batch_mirror != null;
+        const mirrored = replay == null and selected_mirror != null;
         if (replay == null) {
             try self.enforceReplicationWriteGate();
-            try self.preflightReplicationBatchSyncCommit();
-            if (self.local_execution.replication_async_metadata_mirror != null and !mirrored) return error.ReplicationPublisherUnavailable;
+            if (metadata_control) try self.preflightReplicationMetadataSyncCommit() else try self.preflightReplicationBatchSyncCommit();
+            if (other_mirror != null and !mirrored) return error.ReplicationPublisherUnavailable;
             if (mirrored) try prepared.preparePayload();
         }
         var outcome: @TypeOf(prepared.*).ApplyOutcome = undefined;
@@ -8874,30 +8934,49 @@ pub const DB = struct {
                         prepared: @TypeOf(prepared),
                         replay: ?NativeIndexReplay,
                         mirrored: bool,
-                        pub fn stage(participant: @This(), txn: anytype, installed: @import("relational_index_validation.zig").Installed) !void {
+                        pub fn validateBefore(_: @This(), _: anytype) !void {}
+                        pub fn stage(participant: @This(), txn: anytype, installed: if (@hasDecl(@TypeOf(prepared.*), "SchemaRecord")) @TypeOf(prepared.*).SchemaRecord else @import("relational_index_validation.zig").Installed) !void {
+                            const position = if (comptime metadata_control) installed.updated.native else installed.position;
                             if (participant.replay) |value| {
+                                if (!std.meta.eql(position, value.position)) return error.InvalidControlReceiptPosition;
                                 var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
                                 const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
                                 try txn.put(marker.key, marker.value);
                             }
-                            if (participant.mirrored) try participant.db.stageRestoreStagingReplicationOutbox(txn, try participant.prepared.finalizePayload(installed.position));
+                            if (participant.mirrored) {
+                                const payload = try participant.prepared.finalizePayload(position);
+                                if (metadata_control) try participant.db.stageSchemaOwnerReplicationOutbox(txn, payload) else try participant.db.stageRestoreStagingReplicationOutbox(txn, payload);
+                                // Set before releasing apply: ordinary rows
+                                // and other owner effects must not overtake a
+                                // committed but not yet appended control.
+                                participant.db.async_context.primary_replication_append_pending.store(true, .release);
+                            }
                         }
                     };
                     outcome = try prepared.commitSchema(self.core, if (replay) |value| value.position else null, SchemaParticipant{ .db = self, .prepared = prepared, .replay = replay, .mirrored = mirrored });
-                } else outcome = try self.stagePreparedNativeIndexTransaction(prepared, replay, mirrored);
-            } else outcome = try self.stagePreparedNativeIndexTransaction(prepared, replay, mirrored);
+                } else outcome = try self.stagePreparedNativeOwnerTransaction(prepared, replay, mirrored);
+            } else outcome = try self.stagePreparedNativeOwnerTransaction(prepared, replay, mirrored);
         }
         // Snapshot/commit barriers must not be held across publication or an
         // acknowledgement wait. A committed outbox remains an explicit pending
         // result, not an ambiguous rollback-looking API error.
         if (replication_mutation) |*lease| lease.release();
         replication_mutation = null;
-        if (mirrored) self.flushDurableReplicationOutboxes() catch |err| {
-            outcome.replication_pending = true;
-            outcome.error_name = @errorName(err);
-            self.scheduleDurableReplicationOutboxRecovery();
-            return outcome;
-        };
+        if (mirrored) {
+            // Each flush is bounded. The final empty observation, under apply,
+            // clears the shared append gate without holding a mutation lease
+            // across publication/acknowledgement waits. Failed staging can
+            // leave a harmless false positive which the same scan clears.
+            while (true) {
+                self.flushDurableReplicationOutboxes() catch |err| {
+                    outcome.replication_pending = true;
+                    outcome.error_name = @errorName(err);
+                    self.scheduleDurableReplicationOutboxRecovery();
+                    return outcome;
+                };
+                if (!self.async_context.primary_replication_append_pending.load(.acquire)) break;
+            }
+        }
         if (replay == null and prepared.hasPublicationReceipt()) {
             var txn = self.core.store.beginReadTxn() catch |err| {
                 outcome.error_name = @errorName(err);
@@ -8915,7 +8994,8 @@ pub const DB = struct {
     /// Caller holds snapshot/replay admission and apply-exclusive. Ordinary
     /// effects and already-installed retries share the same atomic marker and
     /// outbox path; new schema installation uses the shared writer above.
-    fn stagePreparedNativeIndexTransaction(self: *DB, prepared: anytype, replay: ?NativeIndexReplay, mirrored: bool) !@TypeOf(prepared.*).ApplyOutcome {
+    fn stagePreparedNativeOwnerTransaction(self: *DB, prepared: anytype, replay: ?NativeIndexReplay, mirrored: bool) !@TypeOf(prepared.*).ApplyOutcome {
+        const metadata_control = comptime if (@hasDecl(@TypeOf(prepared.*), "metadata_control")) @TypeOf(prepared.*).metadata_control else false;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         if (replay) |value| {
@@ -8932,7 +9012,11 @@ pub const DB = struct {
             const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
             try txn.put(marker.key, marker.value);
         }
-        if (mirrored and !outcome.duplicate) try self.stageRestoreStagingReplicationOutbox(&txn, try prepared.finalizePayload(outcome.position));
+        if (mirrored and !outcome.duplicate) {
+            const payload = try prepared.finalizePayload(outcome.position);
+            if (metadata_control) try self.stageSchemaOwnerReplicationOutbox(&txn, payload) else try self.stageRestoreStagingReplicationOutbox(&txn, payload);
+            self.async_context.primary_replication_append_pending.store(true, .release);
+        }
         try txn.commit();
         return outcome;
     }
@@ -23233,9 +23317,9 @@ pub const DB = struct {
             null;
         defer if (prepared_recovery) |*prepared| prepared.deinit();
 
+        try self.ensureDurableReplicationStartupBarrier();
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
-        try self.ensureDurableReplicationStartupBarrier();
         try self.enforceReplicationWriteGate();
         try self.preflightReplicationMetadataSyncCommit();
         const durable_replication_schema_payload = if (self.local_execution.replication_async_metadata_mirror) |mirror|
@@ -23941,9 +24025,9 @@ pub const DB = struct {
             null;
         defer if (prepared_recovery) |*prepared| prepared.deinit();
 
+        try self.ensureDurableReplicationStartupBarrier();
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
-        try self.ensureDurableReplicationStartupBarrier();
         try self.enforceReplicationWriteGate();
         try self.preflightReplicationMetadataSyncCommit();
         const replication_schema_payload = if (self.local_execution.replication_async_metadata_mirror) |mirror|
@@ -37314,6 +37398,17 @@ pub const DB = struct {
     /// the applied-LSN capability. Recheck protected effects against this
     /// owner's immutable catalog; this is not an ordinary batch escape hatch.
     pub const validateLiveReplicationIntegrityEffects = local_mutation.validateLiveReplicationIntegrityEffects;
+
+    fn stageSchemaOwnerReplicationOutbox(self: *DB, txn: anytype, payload: []const u8) !void {
+        const mirror = self.local_execution.replication_async_metadata_mirror orelse return error.ReplicationPublisherUnavailable;
+        const from_lsn = mirror.publisher.nextLsn();
+        const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
+        defer self.alloc.free(encoded);
+        const outbox_key = try durableReplicationOutboxKeyAlloc(self.alloc, .metadata_control, from_lsn, self.core.root_generation, payload);
+        defer self.alloc.free(outbox_key);
+        try txn.put(outbox_key, encoded);
+        self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+    }
 
     fn stageRestoreStagingReplicationOutbox(self: *DB, txn: anytype, payload: ?[]const u8) !void {
         const bytes = payload orelse return;
