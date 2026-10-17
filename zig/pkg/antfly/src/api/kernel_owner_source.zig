@@ -3657,7 +3657,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Facts and generation come from the same applying lease. The receiver
     /// still independently obtains metadata permission, enrollment and current
     /// native ownership; this observation is not a signed publication receipt.
-    pub fn nativeSchemaOwnerObservationAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, context: request_operation.RequestContext) !RootedNativeSchemaOwnerObservation {
+    pub fn nativeSchemaOwnerObservationAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, context: request_operation.RequestContext) !RootedNativeSchemaOwnerObservation {
         try context.ensureActive();
         try binding.validate();
         if (binding.authority != .native or binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
@@ -3670,7 +3670,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// its already-loaded private root key, never from an ordinary request.
     /// Possession/signature is not enrollment or permission to publish. The
     /// metadata ACK transaction must independently revalidate both authorities.
-    pub fn attestNativeSchemaOwnerAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, expected: SchemaAttestation.NativeScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.Result {
+    pub fn attestNativeSchemaOwnerAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, expected: SchemaAttestation.NativeScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.Result {
         try context.ensureActive();
         try expected.requireBinding(binding);
         if (binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
@@ -3688,7 +3688,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// Callers retain this exact lease through signing, so a later route
     /// lookup cannot substitute the provenance of another physical owner.
-    fn observeSchemaAtLease(lease: *Lease, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, context: request_operation.RequestContext) !RootedNativeSchemaOwnerObservation {
+    fn observeSchemaAtLease(lease: *Lease, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, context: request_operation.RequestContext) !RootedNativeSchemaOwnerObservation {
         const normalized = try platformDeadlineContext(context);
         var cancellation = normalized.cancellation;
         const result = try lease.owner().nativeSchemaOwnerObservation(table_name, binding, .{

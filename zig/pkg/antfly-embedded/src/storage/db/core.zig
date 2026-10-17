@@ -1359,7 +1359,7 @@ pub const DBCore = struct {
         candidate: *const @import("relational_nullability_job.zig").Candidate,
     ) !PreparedSchemaMetadata {
         const job = @import("relational_nullability_job.zig");
-        try binding.requireCandidate(candidate);
+        try job.requireCandidate(binding, candidate);
         if (!binding.fence.namespace.eql(self.identity_namespace)) return error.IdentityNamespaceMismatch;
         const ready_cut = blk: {
             var txn = try self.store.beginReadTxn();

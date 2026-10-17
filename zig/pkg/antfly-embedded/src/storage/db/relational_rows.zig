@@ -146,21 +146,7 @@ pub const NullabilityResume = struct { projection_identity: [32]u8, after: []con
 
 /// A bounded replay assertion, never proof of coverage by itself. The reader
 /// independently visits the prefix and compares every field before advancing.
-pub const NullabilityReplayBoundary = struct {
-    records_examined: usize,
-    rows_examined: usize,
-    violation_column: ?usize,
-    after: []const u8,
-    more: bool,
-
-    pub fn validate(self: @This()) !void {
-        if (self.records_examined > 65_536 or self.rows_examined > self.records_examined or
-            (self.more and self.records_examined == 0) or (!self.more and self.records_examined >= 65_536) or
-            self.after.len > row_cursor_codec.max_key_bytes or
-            (self.violation_column != null and (self.violation_column.? >= nullability.max_columns or self.rows_examined == 0 or !self.more)))
-            return error.InvalidNullabilityReplay;
-    }
-};
+pub const NullabilityReplayBoundary = @import("relational_schema_owner_contract.zig").NullabilityReplayBoundary;
 
 test "relational rows snapshot exact point successor comparison handles descending suffixes without allocation" {
     try std.testing.expect(Reader.exclusiveSuccessor("abc", "abd"));

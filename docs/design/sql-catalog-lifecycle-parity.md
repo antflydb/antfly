@@ -11619,3 +11619,45 @@ closed until an ordered schema-control envelope is supported. Metadata plan
 admission/ACK acceptance, adoption, all-owner publication/release and read-layout
 retirement qualification also remain unfinished. No public SQL path is switched
 to this private adapter and no source case is reclassified for its coverage.
+
+### Decoder-only schema controls and position-free Raft transport
+
+The corrected compiled owner-source checkpoint passed all 47 tests with zero
+skips/leaks and 49/49 build steps in
+`/private/tmp/antfly-sql-schema-raft-owner-source-debug.log`.
+
+Schema binding, durable ASVJ header, ASVP bounded page descriptor, ASVI input
+framing, replay boundary and native observation now belong to one data-only
+`relational_schema_owner_contract` module. The physical job/row/native adapters
+reuse those exact types and codecs; transaction-bound candidate compilation and
+catalog/namespace checks remain functions of the physical job engine. Column
+and framing bounds have a single source. Existing native observation clients
+and schema attestation consume the contract types rather than importing the
+execution adapter. This extraction changes neither the existing native wire
+fields nor the private compiled-owner ABI version.
+
+ASVR v1 transports Raft schema commands as a bounded canonical descriptor plus
+raw immutable payload and checksum. It carries no term/index, physical root,
+publication flag or request-selected commit position. Decoding is allocation
+free with bounded stack scratch; only the payload borrows the input. Prepare
+must own retained bytes before that transport buffer is released. Native ASVC
+frames and Raft commands remain distinct; an authority-domain mismatch cannot
+be repaired by choosing another encoder.
+
+The native/Raft and authority Debug gate passes 49 tests, zero skips/leaks and
+70/70 build steps in `/private/tmp/antfly-sql-schema-control-contract-debug.log`.
+The Raft follower fixture now round-trips every control through ASVR, frees its
+wire buffer before apply, and still independently replays validation pages.
+It also rejects altered checksums, oversized lengths even with a recomputed
+checksum, noncanonical descriptors and cross-domain frames. Existing native
+journal recovery, schema installation, root proof and runtime status tests
+remain in that gate. Extraction compilation initially caught one physical
+method caller and a nested/global descriptor name collision; both are fixed
+without adding storage dependencies back to decoding.
+
+Final compiled owner-source and full Debug SQL verification is tracked in
+`/private/tmp/antfly-sql-schema-contract-source-sql-debug.log`. The compiled
+owner mutation port, committed-entry ingress, capability/decoder admission,
+durable metadata plan/ACK acceptance, adoption and coordinated publication and
+release are still required. ASVR decoding is not metadata authorization or
+public feature activation. The original parity inventory remains unchanged.

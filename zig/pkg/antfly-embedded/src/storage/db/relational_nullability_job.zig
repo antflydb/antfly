@@ -40,16 +40,12 @@ pub const key = "\x00\x00__metadata__:schema_validation_job:v1";
 pub const inputs_key = key ++ ":inputs";
 pub const cursor_key = key ++ ":cursor";
 const public_key = "\x00\x00__metadata__:schema_json";
-const max_schema = 2 * 1024 * 1024;
-const max_names = 1024 * 1024;
+const contract = @import("relational_schema_owner_contract.zig");
+const max_schema = contract.max_schema;
+const max_names = contract.max_names;
 const max_cursor = @import("relational_index_limits.zig").max_cursor_key_bytes;
-const max_header = 8192;
 
-pub fn hash(bytes: []const u8) Digest {
-    var result: Digest = undefined;
-    std.crypto.hash.Blake3.hash(bytes, &result, .{});
-    return result;
-}
+pub const hash = contract.hash;
 fn eq(a: Digest, b: Digest) bool {
     return std.mem.eql(u8, &a, &b);
 }
@@ -66,7 +62,7 @@ fn digestAt(txn: anytype, name: []const u8) !Digest {
 /// Owned immutable preparation. Compilation is outside serialized apply;
 /// admission checks exact bytes/hashes, not a caller's asserted column types.
 pub const Candidate = struct {
-    pub const max_input_bytes = 56 + 2 * max_schema + integrity.max_catalog_bytes + max_names;
+    pub const max_input_bytes = contract.max_input_bytes;
     alloc: A,
     inputs: []u8,
     native_before: []u8,
@@ -142,21 +138,7 @@ pub const Candidate = struct {
         try control.ensureActive();
         return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version };
     }
-    pub fn parts(bytes: []const u8) ![4][]const u8 {
-        if (bytes.len < 56 or bytes.len > max_input_bytes or !std.mem.eql(u8, bytes[0..8], "ASVI\x01\x00\x00\x00") or !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*))
-            return error.InvalidSchemaValidationJob;
-        var result: [4][]const u8 = undefined;
-        var offset: usize = 24;
-        const limits = [_]usize{ max_schema, max_schema, integrity.max_catalog_bytes, max_names };
-        for (&result, limits, 0..) |*part, limit, i| {
-            const length: usize = std.mem.readInt(u32, bytes[8 + 4 * i ..][0..4], .little);
-            if (length == 0 or length > limit or length > bytes.len - 32 - offset) return error.InvalidSchemaValidationJob;
-            part.* = bytes[offset..][0..length];
-            offset += length;
-        }
-        if (offset != bytes.len - 32) return error.InvalidSchemaValidationJob;
-        return result;
-    }
+    pub const parts = contract.inputParts;
     pub fn load(a: A, txn: anytype, binding: Binding, control: projection.Control) !Candidate {
         const raw = (try optional(txn, inputs_key)) orelse return error.SchemaValidationJobRequired;
         if (!eq(hash(raw), binding.inputs)) return error.SchemaValidationJobChanged;
@@ -165,198 +147,65 @@ pub const Candidate = struct {
         defer names.deinit();
         var result = try init(a, binding.fence.namespace.table_id, view[0], view[1], view[2], names.value, control);
         errdefer result.deinit();
-        try binding.requireCandidate(&result);
+        try requireCandidate(binding, &result);
         return result;
     }
 };
 
-pub const Binding = struct {
-    id: [16]u8,
-    plan_digest: Digest,
-    owner: Digest,
-    fence: topology.Fence,
-    authority: authority.Kind,
-    before_version: u32,
-    after_version: u32,
-    columns: u16,
-    before_schema: Digest,
-    after_schema: Digest,
-    before_public: Digest,
-    after_public: Digest,
-    after_catalog: Digest,
-    physical_catalog: Digest,
-    inputs: Digest,
-    projection_identity: Digest,
+pub const Binding = contract.Binding;
 
-    pub fn validate(self: Binding) !void {
-        _ = try self.fence.encode();
-        if (self.fence.role != .schema_validation or self.fence.owner_group_id != self.fence.peer_group_id or
-            self.fence.namespace.shard_id == 0 or self.fence.namespace.range_id == 0 or
-            self.columns == 0 or self.columns > projection.max_columns or std.mem.allEqual(u8, &self.id, 0) or
-            self.after_version != (std.math.add(u32, self.before_version, 1) catch return error.InvalidSchemaValidationJob))
-            return error.InvalidSchemaValidationJob;
-        inline for (.{ "plan_digest", "owner", "before_schema", "after_schema", "before_public", "after_public", "after_catalog", "physical_catalog", "inputs", "projection_identity" }) |field|
-            if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidSchemaValidationJob;
-    }
-    pub fn prepare(txn: anytype, candidate: *const Candidate, id: [16]u8, plan_digest: Digest, fence: topology.Fence, kind: authority.Kind) !Binding {
-        const parts = try Candidate.parts(candidate.inputs);
-        const result: Binding = .{
-            .id = id,
-            .plan_digest = plan_digest,
-            .fence = fence,
-            .authority = kind,
-            .owner = try activation.ownership(txn),
-            .before_version = candidate.before_version,
-            .after_version = candidate.after_version,
-            .columns = @intCast(candidate.plan.names.len),
-            .before_schema = hash(candidate.native_before),
-            .after_schema = hash(candidate.native_after),
-            .before_public = hash(parts[0]),
-            .after_public = hash(parts[1]),
-            .after_catalog = hash(candidate.catalog_after),
-            .physical_catalog = try digestAt(txn, physical.head_key),
-            .inputs = hash(candidate.inputs),
-            .projection_identity = candidate.plan.identity,
-        };
-        try result.validate();
-        try result.requireCurrent(txn);
-        return result;
-    }
-    pub fn requireCandidate(self: Binding, candidate: *const Candidate) !void {
-        try self.validate();
-        const parts = try Candidate.parts(candidate.inputs);
-        if (self.before_version != candidate.before_version or self.after_version != candidate.after_version or
-            self.columns != candidate.plan.names.len or !eq(self.projection_identity, candidate.plan.identity) or
-            !eq(self.inputs, hash(candidate.inputs)) or !eq(self.before_schema, hash(candidate.native_before)) or
-            !eq(self.after_schema, hash(candidate.native_after)) or !eq(self.before_public, hash(parts[0])) or
-            !eq(self.after_public, hash(parts[1])) or !eq(self.after_catalog, hash(candidate.catalog_after)) or
-            !eq(self.fence.catalog_digest, hash(parts[2]))) return error.SchemaValidationJobChanged;
-    }
-    fn requireNamespace(self: Binding, txn: anytype) !void {
-        const actual = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
-        if (!actual.eql(self.fence.namespace)) return error.IdentityNamespaceMismatch;
-        _ = try authority.require(txn, self.authority, @import("online_source_contract.zig").namespaceBytes(actual));
-    }
-    fn requireCurrent(self: Binding, txn: anytype) !void {
-        try self.requireNamespace(txn);
-        if (!eq(self.owner, try activation.ownership(txn)) or !eq(self.before_schema, try digestAt(txn, schema.schema_key)) or
-            !eq(self.before_public, try digestAt(txn, public_key)) or !eq(self.fence.catalog_digest, try digestAt(txn, integrity.key)) or
-            !eq(self.physical_catalog, try digestAt(txn, physical.head_key))) return error.SchemaValidationJobChanged;
-    }
-};
-
-pub const Phase = enum { fencing, scanning, ready, failed, canceling, canceled, installed };
-/// Durable local installation evidence, not a signed publication receipt.
-/// The outer owner must authenticate decision/root/cohort authority before
-/// staging this record and commit its replay marker/outbox in the same txn.
-pub const Installation = struct {
-    decision: Digest,
-    ready_digest: Digest,
-    ready_position: positions.Position,
-    ready_last_effect: Digest,
-    physical_catalog: Digest,
-    activation: Digest,
-    position: positions.Position,
-};
-pub const Header = struct {
-    binding: Binding,
-    phase: Phase,
-    admitted: ?positions.Position,
-    frozen: ?positions.Position = null,
-    updated: positions.Position,
-    revision: u64 = 1,
-    records: u64 = 0,
-    rows_scanned: u64 = 0,
-    cursor_digest: Digest,
-    chain: Digest,
-    last_effect: Digest,
-    failure_column: ?u16 = null,
-    installation: ?Installation = null,
-
-    pub fn validate(self: Header) !void {
-        try self.binding.validate();
-        inline for (.{ "cursor_digest", "chain", "last_effect" }) |field|
-            if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidSchemaValidationJob;
-        if (self.revision == 0 or self.rows_scanned > self.records or
-            (self.phase == .failed) != (self.failure_column != null) or
-            (self.failure_column != null and self.failure_column.? >= self.binding.columns) or
-            (self.phase != .canceling and self.phase != .canceled and self.admitted == null) or
-            (self.frozen != null and self.admitted == null) or
-            (self.phase == .installed) != (self.installation != null)) return error.InvalidSchemaValidationJob;
-        if (self.phase == .fencing and (self.frozen != null or self.records != 0 or self.rows_scanned != 0 or !eq(self.cursor_digest, hash(""))))
-            return error.InvalidSchemaValidationJob;
-        if ((self.phase == .scanning or self.phase == .ready or self.phase == .failed or self.phase == .installed) and self.frozen == null) return error.InvalidSchemaValidationJob;
-        for ([_]?positions.Position{ self.admitted, self.frozen, self.updated }) |maybe| if (maybe) |position| {
-            try position.requireNamespace(self.binding.fence.namespace);
-            if ((position == .native) != (self.binding.authority == .native)) return error.InvalidControlReceiptPosition;
-            try precedesOrEqual(position, self.updated);
-        };
-        if (self.frozen) |cut| try precedes(self.admitted.?, cut);
-        if (self.installation) |installed| {
-            inline for (.{ "decision", "ready_digest", "ready_last_effect", "physical_catalog", "activation" }) |field|
-                if (std.mem.allEqual(u8, &@field(installed, field), 0)) return error.InvalidSchemaValidationJob;
-            if (!std.meta.eql(installed.position, self.updated)) return error.InvalidControlReceiptPosition;
-            try precedes(installed.ready_position, installed.position);
-            // Installation preserves the exact validation predecessor rather
-            // than adopting an opaque digest beside unrelated row counters.
-            var predecessor = self;
-            predecessor.phase = .ready;
-            predecessor.installation = null;
-            predecessor.updated = installed.ready_position;
-            predecessor.last_effect = installed.ready_last_effect;
-            predecessor.revision = std.math.sub(u64, self.revision, 1) catch return error.InvalidSchemaValidationJob;
-            if (predecessor.revision == 0) return error.InvalidSchemaValidationJob;
-            try precedesOrEqual(predecessor.frozen.?, predecessor.updated);
-            if (!eq(try predecessor.digest(), installed.ready_digest)) return error.InvalidSchemaValidationJob;
-        }
-    }
-    pub fn encode(self: Header, a: A) ![]u8 {
-        try self.validate();
-        var body: [max_header]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&body);
-        try std.json.Stringify.value(self, .{}, &writer);
-        const json = writer.buffered();
-        const bytes = try a.alloc(u8, 12 + json.len + 32);
-        @memcpy(bytes[0..8], "ASVJ\x01\x00\x00\x00");
-        std.mem.writeInt(u32, bytes[8..12], @intCast(json.len), .little);
-        @memcpy(bytes[12..][0..json.len], json);
-        @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
-        return bytes;
-    }
-    pub fn decode(bytes: []const u8) !Header {
-        if (bytes.len < 44 or bytes.len > 44 + max_header or !std.mem.eql(u8, bytes[0..8], "ASVJ\x01\x00\x00\x00") or
-            std.mem.readInt(u32, bytes[8..12], .little) != bytes.len - 44 or !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*))
-            return error.InvalidSchemaValidationJob;
-        var scratch: [64 * 1024]u8 = undefined;
-        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
-        const result = std.json.parseFromSliceLeaky(Header, fixed.allocator(), bytes[12 .. bytes.len - 32], .{}) catch return error.InvalidSchemaValidationJob;
-        try result.validate();
-        var canonical: [max_header]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&canonical);
-        try std.json.Stringify.value(result, .{}, &writer);
-        if (!std.mem.eql(u8, writer.buffered(), bytes[12 .. bytes.len - 32])) return error.InvalidSchemaValidationJob;
-        return result;
-    }
-    pub fn digest(self: Header) !Digest {
-        var buffer: [max_header]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buffer);
-        try std.json.Stringify.value(self, .{}, &writer);
-        return hash(writer.buffered());
-    }
-};
-
-fn precedesOrEqual(a: positions.Position, b: positions.Position) !void {
-    if (a == .native and b == .native) {
-        if (!a.native.namespace.eql(b.native.namespace) or a.native.sequence > b.native.sequence) return error.InvalidControlReceiptPosition;
-    } else if (a == .raft and b == .raft) {
-        if (a.raft.index > b.raft.index or a.raft.term > b.raft.term or (a.raft.index == b.raft.index and a.raft.term != b.raft.term))
-            return error.InvalidControlReceiptPosition;
-    } else return error.InvalidControlReceiptPosition;
+pub fn prepareBinding(txn: anytype, candidate: *const Candidate, id: [16]u8, plan_digest: Digest, fence: topology.Fence, kind: authority.Kind) !Binding {
+    const parts = try Candidate.parts(candidate.inputs);
+    const result: Binding = .{
+        .id = id,
+        .plan_digest = plan_digest,
+        .fence = fence,
+        .authority = kind,
+        .owner = try activation.ownership(txn),
+        .before_version = candidate.before_version,
+        .after_version = candidate.after_version,
+        .columns = @intCast(candidate.plan.names.len),
+        .before_schema = hash(candidate.native_before),
+        .after_schema = hash(candidate.native_after),
+        .before_public = hash(parts[0]),
+        .after_public = hash(parts[1]),
+        .after_catalog = hash(candidate.catalog_after),
+        .physical_catalog = try digestAt(txn, physical.head_key),
+        .inputs = hash(candidate.inputs),
+        .projection_identity = candidate.plan.identity,
+    };
+    try result.validate();
+    try requireCurrent(result, txn);
+    return result;
 }
-fn precedes(a: positions.Position, b: positions.Position) !void {
-    try precedesOrEqual(a, b);
-    if (std.meta.eql(a, b)) return error.InvalidControlReceiptPosition;
+pub fn requireCandidate(self: Binding, candidate: *const Candidate) !void {
+    try self.validate();
+    const parts = try Candidate.parts(candidate.inputs);
+    if (self.before_version != candidate.before_version or self.after_version != candidate.after_version or
+        self.columns != candidate.plan.names.len or !eq(self.projection_identity, candidate.plan.identity) or
+        !eq(self.inputs, hash(candidate.inputs)) or !eq(self.before_schema, hash(candidate.native_before)) or
+        !eq(self.after_schema, hash(candidate.native_after)) or !eq(self.before_public, hash(parts[0])) or
+        !eq(self.after_public, hash(parts[1])) or !eq(self.after_catalog, hash(candidate.catalog_after)) or
+        !eq(self.fence.catalog_digest, hash(parts[2]))) return error.SchemaValidationJobChanged;
 }
+fn requireNamespace(self: Binding, txn: anytype) !void {
+    const actual = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+    if (!actual.eql(self.fence.namespace)) return error.IdentityNamespaceMismatch;
+    _ = try authority.require(txn, self.authority, @import("online_source_contract.zig").namespaceBytes(actual));
+}
+fn requireCurrent(self: Binding, txn: anytype) !void {
+    try requireNamespace(self, txn);
+    if (!eq(self.owner, try activation.ownership(txn)) or !eq(self.before_schema, try digestAt(txn, schema.schema_key)) or
+        !eq(self.before_public, try digestAt(txn, public_key)) or !eq(self.fence.catalog_digest, try digestAt(txn, integrity.key)) or
+        !eq(self.physical_catalog, try digestAt(txn, physical.head_key))) return error.SchemaValidationJobChanged;
+}
+
+pub const Phase = contract.Phase;
+pub const Installation = contract.Installation;
+pub const Header = contract.Header;
+
+const precedesOrEqual = contract.precedesOrEqual;
+const precedes = contract.precedes;
 pub fn load(txn: anytype) !?Header {
     return if (try optional(txn, key)) |bytes| try Header.decode(bytes) else null;
 }
@@ -366,7 +215,7 @@ fn save(a: A, txn: anytype, header: Header) !void {
     try txn.put(key, bytes);
 }
 fn requireCommitted(txn: anytype, header: Header) !void {
-    try header.binding.requireNamespace(txn);
+    try requireNamespace(header.binding, txn);
     const actual: positions.Position = if (header.binding.authority == .native)
         .{ .native = .{ .namespace = header.binding.fence.namespace, .sequence = (try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(header.binding.fence.namespace))).sequence } }
     else blk: {
@@ -377,7 +226,7 @@ fn requireCommitted(txn: anytype, header: Header) !void {
     try precedesOrEqual(header.updated, actual);
 }
 fn nextPosition(txn: anytype, binding: Binding, entry: ?receipts.OrderedApplyReceipt) !positions.Position {
-    try binding.requireNamespace(txn);
+    try requireNamespace(binding, txn);
     if (binding.authority == .native) {
         if (entry != null) return error.InvalidControlReceiptPosition;
         return .{ .native = .{ .namespace = binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), null) } };
@@ -392,7 +241,7 @@ fn nextPosition(txn: anytype, binding: Binding, entry: ?receipts.OrderedApplyRec
 pub fn requireActive(txn: anytype, fence: topology.Fence) !void {
     const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
     if (!header.binding.fence.eql(fence) or header.phase == .canceled) return error.SchemaValidationJobChanged;
-    try header.binding.requireNamespace(txn);
+    try requireNamespace(header.binding, txn);
 }
 pub fn requireFencing(txn: anytype, fence: topology.Fence) !void {
     try requireActive(txn, fence);
@@ -422,12 +271,12 @@ fn workHeader(txn: anytype, binding: Binding) !Header {
 pub fn requireReady(txn: anytype, binding: Binding) !Header {
     const header = try workHeader(txn, binding);
     if (header.phase != .ready) return error.SchemaValidationNotReady;
-    try binding.requireCurrent(txn);
+    try requireCurrent(binding, txn);
     return header;
 }
 
 fn requireSuccessor(a: A, txn: anytype, binding: Binding, installed: Installation) !void {
-    try binding.requireNamespace(txn);
+    try requireNamespace(binding, txn);
     if (!eq(binding.owner, try activation.ownership(txn)) or
         !eq(binding.after_schema, try digestAt(txn, schema.schema_key)) or
         !eq(binding.after_public, try digestAt(txn, public_key)) or
@@ -503,8 +352,8 @@ pub fn observe(a: A, txn: anytype, binding: Binding) !Header {
 
 pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candidate, entry: ?receipts.OrderedApplyReceipt) !Header {
     try binding.validate();
-    try binding.requireCandidate(candidate);
-    try binding.requireCurrent(txn);
+    try requireCandidate(binding, candidate);
+    try requireCurrent(binding, txn);
     if (try load(txn)) |prior| {
         try requireCommitted(txn, prior);
         if (std.meta.eql(prior.binding, binding)) {
@@ -524,7 +373,7 @@ pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candid
 }
 pub fn stageFrozen(a: A, txn: anytype, manager: *transactions.TxnManager, binding: Binding, entry: ?receipts.OrderedApplyReceipt) !Header {
     var header = try workHeader(txn, binding);
-    try binding.requireCurrent(txn);
+    try requireCurrent(binding, txn);
     try topology.requireDrained(txn, manager, binding.fence);
     if (header.frozen != null) return header;
     if (header.phase != .fencing) return error.SchemaValidationJobChanged;
@@ -541,78 +390,7 @@ pub fn stageFrozen(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
 /// Bounded transport command. Cursor bytes remain binary rather than passing
 /// through JSON/UTF-8. Decoding is structural only: replay must independently
 /// execute the prefix before any result is eligible for transactional apply.
-pub const PageCommand = struct {
-    binding: Binding,
-    expected: Digest,
-    boundary: rows.NullabilityReplayBoundary,
-    pub const max_wire_bytes = 48 + max_header + max_cursor;
-    const Descriptor = struct {
-        binding: Binding,
-        expected: Digest,
-        records: usize,
-        rows: usize,
-        violation: ?usize,
-        more: bool,
-    };
-    pub fn validate(self: @This()) !void {
-        try self.binding.validate();
-        try self.boundary.validate();
-        if (std.mem.allEqual(u8, &self.expected, 0) or
-            (self.boundary.violation_column != null and self.boundary.violation_column.? >= self.binding.columns)) return error.InvalidSchemaValidationPageCommand;
-    }
-    pub fn effect(self: @This()) !Digest {
-        try self.validate();
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("schema-validation-page/v1");
-        state.update(&self.expected);
-        state.update(&hash(self.boundary.after));
-        var numbers: [25]u8 = undefined;
-        std.mem.writeInt(u64, numbers[0..8], self.boundary.rows_examined, .little);
-        std.mem.writeInt(u64, numbers[8..16], self.boundary.records_examined, .little);
-        std.mem.writeInt(u64, numbers[16..24], if (self.boundary.violation_column) |column| column else std.math.maxInt(u64), .little);
-        numbers[24] = @intFromBool(self.boundary.more);
-        state.update(&numbers);
-        var result: Digest = undefined;
-        state.final(&result);
-        return result;
-    }
-    pub fn encode(self: @This(), a: A) ![]u8 {
-        try self.validate();
-        const descriptor: Descriptor = .{ .binding = self.binding, .expected = self.expected, .records = self.boundary.records_examined, .rows = self.boundary.rows_examined, .violation = self.boundary.violation_column, .more = self.boundary.more };
-        var buffer: [max_header]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buffer);
-        try std.json.Stringify.value(descriptor, .{}, &writer);
-        const metadata = writer.buffered();
-        const bytes = try a.alloc(u8, 48 + metadata.len + self.boundary.after.len);
-        @memcpy(bytes[0..8], "ASVP\x01\x00\x00\x00");
-        std.mem.writeInt(u32, bytes[8..12], @intCast(metadata.len), .little);
-        std.mem.writeInt(u32, bytes[12..16], @intCast(self.boundary.after.len), .little);
-        @memcpy(bytes[16..][0..metadata.len], metadata);
-        @memcpy(bytes[16 + metadata.len ..][0..self.boundary.after.len], self.boundary.after);
-        @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
-        return bytes;
-    }
-    /// The returned cursor borrows bytes. All descriptor fields are owned
-    /// values; no JSON parser allocation or request arena escapes this call.
-    pub fn decode(bytes: []const u8) !@This() {
-        if (bytes.len < 48 or bytes.len > max_wire_bytes or !std.mem.eql(u8, bytes[0..8], "ASVP\x01\x00\x00\x00") or
-            !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*)) return error.InvalidSchemaValidationPageCommand;
-        const metadata_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
-        const cursor_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
-        if (metadata_len == 0 or metadata_len > max_header or cursor_len > max_cursor or metadata_len + cursor_len != bytes.len - 48)
-            return error.InvalidSchemaValidationPageCommand;
-        var buffer: [64 * 1024]u8 = undefined;
-        var scratch = std.heap.FixedBufferAllocator.init(&buffer);
-        const descriptor = std.json.parseFromSliceLeaky(Descriptor, scratch.allocator(), bytes[16..][0..metadata_len], .{}) catch return error.InvalidSchemaValidationPageCommand;
-        var canonical: [max_header]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&canonical);
-        try std.json.Stringify.value(descriptor, .{}, &writer);
-        if (!std.mem.eql(u8, writer.buffered(), bytes[16..][0..metadata_len])) return error.InvalidSchemaValidationPageCommand;
-        const result: @This() = .{ .binding = descriptor.binding, .expected = descriptor.expected, .boundary = .{ .records_examined = descriptor.records, .rows_examined = descriptor.rows, .violation_column = descriptor.violation, .more = descriptor.more, .after = bytes[16 + metadata_len ..][0..cursor_len] } };
-        try result.validate();
-        return result;
-    }
-};
+pub const PageCommand = contract.PageCommand;
 
 /// Trusted independently executed read preparation. Encoded page claims alone
 /// are never accepted by stagePage; transport receivers must use replay.
@@ -648,7 +426,7 @@ pub const PreparedPage = struct {
         };
         defer reader.deinit();
         const header = try workHeader(&reader.read, binding);
-        try binding.requireCurrent(&reader.read);
+        try requireCurrent(binding, &reader.read);
         if (header.phase != .scanning) return error.SchemaValidationJobChanged;
         if (replay_command) |expected| if (!eq(try header.digest(), expected.expected)) return error.SchemaValidationJobChanged;
         const raw_cursor = (try optional(&reader.read, cursor_key)) orelse return error.InvalidSchemaValidationJob;
@@ -687,7 +465,7 @@ pub fn stagePage(a: A, txn: anytype, manager: *transactions.TxnManager, prepared
     header.phase = if (header.failure_column != null) .failed else if (prepared.page.page.more) .scanning else .ready;
     // The terminal validation cut rechecks the complete immutable metadata
     // once. Intermediate pages use the fixed fence/epoch guards above.
-    if (header.phase == .ready) try binding.requireCurrent(txn);
+    if (header.phase == .ready) try requireCurrent(binding, txn);
     var chain = std.crypto.hash.Blake3.init(.{});
     chain.update(&header.chain);
     chain.update(&effect);
@@ -706,7 +484,7 @@ pub fn stagePage(a: A, txn: anytype, manager: *transactions.TxnManager, prepared
 /// release; generic topology cancellation stays unavailable.
 pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, binding: Binding, entry: ?receipts.OrderedApplyReceipt) !Header {
     try binding.validate();
-    try binding.requireNamespace(txn);
+    try requireNamespace(binding, txn);
     const previous = try load(txn);
     if (previous) |prior| {
         // Cancellation is terminal progress, not permission to repair an

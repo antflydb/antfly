@@ -18,8 +18,7 @@
 //! metadata owner; metadata rechecks that authority when accepting evidence.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const native = local.storage_db_relational_schema_owner_control;
-const job = local.storage_db_relational_nullability_job;
+const job = local.storage_db_relational_schema_owner_contract;
 const roots = @import("store_root_attestation.zig");
 const Digest = [32]u8;
 
@@ -29,7 +28,7 @@ pub const Proof = roots.ProofFor(
 );
 pub const RootedObservation = struct {
     root_generation: u64,
-    observation: native.Observation,
+    observation: job.NativeObservation,
 };
 
 fn hashValue(comptime domain: []const u8, value: anytype) !Digest {

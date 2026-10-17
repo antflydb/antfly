@@ -29,35 +29,9 @@ const Digest = [32]u8;
 pub const magic = "ASVC\x01\x00\x00\x00";
 const max_metadata = 8192;
 pub const max_wire_bytes = 81 + max_metadata + job.Candidate.max_input_bytes;
-pub const Action = enum { begin, freeze, page, cancel, install };
-
-pub const Command = struct {
-    binding: job.Binding,
-    action: Action,
-    /// Borrowed immutable ASVI inputs, ASVP page, or decision+ready digests.
-    payload: []const u8 = "",
-
-    pub fn validate(self: @This()) !void {
-        return self.validateFor(.native);
-    }
-    pub fn validateFor(self: @This(), authority: @FieldType(job.Binding, "authority")) !void {
-        try self.binding.validate();
-        if (self.binding.authority != authority) return error.InvalidControlReceiptPosition;
-        switch (self.action) {
-            .begin => {
-                _ = try job.Candidate.parts(self.payload);
-                if (!equal(job.hash(self.payload), self.binding.inputs)) return error.SchemaValidationJobChanged;
-            },
-            .page => {
-                const command = try job.PageCommand.decode(self.payload);
-                if (!std.meta.eql(command.binding, self.binding)) return error.SchemaValidationJobChanged;
-            },
-            .freeze, .cancel => if (self.payload.len != 0) return error.InvalidSchemaOwnerControl,
-            .install => if (self.payload.len != 64 or std.mem.allEqual(u8, self.payload[0..32], 0) or
-                std.mem.allEqual(u8, self.payload[32..64], 0)) return error.InvalidSchemaOwnerControl,
-        }
-    }
-};
+const contract = @import("relational_schema_owner_contract.zig");
+pub const Action = contract.Action;
+pub const Command = contract.Command;
 
 fn equal(a: Digest, b: Digest) bool {
     return std.mem.eql(u8, &a, &b);
@@ -113,7 +87,7 @@ pub const Payload = struct {
         return self.bytes;
     }
 };
-const Descriptor = struct { binding: job.Binding, action: Action };
+const Descriptor = contract.CommandDescriptor;
 pub const Frame = struct {
     command: Command,
     position: Native,
@@ -161,25 +135,7 @@ pub const Outcome = struct {
 
 /// Independently read local facts, never a signed receipt or metadata grant.
 /// Zero is an observed empty native clock, not a fabricated receipt position.
-pub const Observation = struct {
-    pub const max_wire_bytes = 32 * 1024;
-    binding: job.Binding,
-    physical_root_incarnation: u128,
-    sequence: u64,
-    header: ?job.Header,
-    replication_pending: bool,
-
-    pub fn validateFor(self: @This(), binding: job.Binding) !void {
-        try binding.validate();
-        if (binding.authority != .native or self.physical_root_incarnation == 0 or
-            !std.meta.eql(self.binding, binding)) return error.SchemaValidationJobChanged;
-        if (self.header) |header| {
-            try header.validate();
-            if (!std.meta.eql(header.binding, binding) or header.updated != .native or
-                header.updated.native.sequence > self.sequence) return error.SchemaValidationJobChanged;
-        }
-    }
-};
+pub const Observation = contract.NativeObservation;
 
 pub const Prepared = struct {
     pub const ApplyOutcome = Outcome;
@@ -219,7 +175,7 @@ pub const Prepared = struct {
             var names = try std.json.parseFromSlice([]const []const u8, a, parts[3], .{});
             defer names.deinit();
             self.candidate = try job.Candidate.init(a, command.binding.fence.namespace.table_id, parts[0], parts[1], parts[2], names.value, control(&context));
-            try command.binding.requireCandidate(&self.candidate.?);
+            try job.requireCandidate(command.binding, &self.candidate.?);
             self.command.payload = self.candidate.?.inputs;
         }
         var read = try core.store.beginReadTxn();

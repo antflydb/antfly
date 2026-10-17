@@ -52,7 +52,7 @@ const NullabilityJobFixture = struct {
         const identity = try db.relationalTopologyIdentity();
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        return job.Binding.prepare(&read, prepared, @splat(id), @splat(83), .{
+        return job.prepareBinding(&read, prepared, @splat(id), @splat(83), .{
             .admission_epoch = identity.next_epoch,
             .transition_id = id,
             .attempt = 1,
@@ -111,7 +111,15 @@ test "relational index system nullability job Raft committed controls preserve c
     const Entry = @import("apply_receipts.zig").OrderedApplyReceipt;
     const Driver = struct {
         fn apply(database: *db_mod.DB, command: controls.Command, entry: Entry) !void {
-            var prepared = try database.prepareRaftSchemaOwnerControl(command, .{});
+            var prepared = preparation: {
+                const bytes = try command.encodeRaft(alloc);
+                defer alloc.free(bytes);
+                const decoded = try controls.Command.decodeRaft(bytes);
+                try std.testing.expectEqualDeep(command, decoded);
+                // Destroy the transport buffer before apply. Preparation must
+                // own every candidate/page/install byte it retains.
+                break :preparation try database.prepareRaftSchemaOwnerControl(decoded, .{});
+            };
             defer prepared.deinit();
             try database.applyCommittedRaftSchemaOwnerControl(&prepared, F.namespace.shard_id, entry);
         }
@@ -143,6 +151,31 @@ test "relational index system nullability job Raft committed controls preserve c
         defer alloc.free(predecessor_row);
         const binding = try F.bindingFor(&primary, &candidate, 63, .raft);
         const begin: controls.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
+        {
+            const bytes = try begin.encodeRaft(alloc);
+            defer alloc.free(bytes);
+            try std.testing.expectError(error.InvalidSchemaOwnerControl, controls.Frame.decode(bytes));
+            bytes[bytes.len - 1] ^= 1;
+            try std.testing.expectError(error.InvalidSchemaOwnerControl, controls.Command.decodeRaft(bytes));
+            bytes[bytes.len - 1] ^= 1;
+            // Correct checksums do not make oversized lengths or alternate
+            // descriptor representations canonical or admissible.
+            const metadata_len = std.mem.readInt(u32, bytes[8..12], .little);
+            const alternate = try alloc.alloc(u8, bytes.len + 1);
+            defer alloc.free(alternate);
+            @memcpy(alternate[0..16], bytes[0..16]);
+            alternate[16] = ' ';
+            @memcpy(alternate[17..], bytes[16..]);
+            std.mem.writeInt(u32, alternate[8..12], metadata_len + 1, .little);
+            @memcpy(alternate[alternate.len - 32 ..], &F.job.hash(alternate[0 .. alternate.len - 32]));
+            try std.testing.expectError(error.InvalidSchemaOwnerControl, controls.Command.decodeRaft(alternate));
+            std.mem.writeInt(u32, bytes[12..16], std.math.maxInt(u32), .little);
+            @memcpy(bytes[bytes.len - 32 ..], &F.job.hash(bytes[0 .. bytes.len - 32]));
+            try std.testing.expectError(error.InvalidSchemaOwnerControl, controls.Command.decodeRaft(bytes));
+            var foreign = begin;
+            foreign.binding.authority = .native;
+            try std.testing.expectError(error.InvalidControlReceiptPosition, foreign.encodeRaft(alloc));
+        }
         try std.testing.expectError(error.InvalidControlReceiptPosition, primary.prepareNativeSchemaOwnerControl(begin, .{}));
         var admission = try primary.prepareRaftSchemaOwnerControl(begin, .{});
         defer admission.deinit();

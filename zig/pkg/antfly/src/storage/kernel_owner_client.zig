@@ -679,7 +679,7 @@ pub const Owner = struct {
         return parsed.value;
     }
 
-    pub fn nativeSchemaOwnerObservation(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_owner_control.Observation {
+    pub fn nativeSchemaOwnerObservation(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_owner_contract.NativeObservation {
         try binding.validate();
         var buffer: [8192]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
@@ -691,7 +691,7 @@ pub const Owner = struct {
             .binding_json = .fromSlice(writer.buffered()),
             .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
         }, &response.buffer));
-        const Observation = @import("antfly_local_sources").storage_db_relational_schema_owner_control.Observation;
+        const Observation = @import("antfly_local_sources").storage_db_relational_schema_owner_contract.NativeObservation;
         if (response.bytes().len == 0 or response.bytes().len > Observation.max_wire_bytes) return error.SchemaValidationJobChanged;
         var scratch: [128 * 1024]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&scratch);

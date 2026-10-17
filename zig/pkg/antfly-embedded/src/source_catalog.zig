@@ -479,6 +479,7 @@ pub const storage_db_relational_predicate = @import("storage/db/relational_predi
 pub const storage_db_relational_nullability = @import("storage/db/relational_nullability.zig");
 pub const storage_db_relational_nullability_job = @import("storage/db/relational_nullability_job.zig");
 pub const storage_db_relational_schema_owner_control = @import("storage/db/relational_schema_owner_control.zig");
+pub const storage_db_relational_schema_owner_contract = @import("storage/db/relational_schema_owner_contract.zig");
 pub const storage_db_relational_predicate_implication = @import("storage/db/relational_predicate_implication.zig");
 pub const storage_db_relational_rewrite_contract = @import("storage/db/relational_rewrite_contract.zig");
 pub const storage_db_relational_rewrite_manifest = @import("storage/db/relational_rewrite_manifest.zig");

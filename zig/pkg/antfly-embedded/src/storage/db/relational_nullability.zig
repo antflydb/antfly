@@ -22,7 +22,7 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const Allocator = std.mem.Allocator;
-pub const max_columns = 4096;
+pub const max_columns = @import("relational_schema_owner_contract.zig").max_columns;
 
 /// Borrowed execution checkpoint. Owners adapt their request cancellation,
 /// deadline and work budget here without pulling API/runtime ABI into decoding.
