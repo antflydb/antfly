@@ -26,6 +26,7 @@ import json
 import os
 import platform
 import random
+import re
 import shutil
 import statistics
 import subprocess
@@ -134,7 +135,7 @@ def first_result(argv, cwd, env):
     return elapsed
 
 
-def output_digest(argv, cwd, env, unordered=False):
+def output_digest(argv, cwd, env, unordered=False, statistics_output=False):
     # Correctness is checked outside timed/RSS measurements.
     with tempfile.TemporaryFile() as output:
         result = subprocess.run(
@@ -145,7 +146,31 @@ def output_digest(argv, cwd, env, unordered=False):
         output.seek(0)
         digest = hashlib.sha256()
         size = 0
-        if unordered:
+        stats = None
+        if statistics_output:
+            data = output.read()
+            rows, separator, summary = data.rpartition(b"\n\n")
+            if re.search(rb"(?m)^\d+ matches$", result.stderr):
+                rows, summary = data, result.stderr
+            elif separator:
+                rows += b"\n"
+            else:
+                rows, summary = data, result.stderr
+            stats = {}
+            for label in (
+                b"matches",
+                b"matched lines",
+                b"files contained matches",
+                b"files searched",
+                b"bytes searched",
+            ):
+                found = re.search(rb"(?m)^(\d+) " + label + rb"$", summary)
+                if not found:
+                    raise RuntimeError(f"missing statistic {label!r}: {summary!r}")
+                stats[label.decode()] = int(found[1])
+            digest.update(rows)
+            size = len(rows)
+        elif unordered:
             for line in sorted(output.readlines()):
                 digest.update(line)
                 size += len(line)
@@ -153,7 +178,12 @@ def output_digest(argv, cwd, env, unordered=False):
             while chunk := output.read(256 * 1024):
                 digest.update(chunk)
                 size += len(chunk)
-        return {"sha256": digest.hexdigest(), "bytes": size, "exit": result.returncode}
+        return {
+            "sha256": digest.hexdigest(),
+            "bytes": size,
+            "exit": result.returncode,
+            **({"statistics": stats} if stats is not None else {}),
+        }
 
 
 def main():
@@ -401,6 +431,21 @@ def main():
                 }
             )
             (root / "dense.log").write_bytes(b"k " * (args.mib * 1024 * 512) + b"\n")
+            cases["dense-column"] = [
+                "-n",
+                "--column",
+                "--color=never",
+                "k",
+                "dense.log",
+            ]
+            cases["dense-column-stats"] = [
+                "-n",
+                "--column",
+                "--color=never",
+                "--stats",
+                "k",
+                "dense.log",
+            ]
             cases["dense-fold-count"] = ["-i", "--count-matches", "k", "dense.log"]
             if args.codecs and ("ripgrep" not in binaries or shutil.which("bzip2")):
                 source = random.Random(58472).randbytes(args.mib * 1024 * 1024) + b"\n"
@@ -476,6 +521,7 @@ def main():
                     [binary, "--color=never", *flags],
                     root,
                     env,
+                    statistics_output="--stats" in flags,
                     unordered=case == "small-files-unsorted"
                     or case.startswith("repository-"),
                 )

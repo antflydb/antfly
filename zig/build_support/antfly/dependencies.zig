@@ -719,6 +719,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const tokenizer = @import("../../lib/tokenizer/build_support.zig").create(b, .{
         .platform = platform_mod,
         .root = b.path("lib/tokenizer"),
+        .grapheme = regex_mod.import_table.get("antfly_grapheme").?,
         .target = target,
         .optimize = optimize,
         .protobuf = protobuf_mod,

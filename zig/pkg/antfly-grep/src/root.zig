@@ -1266,9 +1266,13 @@ pub const Search = struct {
                         }
                         cursor = if (hit.span.start == hit.span.end) self.matcher.advance(text, hit.span.end) else hit.span.end;
                         if (cursor > text.len or (peek == null and cursor == text.len)) break;
-                        if (self.options.quiet or self.options.files_with_matches or self.options.invert) break;
+                        if (self.options.quiet or self.options.files_with_matches or self.options.invert or (self.firstSpanOnly() and hits.items.len > 0)) break;
                     }
                     if (self.matcher.failure) |err| return err;
+                    if (self.firstSpanOnly() and self.options.stats) {
+                        const counted = try self.matcher.count(text, std.math.maxInt(usize), peek != null);
+                        exact_occurrences = counted.total - (if (counted.terminal_empty) @as(usize, 1) else 0);
+                    }
                     self.current_hits = hits.items;
                     self.current_hit_text = text;
                     matched = hit_found != self.options.invert;
@@ -1300,11 +1304,11 @@ pub const Search = struct {
                     const duplicate = hit.span.start == hit.span.end and prior_end != null and prior_end.? == hit.span.end;
                     if (!duplicate and !(peek == null and hit.span.start == subject.len and hit.span.end == subject.len)) {
                         total += 1;
-                        if (context_output) try contextual.append(ha, .{ .span = .{ .start = hit.span.start - base, .end = hit.span.end - base }, .captures = if (self.options.replacement != null) try ha.dupe(?@import("matcher.zig").Span, hit.captures) else &.{}, .names = hit.names, .capture_text = subject });
+                        if (context_output and (!self.firstSpanOnly() or contextual.items.len == 0)) try contextual.append(ha, .{ .span = .{ .start = hit.span.start - base, .end = hit.span.end - base }, .captures = if (self.options.replacement != null) try ha.dupe(?@import("matcher.zig").Span, hit.captures) else &.{}, .names = hit.names, .capture_text = subject });
                         prior_end = hit.span.end;
                     }
                     cursor = if (hit.span.start == hit.span.end) self.matcher.advance(subject, hit.span.end) else hit.span.end;
-                    if (cursor > subject.len or (peek == null and cursor == subject.len)) break;
+                    if (cursor > subject.len or (peek == null and cursor == subject.len) or (self.firstSpanOnly() and !self.options.stats and contextual.items.len > 0)) break;
                 }
                 if (self.matcher.failure) |err| return err;
                 exact_occurrences = total;
@@ -1317,7 +1321,7 @@ pub const Search = struct {
                 count += 1;
                 if (count == 1) self.summary.files_with_matches += 1;
                 if (!self.options.files_without_match) self.summary.matches += 1;
-                if (self.options.ask == null and !self.options.invert and self.current_hits == null and exact_occurrences == null) self.summary.occurrences_exact = false;
+                if (self.options.ask == null and !self.options.invert and (self.current_hits == null or self.firstSpanOnly()) and exact_occurrences == null) self.summary.occurrences_exact = false;
                 const occurrences = if (self.options.ask != null or self.options.invert) @as(usize, 1) else (exact_occurrences orelse (if (self.current_hits) |hits| hits.len else 1));
                 match_count += occurrences;
                 self.summary.occurrences += occurrences;
@@ -2012,6 +2016,9 @@ pub const Search = struct {
             try w.writeAll(sep);
         }
     }
+    fn firstSpanOnly(self: *const Search) bool {
+        return self.options.column and !self.options.json and !self.options.only_matching and self.options.replacement == null and !self.color_enabled and !self.options.vimgrep and !self.options.count_matches;
+    }
     fn emit(self: *Search, path_name: []const u8, text: []const u8, line: usize, byte_offset: usize, matched: bool, probability: f64) !void {
         if (self.binary_mode and !self.options.json) return;
         // Plain rows need no capture rendering or temporary output allocation.
@@ -2043,7 +2050,9 @@ pub const Search = struct {
         var cursor: usize = 0;
         var previous_end: ?usize = null;
         if (!replacement_context and self.current_hits != null and self.current_hit_text.ptr == text.ptr and self.current_hit_text.len == text.len and matched and p == null and !self.options.invert) {
-            try hits.appendSlice(a, self.current_hits.?);
+            // Borrow the scanner's stable spans; rendering changes only the
+            // view length, never the backing entries or capture storage.
+            hits.items = @constCast(self.current_hits.?);
         } else if (matched and p == null and !self.options.invert and (self.options.json or self.options.only_matching or self.options.replacement != null or self.color_enabled or self.options.column or self.options.vimgrep)) while (self.matcher.find(text, cursor)) |hit| {
             if (hit.span.start == hit.span.end and previous_end != null and previous_end.? == hit.span.end) {
                 cursor = self.matcher.advance(text, hit.span.end);
@@ -2053,18 +2062,15 @@ pub const Search = struct {
             const captures: []const ?@import("matcher.zig").Span = if (self.options.replacement != null) try a.dupe(?@import("matcher.zig").Span, hit.captures) else &.{};
             try hits.append(a, .{ .span = hit.span, .captures = captures, .names = hit.names });
             previous_end = hit.span.end;
+            if (self.firstSpanOnly()) break;
             cursor = if (hit.span.start == hit.span.end) self.matcher.advance(text, hit.span.end) else hit.span.end;
             if (cursor > text.len or (!terminated and cursor == text.len)) break;
         };
-        if (!terminated) {
-            var retained: usize = 0;
-            for (hits.items) |hit| {
-                if (hit.span.start == text.len and hit.span.end == text.len) continue;
-                hits.items[retained] = hit;
-                retained += 1;
-            }
-            hits.shrinkRetainingCapacity(retained);
-        }
+        if (!terminated) while (hits.items.len > 0) {
+            const last = hits.items[hits.items.len - 1];
+            if (last.span.start != text.len or last.span.end != text.len) break;
+            hits.items.len -= 1;
+        };
         if (self.options.json) {
             const encoded_path = try jsonText(a, path_name);
             if (!self.json_started) {

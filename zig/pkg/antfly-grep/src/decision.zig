@@ -145,10 +145,18 @@ pub const Client = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
+        @memset(probabilities, std.math.nan(f64));
+        const caching = !self.options.no_cache and self.options.cache_ttl_seconds != 0 and self.options.cache_dir != null;
+        const keys = try a.alloc([64]u8, if (caching) inputs.len else 0);
+        for (inputs[0..keys.len], keys) |input, *key_hex| key_hex.* = self.key(input);
+        const batch_key = batchKey(keys);
+        const batch_hit = try self.cachedBatch(a, &batch_key, probabilities);
         var missing: std.ArrayList(Input) = .empty;
         var indices: std.ArrayList(usize) = .empty;
         for (inputs, 0..) |input, i| {
-            if (try self.cached(a, input)) |score| {
+            if (std.math.isFinite(probabilities[i])) {
+                self.cache_hits += 1;
+            } else if (if (caching) try self.cached(a, &keys[i]) else null) |score| {
                 probabilities[i] = score;
                 self.cache_hits += 1;
             } else {
@@ -156,18 +164,23 @@ pub const Client = struct {
                 try indices.append(a, i);
             }
         }
-        if (missing.items.len == 0) return;
+        if (missing.items.len == 0) {
+            if (!batch_hit) self.storeBatch(a, &batch_key, probabilities) catch {};
+            return;
+        }
         const scores = try a.alloc(f64, missing.items.len);
         @memset(scores, std.math.nan(f64));
         var failure: ?anyerror = null;
         self.request(missing.items, scores) catch |err| {
             failure = err;
         };
-        for (scores, indices.items, missing.items) |score, index, input| {
+        var learned = false;
+        for (scores, indices.items) |score, index| {
             if (!std.math.isFinite(score)) continue;
             probabilities[index] = score;
-            try self.store(a, input, score);
+            learned = true;
         }
+        if (learned or !batch_hit) self.storeBatch(a, &batch_key, probabilities) catch {};
         if (failure) |err| return err;
     }
     fn key(self: *Client, input: Input) [64]u8 {
@@ -204,10 +217,9 @@ pub const Client = struct {
         hash.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
     }
-    fn cached(self: *Client, a: Allocator, input: Input) !?f64 {
+    fn cached(self: *Client, a: Allocator, key_hex: []const u8) !?f64 {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return null;
-        const key_hex = self.key(input);
-        const path = try std.fs.path.join(a, &.{ self.options.cache_dir.?, &key_hex });
+        const path = try std.fs.path.join(a, &.{ self.options.cache_dir.?, key_hex });
         const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
         const now = std.Io.Clock.real.now(self.io).nanoseconds;
         const age: i128 = @as(i128, now) - stat.mtime.nanoseconds;
@@ -217,13 +229,44 @@ pub const Client = struct {
         if (!std.math.isFinite(score) or (score < 0 and score != -1) or score > 1) return null;
         return score;
     }
-    fn store(self: *Client, a: Allocator, input: Input, score: f64) !void {
+    fn batchKey(keys: []const [64]u8) [64]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-grep-batch-cache-v6");
+        for (keys) |key_hex| hash.update(&key_hex);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+    fn cachedBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64) !bool {
+        if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
+        const path = try std.fmt.allocPrint(a, "{s}/batch-v6-{s}", .{ self.options.cache_dir.?, key_hex });
+        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+        const age = std.Io.Clock.real.now(self.io).nanoseconds - stat.mtime.nanoseconds;
+        if (age < -300000000000 or age >= @as(i128, self.options.cache_ttl_seconds) * 1000000000) return false;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(16384)) catch return false;
+        const Record = struct { version: u8, scores: []const ?f64 };
+        const record = std.json.parseFromSliceLeaky(Record, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch return false;
+        if (record.version != 6 or record.scores.len != scores.len) return false;
+        // Validate the whole page before making any of its evidence visible.
+        for (record.scores) |score| if (score) |p| {
+            if (!std.math.isFinite(p) or (p < 0 and p != -1) or p > 1) return false;
+        };
+        for (record.scores, scores) |score, *out| if (score) |p| {
+            out.* = p;
+        };
+        return true;
+    }
+    fn storeBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []const f64) !void {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return;
-        // Corrupt/partial cache records are misses. A failed cache write cannot
-        // turn an otherwise valid decision into a failed search.
+        var any = false;
+        const entries = try a.alloc(?f64, scores.len);
+        for (scores, entries) |score, *entry| {
+            entry.* = if (std.math.isFinite(score)) score else null;
+            any = any or entry.* != null;
+        }
+        if (!any) return;
         std.Io.Dir.cwd().createDirPath(self.io, self.options.cache_dir.?) catch return;
-        const key_hex = self.key(input);
-        const path = try std.fs.path.join(a, &.{ self.options.cache_dir.?, &key_hex });
+        const path = try std.fmt.allocPrint(a, "{s}/batch-v6-{s}", .{ self.options.cache_dir.?, key_hex });
         var nonce: [12]u8 = undefined;
         self.io.random(&nonce);
         const suffix = std.fmt.bytesToHex(nonce, .lower);
@@ -232,7 +275,7 @@ pub const Client = struct {
         {
             var file = std.Io.Dir.cwd().createFile(self.io, temporary, .{ .exclusive = true }) catch return;
             defer file.close(self.io);
-            const bytes = try std.fmt.allocPrint(a, "{d}", .{score});
+            const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = 6, .scores = entries }, .{});
             file.writeStreamingAll(self.io, bytes) catch return;
         }
         std.Io.Dir.cwd().rename(temporary, .cwd(), path, self.io) catch {};

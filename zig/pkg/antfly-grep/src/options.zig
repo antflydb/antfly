@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const default_max_requests: usize = 1000;
 pub const Options = struct {
     table_config: ?[]const u8 = null,
     tables: std.ArrayList([]const u8) = .empty,
@@ -136,7 +137,8 @@ pub const Options = struct {
     ranked: bool = true,
     retries: usize = 3,
     retry_base_ms: u64 = 100,
-    max_requests: usize = 1000,
+    max_requests: usize = default_max_requests,
+    request_budget_explicit: bool = false,
     max_source_bytes: usize = std.math.maxInt(usize),
     max_output_bytes: usize = std.math.maxInt(usize),
     exclude: std.ArrayList([]const u8) = .empty,
@@ -558,7 +560,10 @@ pub const Options = struct {
                 } else if (std.mem.eql(u8, name, "--decision-context")) self.decision_context = if (std.mem.eql(u8, value, "shared-v1")) .shared_v1 else if (std.mem.eql(u8, value, "legacy")) .legacy else return error.InvalidDecisionContext else if (std.mem.eql(u8, name, "--backend")) self.backend = if (std.mem.eql(u8, value, "local")) .local else if (std.mem.eql(u8, value, "typesafe")) .typesafe else if (std.mem.eql(u8, value, "http") or std.mem.eql(u8, value, "antfly")) .http else return error.UnsupportedBackend else if (std.mem.eql(u8, name, "--models-dir")) self.models_dir = value else if (std.mem.eql(u8, name, "--library")) self.library_path = value else if (std.mem.eql(u8, name, "--replace")) self.replacement = value else if (std.mem.eql(u8, name, "--threads") or std.mem.eql(u8, name, "--concurrency")) self.jobs = try number(value) else if (std.mem.eql(u8, name, "--max-filesize")) {
                     self.max_file_bytes = try size(value);
                     self.skip_oversize = true;
-                } else if (std.mem.eql(u8, name, "--table-config")) self.table_config = value else if (std.mem.eql(u8, name, "--table")) try self.tables.append(a, value) else if (std.mem.eql(u8, name, "--table-filter")) self.table_filter = value else if (std.mem.eql(u8, name, "--max-index-documents")) self.max_index_documents = try number(value) else if (std.mem.eql(u8, name, "--max-pending-output")) self.max_pending_output = try number(value) else if (std.mem.eql(u8, name, "--cache-ttl")) self.cache_ttl_seconds = try number(value) else if (std.mem.eql(u8, name, "--max-columns")) self.max_columns = unlimited(try number(value)) else if (std.mem.eql(u8, name, "--max-depth")) self.max_depth = try number(value) else if (std.mem.eql(u8, name, "--max-requests")) self.max_requests = try number(value) else if (std.mem.eql(u8, name, "--max-source-bytes")) {
+                } else if (std.mem.eql(u8, name, "--table-config")) self.table_config = value else if (std.mem.eql(u8, name, "--table")) try self.tables.append(a, value) else if (std.mem.eql(u8, name, "--table-filter")) self.table_filter = value else if (std.mem.eql(u8, name, "--max-index-documents")) self.max_index_documents = try number(value) else if (std.mem.eql(u8, name, "--max-pending-output")) self.max_pending_output = try number(value) else if (std.mem.eql(u8, name, "--cache-ttl")) self.cache_ttl_seconds = try number(value) else if (std.mem.eql(u8, name, "--max-columns")) self.max_columns = unlimited(try number(value)) else if (std.mem.eql(u8, name, "--max-depth")) self.max_depth = try number(value) else if (std.mem.eql(u8, name, "--max-requests")) {
+                    self.max_requests = try number(value);
+                    self.request_budget_explicit = true;
+                } else if (std.mem.eql(u8, name, "--max-source-bytes")) {
                     if (self.jev_mode) self.source_excerpt_bytes = unlimited(try size(value)) else self.max_source_bytes = unlimited(try size(value));
                 } else if (std.mem.eql(u8, name, "--max-output-bytes")) self.max_output_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--cache-dir")) self.cache_dir = value else if (std.mem.eql(u8, name, "--base-url")) self.endpoint = value else if (std.mem.eql(u8, name, "--query")) try self.queries.append(a, value) else if (std.mem.eql(u8, name, "--exclude")) try self.exclude.append(a, value) else if (std.mem.eql(u8, name, "--only")) try self.only.append(a, value) else if (std.mem.eql(u8, name, "--not")) try self.not.append(a, value) else if (std.mem.eql(u8, name, "--file")) try self.pattern_files.append(a, value) else if (std.mem.eql(u8, name, "--ignore-file")) try self.ignore_files.append(a, value) else if (std.mem.eql(u8, name, "--type")) try self.types.append(a, value) else if (std.mem.eql(u8, name, "--type-not")) try self.types_not.append(a, value) else if (std.mem.eql(u8, name, "--type-add")) try self.type_add.append(a, value) else if (std.mem.eql(u8, name, "--iglob")) {
                     try self.iglobs.append(a, value);

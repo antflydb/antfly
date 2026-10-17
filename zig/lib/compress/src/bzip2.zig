@@ -191,6 +191,7 @@ pub fn decodeTo(a: A, input: *std.Io.Reader, output: *std.Io.Writer, limit: usiz
             }
             var symbols = Symbols{ .bits = &bits, .tables = tables[0..groups], .selectors = selectors };
             last.clearRetainingCapacity();
+            var counts: [256]usize = @splat(0);
             var sym = try symbols.next();
             while (sym != n + 1) {
                 if (sym < 2) {
@@ -204,6 +205,7 @@ pub fn decodeTo(a: A, input: *std.Io.Reader, output: *std.Io.Writer, limit: usiz
                     }
                     if (run > block_limit - last.items.len) return error.InvalidBzip2;
                     try last.appendNTimes(a, alphabet[0], run);
+                    counts[alphabet[0]] += run;
                 } else {
                     if (sym > n or last.items.len == block_limit) return error.InvalidBzip2;
                     var j = sym - 1;
@@ -211,12 +213,13 @@ pub fn decodeTo(a: A, input: *std.Io.Reader, output: *std.Io.Writer, limit: usiz
                     while (j > 0) : (j -= 1) alphabet[j] = alphabet[j - 1];
                     alphabet[0] = ch;
                     try last.append(a, ch);
+                    counts[ch] += 1;
                     sym = try symbols.next();
                 }
             }
             if (origin >= last.items.len) return error.InvalidBzip2;
-            var counts: [256]usize = @splat(0);
-            for (last.items) |ch| counts[ch] += 1;
+            // Frequencies are accumulated during MTF/RLE decoding, including
+            // whole repeated runs, avoiding a serial histogram pass over BWT.
             var total: usize = 0;
             for (&counts) |*c| {
                 const tmp = c.*;

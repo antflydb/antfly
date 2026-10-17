@@ -17,6 +17,7 @@
 """Black-box CLI contracts, including an actual HTTP decision round trip."""
 
 import base64
+import hashlib
 import json
 import os
 import select
@@ -172,7 +173,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
                     item["input"] = (
                         body["contexts"][item["context_index"]] + "\n" + item["input"]
                     )
-        if self.server.mode == "prefetch":
+        if self.server.mode == "prefetch" and len(self.server.requests) == 1:
             self.server.prefetch_seen = self.server.index_next.wait(2)
         if "state" in body:
             encoded = json.dumps(
@@ -3665,6 +3666,149 @@ class CliTests(unittest.TestCase):
                         for line in result.stdout.splitlines()
                     )
                 )
+
+    def test_explicit_request_budget_prioritizes_decisions_over_prefetch(self):
+        docs = [self.indexed_doc(f"f{i}.txt", "STOP retry\n" * 1000) for i in range(2)]
+        outputs = []
+        for prefetch in (False, True):
+            self.server.requests.clear()
+            self.server.index_requests.clear()
+            config = self.table_config(docs, prefetch=prefetch)
+            result = self.raw_cli(
+                *self.decision_args(),
+                "--no-cache",
+                "--no-refine",
+                "--chunk-lines=2000",
+                "--max-requests=2",
+                "--table-config",
+                config,
+                code=2,
+            )
+            self.assertEqual(len(self.server.requests), 1)
+            self.assertEqual(len(self.server.index_requests), 1)
+            self.assertEqual(len(result.stdout.splitlines()), 1000)
+            outputs.append(result.stdout)
+        self.assertEqual(*outputs)
+        # An explicit default still expresses a budget and must keep ordering.
+        self.server.mode = "prefetch"
+        self.server.requests.clear()
+        self.server.prefetch_seen = False
+        self.server.index_next.clear()
+        config = self.table_config(docs, prefetch=True)
+        self.raw_cli(
+            *self.decision_args(),
+            "--no-cache",
+            "--no-refine",
+            "--max-requests=1000",
+            "--table-config",
+            config,
+        )
+        self.assertFalse(self.server.prefetch_seen)
+
+    def test_batched_cache_validates_records_and_retains_partial_scores(self):
+        self.write("a", "STOP retry\nnoise\n" * 16)
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--no-refine",
+            "--cache-dir=scores",
+            "a",
+        ]
+        first = self.raw_cli(*args)
+        records = list((self.root / "scores").glob("batch-v6-*"))
+        self.assertTrue(records)
+        self.assertLess(len(records), 32)
+        requests = len(self.server.requests)
+        mtimes = [p.stat().st_mtime_ns for p in records]
+        self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
+        self.assertEqual(len(self.server.requests), requests)
+        self.assertEqual(mtimes, [p.stat().st_mtime_ns for p in records])
+        # Missing entries are reevaluated; valid zero scores remain cache hits.
+        for path in records:
+            data = json.loads(path.read_text())
+            data["scores"][0] = None
+            path.write_text(json.dumps(data))
+        self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
+        self.assertGreater(len(self.server.requests), requests)
+        requests = len(self.server.requests)
+        # Malformed/version-mismatched records must never supply evidence.
+        for path in records:
+            path.write_text('{"version":6,"scores":[2]}')
+        self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
+        self.assertGreater(len(self.server.requests), requests)
+        self.assertFalse(list((self.root / "scores").glob("*.tmp")))
+
+    def test_legacy_cache_migrates_to_atomic_batch_records(self):
+        self.write("a", "STOP retry\nSTOP retry\n")
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--no-refine",
+            "--cache-dir=scores",
+            "a",
+        ]
+        expected = self.raw_cli(*args).stdout
+        requests = list(self.server.requests)
+        directory = self.root / "scores"
+        for path in directory.iterdir():
+            path.unlink()
+        # Published v5 key framing and scalar format remain readable by v6.
+        legacy = []
+        for _, _, body in requests:
+            for item in body["inputs"]:
+                digest = hashlib.sha256()
+                parts = [
+                    b"antfly-grep-decisions-v5",
+                    self.decision_args()[-1].encode(),
+                    b"fixture",
+                    b"",
+                    b"http",
+                    b"",
+                    b"",
+                    b"find retry enforcement",
+                    b"line",
+                    b"direct",
+                    hashlib.sha256(b"").digest(),
+                    item["input"].encode(),
+                ]
+                for part in parts:
+                    digest.update(len(part).to_bytes(8, "little"))
+                    digest.update(part)
+                for tag in (b"filters", b"only", b"not"):
+                    digest.update(tag)
+                path = directory / digest.hexdigest()
+                path.write_text("0.9")
+                legacy.append(path)
+        self.server.requests.clear()
+        self.assertEqual(expected, self.raw_cli(*args).stdout)
+        self.assertEqual(len(self.server.requests), 0)
+        self.assertTrue(list(directory.glob("batch-v6-*")))
+        for path in set(legacy):
+            path.unlink()
+        self.assertEqual(expected, self.raw_cli(*args).stdout)
+        self.assertEqual(len(self.server.requests), 0)
+        self.env["ANTFLY_GREP_TOKEN"] = "different-credential"
+        self.raw_cli(*args)
+        self.assertGreater(len(self.server.requests), 0)
+
+    def test_dense_column_needs_only_first_span(self):
+        self.write("dense", "  k " * 65536 + "\n")
+        for io_mode in ("--mmap", "--no-mmap"):
+            result = self.raw_cli(
+                "--color=never", "-n", "--column", io_mode, "k", "dense"
+            )
+            self.assertEqual(result.stdout, b"1:3:" + ("  k " * 65536).encode() + b"\n")
+            stats = self.raw_cli(
+                "--color=never", "--column", "--stats", io_mode, "k", "dense"
+            )
+            self.assertIn(b"65536 matches", stats.stderr)
+        self.write("a", "xx kk\nlast\n")
+        self.assertEqual(
+            self.raw_cli("--column", "-o", "k", "a").stdout, b"1:4:k\n1:5:k\n"
+        )
+        self.assertEqual(
+            self.raw_cli("--column", "-r", "X", "k", "a").stdout, b"1:4:xx XX\n"
+        )
 
     def test_indexed_prefetch_overlaps_decisions_and_preserves_output(self):
         docs = [self.indexed_doc(f"f{i}.txt", "STOP retry\n") for i in range(3)]

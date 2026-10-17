@@ -679,6 +679,8 @@ fn WalkPool(comptime Context: type) type {
         batch_files: bool = false,
         threads: []std.Thread = &.{},
         started: usize = 0,
+        growing: bool = false,
+        growth_failed: bool = false,
         idle: std.atomic.Value(usize) = .init(0),
         stop: std.atomic.Value(bool) = .init(false),
         mutex: std.Io.Mutex = .init,
@@ -767,9 +769,21 @@ fn WalkPool(comptime Context: type) type {
             const idle = self.idle.load(.monotonic);
             if (self.count == self.slots.len or self.count >= @max(1, idle)) return false;
             if (idle == 0) {
-                if (!self.root.options.jobs_auto or self.started == self.threads.len) return false;
-                self.threads[self.started] = try std.Thread.spawn(.{}, Self.worker, .{self});
-                self.started += 1;
+                if (!self.root.options.jobs_auto or self.started == self.threads.len or self.growing or self.growth_failed) return false;
+                self.growing = true;
+                self.mutex.unlock(io);
+                const spawned = std.Thread.spawn(.{}, Self.worker, .{self}) catch null;
+                self.mutex.lockUncancelable(io);
+                self.growing = false;
+                if (spawned) |thread| {
+                    self.threads[self.started] = thread;
+                    self.started += 1;
+                } else {
+                    self.growth_failed = true;
+                    return false; // Continue the producer's inline DFS.
+                }
+                if (self.stop.load(.acquire)) return true;
+                if (self.count == self.slots.len or self.count >= @max(1, self.idle.load(.monotonic))) return false;
             }
             const owned_path = try a.dupe(u8, path);
             errdefer a.free(owned_path);

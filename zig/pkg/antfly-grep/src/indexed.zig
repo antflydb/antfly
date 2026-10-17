@@ -100,7 +100,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const filter = try candidateFilter(filter_arena, search, table, user_filter);
     var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .http = http };
     defer search.summary.index_requests += fetcher.summary.index_requests;
-    const overlap = config.prefetch and !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
+    // Explicit decision budgets preserve foreground order: speculative page
+    // requests must not consume the budget reserved by the user for evidence.
+    const budgeted_decisions = search.options.ask != null and (search.options.request_budget_explicit or search.options.max_requests != @import("options.zig").default_max_requests);
+    const overlap = config.prefetch and !budgeted_decisions and !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
     if (overlap) fetcher.thread = try std.Thread.spawn(.{}, Fetch.worker, .{&fetcher});
     defer fetcher.finish();
     var page_size = config.page_size;
