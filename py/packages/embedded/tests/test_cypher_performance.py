@@ -1408,3 +1408,53 @@ def test_write_read_phases_pull_parallel_pair_pages_and_preserve_postimages(grap
         },
     )
     assert reused["rows"] == [[{"type": "integer", "value": "1000"}, {"type": "integer", "value": "3"}]]
+
+
+def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    layers = 64
+    patterns = ["(s:D {id:'start',score:0})"] + [
+        f"(v{i}_{j}:D {{score:{i + 1}}})" for i in range(layers) for j in range(2)
+    ]
+    patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+    patterns += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    # There are 2**64 paths but only two endpoints with the same score. Neither
+    # DISTINCT nor presence-only SQL reducers need their exact multiplicity.
+    for tail, values in (
+        ("RETURN DISTINCT b.score", ["64"]),
+        ("RETURN DISTINCT b.score ORDER BY b.score DESC LIMIT 1", ["64"]),
+        ("RETURN DISTINCT b.score AS b ORDER BY b.score", ["64"]),
+        ("RETURN DISTINCT b.score,b.missing ORDER BY b.score", ["64", None]),
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) " + tail,
+                "limits": {"intermediate_states": 10000, "explored_edges": 300},
+            },
+        )
+        assert [[cell.get("value") for cell in row] for row in result["rows"]] == [values]
+        assert result["stats"]["explored_edges"] == 254
+        assert result["stats"]["intermediate_states"] < 5000
+    sql_pattern = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(63)) + "-[r63 IS R]->(b IS D)"
+    relation = f"GRAPH_TABLE(g MATCH {sql_pattern} WHERE a.id='start' COLUMNS(b.score AS score,b.missing AS missing)) q"
+    assert db.sql(
+        f"SELECT min(q.score),max(q.score),count(DISTINCT q.score),"
+        f"sum(DISTINCT q.score),avg(DISTINCT q.score),"
+        f"bool_and(q.score>0),bool_or(q.score<0),count(DISTINCT q.missing) FROM {relation}"
+    )["rows"] == [["64", "64", "1", "64", "64", True, False, "0"]]
+    assert db.sql(
+        f"SELECT q.score,min(q.score),count(DISTINCT q.score) FROM {relation} WHERE q.score IN (64,65) GROUP BY q.score"
+    )["rows"] == [["64", "64", "1"]]
+    empty = db.sql(f"SELECT min(q.score),count(DISTINCT q.score) FROM {relation} WHERE q.score<0")
+    assert empty["rows"] == [[None, "0"]]
+    assert empty["sql_nulls"] == [[True, False]]
+    # Mixing a presence-only reducer with COUNT requires exact bags. Keep this
+    # case below saturation, with more paths than could ever be enumerated.
+    relation = relation.replace("-[r62 IS R]->(m62 IS D)-[r63 IS R]->(b IS D)", "")
+    relation = relation.replace("(m61 IS D)", "(b IS D)")
+    assert db.sql(f"SELECT min(q.score),count(*),sum(q.score) FROM {relation}")["rows"] == [
+        ["62", str(2**62), str(62 * 2**62)]
+    ]

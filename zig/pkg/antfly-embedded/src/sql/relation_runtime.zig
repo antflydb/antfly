@@ -2182,11 +2182,11 @@ fn Engine(comptime Context: type) type {
                 self.ordinal += batch.len();
                 return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = if (batch.len() != 0) try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) else null };
             }
-            fn enableWeights(ptr: *anyopaque) !bool {
+            fn enableWeights(ptr: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.ordinal != 0 or self.pending_failure != null or self.iterator.pages != 0 or self.iterator.apply_mode or self.iterator.recursive_id != null or self.iterator.node.operation != .scan) return false;
                 const cursor = self.engine.cursors[self.iterator.node.operation.scan.index];
-                self.weighted = if (cursor.enable_weights) |enable| try enable(cursor.ptr) else false;
+                self.weighted = if (cursor.enable_weights) |enable| try enable(cursor.ptr, multiplicity) else false;
                 return self.weighted;
             }
             fn nextWeighted(self: *Adapter, a: Allocator, limit: u32) !catalog.Page {
@@ -2318,9 +2318,9 @@ fn Source(comptime Context: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.nextColumns(&self.adapter, alloc, limit);
         }
-        fn enableWeights(raw: *anyopaque) !bool {
+        fn enableWeights(raw: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
             const self: *Self = @ptrCast(@alignCast(raw));
-            return Engine(Context).Adapter.enableWeights(&self.adapter);
+            return Engine(Context).Adapter.enableWeights(&self.adapter, multiplicity);
         }
         fn countRows(raw: *anyopaque) !?u64 {
             const self: *Self = @ptrCast(@alignCast(raw));

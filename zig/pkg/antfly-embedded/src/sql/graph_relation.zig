@@ -345,12 +345,12 @@ pub const Cursor = struct {
         self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .empty = empty };
         return .{ .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
     }
-    fn enableWeights(ptr: *anyopaque) !bool {
+    fn enableWeights(ptr: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         if (self.position != 0 or self.resume_position != 0 or self.request.primary_key != null or self.request.graph_source_ordinals) return false;
         for (self.request.fields) |field| if (std.mem.eql(u8, field, "_id")) return false;
         for (self.request.conditions) |condition| if (std.mem.eql(u8, condition.column, "_id")) return false;
-        if (self.stream) |stream| return stream.enableWeights();
+        if (self.stream) |stream| return stream.enableWeights(multiplicity);
         return false;
     }
     fn countRows(ptr: *anyopaque) anyerror!?u64 {
@@ -566,7 +566,7 @@ test "graph cursor resumes pushed pages and preserves observable source ordinals
     for ([_]bool{ false, true }) |ordinals| {
         const weighted = try Cursor.open(std.testing.allocator, path_binding, backend, &.{}, .{ .fields = &.{"id"}, .graph_source_ordinals = ordinals, .limit = 128 }, .{});
         defer weighted.close(weighted.ptr);
-        try std.testing.expectEqual(!ordinals, try weighted.enable_weights.?(weighted.ptr));
+        try std.testing.expectEqual(!ordinals, try weighted.enable_weights.?(weighted.ptr, .exact));
     }
     var request: catalog.Scan = .{ .fields = &.{"id"}, .conditions = &.{.{ .column = "rank", .op = .gte, .value = .{ .integer = 1 } }}, .limit = 1, .row_goal = 1 };
     const first = try Cursor.open(std.testing.allocator, binding, backend, &.{}, request, .{});

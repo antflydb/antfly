@@ -297,9 +297,9 @@ pub const Context = struct {
             if (self.cursor) |cursor| if (cursor.count_rows) |count_rows| return try count_rows(cursor.ptr);
             return null;
         }
-        pub fn weights(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan) !bool {
+        pub fn weights(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan, multiplicity: catalog.Multiplicity) !bool {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.enable_weights) |enable| return enable(cursor.ptr);
+            if (self.cursor) |cursor| if (cursor.enable_weights) |enable| return enable(cursor.ptr, multiplicity);
             return false;
         }
         pub fn columns(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.ColumnPage {

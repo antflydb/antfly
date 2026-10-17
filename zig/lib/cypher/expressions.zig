@@ -218,7 +218,60 @@ fn samePath(a: ast.Path, b: ast.Path) bool {
 pub fn validateGrouping(expr: *const ast.Expr, items: []const ast.Item, aliases: bool) error{CypherInvalidGrouping}!void {
     try grouping(expr, items, aliases, null);
 }
-const Local = struct { name: []const u8, parent: ?*const Local };
+pub const Local = struct { name: []const u8, parent: ?*const Local };
+
+/// Structural projection matches cannot capture a lexical binding with the
+/// same spelling (for example n.rank inside [n IN values | n.rank]).
+pub fn unshadowed(expr: *const ast.Expr, locals: ?*const Local) bool {
+    var current = locals;
+    while (current) |local| : (current = local.parent) {
+        if (references(expr, local.name)) return false;
+    }
+    return true;
+}
+fn references(expr: *const ast.Expr, name: []const u8) bool {
+    return switch (expr.value) {
+        .literal, .parameter => false,
+        .variable => |variable| std.mem.eql(u8, variable, name),
+        .exists, .pattern_comprehension => true,
+        .property => |p| references(p.base, name),
+        .index => |i| references(i.base, name) or references(i.index, name),
+        .slice => |s| references(s.base, name) or optionalReference(s.start, name) or optionalReference(s.end, name),
+        .unary => |u| references(u.operand, name),
+        .binary => |b| references(b.left, name) or references(b.right, name),
+        .comparison => |c| anyReference(c.operands, name),
+        .call => |c| anyReference(c.args, name),
+        .list => |items| anyReference(items, name),
+        .comprehension => |c| references(c.input, name) or (!std.mem.eql(u8, c.alias, name) and (optionalReference(c.predicate, name) or optionalReference(c.projection, name))),
+        .list_predicate => |c| references(c.input, name) or (!std.mem.eql(u8, c.alias, name) and references(c.predicate, name)),
+        .reduce => |r| references(r.initial, name) or references(r.input, name) or (!std.mem.eql(u8, r.alias, name) and !std.mem.eql(u8, r.accumulator, name) and references(r.projection, name)),
+        .map => |entries| blk: {
+            for (entries) |entry| if (references(entry.value, name)) break :blk true;
+            break :blk false;
+        },
+        .map_projection => |p| blk: {
+            if (references(p.base, name)) break :blk true;
+            for (p.items) |item| switch (item) {
+                .entry => |entry| if (references(entry.value, name)) break :blk true,
+                .variable => |variable| if (std.mem.eql(u8, variable, name)) break :blk true,
+                .property, .all => {},
+            };
+            break :blk false;
+        },
+        .case_when => |c| blk: {
+            if (optionalReference(c.operand, name) or optionalReference(c.otherwise, name)) break :blk true;
+            for (c.branches) |branch| if (references(branch.condition, name) or references(branch.value, name)) break :blk true;
+            break :blk false;
+        },
+    };
+}
+fn optionalReference(expr: ?*const ast.Expr, name: []const u8) bool {
+    return if (expr) |value| references(value, name) else false;
+}
+fn anyReference(items: []const *const ast.Expr, name: []const u8) bool {
+    for (items) |item| if (references(item, name)) return true;
+    return false;
+}
 fn grouping(expr: *const ast.Expr, items: []const ast.Item, aliases: bool, locals: ?*const Local) error{CypherInvalidGrouping}!void {
     if (expr.value == .variable) {
         var current = locals;
@@ -227,7 +280,7 @@ fn grouping(expr: *const ast.Expr, items: []const ast.Item, aliases: bool, local
         }
     }
     for (items) |item| {
-        if (!aggregates(item.expression) and same(expr, item.expression)) return;
+        if (!aggregates(item.expression) and same(expr, item.expression) and unshadowed(expr, locals)) return;
         if (aliases and expr.value == .variable and item.alias != null and std.mem.eql(u8, expr.value.variable, item.alias.?)) return;
     }
     switch (expr.value) {

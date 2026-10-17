@@ -358,6 +358,19 @@ fn supportsWeights(bound: *const binding.Bound) bool {
     return true;
 }
 
+/// Negotiate presence only when every reducer ignores duplicate source rows.
+/// A single bag-sensitive reducer keeps exact weights for the whole scan.
+fn multiplicity(bound: *const binding.Bound) catalog.Multiplicity {
+    for (bound.specs) |spec| {
+        if (spec.distinct) continue;
+        switch (spec.kind) {
+            .min, .max, .bool_and, .bool_or => {},
+            .count, .sum, .avg, .pattern_set => return .exact,
+        }
+    }
+    return .presence;
+}
+
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
     if (context.invocation_constants.len != bound.constant_count) return error.InvalidSqlBackendResponse;
@@ -405,7 +418,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             aggregate_loaded = true;
         };
         const weighted = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound) and
-            try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows });
+            try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();

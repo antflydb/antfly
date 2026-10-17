@@ -1607,6 +1607,8 @@ test "weighted endpoint reductions agree with exact cyclic and acyclic route bag
         }
     };
     for ([_]bool{ false, true }) |acyclic| for ([_][]const u8{ "", "REPEATABLE ELEMENTS ", "DIFFERENT RELATIONSHIPS " }) |mode| for ([_][]const u8{
+        "RETURN DISTINCT b.rank AS endpoint ORDER BY endpoint",
+        "RETURN DISTINCT b.rank ORDER BY b.rank",
         "RETURN count(b),count(b.missing),count(*)",
         "WHERE b.rank>=2 RETURN count(b)",
         "RETURN b.rank,count(b),count(b.missing),count(*) ORDER BY b.rank",
@@ -1650,6 +1652,48 @@ test "saturated path counts never become approximate SUM or AVG weights" {
         try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 20000 }));
     }
     try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN min(1),max(1),count(DISTINCT b)", "[[1,1,3]]");
+    try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN DISTINCT b.rank ORDER BY b.rank", "[[1],[2],[3]]");
+}
+
+test "presence cursors retain saturated endpoints while exact cursors keep the route fallback" {
+    const Paged = struct {
+        fn drain(cursor: *runtime.NodeCursor, a: std.mem.Allocator) !void {
+            while (!cursor.done) _ = try cursor.next(a, 128);
+        }
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
+            const offset = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(page.items.len, offset + limit);
+            return .{ .items = page.items[offset..end], .next = if (end < page.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    for ([_]runtime.Multiplicity{ .exact, .presence }) |multiplicity| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, "MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN b.rank AS rank", .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        callbacks.expand = Paged.expand;
+        const cursor = (try runtime.NodeCursor.open(a, .{ .ptr = &fixture, .vtable = &callbacks }, graph, compiled.query, &.{}, .{ .intermediate_states = 20000 })).?;
+        defer cursor.close();
+        try std.testing.expect(try cursor.enableWeights(multiplicity));
+        if (multiplicity == .exact) {
+            try std.testing.expectError(error.CypherStateBudgetExceeded, Paged.drain(cursor, a));
+        } else {
+            var seen = [_]bool{ false, false, false };
+            while (!cursor.done) {
+                const rows = try cursor.next(a, 128);
+                for (rows, cursor.last_weights.items) |row, weight| {
+                    try std.testing.expectEqual(@as(u64, 1), weight);
+                    seen[@intCast(row[0].value.integer - 1)] = true;
+                }
+            }
+            try std.testing.expectEqual([_]bool{ true, true, true }, seen);
+        }
+    }
 }
 
 test "mutation RPC scratch is bounded across large postimages and returns owned entities" {
@@ -1751,7 +1795,7 @@ test "weighted cursor negotiates endpoint bags and falls back for cyclic trails"
         defer reference.deinit();
         const cursor = (try runtime.NodeCursor.open(a, backend, graph, compiled.query, &.{}, .{})).?;
         defer cursor.close();
-        try std.testing.expect(try cursor.enableWeights());
+        try std.testing.expect(try cursor.enableWeights(.exact));
         var weights = [_]u64{ 0, 0, 0 };
         var compressed = false;
         while (!cursor.done) {
@@ -1856,5 +1900,26 @@ test "domain uniqueness distinguishes disjoint trails overlapping domains and no
             defer result.deinit();
             try std.testing.expectEqual(expected, result.rows[0][0].integer);
         }
+    }
+}
+
+test "DISTINCT ordering resolves projected expressions without exposing discarded values" {
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY [n IN [{rank:0}]|n.rank] DESC,n.rank", "[[1],[2],[3]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank AS n ORDER BY [x IN [1]|n.rank] DESC", "[[3],[2],[1]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY reduce(n={rank:0},x IN [1]|n).rank DESC,n.rank", "[[1],[2],[3]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY n.rank DESC", "[[3],[2],[1]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY abs(n.rank-2),n.rank", "[[2],[1],[3]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank AS n ORDER BY n.rank DESC", "[[3],[2],[1]]");
+    try check("MATCH (n:Document) WITH DISTINCT n.rank ORDER BY n.rank DESC RETURN `n.rank`", "[[3],[2],[1]]");
+    try check("UNWIND [3,1,2] AS n RETURN DISTINCT n ORDER BY n DESC", "[[3],[2],[1]]");
+    try check("UNWIND [3,1,2] AS n RETURN DISTINCT * ORDER BY n DESC", "[[3],[2],[1]]");
+    for ([_][]const u8{
+        "MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY n.title",
+        "MATCH (n:Document) RETURN DISTINCT n.rank+1 ORDER BY n.rank",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(error.UnboundCypherVariable, @import("binder.zig").validate(std.testing.allocator, graph, compiled.query));
     }
 }

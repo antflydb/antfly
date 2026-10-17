@@ -1337,9 +1337,21 @@ IN lists and pure builtins retain weights and their ordinary lazy evaluation.
 External decisions and consumable pattern cursors require ordinary rows. Pinned
 statement settings remain stable inputs. The cursor buffers
 endpoint contributions for one anchor, never the complete result or route bag.
+The negotiation explicitly distinguishes exact multiplicities from presence.
+SQL MIN/MAX, Boolean reductions and DISTINCT aggregates request unit endpoint
+contributions when every reducer is duplicate-insensitive. Saturated path counts
+therefore do not force those consumers back into route enumeration. Mixing in a
+bag-sensitive COUNT/SUM/AVG requests exact weights through every scan adapter,
+including authenticated owner cursors; unsupported consumers keep ordinary rows.
 
 Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
 DISTINCT variants consume weighted endpoint rows from those same states.
+Endpoint-only RETURN DISTINCT also reduces the path product states directly,
+including saturated counts, while preserving the existing uniqueness proofs and
+exact cyclic fallback. DISTINCT ordering accepts expressions composed of projected
+values, including an unaliased property such as `b.score`. Structural references
+read the computed projection value even when an alias shadows the source entity;
+discarded properties remain inaccessible.
 Projection aliases in ORDER BY resolve in the projection scope before dependency
 checks. Single fixed-hop reductions retain page-at-a-time streaming, since they
 have no shared prefixes to compress. Nullable arguments ignore NULL without discarding their groups. DISTINCT

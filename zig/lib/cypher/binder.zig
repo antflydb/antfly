@@ -135,19 +135,24 @@ const Binder = struct {
                             else => .unknown,
                         });
                     }
-                    var order_scope = scope;
-                    if (p.value.distinct) order_scope = output else {
-                        order_scope = .empty;
-                        try order_scope.appendSlice(self.a, scope.items);
-                        for (output.items) |symbol| {
-                            var replaced = false;
-                            for (order_scope.items) |*existing| if (std.mem.eql(u8, existing.name, symbol.name)) {
-                                existing.* = symbol;
-                                replaced = true;
-                                break;
-                            };
-                            if (!replaced) try order_scope.append(self.a, symbol);
-                        }
+                    // DISTINCT orders projected values, including structural
+                    // expressions such as n.score without an explicit alias.
+                    // Validate dependencies before exposing the source scope;
+                    // unprojected properties must remain inaccessible.
+                    if (p.value.distinct and !p.value.wildcard) for (p.value.order) |order| {
+                        if (!grouped and expression_rules.aggregates(order.expression)) return error.CypherInvalidGrouping;
+                        expression_rules.validateGrouping(order.expression, p.value.items, true) catch return error.UnboundCypherVariable;
+                    };
+                    var order_scope: Scope = .empty;
+                    try order_scope.appendSlice(self.a, scope.items);
+                    for (output.items) |symbol| {
+                        var replaced = false;
+                        for (order_scope.items) |*existing| if (std.mem.eql(u8, existing.name, symbol.name)) {
+                            existing.* = symbol;
+                            replaced = true;
+                            break;
+                        };
+                        if (!replaced) try order_scope.append(self.a, symbol);
                     }
                     for (p.value.order) |order| try self.expression(order_scope, order.expression, true);
                     if (p.value.skip) |skip| try self.expression(.empty, skip, false);

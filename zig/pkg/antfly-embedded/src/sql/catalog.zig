@@ -19,6 +19,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 pub const graph_relation = @import("graph_relation.zig");
+pub const Multiplicity = @import("cypher").runtime.Multiplicity;
 
 pub const Column = struct {
     name: []const u8,
@@ -493,9 +494,9 @@ pub const Cursor = struct {
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
-    /// Before the first pull, opt into compressed bag rows. Other consumers
-    /// always receive one physical row per logical row.
-    enable_weights: ?*const fn (*anyopaque) anyerror!bool = null,
+    /// Before the first pull, negotiate exact bags or duplicate-insensitive
+    /// presence contributions. Other consumers receive ordinary logical rows.
+    enable_weights: ?*const fn (*anyopaque, Multiplicity) anyerror!bool = null,
 };
 
 pub const StatementScan = struct { table: Table, request: Scan };

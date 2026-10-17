@@ -26,6 +26,9 @@ const A = std.mem.Allocator;
 pub const Row = []const v.Entry;
 pub const max_response_bytes: usize = 32 << 20;
 pub const Limits = struct { memory_bytes: usize = 64 << 20, scanned_anchors: usize = 1_000_000, explored_edges: usize = 1_000_000, intermediate_states: usize = 1_000_000, path_depth: usize = 1024, recursion_depth: usize = 64 };
+/// A presence consumer is insensitive to duplicates of an identical source row.
+/// It receives unit contributions, including when exact path counts overflow.
+pub const Multiplicity = enum { exact, presence };
 pub const Stats = struct { scanned_anchors: usize = 0, explored_edges: usize = 0, intermediate_states: usize = 0, mutations: usize = 0, search_calls: usize = 0, search_candidates: usize = 0, search_approximate: bool = false, memory_bytes: usize = 0 };
 pub const Stage = struct { operation: []const u8, span: ast.Span, input_rows: usize, output_rows: usize };
 pub const Result = struct {
@@ -109,13 +112,14 @@ pub const NodeCursor = struct {
     interior_anchors: []const usize = &.{},
     frames: std.ArrayList(*PathFrame) = .empty,
     weighted: bool = false,
+    multiplicity: Multiplicity = .exact,
     weighted_arena: std.heap.ArenaAllocator,
     pending: std.ArrayList(struct { row: Row, weight: u64 }) = .empty,
     pending_position: usize = 0,
     last_weights: std.ArrayList(u64) = .empty,
     /// Negotiate endpoint bags before the first pull. Route-observing queries
     /// retain the ordinary cursor; every declined per-anchor proof does too.
-    pub fn enableWeights(self: *NodeCursor) !bool {
+    pub fn enableWeights(self: *NodeCursor, multiplicity: Multiplicity) !bool {
         if (self.started or self.done or self.exact_count != null) return false;
         const operation = self.query.clauses[0].operation.match;
         if (operation.paths.len != 1 or self.interior_anchors[0] != 0) return false;
@@ -129,6 +133,7 @@ pub const NodeCursor = struct {
         for (path.nodes) |node| for (node.properties) |entry| if (self.engine.constant(entry.value, &.{}) == null) return false;
         for (path.edges) |edge| for (edge.properties) |entry| if (self.engine.constant(entry.value, &.{}) == null) return false;
         self.weighted = true;
+        self.multiplicity = multiplicity;
         return true;
     }
     fn emitWeighted(ptr: *anyopaque, row: Row, weight: u64) !void {
@@ -424,7 +429,7 @@ pub const NodeCursor = struct {
             _ = self.weighted_arena.reset(.retain_capacity);
             self.pending = .empty;
             self.pending_position = 0;
-            e.weighted_sink = .{ .ptr = self, .emit = emitWeighted };
+            e.weighted_sink = .{ .ptr = self, .emit = emitWeighted, .multiplicity = self.multiplicity };
             e.stream_predicate = self.query.clauses[0].operation.match.predicate;
             defer {
                 e.weighted_sink = null;
@@ -789,7 +794,7 @@ const Engine = struct {
     stream_predicate: ?*const ast.Expr = null,
     shortest_count: ?*u64 = null,
     count_endpoints: bool = false,
-    weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void } = null,
+    weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
     interior: ?*const Interior = null,
     cache_reads: bool = false,
@@ -798,6 +803,8 @@ const Engine = struct {
     lookups: []Lookup = &.{},
     lookup: ?*Lookup = null,
     aggregate_overrides: ?[]const AggregateValue = null,
+    projection_overrides: ?struct { items: []const ast.Item, row: Row } = null,
+    projection_locals: ?*const @import("expressions.zig").Local = null,
     read_nodes: std.HashMapUnmanaged(v.Identity, ?*const v.Node, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
     stages: std.ArrayList(Stage) = .empty,
     recursion: usize = 0,
@@ -1011,7 +1018,7 @@ const Engine = struct {
             if (projection.predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
             if (projection.distinct and !try unique_rows.accept(self, self.a, row)) continue;
             const keys = try self.a.alloc(v.Value, projection.order.len);
-            for (projection.order, keys) |order, *key| key.* = try self.eval(order.expression, scope, &.{});
+            for (projection.order, keys) |order, *key| key.* = try self.orderValue(order.expression, projection, row, scope, &.{});
             try projected.append(self.a, .{ .row = row, .source = group.source, .group = null, .keys = keys });
         }
         self.aggregate_overrides = previous;
@@ -1202,7 +1209,7 @@ const Engine = struct {
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
-        const count_endpoints = !count_shortest and !operation.optional and operation.paths.len == 1 and path.selector == .all and grouped and middle.len == 0 and calls.items.len != 0 and blk: {
+        const count_endpoints = !count_shortest and !operation.optional and operation.paths.len == 1 and path.selector == .all and grouped and middle.len == 0 and blk: {
             // One fixed hop has no shared prefixes to compress. Keep its
             // page-at-a-time fold instead of retaining the whole adjacency.
             if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) break :blk false;
@@ -2340,7 +2347,7 @@ const Engine = struct {
         // Never approximate SUM/AVG with the overflow sentinel.
         var exact_weights = true;
         if (self.count_endpoints or self.weighted_sink != null) {
-            const needs_weights = if (self.weighted_sink != null) true else for (self.stream_fold.?.calls) |expression| {
+            const needs_weights = if (self.weighted_sink) |sink| sink.multiplicity == .exact else for (self.stream_fold.?.calls) |expression| {
                 const aggregate_call = expression.value.call;
                 if (!aggregate_call.distinct and (std.ascii.eqlIgnoreCase(aggregate_call.name, "sum") or std.ascii.eqlIgnoreCase(aggregate_call.name, "avg"))) break true;
             } else false;
@@ -2375,7 +2382,7 @@ const Engine = struct {
                 const row = (try self.bind(input.row, path.nodes[path.nodes.len - 1].alias, .{ .node = node })) orelse continue;
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
                 if (self.weighted_sink) |sink| {
-                    try sink.emit(sink.ptr, row, ways);
+                    try sink.emit(sink.ptr, row, if (sink.multiplicity == .presence) 1 else ways);
                     continue;
                 }
                 const fold = self.stream_fold.?;
@@ -3222,6 +3229,9 @@ const Engine = struct {
         return result;
     }
     fn evalInner(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
+        if (expression.value != .variable) if (self.projection_overrides) |overrides| for (overrides.items, overrides.row) |item, entry| {
+            if (@import("expressions.zig").same(item.expression, expression) and @import("expressions.zig").unshadowed(expression, self.projection_locals)) return entry.value;
+        };
         if (self.aggregate_overrides) |overrides| for (overrides) |override| if (override.expression == expression) return override.value;
         try self.checkpoint();
         return switch (expression.value) {
@@ -3291,6 +3301,10 @@ const Engine = struct {
                 if (input != .list) return error.CypherTypeMismatch;
                 var true_count: usize = 0;
                 var unknown = false;
+                const previous_locals = self.projection_locals;
+                defer self.projection_locals = previous_locals;
+                const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous_locals };
+                self.projection_locals = &local;
                 for (input.list) |item| {
                     try self.state();
                     const inner = try self.replace(row, c.alias, item);
@@ -3315,6 +3329,12 @@ const Engine = struct {
                 const input = try self.eval(c.input, row, group);
                 if (input == .null) break :blk .null;
                 if (input != .list) return error.CypherTypeMismatch;
+                const previous_locals = self.projection_locals;
+                defer self.projection_locals = previous_locals;
+                const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous_locals };
+                self.projection_locals = &local;
+                const accumulator_local: @import("expressions.zig").Local = .{ .name = c.accumulator, .parent = &local };
+                self.projection_locals = &accumulator_local;
                 for (input.list) |item| {
                     try self.state();
                     const inner = try self.replace(try self.replace(row, c.accumulator, accumulator), c.alias, item);
@@ -3327,6 +3347,10 @@ const Engine = struct {
                 if (input == .null) break :blk .null;
                 if (input != .list) return error.CypherTypeMismatch;
                 var values: std.ArrayList(v.Value) = .empty;
+                const previous_locals = self.projection_locals;
+                defer self.projection_locals = previous_locals;
+                const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous_locals };
+                self.projection_locals = &local;
                 for (input.list) |item| {
                     try self.state();
                     const inner = try self.replace(row, c.alias, item);
@@ -3919,6 +3943,14 @@ const Engine = struct {
         for (rows) |row| try top.add(row);
         return top.finish(final);
     }
+    fn orderValue(self: *Engine, expression: *const ast.Expr, projection: ast.Projection, projected: Row, scope: Row, group: ?[]const Row) !v.Value {
+        const previous = self.projection_overrides;
+        defer self.projection_overrides = previous;
+        // DISTINCT sorts its already computed values. Structural references
+        // remain valid even if a projection alias shadows the source entity.
+        if (projection.distinct) self.projection_overrides = .{ .items = projection.items, .row = projected[projected.len - projection.items.len ..] };
+        return self.eval(expression, scope, group);
+    }
     // Unordered, non-grouped projection needs one output binding per input.
     // Avoid singleton group buffers, Projected records and unused source/alias
     // scopes. Every input is still evaluated before applying SKIP/LIMIT.
@@ -4012,7 +4044,7 @@ const Engine = struct {
             for (out_row) |entry| scope = try self.replace(scope, entry.name, entry.value);
             if (projection.predicate) |predicate| if ((try (try self.eval(predicate, if (grouped or projection.distinct) out_row else scope, null)).truth()) != true) continue;
             const order_keys = try self.a.alloc(v.Value, projection.order.len);
-            for (projection.order, order_keys) |order_value, *key| key.* = try self.eval(order_value.expression, scope, if (grouped) group.items else null);
+            for (projection.order, order_keys) |order_value, *key| key.* = try self.orderValue(order_value.expression, projection, out_row, scope, if (grouped) group.items else null);
             if (projection.distinct) {
                 const hash = try self.rowHash(out_row);
                 var candidate = projected_index.head(hash);

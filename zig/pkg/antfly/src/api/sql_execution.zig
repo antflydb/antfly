@@ -1663,13 +1663,13 @@ pub const Adapter = struct {
             try self.validate(a);
             return page;
         }
-        fn enableWeights(ptr: *anyopaque) !bool {
+        fn enableWeights(ptr: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const enable = self.child.enable_weights orelse return false;
             var arena = std.heap.ArenaAllocator.init(self.a);
             defer arena.deinit();
             try self.validate(arena.allocator());
-            const enabled = try enable(self.child.ptr);
+            const enabled = try enable(self.child.ptr, multiplicity);
             try self.validate(arena.allocator());
             return enabled;
         }

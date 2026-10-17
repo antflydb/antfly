@@ -61,10 +61,10 @@ const Cursor = struct {
         try self.read.validate();
         return page;
     }
-    fn enableWeights(ptr: *anyopaque) !bool {
+    fn enableWeights(ptr: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         try self.read.validate();
-        const enabled = if (self.child.enable_weights) |enable| try enable(self.child.ptr) else false;
+        const enabled = if (self.child.enable_weights) |enable| try enable(self.child.ptr, multiplicity) else false;
         try self.read.validate();
         return enabled;
     }

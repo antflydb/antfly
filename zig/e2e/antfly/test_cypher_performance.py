@@ -419,6 +419,16 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert computed_sql["rows"] == [["497250", "6", "17", "138"]], computed_sql
         assert time.monotonic() - start < 10
+        distinct_endpoints = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*6..6]->(b:H) RETURN DISTINCT b.score ORDER BY b.score",
+                "limits": {"explored_edges": 1000, "intermediate_states": 30000},
+            },
+        )
+        assert distinct_endpoints["rows"] == [
+            [{"type": "integer", "value": str(i)}] for i in range(6, 18)
+        ], distinct_endpoints
         phase = call(
             f"/graphs/{hops}/query",
             {
@@ -540,6 +550,34 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             )
             assert pair["rows"] == [[{"type": "integer", "value": "1"}]], pair
             assert pair["stats"]["explored_edges"] <= 2, pair
+        # Exercise presence negotiation through the authenticated SQL cursor
+        # wrappers with more paths than fit an exact signed multiplicity.
+        layers = 64
+        patterns = ["(s:H {id:'presence_start',score:0})"] + [
+            f"(v{i}_{j}:H {{score:{i + 1}}})" for i in range(layers) for j in range(2)
+        ]
+        patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+        patterns += [
+            f"(v{i}_{j})-[:R]->(v{i + 1}_{k})"
+            for i in range(layers - 1)
+            for j in range(2)
+            for k in range(2)
+        ]
+        call(f"/graphs/{hops}/query", {"query": "CREATE " + ",".join(patterns)})
+        presence_path = (
+            "(a IS H)"
+            + "".join(f"-[r{i} IS R]->(m{i} IS H)" for i in range(63))
+            + "-[r63 IS R]->(b IS H)"
+        )
+        presence_sql = call(
+            "/sql",
+            {
+                "statement": "SELECT min(q.score),max(q.score),count(DISTINCT q.score) "
+                f"FROM GRAPH_TABLE({hops} MATCH {presence_path} "
+                "WHERE a.id='presence_start' COLUMNS(b.score AS score)) q"
+            },
+        )
+        assert presence_sql["rows"] == [["64", "64", "1"]], presence_sql
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"
