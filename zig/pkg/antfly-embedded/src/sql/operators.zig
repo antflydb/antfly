@@ -237,11 +237,33 @@ pub const TopK = struct {
         var row = input;
         row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
         if (self.external) |sort| return sort.add(row);
-        self.addInMemory(row) catch |err| {
-            if (self.spill_manager == null or (err != error.SqlProgramLimitExceeded and err != error.OutOfMemory)) return err;
-            try self.startSpill();
-            try self.external.?.add(row);
-        };
+        self.addInMemory(row) catch |err| return self.spillCandidate(row, err);
+    }
+    fn spillCandidate(self: *TopK, row: Row, err: anyerror) !void {
+        if (self.spill_manager == null or (err != error.SqlProgramLimitExceeded and err != error.OutOfMemory)) return err;
+        try self.startSpill();
+        try self.external.?.add(row);
+    }
+    pub fn addBatch(self: *TopK, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinals: []const u64) !void {
+        if (batch.len() != keys.len or keys.len != ordinals.len or self.finished) return error.InvalidSqlBackendResponse;
+        var index: usize = 0;
+        while (index < batch.len()) : (index += 1) {
+            if (self.external) |sort| {
+                const selection = try a.alloc(usize, batch.len() - index);
+                for (selection, index..) |*position, i| position.* = i;
+                return sort.addBatch(try batch.select(a, selection), keys[index..], ordinals[index..]);
+            }
+            var row: Row = .{ .values = &.{}, .keys = keys[index], .ordinal = ordinals[index], .normalized = @import("sort_key.zig").encode(keys[index], self.orders) };
+            if (row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
+            for (row.keys) |key| if (!key.sql_null) {
+                _ = try scalar.compareDatums(key, key);
+            };
+            if (self.capacity == 0 or (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt)) continue;
+            // Reject losers before reading payload cells. A small LIMIT keeps
+            // its bounded heap rather than sorting the complete input on disk.
+            row.values = try batch.row(a, index);
+            self.retainInMemory(row) catch |err| try self.spillCandidate(row, err);
+        }
     }
     fn addInMemory(self: *TopK, row: Row) !void {
         if (self.finished) return error.InvalidSqlBackendResponse;
@@ -253,6 +275,9 @@ pub const TopK = struct {
             _ = try scalar.compareDatums(key, key);
         };
         if (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt) return;
+        return self.retainInMemory(row);
+    }
+    fn retainInMemory(self: *TopK, row: Row) !void {
         try self.growEntries();
         var estimate: usize = 0;
         for (row.values) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
@@ -652,8 +677,7 @@ pub const HashJoin = struct {
                 return match;
             }
             if (self.owner.disk) |*file| while (self.cursor) |index| {
-                _ = self.owner.disk_arena.reset(.free_all);
-                const decoded = try file.read(self.owner.disk_arena.allocator(), index);
+                const decoded = try self.owner.readDiskKey(file, index);
                 self.cursor = if (decoded.next == @import("spill.zig").none) null else @intCast(decoded.next);
                 self.owner.probes += 1;
                 if (decoded.row.keys.len != self.keys.len) return error.InvalidSqlSpill;
@@ -1256,12 +1280,20 @@ pub const HashJoin = struct {
         }
         self.entries.items[index].matched = true;
     }
+    fn readDiskKey(self: *HashJoin, file: *@import("spill.zig").File, offset: u64) !@import("spill.zig").Decoded {
+        _ = self.disk_arena.reset(.free_all);
+        const stable = self.budget.allocator();
+        var pressure: @import("spill.zig").CachePressure = .{ .manager = file.manager, .context = self, .evict = evictPayload, .backing = stable };
+        if (file.read_buffer.len == 0) pressure.prepare(@max(1, file.buffer_bytes orelse file.manager.buffer_bytes));
+        self.disk_arena.child_allocator = pressure.allocator();
+        defer self.disk_arena.child_allocator = stable;
+        return file.read(self.disk_arena.allocator(), offset);
+    }
     pub fn unmatched(self: *HashJoin, next: *usize) !?Match {
         if (self.disk) |*file| {
             while (next.* < file.size) {
                 const offset = next.*;
-                _ = self.disk_arena.reset(.free_all);
-                const row = try file.read(self.disk_arena.allocator(), offset);
+                const row = try self.readDiskKey(file, offset);
                 next.* = @intCast(row.following);
                 if (!row.matched) return try self.diskMatch(offset, row);
             }
@@ -3644,4 +3676,69 @@ test "SQL native spill classification keeps ordinary inline rows on one sizing r
     try join.addBatch(source.allocator(), .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .count = 64, .width = 1 } }, &keys);
     try std.testing.expect(join.disk_values == null);
     try std.testing.expectEqual(@as(usize, 128), reader.reads);
+}
+
+test "SQL native key reads evict optional caches before parent admission" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator) !void {
+            var budget: MemoryBudget = .{ .backing = a, .limit = 98304 };
+            defer std.debug.assert(budget.live == 0);
+            var dummy: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            const join = try HashJoin.create(budget.allocator(), .{ .bytes = budget.limit, .spill = &manager });
+            defer join.deinit();
+            try join.startSpill();
+            var body: [12000]u8 = @splat('x');
+            const key: [8192]u8 = @splat('k');
+            for (0..10) |index| {
+                body[0] = @intCast('a' + index);
+                try join.add(&.{Datum.json(.{ .string = &body })}, &.{Datum.json(.{ .string = &key })});
+            }
+            var probe = try join.probe(&.{Datum.json(.{ .string = &key })});
+            var found: usize = 0;
+            while (try probe.next()) |match| {
+                const block = try match.native.?.block();
+                try std.testing.expectEqual(@as(u8, @intCast('j' - found)), (try block.cell(0, 0)).value.string[0]);
+                found += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 10), found);
+            var offset: usize = 0;
+            var unmatched_count: usize = 0;
+            while (try join.unmatched(&offset)) |match| {
+                const block = try match.native.?.block();
+                _ = try block.cell(0, 0);
+                unmatched_count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 10), unmatched_count);
+            try std.testing.expect(!budget.isExhausted());
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL native small limit rejects batch losers without reading payloads" {
+    const Reader = struct {
+        reads: usize = 0,
+        fn cell(raw: *anyopaque, _: Allocator, _: usize, _: usize) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return error.UnexpectedPayloadMaterialization;
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var top = try TopK.init(a, 1, &.{.{}}, 64 * 1024);
+    defer top.deinit();
+    try top.add(.{ .values = &.{Datum.json(.{ .integer = 99 })}, .keys = &.{Datum.json(.{ .integer = 0 })}, .ordinal = 0 });
+    var reader: Reader = .{};
+    const loser = [_]Datum{Datum.json(.{ .integer = 1 })};
+    try top.addBatch(arena.allocator(), .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .count = 3, .width = 1 } }, &.{ &loser, &loser, &loser }, &.{ 1, 2, 3 });
+    try std.testing.expectEqual(@as(usize, 0), reader.reads);
+    try std.testing.expectEqual(@as(usize, 3), top.comparisons);
+    const result = try top.finish(arena.allocator());
+    try std.testing.expectEqual(@as(i64, 99), result[0].values[0].value.integer);
 }

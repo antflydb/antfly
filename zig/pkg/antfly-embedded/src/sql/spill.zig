@@ -277,8 +277,10 @@ pub const File = struct {
         // touching the parent budget; actual allocator failures propagate.
         const required = (if (self.spare.len == 0) self.write_buffer.len else @as(usize, 0)) +
             (if (self.write_job == null) @sizeOf(WriteJob) else @as(usize, 0));
-        if (@import("memory_budget.zig").headroom(self.manager.alloc)) |available|
+        if (required != 0) {
+            const available = @import("memory_budget.zig").optionalHeadroom(self.manager.alloc) orelse return null;
             if (required > available) return null;
+        }
         const fresh = self.spare.len == 0;
         if (fresh) self.spare = try self.manager.allocator().alloc(u8, self.write_buffer.len);
         errdefer if (fresh) {
@@ -1145,6 +1147,7 @@ pub const CachePressure = struct {
     manager: *Manager,
     context: *anyopaque,
     evict: *const fn (*anyopaque) bool,
+    backing: ?Allocator = null,
     /// The optional payload owner may be published during the operation.
     pub fn forPayloads(manager: *Manager, payloads: *?*JoinPayloads) CachePressure {
         return .{ .manager = manager, .context = @ptrCast(payloads), .evict = evictPayloads };
@@ -1164,21 +1167,21 @@ pub const CachePressure = struct {
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *CachePressure = @ptrCast(@alignCast(raw));
         self.prepare(len);
-        return self.manager.allocator().rawAlloc(len, alignment, ra);
+        return (self.backing orelse self.manager.allocator()).rawAlloc(len, alignment, ra);
     }
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *CachePressure = @ptrCast(@alignCast(raw));
         self.prepare(len -| bytes.len);
-        return self.manager.allocator().rawResize(bytes, alignment, len, ra);
+        return (self.backing orelse self.manager.allocator()).rawResize(bytes, alignment, len, ra);
     }
     fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *CachePressure = @ptrCast(@alignCast(raw));
         self.prepare(len -| bytes.len);
-        return self.manager.allocator().rawRemap(bytes, alignment, len, ra);
+        return (self.backing orelse self.manager.allocator()).rawRemap(bytes, alignment, len, ra);
     }
     fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *CachePressure = @ptrCast(@alignCast(raw));
-        self.manager.allocator().rawFree(bytes, alignment, ra);
+        (self.backing orelse self.manager.allocator()).rawFree(bytes, alignment, ra);
     }
 };
 
@@ -2748,6 +2751,78 @@ pub const Sort = struct {
         self.estimated +|= retained;
         self.total += 1;
     }
+    /// Retain compact payload columns, evaluating only sort keys as Datums.
+    /// Oversized singleton runs encode directly without constructing a DOM.
+    pub fn addBatch(self: *Sort, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinals: []const u64) !void {
+        if (self.finished or batch.len() != keys.len or keys.len != ordinals.len) return error.InvalidSqlBackendResponse;
+        var begin: usize = 0;
+        while (begin < batch.len()) {
+            try self.manager.check();
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var count = @min(@as(usize, 64), batch.len() - begin);
+            var positions: [64]usize = undefined;
+            var normalized: [64]?@import("sort_key.zig").Key = undefined;
+            for (0..count) |i| {
+                positions[i] = begin + i;
+                if (keys[begin + i].len != self.orders.len) return error.InvalidSqlBackendResponse;
+                for (keys[begin + i]) |key| if (!key.sql_null) {
+                    _ = try scalar.compareDatums(key, key);
+                };
+                normalized[i] = try self.normalize(keys[begin + i]);
+                var bytes: usize = @sizeOf(Row);
+                for (0..batch.width()) |column| bytes +|= try batch.cellBytes(a, begin + i, column);
+                for (keys[begin + i]) |key| bytes +|= try operators.datumBytes(key);
+                self.max_row_bytes = @max(self.max_row_bytes, bytes);
+            }
+            if (self.presorted) {
+                if (self.presorted_run == null) self.presorted_run = try self.createRun();
+                try self.presorted_run.?.appendBatch(try batch.select(a, positions[0..count]), .{ .rows = keys[begin..][0..count] }, ordinals[begin..][0..count]);
+                self.total += count;
+                begin += count;
+                continue;
+            }
+            try self.collectPresortedRun();
+            if (self.rows.items.len != 0 and (self.values.columns.len != batch.width() or self.keys.columns.len != self.orders.len)) try self.flush();
+            const target = self.memory_bytes / (if (self.parallel_runs and self.memory_bytes >= 128 * 1024) @as(usize, 8) else 4);
+            var retained: usize = 0;
+            while (true) {
+                const selected = try batch.select(a, positions[0..count]);
+                retained = count *| @sizeOf(Entry) +| try self.values.batchAppendBytes(a, selected, target);
+                for (keys[begin..][0..count]) |row| retained +|= try self.keys.appendBytes(row);
+                if (self.rows.items.len != 0 and (self.values.columns.len != batch.width() or self.keys.columns.len != self.orders.len or retained > target -| self.estimated)) {
+                    try self.flush();
+                    continue;
+                }
+                if (retained <= target or count == 1) break;
+                count = @max(1, count / 2);
+            }
+            const selected = try batch.select(a, positions[0..count]);
+            if (retained > target) {
+                try self.collectRun();
+                const run = blk: {
+                    var file = try self.createRun();
+                    errdefer file.close();
+                    try file.appendBatch(selected, .{ .rows = keys[begin..][0..count] }, ordinals[begin..][0..count]);
+                    try file.seal();
+                    break :blk file;
+                };
+                try self.admitRun(run);
+            } else {
+                try self.rows.ensureUnusedCapacity(self.a, count);
+                const position = self.values.len;
+                try self.values.appendBatch(selected);
+                for (keys[begin..][0..count], 0..) |row, i| {
+                    _ = try self.keys.append(row);
+                    self.rows.appendAssumeCapacity(.{ .position = position + i, .ordinal = ordinals[begin + i], .normalized = normalized[i] });
+                }
+                self.estimated +|= retained;
+            }
+            self.total += count;
+            begin += count;
+        }
+    }
     fn normalize(self: *const Sort, keys: []const Datum) !?@import("sort_key.zig").Key {
         if (!self.encoded_bytes) return @import("sort_key.zig").encode(keys, self.orders);
         if (keys.len != 1 or self.orders.len != 1 or self.orders[0].descending or keys[0].sql_null or keys[0].numeric != null or keys[0].array != null or keys[0].value != .string) return error.InvalidSqlBackendResponse;
@@ -3048,28 +3123,93 @@ pub const Sort = struct {
         decoded.row.normalized = try self.normalize(decoded.row.keys);
         return decoded;
     }
+    const MergeRows = struct {
+        const Location = struct { block: *Sequential.OwnedBlock, row: usize };
+        locations: []const Location,
+        keys: bool,
+        fn cell(raw: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const location = self.locations[row];
+            return if (self.keys) location.block.keyCell(location.row, column) else location.block.cell(location.row, column);
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const location = self.locations[row];
+            return if (location.block.encoded) |block| block.frozenJson(location.row, column, self.keys) else null;
+        }
+        fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const location = self.locations[row];
+            return if (location.block.encoded) |block| block.encodedJson(location.row, column, self.keys) else null;
+        }
+        fn batch(self: *@This()) @import("execution_batch.zig").Batch {
+            const block = self.locations[0].block;
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
+        }
+        fn write(locations: []const Location, ordinals: []const u64, output: *Sequential) !void {
+            if (locations.len == 0) return;
+            var values: MergeRows = .{ .locations = locations, .keys = false };
+            var keys: MergeRows = .{ .locations = locations, .keys = true };
+            try output.appendBatch(values.batch(), keys.batch(), ordinals);
+        }
+    };
     fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
         std.debug.assert(inputs.len >= 2 and inputs.len <= self.fanIn());
         var output = try self.createRun();
         errdefer output.close();
         var arenas: [8]std.heap.ArenaAllocator = undefined;
-        var heads: [8]?Decoded = @splat(null);
-        for (arenas[0..inputs.len]) |*arena| arena.* = std.heap.ArenaAllocator.init(self.a);
+        var heads: [8]?Row = @splat(null);
+        var blocks: [8]?*Sequential.OwnedBlock = @splat(null);
+        var positions: [8]usize = @splat(0);
+        var offsets: [8]u64 = @splat(0);
+        for (arenas[0..inputs.len]) |*arena| arena.* = .init(self.a);
         defer for (arenas[0..inputs.len]) |*arena| arena.deinit();
-        for (inputs, arenas[0..inputs.len], heads[0..inputs.len]) |file, *arena, *head|
-            head.* = if (file.size != 0) try self.readRun(file, arena.allocator(), 0) else null;
+        defer for (blocks) |block| if (block) |owner| owner.release();
+        for (inputs, 0..) |file, index| if (file.size != 0) {
+            try file.seal();
+            blocks[index] = try file.readOwnedBlock(0);
+            var row = try blocks[index].?.keyRowAlloc(arenas[index].allocator(), 0);
+            row.normalized = try self.normalize(row.keys);
+            heads[index] = row;
+        };
+        var pending: [64]MergeRows.Location = undefined;
+        var ordinals: [64]u64 = undefined;
+        var count: usize = 0;
         while (true) {
             try self.manager.check();
             var selected: ?usize = null;
-            for (heads[0..inputs.len], 0..) |head, index| if (head) |value| {
-                if (selected == null or (try self.compare(value.row, heads[selected.?].?.row)) == .lt) selected = index;
+            for (heads[0..inputs.len], 0..) |head, index| if (head) |row| {
+                if (selected == null or (try self.compare(row, heads[selected.?].?)) == .lt) selected = index;
             };
             const index = selected orelse break;
-            const head = heads[index].?;
-            _ = try output.append(head.row, none);
+            const block = blocks[index].?;
+            pending[count] = .{ .block = block, .row = positions[index] };
+            ordinals[count] = heads[index].?.ordinal;
+            count += 1;
+            positions[index] += 1;
+            offsets[index] += 1;
+            // Pending rows borrow current input blocks. Flush before retiring
+            // any block, so wide payloads never need extra pinned cohorts.
+            if (count == pending.len or positions[index] == block.count()) {
+                try MergeRows.write(pending[0..count], ordinals[0..count], &output);
+                count = 0;
+            }
+            if (positions[index] == block.count()) {
+                blocks[index] = null;
+                block.release();
+                if (offsets[index] < inputs[index].size) {
+                    blocks[index] = try inputs[index].readOwnedBlock(offsets[index]);
+                    positions[index] = 0;
+                }
+            }
             _ = arenas[index].reset(.retain_capacity);
-            heads[index] = if (head.following < inputs[index].size) try self.readRun(inputs[index], arenas[index].allocator(), head.following) else null;
+            heads[index] = if (blocks[index]) |next_block| blk: {
+                var row = try next_block.keyRowAlloc(arenas[index].allocator(), positions[index]);
+                row.normalized = try self.normalize(row.keys);
+                break :blk row;
+            } else null;
         }
+        try MergeRows.write(pending[0..count], ordinals[0..count], &output);
         self.manager.increment("merges", 1);
         return output;
     }
@@ -5528,4 +5668,92 @@ test "SQL native async spill fallback preserves parent admission and reports gen
     };
     try Fixture.run(std.testing.allocator, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
+}
+
+test "SQL native optional async buffers decline opaque enclosing quotas" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |nested| {
+        var storage: [65536]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        var budget: @import("memory_budget.zig") = .{ .backing = fixed.allocator(), .limit = storage.len };
+        const a = if (nested) budget.allocator() else fixed.allocator();
+        var dummy: u8 = 0;
+        var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+        defer manager.deinit();
+        var file = try manager.create();
+        defer file.close();
+        const data: [2048]u8 = @splat(42);
+        try file.writeRaw(0, &data);
+        const ballast = try fixed.allocator().alloc(u8, storage.len - fixed.end_index - 1024);
+        defer fixed.allocator().free(ballast);
+        try file.flush();
+        try std.testing.expect(file.write_job == null);
+        try std.testing.expect(!budget.isExhausted());
+        var actual: [2048]u8 = undefined;
+        // Direct physical verification needs no optional read buffer.
+        try std.testing.expectEqual(actual.len, try file.readPhysical(&actual, 0));
+        try std.testing.expectEqualSlices(u8, &data, &actual);
+    }
+}
+
+test "SQL native batch sort preserves frozen payloads through singleton runs and merges" {
+    const Reader = struct {
+        frozen: @import("execution_batch.zig").FrozenJson,
+        fn cell(_: *anyopaque, _: Allocator, _: usize, _: usize) anyerror!Datum {
+            return error.UnexpectedPayloadMaterialization;
+        }
+        fn payload(raw: *anyopaque, _: usize, _: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.frozen;
+        }
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, count: usize) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const body: [1024]u8 = @splat('x');
+            var object: std.json.ObjectMap = .empty;
+            try object.put(sa, "payload", .{ .string = &body });
+            const wire = try encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(.{ .object = object })}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+            const block = try decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+            defer block.deinit();
+            var reader: @This() = .{ .frozen = (try block.frozenJson(0, 0, false)).? };
+            var dummy: u8 = 0;
+            var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            var sort = Sort.init(a, &manager, &.{.{}}, 4096);
+            defer sort.deinit();
+            sort.parallel_runs = false;
+            sort.run_limit = 3;
+            const keys = try sa.alloc([]const Datum, count);
+            const ordinals = try sa.alloc(u64, count);
+            for (keys, ordinals, 0..) |*key, *ordinal, index| {
+                const values = try sa.alloc(Datum, 1);
+                values[0] = Datum.json(.{ .integer = @intCast(index % 3) });
+                key.* = values;
+                ordinal.* = index;
+            }
+            try sort.addBatch(.{ .reader = .{ .ptr = &reader, .read = cell, .read_frozen = payload, .count = count, .width = 1 } }, keys, ordinals);
+            var seen: usize = 0;
+            var previous_key: i64 = -1;
+            var previous_ordinal: u64 = 0;
+            while (try sort.nextLeased()) |lease| {
+                defer lease.release();
+                const owned = lease.block.?;
+                try std.testing.expect((try owned.encoded.?.frozenJson(lease.index, 0, false)) != null);
+                const key = (try owned.keyCell(lease.index, 0)).value.integer;
+                try std.testing.expect(key >= previous_key);
+                if (key == previous_key) try std.testing.expect(lease.row.ordinal > previous_ordinal);
+                previous_key = key;
+                previous_ordinal = lease.row.ordinal;
+                seen += 1;
+            }
+            try std.testing.expectEqual(count, seen);
+            if (count > 3) try std.testing.expect(manager.merges > 0);
+        }
+    };
+    try Reader.run(std.testing.allocator, 24);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Reader.run, .{@as(usize, 4)});
 }

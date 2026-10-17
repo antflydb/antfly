@@ -335,6 +335,22 @@ pub const Cursor = struct {
         if (self.memory) |memory| return memory.append(values);
         _ = try self.rows.append(.{ .values = values, .keys = &.{}, .ordinal = self.rows.size }, @import("spill.zig").none);
     }
+    pub fn appendBatch(raw: *anyopaque, values: @import("execution_batch.zig").Batch) !void {
+        const self: *Cursor = @ptrCast(@alignCast(raw));
+        if (self.replay_failed or self.sealed or self.sorted != null or values.width() != self.width) return error.InvalidSqlBackendResponse;
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        if (self.memory) |memory| {
+            for (0..values.len()) |row| {
+                _ = scratch.reset(.free_all);
+                try memory.append(try values.row(scratch.allocator(), row));
+            }
+            return;
+        }
+        const ordinals = try scratch.allocator().alloc(u64, values.len());
+        for (ordinals, 0..) |*ordinal, i| ordinal.* = self.rows.size + i;
+        try self.rows.appendBatch(values, .{ .vectors = .{ .values = &.{}, .count = values.len() } }, ordinals);
+    }
     pub fn close(self: *Cursor) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.replay_readers == 0);
@@ -807,14 +823,8 @@ test "SQL blocking native leases size frozen JSON without DOM expansion and pres
             const row = &.{ datum, Datum.json(.{ .string = "repeated dictionary body" }) };
             // More rows make the physical string dictionary worthwhile.
             const rows = try sa.alloc([]const Datum, 8);
-            const keys = try sa.alloc([]const Datum, 8);
-            const ordinals = try sa.alloc(u64, 8);
-            for (rows, keys, ordinals, 0..) |*r, *k, *o, index| {
-                r.* = row;
-                k.* = &.{};
-                o.* = index;
-            }
-            try cursor.rows.appendBatch(.{ .rows = rows }, .{ .rows = keys }, ordinals);
+            @memset(rows, row);
+            try Cursor.appendBatch(cursor, .{ .rows = rows });
             try cursor.loadBlock();
             const block = cursor.block.?;
             const before = block.retainedBytes();

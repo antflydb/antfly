@@ -104,6 +104,31 @@ pub fn headroom(a: std.mem.Allocator) ?usize {
     self.mutex.unlock();
     return if (headroom(backing)) |parent| @min(available, parent) else available;
 }
+/// Optional acceleration must not speculate through an opaque quota wrapper.
+/// Recognize only our complete budget chain and standard unbounded backings;
+/// mandatory allocations continue to use the normal allocator error contract.
+pub fn optionalHeadroom(a: std.mem.Allocator) ?usize {
+    if (a.vtable.alloc == alloc or a.vtable.alloc == scratchAlloc) {
+        const self: *Budget = @ptrCast(@alignCast(a.ptr));
+        self.lock();
+        const available = self.limit -| if (self.monotonic) self.spent else self.live;
+        const backing = self.backing;
+        const shared_admission = self.admission != null;
+        self.mutex.unlock();
+        // An external reservation owner can impose another, opaque cap.
+        if (shared_admission) return null;
+        const parent = optionalHeadroom(backing) orelse return null;
+        return @min(available, parent);
+    }
+    if (a.vtable == std.heap.page_allocator.vtable) return std.math.maxInt(usize);
+    if (comptime !@import("builtin").single_threaded) {
+        if (a.vtable == std.heap.smp_allocator.vtable) return std.math.maxInt(usize);
+    }
+    if (comptime @import("builtin").link_libc) {
+        if (a.vtable == std.heap.c_allocator.vtable) return std.math.maxInt(usize);
+    }
+    return null;
+}
 fn admit(self: *Budget, growth: usize) bool {
     if (growth > self.limit -| if (self.monotonic) self.spent else self.live) {
         self.exhausted = true;

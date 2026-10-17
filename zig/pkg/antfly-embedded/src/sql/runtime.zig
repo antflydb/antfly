@@ -235,7 +235,43 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
 pub const RowSink = struct {
     ptr: *anyopaque,
     append: *const fn (*anyopaque, []const Datum) anyerror!void,
+    append_batch: ?*const fn (*anyopaque, @import("execution_batch.zig").Batch) anyerror!void = null,
     take_sorted: ?*const fn (*anyopaque, *@import("operators.zig").TopK, usize, usize, bool) anyerror!void = null,
+};
+// A synchronous view over a scan-page lease. Expressions and sort keys use
+// scalar semantics; pass-through JSON retains the native producer capability.
+const ProjectedBatch = struct {
+    rows: []const catalog.Row,
+    selection: []const usize,
+    positions: []const ?usize,
+    fields: []const []const u8,
+    columns: []const describe.Column,
+    expressions: []const ?[]const Datum,
+    coerced: []const ?[]const Datum = &.{},
+    fn cell(raw: *anyopaque, a: std.mem.Allocator, lane: usize, column: usize) anyerror!Datum {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (column < self.coerced.len) if (self.coerced[column]) |values| return values[lane];
+        const row = self.selection[lane];
+        const input = if (column < self.expressions.len and self.expressions[column] != null)
+            self.expressions[column].?[self.positions[row].?]
+        else
+            try self.rows[row].cell(self.fields[column]);
+        return describe.coerceDatum(a, input, self.columns[column].type, self.columns[column].element_type);
+    }
+    fn native(self: *@This(), column: usize) bool {
+        return self.columns[column].type == .json and (column >= self.expressions.len or self.expressions[column] == null);
+    }
+    fn frozen(raw: *anyopaque, lane: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.native(column)) self.rows[self.selection[lane]].frozenJson(self.fields[column]) else null;
+    }
+    fn json(raw: *anyopaque, lane: usize, column: usize) anyerror!?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.native(column)) self.rows[self.selection[lane]].encodedJson(self.fields[column]) else null;
+    }
+    fn batch(self: *@This()) @import("execution_batch.zig").Batch {
+        return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .count = self.selection.len, .width = self.columns.len } };
+    }
 };
 pub const Context = struct {
     sink: ?RowSink = null,
@@ -366,7 +402,7 @@ pub const Context = struct {
         const Cursor = @import("result_cursor.zig").Cursor;
         const cursor = if (self.spill) |manager| try Cursor.create(self.alloc, manager, self.binding.columns.len) else try Cursor.createMemory(self.alloc, self.binding.columns.len, self.limits.retained_bytes / 2);
         errdefer cursor.close();
-        try self.selectInto(statement, .{ .ptr = cursor, .append = Cursor.append, .take_sorted = Cursor.takeSorted });
+        try self.selectInto(statement, .{ .ptr = cursor, .append = Cursor.append, .append_batch = Cursor.appendBatch, .take_sorted = Cursor.takeSorted });
         return cursor;
     }
 
@@ -873,6 +909,77 @@ pub const Context = struct {
                     try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
                 else
                     null;
+                if (!defer_projection and !statement.count_all and (top_k != null or (self.sink != null and self.sink.?.append_batch != null))) {
+                    const selection = try scratch.alloc(usize, selected_cells.items.len);
+                    const ordinals = try scratch.alloc(u64, selected_cells.items.len);
+                    var selected_count: usize = 0;
+                    var complete = false;
+                    for (chunk_rows, 0..) |_, row_index| {
+                        try self.checkpoint();
+                        visited += 1;
+                        if (predicate_values) |values| {
+                            if (values[row_index].sql_null or !values[row_index].value.bool) continue;
+                        }
+                        scanned += 1;
+                        if (top_k == null and scanned <= offset) continue;
+                        if (top_k == null and delivered + selected_count == limit) {
+                            if (statement.limit == null) return error.SqlResultTooLarge;
+                            complete = true;
+                            break;
+                        }
+                        selection[selected_count] = row_index;
+                        ordinals[selected_count] = visited;
+                        selected_count += 1;
+                        if (top_k == null and delivered + selected_count == limit and statement.limit != null) {
+                            complete = true;
+                            break;
+                        }
+                    }
+                    if (selected_count != 0) {
+                        var view: ProjectedBatch = .{ .rows = chunk_rows, .selection = selection[0..selected_count], .positions = selected_positions, .fields = fields.items, .columns = columns, .expressions = projection_values };
+                        // Keep declared coercion errors eager even for heap
+                        // losers. Cache scalar columns once; validated native
+                        // JSON needs no DOM to cross its declared JSON boundary.
+                        if (top_k != null) {
+                            const coerced = try scratch.alloc(?[]const Datum, columns.len);
+                            @memset(coerced, null);
+                            for (columns, 0..) |column, ordinal| {
+                                if (column.type == .json) {
+                                    for (0..selected_count) |lane| {
+                                        if (try ProjectedBatch.frozen(&view, lane, ordinal) != null or try ProjectedBatch.json(&view, lane, ordinal) != null) continue;
+                                        _ = try ProjectedBatch.cell(&view, scratch, lane, ordinal);
+                                    }
+                                    continue;
+                                }
+                                const values = try scratch.alloc(Datum, selected_count);
+                                for (values, 0..) |*cell_, lane| cell_.* = try ProjectedBatch.cell(&view, scratch, lane, ordinal);
+                                coerced[ordinal] = values;
+                            }
+                            view.coerced = coerced;
+                        }
+                        const batch = view.batch();
+                        if (top_k) |*operator| {
+                            const keys = try scratch.alloc([]const Datum, selected_count);
+                            for (selection[0..selected_count], keys, 0..) |physical, *out, lane| {
+                                const row_keys = try scratch.alloc(Datum, self.binding.order_keys.len);
+                                for (self.binding.order_keys, row_keys) |key, *sort_key| sort_key.* = switch (key.source) {
+                                    .output => |column| try batch.cell(scratch, lane, column),
+                                    .expression => |column| order_values[column].?[selected_positions[physical].?],
+                                    .column => |column| try describe.coerceDatum(scratch, try chunk_rows[physical].cell(column.path), column.type, column.element_type),
+                                };
+                                out.* = row_keys;
+                            }
+                            try operator.addBatch(scratch, batch, keys, ordinals[0..selected_count]);
+                        } else {
+                            const sink = self.sink.?;
+                            try sink.append_batch.?(sink.ptr, batch);
+                            delivered += selected_count;
+                        }
+                    }
+                    if (complete) return .{ .columns = columns, .command_tag = "SELECT" };
+                    first += chunk_rows.len;
+                    continue;
+                }
                 for (chunk_rows, 0..) |row, row_index| {
                     try self.checkpoint();
                     visited += 1;
