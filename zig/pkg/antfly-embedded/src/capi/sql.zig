@@ -130,6 +130,11 @@ pub fn Adapter(comptime native: type) type {
             if (schema.storage_mode != .relational) return error.UnsupportedSqlShape;
             var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
             if (!try dependencies.sql_schema_ddl.apply(a, &candidate, ddl_value)) return .{};
+            // The low-level schema CAS changes future validation, not existing
+            // row validity. Tightening needs staged validation/publication;
+            // this embedded adapter has no metadata-owned rewrite service.
+            if (ddl_value.schema_change.? == .set_nullability and !ddl_value.schema_change.?.set_nullability.nullable)
+                return error.SqlSchemaRewriteRequiresMetadataOwner;
             const validation = ddl_value.schema_change.? == .validate_constraint;
             const version = if (validation) schema.version else std.math.add(u32, schema.version, 1) catch return error.SqlProgramLimitExceeded;
             try candidate.object.put(a, "version", .{ .integer = version });

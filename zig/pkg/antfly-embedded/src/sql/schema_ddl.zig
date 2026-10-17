@@ -163,17 +163,81 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
         if (property != .object) return error.InvalidSqlBackendResponse;
         for (columns[0..index]) |prior| if (std.mem.eql(u8, prior, column)) return error.DuplicateSqlColumn;
     }
-    const required = try list(row, alloc, "required");
     for (columns) |column| {
-        const property = properties.object.getPtr(column).?;
-        try property.object.put(alloc, "nullable", .{ .bool = false });
-        var found = false;
-        for (required.items) |entry| if (entry == .string and std.mem.eql(u8, entry.string, column)) {
-            found = true;
-            break;
-        };
-        if (!found) try required.append(.{ .string = try alloc.dupe(u8, column) });
+        _ = try setColumnNullability(alloc, schema.*, row, properties, column, false);
     }
+}
+
+fn setColumnNullability(alloc: std.mem.Allocator, schema: Value, row: *Value, properties: Value, column_name: []const u8, nullable: bool) !bool {
+    const property = properties.object.getPtr(column_name) orelse return error.UndefinedColumn;
+    if (property.* != .object) return error.InvalidSqlBackendResponse;
+    // Do not override a shared referenced definition with an ignored sibling.
+    if (property.object.contains("$ref")) return error.UnsupportedSqlShape;
+    if (nullable) if (schema.object.get("unique_constraints")) |constraints| {
+        if (constraints != .array) return error.InvalidSqlBackendResponse;
+        for (constraints.array.items) |constraint| {
+            if (constraint != .object) return error.InvalidSqlBackendResponse;
+            const primary = constraint.object.get("primary") orelse continue;
+            if (primary != .bool) return error.InvalidSqlBackendResponse;
+            if (!primary.bool) continue;
+            const columns = constraint.object.get("columns") orelse return error.InvalidSqlBackendResponse;
+            if (columns != .array) return error.InvalidSqlBackendResponse;
+            for (columns.array.items) |column| {
+                if (column != .string) return error.InvalidSqlBackendResponse;
+                if (std.mem.eql(u8, column.string, column_name)) return error.SqlPrimaryKeyNotNull;
+            }
+        }
+    };
+    // Presence and explicit SQL NULL admission are independent schema bits.
+    // Keep the original type/format/modifier and remove only a null union arm.
+    const kind = property.object.get("type") orelse return error.UnsupportedSqlShape;
+    var union_null = false;
+    var nonnull_type: ?Value = null;
+    switch (kind) {
+        .array => |kinds| {
+            for (kinds.items) |entry| {
+                if (entry != .string) return error.InvalidSqlBackendResponse;
+                if (std.mem.eql(u8, entry.string, "null")) {
+                    union_null = true;
+                } else {
+                    if (nonnull_type != null) return error.UnsupportedSqlShape;
+                    nonnull_type = entry;
+                }
+            }
+            if (nonnull_type == null) return error.UnsupportedSqlShape;
+        },
+        .string => |name| if (std.mem.eql(u8, name, "null")) {
+            return error.UnsupportedSqlShape;
+        },
+        else => return error.InvalidSqlBackendResponse,
+    }
+    const flag = property.object.get("nullable");
+    if (flag != null and flag.? != .bool) return error.InvalidSqlBackendResponse;
+    const allows_null = union_null or (if (flag) |v| v.bool else false);
+    var required_index: ?usize = null;
+    if (row.object.getPtr("required")) |required| {
+        if (required.* != .array) return error.InvalidSqlBackendResponse;
+        for (required.array.items, 0..) |entry, i| {
+            if (entry != .string) return error.InvalidSqlBackendResponse;
+            if (std.mem.eql(u8, entry.string, column_name)) {
+                required_index = i;
+                break;
+            }
+        }
+    }
+    if (nullable and required_index == null and allows_null) return false;
+    if (!nullable and required_index != null and !allows_null) return false;
+    // Adding a row-level required list can relocate row map slots; finish all
+    // nested property work before that insertion, then reacquire as needed.
+    if (!nullable and kind == .array) try property.object.put(alloc, "type", nonnull_type.?);
+    try property.object.put(alloc, "nullable", .{ .bool = nullable });
+    if (nullable) {
+        if (required_index) |i| _ = row.object.getPtr("required").?.array.orderedRemove(i);
+    } else if (required_index == null) {
+        const required = try list(row, alloc, "required");
+        try required.append(.{ .string = try alloc.dupe(u8, column_name) });
+    }
+    return true;
 }
 
 pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
@@ -466,9 +530,12 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
                 .add_column => |c| c.name,
                 .drop_column, .drop_default => |n| n,
                 .set_default => |d| d.column,
+                .set_nullability => |d| d.column,
                 else => unreachable,
             };
             if (std.mem.eql(u8, column_name, "_id")) return error.UnsupportedSqlShape;
+            if (change == .set_nullability)
+                return setColumnNullability(alloc, schema.*, row, properties.*, column_name, change.set_nullability.nullable);
             if (change == .add_column) {
                 if (properties.object.contains(column_name)) return error.DuplicateSqlColumn;
                 const column = change.add_column;
@@ -530,7 +597,7 @@ fn primaryKeyGrowth(allocator: std.mem.Allocator) !void {
     const a = arena.allocator();
     var schema = try value(a, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{
         .type = "object",
-        .properties = .{ .id = .{ .type = "integer", .nullable = true }, .tenant = .{ .type = "keyword" } },
+        .properties = .{ .id = .{ .type = [_][]const u8{ "integer", "null" }, .nullable = true }, .tenant = .{ .type = "keyword" } },
         .additionalProperties = false,
     } } } });
     try std.testing.expect(try apply(a, &schema, .{
@@ -546,7 +613,68 @@ fn primaryKeyGrowth(allocator: std.mem.Allocator) !void {
         try std.testing.expectEqualStrings(column, entry.string);
         try std.testing.expect(!row.object.get("properties").?.object.get(column).?.object.get("nullable").?.bool);
     }
+    try std.testing.expectEqualStrings("integer", row.object.get("properties").?.object.get("id").?.object.get("type").?.string);
     try std.testing.expect(hasPrimary(schema));
+}
+
+fn columnNullabilityEvolution(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("compiler.zig");
+    var created = try compiler.compile(a, "CREATE TABLE items (id bigint PRIMARY KEY, n numeric(4,2) DEFAULT 1.25, g bigint GENERATED ALWAYS AS (id+1) STORED)", .{});
+    defer created.deinit();
+    var schema = try std.json.parseFromSliceLeaky(Value, a, try @import("ddl_runtime.zig").createSchemaAlloc(a, created.statement.create_table), .{});
+    const defaults = try std.json.Stringify.valueAlloc(a, schema.object.get("column_defaults").?, .{});
+    const generated = try std.json.Stringify.valueAlloc(a, schema.object.get("generated_columns").?, .{});
+    const row = schema.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?;
+    try row.object.getPtr("properties").?.object.getPtr("n").?.object.put(a, "type", try value(a, [_][]const u8{ "number", "null" }));
+    for ([_]struct { sql: []const u8, name: []const u8, nullable: bool }{
+        .{ .sql = "ALTER TABLE items ALTER COLUMN n SET NOT NULL", .name = "n", .nullable = false },
+        .{ .sql = "ALTER TABLE items ALTER n DROP NOT NULL", .name = "n", .nullable = true },
+        .{ .sql = "ALTER TABLE items ALTER g SET NOT NULL", .name = "g", .nullable = false },
+        .{ .sql = "ALTER TABLE items ALTER COLUMN g DROP NOT NULL", .name = "g", .nullable = true },
+    }) |entry| {
+        var compiled = try compiler.compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(entry.nullable, compiled.statement.catalog_ddl.schema_change.?.set_nullability.nullable);
+        try std.testing.expect(try apply(a, &schema, compiled.statement.catalog_ddl));
+        const current_row = schema.object.get("document_schemas").?.object.get("row").?.object.get("schema").?;
+        const property = current_row.object.get("properties").?.object.get(entry.name).?;
+        try std.testing.expectEqual(entry.nullable, property.object.get("nullable").?.bool);
+        var required = false;
+        for (current_row.object.get("required").?.array.items) |name| if (std.mem.eql(u8, name.string, entry.name)) {
+            required = true;
+        };
+        try std.testing.expectEqual(!entry.nullable, required);
+        const before_noop = try std.json.Stringify.valueAlloc(a, schema, .{});
+        try std.testing.expect(!try apply(a, &schema, compiled.statement.catalog_ddl));
+        try std.testing.expectEqualStrings(before_noop, try std.json.Stringify.valueAlloc(a, schema, .{}));
+        try std.testing.expectEqualStrings(defaults, try std.json.Stringify.valueAlloc(a, schema.object.get("column_defaults").?, .{}));
+        try std.testing.expectEqualStrings(generated, try std.json.Stringify.valueAlloc(a, schema.object.get("generated_columns").?, .{}));
+    }
+    const property = schema.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("properties").?.object.get("n").?;
+    try std.testing.expectEqualStrings("number", property.object.get("type").?.string);
+    try std.testing.expectEqualStrings("numeric", property.object.get("x-antfly-sql-type").?.string);
+    try std.testing.expectEqualStrings("4", try std.json.Stringify.valueAlloc(a, property.object.get("x-antfly-sql-numeric-modifier").?.object.get("precision").?, .{}));
+    for ([_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "ALTER TABLE items ALTER id DROP NOT NULL", .err = error.SqlPrimaryKeyNotNull },
+        .{ .sql = "ALTER TABLE items ALTER absent SET NOT NULL", .err = error.UndefinedColumn },
+    }) |entry| {
+        var compiled = try compiler.compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        const before = try std.json.Stringify.valueAlloc(a, schema, .{});
+        if (apply(a, &schema, compiled.statement.catalog_ddl)) |_| return error.TestUnexpectedResult else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(entry.err, err);
+        }
+        try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
+    }
+}
+
+test "SQL column nullability preserves expressions domains primary keys and no-op epochs" {
+    try columnNullabilityEvolution(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, columnNullabilityEvolution, .{});
 }
 
 test "primary key schema lowering retains column ownership across row map growth" {

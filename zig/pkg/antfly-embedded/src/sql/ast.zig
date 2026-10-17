@@ -349,6 +349,7 @@ pub const SchemaChange = union(enum) {
     drop_column: []const u8,
     set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
+    set_nullability: struct { column: []const u8, nullable: bool },
 
     /// Provenance is internal compiler data, never inferred from the spelling
     /// of an identifier or persisted as an editable public-schema attribute.

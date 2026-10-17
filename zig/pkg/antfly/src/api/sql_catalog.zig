@@ -292,6 +292,8 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         .create_index => |index| if (index.unique) return beginIndex(server, context, allocators, target, guard, index.name, updated),
         .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}, null),
+        .set_nullability => |column| if (!column.nullable)
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, null),
         .add_unique => |constraint| if (constraint.primary)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, if (guard.constraint_name_admission != null) guard else null),
         else => {},
@@ -1167,6 +1169,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     for ([_][]const u8{
         "ALTER TABLE items ADD COLUMN n integer DEFAULT (2+3)",
         "ALTER TABLE items ADD COLUMN g bigint GENERATED ALWAYS AS (id+1) STORED",
+        "ALTER TABLE items ALTER COLUMN id SET NOT NULL",
     }) |sql| {
         var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, sql, .{});
         defer compiled.deinit();
@@ -1231,6 +1234,14 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     _ = try executeWithPath(&server, null, .{}, "default", "tenant", alloc, .{ .catalog_ddl = qualified_alter.statement.catalog_ddl }, &empty_path);
     try std.testing.expectEqual(empty_reads + 1, source.resolutions);
     try std.testing.expectEqual(@as(usize, 7), source.updates);
+    // Relaxation needs only the same guarded metadata CAS, never an unguarded
+    // table update or a full-table rewrite. Tightening above requires the
+    // metadata-owned staging/validation/publication path before any mutation.
+    var relaxed = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ALTER COLUMN id DROP NOT NULL", .{});
+    defer relaxed.deinit();
+    const relaxed_outcome = try execute(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = relaxed.statement.catalog_ddl });
+    try std.testing.expectEqual(catalog.MutationOutcome.committed, relaxed_outcome.mutation_outcome);
+    try std.testing.expectEqual(@as(usize, 8), source.updates);
 }
 
 test "SQL catalog regular UNIQUE admits an owned private build without publishing through schema CAS" {

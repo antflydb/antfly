@@ -8187,7 +8187,16 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     defer antfly_db_close(first_id);
     _ = try Test.execute(a, first_id, "CREATE TABLE invoices (amount NUMERIC(20,4), label TEXT, tenant BIGINT)");
     _ = try Test.execute(a, first_id, "INSERT INTO invoices (_id,amount,label,tenant) VALUES ('one',9007199254740993.1250,'READY',7)");
+    // A schema CAS alone cannot validate existing rows. The embedded adapter
+    // must not expose tightening through its generic DDL fallback.
+    try Test.reject(a, first_id, "ALTER TABLE invoices ALTER COLUMN amount SET NOT NULL", "0A000");
     try Test.checkRow(try Test.execute(a, first_id, "SELECT amount FROM invoices"), "9007199254740993.1250");
+    _ = try Test.execute(a, first_id, "CREATE TABLE nullable_columns (id BIGINT NOT NULL DEFAULT 1, g BIGINT GENERATED ALWAYS AS (id+1) STORED)");
+    _ = try Test.execute(a, first_id, "INSERT INTO nullable_columns (_id) VALUES ('one')");
+    _ = try Test.execute(a, first_id, "ALTER TABLE nullable_columns ALTER COLUMN id SET NOT NULL");
+    _ = try Test.execute(a, first_id, "ALTER TABLE nullable_columns ALTER COLUMN id DROP NOT NULL");
+    _ = try Test.execute(a, first_id, "INSERT INTO nullable_columns (_id,id) VALUES ('two',NULL)");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT g FROM nullable_columns WHERE _id='one'"), "2");
     _ = try Test.execute(a, first_id, "CREATE INDEX tenant_idx ON invoices(tenant)");
     _ = try Test.execute(a, first_id, "CREATE INDEX mixed_idx ON invoices(tenant DESC NULLS FIRST,lower(label)) INCLUDE(amount) WHERE tenant>0");
     try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
@@ -8280,6 +8289,9 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     const final_owner = try openLiteHandleAlloc(path, options, false);
     const final_id = try publishHandle(final_owner);
     defer antfly_db_close(final_id);
+    try Test.reject(a, final_id, "ALTER TABLE invoices ALTER COLUMN amount SET NOT NULL", "0A000");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT g FROM nullable_columns WHERE _id='one'"), "2");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT count(*) FROM nullable_columns WHERE id IS NULL AND g IS NULL"), "1");
     try Test.checkRow(try Test.execute(a, final_id, "SELECT amount FROM invoices"), "9007199254740993.1253");
     try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1253");
     try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT p.amount FROM invoices p CROSS JOIN invoices q WHERE p.tenant=7 AND p.tenant>0 AND lower(p.label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1253");

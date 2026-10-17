@@ -10734,3 +10734,58 @@ view uses bounded point reads; no throughput improvement is claimed. Inactive
 failed-fixture binaries and seven superseded test executable/object pairs
 (about 5.8 GiB total) were removed for headroom. They are rebuildable; source,
 logs, current successful validation artifacts and user data remain.
+
+### Shared column nullability evolution
+
+SQL now lowers ALTER COLUMN SET/DROP NOT NULL into one typed schema operation.
+The schema builder changes presence and explicit-null admission together,
+normalizes nullable type unions without discarding builtin widths/NUMERIC
+modifiers, and preserves defaults and generated expressions. Primary-key
+addition uses the same normalization; setting only nullable=false previously
+left an explicit null type-union arm admissible. Relaxing a primary-key column
+fails with PostgreSQL's 42P16 instead of silently weakening the key.
+
+Tightening uses the existing metadata-owned staged rewrite/validation and atomic
+publication machinery, not an unchecked schema CAS over existing rows. It must
+not publish when old rows or concurrent source changes violate the candidate.
+Relaxation uses the pinned relation/schema CAS without a table rewrite; an
+already matching declaration returns a no-op without advancing the schema
+epoch. Shared referenced definitions remain guarded rather than being silently
+overridden by a local nullable sibling.
+The embedded adapter's CAS-only path rejects tightening before publication;
+it cannot substitute future-write validation for checking existing rows.
+An already-tight no-op remains permitted. Embedded staged-rewrite activation
+is not claimed by this checkpoint.
+
+The independent PostgreSQL 18 oracle checks the exact original sql-0744/0745
+statements, existing-NULL rejection and unchanged rows, subsequent write
+enforcement, repeated ALTERs, preserved defaults/generated values and primary-key
+rejection. All 17 catalog lifecycle oracle tests pass in
+`/private/tmp/antfly-sql-nullability-catalog-postgres-suite.log`. Component
+qualification includes type-union/NUMERIC preservation, generated expressions,
+primary keys, no-op byte stability and allocation-failure sweeps. Full Debug
+`sql-test` passes 882 portable and 234 native tests, with four explicitly
+opt-in benchmark skips, 21/21 steps in
+`/private/tmp/antfly-sql-nullability-full-native-debug.log`.
+The owning `antfly-sql-index-ddl-test` runs the changed ALTER contract
+successfully, but its complete selection is not green: 27/28 contracts pass
+(plus its module companion), while the metadata-only UNIQUE campaign receives
+501 for sql-0692 instead of its expected admission. Its NativeOwner fixture
+initializes ApiHttpServer with no table reader; beginIndex therefore returns
+UnsupportedSqlExecution before preparing any owner admission. The new
+ALTER operation does not execute on that CREATE INDEX path. The failing
+expectation is preserved, not changed into rejection credit. The public-parity
+target's zero-selection audit was also correctly rejected and is not evidence.
+Embedded restart validation passes 18/18 tests, 58/58 steps, zero
+skips/failures/leaks in
+`/private/tmp/antfly-sql-nullability-embedded-debug.log`. The real C API fixture
+rejects tightening before mutation, permits an already-tight no-op, relaxes a
+column with a retained default/generated expression, inserts SQL NULL, and
+verifies preserved values and NULLs after cold owner reopen. Formatting, Python
+lint, control-catalog, Apache boundary, licensing and inventory audits pass.
+Cache GC was previewed only. About 3 GiB of explicitly validated inactive,
+superseded local test outputs were removed; source/user data and all logs were
+preserved. No original dispositions change:
+end-to-end staged-publication and distributed fault qualification of these
+originals is still required. Inventory remains 531 implemented / 132 rejected /
+113 superseded / 810 unresolved.

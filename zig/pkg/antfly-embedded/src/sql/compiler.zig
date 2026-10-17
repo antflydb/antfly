@@ -2197,12 +2197,22 @@ const Parser = struct {
                 const column_name = try self.identifier();
                 ddl.action = .alter_schema;
                 if (self.keyword(.set)) {
-                    try self.expectKeyword(.default);
-                    ddl.schema_change = .{ .set_default = .{ .column = column_name, .expression = try self.schemaDefault() } };
+                    if (self.keyword(.not)) {
+                        try self.expectKeyword(.null);
+                        ddl.schema_change = .{ .set_nullability = .{ .column = column_name, .nullable = false } };
+                    } else {
+                        try self.expectKeyword(.default);
+                        ddl.schema_change = .{ .set_default = .{ .column = column_name, .expression = try self.schemaDefault() } };
+                    }
                 } else {
                     try self.expectKeyword(.drop);
-                    try self.expectKeyword(.default);
-                    ddl.schema_change = .{ .drop_default = column_name };
+                    if (self.keyword(.not)) {
+                        try self.expectKeyword(.null);
+                        ddl.schema_change = .{ .set_nullability = .{ .column = column_name, .nullable = true } };
+                    } else {
+                        try self.expectKeyword(.default);
+                        ddl.schema_change = .{ .drop_default = column_name };
+                    }
                 }
             } else if (kind == .table and self.ddlWord("VALIDATE")) {
                 try self.expectKeyword(.constraint);

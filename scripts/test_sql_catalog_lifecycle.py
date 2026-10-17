@@ -28,6 +28,65 @@ from psycopg import sql as pgsql
 
 
 class IndexLifecycleTest(unittest.TestCase):
+    def test_column_nullability_validation_preserves_rows_and_expressions(self):
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE usage_records ("
+                "id BIGINT PRIMARY KEY, status TEXT DEFAULT 'open', "
+                "status_upper TEXT GENERATED ALWAYS AS (upper(status)) STORED)"
+            )
+            db.execute(
+                "INSERT INTO usage_records (id,status) VALUES (1,NULL),(2,'open')"
+            )
+            rows = db.execute("SELECT * FROM usage_records ORDER BY id").fetchall()
+            with self.assertRaises(psycopg.Error) as rejected:
+                db.execute(
+                    "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL;"
+                )
+            self.assertEqual("23502", rejected.exception.sqlstate)
+            self.assertEqual(
+                rows, db.execute("SELECT * FROM usage_records ORDER BY id").fetchall()
+            )
+            self.assertEqual(
+                [(False,)],
+                db.execute(
+                    "SELECT attnotnull FROM pg_attribute "
+                    "WHERE attrelid='usage_records'::regclass AND attname='status'"
+                ).fetchall(),
+            )
+            db.execute("UPDATE usage_records SET status='ready' WHERE id=1")
+            for _ in range(2):
+                self.assertEqual(
+                    "ALTER TABLE",
+                    db.execute(
+                        "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL;"
+                    ).statusmessage,
+                )
+            with self.assertRaises(psycopg.Error) as rejected:
+                db.execute("INSERT INTO usage_records (id,status) VALUES (3,NULL)")
+            self.assertEqual("23502", rejected.exception.sqlstate)
+            for _ in range(2):
+                self.assertEqual(
+                    "ALTER TABLE",
+                    db.execute(
+                        "ALTER TABLE usage_records ALTER COLUMN status DROP NOT NULL;"
+                    ).statusmessage,
+                )
+            db.execute("INSERT INTO usage_records (id,status) VALUES (3,NULL)")
+            db.execute("INSERT INTO usage_records (id) VALUES (4)")
+            self.assertEqual(
+                [
+                    (1, "ready", "READY"),
+                    (2, "open", "OPEN"),
+                    (3, None, None),
+                    (4, "open", "OPEN"),
+                ],
+                db.execute("SELECT * FROM usage_records ORDER BY id").fetchall(),
+            )
+            with self.assertRaises(psycopg.Error) as rejected:
+                db.execute("ALTER TABLE usage_records ALTER COLUMN id DROP NOT NULL")
+            self.assertEqual("42P16", rejected.exception.sqlstate)
+
     def test_anonymous_primary_key_validation_preserves_failed_source(self):
         cases = (
             ("pk_anonymous", [(1, "a"), (2, "b")], None, False),

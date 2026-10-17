@@ -99,6 +99,11 @@ statement before any mutation.
   clause follows UNIQUE for constraints and INCLUDE for indexes; covering
   columns remain outside the unique key. Nonunique indexes accept the clause
   without becoming unique. Public/lifecycle qualification remains case-specific.
+  ALTER COLUMN SET/DROP NOT NULL preserves type domains, defaults and generated
+  expressions; primary-key columns cannot drop NOT NULL. Server tightening
+  requires metadata-owned staged validation/publication, while relaxation uses
+  the guarded schema CAS. The embedded CAS-only adapter rejects tightening;
+  matching no-ops do not publish a new schema epoch.
 - `BEGIN`/`START TRANSACTION` isolation/read modes, `COMMIT`, `ROLLBACK`, named
   SAVEPOINT/ROLLBACK TO/RELEASE, backed by durable native session ownership.
 - Deferrable UNIQUE and `SET CONSTRAINTS ... IMMEDIATE/DEFERRED`, with durable
