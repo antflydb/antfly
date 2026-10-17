@@ -1004,3 +1004,57 @@ test "native projection refinements benchmark" {
         }
     }
 }
+
+test "native projection refinements benchmark physical dictionary encoding" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const sa = source.allocator();
+    var values: [6]Datum = undefined;
+    values[0] = .{};
+    values[1] = Datum.json(.null);
+    for (values[2..], 0..) |*value, i| {
+        const text = try sa.alloc(u8, 4096);
+        @memset(text, @as(u8, @intCast(i)) + 'a');
+        value.* = Datum.json(.{ .string = text });
+    }
+    var rows: [256]operators.Row = undefined;
+    var cells: [256]Datum = undefined;
+    var indices: [256]u32 = undefined;
+    var ordinals: [256]u64 = undefined;
+    for (&rows, &cells, &indices, &ordinals, 0..) |*row, *cell, *id, *ordinal, i| {
+        id.* = @intCast(i % values.len);
+        cell.* = values[id.*];
+        ordinal.* = i;
+        row.* = .{ .values = @as(*const Datum, cell)[0..1], .keys = &.{}, .ordinal = i };
+    }
+    const batch: @import("execution_batch.zig").Batch = .{ .dictionary = .{ .values = &values, .indices = &indices } };
+    const Fixture = struct {
+        fn measure(alloc: std.mem.Allocator, input: @import("execution_batch.zig").Batch, scalar_rows: []const operators.Row, order: []const u64, direct: bool) !ProjectionStats {
+            var counted: CountingAllocator = .{};
+            var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 8 << 20 };
+            var result: ProjectionStats = .{ .ns = 0, .peak = 0, .allocations = 0, .checksum = 0 };
+            _ = alloc;
+            const start = now();
+            for (0..64) |_| {
+                const encoded = if (direct) try spill.encodeColumnarBatchVersionAlloc(budget.allocator(), input, order, 1 << 20, .v2) else try spill.encodeColumnarBlockVersionAlloc(budget.allocator(), scalar_rows, 1 << 20, .v2);
+                result.checksum +%= std.hash.Wyhash.hash(0, encoded);
+                budget.allocator().free(encoded);
+            }
+            result.ns = now() - start;
+            result.peak = budget.peak;
+            result.allocations = counted.allocations;
+            return result;
+        }
+    };
+    _ = try Fixture.measure(a, batch, &rows, &ordinals, false);
+    _ = try Fixture.measure(a, batch, &rows, &ordinals, true);
+    for (0..5) |sample| {
+        const first = try Fixture.measure(a, batch, &rows, &ordinals, sample % 2 != 0);
+        const second = try Fixture.measure(a, batch, &rows, &ordinals, sample % 2 == 0);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("physical_dictionary sample={d} old_ns={d} new_ns={d} old_peak={d} new_peak={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak });
+    }
+}

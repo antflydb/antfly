@@ -260,7 +260,7 @@ pub const Projection = struct {
         return result;
     }
 
-    pub const SearchSource = union(enum) { value: Json, bytes: []const u8 };
+    pub const SearchSource = union(enum) { value: Json, bytes: []const u8, fields: []const @import("../storage/document_projection.zig").FieldValue };
     pub const SearchMetadata = struct { score: ?f64 = null, highlights: ?Json = null };
 
     /// Copy only selected payloads into their final native cells. Raw stored
@@ -302,6 +302,9 @@ pub const Projection = struct {
         };
         var sink: Sink = .{ .projection = self, .alloc = alloc, .scratch = scratch, .cells = cells, .presence = presence };
         switch (source) {
+            // A revision-bound directory already validated the complete root;
+            // range digests bind these selected fields to that immutable cut.
+            .fields => |fields| for (fields) |field| try Sink.member(&sink, field.name, field.value),
             .value => |root| {
                 if (root != .object) return error.InvalidSqlBackendResponse;
                 var fields = self.source_slots.iterator();
@@ -674,7 +677,20 @@ test "SQL document search projection owns only selected payloads with metadata a
             const names = &[_][]const u8{ "i", "n", "a", "j", "z", "missing", "score", "_highlights" };
             const projection = try Projection.initSearch(a, table, names);
             defer projection.deinit(a);
-            for ([_]bool{ false, true }) |raw| {
+            const FieldValue = @import("../storage/document_projection.zig").FieldValue;
+            const Capture = struct {
+                a: std.mem.Allocator,
+                fields: std.ArrayList(FieldValue) = .empty,
+                fn member(raw: *anyopaque, name: []const u8, value: []const u8) !void {
+                    const capture: *@This() = @ptrCast(@alignCast(raw));
+                    try capture.fields.append(capture.a, .{ .name = try capture.a.dupe(u8, name), .value = value });
+                }
+            };
+            var capture: Capture = .{ .a = sa };
+            var scanner = std.json.Scanner.initCompleteInput(sa, bytes);
+            defer scanner.deinit();
+            try @import("antfly-json").scanValue(sa, &scanner, bytes.len, .{ .ctx = &capture, .member_fn = Capture.member });
+            for (0..3) |raw| {
                 var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 };
                 var output = std.heap.ArenaAllocator.init(budget.allocator());
                 defer output.deinit();
@@ -682,7 +698,7 @@ test "SQL document search projection owns only selected payloads with metadata a
                 defer scratch.deinit();
                 const oa = output.allocator();
                 const layout = try catalog.Row.TypedLayout.init(oa, names);
-                const row = try projection.projectSearch(oa, scratch.allocator(), layout, "row", if (raw) .{ .bytes = bytes } else .{ .value = root }, .{ .score = 0.5, .highlights = .{ .string = "actual" } });
+                const row = try projection.projectSearch(oa, scratch.allocator(), layout, "row", if (raw == 1) .{ .bytes = bytes } else if (raw == 2) .{ .fields = capture.fields.items } else .{ .value = root }, .{ .score = 0.5, .highlights = .{ .string = "actual" } });
                 _ = scratch.reset(.free_all);
                 try std.testing.expect(row.typed_cells != null and row.value == .null);
                 try std.testing.expectEqual(@as(i64, 9007199254740993), (try row.cell("i")).value.integer);
@@ -693,7 +709,11 @@ test "SQL document search projection owns only selected payloads with metadata a
                 try std.testing.expect(!try row.hasField("missing"));
                 try std.testing.expectEqual(@as(f64, 0.5), (try row.cell("score")).value.float);
                 try std.testing.expectEqualStrings("actual", (try row.cell("_highlights")).value.string);
-                if (large) std.debug.print("document search {s}: output peak {d} bytes for {d}-byte hit\n", .{ if (raw) "raw" else "parsed", budget.peak, bytes.len });
+                if (large) std.debug.print("document search {s}: output peak {d} bytes for {d}-byte hit\n", .{ switch (raw) {
+                    0 => "parsed",
+                    1 => "raw",
+                    else => "ranges",
+                }, budget.peak, bytes.len });
                 for ([_][]const u8{ "{\"ignored\":{\"x\":0,\"\\u0078\":1}}", "{\"ignored\":[1,]}", "{} trailing", "[]" }) |invalid| {
                     if (projection.projectSearch(oa, scratch.allocator(), layout, "row", .{ .bytes = invalid }, .{})) |_| return error.ExpectedInvalidDocument else |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -706,4 +726,42 @@ test "SQL document search projection owns only selected payloads with metadata a
     try Probe.run(std.testing.allocator, true);
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try @import("antfly_platform").allocator.checkAllAllocationFailures(stable.allocator(), Probe.run, .{false});
+}
+
+test "SQL projected document directory validates ranges identities corruption and allocation failures" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const module = @import("../storage/document_projection.zig");
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const temp = arena.allocator();
+            const ignored = try temp.alloc(u8, module.minimum_bytes);
+            @memset(ignored, 'x');
+            const bytes = try std.fmt.allocPrint(temp, "{{\"ignored\":\"{s}\",\"\\u0062ody\":{{\"z\":[1,null]}},\"a\":null}}", .{ignored});
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            const proof = .{ .bytes = @as(u64, bytes.len), .kind = @as(u8, 16), .digest = digest };
+            const encoded = (try module.build(temp, bytes, 16, digest)).?;
+            const directory = (try module.Directory.open(temp, encoded, proof)).?;
+            const field = directory.find("body").?;
+            try std.testing.expectEqualStrings("{\"z\":[1,null]}", bytes[@intCast(field.offset)..][0..@intCast(field.length)]);
+            try std.testing.expect(directory.find("missing") == null);
+            for (0..encoded.len) |end| try std.testing.expect(try module.Directory.open(temp, encoded[0..end], proof) == null);
+            const altered = try temp.dupe(u8, encoded);
+            altered[12] ^= 1;
+            try std.testing.expect(try module.Directory.open(temp, altered, proof) == null);
+            try std.testing.expect(try module.build(temp, "{}", 16, digest) == null);
+            const duplicate = try std.fmt.allocPrint(temp, "{{\"ignored\":\"{s}\",\"a\":1,\"\\u0061\":2}}", .{ignored});
+            try std.testing.expect(try module.build(temp, duplicate, 16, digest) == null);
+            const unsupported = try module.buildAuthority(temp, ignored, 16, digest);
+            try std.testing.expect(unsupported != null);
+            const unsupported_proof = .{ .bytes = @as(u64, ignored.len), .kind = @as(u8, 16), .digest = digest };
+            try std.testing.expect(try module.isCurrent(temp, unsupported.?, unsupported_proof));
+            try std.testing.expect(try module.Directory.open(temp, unsupported.?, unsupported_proof) == null);
+            const trailing = try std.fmt.allocPrint(temp, "{s} trailing", .{bytes});
+            try std.testing.expect(try module.build(temp, trailing, 16, digest) == null);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

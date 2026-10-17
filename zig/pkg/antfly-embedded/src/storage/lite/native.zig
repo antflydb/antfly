@@ -381,7 +381,7 @@ test "lite allocator v4 long keys shared values incremental deletion and vacuum"
     var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     var key: [1024]u8 = @splat('k');
-    const value: [32768]u8 = @splat('v');
+    const value: [131072]u8 = @splat('v');
     for (0..150) |i| {
         _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
         try file.putDocument(&key, &value);
@@ -6055,7 +6055,7 @@ pub const NativeFile = struct {
             for (mutations, 0..) |mutation, ordinal| {
                 var external_value_root_page: u64 = mutation.external_value_root_page;
                 if (external_value_root_page == 0 and !mutation.is_delete and !self.documentEntryFitsInline(mutation.key, mutation.value)) {
-                    external_value_root_page = try self.writeValuePagesAllocated(page_allocator, mutation.value);
+                    external_value_root_page = try self.writeDocumentValue(page_allocator, mutation.value);
                 }
 
                 const namespace = documentNamespace(mutation.key);
@@ -6242,7 +6242,7 @@ pub const NativeFile = struct {
                 continue;
             }
             var value_root = mutation.external_value_root_page;
-            if (value_root == 0 and !self.documentEntryFitsInline(mutation.key, mutation.value)) value_root = try self.writeValuePagesAllocated(pages, mutation.value);
+            if (value_root == 0 and !self.documentEntryFitsInline(mutation.key, mutation.value)) value_root = try self.writeDocumentValue(pages, mutation.value);
             const record = try pages.writeDocument(.{ .previous_page = 0, .previous_namespace_page = 0, .key = mutation.key, .value = mutation.value, .external_value_root_page = value_root, .external_value_len = mutation.external_value_len });
             if (bulk) try builder.add(mutation.key, record) else try editor.put(mutation.key, record);
         }
@@ -6397,6 +6397,22 @@ pub const NativeFile = struct {
         if (!std.mem.eql(u8, entry.key, key)) return error.InvalidDocumentIndex;
         if (entry.is_delete) return null;
         return if (entry.external_value_root_page != 0) try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint) else try allocator.dupe(u8, entry.value);
+    }
+
+    /// Extents and inline slices are resolved against the caller's checkpoint.
+    pub fn readDocumentRangeAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, offset: u64, length: usize) ![]u8 {
+        const page_id = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
+        var reader: ValuePageReader = undefined;
+        reader.init();
+        defer reader.deinit(self);
+        const payload = try reader.readPayload(self, checkpoint, page_id, 1, .document);
+        const entry = try decodeDocumentEntry(payload);
+        if (!std.mem.eql(u8, entry.key, key)) return error.InvalidDocumentIndex;
+        if (entry.is_delete) return error.NotFound;
+        const size = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        if (offset > size or length > size - offset) return error.EndOfStream;
+        if (entry.external_value_root_page != 0) return self.readValuePagesRangeAlloc(allocator, entry.external_value_root_page, size, @intCast(offset), length, checkpoint);
+        return allocator.dupe(u8, entry.value[@intCast(offset)..][0..length]);
     }
 
     /// Read one document into reusable caller storage. Oversized values are
@@ -7291,7 +7307,7 @@ pub const NativeFile = struct {
     };
 
     /// Repack arbitrary source chunk boundaries into full output pages. Catalog
-    /// values use the bounded extent frontier; documents use contiguous chains.
+    /// values use the bounded extent frontier; large documents do too.
     fn copyExternalValue(self: *NativeFile, file: std.Io.File, next_page: *u64, root: u64, len: usize, tree: bool, cancel: ?*const maintenance.CancelToken, tracking: ?*PageAllocator) !u64 {
         var source: ValueChunkCursor = undefined;
         try source.initInto(self, root, len, self.activeCheckpoint(), true);
@@ -7378,7 +7394,7 @@ pub const NativeFile = struct {
             const value = try self.catalogEntryValueAlloc(self.allocator, entry);
             return .{ .inline_value = value, .owned = value, .len = len };
         }
-        const root = try self.copyExternalValue(file, next_page, entry.external_value_root_page, len, tree, cancel, tracking);
+        const root = try self.copyExternalValue(file, next_page, entry.external_value_root_page, len, tree or len >= 64 * 1024, cancel, tracking);
         return .{ .inline_value = "", .root = root, .len = len };
     }
 
@@ -8458,6 +8474,14 @@ pub const NativeFile = struct {
         for (node.children[0..node.count]) |child| try self.validateExtent(child, checkpoint, reachable);
     }
 
+    /// Large document ranges need logarithmic seeks, including fields near the
+    /// end. Existing readers/reclamation understand both extent trees and old
+    /// chains. Keep small values as chains to avoid another index page.
+    fn writeDocumentValue(self: *NativeFile, pages: *PageAllocator, value: []const u8) !u64 {
+        if (value.len >= 64 * 1024) return (try self.writeValueTree(pages, value, .{})).page;
+        return self.writeValuePagesAllocated(pages, value);
+    }
+
     fn writeValuePagesAllocated(self: *NativeFile, page_allocator: *PageAllocator, value: []const u8) !u64 {
         if (value.len == 0) return error.InvalidNativeValueChain;
         const chunk_size = self.maxValuePagePayloadBytes();
@@ -8921,7 +8945,7 @@ pub const NativeFile = struct {
                 live_bytes +|= record.key.len + len;
                 const external = header_len + record.key.len + len > self.maxPagePayloadBytes();
                 const record_size = header_len + record.key.len + (if (external) @as(usize, 8) else len);
-                if (external) compact_pages += if (is_catalog) self.valueTreePageCount(len) else self.valuePageCount(len);
+                if (external) compact_pages += if (is_catalog or len >= 64 * 1024) self.valueTreePageCount(len) else self.valuePageCount(len);
                 if (record_size + 4 > self.maxPagePayloadBytes() / 2) {
                     compact_pages += 1;
                 } else {
@@ -9131,7 +9155,7 @@ pub const NativeFile = struct {
         }
         if (!mutation.is_delete and mutation.external_value_root_page == 0 and !inline_value) {
             owned.external_value_root_page = if (root == .documents)
-                try self.writeValuePagesAllocated(&writes.pages, source_value)
+                try self.writeDocumentValue(&writes.pages, source_value)
             else
                 try self.writeCatalogValue(&writes.pages, source_value, options);
             owned.external_value_len = mutation.value.len;
@@ -16899,8 +16923,9 @@ test "lite allocator v4 compact estimates match long keys values and migration" 
             try file.putDocument(&key, "value");
             try file.putCatalogRecord(&key, "catalog value");
         }
-        const value: [32768]u8 = @splat('v');
-        try file.putDocument("chain", &value);
+        const value: [131072]u8 = @splat('v');
+        try file.putDocument("chain", value[0..32768]);
+        try file.putDocument("large-document", &value);
         try file.putCatalogRecord("extent", &value);
         const stats = try file.liveStats(null);
         var image = try file.prepareVacuum(null);

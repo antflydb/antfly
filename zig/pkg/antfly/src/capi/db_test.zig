@@ -6758,12 +6758,14 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
             const ignored = try a.alloc(u8, 1024 * 1024);
             defer a.free(ignored);
-            @memset(ignored, 'x');
-            const document = try std.fmt.allocPrint(a, "{{\"body\":\"alpha\",\"ignored\":\"{s}\"}}", .{ignored});
+            var random = std.Random.DefaultPrng.init(0x9561165);
+            random.random().bytes(ignored);
+            for (ignored) |*byte| byte.* = 'a' + byte.* % 26;
+            const document = try std.fmt.allocPrint(a, "{{\"ignored\":\"{s}\",\"body\":\"alpha\"}}", .{ignored});
             defer a.free(document);
-            const second = try std.fmt.allocPrint(a, "{{\"body\":\"beta\",\"ignored\":\"{s}\"}}", .{ignored});
+            const second = try std.fmt.allocPrint(a, "{{\"ignored\":\"{s}\",\"body\":\"beta\"}}", .{ignored});
             defer a.free(second);
-            try database.batch(.{ .writes = &.{ .{ .key = "a", .value = document }, .{ .key = "b", .value = second } } });
+            try database.batch(.{ .writes = &.{ .{ .key = "a", .value = document }, .{ .key = "b", .value = second }, .{ .key = "legacy", .value = document } } });
             var small_arena = std.heap.ArenaAllocator.init(a);
             defer small_arena.deinit();
             const small_a = small_arena.allocator();
@@ -6788,6 +6790,10 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
                 try std.testing.expectEqualStrings(id, row[0].string);
                 try std.testing.expectEqualStrings("tiny", row[1].string);
             }
+            const revisions = @import("antfly_local_sources").storage_document_mutation_revision;
+            const projection_keys = @import("antfly_local_sources").storage_document_projection;
+            const legacy_key = try revisions.keyForDocumentAlloc(a, "legacy");
+            try database.core.store.delete(&projection_keys.keyForRevision(legacy_key));
             var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
             var lease = try database.beginQueryReadLease();
             var held = true;
@@ -6804,6 +6810,25 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             held = false;
             try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"changed\",\"ignored\":\"small\"}" }}, .deletes = &.{"b"} });
             try database.runUntilIdle();
+            // Both projections use the original captured cut, after update/delete.
+            const projected_before = if (file) |native_file| native_file.test_backing_read_bytes.load(.monotonic) else 0;
+            const projected = try reader.lookupProjectedBatch(&.{ "a", "b" }, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqual(@as(usize, 1), projected.consumed);
+            try std.testing.expectEqualStrings("body", projected.values[0].fields[0].name);
+            try std.testing.expectEqualStrings("\"alpha\"", projected.values[0].fields[0].value);
+            const projected_reads = if (file) |native_file| native_file.test_backing_read_bytes.load(.monotonic) - projected_before else 0;
+            std.debug.print("projected hydration lite={any}: scoped_peak={d} backing_read_bytes={d} source_bytes={d}\n", .{ is_lite, budget.peak, projected_reads, document.len });
+            if (is_lite) {
+                try std.testing.expect(budget.peak < 256 * 1024);
+                try std.testing.expect(projected_reads < document.len / 4);
+            }
+            const deleted_projection = try reader.lookupProjectedBatch(&.{"b"}, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualStrings("\"beta\"", deleted_projection.values[0].fields[0].value);
+            reader.releasePage();
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            const legacy = try reader.lookupProjectedBatch(&.{"legacy"}, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualSlices(u8, document, legacy.values[0].bytes);
+            reader.releasePage();
             for (0..32) |index| {
                 const raw = try reader.lookup(if (index % 2 == 0) "a" else "b");
                 try std.testing.expectEqualSlices(u8, if (index % 2 == 0) document else second, raw);
@@ -6851,6 +6876,30 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             if (file != null) std.debug.print("document hydration 64 small keys: point pages {d}, bounded batch pages incl proofs {d}\n", .{ point_reads, batch_reads });
             reader.releasePage();
             try std.testing.expectEqual(@as(usize, 0), budget.live);
+            const legacy_revision = blk: {
+                var txn = try database.core.store.beginReadTxn();
+                defer txn.abort();
+                break :blk try revisions.load(&txn, legacy_key);
+            };
+            try std.testing.expect(database.document_authority_backfill_requested.load(.acquire));
+            // Manual owners drive the independent authority worker explicitly;
+            // runUntilIdle drains replay/index work, not this cache migration.
+            var maintenance_pages: usize = 0;
+            while (database.document_authority_backfill_active.load(.acquire) or database.document_authority_backfill_requested.load(.acquire)) : (maintenance_pages += 1) {
+                try std.testing.expect(maintenance_pages < 256);
+                _ = try database.advanceDocumentAuthorityBackfillPage();
+            }
+            {
+                var txn = try database.core.store.beginReadTxn();
+                defer txn.abort();
+                try std.testing.expectEqual(legacy_revision, try revisions.load(&txn, legacy_key));
+            }
+            var migrated_lease = try database.beginQueryReadLease();
+            defer migrated_lease.release();
+            var migrated = try migrated_lease.documentRows(budget.allocator(), 1);
+            defer migrated.deinit();
+            const migrated_value = try migrated.lookupProjectedBatch(&.{"legacy"}, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualStrings("\"alpha\"", migrated_value.values[0].fields[0].value);
             std.debug.print("document ranked hydration lite={any}: scoped peak {d} bytes across snapshot and bounded batch reads\n", .{ is_lite, budget.peak });
         }
     };

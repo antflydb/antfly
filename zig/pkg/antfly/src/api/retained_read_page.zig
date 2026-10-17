@@ -70,6 +70,25 @@ const RowPlan = struct {
         if (source >= cells.count()) return error.InvalidRetainedReadPage;
         return if (cells.presence) |flags| flags[source] else true;
     }
+    const DictionaryKey = struct { block: usize, column: usize, entry: u64 };
+    fn dictionaryKey(self: RowPlan, names: []const []const u8, ordinal: usize) !?DictionaryKey {
+        if (std.mem.eql(u8, names[ordinal], "_id")) return null;
+        const cells = self.input.typed_cells orelse return null;
+        const source = cells.columnar orelse return null;
+        if (cells.values.len != 0) return error.InvalidRetainedReadPage;
+        const mapping = self.ordinals orelse return null;
+        const physical = mapping[ordinal] orelse return null;
+        var first: usize = 0;
+        for (source.blocks) |*block| {
+            if (physical - first < block.values.len) {
+                const entry = (try block.dictionaryIdentity(source.row, physical - first, false)) orelse return null;
+                if (!try self.present(names, ordinal) and entry != 0) return error.InvalidRetainedReadPage;
+                return .{ .block = @intFromPtr(block), .column = physical - first, .entry = entry };
+            }
+            first += block.values.len;
+        }
+        return error.InvalidRetainedReadPage;
+    }
     fn value(self: RowPlan, names: []const []const u8, ordinal: usize) !Datum {
         // _id is transport-owned even if a provider includes a payload slot.
         if (std.mem.eql(u8, names[ordinal], "_id")) return self.input.cell("_id");
@@ -160,11 +179,34 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     return self.plans[row].value(self.names, self.column + ordinal);
                 }
+                fn dictionary(raw: *anyopaque, scratch_alloc: A, ordinal: usize) !?sources.sql_execution_batch.Batch {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.plans.len == 0 or (try self.plans[0].dictionaryKey(self.names, self.column + ordinal)) == null) return null;
+                    var ids: std.AutoHashMapUnmanaged(RowPlan.DictionaryKey, u32) = .empty;
+                    defer ids.deinit(scratch_alloc);
+                    var values: std.ArrayList(Datum) = .empty;
+                    defer values.deinit(scratch_alloc);
+                    const indices = try scratch_alloc.alloc(u32, self.plans.len);
+                    var transferred = false;
+                    defer if (!transferred) scratch_alloc.free(indices);
+                    for (self.plans, indices) |plan, *id| {
+                        const key = (try plan.dictionaryKey(self.names, self.column + ordinal)) orelse return null;
+                        const entry = try ids.getOrPut(scratch_alloc, key);
+                        if (!entry.found_existing) {
+                            entry.value_ptr.* = @intCast(values.items.len);
+                            try values.append(scratch_alloc, try plan.value(self.names, self.column + ordinal));
+                        }
+                        id.* = entry.value_ptr.*;
+                    }
+                    const entries = try values.toOwnedSlice(scratch_alloc);
+                    transferred = true;
+                    return .{ .dictionary = .{ .values = entries, .indices = indices } };
+                }
             };
             var columns: Columns = .{ .plans = plans[first..][0..count], .names = names.keys(), .column = column };
             var ordinals: [256]u64 = undefined;
             for (ordinals[0..count], first..) |*ordinal, index| ordinal.* = index;
-            const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .count = count, .width = width } };
+            const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .read_dictionary = Columns.dictionary, .count = count, .width = width } };
             const bytes = try spill.encodeColumnarBatchVersionAlloc(b, batch, ordinals[0..count], max_bytes, version);
             if (!std.mem.startsWith(u8, bytes, if (version == .v1) block_magic else "NCB\x02")) return error.InvalidRetainedReadPage;
             try blob(w, bytes);
@@ -295,6 +337,17 @@ fn consumerTests() type {
             var page = try decode(a, bytes, 1, 3, 256);
             defer page.deinit();
             try std.testing.expectEqual(@as(i64, 42), (try page.rows[255].typed_cells.?.at(1023)).value.integer);
+            const repeated = try encodeVersion(a, 1, page.rows, null, .v2);
+            defer a.free(repeated);
+            try std.testing.expectEqualSlices(u8, bytes, repeated);
+            var other = try decode(a, bytes, 1, 3, 256);
+            defer other.deinit();
+            const mixed = try a.alloc(View.Row, page.rows.len);
+            defer a.free(mixed);
+            for (mixed, 0..) |*row, index| row.* = if (index % 2 == 0) page.rows[index] else other.rows[index];
+            const merged = try encodeVersion(a, 1, mixed, null, .v2);
+            defer a.free(merged);
+            try std.testing.expectEqualSlices(u8, bytes, merged);
         }
     };
 }

@@ -31502,6 +31502,7 @@ pub const DB = struct {
     /// Leadership and root-image gates cover the short publication transaction;
     /// hashing and scanning happen beforehand under a disposable read snapshot.
     pub fn advanceDocumentAuthorityBackfillPage(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceDocumentAuthorityBackfillPage", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return true;
         if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return false;
         if (!self.document_authority_backfill_mutex.tryLock()) return false;
@@ -40174,10 +40175,15 @@ pub const DB = struct {
         keys: [64][]const u8 = undefined,
         ids: [64][]const u8 = undefined,
         sizes: [64]?u64 = undefined,
+        proofs: [64]?@import("../document_mutation_revision.zig").Content = undefined,
         cached: usize = 0,
         next_cached: usize = 0,
+        repair_requested: bool = false,
         values: [64]?[]const u8 = undefined,
+        sources: [64]Source = undefined,
         pub const Batch = struct { values: []const ?[]const u8, consumed: usize };
+        pub const Source = @import("../document_projection.zig").Source;
+        pub const ProjectedBatch = struct { values: []const Source, consumed: usize };
 
         // Keep keys and scalar size proofs separate from body scratch: sorted
         // reads retire body scratch, and a small byte target can consume this
@@ -40206,6 +40212,7 @@ pub const DB = struct {
             defer scope.close();
             try @import("../document_mutation_revision.zig").loadWindow(&scope, a, self.keys[0..count], self.ids[0..count], contents[0..count], timestamps[0..count]);
             for (contents[0..count], 0..) |content, index| self.sizes[index] = if (content) |proof| proof.bytes else null;
+            @memcpy(self.proofs[0..count], contents[0..count]);
             self.cached = count;
         }
 
@@ -40215,20 +40222,38 @@ pub const DB = struct {
         /// Results expire on the next lookup, batch or page release.
         pub fn lookupBatch(self: *@This(), documents: []const []const u8, max_bytes: usize) !Batch {
             if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookupBatch", .{ self, documents, max_bytes });
+            const hydrated = try self.lookupBatchImpl(documents, &.{}, max_bytes);
+            return .{ .values = self.values[0..hydrated.consumed], .consumed = hydrated.consumed };
+        }
+        pub fn lookupProjectedBatch(self: *@This(), documents: []const []const u8, fields: []const []const u8, max_bytes: usize) !ProjectedBatch {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookupProjectedBatch", .{ self, documents, fields, max_bytes });
+            return self.lookupBatchImpl(documents, fields, max_bytes);
+        }
+        fn lookupBatchImpl(self: *@This(), documents: []const []const u8, fields: []const []const u8, max_bytes: usize) !ProjectedBatch {
             if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
             self.window.retire();
             errdefer self.window.retire();
-            if (documents.len == 1) {
+            if (documents.len == 1 and fields.len == 0) {
                 self.values[0] = try self.lookup(documents[0]);
-                return .{ .values = self.values[0..1], .consumed = 1 };
+                self.sources[0] = .{ .bytes = self.values[0].? };
+                return .{ .values = self.sources[0..1], .consumed = 1 };
             }
             try self.prepare(documents);
+            if (fields.len != 0) if (try self.projectCurrent(fields)) |raw| {
+                self.sources[0] = .{ .fields = raw };
+                self.next_cached += 1;
+                return .{ .values = self.sources[0..1], .consumed = 1 };
+            };
+            // A declined projection must not retain its metadata/range buffers
+            // beside the full body. The proof cache has a separate owner.
+            self.window.retire();
             const available = @min(documents.len, self.cached - self.next_cached);
             const limit = @min(max_bytes, DocumentPrimaryReadWindow.max_bytes);
             var count: usize = 0;
             var bytes: u64 = 0;
             while (count < available) : (count += 1) {
                 const length = self.sizes[self.next_cached + count] orelse break;
+                if (count != 0 and fields.len != 0 and length >= @import("../document_projection.zig").minimum_bytes) break;
                 if (length > limit -| bytes) break;
                 bytes += length;
             }
@@ -40242,7 +40267,60 @@ pub const DB = struct {
             } else try self.window.getMany(&self.read, keys, self.values[0..count]);
             for (self.values[0..count]) |value| if (value == null) return error.StorageReadTemporarilyUnavailable;
             self.next_cached += count;
-            return .{ .values = self.values[0..count], .consumed = count };
+            for (self.sources[0..count], self.values[0..count]) |*source, value| source.* = .{ .bytes = value.? };
+            return .{ .values = self.sources[0..count], .consumed = count };
+        }
+
+        fn requestRepair(self: *@This()) void {
+            if (self.repair_requested or openModeRequiresReadOnlyBackends(self.db.open_mode)) return;
+            self.repair_requested = true;
+            self.db.document_authority_backfill_requested.store(true, .release);
+        }
+        fn projectCurrent(self: *@This(), fields: []const []const u8) !?[]const @import("../document_projection.zig").FieldValue {
+            const projection = @import("../document_projection.zig");
+            const revision = @import("../document_mutation_revision.zig");
+            const proof = self.proofs[self.next_cached] orelse {
+                self.requestRepair();
+                return null;
+            };
+            if (proof.bytes < projection.minimum_bytes) return null;
+            const physical = self.keys[self.next_cached];
+            const a = self.window.arena.allocator();
+            self.window.scope = try self.read.openReadScope(a);
+            const scope = &self.window.scope.?;
+            const raw = scope.get(&projection.keyForRevision(revision.keyForPhysical(physical).?)) catch |err| {
+                if (err == error.NotFound) {
+                    self.requestRepair();
+                    return null;
+                }
+                return err;
+            };
+            const directory = (try projection.Directory.open(a, raw, proof)) orelse {
+                if (!try projection.isCurrent(a, raw, proof)) self.requestRepair();
+                return null;
+            };
+            var selected_bytes: u64 = 0;
+            for (fields) |name| {
+                if (directory.find(name)) |field| selected_bytes +|= field.length;
+            }
+            if (selected_bytes >= proof.bytes / 2) return null;
+            // Non-range backends borrow the body once, avoiding repeated full
+            // value reads for separate projected fields. Lite reads extents.
+            const body = if (!scope.supportsRange()) try scope.get(physical) else null;
+            const output = try a.alloc(projection.FieldValue, fields.len);
+            var count: usize = 0;
+            for (fields) |name| if (directory.find(name)) |field| {
+                const value = if (body) |bytes| blk: {
+                    if (field.offset > bytes.len or field.length > bytes.len - field.offset) return error.InvalidDocumentContentAuthority;
+                    break :blk bytes[@intCast(field.offset)..][0..@intCast(field.length)];
+                } else try scope.getRange(physical, field.offset, std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+                if (!std.mem.eql(u8, &digest, &field.digest)) return error.InvalidDocumentContentAuthority;
+                output[count] = .{ .name = field.name, .value = value };
+                count += 1;
+            };
+            return output[0..count];
         }
 
         pub fn lookup(self: *@This(), key: []const u8) ![]const u8 {

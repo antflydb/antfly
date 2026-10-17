@@ -803,16 +803,17 @@ pub fn encodeColumnarBlockVersionAlloc(a: Allocator, rows: []const Row, max_byte
 /// are identical to the row API; neither payloads nor a row matrix are staged.
 pub fn encodeColumnarBatchVersionAlloc(a: Allocator, values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion) ![]u8 {
     if (values.len() == 0 or values.len() > 256 or values.width() > 1024 or ordinals.len != values.len()) return error.InvalidSqlSpill;
+    const work = @import("memory_budget.zig").reclaimingAllocator(a);
     var bytes: std.ArrayList(u8) = .empty;
-    errdefer bytes.deinit(a);
-    var encoder: Encoder = .{ .compact_arrays = version == .v2, .a = a, .bytes = &bytes, .limit = max_bytes };
+    defer bytes.deinit(work);
+    var encoder: Encoder = .{ .compact_arrays = version == .v2, .a = work, .bytes = &bytes, .limit = max_bytes };
     try encoder.append(if (version == .v1) columnar_v1_magic else columnar_v2_magic);
     try encoder.word(values.len());
     try encoder.word(values.width());
     try encoder.word(0);
     for (ordinals) |ordinal| try encoder.word(ordinal);
     try Sequential.encodeBatchColumns(&encoder, values, 0, values.len());
-    return bytes.toOwnedSlice(a);
+    return if (work.ptr == a.ptr and work.vtable == a.vtable) bytes.toOwnedSlice(a) else a.dupe(u8, bytes.items);
 }
 /// Payload bytes and decoded metadata borrow the caller's page arena. Fetch
 /// authenticated artifact bytes into that same arena before decoding, so no
@@ -938,24 +939,96 @@ pub const Sequential = struct {
         var rows: [256]Row = undefined;
         var positions: [256]usize = undefined;
         for (positions[0 .. end - begin], begin..) |*position, index| position.* = index;
-        const selected = try batch.select(temporary, positions[0 .. end - begin]);
-        var column_scratch = std.heap.ArenaAllocator.init(encoder.a);
+        const selected = if (begin == 0 and end == batch.len()) batch else try batch.select(temporary, positions[0 .. end - begin]);
+        var column_scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(encoder.a));
         defer column_scratch.deinit();
         for (0..batch.width()) |column| {
             if (!column_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
             const column_alloc = column_scratch.allocator();
             const dictionary = try selected.dictionaryColumn(column_alloc, column);
             if (dictionary) |physical| if (physical != .dictionary or physical.len() != end - begin) return error.InvalidSqlSpill;
-            defer if (dictionary) |physical| {
+            defer if (dictionary) |physical| if (selected != .dictionary) {
                 column_alloc.free(physical.dictionary.values);
                 column_alloc.free(physical.dictionary.indices);
             };
+            if (dictionary) |physical| if (try encodeDictionaryColumn(encoder, physical)) continue;
             for (begin..end, 0..) |index, lane| {
                 cells[lane] = if (dictionary) |physical| try physical.cell(column_alloc, lane, 0) else try batch.cell(column_alloc, index, column);
                 rows[lane] = .{ .values = cells[lane..][0..1], .keys = &.{}, .ordinal = 0 };
             }
             try encodeColumns(encoder, rows[0 .. end - begin], false);
         }
+    }
+    /// First-use ordering matches the frozen row codec. Hash each referenced
+    /// dictionary entry once, including coalescing equal source entries.
+    fn encodeDictionaryColumn(encoder: *Encoder, physical: @import("execution_batch.zig").Batch) !bool {
+        const input = physical.dictionary;
+        if (input.values.len > 256 or input.indices.len > 256) return false;
+        var remap: [256]u16 = @splat(std.math.maxInt(u16));
+        var flags: [256]u8 = undefined;
+        var sizes: [256]usize = undefined;
+        var entries: [256]Datum = undefined;
+        var slots: [512]u16 = @splat(std.math.maxInt(u16));
+        var indices: [256]u16 = undefined;
+        var kind: ?u8 = null;
+        var unique: usize = 0;
+        var present: usize = 0;
+        var expanded_bytes: usize = 0;
+        var unique_bytes: usize = 0;
+        for (input.indices, 0..) |id, lane| {
+            if (id >= input.values.len) return error.InvalidSqlSpill;
+            if (remap[id] == std.math.maxInt(u16)) {
+                const value = input.values[id];
+                flags[id] = if (value.sql_null) 1 else if (value.value == .null and value.array == null and value.numeric == null and value.patterns == null) 2 else 0;
+                if (flags[id] != 0) {
+                    remap[id] = 256;
+                } else {
+                    const actual = tag(value);
+                    if (actual < 1 or actual > 5 or (kind != null and kind.? != actual)) return false;
+                    kind = actual;
+                    sizes[id] = physicalBytes(value);
+                    var slot: usize = @intCast(physicalHash(value) & 511);
+                    while (slots[slot] != std.math.maxInt(u16) and !physicalEqual(entries[slots[slot]], value)) slot = (slot + 1) & 511;
+                    if (slots[slot] == std.math.maxInt(u16)) {
+                        slots[slot] = @intCast(unique);
+                        entries[unique] = value;
+                        unique += 1;
+                        unique_bytes +|= sizes[id];
+                    }
+                    remap[id] = slots[slot];
+                }
+            }
+            indices[lane] = remap[id];
+            if (flags[id] == 0) {
+                present += 1;
+                expanded_bytes +|= sizes[id];
+            }
+        }
+        const type_ = kind orelse 0;
+        const dictionary = present != 0 and unique_bytes +| (present * 2) +| 9 < expanded_bytes;
+        try encoder.append(&.{if (dictionary) 6 else type_});
+        for (0..(input.indices.len + 3) / 4) |group| {
+            var bits: u8 = 0;
+            for (0..4) |lane| {
+                const index = group * 4 + lane;
+                if (index >= input.indices.len) break;
+                bits |= flags[input.indices[index]] << @as(u3, @intCast(lane * 2));
+            }
+            try encoder.append(&.{bits});
+        }
+        if (dictionary) {
+            try encoder.append(&.{type_});
+            try encoder.word(unique);
+            for (entries[0..unique]) |value| try encodePhysical(encoder, type_, value);
+            var encoded: [512]u8 = undefined;
+            var used: usize = 0;
+            for (input.indices, 0..) |id, lane| if (flags[id] == 0) {
+                std.mem.writeInt(u16, encoded[used..][0..2], indices[lane], .little);
+                used += 2;
+            };
+            try encoder.append(encoded[0..used]);
+        } else for (input.indices) |id| if (flags[id] == 0) try encodePhysical(encoder, type_, input.values[id]);
+        return true;
     }
     fn tag(value: Datum) u8 {
         if (value.patterns != null or value.array != null or value.numeric != null) return 255;
@@ -3961,4 +4034,64 @@ test "SQL column batch encoding retires allocating reader payloads per column" {
     try Probe.run(std.testing.allocator);
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try @import("antfly_platform").allocator.checkAllAllocationFailures(stable.allocator(), Probe.run, .{});
+}
+
+test "SQL physical dictionary emission preserves frozen entry order nulls duplicate values and fallback" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const Batch = @import("execution_batch.zig").Batch;
+            for ([_][]const Datum{
+                &.{ .{}, Datum.json(.null), Datum.json(.{ .string = "long dictionary payload" }), Datum.json(.{ .string = "long dictionary payload" }), Datum.json(.{ .string = "second dictionary payload" }) },
+                &.{ .{}, Datum.json(.null), Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .integer = -7 }) },
+                &.{ .{}, Datum.json(.null), Datum.json(.{ .float = -0.0 }), Datum.json(.{ .float = 0.0 }), Datum.json(.{ .float = std.math.nan(f64) }) },
+                &.{ .{}, Datum.json(.null), Datum.json(.{ .bool = true }), Datum.json(.{ .bool = false }), Datum.json(.{ .bool = true }) },
+                &.{ .{}, Datum.json(.null), Datum.json(.{ .integer = 7 }), Datum.json(.{ .string = "mixed" }), Datum.json(.{ .bool = true }) },
+                &.{ .{}, Datum.json(.null), .{}, Datum.json(.null), .{} },
+            }) |values| {
+                var indices: [65]u32 = undefined;
+                var rows: [65]Row = undefined;
+                var cells: [65]Datum = undefined;
+                var ordinals: [65]u64 = undefined;
+                for (&indices, &rows, &cells, &ordinals, 0..) |*id, *row, *cell, *ordinal, i| {
+                    id.* = @intCast((i * 3) % values.len);
+                    cell.* = values[id.*];
+                    ordinal.* = i + 1;
+                    row.* = .{ .values = @as(*const Datum, cell)[0..1], .keys = &.{}, .ordinal = ordinal.* };
+                }
+                const batch: Batch = .{ .dictionary = .{ .values = values, .indices = &indices } };
+                for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+                    const expected = try encodeColumnarBlockVersionAlloc(a, &rows, 1 << 20, version);
+                    defer a.free(expected);
+                    const actual = try encodeColumnarBatchVersionAlloc(a, batch, &ordinals, 1 << 20, version);
+                    defer a.free(actual);
+                    try std.testing.expectEqualSlices(u8, expected, actual);
+                }
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL column batch region owners bound actual backing memory and retain only returned wire" {
+    const Source = struct {
+        fn cell(_: *anyopaque, a: Allocator, _: usize, _: usize) !Datum {
+            const bytes = try a.alloc(u8, 32 * 1024);
+            @memset(bytes, 'x');
+            return Datum.json(.{ .string = bytes });
+        }
+    };
+    var dummy: u8 = 0;
+    var parent: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 16 << 20 };
+    var region = std.heap.ArenaAllocator.init(parent.allocator());
+    defer region.deinit();
+    var budget: @import("memory_budget.zig") = .{ .backing = region.allocator(), .limit = 16 << 20 };
+    const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &dummy, .read = Source.cell, .count = 16, .width = 128 } };
+    var ordinals: [16]u64 = undefined;
+    for (&ordinals, 0..) |*ordinal, i| ordinal.* = i;
+    const bytes = try encodeColumnarBatchVersionAlloc(budget.allocator(), batch, &ordinals, 16 << 20, .v2);
+    defer budget.allocator().free(bytes);
+    try std.testing.expectEqual(@as(usize, bytes.len), budget.live);
+    try std.testing.expect(parent.peak < 16 << 20);
+    std.debug.print("region encoder: inner_peak={d} backing_peak={d} returned={d}\n", .{ budget.peak, parent.peak, bytes.len });
 }

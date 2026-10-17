@@ -305,16 +305,52 @@ hits receive complete syntax and duplicate-key validation, including unselected
 subtrees, while only selected members acquire a temporary DOM. Eligible plain
 ranked searches capture primary storage and schema under the same apply fence
 as ranking, retain IDs/scores, and read source bytes only as pages demand them.
-Each document read retires the previous byte/decompression scope; selected cells
-own their page payloads, and page completion retires the last source scope. ID/score-only projections skip body reads. Highlight,
+Sorted, deduplicated hydration uses up to 64 keys and a 256 KiB soft source-byte
+target. Unknown or oversized documents read in isolation. Each new window
+retires the previous byte/decompression scope; selected cells own their page
+payloads, and page completion retires the last source scope. ID/score-only projections skip body reads. Highlight,
 graph, hierarchy, aggregation, and hit-evaluation requests keep their existing
 source-capture path.
+
+Large JSON documents also carry a disposable root-field directory bound to the
+primary content digest and physical kind. Directories contain at most 512 fields
+and 32 KiB of metadata, limited further to 1/16 of the source size. They are
+prepared for JSON documents at least 16 KiB long; relational rows do not acquire
+projection metadata.
+Every selected range carries its own digest. Lite resolves ranges against the
+captured checkpoint. New values of at least 64 KiB and vacuum output use the
+existing extent-tree format for direct seeks; old linked chains remain readable.
+Non-range backends borrow the body once and use the same
+field offsets. Selected fields feed native SQL cells directly, without rebuilding
+a JSON object. Selecting at least half the source bytes keeps the full-body path.
+
+An ordinary leader-gated authority backfill publishes directories for older roots
+in bounded, resumable pages. Manual owners can advance the same bounded entry
+point explicitly; `runUntilIdle` does not drain this independent cache migration.
+Publication rechecks the captured mutation revision;
+it never rewrites primary values or advances logical document revisions. Missing
+or stale directories request migration at most once per cursor. Unsupported large
+values have a content-bound negative marker so migration does not repeatedly read
+them. Full-body fallback remains available throughout rollout. The tradeoff is a
+bounded metadata record and additional scan/hash work when writing large documents;
+the primary storage and public wire formats are unchanged.
 
 Retained-page encoding feeds the frozen v1/v2 block codecs one bounded column
 at a time. Cached relation replay passes borrowed compact batches directly to
 operators; prepared RETURNING inputs also pass native batches through a lazy
 ordinal/type mapping, including memory and spilled inputs. Scalar consumers use
 one reusable row of descriptors per reader.
+Native dictionaries retain physical identities through encoding. Each referenced
+entry is hashed once, equal entries coalesce, and first-use ordering preserves
+frozen v1/v2 bytes and distinct SQL NULL/JSON null lanes. Retained transport adapters
+preserve identities across independent source blocks. Mixed-type columns use the
+existing scalar codec.
+
+Encoder working buffers use reclaimable allocation even beneath standard arenas.
+All enclosing SQL budgets, shared admission, and unknown failure allocators retain
+authority. When output belongs to an arena, only the final wire is copied into
+that owner; transient growth and column buffers release their actual backing
+memory instead of refunding a budget while leaving buffers in the arena.
 Batch payloads expire when their reader loads a different block; scalar adapter
 descriptors expire on that reader's next scalar read. Independent readers cannot
 retire one another's blocks. Retaining consumers copy at their ownership boundary.

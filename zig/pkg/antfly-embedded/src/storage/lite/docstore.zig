@@ -3246,6 +3246,17 @@ pub const Txn = struct {
             return self.scratch.allocator();
         }
 
+        pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+            const a = self.resultAllocator();
+            const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });
+            defer if (self.parent.prefix.len > 0) a.free(full);
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const value = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                if (offset > value.len or length > value.len - offset) return error.EndOfStream;
+                return a.dupe(u8, value[@intCast(offset)..][0..length]);
+            }
+            return (try self.parent.readFile()).readDocumentRangeAlloc(a, self.parent.checkpoint, full, offset, length);
+        }
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return self.parent.getOwned(self.resultAllocator(), key);
         }
@@ -6364,6 +6375,9 @@ test "lite scoped reads release values without growing parent point reads" {
         try std.testing.expectError(error.BufferTooSmall, scope.getInto("doc", out[0..1]));
         const value = try scope.get("doc");
         try std.testing.expectEqualSlices(u8, payload, value);
+        try std.testing.expectEqualSlices(u8, payload[4090..][0..8192], try scope.getRange("doc", 4090, 8192));
+        try std.testing.expectEqual(@as(usize, 0), (try scope.getRange("doc", payload.len, 0)).len);
+        try std.testing.expectError(error.EndOfStream, scope.getRange("doc", payload.len - 1, 2));
         try std.testing.expectError(error.NotFound, scope.get("missing"));
         scope.close();
         try std.testing.expectEqual(@as(usize, 0), budget.live);
@@ -6415,6 +6429,7 @@ test "lite scoped write reads preserve copied values across pending mutations" {
     const disk = try scope.get("doc");
     try txn.put("doc", "pending");
     const pending = try scope.get("doc");
+    try std.testing.expectEqualStrings("end", try scope.getRange("doc", 1, 3));
     try txn.delete("doc");
     try std.testing.expectError(error.NotFound, scope.get("doc"));
     try std.testing.expectEqualStrings("disk", disk);

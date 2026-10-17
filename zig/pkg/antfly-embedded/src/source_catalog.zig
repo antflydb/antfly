@@ -661,6 +661,7 @@ pub const graph_relationship_filter = @import("graph/relationship_filter.zig");
 pub const common_json_number = @import("common/json_number.zig");
 pub const storage_graph_cleanup_contract = @import("storage/graph_cleanup_contract.zig");
 pub const storage_db_query_member_identity = @import("storage/db/query/member_identity.zig");
+pub const storage_document_projection = @import("storage/document_projection.zig");
 pub const storage_document_mutation_revision = @import("storage/document_mutation_revision.zig");
 pub const api_table_drop_contract = @import("api/table_drop_contract.zig");
 pub const storage_db_lookup_key_scratch = @import("storage/db/lookup_key_scratch.zig");

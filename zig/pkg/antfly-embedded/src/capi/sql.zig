@@ -599,6 +599,7 @@ pub fn Adapter(comptime native: type) type {
             reader: ?DB.RelationalRows.Reader,
             documents: ?DB.DocumentRows,
             needs_document: bool,
+            source_fields: []const []const u8,
             layout: catalog.Row.TypedLayout,
             projection: dependencies.sql_document_row.Projection,
             position: usize = 0,
@@ -616,7 +617,7 @@ pub fn Adapter(comptime native: type) type {
                 const highlight_slot = layout.ordinals.get("_highlights");
                 var produced: usize = 0;
                 var bytes: usize = 0;
-                var document_values: []const ?[]const u8 = &.{};
+                var document_values: []const DB.DocumentRows.Source = &.{};
                 var document_begin: usize = 0;
                 var document_end: usize = 0;
                 var document_scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -658,13 +659,16 @@ pub fn Adapter(comptime native: type) type {
                                 const n = @min(count - produced, 64);
                                 var ids: [64][]const u8 = undefined;
                                 for (self.result.hits[self.position + produced ..][0..n], 0..) |candidate, index| ids[index] = candidate.id;
-                                const batch = try documents.lookupBatch(ids[0..n], 256 * 1024);
+                                const batch = try documents.lookupProjectedBatch(ids[0..n], self.source_fields, 256 * 1024);
                                 document_values = batch.values;
                                 document_begin = produced;
                                 document_end = produced + batch.consumed;
                             }
                         };
-                        const source: dependencies.sql_document_row.Projection.SearchSource = if (!self.needs_document) .{ .value = .{ .object = .empty } } else if (self.documents != null) .{ .bytes = document_values[produced - document_begin].? } else if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
+                        const source: dependencies.sql_document_row.Projection.SearchSource = if (!self.needs_document) .{ .value = .{ .object = .empty } } else if (self.documents != null) switch (document_values[produced - document_begin]) {
+                            .bytes => |raw| .{ .bytes = raw },
+                            .fields => |fields| .{ .fields = fields },
+                        } else if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
                         const highlights = if (highlight_slot != null) try highlightsValueLeaky(document_scratch.allocator(), hit.highlights) else null;
                         const out = &rows[produced];
                         out.* = try self.projection.projectSearch(a, document_scratch.allocator(), layout, hit.id, source, .{ .score = if (hit.score) |score| @as(f64, score) else null, .highlights = highlights });
@@ -723,16 +727,18 @@ pub fn Adapter(comptime native: type) type {
             errdefer if (reader) |*value| value.deinit();
             const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
             const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.initSearch(a, table, request.fields) else .{ .columns = &.{} };
-            const needs_document = for (projection.columns) |column| {
-                if (!std.mem.eql(u8, column.path, "score") and !std.mem.eql(u8, column.path, "_highlights")) break true;
-            } else false;
+            var source_fields: std.StringArrayHashMapUnmanaged(void) = .empty;
+            for (projection.columns) |column| {
+                if (!std.mem.eql(u8, column.path, "score") and !std.mem.eql(u8, column.path, "_highlights")) try source_fields.put(a, column.path, {});
+            }
+            const needs_document = source_fields.count() != 0;
             if (!needs_document) if (documents) |*document_reader| {
                 document_reader.deinit();
                 documents = null;
             };
             // Finish allocating before moving the arena: a later allocation
             // could add a chunk that the cursor's earlier copy would not own.
-            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .needs_document = needs_document, .layout = layout, .projection = projection };
+            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .needs_document = needs_document, .source_fields = source_fields.keys(), .layout = layout, .projection = projection };
             return .{ .ptr = cursor, .next = SearchCursor.next, .close = SearchCursor.close };
         }
 
