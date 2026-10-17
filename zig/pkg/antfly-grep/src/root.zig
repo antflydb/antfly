@@ -44,10 +44,91 @@ pub const Summary = struct {
 };
 pub const Line = @import("source_cache.zig").Line;
 const Limits = @import("budget.zig").Limits;
-const Task = struct { prepared: bool = false, path: []const u8, display: []const u8, filename: bool, explicit_file: bool = false, timestamp: i96 = 0, result: ?[]u8 = null, score: f64 = 0 };
+const Task = struct { prepared: bool = false, path: []const u8, display: []const u8, filename: bool, explicit_file: bool = false, timestamp: i96 = 0, ordinal: usize = 0, result: ?[]u8 = null, score: f64 = 0 };
+const EvidenceRow = struct { line: usize, byte_offset: usize, text: []const u8, p: ?f64, region_p: ?f64, matched: bool };
+const EvidenceView = struct {
+    rows: []EvidenceRow,
+    regions: []@import("evidence.zig").Region,
+    calls: []@import("source.zig").Call,
+    declarations: []const @import("source.zig").Declaration,
+    file_score: ?f64,
+    parse_complete: bool,
+    any_selected: bool,
+    omitted_lines: usize,
+    omitted_bytes: usize,
+};
+const RenderRow = struct { raw: []const u8, length: usize, line: usize, offset: usize, matched: bool, probability: f64, independent: bool, gap: bool };
+const Candidate = struct {
+    a: Allocator,
+    budget: @import("antfly_regex").Budget,
+    arena: std.heap.ArenaAllocator,
+    path: []const u8 = "",
+    score: f64 = 0,
+    ordinal: usize = 0,
+    provenance: @import("document.zig").Provenance = .{},
+    rows: []RenderRow = &.{},
+    view: ?EvidenceView = null,
+    before: Summary = .{},
+    summary: Summary = .{},
+    filename: bool = true,
+    color: bool = false,
+    started: ?std.Io.Timestamp = null,
+    pub fn bytes(self: *const Candidate) usize {
+        return @sizeOf(Candidate) + self.budget.live;
+    }
+    pub fn deinit(self: *Candidate) void {
+        const a = self.a;
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
+const Ranking = @import("ranked.zig").Heap(Candidate);
+// Clone only retained output evidence; parsed source and page buffers can be released.
+fn retainedClone(comptime T: type, a: Allocator, value: T, depth: usize) error{ OutOfMemory, ResultNestingTooDeep }!T {
+    if (depth > 512) return error.ResultNestingTooDeep;
+    if (T == std.json.Value) return switch (value) {
+        .string => |v| .{ .string = try a.dupe(u8, v) },
+        .number_string => |v| .{ .number_string = try a.dupe(u8, v) },
+        .array => |v| blk: {
+            var out = std.json.Array.init(a);
+            for (v.items) |item| try out.append(try retainedClone(T, a, item, depth + 1));
+            break :blk .{ .array = out };
+        },
+        .object => |v| blk: {
+            var out: std.json.ObjectMap = .empty;
+            var it = v.iterator();
+            while (it.next()) |entry| try out.put(a, try a.dupe(u8, entry.key_ptr.*), try retainedClone(T, a, entry.value_ptr.*, depth + 1));
+            break :blk .{ .object = out };
+        },
+        else => value,
+    };
+    return switch (@typeInfo(T)) {
+        .optional => |o| if (value) |v| try retainedClone(o.child, a, v, depth + 1) else null,
+        .@"struct" => blk: {
+            var out: T = undefined;
+            inline for (@typeInfo(T).@"struct".field_names) |name| @field(out, name) = try retainedClone(@FieldType(T, name), a, @field(value, name), depth + 1);
+            break :blk out;
+        },
+        .pointer => |ptr| blk: {
+            if (ptr.size != .slice) @compileError("retained pointer must be a slice");
+            const out = try a.alloc(ptr.child, value.len);
+            for (value, out) |v, *dest| dest.* = try retainedClone(ptr.child, a, v, depth + 1);
+            break :blk out;
+        },
+        else => value,
+    };
+}
 const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
+    ranking: ?*Ranking = null,
+    owns_ranking: bool = false,
+    deferred_candidate: ?*Candidate = null,
+    next_ordinal: usize = 0,
+    result_ordinal: usize = 0,
+    file_before: Summary = .{},
+    independent_override: ?bool = null,
+    reserved_output: usize = 0,
     index_worker: ?*Search = null,
     provenance: @import("document.zig").Provenance = .{},
     dictionary: ?*ExternalDictionary = null,
@@ -107,13 +188,21 @@ pub const Search = struct {
     }
     fn initShared(root: *Search) !Search {
         const matcher = try root.matcher.clone(root.a);
-        return .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
+        var result: Search = .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
+        result.decider.shareCache(&root.decider);
+        result.ranking = root.ranking;
+        return result;
     }
     pub fn deinit(self: *Search) void {
         if (self.input_buffer) |buffer| self.a.free(buffer);
         if (self.index_worker) |worker| {
             worker.deinit();
             self.a.destroy(worker);
+        }
+        if (self.deferred_candidate) |candidate| candidate.deinit();
+        if (self.owns_ranking) {
+            self.ranking.?.deinit();
+            self.a.destroy(self.ranking.?);
         }
         if (self.dictionary) |dictionary| dictionary.release();
         self.output_buffer.deinit(self.a);
@@ -143,6 +232,7 @@ pub const Search = struct {
         if (!self.options.no_messages) std.debug.print("antfly-grep: {s}: {s}\n", .{ path, @errorName(err) });
     }
     pub fn run(self: *Search) !u8 {
+        errdefer self.flushOutput() catch {};
         const started = std.Io.Clock.awake.now(self.io);
         if (self.options.debug or self.options.trace) std.debug.print("antfly-grep: engine={s} threads={d} encoding={s} multiline={}\n", .{ @tagName(self.options.engine), if (self.options.files) self.options.jobs else self.fileJobs(), self.options.encoding, self.options.multiline });
         if (self.options.debug or self.options.trace) {
@@ -151,7 +241,22 @@ pub const Search = struct {
         }
         self.shared_limits = &self.limits;
         self.decider.limits = &self.limits;
-        if (self.options.ask != null) try self.decider.ensureLocal();
+        if (self.options.ask != null) {
+            self.decider.prepareCache();
+            try self.decider.ensureLocal();
+        }
+        if (self.options.ask != null and self.options.ranked and self.options.sort == null and
+            self.options.max_result_files != std.math.maxInt(usize) and !self.hasStdinPath() and
+            (self.options.paths.items.len > 0 or self.options.table_config != null) and
+            !self.options.quiet and !self.options.count and !self.options.count_matches and
+            !self.options.files and !self.options.files_with_matches and !self.options.files_without_match and
+            !self.options.inventory and !self.options.multiline)
+        {
+            const ranking = try self.a.create(Ranking);
+            ranking.* = .{ .a = self.a, .io = self.io, .limits = &self.limits, .capacity = self.options.max_result_files, .max_bytes = self.options.max_pending_output };
+            self.ranking = ranking;
+            self.owns_ranking = true;
+        }
         const streaming_files = self.options.files and self.options.ask == null and !self.options.inventory and self.options.table_config == null and (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none"));
         if (streaming_files) self.collecting = false;
 
@@ -197,6 +302,7 @@ pub const Search = struct {
             return if (self.summary.complete) 0 else 2;
         }
         try self.flushTasks();
+        if (self.ranking != null) try self.emitRanked();
         if (self.limits.cancel.load(.acquire) and self.summary.complete and !self.options.quiet) {
             self.summary.complete = false;
             try self.reportError("<search>", error.Canceled);
@@ -300,7 +406,7 @@ pub const Search = struct {
         for (threads[0..started]) |thread| thread.join();
         started = 0;
         if (context.failure) |err| return err;
-        if (self.options.ask != null and (self.options.ranked or self.options.jev_mode)) {
+        if (self.ranking == null and self.options.ask != null and (self.options.ranked or self.options.jev_mode)) {
             if (self.options.ranked and self.options.sort == null) std.mem.sort(Task, self.tasks.items, {}, struct {
                 fn less(_: void, a: Task, b: Task) bool {
                     if (a.score != b.score) return a.score > b.score;
@@ -538,6 +644,8 @@ pub const Search = struct {
                 local.render_filename = task.filename;
                 local.explicit_file = task.explicit_file;
                 local.best_probability = 0;
+                local.result_ordinal = task.ordinal;
+                const reserved_before = local.reserved_output;
                 local.file(task.path, task.display) catch |err| {
                     local.reportError(task.display, err) catch |failure| {
                         streaming.release();
@@ -547,7 +655,29 @@ pub const Search = struct {
                 };
                 task.score = local.best_probability;
                 if (local.stop) root.limits.cancel.store(true, .monotonic);
-                if (root.options.ask != null and (root.options.ranked or root.options.jev_mode)) {
+                if (root.ranking) |ranking| {
+                    _ = root.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
+                    ctx.mutex.lockUncancelable(root.io);
+                    root.write(output.written()) catch |err| {
+                        ctx.mutex.unlock(root.io);
+                        ctx.fail(err);
+                        return;
+                    };
+                    ctx.mutex.unlock(root.io);
+                    if (local.deferred_candidate) |candidate| {
+                        local.deferred_candidate = null;
+                        candidate.summary = local.summary;
+                        ranking.offer(candidate) catch |err| {
+                            ctx.mutex.lockUncancelable(root.io);
+                            root.reportError(task.display, err) catch |failure| {
+                                ctx.mutex.unlock(root.io);
+                                ctx.fail(failure);
+                                return;
+                            };
+                            ctx.mutex.unlock(root.io);
+                        };
+                    }
+                } else if (root.options.ask != null and (root.options.ranked or root.options.jev_mode)) {
                     task.result = output.toOwnedSlice() catch |err| {
                         ctx.fail(err);
                         return;
@@ -660,7 +790,8 @@ pub const Search = struct {
                     timestamp = if (std.mem.eql(u8, sort, "modified")) stat.mtime.nanoseconds else if (std.mem.eql(u8, sort, "accessed")) (stat.atime orelse std.Io.Timestamp.zero).nanoseconds else (try @import("filesystem.zig").info(self.a, self.io, path_name)).created orelse return error.CreationTimeUnavailable;
                 }
             }
-            const task: Task = .{ .path = path, .display = shown, .filename = self.render_filename, .timestamp = timestamp, .explicit_file = self.explicit_file };
+            const task: Task = .{ .ordinal = self.next_ordinal, .path = path, .display = shown, .filename = self.render_filename, .timestamp = timestamp, .explicit_file = self.explicit_file };
+            self.next_ordinal += 1;
             if (self.pipeline) |pool| {
                 if (!try pool.submit(task)) {
                     self.a.free(path);
@@ -683,6 +814,7 @@ pub const Search = struct {
         defer self.provenance = previous_source;
         self.provenance = .{ .uri = local_uri, .observed_at = if (self.options.json) std.Io.Clock.real.now(self.io).toSeconds() else null };
         const before = self.summary;
+        self.file_before = before;
         self.file_output_start = self.output_bytes;
         self.file_started = if (self.options.json) std.Io.Clock.awake.now(self.io) else null;
         self.matcher.failure = null;
@@ -723,6 +855,10 @@ pub const Search = struct {
             break :blk worker;
         };
         local.summary = .{};
+        local.file_before = .{};
+        local.result_ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        const reserved_before = local.reserved_output;
         local.stop = false;
         local.output_bytes = 0;
         local.best_probability = 0;
@@ -784,6 +920,16 @@ pub const Search = struct {
             local.processBytes(doc.path, doc.content) catch |err| try local.reportError(doc.path, err);
             if (local.matcher.failure) |err| try local.reportError(doc.path, err);
             try local.jsonEnd(doc.path, .{});
+        }
+        if (self.ranking) |ranking| {
+            _ = self.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
+            try self.write(output.written());
+            if (local.deferred_candidate) |candidate| {
+                local.deferred_candidate = null;
+                candidate.summary = local.summary;
+                ranking.offer(candidate) catch |err| try self.reportError(doc.path, err);
+            }
+            return;
         }
         if (!ranked) {
             try local.flushOutput();
@@ -1002,6 +1148,7 @@ pub const Search = struct {
         self.binary_stop = false;
         self.binary_offset = null;
         const before = self.summary;
+        self.file_before = before;
         self.file_output_start = self.output_bytes;
         self.file_started = if (self.options.json) std.Io.Clock.awake.now(self.io) else null;
         self.json_started = false;
@@ -1560,10 +1707,14 @@ pub const Search = struct {
                 self.summary.reading_leads += 1;
                 self.summary.files_with_matches += 1;
             }
-            try self.renderEvidence(a, path_name, bytes, lines, selected);
             self.summary.matches += count;
             self.summary.occurrences += count;
             if (count > 0) self.summary.files_with_matches += 1;
+            if (self.ranking != null) {
+                try self.retainCandidate(a, path_name, bytes, lines, selected, probabilities, true);
+                return;
+            }
+            try self.renderEvidence(a, path_name, bytes, lines, selected);
             return;
         }
         if (count > 0) self.summary.files_with_matches += 1;
@@ -1634,6 +1785,114 @@ pub const Search = struct {
             try self.renderMultilineReplacement(a, path_name, bytes, lines, selected, multiline_hits.items);
             return;
         }
+        if (self.ranking != null) {
+            if (count > 0) try self.retainCandidate(a, path_name, bytes, lines, selected, probabilities, false);
+            return;
+        }
+        try self.renderSelectedLines(path_name, bytes, lines, selected, probabilities);
+    }
+    fn retainCandidate(self: *Search, scratch: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool, probabilities: []const f64, jev: bool) !void {
+        const ranking = self.ranking.?;
+        if (!ranking.consider(self.best_probability, path, self.result_ordinal)) return;
+        errdefer self.retaining_output = false;
+        if (self.options.max_pending_output <= @sizeOf(Candidate)) return error.PendingOutputBudgetExceeded;
+        const candidate = try self.a.create(Candidate);
+        candidate.* = .{ .a = self.a, .budget = .{ .backing = self.a, .limit = self.options.max_pending_output - @sizeOf(Candidate) }, .arena = undefined };
+        candidate.arena = std.heap.ArenaAllocator.init(candidate.budget.allocator());
+        errdefer candidate.deinit();
+        self.fillCandidate(candidate, scratch, path, bytes, lines, selected, probabilities, jev) catch |err| return if (candidate.budget.denied) error.PendingOutputBudgetExceeded else err;
+        self.deferred_candidate = candidate;
+    }
+    fn fillCandidate(self: *Search, c: *Candidate, scratch: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool, probabilities: []const f64, jev: bool) !void {
+        const a = c.arena.allocator();
+        c.path = try a.dupe(u8, path);
+        c.provenance = try retainedClone(@TypeOf(self.provenance), a, self.provenance, 0);
+        c.score = self.best_probability;
+        c.ordinal = self.result_ordinal;
+        c.before = self.file_before;
+        c.filename = self.render_filename;
+        c.color = self.color_enabled;
+        c.started = self.file_started;
+        if (jev) {
+            c.view = try retainedClone(EvidenceView, a, try self.evidenceView(scratch, bytes, lines, selected), 0);
+        } else {
+            var rows: std.ArrayList(RenderRow) = .empty;
+            var last: ?usize = null;
+            for (lines, 0..) |line, i| {
+                var show = selected[i];
+                if (!show) for (selected[i -| self.options.after .. i + @min(self.options.before, lines.len - i - 1) + 1]) |yes| {
+                    if (yes) {
+                        show = true;
+                        break;
+                    }
+                };
+                if (!show) continue;
+                const p = probabilities[i];
+                const independent = if (self.evidence) |e| std.math.isFinite(e.line_scores[i]) and e.line_scores[i] >= 0 and e.line_scores[i] == p else true;
+                try rows.append(a, .{ .raw = try a.dupe(u8, bytes[line.start..if (i + 1 < lines.len) lines[i + 1].start else bytes.len]), .length = line.end - line.start, .line = i + 1, .offset = line.start, .matched = selected[i], .probability = p, .independent = independent, .gap = last != null and i > last.? + 1 and (self.options.before > 0 or self.options.after > 0) });
+                last = i;
+            }
+            c.rows = rows.items;
+        }
+    }
+    fn emitRanked(self: *Search) !void {
+        const ranking = self.ranking.?;
+        ranking.sort();
+        if (self.options.jev_mode and !self.options.json) {
+            const header = try std.fmt.allocPrint(self.a, "Search: {s}\n{d} files searched; {d} selected source lines; {s}\n", .{ self.options.ask.?, self.summary.files, self.summary.matches, if (self.summary.complete) "complete" else "incomplete" });
+            defer self.a.free(header);
+            try self.write(header);
+            for (ranking.items.items) |c| {
+                const row = try std.fmt.allocPrint(self.a, "  {s}  {d:.3}\n", .{ c.path, c.score });
+                defer self.a.free(row);
+                try self.write(row);
+            }
+            try self.write("\n");
+        }
+        var renderer = try Search.initShared(self);
+        defer renderer.deinit();
+        var render_options = self.options.*;
+        renderer.options = &render_options;
+        var forward = ForwardSink{ .search = self, .writer = .{ .vtable = &.{ .drain = ForwardSink.drain }, .buffer = &.{} } };
+        forward.started = true;
+        renderer.sink = &forward.writer;
+        for (ranking.items.items) |c| {
+            render_options.max_output_bytes = self.options.max_output_bytes - self.output_bytes;
+            renderer.summary = c.summary;
+            renderer.best_probability = c.score;
+            renderer.provenance = c.provenance;
+            renderer.render_filename = c.filename;
+            renderer.color_enabled = c.color;
+            renderer.header_printed = false;
+            renderer.file_started = c.started;
+            renderer.file_output_start = 0;
+            renderer.output_bytes = 0;
+            renderer.json_started = false;
+            if (c.view) |view| {
+                var arena = std.heap.ArenaAllocator.init(self.a);
+                defer arena.deinit();
+                renderer.renderEvidenceView(arena.allocator(), c.path, view) catch |err| return forward.failure orelse err;
+            } else for (c.rows) |row| {
+                if (row.gap and !self.options.json and self.options.context_separator.len > 0) {
+                    try renderer.write(self.options.context_separator);
+                    try renderer.write("\n");
+                }
+                renderer.raw_line = row.raw;
+                renderer.independent_override = row.independent;
+                renderer.emit(c.path, row.raw[0..row.length], row.line, row.offset, row.matched, row.probability) catch |err| return forward.failure orelse err;
+            }
+            renderer.jsonEnd(c.path, c.before) catch |err| return forward.failure orelse err;
+        }
+        const omitted = ranking.considered - ranking.items.items.len;
+        if (omitted > 0) {
+            if (self.options.json) try self.json(.{ .type = "omitted_files", .count = omitted }) else {
+                const row = try std.fmt.allocPrint(self.a, "[omitted {d} qualifying files; increase -n/--max-result-files]\n", .{omitted});
+                defer self.a.free(row);
+                try self.write(row);
+            }
+        }
+    }
+    fn renderSelectedLines(self: *Search, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool, probabilities: []const f64) !void {
         var last_shown: ?usize = null;
         for (lines, 0..) |line, i| {
             var show = selected[i];
@@ -1787,11 +2046,10 @@ pub const Search = struct {
         }
         return listing.toOwnedSlice();
     }
-    fn renderEvidence(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool) !void {
+    fn evidenceView(self: *Search, a: Allocator, bytes: []const u8, lines: []const Line, selected: []const bool) !EvidenceView {
         const evidence = self.evidence.?;
         const any_selected = std.mem.indexOfScalar(bool, selected, true) != null;
-        const Row = struct { line: usize, byte_offset: usize, text: []const u8, p: ?f64, region_p: ?f64, matched: bool };
-        var rows: std.ArrayList(Row) = .empty;
+        var rows: std.ArrayList(EvidenceRow) = .empty;
         var included: usize = 0;
         var omitted_lines: usize = 0;
         var omitted_bytes: usize = 0;
@@ -1827,30 +2085,36 @@ pub const Search = struct {
         for (evidence.regions.items) |region| if (region.p >= self.options.threshold) try regions.append(a, region);
         var calls: std.ArrayList(@import("source.zig").Call) = .empty;
         for (evidence.index.calls) |call| if (call.line > 0 and call.line <= selected.len and selected[call.line - 1]) try calls.append(a, call);
+        return .{ .rows = rows.items, .regions = regions.items, .calls = calls.items, .declarations = evidence.index.declarations, .file_score = evidence.file_score, .parse_complete = evidence.index.complete, .any_selected = any_selected, .omitted_lines = omitted_lines, .omitted_bytes = omitted_bytes };
+    }
+    fn renderEvidence(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool) !void {
+        try self.renderEvidenceView(a, path, try self.evidenceView(a, bytes, lines, selected));
+    }
+    fn renderEvidenceView(self: *Search, a: Allocator, path: []const u8, view: EvidenceView) !void {
         if (self.options.json) {
             if (self.options.json_compact) try self.jsonBegin(path);
-            try self.json(.{ .type = "file", .path = path, .relevance = self.best_probability, .file_preview_score = evidence.file_score, .selection = .{ .query = self.options.ask, .additional_queries = self.options.queries.items, .lexical_prefilters = self.options.patterns.items, .policies = .{ .filters = self.options.filters.items, .only = self.options.only.items, .exclude = self.options.not.items }, .file_threshold = self.options.file_threshold, .region_threshold = self.options.threshold, .refined = self.options.refine, .reason = if (any_selected) "scored_source_evidence" else "file_preview_reading_lead" }, .match = if (any_selected) "strong" else "lead", .reading_leads = evidence.index.declarations, .regions = regions.items[0..@min(regions.items.len, self.options.max_regions_per_file)], .lines = rows.items, .calls = calls.items, .omitted = .{ .lines = omitted_lines, .bytes = omitted_bytes, .regions = regions.items.len - @min(regions.items.len, self.options.max_regions_per_file) }, .parse_complete = evidence.index.complete, .complete = self.summary.complete });
+            try self.json(.{ .type = "file", .path = path, .relevance = self.best_probability, .file_preview_score = view.file_score, .selection = .{ .query = self.options.ask, .additional_queries = self.options.queries.items, .lexical_prefilters = self.options.patterns.items, .policies = .{ .filters = self.options.filters.items, .only = self.options.only.items, .exclude = self.options.not.items }, .file_threshold = self.options.file_threshold, .region_threshold = self.options.threshold, .refined = self.options.refine, .reason = if (view.any_selected) "scored_source_evidence" else "file_preview_reading_lead" }, .match = if (view.any_selected) "strong" else "lead", .reading_leads = view.declarations, .regions = view.regions[0..@min(view.regions.len, self.options.max_regions_per_file)], .lines = view.rows, .calls = view.calls, .omitted = .{ .lines = view.omitted_lines, .bytes = view.omitted_bytes, .regions = view.regions.len - @min(view.regions.len, self.options.max_regions_per_file) }, .parse_complete = view.parse_complete, .complete = self.summary.complete });
             return;
         }
         var output: std.Io.Writer.Allocating = .init(a);
         try output.writer.print("{s}  relevance={d:.3}\n", .{ path, self.best_probability });
         if (self.provenance.backend == .antfly) try output.writer.print("  source={s} revision={s} indexed_at={d} (indexed snapshot)\n", .{ self.provenance.uri.?, self.provenance.revision.?, self.provenance.indexed_at.? });
-        for (regions.items[0..@min(regions.items.len, self.options.max_regions_per_file)]) |region| try output.writer.print("  {d}-{d}  {d:.3}  {s}\n", .{ region.start, region.end, region.p, region.label });
-        if (regions.items.len > self.options.max_regions_per_file) try output.writer.print("  [omitted {d} qualifying regions; increase --max-regions]\n", .{regions.items.len - self.options.max_regions_per_file});
-        if (regions.items.len == 0 and evidence.index.declarations.len > 0) {
+        for (view.regions[0..@min(view.regions.len, self.options.max_regions_per_file)]) |region| try output.writer.print("  {d}-{d}  {d:.3}  {s}\n", .{ region.start, region.end, region.p, region.label });
+        if (view.regions.len > self.options.max_regions_per_file) try output.writer.print("  [omitted {d} qualifying regions; increase --max-regions]\n", .{view.regions.len - self.options.max_regions_per_file});
+        if (view.regions.len == 0 and view.declarations.len > 0) {
             try output.writer.writeAll("  Reading leads (declaration locations; no qualifying region score):\n");
-            for (evidence.index.declarations[0..@min(10, evidence.index.declarations.len)]) |decl| try output.writer.print("    {d}-{d}  {s} {s}\n", .{ decl.start, decl.end, decl.kind, decl.name });
+            for (view.declarations[0..@min(10, view.declarations.len)]) |decl| try output.writer.print("    {d}-{d}  {s} {s}\n", .{ decl.start, decl.end, decl.kind, decl.name });
         }
-        for (rows.items) |row| {
+        for (view.rows) |row| {
             if (!row.matched) {
                 try output.writer.print("    {d}  context  {s}\n", .{ row.line, row.text });
                 continue;
             }
             if (row.p) |p| try output.writer.print("    {d}  {d:.3}  {s}\n", .{ row.line, p, row.text }) else try output.writer.print("    {d}  region={d:.3}  {s}\n", .{ row.line, row.region_p orelse 0, row.text });
         }
-        if (omitted_lines > 0) try output.writer.print("  [omitted {d} source lines, {d} bytes; increase --max-source-bytes]\n", .{ omitted_lines, omitted_bytes });
-        for (calls.items) |call| try output.writer.print("  call {d}:{d}  {s}\n", .{ call.line, call.column, call.name });
-        if (rows.items.len == 0 and regions.items.len == 0) try output.writer.writeAll("  [file qualified from its preview; no excerpt cleared the threshold]\n");
+        if (view.omitted_lines > 0) try output.writer.print("  [omitted {d} source lines, {d} bytes; increase --max-source-bytes]\n", .{ view.omitted_lines, view.omitted_bytes });
+        for (view.calls) |call| try output.writer.print("  call {d}:{d}  {s}\n", .{ call.line, call.column, call.name });
+        if (view.rows.len == 0 and view.regions.len == 0) try output.writer.writeAll("  [file qualified from its preview; no excerpt cleared the threshold]\n");
         try self.write(output.written());
     }
     fn evaluate(self: *Search, a: Allocator, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !void {
@@ -1979,6 +2243,7 @@ pub const Search = struct {
     }
     const ForwardSink = struct {
         search: *Search,
+        failure: ?anyerror = null,
         writer: std.Io.Writer,
         started: bool = false,
         fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -1986,25 +2251,37 @@ pub const Search = struct {
             if (!self.started) {
                 self.started = true;
                 const options = self.search.options;
-                if ((options.heading orelse false) and !options.json and !options.count and !options.count_matches and !options.files_with_matches and !options.files_without_match and self.search.output_bytes > 0) self.search.write("\n") catch return error.WriteFailed;
+                if ((options.heading orelse false) and !options.json and !options.count and !options.count_matches and !options.files_with_matches and !options.files_without_match and self.search.output_bytes > 0) self.search.write("\n") catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
             }
             var count: usize = 0;
             for (data[0 .. data.len - 1]) |bytes| {
-                self.search.write(bytes) catch return error.WriteFailed;
+                self.search.write(bytes) catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
                 count += bytes.len;
             }
             for (0..splat) |_| {
                 const bytes = data[data.len - 1];
-                self.search.write(bytes) catch return error.WriteFailed;
+                self.search.write(bytes) catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
                 count += bytes.len;
             }
             return count;
         }
     };
     pub fn write(self: *Search, bytes: []const u8) !void {
-        if (self.retaining_output) if (self.shared_limits) |limits| if (!Limits.reserve(&limits.pending_output, bytes.len, self.options.max_pending_output)) {
-            self.retaining_output = false;
-            return error.PendingOutputBudgetExceeded;
+        if (self.retaining_output) if (self.shared_limits) |limits| {
+            if (!Limits.reserve(&limits.pending_output, bytes.len, self.options.max_pending_output)) {
+                self.retaining_output = false;
+                return error.PendingOutputBudgetExceeded;
+            }
+            self.reserved_output += bytes.len;
         };
         if (bytes.len > self.options.max_output_bytes - self.output_bytes) return error.OutputBudgetExceeded;
         self.output_bytes += bytes.len;
@@ -2092,7 +2369,7 @@ pub const Search = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const p: ?f64 = if (std.math.isNan(probability)) null else probability;
-        const independent = if (self.evidence) |evidence| line > 0 and line <= evidence.line_scores.len and std.math.isFinite(evidence.line_scores[line - 1]) and evidence.line_scores[line - 1] >= 0 and evidence.line_scores[line - 1] == probability else self.options.ask != null;
+        const independent = self.independent_override orelse if (self.evidence) |evidence| line > 0 and line <= evidence.line_scores.len and std.math.isFinite(evidence.line_scores[line - 1]) and evidence.line_scores[line - 1] >= 0 and evidence.line_scores[line - 1] == probability else self.options.ask != null;
         const replacement_context = self.options.replacement != null and !self.options.multiline and !self.options.json and !self.replacement_absolute_start and self.matcher.hasAbsoluteStart();
         if (replacement_context) self.matcher.allowAbsoluteStart(false);
         defer if (replacement_context) self.matcher.allowAbsoluteStart(true);
@@ -2499,23 +2776,11 @@ pub const Search = struct {
         const encoded_path = try jsonText(self.a, path);
         defer if (encoded_path.bytes) |bytes| self.a.free(bytes);
         if (self.options.json_compact) {
-            // Opaque per-observation identity: repeated paths can change within
-            // one wall-clock tick. No shared counter or scheduling dependency.
-            const source = try std.json.Stringify.valueAlloc(self.a, self.provenance, .{});
-            defer self.a.free(source);
-            var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            hash.update("antfly-grep-file-v2");
-            var nonce: [16]u8 = undefined;
+            // The ID is opaque and observation-local. Generate it without
+            // serializing provenance outside the budgeted output writer.
+            var nonce: [32]u8 = undefined;
             self.io.random(&nonce);
-            hash.update(&nonce);
-            var len: [8]u8 = undefined;
-            std.mem.writeInt(u64, &len, path.len, .little);
-            hash.update(&len);
-            hash.update(path);
-            hash.update(source);
-            var digest: [32]u8 = undefined;
-            hash.final(&digest);
-            self.compact_file_id = std.fmt.bytesToHex(digest, .lower);
+            self.compact_file_id = std.fmt.bytesToHex(nonce, .lower);
             try self.json(.{ .type = "begin", .data = .{ .path = encoded_path, .record_delimiter = if (self.options.null_data) "nul" else "lf", .crlf = self.options.crlf } });
         } else try self.json(.{ .type = "begin", .data = .{ .path = encoded_path } });
         self.json_started = true;
@@ -2675,6 +2940,8 @@ test "line offsets preserve CRLF and unterminated final lines" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 test {
+    _ = @import("ranked.zig");
+    _ = @import("batch_store.zig");
     _ = @import("concurrency.zig");
     _ = @import("options.zig");
     _ = @import("matcher.zig");

@@ -20,6 +20,8 @@ import argparse
 import hashlib
 import json
 import os
+import platform
+import time
 import statistics
 import subprocess
 import tempfile
@@ -35,6 +37,8 @@ def main():
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--files", type=int, default=2048)
     parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument(
         "--compact",
         action="store_true",
@@ -42,8 +46,10 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.files < 1 or args.rounds < 1:
-        parser.error("files and rounds must be positive")
+    if args.files < 1 or args.rounds < 1 or args.threads < 1 or args.top_k < 0:
+        parser.error(
+            "files, rounds and threads must be positive; top-k must be nonnegative"
+        )
     binaries = {
         "antfly-grep": str(args.binary.resolve()),
         "baseline": str(args.baseline.resolve()),
@@ -51,10 +57,21 @@ def main():
     report = {
         "files": args.files,
         "rounds": args.rounds,
+        "top_k": args.top_k,
+        "threads": args.threads,
         "fixture_only": True,
+        "host": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cpu_count": os.cpu_count(),
+        },
+        "recorded_at_unix": time.time(),
         "limitations": "Synthetic Python sources and native constant-score fixture; warm filesystem on one host; no model quality or billed tokens measured",
         "binaries": {
-            n: {"sha256": hashlib.sha256(Path(b).read_bytes()).hexdigest()}
+            n: {
+                "sha256": hashlib.sha256(Path(b).read_bytes()).hexdigest(),
+                "version": subprocess.check_output([b, "--version"], text=True).strip(),
+            }
             for n, b in binaries.items()
         },
         "cases": {},
@@ -90,7 +107,7 @@ def main():
                 "--chunk-lines=1000",
                 "--context-lines=0",
                 "--no-refine",
-                "--threads=1",
+                f"--threads={args.threads}",
                 "--max-files=0",
                 "--max-requests=unlimited",
                 "--cache-dir",
@@ -100,6 +117,8 @@ def main():
                 else "--json",
                 "src",
             ]
+            if args.top_k:
+                commands[name].insert(1, f"--max-result-files={args.top_k}")
             result = subprocess.run(
                 commands[name], cwd=root, env=env, capture_output=True, check=True
             )

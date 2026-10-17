@@ -55,6 +55,9 @@ pub const Client = struct {
     cache_hits: usize = 0,
     allow_parallel: bool = true,
     cache_checked: bool = false,
+    batch_store: ?*@import("batch_store.zig").Store = null,
+    owns_batch_store: bool = false,
+    batch_store_failed: bool = false,
     legacy_cache: ?@import("artifact_cache.zig").LegacyPresence = null,
     local: ?*@import("local_decider.zig").Runtime = null,
     shared_local: ?*@import("local_decider.zig").Runtime = null,
@@ -71,8 +74,25 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         if (self.pool) |pool| pool.deinit();
         self.http.deinit();
+        if (self.owns_batch_store) if (self.batch_store) |store| {
+            store.deinit(self.io);
+            self.a.destroy(store);
+        };
         self.score_store.deinit(self.io);
         if (self.local) |local| local.deinit();
+    }
+    pub fn prepareCache(self: *Client) void {
+        if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null or self.batch_store != null or self.batch_store_failed) return;
+        self.batch_store_failed = true;
+        const store = self.a.create(@import("batch_store.zig").Store) catch return;
+        store.* = .{};
+        self.batch_store = store;
+        self.owns_batch_store = true;
+    }
+    pub fn shareCache(self: *Client, parent: *Client) void {
+        if (self.batch_store != null) return;
+        self.batch_store = parent.batch_store;
+        self.batch_store_failed = parent.batch_store_failed;
     }
     pub fn ensureLocal(self: *Client) !void {
         if (!self.options.cached_only and self.options.backend == .local and self.shared_local == null and self.local == null) self.local = try @import("local_decider.zig").Runtime.create(self.a, self.io, self.options);
@@ -222,6 +242,7 @@ pub const Client = struct {
             self.a.destroy(self);
         }
         fn run(self: *Pool, parent: *Client, inputs: []const Input, scores: []f64, written: []?i64) !void {
+            parent.prepareCache();
             const wanted = @min(self.workers.len, (inputs.len + parent.options.batch_size - 1) / parent.options.batch_size);
             // The caller owns dispatch and waits for the previous wave. Spawn
             // outside the mutex; new workers start at the previous generation.
@@ -288,6 +309,7 @@ pub const Client = struct {
         failure: ?anyerror = null,
         fn perform(ctx: *Batches, local: *Client) void {
             const parent = ctx.client;
+            local.shareCache(parent);
             local.requests = 0;
             local.input_tokens = 0;
             local.output_tokens = 0;
@@ -487,9 +509,15 @@ pub const Client = struct {
     const ScoreRecord = struct { bits: u64, written: u64 };
     fn cachedBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64, written: []?i64) !bool {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
+        self.prepareCache();
         var migrated = false;
-        const payload = self.batchCache(scores.len).load(a, self.io, digestKey(key_hex)) orelse blk: {
-            if (!self.legacy().batches) break :blk null;
+        const payload = (if (self.batch_store) |store| store.load(a, self.io, self.options, scores.len, digestKey(key_hex)) else null) orelse blk: {
+            const presence = self.legacy();
+            if (presence.buckets) if (self.batchCache(scores.len).load(a, self.io, digestKey(key_hex))) |old| {
+                migrated = true;
+                break :blk old;
+            };
+            if (!presence.batches) break :blk null;
             const old = self.legacyBatchCache(scores.len).load(a, self.io, digestKey(key_hex)) orelse break :blk null;
             migrated = true;
             break :blk old;
@@ -560,7 +588,8 @@ pub const Client = struct {
         if (!any) return;
         const bytes = try @import("cache_codec.zig").encode(a, entries);
         defer a.free(bytes);
-        self.batchCache(scores.len).store(a, self.io, digestKey(key_hex), bytes);
+        self.prepareCache();
+        if (self.batch_store) |store| store.store(a, self.io, self.options, scores.len, digestKey(key_hex), bytes);
     }
     fn request(self: *Client, inputs: []const Input, probabilities: []f64) !void {
         if (self.options.cached_only) return error.DecisionCacheMiss;

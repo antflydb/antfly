@@ -50,25 +50,44 @@ def read_batch(path):
             else (4096, 8)
         )
         scores, written, records = [], [], []
-        for way in range(ways):
-            h = data[way * 80 : (way + 1) * 80]
-            if len(h) != 80 or h[76:80] != b"AGB1":
-                continue
-            size = struct.unpack_from("<I", h, 64)[0]
-            offset = ways * 80 + way * (slot_size - 80)
-            body = data[offset : offset + size]
-            if hashlib.sha256(h[:32] + h[64:] + body).digest() != h[32:64]:
-                continue
-            count = struct.unpack_from("<I", body)[0]
-            values = [struct.unpack_from("<dq", body, 4 + i * 16) for i in range(count)]
-            records.append((way, offset, len(scores), count))
-            scores.extend(
-                score if math.isfinite(score) else None for score, _ in values
-            )
-            written.extend(
-                stamp if math.isfinite(score) else None for score, stamp in values
-            )
-        return {"version": 9, "scores": scores, "written": written, "_records": records}
+        if path.name.startswith("batch-v10-"):
+            assert data[:8] == b"AGSHD001"
+            page_size, count = struct.unpack_from("<II", data, 8)
+            pages = [
+                4096 + (index - 1) * page_size
+                for index in struct.unpack_from(f"<{count}I", data, 64)
+                if index
+            ]
+        else:
+            pages = [0]
+        for page in pages:
+            for way in range(ways):
+                header = page + way * 80
+                h = data[header : header + 80]
+                if len(h) != 80 or h[76:80] != b"AGB1":
+                    continue
+                size = struct.unpack_from("<I", h, 64)[0]
+                offset = page + ways * 80 + way * (slot_size - 80)
+                body = data[offset : offset + size]
+                if hashlib.sha256(h[:32] + h[64:] + body).digest() != h[32:64]:
+                    continue
+                count = struct.unpack_from("<I", body)[0]
+                values = [
+                    struct.unpack_from("<dq", body, 4 + i * 16) for i in range(count)
+                ]
+                records.append((header, offset, len(scores), count))
+                scores.extend(
+                    score if math.isfinite(score) else None for score, _ in values
+                )
+                written.extend(
+                    stamp if math.isfinite(score) else None for score, stamp in values
+                )
+        return {
+            "version": 10 if path.name.startswith("batch-v10-") else 9,
+            "scores": scores,
+            "written": written,
+            "_records": records,
+        }
     count = struct.unpack_from("<I", data, 64)[0]
     values = [struct.unpack_from("<dq", data, 68 + i * 16) for i in range(count)]
     return {
@@ -95,7 +114,7 @@ def write_batch(path, record):
         data = bytearray(path.read_bytes())
         for way, offset, start, count in record["_records"]:
             body = payload(start, count)
-            h = way * 80
+            h = way
             data[offset : offset + len(body)] = body
             data[h + 32 : h + 64] = hashlib.sha256(
                 data[h : h + 32] + data[h + 64 : h + 80] + body
@@ -394,6 +413,8 @@ class DecisionHandler(BaseHTTPRequestHandler):
             data[0]["answers"][0]["decision_method"] = "embedding_similarity"
         if self.server.mode == "out_of_range":
             data[0]["answers"][0]["probability"] = 1.1
+        if getattr(self.server, "after_decision", None):
+            self.server.after_decision()
         encoded = json.dumps(
             {
                 "data": list(reversed(data)),
@@ -643,7 +664,7 @@ class CliTests(unittest.TestCase):
         directory = self.root / "scores"
         batches = [
             timestamp
-            for path in directory.glob("batch-v9-*")
+            for path in directory.glob("batch-v10-*")
             for timestamp in read_batch(path)["written"]
             if timestamp is not None
         ]
@@ -717,22 +738,22 @@ class CliTests(unittest.TestCase):
         ]
         expected = self.raw_cli(*args).stdout
         directory = self.root / "scores"
-        for path in directory.glob("batch-v9-*"):
+        for path in directory.glob("batch-v10-*"):
             path.unlink()
         calls = len(self.server.requests)
         self.assertEqual(expected, self.raw_cli(*args, "--max-requests=1").stdout)
         self.assertEqual(calls, len(self.server.requests))
-        paths = list(directory.glob("batch-v9-*"))
+        paths = list(directory.glob("batch-v10-*"))
         self.assertTrue(paths, "scalar-only waves must create batch records")
         (directory / "scores-v2.bin").unlink()
         self.assertEqual(expected, self.raw_cli(*args, "--cached-only").stdout)
 
         def headers():
             result = {}
-            for path in directory.glob("batch-v9-*"):
+            for path in directory.glob("batch-v10-*"):
                 raw = path.read_bytes()
                 for way, _, _, _ in read_batch(path)["_records"]:
-                    header = raw[way * 80 : (way + 1) * 80]
+                    header = raw[way : way + 80]
                     result[header[:32]] = header
             return result
 
@@ -786,9 +807,9 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args, "--batch-size=8")
         directory = self.root / "scores"
         self.raw_cli(*args, "--batch-size=3")
-        for path in directory.glob("batch-v9-*"):
+        for path in directory.glob("batch-v10-*"):
             data = read_batch(path)
-            self.assertEqual(data["version"], 9)
+            self.assertEqual(data["version"], 10)
             data["written"] = [
                 1 if score is not None else None for score in data["scores"]
             ]
@@ -819,11 +840,11 @@ class CliTests(unittest.TestCase):
         ]
         first = self.raw_cli(*args)
         directory = self.root / "scores"
-        for path in directory.glob("batch-v9-*"):
+        for path in directory.glob("batch-v10-*"):
             record = read_batch(path)
             raw = path.read_bytes()
             for way, _, start, count in record["_records"]:
-                key = raw[way * 80 : way * 80 + 32].hex()
+                key = raw[way : way + 32].hex()
                 old = path.with_name("batch-v6-" + key)
                 old.write_text(
                     json.dumps(
@@ -870,18 +891,31 @@ class CliTests(unittest.TestCase):
                 if "medium" in path.name
                 else (4096, 8, 512)
             )
-            for way in range(ways):
-                h = data[way * 80 : (way + 1) * 80]
+            entries = (
+                [(way * 80, None) for way in range(ways)]
+                if is_source
+                else [
+                    (header, offset)
+                    for header, offset, _, _ in read_batch(path)["_records"]
+                ]
+            )
+            for header, body_offset in entries:
+                h = data[header : header + 80]
                 if len(h) != 80 or h[76:] not in (b"AGB1", b"AGP1"):
                     continue
                 length = struct.unpack_from("<I", h, 64)[0]
-                offset = ways * 80 + (
-                    sum(
-                        struct.unpack_from("<I", data, prior * 80 + 64)[0]
-                        for prior in range(way)
+                offset = (
+                    body_offset
+                    if body_offset is not None
+                    else ways * 80
+                    + (
+                        sum(
+                            struct.unpack_from("<I", data, prior * 80 + 64)[0]
+                            for prior in range(header // 80)
+                        )
+                        if h[76:] == b"AGP1"
+                        else (header // 80) * (size - 80)
                     )
-                    if h[76:] == b"AGP1"
-                    else way * (size - 80)
                 )
                 body = data[offset : offset + length]
                 key = h[:32]
@@ -889,7 +923,7 @@ class CliTests(unittest.TestCase):
                 namespace = (
                     "source-v2"
                     if is_source
-                    else path.name.rsplit("-", 1)[0].replace("v9", "v8")
+                    else path.name.rsplit("-", 1)[0].replace("v10", "v8")
                 )
                 bucket = int.from_bytes(key[:2], "little") % buckets
                 old_way = 0
@@ -909,7 +943,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(list(directory.glob("source-v3-*")))
         new_times = [
             stamp
-            for path in directory.glob("batch-v9-*")
+            for path in directory.glob("batch-v10-*")
             for stamp in read_batch(path)["written"]
         ]
         self.assertEqual(sorted(old_times), sorted(new_times))
@@ -1503,7 +1537,7 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args)
         self.assertEqual(len(self.server.requests), requests)
         for cache in (self.root / "scores").iterdir():
-            if cache.name.startswith("batch-v9-"):
+            if cache.name.startswith("batch-v10-"):
                 record = read_batch(cache)
                 record["written"] = [
                     1 if score is not None else None for score in record["scores"]
@@ -1675,6 +1709,7 @@ class CliTests(unittest.TestCase):
         self.server.mode = "ok"
         self.server.peak = 0
         self.server.stagger_scores = False
+        self.server.after_decision = None
         self.server.delay = 0
         self.server.barrier = None
 
@@ -4482,6 +4517,237 @@ class CliTests(unittest.TestCase):
         self.raw_cli("cache", "clear")
         self.assertFalse((self.root / ".cache/antfly-grep/decisions").exists())
 
+    def test_compact_provenance_obeys_atomic_output_budget(self):
+        doc = self.indexed_doc()
+        doc["metadata"] = {"escaped": "\x01" * (2 * 1024 * 1024)}
+        config = self.table_config([doc], max_response_bytes=16 * 1024 * 1024)
+        for flag in ("--json", "--json-compact"):
+            result = self.raw_cli(
+                flag,
+                "--max-output-bytes=1024",
+                "--table-config",
+                config,
+                "STOP",
+                code=2,
+            )
+            self.assertLessEqual(len(result.stdout), 1024)
+            for row in result.stdout.splitlines():
+                json.loads(row)  # No partial JSON record may escape the writer.
+
+    def test_top_k_matches_full_ranking_with_bounded_evidence(self):
+        for i in range(48):
+            self.write(
+                f"src/f{i:03}.py",
+                f"def retry_{i}():\n    STOP {'HIGH' if i > 40 else 'LOW'}\n    tail\n",
+            )
+        common = [
+            *self.decision_args(),
+            "--no-refine",
+            "--threads=4",
+            "--chunk-lines=100",
+            "--max-files=0",
+            "src",
+        ]
+        full = [
+            json.loads(line)
+            for line in self.raw_cli(*common, "--json").stdout.splitlines()
+        ]
+        expected = [
+            (r["data"]["path"], r["data"]["lines"], r["probability"], r["scope"])
+            for r in full
+            if r["type"] == "match"
+        ]
+        paths = []
+        for path, *_ in expected:
+            if path not in paths:
+                paths.append(path)
+        expected = [row for row in expected if row[0] in paths[:2]]
+        calls = len(self.server.requests)
+        for flag in ("--json", "--json-compact"):
+            for jobs in (1, 4):
+                result = self.raw_cli(
+                    *common,
+                    flag,
+                    f"--threads={jobs}",
+                    "--max-result-files=2",
+                    "--max-pending-output=20000",
+                )
+                rows = [json.loads(line) for line in result.stdout.splitlines()]
+                identities = {
+                    r["file_id"]: r["data"]["path"]
+                    for r in rows
+                    if r["type"] == "begin" and "file_id" in r
+                }
+                actual = [
+                    (
+                        r["data"].get("path", identities.get(r.get("file_id"))),
+                        r["data"]["lines"],
+                        r["probability"],
+                        r["scope"],
+                    )
+                    for r in rows
+                    if r["type"] == "match"
+                ]
+                self.assertEqual(actual, expected)
+                self.assertEqual(rows[-1]["stats"]["files"], 48)
+                self.assertTrue(rows[-1]["stats"]["complete"])
+                self.assertEqual(
+                    next(r["count"] for r in rows if r["type"] == "omitted_files"), 46
+                )
+        self.assertEqual(
+            calls, len(self.server.requests), "ranking must reuse cached evaluation"
+        )
+
+    def test_top_k_output_budgets_preserve_complete_records_and_text_options(self):
+        for i in range(6):
+            self.write(f"f{i}.py", "before\nSTOP HIGH\ntail\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--unit=line",
+            "--context-lines=0",
+            "--threads=1",
+            *[f"f{i}.py" for i in range(6)],
+        ]
+        for flags in (
+            ["--heading", "-n", "-C1"],
+            ["--no-heading", "--trim", "-b", "--color=always"],
+        ):
+            full = self.raw_cli(*args, *flags).stdout
+            self.assertEqual(
+                full, self.raw_cli(*args, *flags, "--max-result-files=6").stdout
+            )
+        for flag in ("--json", "--json-compact"):
+            for limit in (2048, 4096):
+                result = self.raw_cli(
+                    *args,
+                    flag,
+                    "--max-result-files=5",
+                    f"--max-output-bytes={limit}",
+                    code=2,
+                )
+                self.assertGreater(
+                    len(result.stdout),
+                    0,
+                    "completed records must survive budget exhaustion",
+                )
+                self.assertLessEqual(len(result.stdout), limit)
+                rows = [json.loads(row) for row in result.stdout.splitlines()]
+                self.assertNotEqual(
+                    rows[-1]["type"],
+                    "summary",
+                    "a stopped output stream cannot claim completion",
+                )
+                self.assertIn(b"OutputBudgetExceeded", result.stderr)
+
+    def test_top_k_owns_searched_bytes_and_indexed_provenance(self):
+        original = "def retry():\n    STOP HIGH\n"
+        path = self.write("local.py", original)
+        self.server.after_decision = lambda: path.write_text(
+            "changed after evaluation\n"
+        )
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--json",
+            "--no-refine",
+            "--max-result-files=1",
+            "local.py",
+        )
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertTrue(any("STOP HIGH" in row.get("text", "") for row in rows))
+        self.assertNotIn(b"changed after evaluation", result.stdout)
+        self.server.after_decision = None
+        docs = [self.indexed_doc(f"index{i}.py", original) for i in range(12)]
+        config = self.table_config(docs, page_size=1)
+        self.server.mode = "exploration"
+        result = self.raw_cli(
+            "ask",
+            "retry",
+            "--model=fixture",
+            "--endpoint",
+            self.decision_args()[-1],
+            "--no-cache",
+            "--no-refine",
+            "--json-compact",
+            "--max-result-files=2",
+            "--table-config",
+            config,
+        )
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        sources = {
+            row["file_id"]: row["source"] for row in rows if row["type"] == "begin"
+        }
+        files = [row for row in rows if row["type"] == "file"]
+        self.assertEqual(len(files), 2)
+        for row in files:
+            self.assertEqual(sources[row["file_id"]]["revision"], "version-42")
+            self.assertEqual(sources[row["file_id"]]["metadata"], {"provider": "s3"})
+            self.assertTrue(any("STOP HIGH" in line["text"] for line in row["lines"]))
+        self.assertTrue(rows[-1]["stats"]["complete"])
+
+    def test_v9_bucket_migration_preserves_score_age(self):
+        self.write("a.py", "STOP\nnoise\n")
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--threads=1",
+            "--no-refine",
+            "--cache-dir=scores",
+            "a.py",
+        ]
+        expected = self.raw_cli(*args).stdout
+        directory = self.root / "scores"
+        stamps = []
+        for path in list(directory.glob("batch-v10-*")):
+            raw = path.read_bytes()
+            record = read_batch(path)
+            size, ways, buckets = (
+                (256, 16, 4096)
+                if "small" in path.name
+                else (1024, 8, 2048)
+                if "medium" in path.name
+                else (4096, 8, 512)
+            )
+            for header, offset, start, count in record["_records"]:
+                h = raw[header : header + 80]
+                length = struct.unpack_from("<I", h, 64)[0]
+                bucket = int.from_bytes(h[:2], "little") % buckets
+                old = (
+                    directory
+                    / f"{path.name.rsplit('-', 1)[0].replace('v10', 'v9')}-{bucket:03x}.bin"
+                )
+                page = (
+                    bytearray(old.read_bytes())
+                    if old.exists()
+                    else bytearray(size * ways)
+                )
+                way = next(
+                    i for i in range(ways) if not any(page[i * 80 : (i + 1) * 80])
+                )
+                page[way * 80 : (way + 1) * 80] = h
+                body_offset = ways * 80 + way * (size - 80)
+                page[body_offset : body_offset + length] = raw[offset : offset + length]
+                old.write_bytes(page)
+                stamps.extend(record["written"][start : start + count])
+            path.unlink()
+        (directory / "scores-v2.bin").unlink()
+        calls = len(self.server.requests)
+        self.assertEqual(self.raw_cli(*args, "--cached-only").stdout, expected)
+        self.assertEqual(len(self.server.requests), calls)
+        self.assertFalse(
+            list(directory.glob("batch-v10-*")), "cached-only must stay read-only"
+        )
+        self.assertEqual(self.raw_cli(*args, "--max-requests=1").stdout, expected)
+        self.assertEqual(len(self.server.requests), calls)
+        self.assertEqual(
+            sorted(stamps),
+            sorted(
+                stamp
+                for path in directory.glob("batch-v10-*")
+                for stamp in read_batch(path)["written"]
+            ),
+        )
+
     def test_decision_batches_and_files_are_concurrent_and_ranked(self):
         self.server.delay = 0.05
         self.server.barrier = threading.Barrier(2)
@@ -4723,7 +4989,7 @@ class CliTests(unittest.TestCase):
             "a",
         ]
         first = self.raw_cli(*args)
-        records = list((self.root / "scores").glob("batch-v9-*"))
+        records = list((self.root / "scores").glob("batch-v10-*"))
         self.assertTrue(records)
         self.assertLess(len(records), 32)
         requests = len(self.server.requests)
@@ -4807,7 +5073,7 @@ class CliTests(unittest.TestCase):
         self.server.requests.clear()
         self.assertEqual(expected, self.raw_cli(*args).stdout)
         self.assertEqual(len(self.server.requests), 0)
-        self.assertTrue(list(directory.glob("batch-v9-*")))
+        self.assertTrue(list(directory.glob("batch-v10-*")))
         for path in set(legacy):
             path.unlink()
         self.assertEqual(expected, self.raw_cli(*args).stdout)

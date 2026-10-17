@@ -1354,3 +1354,87 @@ Evidence: [cache scaling](bench/results/bucket-review-cache-scale.json),
 [incremental checks](bench/results/bucket-review-incremental.json). Binary/source
 identities and validation limits are in
 [bucket-review-validation.json](bench/results/bucket-review-validation.json).
+
+
+### Bounded top-K evidence and shared score shards
+
+Finite relevance ranking (`--max-result-files=K`, including the default for
+`ask`) now selects evidence in a synchronized worst-first heap before rendering.
+All eligible candidates are evaluated, while only K current winners retain typed
+rows, declaration/call evidence, and owned provenance. Known losers need no
+output allocation. Winners are serialized once through the existing renderers.
+Excerpts describe the bytes originally searched: local files are never reread,
+and indexed pages can be released before final output. Score/path/discovery-order
+ties are deterministic. Retained arenas count their actual allocated capacity
+against `--max-pending-output`; worker scratch, temporary replacement candidates,
+parser/model memory and output buffers are additional. Metadata nesting beyond
+512 levels reports `ResultNestingTooDeep` rather than using an unbounded stack.
+
+This path applies to relevance-ranked file/table results with finite K. Explicit
+sorting, unlimited ranking, stdin, inventory, count/list/quiet and multiline modes
+keep their existing execution paths. Limiting displayed files does not limit the
+search, inference budget, or final summary's evaluated-source counters. Successful
+evidence survives errors; finite JSON output remains record-atomic, and budget
+exhaustion flushes completed records and exits 2 without claiming completion.
+
+Batch cache V10 uses 16 packed shards for each of three size classes, shared by
+file and batch workers. At most 48 handles stay open until workers join. Positive
+bucket offsets remain stable, so warm hits take one bounded page read without
+open/stat/close operations. The 4 KiB shard directory allocates only occupied
+4/8/32 KiB bucket pages. A best-effort cross-process writer lock protects page
+allocation and updates; checksums reject torn/racing reads. Crash-orphaned pages
+are reused. Batch payload capacity remains 48 MiB, plus 192 KiB of shard
+directories, filesystem overhead and retained legacy formats. V9/V8 and earlier
+records migrate without refreshing score ages; `--cached-only` performs no writes.
+Source V3 and scalar-table V2 formats remain unchanged.
+
+Compact JSON observation IDs are random opaque 64-character hex strings. Their
+creation does not encode provenance; provenance is serialized only by the
+budgeted record writer. A 2 MiB escaped-metadata fixture with a 1 KiB output limit
+uses 19.3 MiB peak RSS versus
+34.4 MiB at the prior PR head, with identical output lengths and exit status.
+
+Paired warm results against `6d91fa53fdc0`, over 2,048 generated Python files:
+
+| Measurement | Prior PR head | Current |
+|---|---:|---:|
+| Top 15, one worker, median elapsed | 564 ms | 348 ms |
+| Top 15, one worker, median peak RSS | 66.7 MiB | 6.3 MiB |
+| Top 15, one worker, median system CPU | 333 ms | 182 ms |
+| Top 15, four workers, median elapsed | 235 ms | 135 ms |
+| Top 15, four workers, median peak RSS | 71.0 MiB | 9.1 MiB |
+| Unlimited results, median elapsed | 575 ms | 432 ms |
+| One-worker cache files | 4,438 | 904 |
+| One-worker allocated cache bytes | 26,210,304 | 26,824,704 |
+
+All three comparisons reconstruct identical matches, probabilities and scopes,
+retain 1,754 warm source-preparation hits and make zero warm inference calls.
+Packed shard allocation costs about 2.3% more disk space in the one-worker fixture;
+it removes thousands of files and bounds open handles. Unlimited output still
+retains all rendered results for ranking, so its approximately 67 MiB RSS is
+unchanged. Dense-output controls remain mixed: JSON 26.1 versus 26.0 ms, literal
+match-only 6.1 versus 6.0 ms, and regex color 12.9 versus 13.2 ms.
+
+These measurements use warm caches on one shared macOS ARM64 host and a constant
+native inference fixture. They establish neither cold-cache/independent-hardware
+speed nor lower cold-query model cost. Linux correctness runs in a two-CPU ARM64
+VM; Windows runtime and live-provider/model quality remain unqualified.
+
+Validation: **170 CLI tests on macOS and Linux** (two/one skips), native grep
+unit/hardening/tooling checks, ten focused ReleaseSafe heap/cache tests, six Linux
+hardening tests, Windows cross-compilation, 1,000 differential cases with no
+mismatches/timeouts, packaging checks, Apache boundaries and 35 checker tests.
+Regression fixtures cover ranking equivalence, ties/concurrency, bounded pending
+storage, searched-byte ownership, released-page provenance, output budgets,
+heading/color/context/trim parity, V9 migration and original score expiry.
+
+Evidence: [single-worker ranking](bench/results/topk-shards-2048-macos.json),
+[four-worker ranking](bench/results/topk-shards-parallel-macos.json),
+[unlimited ranking](bench/results/topk-shards-unlimited-macos.json),
+[escaped provenance](bench/results/topk-provenance-budget-macos.json),
+[dense output controls](bench/results/topk-output-macos.json), and
+[validation and source/binary identities](bench/results/topk-validation.json).
+Reproduce ranking comparisons with `bench/cache_scale.py --top-k 15 --threads 1`
+or `--threads 4`, passing the candidate/baseline binaries and native fixture
+library; omit `--top-k` for unlimited output. `bench/provenance_budget.py` runs the
+escaped-provenance HTTP fixture without a provider or model.

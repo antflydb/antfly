@@ -21,6 +21,7 @@ const A = std.mem.Allocator;
 // New-format writers never create legacy names; a new invocation rechecks.
 pub const LegacyPresence = struct {
     batches: bool = false,
+    buckets: bool = false,
     scalars: bool = false,
     sources: bool = false,
     pub fn scan(io: std.Io, directory: []const u8) LegacyPresence {
@@ -30,6 +31,7 @@ pub const LegacyPresence = struct {
         var iterator = dir.iterate();
         while (iterator.next(io) catch null) |entry| {
             if (std.mem.startsWith(u8, entry.name, "batch-v8-") or std.mem.startsWith(u8, entry.name, "batch-v7-") or std.mem.startsWith(u8, entry.name, "batch-v6-")) result.batches = true;
+            if (std.mem.startsWith(u8, entry.name, "batch-v9-")) result.buckets = true;
             if (std.mem.startsWith(u8, entry.name, "source-v2-")) result.sources = true;
             if (entry.name.len == 64) result.scalars = true;
         }
@@ -76,6 +78,53 @@ pub const Cache = struct {
     }
     fn validHeader(self: Cache, header: *const [header_size]u8) bool {
         return (std.mem.eql(u8, header[76..80], "AGB1") or std.mem.eql(u8, header[76..80], "AGP1")) and std.mem.readInt(u32, header[64..68], .little) <= self.limit - header_size;
+    }
+    /// Decode an already-read fixed bucket. Identity, metadata, and payload
+    /// share one checksum; short/torn pages are disposable misses.
+    pub fn fixedGet(self: Cache, a: A, key: [32]u8, bucket: []const u8) ?[]const u8 {
+        if (bucket.len < self.ways * header_size) return null;
+        for (0..self.ways) |way| {
+            const h = bucket[way * header_size ..][0..header_size];
+            if (!self.validHeader(h) or !std.mem.eql(u8, h[76..80], "AGB1") or !std.mem.eql(u8, h[0..32], &key)) continue;
+            const offset = self.bodyOffset(way);
+            const len = std.mem.readInt(u32, h[64..68], .little);
+            if (offset > bucket.len or len > bucket.len - offset) continue;
+            const body = bucket[@intCast(offset)..][0..len];
+            if (std.mem.eql(u8, h[32..64], &digest(h, body))) return a.dupe(u8, body) catch null;
+        }
+        return null;
+    }
+    pub fn fixedPut(self: Cache, io: std.Io, key: [32]u8, body: []const u8, bucket: []u8) void {
+        std.debug.assert(bucket.len == self.ways * self.limit and body.len <= self.limit - header_size);
+        var selected: ?usize = null;
+        var empty: ?usize = null;
+        var oldest: i64 = std.math.maxInt(i64);
+        var victim: usize = 0;
+        for (0..self.ways) |way| {
+            const h = bucket[way * header_size ..][0..header_size];
+            if (!self.validHeader(h)) {
+                if (empty == null) empty = way;
+                continue;
+            }
+            if (std.mem.eql(u8, h[0..32], &key)) {
+                selected = way;
+                break;
+            }
+            const written = std.mem.readInt(i64, h[68..76], .little);
+            if (written < oldest) {
+                oldest = written;
+                victim = way;
+            }
+        }
+        const way = selected orelse empty orelse victim;
+        const h = bucket[way * header_size ..][0..header_size];
+        @memset(h, 0);
+        h[0..32].* = key;
+        std.mem.writeInt(u32, h[64..68], @intCast(body.len), .little);
+        std.mem.writeInt(i64, h[68..76], @intCast(std.Io.Clock.real.now(io).nanoseconds), .little);
+        h[76..80].* = "AGB1".*;
+        h[32..64].* = digest(h, body);
+        @memcpy(bucket[@intCast(self.bodyOffset(way))..][0..body.len], body);
     }
     pub fn load(self: Cache, a: A, io: std.Io, key: [32]u8) ?[]const u8 {
         std.debug.assert(self.ways <= max_ways and self.limit >= header_size);

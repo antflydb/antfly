@@ -1,0 +1,242 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Shared bounded score-batch shards. Positive bucket offsets are immutable;
+//! warm hits use one positional page read and no open/stat/close operations.
+//! A packed directory allocates only occupied bucket pages, including on APFS.
+const std = @import("std");
+const A = std.mem.Allocator;
+const Options = @import("options.zig").Options;
+const Codec = @import("artifact_cache.zig").Cache;
+const shards = 16;
+const prefix = 4096;
+const magic = "AGSHD001";
+const Class = struct {
+    id: usize,
+    name: []const u8,
+    buckets: usize,
+    ways: usize,
+    slot: usize,
+    fn select(count: usize) Class {
+        const size = 84 + count * 16;
+        return if (size <= 256) .{ .id = 0, .name = "small", .buckets = 4096, .ways = 16, .slot = 256 } else if (size <= 1024) .{ .id = 1, .name = "medium", .buckets = 2048, .ways = 8, .slot = 1024 } else .{ .id = 2, .name = "large", .buckets = 512, .ways = 8, .slot = 4096 };
+    }
+    fn bytes(self: Class) usize {
+        return self.ways * self.slot;
+    }
+    fn codec(self: Class) Codec {
+        return .{ .directory = "", .namespace = "", .buckets = @intCast(self.buckets), .ways = self.ways, .limit = self.slot };
+    }
+};
+const Shard = struct {
+    mutex: std.Io.Mutex = .init,
+    file: ?std.Io.File = null,
+    writable: bool = false,
+    valid: bool = false,
+    mapping: [256]u32 = @splat(0),
+    fn open(self: *Shard, a: A, io: std.Io, o: *const Options, class: Class, number: usize, write: bool) ?std.Io.File {
+        if (self.file != null and (!write or self.writable)) return self.file;
+        const path = std.fmt.allocPrint(a, "{s}/batch-v10-{s}-{x:0>2}.bin", .{ o.cache_dir.?, class.name, number }) catch return null;
+        defer a.free(path);
+        const f = if (write) blk: {
+            std.Io.Dir.cwd().createDirPath(io, o.cache_dir.?) catch return null;
+            break :blk std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600) }) catch return null;
+        } else std.Io.Dir.cwd().openFile(io, path, .{ .mode = if (o.cached_only) .read_only else .read_write }) catch std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+        if (self.file) |old| old.close(io);
+        self.file = f;
+        // A read-only fallback is never used for writes; upgrading happens
+        // under the shard mutex, after all local readers have finished.
+        self.writable = write;
+        var directory: [prefix]u8 = @splat(0);
+        self.valid = (f.readPositionalAll(io, &directory, 0) catch 0) == prefix and validDirectory(&directory, class);
+        @memset(&self.mapping, 0);
+        if (self.valid) for (0..class.buckets / shards) |i| {
+            const value = std.mem.readInt(u32, directory[64 + i * 4 ..][0..4], .little);
+            if (value <= class.buckets / shards) self.mapping[i] = value;
+        };
+        return f;
+    }
+};
+fn validDirectory(bytes: *const [prefix]u8, class: Class) bool {
+    return std.mem.eql(u8, bytes[0..8], magic) and std.mem.readInt(u32, bytes[8..12], .little) == class.bytes() and std.mem.readInt(u32, bytes[12..16], .little) == class.buckets / shards;
+}
+pub const Store = struct {
+    handles: [3][shards]Shard = @splat(@splat(.{})),
+    pub const max_handles = 3 * shards;
+    pub const max_bytes = 48 * 1024 * 1024 + max_handles * prefix;
+    pub fn deinit(self: *Store, io: std.Io) void {
+        for (&self.handles) |*group| for (group) |*shard| if (shard.file) |file| file.close(io);
+    }
+    pub fn load(self: *Store, a: A, io: std.Io, o: *const Options, count: usize, key: [32]u8) ?[]const u8 {
+        const class = Class.select(count);
+        const bucket = std.mem.readInt(u16, key[0..2], .little) % class.buckets;
+        const local = bucket / shards;
+        const shard = &self.handles[class.id][bucket % shards];
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        const file = shard.open(a, io, o, class, bucket % shards, false) orelse return null;
+        if (!shard.valid) {
+            var directory: [prefix]u8 = undefined;
+            shard.valid = (file.readPositionalAll(io, &directory, 0) catch 0) == prefix and validDirectory(&directory, class);
+            if (!shard.valid) return null;
+            for (0..class.buckets / shards) |i| {
+                const value = std.mem.readInt(u32, directory[64 + i * 4 ..][0..4], .little);
+                shard.mapping[i] = if (value <= class.buckets / shards) value else 0;
+            }
+        }
+        if (shard.mapping[local] == 0) {
+            var entry: [4]u8 = undefined;
+            if ((file.readPositionalAll(io, &entry, 64 + local * 4) catch 0) != 4) return null;
+            const value = std.mem.readInt(u32, &entry, .little);
+            if (value == 0 or value > class.buckets / shards) return null;
+            shard.mapping[local] = value;
+        }
+        var page: [32768]u8 = undefined;
+        const offset = prefix + @as(u64, shard.mapping[local] - 1) * class.bytes();
+        const n = file.readPositionalAll(io, page[0..class.bytes()], offset) catch return null;
+        return class.codec().fixedGet(a, key, page[0..n]);
+    }
+    pub fn store(self: *Store, a: A, io: std.Io, o: *const Options, count: usize, key: [32]u8, body: []const u8) void {
+        const class = Class.select(count);
+        if (body.len > class.slot - 80) return;
+        const bucket = std.mem.readInt(u16, key[0..2], .little) % class.buckets;
+        const local = bucket / shards;
+        const shard = &self.handles[class.id][bucket % shards];
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        const file = shard.open(a, io, o, class, bucket % shards, true) orelse return;
+        // Best-effort cache writes never wait behind another process.
+        if (!(file.tryLock(io, .exclusive) catch false)) return;
+        defer file.unlock(io);
+        var directory: [prefix]u8 = @splat(0);
+        if ((file.readPositionalAll(io, &directory, 0) catch 0) != prefix or !validDirectory(&directory, class)) {
+            @memset(&directory, 0);
+            directory[0..8].* = magic.*;
+            std.mem.writeInt(u32, directory[8..12], @intCast(class.bytes()), .little);
+            std.mem.writeInt(u32, directory[12..16], @intCast(class.buckets / shards), .little);
+            file.setLength(io, 0) catch return;
+            file.writePositionalAll(io, &directory, 0) catch return;
+            @memset(&shard.mapping, 0);
+        }
+        shard.valid = true;
+        var index = std.mem.readInt(u32, directory[64 + local * 4 ..][0..4], .little);
+        const existing = index > 0 and index <= class.buckets / shards;
+        if (!existing) {
+            // Reuse orphaned pages left by a crash before directory publication.
+            var used: [256]bool = @splat(false);
+            for (0..class.buckets / shards) |i| {
+                const value = std.mem.readInt(u32, directory[64 + i * 4 ..][0..4], .little);
+                if (value > 0 and value <= class.buckets / shards) used[value - 1] = true;
+            }
+            const free = std.mem.indexOfScalar(bool, used[0 .. class.buckets / shards], false) orelse return;
+            index = @intCast(free + 1);
+        }
+        var page: [32768]u8 = @splat(0);
+        const offset = prefix + @as(u64, index - 1) * class.bytes();
+        if (existing) _ = file.readPositionalAll(io, page[0..class.bytes()], offset) catch 0;
+        class.codec().fixedPut(io, key, body, page[0..class.bytes()]);
+        file.writePositionalAll(io, page[0..class.bytes()], offset) catch return;
+        if (!existing) {
+            var entry: [4]u8 = undefined;
+            std.mem.writeInt(u32, &entry, index, .little);
+            file.writePositionalAll(io, &entry, 64 + local * 4) catch return;
+        }
+        shard.mapping[local] = index;
+    }
+};
+
+test "packed shards reuse handles and recover cold missing directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var options: Options = .{};
+    options.cache_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var reader: Store = .{};
+    defer reader.deinit(io);
+    var writer: Store = .{};
+    defer writer.deinit(io);
+    for ([_]usize{ 1, 16, 128 }) |count| {
+        const class = Class.select(count);
+        const path = try std.fmt.allocPrint(a, "{s}/batch-v10-{s}-00.bin", .{ options.cache_dir.?, class.name });
+        const empty = try std.Io.Dir.cwd().createFile(io, path, .{});
+        empty.close(io);
+        var key: [32]u8 = @splat(0);
+        try std.testing.expect(reader.load(a, io, &options, count, key) == null);
+        writer.store(a, io, &options, count, key, "first");
+        try std.testing.expectEqualStrings("first", reader.load(a, io, &options, count, key).?);
+        const first_handle = reader.handles[class.id][0].file.?.handle;
+        key[0] = shards;
+        writer.store(a, io, &options, count, key, "second");
+        try std.testing.expectEqualStrings("second", reader.load(a, io, &options, count, key).?);
+        try std.testing.expectEqual(first_handle, reader.handles[class.id][0].file.?.handle);
+        try std.testing.expectEqual(@as(u64, prefix + 2 * class.bytes()), (try std.Io.Dir.cwd().statFile(io, path, .{})).size);
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.writePositionalAll(io, "bad", prefix + class.bytes() + class.ways * 80);
+        try std.testing.expect(reader.load(a, io, &options, count, key) == null);
+        writer.store(a, io, &options, count, key, "repaired");
+        try std.testing.expectEqualStrings("repaired", reader.load(a, io, &options, count, key).?);
+        // A page written before its mapping is published is reusable.
+        try file.writePositionalAll(io, &@as([4]u8, @splat(0)), 64 + 4);
+        writer.store(a, io, &options, count, key, "orphan reused");
+        try std.testing.expectEqual(@as(u64, prefix + 2 * class.bytes()), (try file.stat(io)).size);
+        try std.testing.expectEqualStrings("orphan reused", reader.load(a, io, &options, count, key).?);
+    }
+}
+
+test "independent shard writers cannot return a torn identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        directory: []const u8,
+        id: u8,
+        failed: *std.atomic.Value(bool),
+        fn run(w: @This()) void {
+            const io = std.testing.io;
+            var store: Store = .{};
+            defer store.deinit(io);
+            var o: Options = .{};
+            o.cache_dir = w.directory;
+            const alloc = std.heap.page_allocator;
+            var key: [32]u8 = @splat(0);
+            key[31] = w.id;
+            const body: [128]u8 = @splat(w.id);
+            for (0..80) |_| {
+                store.store(alloc, io, &o, 1, key, &body);
+                if (store.load(alloc, io, &o, 1, key)) |actual| {
+                    defer alloc.free(actual);
+                    if (!std.mem.eql(u8, actual, &body)) w.failed.store(true, .monotonic);
+                }
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .directory = directory, .id = @intCast(i + 1), .failed = &failed }});
+        started += 1;
+    }
+    for (threads[0..started]) |thread| thread.join();
+    started = 0;
+    try std.testing.expect(!failed.load(.monotonic));
+}
