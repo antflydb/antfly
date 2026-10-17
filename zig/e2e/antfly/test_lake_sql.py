@@ -4465,6 +4465,27 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
         residual = statement.replace("ON p.k=b.k", "ON p.k+CAST('0' AS NUMERIC)=b.k")
         assert call("POST", "/sql", {"statement": residual})["rows"] == expected
         assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        # Filtered three-way joins retain qualified output order after costing
+        # and inner-join enumeration; every scan shares the statement snapshot.
+        assert call(
+            "POST",
+            "/sql",
+            {
+                "statement": (
+                    "SELECT p.v,q.v,r.v FROM numeric_probe p "
+                    "JOIN numeric_probe q ON p.k=q.k "
+                    "JOIN (SELECT k,v FROM numeric_probe WHERE v=0) r "
+                    "ON q.k=r.k ORDER BY p.v"
+                )
+            },
+        )["rows"] == [["0", "0", "0"]]
+        assert call(
+            "POST",
+            "/sql",
+            {
+                "statement": f"SELECT k=CAST('{targets[0]}' AS NUMERIC) FROM numeric_probe WHERE v<2 ORDER BY v"
+            },
+        )["rows"] == [[True], [False]]
         server.pause()
         # Keep identity/footer intact but remove usable data pages, then drop
         # range caches. The repeated cold query must consume covering values.

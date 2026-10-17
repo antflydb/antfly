@@ -335,6 +335,18 @@ pub const Column = struct {
         };
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
+        if (self.values == .exact) if (try batch.decimalColumnSelected(scratch.allocator(), 0, null)) |decimal| {
+            const view = decimal.physical;
+            const coefficients = view.vector.values.decimal128;
+            for (ids, 0..) |id, lane| {
+                const row = view.rowAt(lane);
+                if (view.vector.nulls.isNull(row)) continue;
+                try @import("../common/decimal128.zig").validateCoefficient(coefficients.values[row], coefficients.precision, coefficients.scale);
+                const number = try @import("numeric_value.zig").ScaledInteger.init(coefficients.values[row], @intCast(coefficients.scale));
+                try self.values.exact.items[id].add(number.view());
+            }
+            return;
+        };
         if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysical(a, ids, physical)) return;
         switch (batch) {
             .vectors => |vectors| return self.updateBatch(a, ids, vectors.values[0]),
@@ -358,6 +370,16 @@ pub const Column = struct {
         if (source.len() != positions.len) return error.InvalidSqlBackendResponse;
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
+        if (self.values == .exact) if (try source.decimalColumnSelected(scratch.allocator(), 0, null)) |decimal| {
+            for (positions, 0..) |position, lane| {
+                if (position >= ids.len) return error.InvalidSqlBackendResponse;
+                var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
+                var number: @import("numeric_value.zig").Value = undefined;
+                const value = try decimal.cell(lane, &fixed, &number);
+                if (!value.sql_null) try self.values.exact.items[ids[position]].add(number);
+            }
+            return;
+        };
         const physical = try source.physicalColumn(scratch.allocator(), 0);
         var begin: usize = 0;
         var selected_ids: [256]usize = undefined;
@@ -877,4 +899,29 @@ test "SQL physical floating extrema retain NaN ordering and signed zero ties" {
         const value = (try column.finish(0)).value.float;
         if (kind == .max) try std.testing.expect(std.math.isNan(value)) else try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), @as(u64, @bitCast(value)));
     }
+}
+
+test "SQL decimal coefficient aggregates widen without per-lane allocations and retain null selections" {
+    const a = std.testing.allocator;
+    var tracked = std.testing.FailingAllocator.init(a, .{});
+    const alloc = tracked.allocator();
+    var selection: [1024]usize = undefined;
+    for (&selection, 0..) |*row_index, index| row_index.* = if (index % 7 == 0) 2 else index % 2;
+    const source: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "null" } }, .columns = &.{.{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 99999999999999999999999999999999999999, 99999999999999999999999999999999999999, std.math.minInt(i128) }, .precision = 38, .scale = 4 } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } }} }, .selection = &selection };
+    const batch: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = source, .definitions = &.{.{ .name = "n", .type = .number, .element_type = .numeric }} } };
+    var state = Column.init(.{ .kind = .sum, .input_type = .number, .input_element = .numeric });
+    defer state.clear(alloc);
+    try state.append(alloc);
+    var warm = batch;
+    warm.columns.page.selection = &.{0};
+    try state.updateEncoded(alloc, &.{0}, warm);
+    const before = tracked.alloc_index;
+    const ids: [1024]usize = @splat(0);
+    try state.updateEncoded(alloc, &ids, batch);
+    try std.testing.expectEqual(before, tracked.alloc_index);
+    const result = try state.finish(0);
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+    const text = try @import("numeric_value.zig").format(&context, result.numeric.?.*);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("8779999999999999999999999999999999999.9122", text);
 }

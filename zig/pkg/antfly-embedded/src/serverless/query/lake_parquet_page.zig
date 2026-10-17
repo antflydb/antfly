@@ -1131,6 +1131,88 @@ pub fn decodeHybridLevelsAlloc(
     return levels;
 }
 
+/// Validated dictionary IDs retain hybrid runs when that is smaller than a
+/// flat vector. Packed payloads borrow their enclosing immutable page.
+pub const HybridIndex = struct {
+    pub const Run = struct {
+        first: usize,
+        count: usize,
+        repeated: ?u32,
+        packed_bytes: []const u8,
+    };
+    runs: []Run = &.{},
+    flat: []u32 = &.{},
+    width: u6,
+    count: usize,
+    pub fn deinit(self: HybridIndex, a: Allocator) void {
+        a.free(self.runs);
+        a.free(self.flat);
+    }
+    pub fn runAt(self: HybridIndex, row: usize) ?Run {
+        std.debug.assert(row < self.count);
+        if (self.runs.len == 0) return null;
+        var lo: usize = 0;
+        var hi = self.runs.len;
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.runs[mid].first <= row) lo = mid else hi = mid;
+        }
+        return self.runs[lo];
+    }
+    pub fn at(self: HybridIndex, row: usize) u32 {
+        std.debug.assert(row < self.count);
+        const run = self.runAt(row) orelse return self.flat[row];
+        return run.repeated orelse (readPackedValueU32(run.packed_bytes, row - run.first, self.width) catch unreachable);
+    }
+    fn next(reader: *LevelReader, first: usize, remaining: usize, width: u6) !Run {
+        const header = try reader.readVarintU64();
+        if (header == 0) return error.InvalidParquetPage;
+        const length = std.math.cast(usize, header >> 1) orelse return error.InvalidParquetPage;
+        if (length == 0) return error.InvalidParquetPage;
+        if ((header & 1) == 0) {
+            if (length > remaining) return error.InvalidParquetPage;
+            return .{ .first = first, .count = length, .repeated = try reader.readFixedWidthValueU32(width), .packed_bytes = &.{} };
+        }
+        const values = std.math.mul(usize, length, 8) catch return error.InvalidParquetPage;
+        const bytes = try packedByteCount(values, width);
+        if (bytes > reader.bytes.len - reader.cursor) return error.InvalidParquetPage;
+        const packed_bytes = reader.bytes[reader.cursor..][0..bytes];
+        reader.cursor += bytes;
+        return .{ .first = first, .count = @min(values, remaining), .repeated = null, .packed_bytes = packed_bytes };
+    }
+    pub fn init(a: Allocator, encoded: []const u8, width: u6, count: usize, dictionary_size: usize) !HybridIndex {
+        if (count > max_values_per_page) return error.ParquetPageTooLarge;
+        if (width > 32) return error.UnsupportedParquetPage;
+        var reader: LevelReader = .{ .bytes = encoded };
+        var first: usize = 0;
+        var run_count: usize = 0;
+        while (first < count) {
+            const run = try next(&reader, first, count - first, width);
+            if (run.repeated) |id| {
+                if (id >= dictionary_size) return error.InvalidParquetPage;
+            } else {
+                for (0..run.count) |lane| {
+                    if (try readPackedValueU32(run.packed_bytes, lane, width) >= dictionary_size) return error.InvalidParquetPage;
+                }
+            }
+            first += run.count;
+            run_count += 1;
+        }
+        if (reader.cursor != encoded.len) return error.InvalidParquetPage;
+        // Fragmented tiny runs must not inflate metadata past the old vector.
+        if (run_count *| @sizeOf(Run) > count *| @sizeOf(u32)) return .{ .width = width, .count = count, .flat = try decodeHybridIndexesAlloc(a, encoded, width, count) };
+        const runs = try a.alloc(Run, run_count);
+        errdefer a.free(runs);
+        reader.cursor = 0;
+        first = 0;
+        for (runs) |*run| {
+            run.* = try next(&reader, first, count - first, width);
+            first += run.count;
+        }
+        return .{ .width = width, .count = count, .runs = runs };
+    }
+};
+
 pub fn decodeHybridIndexesAlloc(
     alloc: Allocator,
     encoded: []const u8,
@@ -3104,17 +3186,17 @@ fn readPackedValue(packed_bytes: []const u8, value_idx: usize, bit_width: u4) !u
 
 fn readPackedValueU32(packed_bytes: []const u8, value_idx: usize, bit_width: u6) !u32 {
     if (bit_width == 0) return 0;
-    var value: u32 = 0;
-    const start_bit = value_idx * @as(usize, bit_width);
-    for (0..@as(usize, bit_width)) |bit_offset| {
-        const absolute_bit = start_bit + bit_offset;
-        const byte_idx = absolute_bit / 8;
-        if (byte_idx >= packed_bytes.len) return error.InvalidParquetPage;
-        const bit_idx: u3 = @intCast(absolute_bit % 8);
-        const bit = (packed_bytes[byte_idx] >> bit_idx) & 1;
-        value |= @as(u32, bit) << @intCast(bit_offset);
-    }
-    return value;
+    if (bit_width > 32) return error.UnsupportedParquetPage;
+    const start_bit = std.math.mul(usize, value_idx, bit_width) catch return error.InvalidParquetPage;
+    const byte_idx = start_bit / 8;
+    const shift: u6 = @intCast(start_bit % 8);
+    const bytes = (@as(usize, shift) + bit_width + 7) / 8;
+    if (byte_idx > packed_bytes.len or bytes > packed_bytes.len - byte_idx) return error.InvalidParquetPage;
+    // At most five bytes cover an unaligned 32-bit dictionary ID. Avoid a
+    // per-bit loop when predicates revisit packed IDs without expanding them.
+    var word: u64 = 0;
+    for (packed_bytes[byte_idx..][0..bytes], 0..) |byte, index| word |= @as(u64, byte) << @intCast(index * 8);
+    return @intCast((word >> shift) & ((@as(u64, 1) << bit_width) - 1));
 }
 
 fn readBitPackedBool(packed_bytes: []const u8, value_idx: usize) bool {
@@ -4322,4 +4404,41 @@ test "external lake malformed Parquet compact page headers return errors" {
     var delta: Reader = .{ .bytes = &.{0xf5} };
     var previous: i16 = std.math.maxInt(i16);
     try std.testing.expectError(error.InvalidParquetPage, delta.readFieldHeader(&previous));
+}
+
+test "lake SQL hybrid dictionary runs retain packed IDs and validate padding bounds and truncation" {
+    const a = std.testing.allocator;
+    // Two 128-value RLE runs, then eight bit-packed IDs (five are logical).
+    const encoded = [_]u8{ 0x80, 0x02, 1, 0x80, 0x02, 0, 3, 0b10101010 };
+    const index = try HybridIndex.init(a, &encoded, 1, 261, 2);
+    defer index.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), index.flat.len);
+    try std.testing.expectEqual(@as(usize, 3), index.runs.len);
+    const flat = try decodeHybridIndexesAlloc(a, &encoded, 1, 261);
+    defer a.free(flat);
+    for (flat, 0..) |id, row| try std.testing.expectEqual(id, index.at(row));
+    for (0..encoded.len) |n| try std.testing.expectError(error.InvalidParquetPage, HybridIndex.init(a, encoded[0..n], 1, 261, 2));
+    try std.testing.expectError(error.InvalidParquetPage, HybridIndex.init(a, &encoded, 1, 261, 1));
+    try std.testing.expectError(error.InvalidParquetPage, HybridIndex.init(a, &.{ 2, 0, 2, 0 }, 1, 1, 2));
+    const fragmented = try HybridIndex.init(a, &.{ 2, 0, 2, 1 }, 1, 2, 2);
+    defer fragmented.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), fragmented.flat.len);
+}
+
+test "lake SQL packed dictionary byte kernels agree with bitwise decoding at every width" {
+    var encoded: [129]u8 = undefined;
+    for (&encoded, 0..) |*byte, index| byte.* = @truncate(index *% 73 +% 151);
+    for (0..33) |width_| {
+        const width: u6 = @intCast(width_);
+        for (0..32) |row| {
+            var expected: u32 = 0;
+            for (0..width_) |bit| {
+                const position = row * width_ + bit;
+                expected |= @as(u32, (encoded[position / 8] >> @as(u3, @intCast(position % 8))) & 1) << @intCast(bit);
+            }
+            try std.testing.expectEqual(expected, try readPackedValueU32(&encoded, row, width));
+        }
+    }
+    try std.testing.expectError(error.InvalidParquetPage, readPackedValueU32(&.{0}, 0, 9));
+    try std.testing.expectError(error.InvalidParquetPage, readPackedValueU32(&encoded, std.math.maxInt(usize), 32));
 }

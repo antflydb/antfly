@@ -142,7 +142,43 @@ pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: ca
         return true;
     }
     const definition = try table.column(condition.column);
-    if (definition.element_type == .numeric) return false;
+    if (definition.element_type == .numeric) {
+        if (vector.values != .decimal128 or definition.numeric_modifier != null) return false;
+        if (condition.datum().sql_null) {
+            @memset(keep, false);
+            return true;
+        }
+        var nonnull = false;
+        for (keep, 0..) |active, row| if (active and !vector.nulls.isNull(row)) {
+            nonnull = true;
+            break;
+        };
+        if (!nonnull) {
+            @memset(keep, false);
+            return true;
+        }
+        const literal = try @import("lake_values.zig").comparisonDatum(a, condition.datum(), definition);
+        const number = literal.numeric orelse return false;
+        const decimal = vector.values.decimal128;
+        const numeric = @import("numeric_value.zig");
+        const coefficient = numeric.coefficientAtScale(number.*, @intCast(decimal.scale));
+        var context: numeric.Context = .{ .alloc = a };
+        for (keep, 0..) |*active, row| {
+            if (!active.*) continue;
+            if (vector.nulls.isNull(row)) {
+                active.* = false;
+                continue;
+            }
+            try @import("../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, decimal.scale);
+            const order = if (coefficient) |value| std.math.order(decimal.values[row], value) else fallback: {
+                const fixed = try numeric.ScaledInteger.init(decimal.values[row], @intCast(decimal.scale));
+                break :fallback try numeric.order(&context, fixed.view(), number.*);
+            };
+            active.* = accepts(condition.op, order);
+        }
+        return true;
+    }
+
     const supported = switch (vector.values) {
         .encoded => |values| switch (values.kind) {
             .i64 => definition.type == .integer or definition.type == .datetime,

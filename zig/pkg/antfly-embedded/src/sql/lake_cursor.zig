@@ -202,7 +202,28 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
-    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .split_ordered_batch = if (stream.iterator != null and stream.selection == null and source.scanner.shared_reader != null) Owner.splitOrderedBatch else null, .close = Owner.close };
+    // Use only already-owned evidence: planning never fetches footers or
+    // enumerates a publication's lazy inventory to obtain a better estimate.
+    var filtered_rows: ?u64 = if (primary_key != null) 1 else null;
+    if (owner.stream.selection) |selection| {
+        var candidates: u64 = selection.coordinates.len;
+        for (selection.blocks) |block| candidates +|= block.rows.cardinality();
+        filtered_rows = if (filtered_rows) |rows_| @min(rows_, candidates) else candidates;
+    } else if (pruning.items.len != 0 and source.inventory.files.len != 0) {
+        var known = true;
+        var candidates: u64 = 0;
+        for (source.inventory.files) |file| {
+            if (file.row_groups.len == 0) {
+                known = false;
+                break;
+            }
+            for (file.row_groups) |group| if (@import("../serverless/query/lake_stream.zig").groupMayMatch(group, pruning.items)) {
+                candidates +|= group.row_count;
+            };
+        }
+        if (known) filtered_rows = if (filtered_rows) |rows_| @min(rows_, candidates) else candidates;
+    }
+    return .{ .estimated_filtered_rows = filtered_rows, .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .split_ordered_batch = if (stream.iterator != null and stream.selection == null and source.scanner.shared_reader != null) Owner.splitOrderedBatch else null, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {

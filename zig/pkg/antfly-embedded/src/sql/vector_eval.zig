@@ -129,6 +129,106 @@ fn dictionarySelectionSingle(a: std.mem.Allocator, ordinal: u32, page: @import("
     return .{ .indices = indices, .representatives = representatives };
 }
 
+fn constantOperand(program: *const scalar.Program, index: u32, depth: usize) bool {
+    if (depth == 32 or index >= program.instructions.len) return false;
+    return switch (program.instructions[index].operation) {
+        .literal, .parameter => true,
+        .cast => |cast| constantOperand(program, cast.operand, depth + 1),
+        .unary => |part| constantOperand(program, part.operand, depth + 1),
+        else => false,
+    };
+}
+fn decimalOperand(program: *const scalar.Program, index_: u32) ?u32 {
+    var index = index_;
+    for (0..32) |_| switch (program.instructions[index].operation) {
+        .column => |ordinal| return ordinal,
+        .cast => |cast| {
+            if (cast.type != .number or cast.element_type != .numeric or cast.numeric_modifier != null) return null;
+            index = cast.operand;
+        },
+        else => return null,
+    };
+    return null;
+}
+fn decimalComparison(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) !?@import("execution_batch.zig").Batch {
+    if (page.selection.len == 0) return null;
+    const comparison_binary = switch (program.instructions[program.root].operation) {
+        .binary => |part| part,
+        else => return null,
+    };
+    var op: @import("catalog.zig").Condition.Op = switch (comparison_binary.op) {
+        .eq => .eq,
+        .neq => .neq,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+        else => return null,
+    };
+    var ordinal = decimalOperand(program, comparison_binary.left);
+    var constant = comparison_binary.right;
+    if (ordinal == null or !constantOperand(program, constant, 0)) {
+        ordinal = decimalOperand(program, comparison_binary.right);
+        constant = comparison_binary.left;
+        if (ordinal == null or !constantOperand(program, constant, 0)) return null;
+        op = switch (op) {
+            .lt => .gt,
+            .lte => .gte,
+            .gt => .lt,
+            .gte => .lte,
+            else => op,
+        };
+    }
+    if (ordinal.? >= columns.len) return error.InvalidSqlBackendResponse;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const Batch = @import("execution_batch.zig").Batch;
+    const source: Batch = .{ .columns = .{ .page = page, .definitions = columns } };
+    const decimal = (try source.decimalColumnSelected(sa, ordinal.?, null)) orelse return null;
+    const view = decimal.physical;
+    for (0..view.len()) |row| {
+        if (!view.vector.nulls.isNull(view.rowAt(row))) break;
+    } else return null;
+    var literal_program = program.*;
+    literal_program.root = constant;
+    const literal = try literal_program.evaluate(sa, &.{}, parameters, .{});
+    const numeric = @import("numeric_value.zig");
+    var integer: numeric.ScaledInteger = undefined;
+    const number: ?numeric.Value = if (literal.sql_null) null else if (literal.numeric) |value| value.* else if (literal.value == .integer) number: {
+        integer = try numeric.ScaledInteger.init(literal.value.integer, 0);
+        break :number integer.view();
+    } else return null;
+    const coefficients = view.vector.values.decimal128;
+    const constant_coefficient = if (number) |value| numeric.coefficientAtScale(value, @intCast(coefficients.scale)) else null;
+    const values = try a.alloc(bool, view.len());
+    errdefer a.free(values);
+    const nulls = try a.alloc(u8, view.len());
+    errdefer a.free(nulls);
+    var context: numeric.Context = .{ .alloc = sa };
+    for (values, nulls, 0..) |*value, *flag, lane| {
+        const row = view.rowAt(lane);
+        flag.* = @intFromBool(number == null or view.vector.nulls.isNull(row));
+        value.* = false;
+        if (flag.* != 0) continue;
+        try @import("../common/decimal128.zig").validateCoefficient(coefficients.values[row], coefficients.precision, coefficients.scale);
+        const order = if (constant_coefficient) |fixed| std.math.order(coefficients.values[row], fixed) else general: {
+            const fixed = try numeric.ScaledInteger.init(coefficients.values[row], @intCast(coefficients.scale));
+            break :general try numeric.order(&context, fixed.view(), number.?);
+        };
+        value.* = switch (op) {
+            .eq => order == .eq,
+            .neq => order != .eq,
+            .lt => order == .lt,
+            .lte => order != .gt,
+            .gt => order == .gt,
+            .gte => order != .lt,
+            else => unreachable,
+        };
+    }
+    return try Batch.fromBoolean(a, values, nulls);
+}
+
 /// Retain expression dictionaries across projection instead of expanding them
 /// into per-row Datum vectors. Ordinary expressions still share fused gathers.
 pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, io: ?std.Io) ![]const ?@import("execution_batch.zig").Batch {
@@ -160,6 +260,13 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
         outputs[index] = physical;
         visited[index] = true;
         published = true;
+    }
+    for (programs, 0..) |program, index| {
+        if (visited[index]) continue;
+        if (try decimalComparison(a, program, page, columns, parameters)) |native_comparison| {
+            outputs[index] = native_comparison;
+            visited[index] = true;
+        }
     }
     var group: std.ArrayList(*const scalar.Program) = .empty;
     defer group.deinit(a);
@@ -1258,4 +1365,30 @@ test "lake SQL fixed decimal string columns fill comparison kernels with null an
     try std.testing.expect(result[0].value.bool);
     try std.testing.expect(result[1].sql_null);
     try std.testing.expect(result[2].value.bool);
+}
+
+fn decimalComparisonScenario(a: std.mem.Allocator) !void {
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .number, .element_type = .numeric }};
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" } }, .columns = &.{.{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 12300, 12301, std.math.minInt(i128) }, .precision = 38, .scale = 4 } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } }} }, .selection = &.{ 1, 0, 2, 1, 0 } };
+    for ([_][]const u8{ "n=1.2300", "n<1.23005", "1.2300<n", "n<>CAST('NaN' AS NUMERIC)", "n<10000000000000000000000000000000000000000000000" }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+        defer program.deinit();
+        const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
+        defer freeEncodedMany(a, outputs);
+        const output = outputs[0] orelse return error.TestExpectedNativeDecimalComparison;
+        try std.testing.expect(output == .reader);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        for (0..page.selection.len) |row| {
+            const cell = try page.typedCell(scratch.allocator(), row, "n", true);
+            const expected = try program.evaluate(scratch.allocator(), &.{cell}, &.{}, .{});
+            try std.testing.expectEqualDeep(expected, try output.cell(scratch.allocator(), row, 0));
+        }
+    }
+}
+test "lake SQL coefficient comparison vectors preserve selected NULL lanes exact fractions and specials with allocation safety" {
+    try decimalComparisonScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, decimalComparisonScenario, .{});
 }

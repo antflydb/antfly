@@ -473,6 +473,8 @@ pub const Cursor = struct {
     /// True only when this cursor preserves every requested Scan.order key.
     order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
+    /// Optional estimate after the captured Scan.conditions, never an execution cap.
+    estimated_filtered_rows: ?u64 = null,
     estimated_rows: ?u64 = null,
     estimated_bytes: ?u64 = null,
     ptr: *anyopaque,
@@ -484,6 +486,8 @@ pub const Cursor = struct {
     set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
     /// Negotiate complete key spooling before building the filter. Absent
     /// means Bloom/domain evidence suffices; do not spill unused exact tuples.
+    /// Planning may also inspect this capability for identity join keys.
+    /// Read captured metadata only; do not start scans or fetch source objects.
     wants_exact_filter: ?*const fn (*anyopaque, []const @import("dynamic_filter.zig").Column) anyerror!bool = null,
     /// Split an unopened pinned scan into disjoint work for exact associative
     /// reducers. Providers may distribute row groups dynamically; child order

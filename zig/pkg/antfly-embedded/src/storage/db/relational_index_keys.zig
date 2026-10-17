@@ -511,9 +511,8 @@ pub const BatchKeys = struct {
                     if (column.column_type == .numeric) {
                         try @import("../../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, decimal.scale);
                         var context: NumericContext = .{ .alloc = self.scratch.allocator() };
-                        var number = try @import("../../sql/numeric_value.zig").fromScaledInteger(&context, decimal.values[row], @intCast(decimal.scale));
-                        defer number.deinit();
-                        break :blk .{ .numeric = try @import("../../sql/numeric_binary.zig").encodeAlloc(&context, number.value) };
+                        const number = try @import("../../sql/numeric_value.zig").ScaledInteger.init(decimal.values[row], @intCast(decimal.scale));
+                        break :blk .{ .numeric = try @import("../../sql/numeric_binary.zig").encodeAlloc(&context, number.view()) };
                     }
                     if (column.column_type == .string or column.column_type == .blob) {
                         const text = try decimal.text(self.scratch.allocator(), row);

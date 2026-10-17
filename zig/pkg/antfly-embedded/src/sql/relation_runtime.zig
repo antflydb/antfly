@@ -713,6 +713,8 @@ fn Engine(comptime Context: type) type {
         visited: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
+        planning_budget: @import("memory_budget.zig") = undefined,
+        planning_arena: ?std.heap.ArenaAllocator = null,
         static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
         static_hashes: std.AutoHashMapUnmanaged(*const binding.Node, *operators.HashJoin) = .empty,
         static_memberships: std.AutoHashMapUnmanaged(*const binding.Node, *operators.TupleMembership) = .empty,
@@ -740,6 +742,10 @@ fn Engine(comptime Context: type) type {
             var rows = self.static_rows.valueIterator();
             while (rows.next()) |replay| replay.*.deinit();
             self.cache_arena.deinit();
+            if (self.planning_arena) |*arena| {
+                arena.deinit();
+                std.debug.assert(self.planning_budget.live == 0);
+            }
         }
 
         fn clearOuter(self: *Self, id: usize) void {
@@ -831,7 +837,7 @@ fn Engine(comptime Context: type) type {
 
         fn estimate(self: *Self, node: *const binding.Node) ?u64 {
             return switch (node.operation) {
-                .scan => |scan| self.cursors[scan.index].estimated_rows,
+                .scan => |scan| self.cursors[scan.index].estimated_filtered_rows orelse self.cursors[scan.index].estimated_rows orelse if (self.cursors[scan.index].estimated_bytes) |bytes| bytes / @max(@as(u64, 16), @as(u64, @intCast(node.columns.len)) * 8) else null,
                 .singleton => 1,
                 .literal_rows => |rows| rows.len,
                 .values => |arms| total: {
@@ -841,7 +847,7 @@ fn Engine(comptime Context: type) type {
                 },
                 .prepared_rows => if (self.context.returning_cursor) |cursor| cursor.count() else self.context.returning_rows.len,
                 .query => |query| blk: {
-                    const source = self.estimate(query.source);
+                    const source = if (self.estimate(query.source)) |rows| (if (query.binding.scalars.predicate) |predicate| binding.JoinPlanning.filteredRows(rows, predicate) else rows) else null;
                     if (query.statement.limit) |limit| {
                         const count = query.statement.capRows(self.context.count(limit, std.math.maxInt(usize)) catch break :blk source);
                         break :blk if (source) |rows| @min(rows, count) else count;
@@ -849,10 +855,39 @@ fn Engine(comptime Context: type) type {
                     break :blk source;
                 },
                 .materialized_ref => |source| self.estimate(source),
+                .join => |join| join.estimated_rows,
                 else => null,
             };
         }
-        fn preferLeftBuild(self: *Self, left: *const binding.Node, right: *const binding.Node) bool {
+        fn exactProbe(self: *Self, node: *const binding.Node, keys_: []const scalar.Program) !bool {
+            if (node.operation != .scan or keys_.len == 0 or keys_.len > 64) return false;
+            const scan = node.operation.scan;
+            const cursor = self.cursors[scan.index];
+            const wants = cursor.wants_exact_filter orelse return false;
+            if (cursor.set_dynamic_filter == null) return false;
+            var columns: [64]@import("dynamic_filter.zig").Column = undefined;
+            for (keys_, columns[0..keys_.len]) |program, *column| {
+                if (program.instructions.len != 1 or program.root != 0 or program.instructions[0].operation != .column) return false;
+                const instruction = program.instructions[0];
+                const kind = instruction.type.kind orelse return false;
+                switch (kind) {
+                    .integer, .number, .string, .boolean => {},
+                    else => return false,
+                }
+                if (instruction.operation.column >= scan.source_columns.len) return false;
+                column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind, .element_type = instruction.type.element_type };
+            }
+            return wants(cursor.ptr, columns[0..keys_.len]);
+        }
+        fn preferLeftBuild(self: *Self, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) !bool {
+            const left = join.left;
+            const right = join.right;
+            // A native exact probe avoids opening source pages altogether.
+            // Preserve that access path before comparing scan/build sizes;
+            // scan-only estimates do not price index seeks or covering payloads.
+            const left_probe = join.kind != .left and join.kind != .full and try self.exactProbe(left, join.left_keys);
+            const right_probe = join.kind != .right and join.kind != .full and try self.exactProbe(right, join.right_keys);
+            if (left_probe != right_probe) return right_probe;
             if (self.estimate(left)) |l| {
                 if (self.estimate(right)) |r| return l < r;
                 // A compiler-owned singleton/constant frame is a bounded
@@ -957,7 +992,7 @@ fn Engine(comptime Context: type) type {
                     .join => |join| {
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
-                        self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else engine.preferLeftBuild(join.left, join.right);
+                        self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else try engine.preferLeftBuild(join);
                         self.left = try createContext(engine, if (self.flipped_join) join.right else join.left, recursive_id, apply_mode);
                         self.right = try createContext(engine, if (self.flipped_join) join.left else join.right, recursive_id, apply_mode);
                     },
@@ -1021,13 +1056,14 @@ fn Engine(comptime Context: type) type {
                     self.join_view = view;
                     const source = try a.create(@import("execution_batch.zig").Batch);
                     source.* = view.values();
-                    if (!self.flipped_join) return source.*;
+                    if (!self.flipped_join and self.node.operation.join.output_order == null) return source.*;
                     const ordinals = try a.alloc(usize, self.node.columns.len);
                     const types = try a.alloc(scalar.Type, self.node.columns.len);
                     const selection = try a.alloc(usize, view.count);
                     const width = self.node.operation.join.left.columns.len;
                     for (ordinals, types, self.node.columns, 0..) |*ordinal, *type_, column, index| {
-                        ordinal.* = if (index < width) self.node.operation.join.right.columns.len + index else index - width;
+                        const original = if (self.node.operation.join.output_order) |order| order[index] else index;
+                        ordinal.* = if (!self.flipped_join) original else if (original < width) self.node.operation.join.right.columns.len + original else original - width;
                         type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
                     }
                     for (selection, 0..) |*index, i| index.* = i;
@@ -1866,6 +1902,11 @@ fn Engine(comptime Context: type) type {
                 @memset(values, .{});
                 if (if (self.flipped_join) right else left) |cells| @memcpy(values[0..width], cells);
                 if (if (self.flipped_join) left else right) |cells| @memcpy(values[width..], cells);
+                if (self.node.operation.join.output_order) |order| {
+                    const logical = try alloc.alloc(Datum, values.len);
+                    for (logical, order) |*value, ordinal| value.* = values[ordinal];
+                    return logical;
+                }
                 return values;
             }
             fn nextPartitionJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
@@ -2049,6 +2090,7 @@ fn Engine(comptime Context: type) type {
                             .left_width = self.left.?.node.columns.len,
                             .right_width = self.right.?.node.columns.len,
                             .flipped = self.flipped_join,
+                            .output_order = join.output_order,
                         };
                         while (true) {
                             _ = scratch.reset(.retain_capacity);
@@ -2265,7 +2307,20 @@ fn Source(comptime Context: type) type {
                     self.engine.cursors = &self.single_list;
                 } else return error.SqlStatementSnapshotRequired;
             }
-            self.iterator = try Engine(Context).Iterator.create(&self.engine, relation.root);
+            const Estimate = struct {
+                fn rows(raw: *anyopaque, node: *const binding.Node) ?u64 {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    return engine.estimate(node);
+                }
+            };
+            self.engine.planning_budget = .{ .backing = context.alloc, .limit = @min(512 * 1024, context.limits.retained_bytes / 16) };
+            self.engine.planning_arena = .init(self.engine.planning_budget.allocator());
+            const root = binding.JoinPlanning.optimize(self.engine.planning_arena.?.allocator(), relation.root, .{ .ptr = &self.engine, .rows = Estimate.rows }) catch |err| fallback: {
+                if (err != error.OutOfMemory or !self.engine.planning_budget.isExhausted()) return err;
+                _ = self.engine.planning_arena.?.reset(.free_all);
+                break :fallback relation.root;
+            };
+            self.iterator = try Engine(Context).Iterator.create(&self.engine, root);
             self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table };
             return self;
         }
@@ -2480,4 +2535,95 @@ test "SQL derived projection errors preserve valid prefixes before invalid text 
     try std.testing.expectEqual(@as(usize, 1), page.selection.len);
     try std.testing.expectEqual(@as(i64, 1), (try page.native.?.values.cell(alloc, 0, 0)).value.integer);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, next(cursor.ptr, alloc, 2));
+}
+
+test "SQL costed inner join execution preserves aliases duplicate keys NULLs and selected output order" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        var indexed_installs: usize = 0;
+        const Captured = struct {
+            a: Allocator,
+            arena: std.heap.ArenaAllocator,
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.arena.deinit();
+                self.a.destroy(self);
+            }
+        };
+        const Scan = struct {
+            table: usize,
+            done: bool = false,
+            installed: bool = false,
+            fn wants(raw: *anyopaque, _: []const @import("dynamic_filter.zig").Column) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.table == 0;
+            }
+            fn install(raw: *anyopaque, filter: *const @import("dynamic_filter.zig").Filter) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.table != 0) return false;
+                try std.testing.expect(filter.sealed);
+                self.installed = true;
+                indexed_installs += 1;
+                return true;
+            }
+            fn close(_: *anyopaque) void {}
+            fn next(raw: *anyopaque, alloc: Allocator, _: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.done) return .{ .rows = &.{} };
+                if (self.table == 0 and !self.installed) return error.InvalidSqlBackendResponse;
+                self.done = true;
+                const count: usize = 3 - self.table;
+                const rows = try alloc.alloc(catalog.Row, count);
+                for (rows, 0..) |*row, index| {
+                    var object = std.json.ObjectMap.empty;
+                    try object.put(alloc, "k", if (index + 1 == count and self.table != 2) .null else .{ .integer = 1 });
+                    try object.put(alloc, "v", .{ .integer = @intCast((self.table + 1) * 10 + index) });
+                    row.* = .{ .id = "row", .version = 1, .value = .{ .object = object } };
+                }
+                return .{ .rows = rows };
+            }
+        };
+        fn checkpoint(_: *anyopaque) !void {}
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = name.table[0] - 'a' + 1, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "k", .path = "k", .type = .integer }, .{ .name = "v", .path = "v", .type = .integer } } };
+        }
+        fn capture(_: *anyopaque, alloc: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self = try alloc.create(Captured);
+            self.* = .{ .a = alloc, .arena = .init(alloc) };
+            errdefer Captured.close(self);
+            const ca = self.arena.allocator();
+            const cursors = try ca.alloc(catalog.Cursor, scans.len);
+            for (cursors, scans) |*cursor, scan| {
+                const source = try ca.create(Scan);
+                source.* = .{ .table = @intCast(scan.table.id - 1) };
+                cursor.* = .{ .ptr = source, .next = Scan.next, .close = Scan.close, .estimated_rows = if (source.table == 2) 1 else (source.table + 1) * 1_000_000, .set_dynamic_filter = Scan.install, .wants_exact_filter = Scan.wants };
+            }
+            return .{ .ptr = self, .cursors = cursors, .close = Captured.close };
+        }
+    };
+    Fixture.indexed_installs = 0;
+    var state: u8 = 0;
+    const backend: catalog.Backend = .{ .ptr = &state, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .open_statement = Fixture.capture, .checkpoint = Fixture.checkpoint } };
+    var compiled = try @import("compiler.zig").compile(a, "SELECT a.v,b.v,c.v FROM a JOIN b ON a.k=b.k JOIN c ON b.k=c.k ORDER BY a.v", .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    const text = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+    defer a.free(text);
+    try std.testing.expectEqualStrings("[[\"10\",\"20\",\"30\"],[\"11\",\"20\",\"30\"]]", text);
+    var aggregate = try @import("compiler.zig").compile(a, "SELECT SUM(a.v),SUM(b.v),SUM(c.v),COUNT(*) FROM a JOIN b ON a.k=b.k JOIN c ON b.k=c.k", .{});
+    defer aggregate.deinit();
+    var sums = try @import("runtime.zig").execute(a, backend, &aggregate, &.{}, .{});
+    defer sums.deinit();
+    const aggregate_text = try std.json.Stringify.valueAlloc(a, sums.output.rows, .{});
+    defer a.free(aggregate_text);
+    try std.testing.expectEqualStrings("[[\"21\",\"40\",\"60\",\"2\"]]", aggregate_text);
+    var pair = try @import("compiler.zig").compile(a, "SELECT a.v,b.v FROM a JOIN b ON a.k=b.k ORDER BY a.v", .{});
+    defer pair.deinit();
+    var paired = try @import("runtime.zig").execute(a, backend, &pair, &.{}, .{});
+    defer paired.deinit();
+    const pair_text = try std.json.Stringify.valueAlloc(a, paired.output.rows, .{});
+    defer a.free(pair_text);
+    try std.testing.expectEqualStrings("[[\"10\",\"20\"],[\"11\",\"20\"]]", pair_text);
+    try std.testing.expectEqual(@as(usize, 3), Fixture.indexed_installs);
 }

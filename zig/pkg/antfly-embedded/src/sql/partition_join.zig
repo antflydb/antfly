@@ -29,6 +29,7 @@ pub const Join = struct {
         left_width: usize,
         right_width: usize,
         flipped: bool = false,
+        output_order: ?[]const usize = null,
     };
 
     const Task = struct {
@@ -113,12 +114,21 @@ pub const Join = struct {
                     @memset(cells, .{});
                     if (pair.left) |values| @memcpy(cells[0..evaluation.left_width], values);
                     if (pair.right) |values| @memcpy(cells[evaluation.left_width..], values);
-                    const logical = if (!evaluation.flipped) cells else blk: {
+                    const combined = if (!evaluation.flipped) cells else blk: {
                         const reordered = try a.alloc(Datum, cells.len);
                         @memcpy(reordered[0..evaluation.right_width], cells[evaluation.left_width..]);
                         @memcpy(reordered[evaluation.right_width..], cells[0..evaluation.left_width]);
                         break :blk reordered;
                     };
+                    const logical = if (evaluation.output_order) |order| blk: {
+                        if (order.len != combined.len) return error.InvalidSqlBackendResponse;
+                        const reordered = try a.alloc(Datum, combined.len);
+                        for (reordered, order) |*value, ordinal| {
+                            if (ordinal >= combined.len) return error.InvalidSqlBackendResponse;
+                            value.* = combined[ordinal];
+                        }
+                        break :blk reordered;
+                    } else combined;
                     const accepted = try program.evaluate(a, logical, evaluation.parameters, .{});
                     if (accepted.sql_null) continue;
                     if (accepted.value != .bool) return error.SqlTypeMismatch;
@@ -1084,4 +1094,44 @@ fn skewEarlyClose(a: A) !void {
 test "SQL partitioned join block skew releases typed inputs and match state on early close and allocation faults" {
     try skewEarlyClose(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, skewEarlyClose, .{});
+}
+
+test "SQL parallel partition residuals use logical output permutations" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |flipped| {
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        defer manager.deinit();
+        var compiled = try @import("compiler.zig").compileScalar(a, if (flipped) "rk=lk AND rv-lv = -10000" else "rk=lk AND rv-lv = 10000", .{});
+        defer compiled.deinit();
+        var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "rk", .type = .integer }, .{ .name = "rv", .type = .integer }, .{ .name = "lk", .type = .integer }, .{ .name = "lv", .type = .integer } }, &.{}, .{});
+        defer condition.deinit();
+        const join = try Join.create(a, &manager, 512 * 1024, 10000, 200000, false, false);
+        defer join.close();
+        join.evaluation = .{ .condition = &condition, .left_width = 2, .right_width = 2, .flipped = flipped, .output_order = &.{ 2, 3, 0, 1 } };
+        for (0..512) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(true, &.{ key, Datum.json(.{ .integer = @intCast(i + 20000) }) }, &.{key}, i);
+        }
+        for (0..512) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(false, &.{ key, Datum.json(.{ .integer = @intCast(i + 10000) }) }, &.{key}, i);
+        }
+        var count: usize = 0;
+        while (try join.nextTypedBatch(137)) |view| {
+            defer view.deinit();
+            for (0..view.count) |row| {
+                const values = view.values();
+                const left = (try values.cell(a, row, 1)).value.integer;
+                const right = (try values.cell(a, row, 3)).value.integer;
+                try std.testing.expectEqual(@as(i64, 10000), right - left);
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 512), count);
+        try std.testing.expect(join.parallel_partitions_completed > 1);
+    }
 }

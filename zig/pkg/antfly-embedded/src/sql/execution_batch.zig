@@ -172,13 +172,53 @@ pub const PhysicalColumn = struct {
         }
     }
 };
+/// Fixed decimal views are opt-in: primitive consumers keep their established
+/// physical contract, while exact kernels borrow coefficients and selected rows.
+pub const DecimalColumn = struct {
+    physical: PhysicalColumn,
+    pub fn cell(self: @This(), index: usize, fixed: *@import("numeric_value.zig").ScaledInteger, value: *@import("numeric_value.zig").Value) !scalar.Datum {
+        const row = self.physical.rowAt(index);
+        if (self.physical.vector.nulls.isNull(row)) return .{};
+        const decimal = self.physical.vector.values.decimal128;
+        try @import("../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, decimal.scale);
+        fixed.* = try @import("numeric_value.zig").ScaledInteger.init(decimal.values[row], @intCast(decimal.scale));
+        value.* = fixed.view();
+        return scalar.Datum.typedNumeric(value);
+    }
+};
+/// One stable scratch slot per key column, reused across a census/hash window.
+/// Escaping keys are copied by the existing typed group/join stores.
+pub const NumericScratch = struct {
+    views: []?DecimalColumn,
+    fixed: []@import("numeric_value.zig").ScaledInteger,
+    numbers: []@import("numeric_value.zig").Value,
+    pub fn init(a: A, columns: []const Batch) !NumericScratch {
+        var present = false;
+        for (columns) |column| if (try column.decimalColumnSelected(a, 0, null) != null) {
+            present = true;
+            break;
+        };
+        if (!present) return .{ .views = &.{}, .fixed = &.{}, .numbers = &.{} };
+        const views = try a.alloc(?DecimalColumn, columns.len);
+        errdefer a.free(views);
+        const fixed = try a.alloc(@import("numeric_value.zig").ScaledInteger, columns.len);
+        errdefer a.free(fixed);
+        const numbers = try a.alloc(@import("numeric_value.zig").Value, columns.len);
+        errdefer a.free(numbers);
+        for (columns, views) |column, *view| view.* = try column.decimalColumnSelected(a, 0, null);
+        return .{ .views = views, .fixed = fixed, .numbers = numbers };
+    }
+    pub fn cell(self: *NumericScratch, a: A, columns: []const Batch, row: usize, column: usize) !scalar.Datum {
+        return if (self.views.len != 0 and self.views[column] != null) self.views[column].?.cell(row, &self.fixed[column], &self.numbers[column]) else columns[column].cell(a, row, 0);
+    }
+};
 pub const Batch = union(enum) {
     /// One expression over page-local dictionary entries, including a NULL lane.
     dictionary: struct { values: []const scalar.Datum, indices: []const u32 },
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_physical_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?PhysicalColumn = null, cohort: ?struct { source: *const Batch, positions: []const usize } = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
+    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_decimal_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?DecimalColumn = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_physical_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?PhysicalColumn = null, cohort: ?struct { source: *const Batch, positions: []const usize } = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
@@ -211,6 +251,10 @@ pub const Batch = union(enum) {
         const View = struct {
             source: *const Batch,
             column: usize,
+            fn decimalSelected(raw: *anyopaque, alloc: A, _: usize, selection: ?[]const usize) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.decimalColumnSelected(alloc, view.column, selection);
+            }
             fn physicalView(raw: *anyopaque, alloc: A, _: usize) !?PhysicalColumn {
                 return physicalSelected(raw, alloc, 0, null);
             }
@@ -233,7 +277,7 @@ pub const Batch = union(enum) {
         };
         const view = try a.create(View);
         view.* = .{ .source = self, .column = column };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .count = self.len(), .width = 1 } };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .count = self.len(), .width = 1 } };
     }
     /// Keep FILTER cohorts sparse. Aggregate consumers gather group IDs for
     /// accepted lanes directly; scalar fallback observes SQL NULL elsewhere.
@@ -267,6 +311,10 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.columns[column].cell(alloc, row_index, 0);
             }
+            fn decimalSelected(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].decimalColumnSelected(alloc, 0, selection);
+            }
             fn physical(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize) !?PhysicalColumn {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.columns[column].physicalColumnSelected(alloc, 0, selection);
@@ -282,7 +330,7 @@ pub const Batch = union(enum) {
         };
         const view = try a.create(View);
         view.* = .{ .columns = columns };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical_selected = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity, .width = columns.len, .count = count } };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity, .width = columns.len, .count = count } };
     }
     /// Normalize a stable reader once; borrowed views are reused by hashing,
     /// admission and reduction until the enclosing block/window is released.
@@ -293,6 +341,10 @@ pub const Batch = union(enum) {
             fn read(raw: *anyopaque, alloc: A, row_index: usize, column: usize) !scalar.Datum {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, row_index, column);
+            }
+            fn decimalSelected(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.decimalColumnSelected(alloc, column, selection);
             }
             fn physical(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize) !?PhysicalColumn {
                 const view: *@This() = @ptrCast(@alignCast(raw));
@@ -308,7 +360,7 @@ pub const Batch = union(enum) {
         for (columns, 0..) |*column, index| column.* = try self.physicalColumn(a, index);
         const view = try a.create(View);
         view.* = .{ .source = self, .columns = columns };
-        return .{ .reader = .{ .ptr = view, .count = self.len(), .width = self.width(), .read = View.read, .read_physical_selected = View.physical, .read_identity = View.identity } };
+        return .{ .reader = .{ .ptr = view, .count = self.len(), .width = self.width(), .read = View.read, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physical, .read_identity = View.identity } };
     }
     fn selectedRows(a: A, rows: []const usize, selection: ?[]const usize) ![]const usize {
         const indices = selection orelse return rows;
@@ -319,6 +371,60 @@ pub const Batch = union(enum) {
             row_index.* = rows[index];
         }
         return selected;
+    }
+    /// Transfer owned boolean vectors into the existing native reader contract.
+    pub fn fromBoolean(a: A, values: []bool, nulls: []u8) !Batch {
+        if (values.len != nulls.len) return error.InvalidSqlBackendResponse;
+        const View = struct {
+            values: []bool,
+            nulls: []u8,
+            fn column(self: *@This()) PhysicalColumn {
+                return .{ .vector = .{ .name = "", .values = .{ .bool = self.values }, .nulls = .{ .bytes = self.nulls } }, .range = .{ .count = self.values.len }, .kind = .boolean, .element = .boolean };
+            }
+            fn read(raw: *anyopaque, _: A, row_index: usize, _: usize) !scalar.Datum {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.column().cell(row_index);
+            }
+            fn physical(raw: *anyopaque, alloc: A, _: usize, selection: ?[]const usize) !?PhysicalColumn {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return if (selection) |rows| try self.column().select(alloc, rows) else self.column();
+            }
+            fn free(raw: *anyopaque, alloc: A) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                alloc.free(self.values);
+                alloc.free(self.nulls);
+                alloc.destroy(self);
+            }
+        };
+        const view = try a.create(View);
+        view.* = .{ .values = values, .nulls = nulls };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical_selected = View.physical, .free_owned = View.free, .count = values.len, .width = 1 } };
+    }
+    pub fn decimalColumnSelected(self: Batch, a: A, column: usize, selection: ?[]const usize) anyerror!?DecimalColumn {
+        if (column >= self.width()) return error.InvalidSqlBackendResponse;
+        if (selection) |rows| for (rows) |row_index| if (row_index >= self.len()) return error.InvalidSqlBackendResponse;
+        return switch (self) {
+            .reader => |v| if (v.read_decimal_selected) |read| read(v.ptr, a, column, selection) else null,
+            .mapped => |v| blk: {
+                if (column >= v.types.len or v.types[column].kind != .number or v.types[column].element_type != .numeric or v.types[column].numeric_modifier != null or v.ordinals[column] == std.math.maxInt(usize)) break :blk null;
+                break :blk try v.source.decimalColumnSelected(a, v.ordinals[column], try selectedRows(a, v.selection, selection));
+            },
+            .columns => |v| blk: {
+                const definition = v.definitions[column];
+                if (definition.type != .number or definition.element_type != .numeric or definition.numeric_modifier != null) break :blk null;
+                const rows = try selectedRows(a, v.page.selection, selection);
+                if (v.page.native) |native| {
+                    for (native.names, 0..) |name, ordinal| if (std.mem.eql(u8, name, definition.name)) break :blk try native.values.decimalColumnSelected(a, ordinal, rows);
+                    break :blk null;
+                }
+                const vector = v.page.batch.findColumn(definition.name) orelse break :blk null;
+                if (vector.values != .decimal128) break :blk null;
+                try vector.nulls.validate(vector.rowCount());
+                for (rows) |row_index| if (row_index >= vector.rowCount()) return error.InvalidSqlBackendResponse;
+                break :blk .{ .physical = .{ .vector = vector, .selection = rows, .kind = .number, .element = .numeric } };
+            },
+            else => null,
+        };
     }
     pub fn physicalColumn(self: Batch, a: A, column: usize) anyerror!?PhysicalColumn {
         return self.physicalColumnSelected(a, column, null);
@@ -442,6 +548,10 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, view.selection[row_index], column);
             }
+            fn decimalSelected(raw: *anyopaque, alloc: A, column: usize, outer_selection: ?[]const usize) !?DecimalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.decimalColumnSelected(alloc, column, try selectedRows(alloc, view.selection, outer_selection));
+            }
             fn physical(raw: *anyopaque, alloc: A, column: usize) !?PhysicalColumn {
                 return physicalSelected(raw, alloc, column, null);
             }
@@ -480,7 +590,7 @@ pub const Batch = union(enum) {
         for (selection) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
         const view = try a.create(View);
         view.* = .{ .source = self, .selection = selection };
-        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity } };
+        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity } };
     }
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;

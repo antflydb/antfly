@@ -83,6 +83,28 @@ contract remains an explicit decoding mode. Timestamp predicates normalize wire
 strings and numeric operands to exact
 signed epoch nanoseconds; canonical SQL projections preserve pre-1970 values.
 
+Exact decimal comparisons, hashes and mergeable aggregate updates borrow stack
+NUMERIC views instead of allocating a numeric value for every lane. Common
+comparison literals lower once to the column's coefficient scale; fractional,
+large and special literals retain exact comparison. SUM/AVG use wide state and
+can exceed i128. String declarations and explicit NUMERIC modifiers retain their
+existing coercion boundary.
+
+Dictionary predicates retain validated Parquet RLE/bit-packed ID runs when that
+uses less memory than an expanded ID vector. Repeated runs can reject a dense
+mask interval at once; packed IDs use bounded byte reads. Projected survivor
+cohorts keep the existing dictionary interfaces.
+
+After capturing a statement snapshot, eligible inner joins with three to eight
+inputs can use filter-aware estimates to choose a cheaper connected join order.
+Build-side selection preserves a negotiated native exact-index probe when only
+one side offers it; scan row estimates do not account for covering-index seeks.
+Planning uses bounded memory and only already-owned pruning/candidate evidence;
+it does not fetch Parquet footers to improve estimates. Logical column order is
+preserved across projection, aggregation and parallel spill workers. Unsupported
+or effectful shapes keep their original plan. Estimates remain advisory and use
+heuristics when precise cardinality statistics are unavailable.
+
 Table creation can infer and persist columns/fingerprints from every Parquet
 footer or the selected Iceberg schema. Inference preserves requiredness and
 rejects incompatible or unsupported flat types; nested/binary schemas need a

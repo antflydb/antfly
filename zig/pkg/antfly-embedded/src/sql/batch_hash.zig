@@ -43,8 +43,13 @@ pub fn encodedColumnsWithPhysical(a: A, values: []const @import("execution_batch
         defer memo.deinit(a);
         var text: std.StringHashMapUnmanaged(u64) = .empty;
         defer text.deinit(a);
+        var numeric_scratch = std.heap.ArenaAllocator.init(a);
+        defer numeric_scratch.deinit();
+        const decimal = try column.decimalColumnSelected(numeric_scratch.allocator(), 0, null);
         for (states, result, 0..) |*state, *valid, index| {
-            const cell = if (native) |view| try view.cell(index) else try column.cell(a, index, 0);
+            var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
+            var number: @import("numeric_value.zig").Value = undefined;
+            const cell = if (native) |view| try view.cell(index) else if (decimal) |view| try view.cell(index, &fixed, &number) else try column.cell(a, index, 0);
             if (!grouped and cell.sql_null) valid.* = null;
             if (valid.* == null) continue;
             const semantic = if (cell.sql_null) 0 else if (if (native) |view| view.dictionaryIdentity(index) else try column.dictionaryIdentity(index, 0)) |id| blk: {

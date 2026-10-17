@@ -1195,6 +1195,8 @@ pub const Grouped = struct {
         const rows = try a.alloc(usize, count);
         const tuple = try a.alloc(u64, keys.len);
         const cells = try a.alloc(Datum, keys.len);
+        var numeric_keys = try @import("execution_batch.zig").NumericScratch.init(a, keys);
+        var candidate_keys = try @import("execution_batch.zig").NumericScratch.init(a, keys);
         var needed: usize = 0;
         for (rows, 0..) |*representative, row_index| {
             var encoded = true;
@@ -1210,14 +1212,14 @@ pub const Grouped = struct {
                 representative.* = previous;
                 continue;
             };
-            for (keys, physical, cells) |column, native, *cell| cell.* = if (native) |view| try view.cell(row_index) else try column.cell(a, row_index, 0);
+            for (physical, cells, 0..) |native, *cell, col| cell.* = if (native) |view| try view.cell(row_index) else try numeric_keys.cell(a, keys, row_index, col);
             const hash = hashes[row_index] orelse return error.InvalidSqlBackendResponse;
             var previous = heads.get(hash);
             while (previous) |index| {
                 const candidate = representatives.items[index];
                 var equal_ = true;
-                for (keys, physical, cells) |column, native, cell| {
-                    const before = if (native) |view| try view.cell(candidate.row) else try column.cell(a, candidate.row, 0);
+                for (physical, cells, 0..) |native, cell, col| {
+                    const before = if (native) |view| try view.cell(candidate.row) else try candidate_keys.cell(a, keys, candidate.row, col);
                     if (try scalar.compareDatums(before, cell) != .eq) {
                         equal_ = false;
                         break;
@@ -1456,6 +1458,14 @@ pub const Grouped = struct {
         var preparation: MemoryBudget = .{ .backing = self.backing, .limit = @min(2 * 1024 * 1024, (MemoryBudget.headroom(self.backing) orelse 4 * 1024 * 1024) / 2) };
         var physical_arena = std.heap.ArenaAllocator.init(preparation.allocator());
         defer physical_arena.deinit();
+        var numeric_keys = @import("execution_batch.zig").NumericScratch.init(physical_arena.allocator(), keys) catch |err| {
+            if (err == error.OutOfMemory and preparation.isExhausted()) return false;
+            return err;
+        };
+        var numeric_inputs = @import("execution_batch.zig").NumericScratch.init(physical_arena.allocator(), inputs) catch |err| {
+            if (err == error.OutOfMemory and preparation.isExhausted()) return false;
+            return err;
+        };
         const physical_keys = prepareColumns(physical_arena.allocator(), keys) catch |err| {
             if (err == error.OutOfMemory and preparation.isExhausted() and count > 1) return false;
             return err;
@@ -1586,7 +1596,7 @@ pub const Grouped = struct {
                 needed +|= self.key_columns.appendGrowthBytes(additional);
                 for (self.state_columns) |*state| needed +|= state.appendGrowth(additional);
             }
-            for (self.state_columns, inputs) |*state, column| if (state.values == .exact) {
+            for (self.state_columns, inputs, 0..) |*state, _, input_column| if (state.values == .exact) {
                 const high = ca.alloc(?i32, groups_.representatives.len) catch |err| {
                     if (err == error.OutOfMemory and census_budget.isExhausted() and count > 1) return false;
                     return err;
@@ -1597,7 +1607,7 @@ pub const Grouped = struct {
                 };
                 @memset(high, null);
                 for (groups_.rows, 0..) |representative, row| {
-                    const input = column.cell(ca, row, 0) catch |err| {
+                    const input = numeric_inputs.cell(ca, inputs, row, input_column) catch |err| {
                         if (err == error.OutOfMemory and census_budget.isExhausted() and count > 1) return false;
                         return err;
                     };
@@ -1650,8 +1660,8 @@ pub const Grouped = struct {
                     const ids_: ?InputIdentity = if (identity) |ids_| .{ .ordinals = ids_.ordinals[index..], .hashes = ids_.hashes[index..] } else null;
                     if (try self.spillEncodedColumns(key_parts, input_parts, selected.len, ids_)) return true;
                 }
-                for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(index) else try column.cell(a, index, 0);
-                for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, index, 0);
+                for (physical_keys, row_keys, 0..) |native, *cell, col| cell.* = if (native) |view| try view.cell(index) else try numeric_keys.cell(a, keys, index, col);
+                for (row_inputs, 0..) |*cell, col| cell.* = try numeric_inputs.cell(a, inputs, index, col);
                 if (identity) |ids| self.source_ordinal = ids.ordinals[index];
                 try self.add(row_keys, row_inputs);
             }
@@ -1672,7 +1682,7 @@ pub const Grouped = struct {
         }
         const groups_ = census.?;
         for (groups_.representatives) |*representative| {
-            for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(representative.row) else try column.cell(a, representative.row, 0);
+            for (physical_keys, row_keys, 0..) |native, *cell, col| cell.* = if (native) |view| try view.cell(representative.row) else try numeric_keys.cell(a, keys, representative.row, col);
             self.source_ordinal = if (identity) |identity_| identity_.ordinals[representative.row] else previous_ordinal orelse (std.math.add(u64, self.rows_seen, representative.row) catch return error.SqlNumericOutOfRange);
             representative.group = representative.existing orelse try self.appendGroup(row_keys, representative.hash);
         }

@@ -5542,3 +5542,67 @@ pruning and restart coverage. Zig/Python formatting, Python lint, whitespace,
 source/error catalog checks, license headers and the Apache product boundary
 (2,282 source files) passed. Representative archive-scale latency/RSS and
 live-provider retention qualification remain deferred.
+
+### Coefficient kernels, hybrid runs and snapshot join planning (2026-10-17)
+
+Fixed decimal128 vectors now enter exact comparison and hash kernels through a
+stack-owned canonical NUMERIC view. Common comparison literals lower once to a
+coefficient at the column scale. Fractional literals that cannot be represented
+at that scale, huge values and specials retain exact arbitrary-precision
+comparison without allocating a NUMERIC value per source row. Projection kernels
+publish ordinary native boolean vectors, preserving selected/duplicate lanes,
+SQL NULLs and the existing scalar error-prefix fallback. String declarations and
+NUMERIC modifiers keep their existing coercion boundary.
+
+An opt-in coefficient view follows column projection, selection and normalization
+wrappers. Hash/group census scratch reuses one stable NUMERIC slot per key column;
+retained keys still enter the canonical typed store. SUM/AVG update the existing
+wide base-10000 accumulator directly, including FILTER cohorts. Only retained
+state growth allocates; a sum can exceed i128 without narrowing. Ordered NUMERIC
+index keys use the same stack view. Optional preparation remains admitted and
+falls back to smaller windows under pressure.
+
+Parquet dictionary predicates retain validated hybrid RLE/bit-packed runs and
+borrow packed payload bytes, extracting IDs with at most five byte reads rather
+than a per-bit loop. Highly fragmented short runs use a flat ID vector
+when that is smaller. Repeated runs can reject a dense mask interval with one
+write; nullable coordinates and projected survivor IDs retain their existing
+interfaces. All logical dictionary IDs and framing remain validated before a
+page is exposed, including truncated streams and padded final packed groups.
+
+Join planning runs after statement snapshot capture. Up to eight eligible inputs
+use bounded dynamic programming over connected left-deep inner-join orders;
+only a strictly cheaper estimated plan replaces the original tree. Identity
+keys and pure equality conjunctions are required. Outer, lateral, correlated,
+recursive, effectful and unsupported shapes retain their existing plan. Explicit
+output permutations preserve logical columns, including typed spill output,
+parallel worker residual evaluation and join partial aggregation. Independent filter producers retain their evaluation
+boundary. Their estimates account for AND/OR selectivity and LIMIT; ordinary
+row/byte estimates remain advisory. Providers can supply estimates after their
+captured conditions, and lake scans use already-owned candidate or row-group
+pruning evidence without fetching footers or enumerating lazy inventories.
+Absent precise evidence, selectivity and key cardinality remain costing
+heuristics; no estimate limits execution or substitutes for exact matching.
+Planning has its own bounded owner and declines under resource pressure.
+Build-side selection first preserves a negotiated native exact-index probe when
+only one side offers it. Compressed scan estimates alone must not switch away
+from an available indexed/covering probe, including after a cold restart. The
+metadata-only capability negotiation reuses the exact-key spooling contract.
+A biased-estimate runtime fixture refuses indexed source reads until its filter
+is installed; the real-file cold covering join exercises the durable path.
+
+Qualification: all 1,022 SQL tests passed (three opt-in benchmarks skipped), all
+525 native lake tests passed, and the runtime I/O ABI gate passed with zero
+failures or leaks. All 32 runtime error ABI tests passed. This includes the
+biased-estimate indexed-probe fixture, both spill-worker orientations, wide-key
+memory pressure, decimal allocation-failure coverage and every packed-ID width.
+All 56 real Parquet/Iceberg E2Es passed in 334.09 seconds with two workers against
+the final Debug CLI. Its SHA-256 remained
+`99b5642c0dfa98420d3c016f8a298783a85bca7921fac14232d70be6397be423`.
+The targeted covering/non-covering cold-index regression also passed in both
+modes. Source/error catalogs, Zig/Python formatting, Python lint, whitespace,
+license headers and the Apache product boundary (2,285 source files) passed.
+Fixtures and server roots were isolated under the worktree.
+
+Latest fetched origin/main `68a27a0225` is merged. Real-provider retention
+qualification and representative archive-scale latency/RSS remain deferred.

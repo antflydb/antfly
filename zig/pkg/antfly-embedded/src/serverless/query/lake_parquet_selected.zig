@@ -30,7 +30,7 @@ arena: std.heap.ArenaAllocator = undefined,
 chunk: Chunk,
 kind: enum { integer, number, boolean, bytes },
 positions: []u32 = &.{},
-indices: []u32 = &.{},
+indices: ?page.HybridIndex = null,
 offsets: []u32 = &.{},
 data: []const u8 = &.{},
 dictionary: ?page.Dictionary = null,
@@ -93,12 +93,12 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
     if (header.encoding != .plain) {
         if (present == 0) return self;
         if (data.len == 0 or data[0] > 32) return error.InvalidParquetPage;
-        self.indices = try page.decodeHybridIndexesAlloc(alloc, data[1..], @intCast(data[0]), present);
+
         // All IDs are structural evidence, even when their values are deferred.
         const size = switch (dictionary.?) {
             inline else => |values| values.len,
         };
-        for (self.indices) |id| if (id >= size) return error.InvalidParquetPage;
+        self.indices = try page.HybridIndex.init(alloc, data[1..], @intCast(data[0]), present, size);
         return self;
     }
     self.width = if (std.mem.eql(u8, chunk.physical_type, "int32") or std.mem.eql(u8, chunk.physical_type, "float")) 4 else if (kind == .integer or kind == .number) 8 else if (std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array")) std.math.cast(usize, chunk.type_length) orelse return error.InvalidParquetPage else 0;
@@ -140,7 +140,7 @@ fn lanePosition(self: *const Self, row: usize) u32 {
 }
 fn integer(self: *Self, position: usize) !i64 {
     if (self.dictionary) |dictionary| return switch (dictionary) {
-        .i64 => |values| values[self.indices[position]],
+        .i64 => |values| values[self.indices.?.at(position)],
         else => error.InvalidParquetPage,
     };
     const offset = position * self.width;
@@ -148,7 +148,7 @@ fn integer(self: *Self, position: usize) !i64 {
 }
 fn number(self: *Self, position: usize) !f64 {
     if (self.dictionary) |dictionary| return switch (dictionary) {
-        .f64 => |values| values[self.indices[position]],
+        .f64 => |values| values[self.indices.?.at(position)],
         else => error.InvalidParquetPage,
     };
     const offset = position * self.width;
@@ -156,7 +156,7 @@ fn number(self: *Self, position: usize) !f64 {
 }
 fn bytes(self: *Self, position: usize) ![]const u8 {
     if (self.dictionary) |dictionary| return switch (dictionary) {
-        .bytes => |values| values[self.indices[position]],
+        .bytes => |values| values[self.indices.?.at(position)],
         else => error.InvalidParquetPage,
     };
     if (self.width != 0) return self.data[position * self.width ..][0..self.width];
@@ -234,10 +234,17 @@ fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, 
             keep[lane] = false;
             continue;
         }
+        if (self.positions.len == 0) if (self.indices) |index| if (index.runAt(position)) |run| if (run.repeated != null) {
+            const end = @min(keep.len, run.first + run.count - begin);
+            const matches = comparePredicate(T, op, try self.predicateValue(T, position), literal);
+            if (!matches) @memset(keep[lane..end], false);
+            lane = end - 1;
+            continue;
+        };
         var slot: usize = 0;
         var id: u32 = 0;
         if (self.dictionary != null) {
-            id = self.indices[position];
+            id = self.indices.?.at(position);
             slot = (id *% 2654435761) & (memo.len - 1);
             while (memo[slot] != 0 and identities[slot] != id) slot = (slot + 1) & (memo.len - 1);
             if (memo[slot] != 0) {
@@ -279,7 +286,7 @@ fn encodedValue(raw: *const anyopaque, row: usize) !std.json.Value {
 }
 fn encodedId(raw: *const anyopaque, row: usize) ?u32 {
     const self: *const Self = @ptrCast(@alignCast(raw));
-    return if (self.lanePosition(row) == absent) null else self.indices[self.lanePosition(row)];
+    return if (self.lanePosition(row) == absent) null else self.indices.?.at(self.lanePosition(row));
 }
 pub fn evidence(self: *Self, a: A, begin: usize, count: usize) !?types.ColumnVector {
     if (std.mem.eql(u8, self.chunk.logical_type, "decimal")) return null;
@@ -313,7 +320,7 @@ pub fn project(self: *Self, a: A, begin: usize, keep: []const bool) !types.Colum
         for (keep, nulls, indices, begin..) |selected, *flag, *id, row| {
             const position = self.lanePosition(row);
             flag.* = @intFromBool(!selected or position == absent);
-            id.* = if (flag.* == 0) self.indices[position] else 0;
+            id.* = if (flag.* == 0) self.indices.?.at(position) else 0;
             if (flag.* == 0) self.converted += 1;
         }
         vector.values = switch (dictionary) {
@@ -462,4 +469,23 @@ test "lake SQL encoded numeric predicate runs preserve exact integers selections
     keep[1] = false;
     try std.testing.expect(try encodedMask(floats, 0, &keep, .{ .float = 7 }, .eq));
     try std.testing.expectEqualSlices(bool, &.{ true, false }, &keep);
+}
+
+test "lake SQL repeated dictionary predicate masks need no expanded page ID vector" {
+    const a = std.testing.allocator;
+    const payload = [_]u8{ 1, 0x80, 0x80, 8, 1 };
+    const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = payload.len, .uncompressed_page_size = payload.len, .value_count = 65536, .encoding = .rle_dictionary };
+    const chunk: Chunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = payload.len, .physical_type = @constCast("int64") };
+    var dictionary_values = [_]i64{ 7, 99 };
+    const selected = (try create(a, chunk, header, &payload, .{ .i64 = &dictionary_values }, 16 * 1024)).?;
+    defer selected.destroy();
+    try std.testing.expectEqual(@as(usize, 0), selected.indices.?.flat.len);
+    try std.testing.expectEqual(@as(usize, 1), selected.indices.?.runs.len);
+    var mask: [1024]bool = @splat(true);
+    mask[17] = false;
+    try std.testing.expect(try encodedMask(selected, 60000, &mask, .{ .integer = 99 }, .eq));
+    try std.testing.expect(!mask[17] and mask[0] and mask[1023]);
+    try std.testing.expect(try encodedMask(selected, 60000, &mask, .{ .integer = 7 }, .eq));
+    for (mask) |active| try std.testing.expect(!active);
+    try std.testing.expectEqual(@as(usize, 0), selected.converted);
 }
