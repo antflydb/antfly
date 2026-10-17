@@ -546,25 +546,66 @@ pub const Store = struct {
     // Content keys borrow only this store's owned immutable payloads. Small
     // values avoid dictionary metadata; large fan-out rows share bytes/cache.
     json_payloads: std.HashMapUnmanaged(JsonKey, *JsonPayload, JsonKeyContext, 80) = .empty,
-    const JsonKey = struct { representation: u8, bytes: []const u8 };
+    const JsonKey = struct { representation: u8, bytes: []const u8, hash: u64 };
+    /// A memo belongs to one immutable producer lease, and is discarded before
+    /// another pull. Admission and retention may share it; borrowed addresses
+    /// must never become persistent keys in the destination store.
+    pub const JsonLease = struct {
+        a: A,
+        identities: std.AutoHashMapUnmanaged(Identity, Resolution) = .empty,
+        // Local counters make hash work measurable without global test hooks.
+        hashed_bytes: usize = 0,
+        const Identity = struct { address: usize, len: usize, representation: u8 };
+        const Resolution = struct { key: JsonKey, owned: ?*JsonPayload, estimated: bool = false };
+        pub fn init(a: A) JsonLease {
+            return .{ .a = @import("memory_budget.zig").reclaimingAllocator(a) };
+        }
+        pub fn deinit(self: *JsonLease) void {
+            self.identities.deinit(self.a);
+        }
+        fn resolve(self: *JsonLease, store: *const Store, payload: JsonPayload) !*Resolution {
+            const bytes = if (payload.frozen) |value| value.bytes else payload.text.?;
+            const representation: u8 = if (payload.frozen) |value| (if (value.lossless_text) @as(u8, 3) else 2) else 1;
+            const slot = try self.identities.getOrPut(self.a, .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .representation = representation });
+            if (!slot.found_existing) {
+                const key: JsonKey = .{ .representation = representation, .bytes = bytes, .hash = std.hash.Wyhash.hash(representation, bytes) };
+                self.hashed_bytes +|= bytes.len;
+                slot.value_ptr.* = .{ .key = key, .owned = store.json_payloads.get(key) };
+            }
+            return slot.value_ptr;
+        }
+    };
     const JsonKeyContext = struct {
         pub fn hash(_: @This(), key: JsonKey) u64 {
-            return std.hash.Wyhash.hash(key.representation, key.bytes);
+            return key.hash;
         }
         pub fn eql(_: @This(), left: JsonKey, right: JsonKey) bool {
             return left.representation == right.representation and std.mem.eql(u8, left.bytes, right.bytes);
         }
     };
-    fn ownJson(self: *Store, payload: JsonPayload) !*JsonPayload {
-        const key: JsonKey = if (payload.frozen) |value| .{ .representation = if (value.lossless_text) 3 else 2, .bytes = value.bytes } else .{ .representation = 1, .bytes = payload.text.? };
-        const dictionary = key.bytes.len >= 256;
-        if (dictionary) if (self.json_payloads.get(key)) |existing| return existing;
+    fn ownJson(self: *Store, payload: JsonPayload, lease: *JsonLease) !*JsonPayload {
+        const source = if (payload.frozen) |value| value.bytes else payload.text.?;
+        const resolved = if (source.len >= 256) try lease.resolve(self, payload) else null;
+        if (resolved) |entry| {
+            if (entry.owned) |existing| return existing;
+            // A different source address with equal content may have been
+            // retained since admission. Cached hashes keep this lookup cheap.
+            if (self.json_payloads.get(entry.key)) |existing| {
+                entry.owned = existing;
+                return existing;
+            }
+        }
         const owned = self.arena.allocator();
         const result = try owned.create(JsonPayload);
         result.* = payload;
-        const bytes = try owned.dupe(u8, key.bytes);
+        const bytes = try owned.dupe(u8, source);
         if (payload.frozen != null) result.frozen.?.bytes = bytes else result.text = bytes;
-        if (dictionary) try self.json_payloads.put(self.a, .{ .representation = key.representation, .bytes = bytes }, result);
+        if (resolved) |entry| {
+            var key = entry.key;
+            key.bytes = bytes;
+            try self.json_payloads.put(self.a, key, result);
+            entry.owned = result;
+        }
         return result;
     }
     pub fn init(a: A) Store {
@@ -663,6 +704,13 @@ pub const Store = struct {
     /// batch. Keys borrow the producer's immutable lease for this call only.
     /// Per-cell descriptors and allocator growth remain separate reservations.
     pub fn batchAppendBytes(self: *const Store, a: A, batch: @import("execution_batch.zig").Batch, maximum: usize) !usize {
+        var lease = JsonLease.init(a);
+        defer lease.deinit();
+        return self.batchAppendBytesLeased(a, batch, maximum, &lease);
+    }
+    /// Reuse this memo only for this candidate's admission followed by append;
+    /// prefix retries need a fresh memo because their counted set differs.
+    pub fn batchAppendBytesLeased(self: *const Store, a: A, batch: @import("execution_batch.zig").Batch, maximum: usize, lease: *JsonLease) !usize {
         var region = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
         defer region.deinit();
         const work = region.allocator();
@@ -671,27 +719,29 @@ pub const Store = struct {
         defer cell_region.deinit();
         var bytes: usize = 0;
         for (0..batch.width()) |column| for (0..batch.len()) |index| {
-            const key: ?JsonKey = if (try batch.frozenJson(index, column)) |frozen|
-                .{ .representation = if (frozen.lossless_text) 3 else 2, .bytes = frozen.bytes }
+            const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
+                .{ .frozen = frozen }
             else if (try batch.encodedJson(index, column)) |text|
-                .{ .representation = 1, .bytes = text }
+                .{ .text = text }
             else
                 null;
-            if (key) |native| {
+            if (payload) |native| {
                 bytes +|= @sizeOf(?*JsonPayload) + 1;
                 if (bytes > maximum) return bytes;
-                if (native.bytes.len >= 256) {
-                    if (self.json_payloads.contains(native)) continue;
-                    const entry = try incoming.getOrPut(work, native);
+                const source = if (native.frozen) |frozen| frozen.bytes else native.text.?;
+                if (source.len >= 256) {
+                    const resolved = try lease.resolve(self, native);
+                    if (resolved.owned != null or resolved.estimated) continue;
+                    resolved.estimated = true;
+                    const entry = try incoming.getOrPut(work, resolved.key);
                     if (entry.found_existing) continue;
                 }
-                bytes +|= native.bytes.len +| @sizeOf(JsonPayload) +| 64;
+                bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
             } else {
                 _ = cell_region.reset(.retain_capacity);
                 bytes +|= try @import("operators.zig").datumBytes(try batch.cell(cell_region.allocator(), index, column));
             }
-            // Reject oversized candidates before building an unbounded probe
-            // dictionary; the caller retries with a smaller prefix.
+            // Reject before temporary identity state can outgrow admission.
             if (bytes > maximum) return bytes;
         };
         return bytes;
@@ -710,6 +760,11 @@ pub const Store = struct {
     /// Column-major payload admission. No per-row Datum slices or arenas;
     /// primitive and dictionary state is retained directly in each column.
     pub fn appendBatch(self: *Store, batch: @import("execution_batch.zig").Batch) !void {
+        var lease = JsonLease.init(self.a);
+        defer lease.deinit();
+        return self.appendBatchLeased(batch, &lease);
+    }
+    pub fn appendBatchLeased(self: *Store, batch: @import("execution_batch.zig").Batch, lease: *JsonLease) !void {
         if (self.failed or (self.initialized and self.columns.len != batch.width())) return error.InvalidSqlBackendResponse;
         errdefer self.failed = true;
         if (!self.initialized) {
@@ -730,12 +785,12 @@ pub const Store = struct {
                 _ = scratch.reset(.retain_capacity);
                 if (try batch.frozenJson(index, ordinal)) |frozen| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .frozen = frozen }));
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .frozen = frozen }, lease));
                     continue;
                 }
                 if (try batch.encodedJson(index, ordinal)) |bytes| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .text = bytes }));
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .text = bytes }, lease));
                     continue;
                 }
                 const value = try batch.cell(scratch.allocator(), index, ordinal);
@@ -1260,4 +1315,111 @@ test "SQL native JSON admission counts new payloads once and preserves represent
         try Fixture.run(std.testing.allocator, frozen);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{frozen});
     }
+}
+
+test "SQL native JSON lease hashes each body once across admission and retention" {
+    const Fixture = struct {
+        fn run(a: A, frozen_mode: bool) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const padding: [1024]u8 = @splat('x');
+            const text = try std.fmt.allocPrint(sa, "{{\"payload\":\"{s}\"}}", .{padding});
+            var fixture: SharedJsonFixture = .{ .text = text };
+            if (frozen_mode) {
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, text, .{});
+                const wire = try @import("spill.zig").encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+                const block = try @import("spill.zig").decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+                defer block.deinit();
+                fixture.frozen = (try block.frozenJson(0, 0, false)).?;
+            }
+            var store = Store.init(a);
+            defer store.deinit();
+            const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &fixture, .read = SharedJsonFixture.cell, .read_json = SharedJsonFixture.json, .read_frozen = SharedJsonFixture.tokens, .count = 64, .width = 1 } };
+            var lease = Store.JsonLease.init(a);
+            defer lease.deinit();
+            const estimate = try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease);
+            const length = if (fixture.frozen) |frozen| frozen.bytes.len else text.len;
+            try std.testing.expectEqual(length, lease.hashed_bytes);
+            try store.appendBatchLeased(batch, &lease);
+            try std.testing.expectEqual(length, lease.hashed_bytes);
+            try std.testing.expectEqual(@as(usize, 1), store.json_payloads.count());
+            try std.testing.expectEqual(@as(usize, 64), store.len);
+            // A new lease must resolve content afresh, even if the producer
+            // reuses the same address for a different payload on the next pull.
+            var again = Store.JsonLease.init(a);
+            defer again.deinit();
+            try std.testing.expectEqual(@as(usize, 64 * (@sizeOf(?*JsonPayload) + 1)), try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &again));
+            try std.testing.expect(estimate > 64 * (@sizeOf(?*JsonPayload) + 1));
+            try store.appendBatchLeased(batch, &again);
+            try std.testing.expectEqual(length, again.hashed_bytes);
+            try std.testing.expectEqual(@as(usize, 1), store.json_payloads.count());
+        }
+    };
+    for ([_]bool{ false, true }) |frozen| {
+        try Fixture.run(std.testing.allocator, frozen);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{frozen});
+    }
+}
+
+test "SQL native JSON lease scopes reused addresses and deduplicates distinct addresses" {
+    const Fixture = struct {
+        fn run(a: A) !void {
+            var original: [1024]u8 = @splat('x');
+            @memcpy(original[0..6], "{\"p\":\"");
+            @memcpy(original[original.len - 2 ..], "\"}");
+            var other = original;
+            var fixture: SharedJsonFixture = .{ .text = &original };
+            var store = Store.init(a);
+            defer store.deinit();
+            const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &fixture, .read = SharedJsonFixture.cell, .read_json = SharedJsonFixture.json, .count = 8, .width = 1 } };
+            {
+                var lease = Store.JsonLease.init(a);
+                defer lease.deinit();
+                const first = try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease);
+                // A separate immutable range with the same bytes shares content
+                // storage, but has its own lease identity and content hash.
+                fixture.text = &other;
+                try store.appendBatchLeased(batch, &lease);
+                fixture.text = &original;
+                try store.appendBatchLeased(batch, &lease);
+                try std.testing.expect(first > original.len);
+                try std.testing.expectEqual(@as(usize, original.len * 2), lease.hashed_bytes);
+                try std.testing.expectEqual(@as(usize, 1), store.json_payloads.count());
+            }
+            // The producer can overwrite an expired lease's address. The new
+            // lease must hash the new bytes and retain a different payload.
+            original[6] = 'y';
+            var next = Store.JsonLease.init(a);
+            defer next.deinit();
+            _ = try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &next);
+            try store.appendBatchLeased(batch, &next);
+            try std.testing.expectEqual(@as(usize, original.len), next.hashed_bytes);
+            try std.testing.expectEqual(@as(usize, 2), store.json_payloads.count());
+            try std.testing.expectEqual(@as(u8, 'x'), (try store.encodedJson(0, 0)).?[6]);
+            try std.testing.expectEqual(@as(u8, 'y'), (try store.encodedJson(16, 0)).?[6]);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "native projection refinements benchmark shared JSON lease hash work" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    var text: std.Io.Writer.Allocating = .init(source.allocator());
+    try text.writer.writeAll("{\"payload\":\"");
+    try text.writer.splatByteAll('x', 1 << 20);
+    try text.writer.writeAll("\"}");
+    var fixture: SharedJsonFixture = .{ .text = text.written() };
+    var store = Store.init(a);
+    defer store.deinit();
+    const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &fixture, .read = SharedJsonFixture.cell, .read_json = SharedJsonFixture.json, .count = 64, .width = 1 } };
+    var lease = Store.JsonLease.init(a);
+    defer lease.deinit();
+    _ = try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease);
+    try store.appendBatchLeased(batch, &lease);
+    try std.testing.expectEqual(text.written().len, lease.hashed_bytes);
+    std.debug.print("SHARED_JSON_HASH rows=64 wire={d} before_hash_input={d} after_hash_input={d} unique_payloads={d}\n", .{ text.written().len, 128 * text.written().len, lease.hashed_bytes, store.json_payloads.count() });
 }

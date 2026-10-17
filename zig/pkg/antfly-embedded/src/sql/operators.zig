@@ -766,14 +766,16 @@ pub const HashJoin = struct {
         const ceiling = if (keys.len == 1 and self.budget.live <= self.budget.limit / 2) self.budget.limit else self.budget.limit / 2;
         const available = ceiling -| self.budget.live;
         if (needed > available) return false;
-        needed +|= (try self.value_columns.batchAppendBytes(a, batch, (available - needed) / 4)) *| 4;
+        var payloads = @import("typed_store.zig").Store.JsonLease.init(a);
+        defer payloads.deinit();
+        needed +|= (try self.value_columns.batchAppendBytesLeased(a, batch, (available - needed) / 4, &payloads)) *| 4;
         if (needed > available) return false;
         const hashes = try @import("batch_hash.zig").rows(a, keys, false);
         defer a.free(hashes);
         const retained = self.budget.allocator();
         try self.entries.ensureUnusedCapacity(retained, keys.len);
         try self.heads.ensureUnusedCapacity(retained, @intCast(keys.len));
-        try self.value_columns.appendBatch(batch);
+        try self.value_columns.appendBatchLeased(batch, &payloads);
         for (keys, hashes) |row, hash| {
             const index = self.entries.items.len;
             _ = try self.key_columns.append(row);
