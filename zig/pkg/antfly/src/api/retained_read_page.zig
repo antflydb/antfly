@@ -182,6 +182,12 @@ fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_me
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     return self.plans[row].value(self.names, self.column + ordinal);
                 }
+                fn json(raw: *anyopaque, row: usize, ordinal: usize) !?[]const u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const plan = self.plans[row];
+                    if (!try plan.present(self.names, self.column + ordinal)) return null;
+                    return plan.input.sqlRow().encodedJson(self.names[self.column + ordinal]);
+                }
                 fn dictionary(raw: *anyopaque, scratch_alloc: A, ordinal: usize) !?sources.sql_execution_batch.Batch {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     if (self.plans.len == 0 or (try self.plans[0].dictionaryKey(self.names, self.column + ordinal)) == null) return null;
@@ -209,7 +215,7 @@ fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_me
             var columns: Columns = .{ .plans = plans[first..][0..count], .names = names.keys(), .column = column };
             var ordinals: [256]u64 = undefined;
             for (ordinals[0..count], first..) |*ordinal, index| ordinal.* = index;
-            const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .read_dictionary = Columns.dictionary, .count = count, .width = width } };
+            const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .read_dictionary = Columns.dictionary, .read_json = Columns.json, .count = count, .width = width } };
             if (direct) {
                 var response = out.toArrayList();
                 defer out = .fromArrayList(output_budget.allocator(), &response);
@@ -294,6 +300,8 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
         };
         row.* = .{ .id = id, .version = version, .schema_version = schema_version, .value = .null, .typed_cells = .{ .layout = layout, .presence = presence }, .expected_content_digest = digest, .document = document };
     }
+    var cache_blocks: std.ArrayList(spill.ColumnarBlock) = .empty;
+    errdefer for (cache_blocks.items) |block| block.deinit();
     var first: usize = 0;
     while (first < count) {
         const n = @min(256, count - first);
@@ -303,13 +311,14 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
             const k = @min(1024, width - column);
             const encoded = try r.required();
             if (!std.mem.startsWith(u8, encoded, if (compact) "NCB\x02" else block_magic)) return error.InvalidRetainedReadPage;
-            block.* = try spill.decodeColumnarBlockInArena(a, encoded, max_bytes);
+            try cache_blocks.ensureUnusedCapacity(a, 1);
+            block.* = try spill.decodeColumnarBlockWithCache(a, alloc, encoded, max_bytes);
+            cache_blocks.appendAssumeCapacity(block.*);
             if (block.count() != n or block.values.len != k or block.keys.len != 0) return error.InvalidRetainedReadPage;
             for (rows[first..][0..n], 0..) |row, index| {
                 if (block.ordinals[index] != first + index) return error.InvalidRetainedReadPage;
                 for (column..column + k) |ordinal| {
-                    const cell = try block.cell(index, ordinal - column);
-                    if (!row.typed_cells.?.presence.?[ordinal] and !cell.sql_null) return error.InvalidRetainedReadPage;
+                    if (!row.typed_cells.?.presence.?[ordinal] and !try block.isSqlNull(index, ordinal - column)) return error.InvalidRetainedReadPage;
                 }
             }
             column += k;
@@ -318,7 +327,7 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
         first += n;
     }
     if (r.at != bytes.len) return error.InvalidRetainedReadPage;
-    return .{ .arena = arena, .rows = rows, .after = after };
+    return .{ .arena = arena, .rows = rows, .after = after, .columnar_blocks = cache_blocks.items };
 }
 
 test {
@@ -373,6 +382,40 @@ fn consumerTests() type {
             const merged = try encodeVersion(a, 1, mixed, null, .v2);
             defer a.free(merged);
             try std.testing.expectEqualSlices(u8, bytes, merged);
+        }
+
+        test "SQL pgwire native retained read RPC lazy JSON survives moved retained pages and frozen reencoding allocation failures" {
+            const Fixture = struct {
+                fn run(backing: A) !void {
+                    var source = std.heap.ArenaAllocator.init(backing);
+                    defer source.deinit();
+                    const a = source.allocator();
+                    const json = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"x\":[9007199254740993,1e-3]}", .{ .parse_numbers = false });
+                    const layout = try catalog.Row.TypedLayout.init(a, &.{"j"});
+                    const rows = [_]View.Row{.{ .id = "key", .version = 1, .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{Datum.json(json)} } }};
+                    for ([_]spill.ColumnarVersion{ .v1, .v2 }) |version| {
+                        const bytes = try encodeVersion(a, 1, &rows, null, version);
+                        var page = try decode(backing, bytes, 1, 3, 1);
+                        var active = true;
+                        defer if (active) page.deinit();
+                        var retained = try page.retain(backing);
+                        defer retained.deinit();
+                        page.deinit();
+                        active = false;
+                        const row = retained.rows[0].sqlRow();
+                        try std.testing.expectEqualStrings("{\"x\":[9007199254740993,1e-3]}", (try row.encodedJson("j")).?);
+                        const ordinal = row.typed_cells.?.layout.ordinals.get("j").?;
+                        const frozen = retained.columnar_blocks[0].values[ordinal].values.dynamic.json[0].?;
+                        try std.testing.expect(frozen.value == null);
+                        const replay = try encodeVersion(a, 1, retained.rows, null, version);
+                        try std.testing.expectEqualSlices(u8, bytes, replay);
+                        try std.testing.expect(frozen.value == null);
+                        try std.testing.expectEqualStrings("9007199254740993", (try row.cell("j")).value.object.get("x").?.array.items[0].number_string);
+                    }
+                }
+            };
+            try Fixture.run(std.testing.allocator);
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
         }
     };
 }

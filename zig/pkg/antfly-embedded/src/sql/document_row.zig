@@ -228,6 +228,7 @@ pub const Projection = struct {
                     direct = false;
                     break;
                 }
+                if (column.type == .json and try row.encodedJson(name) != null) continue;
                 const cell = try row.cell(name);
                 if (cell.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
                 if (!cell.sql_null and ((column.type == .array and cell.array == null) or

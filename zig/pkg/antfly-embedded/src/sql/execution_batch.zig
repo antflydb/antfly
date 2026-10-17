@@ -64,6 +64,11 @@ pub const Batch = union(enum) {
             else => null,
         };
     }
+    /// Size admission must not force an encoded JSON column into a DOM.
+    pub fn cellBytes(self: Batch, a: A, row_index: usize, column: usize) !usize {
+        if (try self.encodedJson(row_index, column)) |bytes| return bytes.len;
+        return @import("operators.zig").datumBytes(try self.cell(a, row_index, column));
+    }
     /// A single borrowed column retains physical dictionary identities.
     pub fn project(self: *const Batch, a: A, column: usize) !Batch {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;

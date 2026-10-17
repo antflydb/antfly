@@ -6445,16 +6445,18 @@ pub const NativeFile = struct {
             size: usize,
             inline_value: []const u8,
             reader: *ValuePageReader,
+            cursor: *LinkedRangeCursor,
             pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
                 if (ctx.root == 0) return ctx.a.dupe(u8, ctx.inline_value[begin..][0..len]);
                 const bytes = try ctx.a.alloc(u8, len);
                 errdefer ctx.a.free(bytes);
-                try ctx.file.readValuePagesRangeIntoReader(ctx.root, ctx.size, begin, bytes, ctx.checkpoint, ctx.reader);
+                try ctx.file.readValuePagesRangeIntoReader(ctx.root, ctx.size, begin, bytes, ctx.checkpoint, ctx.reader, ctx.cursor);
                 return bytes;
             }
         };
+        var cursor: LinkedRangeCursor = .{};
         const size = if (entry.external_value_root_page == 0) entry.value.len else entry.external_value_len;
-        try @import("../value_ranges.zig").read(size, ranges, output, Context{ .file = self, .a = allocator, .checkpoint = checkpoint, .root = entry.external_value_root_page, .size = size, .inline_value = entry.value, .reader = &reader });
+        try @import("../value_ranges.zig").read(size, ranges, output, Context{ .file = self, .a = allocator, .checkpoint = checkpoint, .root = entry.external_value_root_page, .size = size, .inline_value = entry.value, .reader = &reader, .cursor = &cursor });
     }
 
     /// Extents and inline slices are resolved against the caller's checkpoint.
@@ -8845,14 +8847,18 @@ pub const NativeFile = struct {
         var reader: ValuePageReader = undefined;
         reader.init();
         defer reader.deinit(self);
-        return self.readValuePagesRangeIntoReader(root_page_id, value_len, range_start, out, checkpoint, &reader);
+        return self.readValuePagesRangeIntoReader(root_page_id, value_len, range_start, out, checkpoint, &reader, null);
     }
-    fn readValuePagesRangeIntoReader(self: *NativeFile, root_page_id: u64, value_len: usize, range_start: usize, out: []u8, checkpoint: CheckpointSlot, reader: *ValuePageReader) !void {
+    const LinkedRangeCursor = struct { root: u64 = 0, page: u64 = 0, offset: usize = 0, visited: u64 = 0 };
+    fn readValuePagesRangeIntoReader(self: *NativeFile, root_page_id: u64, value_len: usize, range_start: usize, out: []u8, checkpoint: CheckpointSlot, reader: *ValuePageReader, cursor: ?*LinkedRangeCursor) !void {
         const range_len = out.len;
         if (range_start > value_len or range_len > value_len - range_start) return error.EndOfStream;
         if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
         if (range_len == 0) return;
 
+        if (cursor) |state| if (state.root == root_page_id and range_start >= state.offset) {
+            return self.readLinkedRangeIntoReader(root_page_id, value_len, range_start, out, checkpoint, reader, cursor, state.page, state.offset, null);
+        };
         const root_raw = try reader.read(self, checkpoint, root_page_id, 1);
         if (root_raw[4] == @backingInt(PageKind.value_extent)) {
             const payload = try reader.payload(root_raw, .value_extent);
@@ -8872,16 +8878,27 @@ pub const NativeFile = struct {
 
         reader.chain_previous = root_page_id;
         reader.chain_run = 1;
+        return self.readLinkedRangeIntoReader(root_page_id, value_len, range_start, out, checkpoint, reader, cursor, root_page_id, 0, root_leaf);
+    }
+    // Sorted cohorts continue at the last touched page instead of replaying
+    // every prefix. Navigation never outlives this document/checkpoint owner.
+    fn readLinkedRangeIntoReader(self: *NativeFile, root: u64, value_len: usize, range_start: usize, out: []u8, checkpoint: CheckpointSlot, reader: *ValuePageReader, cursor: ?*LinkedRangeCursor, initial_page: u64, initial_offset: usize, first_leaf: ?ValuePage) !void {
+        const range_len = out.len;
         const range_end = range_start + range_len;
-        var value_offset: usize = 0;
+        var value_offset = initial_offset;
         var written: usize = 0;
-        var page_id = root_page_id;
-        var pages_seen: u64 = 0;
+        var page_id = initial_page;
+        const continuing = if (cursor) |state| state.root == root and state.page == initial_page and state.offset == initial_offset else false;
+        var pages_seen: u64 = if (continuing) cursor.?.visited else 0;
+        var first_read = true;
         while (page_id != 0) {
-            pages_seen += 1;
+            // Re-reading the last touched page is not a new navigation step.
+            // Keep the cycle bound across cohorts, rather than resetting it.
+            if (!first_read or !continuing) pages_seen += 1;
             if (pages_seen > checkpoint.page_count) return error.InvalidNativeValueChain;
 
-            const page = if (pages_seen == 1) root_leaf else try decodeValuePage(try reader.payload(try reader.readChain(self, checkpoint, page_id, range_end - value_offset), .value));
+            const page = if (first_read and first_leaf != null) first_leaf.? else try decodeValuePage(try reader.payload(try reader.readChain(self, checkpoint, page_id, range_end - value_offset), .value));
+            first_read = false;
             if (page.chunk.len == 0) return error.InvalidNativeValueChain;
             if (page.chunk.len > value_len - value_offset) return error.InvalidNativeValueChain;
 
@@ -8895,6 +8912,7 @@ pub const NativeFile = struct {
                 written += copy_len;
             }
 
+            if (cursor) |state| state.* = .{ .root = root, .page = page_id, .offset = page_start, .visited = pages_seen };
             value_offset = page_end;
             page_id = page.next_page;
             if (value_offset == value_len and page_id != 0) return error.InvalidNativeValueChain;
@@ -18510,5 +18528,45 @@ test "lite native projected document batches share index traversal and preserve 
         std.debug.print("PROJECTED_DOCUMENT_BATCH indexed={any} scalar_backing={d} batch_backing={d} documents=32\n", .{ indexed, scalar_bytes, batch_bytes });
         const reversed = [_]@import("../value_ranges.zig").Request{ requests[1], requests[0] };
         try std.testing.expectError(error.InvalidBatch, reader.readDocumentRangesBatchAlloc(arena.allocator(), checkpoint, &reversed));
+    }
+}
+
+test "lite native sparse linked ranges walk forward across sorted cohorts and captured replacement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "sparse-legacy-ranges.aflite");
+    defer a.free(path);
+    const bytes = try a.alloc(u8, 60 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    for ([_]bool{ false, true }) |indexed| {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = indexed, .no_sync = true });
+        defer file.close();
+        try file.putDocument("doc", bytes);
+        var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reader.close();
+        reader.page_cache_enabled.store(false, .monotonic);
+        const checkpoint = reader.activeCheckpoint();
+        try file.putDocument("doc", "replacement");
+        var ranges: [12]@import("../value_ranges.zig").Range = undefined;
+        for (ranges[0..10], 0..) |*range, i| range.* = .{ .offset = (9 - i) * 6144, .length = 1 };
+        ranges[10] = ranges[0];
+        ranges[11] = .{ .offset = bytes.len, .length = 0 };
+        const before = reader.test_backing_read_bytes.load(.monotonic);
+        for (ranges) |range| {
+            const part = try reader.readDocumentRangeAlloc(a, checkpoint, "doc", range.offset, range.length);
+            a.free(part);
+        }
+        const scalar = reader.test_backing_read_bytes.load(.monotonic) - before;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var output: [ranges.len][]const u8 = undefined;
+        const start = reader.test_backing_read_bytes.load(.monotonic);
+        try reader.readDocumentRangesAlloc(arena.allocator(), checkpoint, "doc", &ranges, &output);
+        const projected = reader.test_backing_read_bytes.load(.monotonic) - start;
+        for (ranges, output) |range, value| try std.testing.expectEqualSlices(u8, bytes[@intCast(range.offset)..][0..range.length], value);
+        try std.testing.expect(projected * 2 < scalar);
+        std.debug.print("LINKED_RANGE_FORWARD indexed={any} scalar_backing={d} forward_backing={d} ranges={d}\n", .{ indexed, scalar, projected, ranges.len });
     }
 }

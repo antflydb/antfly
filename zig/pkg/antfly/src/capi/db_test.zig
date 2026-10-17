@@ -6842,7 +6842,15 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             reader.releasePage();
             const bounded_projection = try reader.lookupProjectedBatch(&.{ "b", "a" }, &.{"body"}, 8);
             try std.testing.expectEqual(@as(usize, 1), bounded_projection.consumed);
+            const metadata_owner = reader.directory_scope.?.ptr;
+            const cached_directory = reader.directories[1].?.ptr;
+            budget.limit = 0;
+            try std.testing.expectError(error.OutOfMemory, reader.lookupProjectedBatch(&.{"a"}, &.{"body"}, 8));
+            budget.limit = 8 * 1024 * 1024;
             const continued_projection = try reader.lookupProjectedBatch(&.{"a"}, &.{"body"}, 8);
+            try std.testing.expectEqual(metadata_owner, reader.directory_scope.?.ptr);
+            try std.testing.expectEqual(cached_directory, reader.directories[1].?.ptr);
+
             try std.testing.expectEqualStrings("\"alpha\"", continued_projection.values[0].fields[0].value);
             reader.releasePage();
             const absent_projection = try reader.lookupProjectedBatch(&.{ "b", "a", "b" }, &.{"not-present"}, 8);

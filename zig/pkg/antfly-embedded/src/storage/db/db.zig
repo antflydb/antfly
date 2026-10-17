@@ -40183,11 +40183,23 @@ pub const DB = struct {
         cached: usize = 0,
         next_cached: usize = 0,
         repair_requested: bool = false,
+        directory_arena: std.heap.ArenaAllocator,
+        directory_scope: ?@import("../backend_erased.zig").ReadScope = null,
+        directories: [64]?[]const u8 = @splat(null),
+        directories_loaded: [64]bool = @splat(false),
         values: [64]?[]const u8 = undefined,
         sources: [64]Source = undefined,
         pub const Batch = struct { values: []const ?[]const u8, consumed: usize };
         pub const Source = @import("../document_projection.zig").Source;
         pub const ProjectedBatch = struct { values: []const Source, consumed: usize };
+
+        fn retireDirectories(self: *@This()) void {
+            if (self.directory_scope) |*scope| scope.close();
+            self.directory_scope = null;
+            _ = self.directory_arena.reset(.free_all);
+            @memset(&self.directories_loaded, false);
+            @memset(&self.directories, null);
+        }
 
         // Keep keys and scalar size proofs separate from body scratch: sorted
         // reads retire body scratch, and a small byte target can consume this
@@ -40203,6 +40215,7 @@ pub const DB = struct {
             }
             self.cached = 0;
             self.next_cached = 0;
+            self.retireDirectories();
             _ = self.metadata.reset(.free_all);
             const a = self.metadata.allocator();
             const count = @min(documents.len, self.keys.len);
@@ -40289,7 +40302,9 @@ pub const DB = struct {
             // projected payload cohorts enter the caller's soft byte window.
             var directory_keys: [64]projection.Key = undefined;
             var keys: [64][]const u8 = undefined;
-            var directories: [64]?[]const u8 = @splat(null);
+            var pending: [64]usize = undefined;
+            var pending_count: usize = 0;
+            var fetched: [64]?[]const u8 = @splat(null);
             var candidates: usize = 0;
             for (0..available) |i| {
                 const proof = self.proofs[self.next_cached + i] orelse {
@@ -40297,12 +40312,26 @@ pub const DB = struct {
                     break;
                 };
                 if (proof.bytes < projection.minimum_bytes) break;
-                directory_keys[i] = projection.keyForRevision(revision.keyForPhysical(self.keys[self.next_cached + i]).?);
-                keys[i] = &directory_keys[i];
+                if (!self.directories_loaded[self.next_cached + i]) {
+                    directory_keys[pending_count] = projection.keyForRevision(revision.keyForPhysical(self.keys[self.next_cached + i]).?);
+                    keys[pending_count] = &directory_keys[pending_count];
+                    pending[pending_count] = self.next_cached + i;
+                    pending_count += 1;
+                }
                 candidates += 1;
             }
             if (candidates == 0) return null;
-            try DocumentPrimaryReadWindow.readMany(scope, keys[0..candidates], directories[0..candidates]);
+            if (pending_count != 0) {
+                // Keep this bounded metadata lease across payload windows. A
+                // one-row byte limit must not re-read all remaining directories.
+                errdefer self.retireDirectories();
+                if (self.directory_scope == null) self.directory_scope = try self.read.openReadScope(self.directory_arena.allocator());
+                try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
+                for (pending[0..pending_count], fetched[0..pending_count]) |index, raw| {
+                    self.directories[index] = raw;
+                    self.directories_loaded[index] = true;
+                }
+            }
             const Prepared = struct { fields: []projection.FieldValue, ranges: []ranges_mod.Range, values: [][]const u8, hashes: [][32]u8, duplicate: bool = false };
             var prepared: [64]Prepared = undefined;
             var requests: [64]ranges_mod.Request = undefined;
@@ -40320,7 +40349,7 @@ pub const DB = struct {
                     continue;
                 }
                 const proof = self.proofs[self.next_cached + count].?;
-                const raw = directories[count] orelse {
+                const raw = self.directories[self.next_cached + count] orelse {
                     self.requestRepair();
                     break;
                 };
@@ -40397,6 +40426,7 @@ pub const DB = struct {
         pub fn releasePage(self: *@This()) void {
             if (comptime storage_engine.enabled) return storage_engine.call("documentRowsReleasePage", .{self}) catch @panic("incompatible storage owner");
             self.window.retire();
+            self.retireDirectories();
             _ = self.metadata.reset(.free_all);
             self.cached = 0;
             self.next_cached = 0;
@@ -40404,6 +40434,8 @@ pub const DB = struct {
         pub fn deinit(self: *@This()) void {
             if (comptime storage_engine.enabled) return storage_engine.call("documentRowsDeinit", .{self}) catch @panic("incompatible storage owner");
             self.window.deinit();
+            self.retireDirectories();
+            self.directory_arena.deinit();
             self.metadata.deinit();
             self.read.abort();
             self.schema.release();
@@ -40440,7 +40472,7 @@ pub const DB = struct {
             if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
             var read = try self.db.core.store.beginReadTxn();
             errdefer read.abort();
-            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
+            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc), .directory_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {

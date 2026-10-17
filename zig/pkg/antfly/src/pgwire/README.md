@@ -421,3 +421,24 @@ buffer; canonical storage-copy timing includes its output allocation and keeps
 the same admission proof in the reconstruction baseline. Column encoding
 compares complete output hashes. These are microbenchmarks,
 not server RSS, throughput, or zero-cost claims.
+
+Frozen JSON objects/arrays in native spill and retained transport blocks are
+validated without building a DOM. Duplicate keys, depth, extents, and null flags
+are checked before publication. Ordinary scalar access materializes and caches
+a value on demand; encoded access builds canonical text without a DOM. Integer
+and float DOM tags decline text passthrough so frozen replay preserves their
+original tags. Existing arena-only block decoding remains eager; the explicit
+cache-owning decoder is used by spill leases and transported pages.
+
+Lazy caches use stable owners with enclosing allocation quotas and the existing
+bounded block lifetime. They do not capture movable page arenas or temporary decode budgets.
+Page/block retirement releases these owners; page retention shares the same
+lease. Server SQL column cursors and transport reencoding forward the optional
+encoded accessor. Sequential spill sizing uses encoded byte lengths and reclaims
+scalar fallback scratch after each row.
+
+Directory leases stay with the existing 64-document metadata window across
+small payload pulls, and retire at page completion or a changed ID window.
+Sorted range cohorts in linked values continue from the last touched page;
+extent-backed values keep their indexed lookup path. Neither change introduces
+a primary or transport format version.
