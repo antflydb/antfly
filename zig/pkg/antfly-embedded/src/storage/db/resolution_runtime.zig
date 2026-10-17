@@ -2440,20 +2440,30 @@ fn clearReresolveCursor(store: *backend_erased.Store, key: []const u8) !void {
     try txn.commit();
 }
 
-/// Probe both durable backfill namespaces in one read snapshot. Cold startup
+/// Check both durable backfill namespaces in one committed view. Cold startup
 /// must observe cursor-only debt without constructing workers or scanning the
 /// document corpus, even when the replay watermarks already match.
 pub fn hasDurableReresolveBacklog(store: anytype) !bool {
-    var txn = try store.beginProbe();
-    defer txn.abort();
-    for ([_][]const u8{ resolver_catalog.reresolve_resume_key, resolver_catalog.reresolve_repair_resume_key }) |key| {
-        _ = txn.get(key) catch |err| switch (err) {
-            error.NotFound => continue,
-            else => return err,
-        };
-        return true;
+    // getManySorted requires lexical order (repair precedes resume).
+    const keys = [_][]const u8{ resolver_catalog.reresolve_repair_resume_key, resolver_catalog.reresolve_resume_key };
+    var values: [keys.len]?[]const u8 = @splat(null);
+    if (comptime @hasDecl(@typeInfo(@TypeOf(store)).pointer.child, "readManyConsistent")) {
+        var txn = try store.readManyConsistent(&keys, &values);
+        defer txn.abort();
+        return values[0] != null or values[1] != null;
+    } else {
+        var probe = try store.beginProbe();
+        if (probe.vtable.get_many_sorted_is_atomic) {
+            defer probe.abort();
+            try probe.getManySorted(&keys, &values);
+        } else {
+            probe.abort();
+            var txn = try store.beginRead();
+            defer txn.abort();
+            try txn.getManySorted(&keys, &values);
+        }
+        return values[0] != null or values[1] != null;
     }
-    return false;
 }
 
 pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {

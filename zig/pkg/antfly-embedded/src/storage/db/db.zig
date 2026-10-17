@@ -30668,8 +30668,7 @@ pub const DB = struct {
     fn persistedResolutionStageStats(self: *DB) !types.ReplayStageStats {
         var persisted_stage = try self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false);
         const resources = self.core.batchExecutionResources();
-        var backend = resources.store.backendStore();
-        if (try resolution_runtime_mod.hasDurableReresolveBacklog(&backend)) {
+        if (try resolution_runtime_mod.hasDurableReresolveBacklog(resources.store)) {
             persisted_stage.enabled = true;
             persisted_stage.catch_up_required = true;
         }
