@@ -8224,6 +8224,42 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     try std.testing.expectEqualStrings("amount", mixed.include_columns[0]);
     try std.testing.expectEqualStrings("tenant", mixed.where[0].column);
     try std.testing.expectEqual(.gt, mixed.where[0].op);
+    _ = try Test.execute(a, first_id, "CREATE INDEX default_label_idx ON invoices(coalesce(label,'empty'))");
+    {
+        const guard = enterHandle(first_id, .exclusive).?;
+        defer guard.leave();
+        const indexed_db = try @import("tables.zig").get(guard.handle, "invoices");
+        for (0..256) |_| {
+            if ((try indexed_db.relationalIndexBuildStatus("default_label_idx")).state == .ready) break;
+            _ = try indexed_db.buildRelationalIndexStep("default_label_idx", .{});
+        }
+        try std.testing.expectEqual(.ready, (try indexed_db.relationalIndexBuildStatus("default_label_idx")).state);
+    }
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM invoices p CROSS JOIN invoices q WHERE p.tenant=7 AND p.tenant>0 AND lower(p.label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON true WHERE lower(q.label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
+    for ([_][]const u8{
+        "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON true WHERE coalesce(q.label,'empty')='empty'",
+        "SELECT p.amount FROM invoices p FULL JOIN invoices q ON true WHERE coalesce(q.label,'empty')='empty'",
+    }) |statement| {
+        const filtered = try Test.execute(a, first_id, statement);
+        try std.testing.expectEqual(@as(usize, 0), filtered.object.get("rows").?.array.items.len);
+    }
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON coalesce(q.label,'empty')='empty'"), "9007199254740993.1250");
+    _ = try Test.execute(a, first_id, "INSERT INTO invoices (_id,amount,label,tenant) VALUES ('two',2.0000,'OTHER',8)");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT p.amount FROM invoices p WHERE p._id='one'"), "9007199254740993.1250");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT p.amount FROM invoices p WHERE p.amount=9007199254740993.1250"), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE amount=$1", &.{.{ .number_string = "9007199254740993.1250" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM invoices p WHERE p.amount=$1", &.{.{ .number_string = "9007199254740993.1250" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM (SELECT amount FROM invoices) p WHERE p.amount=$1", &.{.{ .number_string = "9007199254740993.1250" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.execute(a, first_id, "UPDATE invoices p SET amount=p.amount FROM invoices q WHERE p._id='one' AND q._id='two' AND q.tenant=8 RETURNING p.amount"), "9007199254740993.1250");
+    const numeric_miss = try Test.execute(a, first_id, "SELECT p.amount FROM invoices p WHERE p.amount=9007199254740993.1251");
+    try std.testing.expectEqual(@as(usize, 0), numeric_miss.object.get("rows").?.array.items.len);
+    const limited = try Test.execute(a, first_id, "SELECT p.amount FROM (SELECT amount,label FROM invoices ORDER BY _id LIMIT 1) p WHERE coalesce(p.label,'empty')='OTHER'");
+    try std.testing.expectEqual(@as(usize, 0), limited.object.get("rows").?.array.items.len);
+    const shared = try Test.execute(a, first_id, "WITH c AS MATERIALIZED (SELECT amount,label FROM invoices) SELECT p.amount FROM c p CROSS JOIN c q WHERE lower(p.label)='ready'");
+    try std.testing.expectEqual(@as(usize, 2), shared.object.get("rows").?.array.items.len);
+    try Test.checkRow(try Test.execute(a, first_id, "WITH c AS MATERIALIZED (SELECT amount,label FROM invoices WHERE lower(label)='ready') SELECT p.amount FROM c p CROSS JOIN c q"), "9007199254740993.1250");
+    _ = try Test.execute(a, first_id, "DELETE FROM invoices WHERE _id='two'");
     try Test.checkRow(try Test.execute(a, first_id, "UPDATE invoices SET amount=amount+0.0001 RETURNING amount"), "9007199254740993.1251");
     antfly_db_close(first_id);
     // Retained bindings must not borrow the retired database/schema parser.
@@ -8246,6 +8282,7 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     defer antfly_db_close(final_id);
     try Test.checkRow(try Test.execute(a, final_id, "SELECT amount FROM invoices"), "9007199254740993.1253");
     try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1253");
+    try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT p.amount FROM invoices p CROSS JOIN invoices q WHERE p.tenant=7 AND p.tenant>0 AND lower(p.label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1253");
 }
 
 test "capi SQL connections share storage while session IDs and close remain independent" {

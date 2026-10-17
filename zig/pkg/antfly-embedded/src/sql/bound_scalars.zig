@@ -320,8 +320,25 @@ test "SQL inferred bare target parameters retain PostgreSQL ambiguity diagnostic
 }
 
 pub fn predicateScalar(alloc: Allocator, table: ?catalog.Table, predicate: *const ast.Predicate) !*const ast.Scalar {
-    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = &.{}, .parameters = &.{} };
+    return predicateScalarTyped(alloc, table, predicate, &.{});
+}
+
+pub fn predicateScalarTyped(alloc: Allocator, table: ?catalog.Table, predicate: *const ast.Predicate, parameters: []scalar.Type) !*const ast.Scalar {
+    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = &.{}, .parameters = parameters };
     return builder.predicateExpression(predicate);
+}
+
+/// Shape inference and executable binding must constrain comparison inputs
+/// identically. Typmods constrain stored columns, not comparison operands.
+pub fn comparisonOperand(alloc: Allocator, column: scalar.Type, value: ast.Value, parameters: []const scalar.Type) !*const ast.Scalar {
+    const literal = try alloc.create(ast.Scalar);
+    literal.* = .{ .literal = value };
+    if (value == .null or column.kind == null) return literal;
+    const floating_parameter = value == .parameter and value.parameter > 0 and value.parameter <= parameters.len and
+        (parameters[value.parameter - 1].element_type == .float32 or parameters[value.parameter - 1].element_type == .float64);
+    const cast = try alloc.create(ast.Scalar);
+    cast.* = .{ .cast = .{ .operand = literal, .type = column.kind.?, .element_type = if (column.kind == .array or (column.element_type == .numeric and !floating_parameter)) column.element_type else null } };
+    return cast;
 }
 
 /// allocator is the bounded binding arena. Nested Program arenas allocate from
@@ -766,13 +783,7 @@ const Builder = struct {
             .scalar => |expression| expression,
             .comparison => |comparison| blk: {
                 const column = try (self.table orelse return error.UndefinedColumn).column(comparison.field);
-                const literal = try self.node(.{ .literal = comparison.value });
-                // Declared floating parameters keep PostgreSQL's mixed
-                // NUMERIC/float comparison domain. Unknown inputs instead
-                // inherit the column's exact NUMERIC identity.
-                const floating_parameter = comparison.value == .parameter and comparison.value.parameter > 0 and comparison.value.parameter <= self.parameters.len and
-                    (self.parameters[comparison.value.parameter - 1].element_type == .float32 or self.parameters[comparison.value.parameter - 1].element_type == .float64);
-                const right = if (comparison.value == .null) literal else try self.node(.{ .cast = .{ .operand = literal, .type = column.type, .element_type = if (column.type == .array or (column.element_type == .numeric and !floating_parameter)) column.element_type else null } });
+                const right = try comparisonOperand(self.alloc, scalar.columnType(column), comparison.value, self.parameters);
                 break :blk try self.node(.{ .binary = .{
                     .op = switch (comparison.op) {
                         inline else => |tag| @field(ast.Scalar.Binary, @tagName(tag)),

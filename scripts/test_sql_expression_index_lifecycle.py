@@ -43,6 +43,95 @@ def row(number, email, status):
 
 
 class ExpressionIndexTest(unittest.TestCase):
+    def test_join_access_placement_and_shared_producer_semantics(self):
+        with postgres() as db:
+            print(
+                "PostgreSQL join access oracle:",
+                db.execute("SHOW server_version_num").fetchone()[0],
+            )
+            db.execute(
+                "CREATE TABLE invoices (_id TEXT PRIMARY KEY, amount NUMERIC(20,4), label TEXT, tenant BIGINT)"
+            )
+            db.execute(
+                "INSERT INTO invoices VALUES ('one',9007199254740993.1250,'READY',7)"
+            )
+            db.execute(
+                "CREATE INDEX mixed_idx ON invoices(tenant DESC NULLS FIRST,lower(label)) INCLUDE(amount) WHERE tenant>0"
+            )
+            db.execute(
+                "CREATE INDEX default_label_idx ON invoices(coalesce(label,'empty'))"
+            )
+            expected = Decimal("9007199254740993.1250")
+            for statement, rows in (
+                (
+                    "SELECT p.amount FROM invoices p CROSS JOIN invoices q WHERE p.tenant=7 AND p.tenant>0 AND lower(p.label)='ready'",
+                    [(expected,)],
+                ),
+                (
+                    "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON true WHERE lower(q.label)='ready'",
+                    [(expected,)],
+                ),
+                (
+                    "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON true WHERE coalesce(q.label,'empty')='empty'",
+                    [],
+                ),
+                (
+                    "SELECT p.amount FROM invoices p FULL JOIN invoices q ON true WHERE coalesce(q.label,'empty')='empty'",
+                    [],
+                ),
+                (
+                    "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON coalesce(q.label,'empty')='empty'",
+                    [(expected,)],
+                ),
+            ):
+                with self.subTest(statement=statement):
+                    self.assertEqual(rows, db.execute(statement).fetchall())
+            db.execute("INSERT INTO invoices VALUES ('two',2.0000,'OTHER',8)")
+            for statement in (
+                "SELECT p.amount FROM invoices p WHERE p.amount=%s",
+                "SELECT p.amount FROM (SELECT amount FROM invoices) p WHERE p.amount=%s",
+            ):
+                with self.subTest(statement=statement):
+                    self.assertEqual(
+                        [(expected,)], db.execute(statement, (expected,)).fetchall()
+                    )
+                    self.assertEqual(
+                        [],
+                        db.execute(
+                            statement, (Decimal("9007199254740993.1251"),)
+                        ).fetchall(),
+                    )
+            self.assertEqual(
+                [(expected,)],
+                db.execute(
+                    "UPDATE invoices p SET amount=p.amount FROM invoices q WHERE p._id='one' AND q._id='two' AND q.tenant=8 RETURNING p.amount"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [(expected,)],
+                db.execute(
+                    "SELECT p.amount FROM invoices p WHERE p._id='one'"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [(expected,), (expected,)],
+                db.execute(
+                    "WITH c AS MATERIALIZED (SELECT amount,label FROM invoices) SELECT p.amount FROM c p CROSS JOIN c q WHERE lower(p.label)='ready'"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [(expected,)],
+                db.execute(
+                    "WITH c AS MATERIALIZED (SELECT amount,label FROM invoices WHERE lower(label)='ready') SELECT p.amount FROM c p CROSS JOIN c q"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [],
+                db.execute(
+                    "SELECT p.amount FROM (SELECT amount,label FROM invoices ORDER BY _id LIMIT 1) p WHERE coalesce(p.label,'empty')='OTHER'"
+                ).fetchall(),
+            )
+
     def test_exact_numeric_literals_with_composite_expression_indexes(self):
         with postgres() as db:
             print(

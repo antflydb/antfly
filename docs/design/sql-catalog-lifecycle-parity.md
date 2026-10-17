@@ -10237,3 +10237,63 @@ Checkpoint validation (Debug):
   `/private/tmp/antfly-sql-automatic-index-point-capi-debug.log`.
 - Formatting, licensing, the 2,063-source Apache dependency boundary and
   immutable original-inventory audit pass. No release-disposition counts change.
+
+### Relation-aware access preparation before capture
+
+Relational scans now prepare immutable typed access facts before opening any
+statement cursor, including the shared capture used by source-aware mutations
+and RETURNING. The binding caches an immutable relation DAG and its immediate
+dominators. Execution prepares only parameter-dependent operands, in bounded
+scratch memory, and copies owned facts into statement-local scan requests.
+Neither the cached graph nor the original bound scans are mutated.
+
+Canonical column lineage supports direct predicates, primary-key equalities
+and matching expression equalities through joins and passthrough projections.
+Outer-join ON facts apply only to the nonpreserved input; WHERE facts on
+null-extended inputs must reject a synthetic NULL row. Shared producers require
+domination, so a filter on one materialized CTE consumer cannot narrow the
+producer used by another. Intrinsic producer filters still qualify. LIMIT,
+OFFSET, cardinality, aggregation, windows, volatile derived projections,
+set/recursive coercions and explicit materialization remain optimizer fences.
+Every SQL residual remains authoritative and row goals are cleared when facts
+are added. Native READY/partial-membership and retained-snapshot checks remain
+unchanged. Exhausting optional planner scratch falls back to original scans;
+actual allocation failure, cancellation and final publication failure propagate.
+
+Validation exposed a separate NUMERIC inference error: relation shape lowering
+inserted a coarse number cast and thereby inferred FLOAT8 before executable
+binding. Shape inference and executable binding now share comparison-operand
+construction. Unknown NUMERIC inputs preserve their exact domain, explicit
+floating descriptors preserve PostgreSQL's mixed-domain behavior, and column
+typmods do not round comparison operands. Both lowering passes receive the
+invocation's authoritative parameter descriptors. Regressions cover aliased and
+unaliased JSON number tokens above 2^53, explicit floating inputs, near misses
+and cold native reopen.
+
+This closes statement-local relation access placement, not join equivalence
+propagation or arbitrary computed-projection substitution. Unified physical
+EXPLAIN/execution planning, broader typed range domains, Raft-owned index
+publication, per-constraint activation, immutable embedded layout reuse and
+bounded conflict-counter retirement remain unfinished. Original dispositions
+remain 531 implemented / 132 rejected / 113 superseded / 810 unresolved.
+
+Checkpoint validation (Debug):
+
+- Full SQL: 881 core and 234 server contracts pass, four existing opt-in skips,
+  no failures/leaks, 21/21 steps in
+  `/private/tmp/antfly-sql-joined-access-shape-final-debug.log`.
+- Real C API: all four SQL contracts, 17 custom companion contracts and the
+  standard companion gates pass, 58/58 steps in
+  `/private/tmp/antfly-sql-joined-access-shape-final-capi-debug.log`. The native
+  fixture covers joined source UPDATE as well as reads and cold reopen.
+- The expanded precise-parameter contract passes for direct aliases and derived
+  projections, both inferred NUMERIC and explicit floating descriptors, in
+  `/private/tmp/antfly-sql-numeric-derived-final-debug.log`. Relation graph and
+  access preparation allocation-failure, cancellation and tiny-headroom
+  contracts also run in the full SQL gate.
+- Three owned PostgreSQL 18.6 oracle tests pass in
+  `/private/tmp/antfly-sql-joined-access-oracle-validated.log`, including outer
+  joins, shared producers, exact derived parameters, LIMIT and joined UPDATE.
+- Formatting, source licensing, the 2,064-source Apache boundary and immutable
+  original-inventory audit pass. Cache GC was previewed only; nothing deleted.
+  No original cases receive new credit from these component contracts.

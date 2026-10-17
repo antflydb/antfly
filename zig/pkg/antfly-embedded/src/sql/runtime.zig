@@ -1964,6 +1964,31 @@ test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
         try std.testing.expectEqualStrings(if (index == 1) "9007199254740994.1200" else "9007199254740993.1200", result.output.rows[0][0].string);
+        if (index == 0) {
+            var token_result = try execute(a, backend, &compiled, &.{.{ .number_string = "9007199254740993.1200" }}, .{});
+            defer token_result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), token_result.output.rows.len);
+            try std.testing.expectEqualStrings("9007199254740993.1200", token_result.output.rows[0][0].string);
+            for ([_][]const u8{
+                "SELECT q.n FROM docs q WHERE q.n=$1",
+                "SELECT q.n FROM (SELECT n FROM docs) q WHERE q.n=$1",
+            }) |aliased_sql| {
+                var aliased = try compiler.compile(a, aliased_sql, .{});
+                defer aliased.deinit();
+                var aliased_backend = backend;
+                var aliased_callbacks = backend.vtable.*;
+                aliased_callbacks.open_scan = Fixture.open;
+                aliased_backend.vtable = &aliased_callbacks;
+                var aliased_result = try execute(a, aliased_backend, &aliased, &.{.{ .number_string = "9007199254740993.1200" }}, .{});
+                defer aliased_result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), aliased_result.output.rows.len);
+                try std.testing.expectEqualStrings("9007199254740993.1200", aliased_result.output.rows[0][0].string);
+                aliased_backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float64 }};
+                var aliased_floating = try execute(a, aliased_backend, &aliased, &.{.{ .float = 9007199254740994 }}, .{});
+                defer aliased_floating.deinit();
+                try std.testing.expectEqual(@as(usize, 2), aliased_floating.output.rows.len);
+            }
+        }
         try std.testing.expectEqual(@as(usize, @intFromBool(index != 0)), fixture.mutations);
         if (index == 0) {
             var floating_backend = backend;

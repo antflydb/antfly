@@ -155,7 +155,7 @@ pub const Node = struct {
     },
 };
 pub const virtual_table_name = "$sql_relation";
-pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select, prepared_fields: []const []const u8 = &.{} };
+pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select, prepared_fields: []const []const u8 = &.{}, access_graph: ?*const @import("relation_access.zig").Graph = null };
 pub const prepared_scope_name = "$sql_prepared_scope";
 
 fn qualified(node: *const ast.Scalar) bool {
@@ -466,7 +466,7 @@ const Builder = struct {
             try self.constraints.append(self.alloc, .{ .expression = out.* });
         }
         if (query.predicate) |predicate_| {
-            const expression_ = try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(source.columns), predicate_);
+            const expression_ = try self.typedPredicate(source.columns, predicate_);
             try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(expression_, source.columns), .expected = .boolean });
         }
         if (query.having) |having| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(having, source.columns), .expected = .boolean });
@@ -671,7 +671,7 @@ const Builder = struct {
                 const prepared = self.prepared.get(leaf).?;
                 const columns = try self.scalarColumns(prepared.source.columns);
                 if (prepared.lowered.predicate) |predicate_| {
-                    const expression_ = try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(prepared.source.columns), predicate_);
+                    const expression_ = try self.typedPredicate(prepared.source.columns, predicate_);
                     changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation }) or changed;
                 }
                 for (prepared.expressions, common, prepared.types) |expression_, kind, *output| {
@@ -757,7 +757,7 @@ const Builder = struct {
                 const prepared = self.prepared.getPtr(leaf) orelse return error.InvalidSqlBackendResponse;
                 const columns = try self.scalarColumns(prepared.source.columns);
                 if (prepared.lowered.predicate) |predicate_| {
-                    const expression_ = try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(prepared.source.columns), predicate_);
+                    const expression_ = try self.typedPredicate(prepared.source.columns, predicate_);
                     changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation }) or changed;
                 }
                 for (prepared.expressions, common, prepared.types) |expression_, kind, *output| {
@@ -875,16 +875,20 @@ const Builder = struct {
         result.* = value;
         return result;
     }
+    fn typedPredicate(self: *Builder, columns: []const Column, predicate_: *const ast.Predicate) !*const ast.Scalar {
+        const descriptors: []scalar.Type = if (self.backend.parameter_invocation) |owner| owner.descriptors else &.{};
+        return @import("bound_scalars.zig").predicateScalarTyped(self.alloc, try self.virtualTable(columns), predicate_, descriptors);
+    }
     fn shapePredicate(self: *Builder, columns: []const Column, input: *const ast.Predicate) anyerror!*const ast.Scalar {
         return switch (input.*) {
             .scalar => |expression_| expression_,
             .comparison => |part| blk: {
-                var kind: ?ast.ColumnType = null;
+                var kind: scalar.Type = .{};
                 for (columns) |column| if (std.mem.eql(u8, column.internal, part.field)) {
-                    kind = if (column.origin) |origin| (try scalar.inferOutputWithInvocation(self.alloc, origin, self.shape_columns.items, self.parameters, self.backend.parameter_invocation)).kind else column.type;
+                    kind = if (column.origin) |origin| try scalar.inferOutputWithInvocation(self.alloc, origin, self.shape_columns.items, self.parameters, self.backend.parameter_invocation) else scalar.columnType(column);
                 };
-                const literal = try self.scalarNode(.{ .literal = part.value });
-                const right = if (kind != null and part.value != .null) try self.scalarNode(.{ .cast = .{ .operand = literal, .type = kind.? } }) else literal;
+                const descriptors: []const scalar.Type = if (self.backend.parameter_invocation) |owner| owner.descriptors else &.{};
+                const right = try @import("bound_scalars.zig").comparisonOperand(self.alloc, kind, part.value, descriptors);
                 break :blk try self.scalarNode(.{ .binary = .{ .op = switch (part.op) {
                     inline else => |tag| @field(ast.Scalar.Binary, @tagName(tag)),
                 }, .left = try self.scalarNode(.{ .column = part.field }), .right = right } });
@@ -1010,7 +1014,7 @@ const Builder = struct {
         result.windows = windows;
         if (result.predicate) |predicate_| {
             const wrapper = try self.alloc.create(ast.Predicate);
-            wrapper.* = .{ .scalar = if (self.shape_only) try self.shapePredicate(source.columns, predicate_) else try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(source.columns), predicate_) };
+            wrapper.* = .{ .scalar = if (self.shape_only) try self.shapePredicate(source.columns, predicate_) else try self.typedPredicate(source.columns, predicate_) };
             result.predicate = wrapper;
         }
         if (self.outer_scope != null) {
@@ -2132,7 +2136,8 @@ fn bindWithPreparedScope(alloc: Allocator, backend: catalog.Backend, statement: 
     const prepared_fields = try alloc.alloc([]const u8, builder.prepared_demands.count());
     var iterator = builder.prepared_demands.keyIterator();
     for (prepared_fields) |*field| field.* = iterator.next().?.*;
-    return .{ .root = root, .scans = try builder.scans.toOwnedSlice(alloc), .table = try builder.virtualTable(root.columns), .statement = lowered, .prepared_fields = prepared_fields };
+    const scans = try builder.scans.toOwnedSlice(alloc);
+    return .{ .root = root, .scans = scans, .table = try builder.virtualTable(root.columns), .statement = lowered, .prepared_fields = prepared_fields, .access_graph = try @import("relation_access.zig").prepareGraph(alloc, root, scans, backend) };
 }
 
 /// Assignment types cross arbitrary derived/CTE/set boundaries before binding

@@ -2284,7 +2284,8 @@ fn Source(comptime Context: type) type {
             if (self.engine.context.backend.regex_execution == null) self.engine.context.backend.regex_execution = &self.regex_execution;
             var search_arena = std.heap.ArenaAllocator.init(context.alloc);
             defer search_arena.deinit();
-            const scans = try bindSearchScans(search_arena.allocator(), relation.scans, context.parameters);
+            const prepared_scans = if (context.statement_capture != null) relation.scans else try @import("relation_access.zig").prepareScans(search_arena.allocator(), context.alloc, context.backend, &context.binding, context.parameters);
+            const scans = try bindSearchScans(search_arena.allocator(), prepared_scans, context.parameters);
             if (scans.len != 0) {
                 if (context.statement_capture) |capture| {
                     self.engine.cursors = try capture.cursors(relation);
