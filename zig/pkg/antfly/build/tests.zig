@@ -718,6 +718,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const nullability_scan_run = addFilteredTestRunArtifact(b, nullability_scan_tests);
     nullability_scan_run.addArg("--require-no-skips");
     b.step("antfly-relational-nullability-scan-test", "Verify bounded physical NULL validation, retained source cuts, resume and cancellation atomicity").dependOn(&nullability_scan_run.step);
+    const nullability_job_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system nullability job"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const nullability_job_run = addFilteredTestRunArtifact(b, nullability_job_tests);
+    nullability_job_run.addArg("--require-no-skips");
+    b.step("antfly-relational-nullability-job-test", "Verify durable fenced validation progress, cold resume and transactional cancellation").dependOn(&nullability_job_run.step);
     const relational_index_page_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{ "relational index build pages", "relational index release", "relational index system ready publication waits", "relational index system prepared writer reserves", "relational index system ordinary tuple replacement" },

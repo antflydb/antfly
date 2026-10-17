@@ -11020,3 +11020,66 @@ reopens cold storage, scans both old and new frames, and rejects historical
 absence as SQL NULL. The original row remains physically encoded at epoch 1.
 Both final native tests pass with zero skips/leaks and 51/51 build steps in
 `/private/tmp/antfly-sql-nullability-owner-scan-epochs-debug.log`.
+
+### Durable fenced validation progress
+
+`storage/db/relational_nullability_job.zig` now prepares exact nullability-only
+successors outside serialized apply and stages immutable inputs, owner-bound
+admission, a drained source cut, bounded compare-and-set scan progress and
+terminal cancellation in the caller's storage transaction. The job binds the
+namespace/range, admission epoch, physical catalog, predecessor/successor
+schemas, integrity catalog, ordered projection and immutable plan identity.
+Native progress advances the actual transactional source clock; Raft positions
+remain a distinct tagged domain and require a supplied ordered apply identity.
+Checksums and structural positions are not authenticated owner receipts.
+
+The reserved `schema_validation` topology role cannot be acquired, canceled or
+released by generic topology commands. Existing participants must drain before
+the source is frozen; new writes and unrelated schema changes stay fenced.
+Ready validation deliberately retains that fence without publishing a schema.
+Cancellation consumes the epoch even when admission never arrived, preventing
+late begin from reopening it. Begin/freeze/cancel reject headers ahead of the
+durable owner clock; cancellation must not silently adopt a copied future cut.
+
+Read preparation captures a retained snapshot after durable drain, verifies
+immutable inputs and resumes the physical iterator outside apply. Page commit
+uses fixed-size owner/epoch guards, exact predecessor comparison, checked
+counters and a rolling effect chain. Exact duplicate pages do not advance the
+clock; stale competing pages fail. Full schema/catalog hashes are checked at
+admission, freeze, read preparation and terminal readiness, not rehashed for
+every intermediate page under the apply lock. Cursor/header changes commit
+together, and callers must abort on any staging error.
+
+This is a storage participant, not the complete distributed validation job.
+`PreparedPage` is trusted local preparation, never an accepted wire assertion.
+Remaining integration must authenticate the metadata plan, join native/Raft
+apply and durable standby/outbox effects, independently verify replicated work,
+qualify restore/adoption of retained progress, sign exact owner receipts and
+coordinate all-owner installation/publication. No metadata capability is newly
+advertised: topology protocol remains version 54. Public tightening still uses
+the guarded rewrite, and no original case receives completion credit.
+
+Compatible publication must preserve unchanged index identities and historical
+row layouts. The ordinary metadata schema path currently retains a migration
+read schema and upserts a versioned full-text index; the ordinary storage path
+requires an unfenced owner. Reusing either path unchanged would violate this
+job's no-rewrite/index-preservation contract. The dedicated installer must
+prepare immutable schema/catalog state outside apply, verify the exact ready
+job and all required FK parent bindings inside the atomic publication, and
+retain admission until the authoritative cohort decision is installed. Generic
+schema/fence bypasses are not an acceptable substitute.
+
+Verification: both native validation-job tests and both physical scan tests
+pass in Debug, with zero skips/leaks and 60/60 combined build steps in
+`/private/tmp/antfly-sql-nullability-job-clock-guard-debug.log`. They cover real
+native LSM admission/drain, an older transaction completing behind admission,
+blocked new writes/schema changes, duplicate/stale pages, cold persisted resume,
+ready-without-publication, failed validation, never-visited cancellation,
+future-cut rejection and allocation-failure transaction rollback. Raft codec
+round trips test domain separation only, not an activated Raft job producer.
+The complete Debug SQL gate passes 896 portable and 234 native tests, with the
+four existing opt-in benchmarks skipped and 21/21 build steps in
+`/private/tmp/antfly-sql-nullability-job-full-sql-debug.log`. Formatting,
+control-catalog, Apache boundary (2,071 sources), license and inventory checks
+pass. GC was previewed only; nothing was deleted. Inventory remains
+531 implemented / 132 rejected / 113 superseded / 810 unresolved.

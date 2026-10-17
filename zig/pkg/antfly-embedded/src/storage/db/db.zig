@@ -26959,6 +26959,10 @@ pub const DB = struct {
         native_control: ?NativeTopologyContext,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // The dedicated schema-job adapter must validate admission and join
+        // progress with its authoritative apply/outbox transaction. Ordinary
+        // topology RPCs do not advertise or admit this unfinished producer.
+        if (command.fence.role == .schema_validation) return error.SchemaValidationJobRequired;
         const receipt_entry = ordered_receipt orelse native_receipt;
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();

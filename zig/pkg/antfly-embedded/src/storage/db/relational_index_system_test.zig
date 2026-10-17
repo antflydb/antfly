@@ -28,6 +28,254 @@ const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
 const docstore = @import("../docstore.zig");
 
+const NullabilityJobFixture = struct {
+    const job = @import("relational_nullability_job.zig");
+    const topo = @import("relational_integrity_topology.zig");
+    const source = @import("../source_authority.zig");
+    const namespace = @import("doc_identity_namespace.zig").Namespace{ .table_id = 900, .shard_id = 901, .range_id = 902 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .online_source_authority = .native, .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } };
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":false}},"required":["n"],"additionalProperties":false}}}}
+    ;
+    fn candidate(db: *db_mod.DB) !job.Candidate {
+        const predecessor = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(predecessor);
+        return job.Candidate.init(alloc, namespace.table_id, before, after, predecessor, &.{"n"}, .{});
+    }
+    fn binding(db: *db_mod.DB, prepared: *const job.Candidate, id: u8) !job.Binding {
+        const identity = try db.relationalTopologyIdentity();
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        return job.Binding.prepare(&read, prepared, @splat(id), @splat(83), .{
+            .admission_epoch = identity.next_epoch,
+            .transition_id = id,
+            .attempt = 1,
+            .owner_group_id = namespace.shard_id,
+            .peer_group_id = namespace.shard_id,
+            .namespace = namespace,
+            .catalog_digest = identity.catalog_digest,
+            .role = .schema_validation,
+        }, .native);
+    }
+    const Action = enum { begin, freeze, cancel };
+    fn apply(db: *db_mod.DB, prepared: *const job.Candidate, expected: job.Binding, action: Action) !job.Header {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        const header = switch (action) {
+            .begin => try job.stageBegin(alloc, &txn, expected, prepared, null),
+            .freeze => try job.stageFrozen(alloc, &txn, &manager, expected, null),
+            .cancel => try job.stageCancel(alloc, &txn, &manager, expected, null),
+        };
+        try txn.commit();
+        return header;
+    }
+    fn page(db: *db_mod.DB, prepared: *const job.PreparedPage) !job.Header {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        const header = try job.stagePage(alloc, &txn, &manager, prepared, null);
+        try txn.commit();
+        return header;
+    }
+    fn current(db: *db_mod.DB) !job.Header {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        return (try job.load(&read)) orelse error.MissingValidationJob;
+    }
+    fn clock(db: *db_mod.DB) !u64 {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        return (try source.load(&read)).?.sequence;
+    }
+};
+
+test "relational index system nullability job drains persists resumes and cancels without publishing" {
+    const F = NullabilityJobFixture;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-job-resume");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    var live = true;
+    defer if (live) database.close();
+    try database.setSchemaJson(alloc, F.before);
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} });
+    const old = try database.beginTransactionWithId(@splat(71), 100);
+    try database.writeTransaction(old, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} });
+    var prepared = try F.candidate(&database);
+    defer prepared.deinit();
+    const expected = try F.binding(&database, &prepared, 17);
+    try std.testing.expectError(error.SchemaValidationJobRequired, database.applyRelationalTopologyControl(.{ .fence = expected.fence, .action = .begin }, null));
+    const admitted = try F.apply(&database, &prepared, expected, .begin);
+    try std.testing.expect(admitted.updated == .native);
+    const duplicate = try F.apply(&database, &prepared, expected, .begin);
+    try std.testing.expectEqualDeep(admitted, duplicate);
+    try std.testing.expectError(error.TransactionTopologyBusy, F.apply(&database, &prepared, expected, .freeze));
+    try std.testing.expectEqualDeep(admitted, try F.current(&database));
+    try std.testing.expectError(error.IntegrityTopologyBusy, database.batch(.{ .writes = &.{.{ .key = "z", .value = "{\"n\":null}" }} }));
+    try database.commitTransaction(old, 220);
+    const frozen = try F.apply(&database, &prepared, expected, .freeze);
+    try std.testing.expectEqual(F.job.Phase.scanning, frozen.phase);
+    try std.testing.expect(frozen.frozen.?.native.sequence > admitted.updated.native.sequence);
+    try std.testing.expectEqualDeep(frozen, try F.apply(&database, &prepared, expected, .freeze));
+    {
+        var first = try F.job.PreparedPage.prepare(alloc, database.core, expected, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+        defer first.deinit();
+        var stale = try F.job.PreparedPage.prepare(alloc, database.core, expected, .{ .records = 2, .time_ns = std.time.ns_per_s }, .{});
+        defer stale.deinit();
+        const advanced = try F.page(&database, &first);
+        try std.testing.expectEqual(@as(u64, 1), advanced.rows_scanned);
+        const clock = try F.clock(&database);
+        try std.testing.expectEqualDeep(advanced, try F.page(&database, &first));
+        try std.testing.expectEqual(clock, try F.clock(&database));
+        try std.testing.expectError(error.SchemaValidationJobChanged, F.page(&database, &stale));
+        try std.testing.expectEqual(clock, try F.clock(&database));
+    }
+    database.close();
+    live = false;
+    database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    live = true;
+    try std.testing.expectEqual(@as(u64, 1), (try F.current(&database)).rows_scanned);
+    for (0..8) |_| {
+        var next = try F.job.PreparedPage.prepare(alloc, database.core, expected, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+        defer next.deinit();
+        const result = try F.page(&database, &next);
+        if (result.phase == .ready) break;
+    } else return error.ValidationJobDidNotComplete;
+    const validated = try F.current(&database);
+    try std.testing.expectEqual(@as(u64, 2), validated.rows_scanned);
+    try std.testing.expectEqual(F.job.Phase.ready, validated.phase);
+    try std.testing.expectError(error.IntegrityTopologyBusy, database.setSchemaJson(alloc,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":true},"extra":{"type":"string","nullable":true}},"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.SchemaValidationJobChanged, F.job.PreparedPage.prepare(alloc, database.core, expected, .{}, .{}));
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 1), database.core.schema.?.version);
+        const bytes = try validated.encode(alloc);
+        defer alloc.free(bytes);
+        try std.testing.expectEqualDeep(validated, try F.job.Header.decode(bytes));
+        // Structural codec coverage only: changing the tagged authority is
+        // not permission to submit a native job through a Raft producer.
+        var raft_header = validated;
+        raft_header.binding.authority = .raft;
+        raft_header.admitted = .{ .raft = .{ .term = 1, .index = 10 } };
+        raft_header.frozen = .{ .raft = .{ .term = 1, .index = 11 } };
+        raft_header.updated = .{ .raft = .{ .term = 1, .index = 12 } };
+        const raft_bytes = try raft_header.encode(alloc);
+        defer alloc.free(raft_bytes);
+        try std.testing.expectEqualDeep(raft_header, try F.job.Header.decode(raft_bytes));
+        raft_header.updated = validated.updated;
+        try std.testing.expectError(error.InvalidControlReceiptPosition, raft_header.encode(alloc));
+        try std.testing.expectError(error.SchemaValidationPublicationRequired, F.topo.stageRelease(&read, expected.fence));
+        try std.testing.expectError(error.SchemaValidationCancellationRequired, F.topo.stageCancel(&read, expected.fence));
+    }
+    const canceled = try F.apply(&database, &prepared, expected, .cancel);
+    try std.testing.expectEqual(F.job.Phase.canceled, canceled.phase);
+    try std.testing.expect((try database.relationalTopologyStatus()).fence == null);
+    try std.testing.expectEqualDeep(canceled, try F.apply(&database, &prepared, expected, .cancel));
+    try std.testing.expectError(error.SchemaValidationCanceled, F.apply(&database, &prepared, expected, .begin));
+    try database.batch(.{ .writes = &.{.{ .key = "z", .value = "{\"n\":null}" }} });
+
+    const never_visited = try F.binding(&database, &prepared, 18);
+    const terminal = try F.apply(&database, &prepared, never_visited, .cancel);
+    try std.testing.expect(terminal.admitted == null);
+    try std.testing.expectError(error.SchemaValidationCanceled, F.apply(&database, &prepared, never_visited, .begin));
+    try std.testing.expectError(error.SchemaValidationJobChanged, F.apply(&database, &prepared, expected, .begin));
+}
+
+test "relational index system nullability job failure scope corruption and transaction rollback stay fenced" {
+    const F = NullabilityJobFixture;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-job-faults");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    defer database.close();
+    try database.setSchemaJson(alloc, F.before);
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":null}" }} });
+    var prepared = try F.candidate(&database);
+    defer prepared.deinit();
+    const expected = try F.binding(&database, &prepared, 21);
+    var foreign = expected;
+    foreign.fence.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, F.apply(&database, &prepared, foreign, .begin));
+    _ = try F.apply(&database, &prepared, expected, .begin);
+    _ = try F.apply(&database, &prepared, expected, .freeze);
+    {
+        const original = try F.current(&database);
+        const clock_before = try F.clock(&database);
+        database.core.lockApply();
+        defer database.core.unlockApply();
+        var txn = try database.core.store.beginWriteTxn();
+        defer txn.abort();
+        var manager = try database.core.initTxnManager();
+        defer manager.deinit();
+        var future = original;
+        future.updated.native.sequence = clock_before + 1;
+        const bytes = try future.encode(alloc);
+        defer alloc.free(bytes);
+        try txn.put(F.job.key, bytes);
+        // A structurally valid copied header is not evidence that its cut
+        // committed on this owner. No mutation may silently adopt it.
+        try std.testing.expectError(error.InvalidControlReceiptPosition, F.job.stageBegin(alloc, &txn, expected, &prepared, null));
+        try std.testing.expectError(error.InvalidControlReceiptPosition, F.job.stageFrozen(alloc, &txn, &manager, expected, null));
+        try std.testing.expectError(error.InvalidControlReceiptPosition, F.job.stageCancel(alloc, &txn, &manager, expected, null));
+        try std.testing.expectEqual(clock_before, try F.clock(&database));
+        try std.testing.expectEqualDeep(original, try F.current(&database));
+    }
+    var failed = try F.job.PreparedPage.prepare(alloc, database.core, expected, .{}, .{});
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), failed.page.violation_column);
+    const result = try F.page(&database, &failed);
+    try std.testing.expectEqual(F.job.Phase.failed, result.phase);
+    try std.testing.expectEqual(@as(?u16, 0), result.failure_column);
+    try std.testing.expectError(error.IntegrityTopologyBusy, database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }));
+    const encoded = try result.encode(alloc);
+    defer alloc.free(encoded);
+    encoded[encoded.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, F.job.Header.decode(encoded));
+    encoded[encoded.len - 1] ^= 1;
+    var invalid = result;
+    invalid.rows_scanned = invalid.records + 1;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, invalid.encode(alloc));
+    _ = try F.apply(&database, &prepared, expected, .cancel);
+    const next_binding = try F.binding(&database, &prepared, 22);
+    const Rollback = struct {
+        fn run(a: std.mem.Allocator, db: *db_mod.DB, binding: F.job.Binding, candidate: *const F.job.Candidate) !void {
+            const clock = try F.clock(db);
+            const old = try F.current(db);
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            var txn = try db.core.store.beginWriteTxn();
+            var active = true;
+            defer if (active) txn.abort();
+            _ = F.job.stageBegin(a, &txn, binding, candidate, null) catch |err| {
+                txn.abort();
+                active = false;
+                try std.testing.expectEqual(clock, try F.clock(db));
+                try std.testing.expectEqualDeep(old, try F.current(db));
+                return err;
+            };
+            // Abort even the successful attempt so every allocation cut
+            // starts from the same committed owner record and native clock.
+            txn.abort();
+            active = false;
+            try std.testing.expectEqual(clock, try F.clock(db));
+            try std.testing.expectEqualDeep(old, try F.current(db));
+        }
+    };
+    try Rollback.run(alloc, &database, next_binding, &prepared);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Rollback.run, .{ &database, next_binding, &prepared });
+}
+
 const NullabilityScanFixture = struct {
     const validation = @import("relational_nullability.zig");
     fn open(database: *db_mod.DB, a: std.mem.Allocator, request: rows.Request, now_ns: u64) !rows.Reader {
