@@ -11523,3 +11523,44 @@ and inventory checks pass. Inventory remains 531 implemented / 132 rejected /
 113 superseded / 810 unresolved. The full Debug SQL gate for this attestation
 checkpoint is tracked separately; the prior pinned-observation gate above
 already passed all 1,130 SQL tests.
+
+### Protected catalog reopening during schema validation
+
+The attestation checkpoint's full Debug SQL gate subsequently completed:
+896 portable and 234 native tests passed, four opt-in benchmarks skipped,
+zero failures/leaks and 21/21 build steps. See
+`/private/tmp/antfly-sql-schema-attestation-full-debug.log`.
+
+Cold-owner configuration now distinguishes preserving a durable catalog from
+admitting its descriptor. Under a schema-validation fence, an exact predecessor
+public schema and exact persisted desired-index contract may reconstruct the
+existing runtime without schema writes, index reconciliation or contract
+replacement. The check pins schema/index runtime and an immutable store cut
+under apply-shared, then verifies durable progress outside that lock. A missing
+or different desired-index contract defers admission rather than guessing.
+
+Once the local successor is installed, both predecessor and successor hints
+remain deferred: neither a lower version nor an equal successor version grants
+publication. Historical descriptors only suppress admission. Catalog-driven
+repair/reconciliation reports busy throughout the active job, including after
+local installation. Cancellation removes the topology barrier; the retained
+historical job header does not become a permanent catalog lock.
+
+The first native Debug gate passes nine tests with zero skips/leaks and 51/51
+build steps in `/private/tmp/antfly-sql-schema-owner-catalog-debug.log`. Actual
+primary and standby roots carry an existing full-text index and execute the
+native validation journal. Descriptor-driven index deletion, schema advancement
+and repair leave the owner cut unchanged. The installed peer is closed and
+reopened before checking both descriptor versions again. The subsequent
+combined Debug gate adds the explicit post-cancellation policy check and
+existing runtime/authority regressions: 48 tests pass, zero skips/leaks and
+70/70 build steps; see
+`/private/tmp/antfly-sql-schema-owner-catalog-combined-debug.log`.
+
+This qualifies local catalog preservation, not positive end-to-end publication
+or a public lease. Metadata admission/ACK acceptance, enrollment/cohort checks,
+capability barriers, ordered Raft controls, adoption, all-owner publication and
+release, and read-layout/full-text retirement semantics remain required before
+activation. No parity case is reclassified. The control-source catalog is
+regenerated because the mounted regression now explicitly imports physical
+storage configuration.

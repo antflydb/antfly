@@ -97,6 +97,9 @@ const NullabilityJobFixture = struct {
         defer read.abort();
         return (try source.load(&read)).?.sequence;
     }
+    fn configure(db: *db_mod.DB, schema_json: []const u8, indexes_json: []const u8, historical: bool) !bool {
+        return @import("../write.zig").configureStorageKernelOwnerDbAtOpen(alloc, db, "rows", schema_json, indexes_json, null, null, null, null, null, historical);
+    }
 };
 
 test "relational index system nullability job drains persists resumes and cancels without publishing" {
@@ -785,6 +788,8 @@ test "relational index system nullability job native metadata journal preserves 
             defer alloc.free(orphan);
             const stamp: [8]u8 = @splat(0);
             try database.core.store.put(orphan, &stamp);
+            try std.testing.expect(!try F.configure(database, F.before, "{\"old\":{\"type\":\"full_text\"}}", false));
+            try std.testing.expect(database.hasIndex("old"));
         }
         var candidate = try F.candidate(&primary_db);
         defer candidate.deinit();
@@ -828,6 +833,16 @@ test "relational index system nullability job native metadata journal preserves 
         try std.testing.expect(pending_observation.replication_pending);
         try std.testing.expectEqual(primary_db.root_incarnation, pending_observation.physical_root_incarnation);
         try std.testing.expectEqualDeep(admitted.header.?, pending_observation.header.?);
+        try std.testing.expectEqual(@as(u64, 1), journal.lastLsn());
+        // Exact predecessor reads stay available, but hints cannot change
+        // schemas, remove an index, or start maintenance through this job.
+        try std.testing.expect(!try F.configure(&primary_db, F.before, "{\"old\":{\"type\":\"full_text\"}}", false));
+        try std.testing.expect(try F.configure(&primary_db, F.before, "{}", false));
+        try std.testing.expect(try F.configure(&primary_db, F.after, "{}", false));
+        try std.testing.expect(try F.configure(&primary_db, "{\"version\":0}", "{}", true));
+        try std.testing.expectError(error.SchemaValidationJobChanged, F.configure(&primary_db, "{\"version\":99}", "{}", false));
+        try std.testing.expect(primary_db.hasIndex("old"));
+        try std.testing.expectEqual(@as(u32, 1), primary_db.core.schema.?.version);
         try std.testing.expectEqual(@as(u64, 1), journal.lastLsn());
         const original_cut = admitted.position;
         primary_db.close();
@@ -908,6 +923,10 @@ test "relational index system nullability job native metadata journal preserves 
             try std.testing.expect(retried_cancel.duplicate and !retried_cancel.replication_pending);
             try std.testing.expectEqualDeep(canceled.position, retried_cancel.position);
             try Driver.replayTo(&journal, &peer_db, &next_lsn);
+            // A retained canceled header is history, not a permanent catalog
+            // barrier. Release is still governed by the durable topology.
+            for ([_]*db_mod.DB{ &primary_db, &peer_db }) |database|
+                try std.testing.expect((try database.schemaOwnerCatalogPolicy(F.before, false)) == .unprotected);
             try std.testing.expectError(error.SchemaValidationCanceled, Driver.command(&primary_db, begin));
         } else {
             const validated = try F.current(&primary_db);
@@ -925,6 +944,15 @@ test "relational index system nullability job native metadata journal preserves 
             try std.testing.expectEqual(end_lsn, journal.lastLsn());
             try std.testing.expectError(error.SchemaValidationPublicationRequired, Driver.command(&primary_db, .{ .binding = binding, .action = .cancel }));
             try std.testing.expectEqual(@as(u32, 2), peer_db.core.schema.?.version);
+            for ([_]*db_mod.DB{ &primary_db, &peer_db }) |database| {
+                const catalog_cut = try database.observeNativeSchemaOwner(binding, .{});
+                try std.testing.expect(try F.configure(database, F.before, "{}", false));
+                try std.testing.expect(try F.configure(database, F.after, "{}", false));
+                try std.testing.expect(database.hasIndex("old"));
+                const maintained = try @import("../write.zig").reconcileStorageKernelOwnerDb(alloc, database, "rows", F.after, "{}", "old", true, null, null, null);
+                try std.testing.expect(maintained.state == .busy);
+                try std.testing.expectEqualDeep(catalog_cut, try database.observeNativeSchemaOwner(binding, .{}));
+            }
             const AllocationProbe = struct {
                 parent: std.mem.Allocator,
                 database: *db_mod.DB,
@@ -975,6 +1003,12 @@ test "relational index system nullability job native metadata journal preserves 
         peer_live = true;
         try std.testing.expectEqualDeep(try F.current(&primary_db), try F.current(&peer_db));
         try std.testing.expectEqual(try F.clock(&primary_db), try F.clock(&peer_db));
+        if (!cancel_only) {
+            try std.testing.expect(try F.configure(&peer_db, F.before, "{}", false));
+            try std.testing.expect(try F.configure(&peer_db, F.after, "{}", false));
+            try std.testing.expect(peer_db.hasIndex("old"));
+            try std.testing.expectEqual(@as(u32, 2), peer_db.core.schema.?.version);
+        }
         try std.testing.expect(publisher.completions > 0);
     }
 }

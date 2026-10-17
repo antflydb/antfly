@@ -8843,6 +8843,37 @@ pub const DB = struct {
     /// under apply-exclusive, together with the transport marker and outbox.
     pub const NativeSchemaOwnerControl = @import("relational_schema_owner_control.zig");
 
+    pub const SchemaOwnerCatalogPolicy = enum { unprotected, readable, deferred };
+
+    /// Catalog hints cannot install a successor or reconcile indexes through a
+    /// validation job. Exact predecessor reads may use the durable runtime;
+    /// installation remains unpublished until coordinated release. Historical
+    /// descriptors only force deferral, never grant serving/mutation authority.
+    pub fn schemaOwnerCatalogPolicy(self: *DB, schema_json: []const u8, historical: bool) !SchemaOwnerCatalogPolicy {
+        const job = @import("relational_nullability_job.zig");
+        self.core.lockApplyShared();
+        var apply_shared = true;
+        defer if (apply_shared) self.core.unlockApplyShared();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        var resident = NativeSchemaOwnerControl.Resident.pin(self.core);
+        defer resident.deinit();
+        self.core.unlockApplyShared();
+        apply_shared = false;
+        const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return .unprotected;
+        if (fence.role != .schema_validation) return .unprotected;
+        if (!fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const stored = (try job.load(&read)) orelse return error.SchemaValidationJobRequired;
+        const header = try job.observe(self.alloc, &read, stored.binding);
+        if (header.phase == .installed) try resident.require(header) else try resident.requireBefore(header.binding);
+        if (historical or schema_json.len == 0) return .deferred;
+        const digest = job.hash(schema_json);
+        const before = std.mem.eql(u8, &digest, &header.binding.before_public);
+        const after = std.mem.eql(u8, &digest, &header.binding.after_public);
+        if (!before and !after) return error.SchemaValidationJobChanged;
+        return if (header.phase != .installed and before) .readable else .deferred;
+    }
+
     /// Read one actual owner cut without manufacturing publication permission
     /// or performing recovery. Debt is checked in the same immutable snapshot
     /// as the header; installed progress additionally requires its live runtime.

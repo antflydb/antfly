@@ -373,10 +373,16 @@ pub const Resident = struct {
     }
     pub fn require(self: @This(), header: job.Header) !void {
         if (header.phase != .installed or header.installation == null) return error.SchemaValidationRuntimeRecoveryRequired;
+        return self.requireVersion(header.binding.after_version, header.installation.?.physical_catalog);
+    }
+    pub fn requireBefore(self: @This(), binding: job.Binding) !void {
+        return self.requireVersion(binding.before_version, binding.physical_catalog);
+    }
+    fn requireVersion(self: @This(), version: u32, physical_catalog: Digest) !void {
         const view = self.view orelse return error.SchemaValidationRuntimeRecoveryRequired;
-        if (view.version() != header.binding.after_version) return error.SchemaValidationRuntimeRecoveryRequired;
+        if (view.version() != version) return error.SchemaValidationRuntimeRecoveryRequired;
         const physical_hash = if (self.indexes) |value| job.hash(&value.head.encode()) else job.hash("");
-        if (!equal(physical_hash, header.installation.?.physical_catalog) or
+        if (!equal(physical_hash, physical_catalog) or
             (self.indexes != null and self.indexes.?.plan.schemaView().epoch != view.epoch)) return error.SchemaValidationRuntimeRecoveryRequired;
     }
 };

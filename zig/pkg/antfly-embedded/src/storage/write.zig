@@ -1606,6 +1606,21 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     installed: ?*OwnerManagedConfig,
     historical_ordered_apply: bool,
 ) !bool {
+    const schema_policy = try db.schemaOwnerCatalogPolicy(schema_json, historical_ordered_apply);
+    if (schema_policy != .unprotected) {
+        if (schema_policy == .deferred) return true;
+        const durable = (try loadOwnerCatalogContract(alloc, db)) orelse return true;
+        defer alloc.free(durable);
+        if (!std.mem.eql(u8, durable, indexes_json)) return true;
+        // Restore only the already durable query/producer runtime. No schema,
+        // index reconciliation or desired-contract write is admitted here.
+        if (backend_runtime != null and (if (installed) |state| !state.matches(durable) else true)) {
+            try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, durable, backend_runtime, antfly_provider, null, null, table_name, secret_store, remote_content);
+            try db.resumeEnrichmentRuntimeAfterReconfigure("protected schema owner reopen", "*");
+        }
+        if (installed) |state| state.publish(durable);
+        return false;
+    }
     if (historical_ordered_apply) {
         const stored = try loadOwnerCatalogContract(alloc, db);
         defer if (stored) |value| alloc.free(value);
@@ -1826,6 +1841,10 @@ pub fn reconcileStorageKernelOwnerDb(
     antfly_provider: ?managed_embedder.AntflyProvider,
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
+    // A scheduler hint cannot repair or mutate this protected catalog, even
+    // if the visible descriptor happens to equal the newly installed schema.
+    if (try db.schemaOwnerCatalogPolicy("", true) != .unprotected)
+        return .{ .state = .busy };
     if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
         return .{ .state = .busy };
     if (try db.childGenerationSourceDefersOwnerCatalog())
