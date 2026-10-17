@@ -4108,6 +4108,114 @@ test "relational index system full-key reads guard exact READY tuple including m
     try db.abortTransaction(compound_reader, 7);
 }
 
+test "relational index system automatic expression points protect phantoms without unrelated write conflicts" {
+    const protection = @import("../range_protection.zig");
+    const Input = db_mod.types.RelationalRowQuery;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("automatic-expression-point-proof");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"mixed","keys":[{"column":"tenant","direction":"desc"},{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"email"}]},"result_type":"string","nulls":"first"}],"include_columns":["extra"],"where":[{"column":"active","op":"eq","value":true}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"email":{"type":"keyword"},"active":{"type":"boolean"},"extra":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .activate_range_tracking = true });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"tenant\":7,\"email\":\"Owner\",\"active\":true,\"extra\":\"before\"}" },
+        .{ .key = "b", .value = "{\"tenant\":8,\"email\":\"Other\",\"active\":true,\"extra\":\"before\"}" },
+    } });
+    const identity = blk: {
+        var pinned = db.core.relational_indexes.acquire().?;
+        defer pinned.deinit();
+        const expression = pinned.plan.boundIndexes()[0].tuple.keys[1].expression.?;
+        break :blk @import("../relational_index.zig").ExpressionKeyIdentity{ .fingerprint = expression.plan.fingerprint, .kind = .string, .builtin = expression.plan.result_sql_type };
+    };
+    var hints = [_]Input.ExpressionEquality{.{ .identity = identity, .value = .{ .string = "owner" } }};
+    const query: Input = .{ .auto_index = true, .schema_version = 1, .fields = &.{ "email", "extra" }, .expression_equalities = &hints, .conditions = &.{
+        .{ .column = "tenant", .op = .eq, .value = .{ .integer = 7 } },
+        .{ .column = "active", .op = .eq, .value = .{ .bool = true } },
+    } };
+    const Check = struct {
+        fn proofs(database: *db_mod.DB, input: Input, exact: bool) ![]protection.Proof {
+            const session = try database.openRelationalReadSession(alloc, "", "", .{ .include_range_proofs = true, .relational_query = input });
+            defer session.deinit();
+            try std.testing.expectEqual(exact, session.reader.exact_index_tuple != null);
+            const captured = try session.rangeProofs(alloc);
+            errdefer alloc.free(captured);
+            try std.testing.expectEqual(@as(usize, if (exact) 1 else protection.bucket_count), captured.len);
+            try std.testing.expectEqual(exact, captured[0].index != null);
+            return captured;
+        }
+    };
+    const unready = try Check.proofs(&db, query, false);
+    alloc.free(unready);
+    _ = try readyIndex(&db, "mixed");
+    const point = try Check.proofs(&db, query, true);
+    defer alloc.free(point);
+    var explicit = query;
+    explicit.auto_index = false;
+    explicit.index = "mixed";
+    explicit.expression_equalities = &.{};
+    explicit.lower = .{ .values = &.{ .{ .integer = 7 }, .{ .string = "owner" } } };
+    explicit.upper = explicit.lower;
+    const equivalent = try Check.proofs(&db, explicit, true);
+    defer alloc.free(equivalent);
+    try std.testing.expectEqualDeep(point, equivalent);
+    // Even nextPrefix-shaped bounds are not a point without full key arity.
+    explicit.lower = .{ .values = &.{.{ .integer = 7 }} };
+    explicit.upper = explicit.lower;
+    const prefix = try Check.proofs(&db, explicit, false);
+    alloc.free(prefix);
+    explicit.lower = .{ .values = &.{ .{ .integer = 7 }, .{ .string = "owner" } } };
+    explicit.upper = .{ .values = &.{ .{ .integer = 7 }, .{ .string = "zulu" } } };
+    const ranged = try Check.proofs(&db, explicit, false);
+    alloc.free(ranged);
+    var broad = query;
+    broad.expression_equalities = &.{};
+    const automatic_prefix = try Check.proofs(&db, broad, false);
+    alloc.free(automatic_prefix);
+
+    const reader = try db.beginTransaction(2);
+    try db.writeTransaction(reader, .{ .range_guards = point });
+    // The previous primary-range fallback blocked this unrelated tuple too.
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"tenant\":8,\"email\":\"Other\",\"active\":true,\"extra\":\"unrelated\"}" }} });
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"tenant\":7,\"email\":\"OWNER\",\"active\":true}" }} }));
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"tenant\":7,\"email\":\"Owner\",\"active\":true,\"extra\":\"changed\"}" }} }));
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"tenant\":7,\"email\":\"Owner\",\"active\":true}" }} }));
+    try db.abortTransaction(reader, 3);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"tenant\":7,\"email\":\"Owner\",\"active\":true,\"extra\":\"changed\"}" }} });
+    const stale = try db.beginTransaction(4);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(stale, .{ .range_guards = point }));
+    try db.abortTransaction(stale, 5);
+
+    hints[0].value = .{ .string = "absent" };
+    const empty = try Check.proofs(&db, query, true);
+    defer alloc.free(empty);
+    try std.testing.expect(empty[0].generation == null);
+    const missing_reader = try db.beginTransaction(6);
+    try db.writeTransaction(missing_reader, .{ .range_guards = empty });
+    try db.batch(.{ .writes = &.{.{ .key = "inactive", .value = "{\"tenant\":7,\"email\":\"ABSENT\",\"active\":false}" }} });
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "phantom", .value = "{\"tenant\":7,\"email\":\"ABSENT\",\"active\":true}" }} }));
+    try db.abortTransaction(missing_reader, 7);
+    try db.batch(.{ .writes = &.{.{ .key = "phantom", .value = "{\"tenant\":7,\"email\":\"ABSENT\",\"active\":true}" }} });
+    const missing_stale = try db.beginTransaction(8);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(missing_stale, .{ .range_guards = empty }));
+    try db.abortTransaction(missing_stale, 9);
+    const before_restart = try Check.proofs(&db, query, true);
+    defer alloc.free(before_restart);
+    db.close();
+    db_open = false;
+    db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    db_open = true;
+    const after_restart = try Check.proofs(&db, query, true);
+    defer alloc.free(after_restart);
+    try std.testing.expectEqualDeep(before_restart, after_restart);
+    const restart_stale = try db.beginTransaction(10);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(restart_stale, .{ .range_guards = empty }));
+    try db.abortTransaction(restart_stale, 11);
+    std.debug.print("automatic expression point proof: conservative_scopes={} selected_scopes=1 unrelated_write=allowed phantom=blocked cold_counter=preserved\n", .{protection.bucket_count});
+}
+
 test "relational index system exact tuple proof sees non-indexed row updates" {
     const protection = @import("../range_protection.zig");
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-exact-row-update");

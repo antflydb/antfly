@@ -39590,20 +39590,11 @@ pub const DB = struct {
         errdefer session.reader.deinit();
         if (opts.include_range_proofs) {
             const tracking = @import("../range_protection.zig");
-            if (session.reader.index) |index| {
-                const prefix = try @import("relational_index_records.zig").forwardPrefix(index.id());
-                const next = if (parsed.value.after == null and lower != null and upper != null and
-                    lower.?.inclusive and upper.?.inclusive and
-                    lower.?.values.len == index.tuple.keys.len and upper.?.values.len == index.tuple.keys.len and
-                    std.mem.startsWith(u8, session.reader.lower, &prefix) and session.reader.lower.len > prefix.len)
-                    try internal_keys.nextPrefixAlloc(scratch, session.reader.lower)
-                else
-                    null;
-                if (next) |exclusive_end| {
-                    if (std.mem.eql(u8, exclusive_end, session.reader.upper)) {
-                        session.range_proofs = try tracking.captureIndex(alloc, &session.reader.read, index.id().encode(), session.reader.lower[prefix.len..]);
-                    }
-                }
+            if (session.reader.exact_index_tuple) |tuple| {
+                // Physical access selection, not ingress syntax, owns the
+                // proof domain. Both explicit and automatic full-key reads
+                // observe the same generation counter on this retained cut.
+                session.range_proofs = try tracking.captureIndex(alloc, &session.reader.read, session.reader.index.?.id().encode(), tuple);
             }
             if (session.range_proofs == null) session.range_proofs = try tracking.capture(alloc, &session.reader.read, from_key, to_key);
         }

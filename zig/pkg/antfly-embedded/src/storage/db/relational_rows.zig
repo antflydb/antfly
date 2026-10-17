@@ -124,6 +124,17 @@ pub const Page = struct {
     }
 };
 
+test "relational rows snapshot exact point successor comparison handles descending suffixes without allocation" {
+    try std.testing.expect(Reader.exclusiveSuccessor("abc", "abd"));
+    try std.testing.expect(Reader.exclusiveSuccessor("abc\xff\xff", "abd"));
+    try std.testing.expect(Reader.exclusiveSuccessor("\x00\xff", "\x01"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("", ""));
+    try std.testing.expect(!Reader.exclusiveSuccessor("\xff\xff", ""));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abc"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abe"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abd\x00"));
+}
+
 pub const Reader = struct {
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     alloc: Allocator,
@@ -135,6 +146,9 @@ pub const Reader = struct {
     planner_candidates: usize = 0,
     planner_records: usize = 0,
     index: ?plans.BoundIndex,
+    /// Full-tuple equality selected on this retained snapshot, never a prefix
+    /// or a caller assertion. Borrows the reader-owned physical lower bound.
+    exact_index_tuple: ?[]const u8 = null,
     lower: []const u8,
     upper: []const u8,
     owned_lower: []const u8,
@@ -227,6 +241,7 @@ pub const Reader = struct {
         var lower: []const u8 = owned_lower;
         var upper: []const u8 = owned_upper;
         var selected_index: ?plans.BoundIndex = null;
+        var full_tuple_equality = false;
         var cursor_identity: ?[row_cursor_codec.identity_len]u8 = null;
         if (request.primary_lower) |bound| {
             const prefix = try internal.documentExactPrefixAlloc(owned, bound.key);
@@ -262,6 +277,10 @@ pub const Reader = struct {
                 const requested = (try internal.nextPrefixAlloc(owned, key)) orelse return error.InvalidRelationalRowsRequest;
                 if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
             }
+            full_tuple_equality = request.after == null and request.lower != null and request.upper != null and
+                request.lower.?.inclusive and request.upper.?.inclusive and
+                request.lower.?.values.len == selected_index.?.tuple.keys.len and
+                request.upper.?.values.len == selected_index.?.tuple.keys.len;
         }
         const conditions = try alloc.alloc(predicates.Plan, request.conditions.len);
         var initialized: usize = 0;
@@ -411,6 +430,7 @@ pub const Reader = struct {
                         const bounds = try candidate.bounds(owned, request.conditions, conditions);
                         lower = bounds.lower;
                         upper = bounds.upper;
+                        full_tuple_equality = candidate.equality_count == candidate.index.tuple.keys.len and !candidate.has_range;
                     }
                 }
             }
@@ -431,6 +451,7 @@ pub const Reader = struct {
                 };
             } else index_only = false;
         }
+        const exact_index_tuple = if (full_tuple_equality) try exactTuple(selected_index.?, lower, upper) else null;
         return .{
             .alloc = alloc,
             .arena = arena,
@@ -440,6 +461,7 @@ pub const Reader = struct {
             .planner_candidates = planner_candidates,
             .planner_records = planner_records,
             .index = selected_index,
+            .exact_index_tuple = exact_index_tuple,
             .lower = lower,
             .upper = upper,
             .owned_lower = owned_lower,
@@ -502,6 +524,24 @@ pub const Reader = struct {
             return .{ .lower = lower, .upper = upper };
         }
     };
+
+    fn exactTuple(index: plans.BoundIndex, lower: []const u8, upper: []const u8) !?[]const u8 {
+        const prefix = try records.forwardPrefix(index.id());
+        if (lower.len <= prefix.len or !std.mem.startsWith(u8, lower, &prefix) or !exclusiveSuccessor(lower, upper)) return null;
+        return lower[prefix.len..];
+    }
+
+    fn exclusiveSuccessor(lower: []const u8, upper: []const u8) bool {
+        // Compare nextPrefix(lower) without allocating another potentially
+        // wide tuple. Full-key arity is proven separately by the bound plan.
+        var length = lower.len;
+        while (length != 0) : (length -= 1) {
+            const ordinal = length - 1;
+            if (lower[ordinal] == 255) continue;
+            return upper.len == length and std.mem.eql(u8, lower[0..ordinal], upper[0..ordinal]) and upper[ordinal] == lower[ordinal] + 1;
+        }
+        return false;
+    }
 
     fn boundKey(alloc: Allocator, index: plans.BoundIndex, bound: Bound, upper: bool) ![]const u8 {
         var key = std.ArrayList(u8).empty;

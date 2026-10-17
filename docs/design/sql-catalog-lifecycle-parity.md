@@ -10181,3 +10181,59 @@ Checkpoint validation (Debug):
   `/private/tmp/antfly-sql-expression-access-headroom-debug.log`. Formatting,
   licensing, the 2,063-source Apache boundary and immutable inventory checks
   pass. No original cases are newly qualified by these component contracts.
+
+### Physical-plan exact tuple protection
+
+The native retained reader now records a complete-tuple equality domain from
+its selected READY access path. Explicit full-key bounds and automatic mixed
+direct/expression equality prefixes share this metadata. Full key arity is
+proved separately from physical successor bounds: a composite prefix must not
+be mistaken for a point merely because its upper bound is nextPrefix(lower).
+Successor comparison needs no additional tuple allocation. All fallible
+preparation finishes before schema/index lifetime pins are cloned.
+
+Read-session range protection consumes that physical plan, not ingress syntax.
+Eligible automatic full-key reads now capture one existing index-tuple
+generation counter on the same retained snapshot rather than 257 primary
+bucket counters. This reduces read-set and prepared-guard amplification while
+allowing unrelated tuples to change. It adds no new counter format or writer
+tracking protocol: inserts, key moves and non-indexed payload updates already
+advance or reserve the same canonical tuple identity. Empty point reads guard
+future members too. Partial-index membership and generation/READY checks remain
+mandatory; prefixes, ranges and unavailable-index fallbacks remain conservative.
+
+The new native regression compares automatic and explicit proof identities,
+allows an unrelated update, blocks matching inserts/key moves/payload updates,
+detects stale observations, permits excluded partial-index rows, protects an
+empty lookup against a matching phantom and verifies counters after cold
+reopen. A separate allocation-free successor contract covers descending
+trailing bytes and non-point bounds. The observed guard-scope reduction is
+257 to one for this full-key fixture, not a general query latency claim.
+
+This closes automatic full-tuple proof derivation, not general interval/phantom
+protection or distributed index publication. Join access facts still need
+lineage- and sharing-aware preparation before cursor capture, and EXPLAIN must
+consume the shared physical access plan. Raft-backed index publication and
+per-constraint activation remain unfinished. No original cases are newly
+qualified: 531 implemented / 810 unresolved.
+
+The pre-existing exact-span counter ledger also needs bounded reclamation for
+live-generation churn. This change neither creates a new counter family nor
+deletes old observations. Counters must not simply disappear while an older
+unprepared read can still be admitted: absent-to-absent reuse would introduce
+ABA. The long-term retirement design must fence stale observations and preserve
+prepared guard reservations, with bounded work and explicit generation scope.
+
+Checkpoint validation (Debug):
+
+- Full native index-system gate: 273 contracts plus the native Raft snapshot
+  companion pass without skips, failures or leaks, 51/51 steps in
+  `/private/tmp/antfly-sql-automatic-index-point-final-debug.log`.
+- The focused point/successor contracts pass on the final code, including the
+  cold-reopen phase, in
+  `/private/tmp/antfly-sql-automatic-index-point-focused-debug.log`.
+- All four real C API SQL contracts, 17 custom companion contracts and the
+  standard companion gates pass, 58/58 steps in
+  `/private/tmp/antfly-sql-automatic-index-point-capi-debug.log`.
+- Formatting, licensing, the 2,063-source Apache dependency boundary and
+  immutable original-inventory audit pass. No release-disposition counts change.
