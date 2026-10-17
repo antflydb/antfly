@@ -1239,6 +1239,9 @@ const Engine = struct {
             const single: ast.Projection = .{ .items = &.{.{ .expression = expression }} };
             var direction: ?usize = null;
             for (input) |row| {
+                // Planning correlated input rows is statement work too, and
+                // must remain cancellable before opening either pass.
+                try self.state();
                 const planned = try self.reductionPath(path, row, operation, single, middle);
                 if (!try self.batchEligible(planned, row, operation, single, middle)) return ordinary;
                 const next: usize = if (planned.execution_reversed == path.execution_reversed) 0 else 1;
@@ -1427,7 +1430,8 @@ const Engine = struct {
         self.collect_match_paths = false;
         self.stream_fold = if (count_shortest) null else &fold;
         self.stream_predicate = operation.predicate;
-        const passes = if (count_endpoints) try self.reductionPasses(input, operation, projection, middle, calls.items) else try retained.dupe(ReductionPass, &.{.{ .projection = projection }});
+        const zero_limit = if (projection.limit) |limit| try self.count(limit) == 0 else false;
+        const passes = if (count_endpoints and !zero_limit) try self.reductionPasses(input, operation, projection, middle, calls.items) else try retained.dupe(ReductionPass, &.{.{ .projection = projection }});
         for (passes, 0..) |pass, pass_index| {
             fold.active_calls = pass.active_calls;
             fold.record_rows = pass_index == 0;

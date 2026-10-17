@@ -1943,6 +1943,16 @@ test "DISTINCT ordering resolves projected expressions without exposing discarde
     }
 }
 
+test "zero aggregate demand skips partition planning and graph work" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES*1..]->(b:Document) RETURN sum(a.rank),sum(b.rank) LIMIT 0", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 64, .scanned_anchors = 0, .explored_edges = 0 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+}
+
 test "endpoint pipeline bags and aggregate partitions agree with ordered route execution" {
     const Dag = struct {
         fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
