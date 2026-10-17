@@ -63,20 +63,44 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 
 /// Monotonic feature epoch, published with catalog mutations and checked before parsing.
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
-pub const supported_reader_version: u32 = 2;
+pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
+pub const graph_expiration_namespace_reader_version: u32 = 4;
+pub const supported_reader_version: u32 = graph_expiration_namespace_reader_version;
+
+pub fn readerVersionBytes(version: u32) ![]const u8 {
+    return switch (version) {
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        else => error.UnsupportedDatabaseReaderVersion,
+    };
+}
+
+pub fn versionedCatalog(a: Allocator, data: []const u8, version: u32) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
+    defer parsed.deinit();
+    if (parsed.value == .array) {
+        return try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, data });
+    }
+    if (parsed.value != .object) return error.InvalidResolverConfig;
+    try parsed.value.object.put(parsed.arena.allocator(), "version", .{ .integer = version });
+    return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
 
 pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
     defer parsed.deinit();
     const rows = try catalogRows(parsed.value);
-    if (parsed.value == .object) return 2;
+    var required: u32 = if (parsed.value == .object) @intCast(parsed.value.object.get("version").?.integer) else 1;
     for (rows.array.items) |entry| {
         if (entry != .object) return error.InvalidResolverConfig;
+        if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) required = @max(required, 3);
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
-            if (entry.object.contains(field)) return 2;
+            if (entry.object.contains(field)) required = @max(required, 2);
         }
     }
-    return 1;
+    return required;
 }
 
 pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
@@ -89,9 +113,21 @@ pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
     return version;
 }
 
+/// Exclude temporary replacement reservations when proving a permanent format
+/// upgrade. A migration completion marker must outlive cancellation of a job.
+pub fn readAuthoritativeReaderVersion(txn: anytype, supported: u32) !u32 {
+    const raw = txn.get(replacement_reader_base_key) catch |err| switch (err) {
+        error.NotFound => return readMinimumReaderVersion(txn, supported),
+        else => return err,
+    };
+    const version = try std.fmt.parseInt(u32, raw, 10);
+    if (version == 0 or version > supported) return error.UnsupportedDatabaseReaderVersion;
+    return version;
+}
+
 pub fn stampMinimumReaderVersion(a: Allocator, txn: anytype, catalog: []const u8) !u32 {
     const version = @max(try readMinimumReaderVersion(txn, supported_reader_version), try catalogReaderVersion(a, catalog));
-    try txn.put(minimum_reader_key, if (version == 1) "1" else "2");
+    try txn.put(minimum_reader_key, try readerVersionBytes(version));
     return version;
 }
 
@@ -144,6 +180,11 @@ pub const ResolverConfig = struct {
     /// state for re-add/rename. These fields are catalog-owned, never public config.
     inline_managed: ?bool = null,
     retired: bool = false,
+    /// Unpublished execution contract owned by a durable graph replacement.
+    /// Its internal name keeps the serving resolver addressable during replay.
+    replacement_index: []const u8 = "",
+    replacement_resolver: []const u8 = "",
+
     /// Materialize canonical entity documents; false resolves graph keys only.
     promote: bool = true,
     /// Optional work is bounded independently of authoritative resolutions.
@@ -245,7 +286,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
+                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -288,40 +329,38 @@ pub const ResolverConfig = struct {
         return out;
     }
 
+    /// Serving resolvers and each private replacement have separate sibling
+    /// routing/identity views. A reservation name is exclusive while active;
+    /// its generation is already fenced by catalog admission.
+    pub fn sharesRoutingDomain(self: ResolverConfig, other: ResolverConfig) bool {
+        return !self.retired and !other.retired and std.mem.eql(u8, self.replacement_index, other.replacement_index);
+    }
+
+    /// Graph names are reserved while a replacement is private. Its shadow
+    /// uses that same name, so only that graph may consume staged decisions.
+    /// Public contracts remain available to graphs with unchanged resolvers.
+    pub fn visibleToGraph(self: ResolverConfig, index_name: []const u8) bool {
+        return self.replacement_index.len == 0 or std.mem.eql(u8, self.replacement_index, index_name);
+    }
+
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
-        return .{
-            .name = try alloc.dupe(u8, cfg.name),
-            .table = try alloc.dupe(u8, cfg.table),
-            .source_artifact = try alloc.dupe(u8, cfg.source_artifact),
-            .source_artifact_kind = cfg.source_artifact_kind,
-            .resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact),
-            .key_template = try alloc.dupe(u8, cfg.key_template),
-            .aliases = try cloneAliases(alloc, cfg.aliases),
-            .merges = try cloneAliases(alloc, cfg.merges),
-            .merge_generation = cfg.merge_generation,
-            .merge_state_version = cfg.merge_state_version,
-            .resolution_generation = cfg.resolution_generation,
-            .namespace_generation = cfg.namespace_generation,
-            .inline_managed = cfg.inline_managed,
-            .retired = cfg.retired,
-            .promote = cfg.promote,
-            .retain_work = cfg.retain_work,
-            .max_work_bytes = cfg.max_work_bytes,
-            .labels = try cloneLabels(alloc, cfg.labels),
-            .type_must_match = cfg.type_must_match,
-            .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
-            .candidate_search = if (cfg.candidate_search.len > 0) try alloc.dupe(u8, cfg.candidate_search) else "",
-            .candidate_ann_index = if (cfg.candidate_ann_index.len > 0) try alloc.dupe(u8, cfg.candidate_ann_index) else "",
-            .candidate_limit = cfg.candidate_limit,
-            .name_embedding = if (cfg.name_embedding.len > 0) try alloc.dupe(u8, cfg.name_embedding) else "",
-            .name_embedding_dims = cfg.name_embedding_dims,
-            .fusion_combine = if (cfg.fusion_combine.len > 0) try alloc.dupe(u8, cfg.fusion_combine) else "",
-            .fusion_trust = cfg.fusion_trust,
-            .fusion_prior = cfg.fusion_prior,
-            .fusion_prior_weight = cfg.fusion_prior_weight,
-            .min_confidence = cfg.min_confidence,
-            .config_generation = cfg.config_generation,
-        };
+        var owned = cfg;
+        // Establish an empty cleanup owner before the first allocation. Keep
+        // borrowed fields out of it until each clone has succeeded.
+        inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |name, T| {
+            if (T == []const u8 or T == []const []const u8 or T == []const resolver_lib.KeyAlias) @field(owned, name) = &.{};
+        }
+        errdefer owned.deinit(alloc);
+        inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |name, T| {
+            if (T == []const u8) {
+                @field(owned, name) = if (@field(cfg, name).len > 0) try alloc.dupe(u8, @field(cfg, name)) else "";
+            } else if (T == []const []const u8) {
+                @field(owned, name) = try cloneLabels(alloc, @field(cfg, name));
+            } else if (T == []const resolver_lib.KeyAlias) {
+                @field(owned, name) = try cloneAliases(alloc, @field(cfg, name));
+            }
+        }
+        return owned;
     }
 
     pub fn deinit(self: *ResolverConfig, alloc: Allocator) void {
@@ -347,6 +386,8 @@ pub const ResolverConfig = struct {
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
+        if (self.replacement_index.len > 0) alloc.free(self.replacement_index);
+        if (self.replacement_resolver.len > 0) alloc.free(self.replacement_resolver);
         self.* = undefined;
     }
 
@@ -414,21 +455,31 @@ pub const ResolverConfig = struct {
 
 /// Extended catalogs carry an explicit envelope. Pre-epoch readers parse only
 /// arrays, so they reject this shape even when they ignore unknown row fields.
-fn catalogRows(value: std.json.Value) !std.json.Value {
+/// Borrow the definition rows from a validated legacy array or reader envelope.
+/// The returned view has the lifetime of the caller's parsed JSON document.
+pub fn catalogRows(value: std.json.Value) !std.json.Value {
     if (value == .array) return value;
     if (value != .object) return error.InvalidResolverConfig;
     const version = value.object.get("version") orelse return error.InvalidResolverConfig;
-    if (version != .integer or version.integer != supported_reader_version) return error.UnsupportedResolverCatalogVersion;
+    if (version != .integer or (version.integer < 2 or version.integer > supported_reader_version)) return error.UnsupportedResolverCatalogVersion;
     const rows = value.object.get("resolvers") orelse return error.InvalidResolverConfig;
     if (rows != .array) return error.InvalidResolverConfig;
     return rows;
 }
 
 pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]u8 {
+    return serializeCatalogWithMinimumVersion(alloc, resolvers, 1);
+}
+
+/// Preserve a loaded catalog's envelope independently of the feature versions
+/// inferred from its current definitions (which may now be empty).
+pub fn serializeCatalogWithMinimumVersion(alloc: Allocator, resolvers: []const ResolverConfig, minimum: u32) ![]u8 {
+    if (minimum == 0 or minimum > supported_reader_version) return error.UnsupportedResolverCatalogVersion;
     const rows = try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
     errdefer alloc.free(rows);
-    if (try catalogReaderVersion(alloc, rows) == 1) return rows;
-    const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"resolvers\":{s}}}", .{rows});
+    const version = @max(minimum, try catalogReaderVersion(alloc, rows));
+    if (version == 1) return rows;
+    const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, rows });
     alloc.free(rows);
     return wrapped;
 }
@@ -857,4 +908,31 @@ test "capi resolver reader epochs fence older readers and remain monotonic" {
     try std.testing.expectEqual(@as(u32, 2), try stampMinimumReaderVersion(a, &txn, "[]"));
     txn.value = "3";
     try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&txn, 2));
+}
+
+test "graph ttl migration catalog epoch remains authoritative with replacement fields" {
+    const a = std.testing.allocator;
+    const old = "{\"version\":3,\"resolvers\":[{\"replacement_index\":\"shadow\"}]}";
+    const fenced = try versionedCatalog(a, old, 4);
+    defer a.free(fenced);
+    try std.testing.expectEqual(@as(u32, 4), try catalogReaderVersion(a, fenced));
+    try std.testing.expectEqualStrings("4", try readerVersionBytes(4));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(5));
+}
+
+test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 1, 2, 3, 4 }) |version| {
+        const encoded = try serializeCatalogWithMinimumVersion(a, &.{}, version);
+        defer a.free(encoded);
+        try std.testing.expectEqual(version, try catalogReaderVersion(a, encoded));
+        const definitions = try deserializeCatalog(a, encoded);
+        defer a.free(definitions);
+        try std.testing.expectEqual(@as(usize, 0), definitions.len);
+        const roundtrip = try serializeCatalogWithMinimumVersion(a, definitions, version);
+        defer a.free(roundtrip);
+        try std.testing.expectEqualStrings(encoded, roundtrip);
+    }
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 0));
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 5));
 }

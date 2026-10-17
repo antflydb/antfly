@@ -2321,6 +2321,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         // cause; keep RuntimeBoundaryFailure terminal as a fail-closed guard
         // for every other boundary.
         error.InferenceProviderFailure,
+        error.InferenceWorkerExecutableNotConfigured,
         error.KernelJitRequiredDynamicLoad,
         error.RuntimeBoundaryFailure,
         error.UnboundedEnrichmentProvider,
@@ -2421,6 +2422,19 @@ fn lockRuntime(runtime: *EnrichmentRuntime) ?std.Io {
 fn unlockRuntime(runtime: *EnrichmentRuntime, maybe_io: ?std.Io) void {
     if (comptime builtin.os.tag == .freestanding) return;
     if (maybe_io) |io| runtime.mutex.unlock(io);
+}
+
+/// Read capture retains terminal request outcomes rather than acknowledging
+/// successful write visibility. Check replay and owner health together without
+/// allocating diagnostics or consulting the terminal repair ledger.
+fn requireEnrichmentSettledForQueryCapture(runtime: *EnrichmentRuntime, sequence: u64) !void {
+    const maybe_io = lockRuntime(runtime);
+    defer unlockRuntime(runtime, maybe_io);
+    if (runtime.worker_failed) return RuntimeError.EnrichmentWorkerFailed;
+    if (runtime.retrying or runtime.applied_sequence < sequence)
+        return RuntimeError.EnrichmentRetryInProgress;
+    if (comptime @hasField(EnrichmentRuntime, "graph_stage_recovery_pending"))
+        if (runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
 }
 
 fn setActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) void {
@@ -2737,6 +2751,8 @@ fn isEnrichmentControlError(err: anyerror) bool {
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
     try std.testing.expect(!isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(!isRetryableEnrichmentError(error.InferenceWorkerExecutableNotConfigured));
+    try std.testing.expect(isRetryableEnrichmentError(error.InferenceWorkerUnavailable));
     try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
     try std.testing.expect(!isRetryableEnrichmentError(error.ResourceLimitExceeded));
 }
@@ -5034,6 +5050,8 @@ const UnsupportedEnrichmentRuntime = struct {
         try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, null);
     }
 
+    pub const requireSettledForQueryCapture = requireEnrichmentSettledForQueryCapture;
+
     pub fn syncWaitTimeoutMs(self: *const @This()) u64 {
         return @max(self.config.sync_wait_timeout_ms, 1);
     }
@@ -5681,6 +5699,8 @@ const PlatformEnrichmentRuntime = struct {
     pub fn waitForAppliedWithCancellation(self: *EnrichmentRuntime, sequence: u64, cancellation: CancellationToken) !void {
         try self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, null);
     }
+
+    pub const requireSettledForQueryCapture = requireEnrichmentSettledForQueryCapture;
 
     pub fn syncWaitTimeoutMs(self: *const EnrichmentRuntime) u64 {
         return @max(self.config.sync_wait_timeout_ms, 1);

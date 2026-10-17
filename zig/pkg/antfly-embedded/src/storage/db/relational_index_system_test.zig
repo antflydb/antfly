@@ -3063,6 +3063,7 @@ test "relational index system query lease typed point hydration retains nulls nu
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"},"optional":{"type":["json","null"]}},"required":["payload"],"additionalProperties":false}}}}
     );
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"payload\":null,\"optional\":null}", .json_null_fields = &.{"payload"} }} });
+    try db.batch(.{ .writes = &.{.{ .key = "z", .value = "{\"payload\":{\"old\":1},\"optional\":null}" }} });
     var reader = captured: {
         var lease = try db.beginQueryReadLease();
         defer lease.release();
@@ -3077,8 +3078,111 @@ test "relational index system query lease typed point hydration retains nulls nu
     try std.testing.expectEqualSlices(bool, &.{ false, true }, retained.sql_nulls.?);
     try std.testing.expect(retained.typed.?.object.get("payload").? == .null);
     try std.testing.expect(try reader.lookupTypedRow(a, "missing") == null);
+    const native = (try reader.lookupSqlRow(a, "a")).?;
+    try std.testing.expect(native.typed == null and native.sql_nulls == null);
+    const native_row: @import("../../sql/catalog.zig").Row = .{ .id = native.key, .version = native.version, .value = .null, .typed_cells = native.typed_cells };
+    try std.testing.expect(!(try native_row.cell("payload")).sql_null);
+    try std.testing.expect((try native_row.cell("payload")).value == .null);
+    try std.testing.expect((try native_row.cell("optional")).sql_null);
+    try std.testing.expect(try reader.lookupSqlRow(a, "missing") == null);
     var current = try db.beginRelationalRows(alloc, .{ .fields = &.{ "payload", "optional" } });
     defer current.deinit();
     const updated = (try current.lookupTypedRow(a, "a")).?;
     try std.testing.expectEqualStrings("0.123456789012345678901", updated.typed.?.object.get("payload").?.object.get("fraction").?.number_string);
+    const output_layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(a, &.{ "score", "optional", "payload" });
+    const batch = try reader.lookupSqlBatch(a, &.{ "z", "a", "missing" }, output_layout, 256 * 1024);
+    try std.testing.expectEqual(@as(usize, 3), batch.consumed);
+    try std.testing.expectEqualStrings("z", batch.rows[0].?.key);
+    try std.testing.expectEqualStrings("a", batch.rows[1].?.key);
+    try std.testing.expect(batch.rows[2] == null);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true }, batch.rows[1].?.typed_cells.?.presence.?);
+    try std.testing.expect(!batch.rows[1].?.typed_cells.?.values[2].sql_null);
+    try std.testing.expect(batch.rows[1].?.typed_cells.?.values[2].value == .null);
+    const one = try reader.lookupSqlBatch(a, &.{ "z", "a" }, output_layout, 1);
+    try std.testing.expectEqual(@as(usize, 1), one.consumed);
+    const Probe = struct {
+        fn run(backing: std.mem.Allocator, live: *@import("relational_rows.zig").Reader) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(region.allocator(), &.{ "payload", "optional", "score" });
+            const result = try live.lookupSqlBatch(region.allocator(), &.{ "z", "a", "missing" }, layout, 256 * 1024);
+            try std.testing.expectEqualStrings("z", result.rows[0].?.key);
+            try std.testing.expectEqual(@as(usize, 3), result.consumed);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Probe.run, .{&reader});
+    // Paired allocation fixture for the former point-hydration/output-copy
+    // path versus sorted batch hydration directly into the final layout.
+    var ids_buffer: [64][8]u8 = undefined;
+    var ids: [64][]const u8 = undefined;
+    var writes: [64]db_mod.types.BatchWrite = undefined;
+    for (&ids_buffer, &ids, &writes, 0..) |*buffer, *id, *write_out, i| {
+        id.* = try std.fmt.bufPrint(buffer, "x{d:0>3}", .{63 - i});
+        write_out.* = .{ .key = id.*, .value = "{\"payload\":null,\"optional\":null}", .json_null_fields = &.{"payload"} };
+    }
+    try db.batch(.{ .writes = &writes });
+    var peaks: [2]usize = undefined;
+    var calls: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |batched, i| {
+        const test_alloc = @import("../lite/test_allocator.zig");
+        var counted = std.testing.FailingAllocator.init(alloc, .{});
+        var stable: test_alloc.NoResizeAllocator = .{ .backing = counted.allocator() };
+        var budget: test_alloc.BudgetAllocator = .{ .backing = stable.allocator() };
+        {
+            var points = try db.beginRelationalRows(budget.allocator(), .{ .fields = &.{ "payload", "optional" } });
+            defer points.deinit();
+            var output = std.heap.ArenaAllocator.init(budget.allocator());
+            defer output.deinit();
+            const out = output.allocator();
+            const layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(out, &.{ "payload", "optional" });
+            if (batched) {
+                const result = try points.lookupSqlBatch(out, &ids, layout, 256 * 1024);
+                try std.testing.expectEqual(@as(usize, 64), result.consumed);
+                for (result.rows, &ids) |row, id| {
+                    try std.testing.expectEqualStrings(id, row.?.key);
+                    try std.testing.expect(!row.?.typed_cells.?.values[0].sql_null);
+                }
+            } else {
+                var source_layout: ?*const @import("../../sql/catalog.zig").Row.TypedLayout = null;
+                for (ids) |id| {
+                    const row = (try points.lookupSqlRowWithLayout(out, id, &source_layout)).?;
+                    const values = try out.dupe(@import("../../sql/catalog.zig").Row.Cell, row.typed_cells.?.values);
+                    _ = try out.dupe(bool, row.typed_cells.?.presence.?);
+                    try std.testing.expect(!values[0].sql_null);
+                }
+            }
+            peaks[i] = budget.peak;
+            calls[i] = counted.alloc_index;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(calls[1] < calls[0]);
+    // A tiny-row batch trades bounded read-scope metadata for fewer heap
+    // allocations. Do not claim that every workload lowers its peak.
+    try std.testing.expect(peaks[1] <= peaks[0] + 2 * 1024 * 1024);
+    std.debug.print("SQL ranked hydration: rows=64 point_peak={} batch_peak={} point_allocations={} batch_allocations={}\n", .{ peaks[0], peaks[1], calls[0], calls[1] });
+    // Wide unselected bodies must not turn a small output page into an
+    // unbounded prefetch. Scoped source quota can shrink the microbatch.
+    const body = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(body);
+    var random = std.Random.DefaultPrng.init(42);
+    for (body) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    const wide = try std.fmt.allocPrint(alloc, "{{\"payload\":\"{s}\",\"optional\":null}}", .{body});
+    defer alloc.free(wide);
+    var wide_writes: [16]db_mod.types.BatchWrite = undefined;
+    for (&wide_writes, ids[0..16]) |*entry, id| entry.* = .{ .key = id, .value = wide };
+    try db.batch(.{ .writes = &wide_writes });
+    var wide_reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"optional"} });
+    defer wide_reader.deinit();
+    const small_layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(a, &.{"optional"});
+    var delivered: usize = 0;
+    while (delivered < 16) {
+        const result = try wide_reader.lookupSqlBatch(a, ids[delivered..16], small_layout, 256 * 1024);
+        try std.testing.expect(result.consumed > 0);
+        for (result.rows, ids[delivered..][0..result.consumed]) |row, id| {
+            try std.testing.expectEqualStrings(id, row.?.key);
+            try std.testing.expect(row.?.typed_cells.?.values[0].sql_null);
+        }
+        delivered += result.consumed;
+    }
 }

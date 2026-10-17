@@ -166,3 +166,23 @@ test "executor archive boundary round trips real batched file IO and task result
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+const retained_io = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+extern fn runtime_io_abi_test_retained_source(output: *retained_io.Storage.Lease) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+
+test "executor archive boundary opens retained immutable sources and preserves their leases" {
+    var lease: retained_io.Storage.Lease = undefined;
+    const status = runtime_io_abi_test_retained_source(&lease);
+    if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var source = try lease.view.openLeasedImmutableSource(std.testing.allocator, "/retained/runs/1.sst");
+    defer source.close();
+    // The source must retain its immutable owner after the storage view closes.
+    lease.deinit();
+    leased = false;
+    var bytes: [4]u8 = undefined;
+    try source.readInto(2, &bytes);
+    try std.testing.expectEqualStrings("cdef", &bytes);
+    try std.testing.expectError(error.EndOfStream, source.readInto(7, &bytes));
+}

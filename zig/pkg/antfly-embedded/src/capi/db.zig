@@ -134,10 +134,16 @@ pub fn startLiteEmbeddedInference(
     const models_dir = if (budget_options.models_dir) |directory| try alloc.dupe(u8, directory) else null;
     errdefer if (models_dir) |directory| alloc.free(directory);
     owned_options.models_dir = models_dir;
+    const service = try alloc.create(handles.SharedLiteInference);
+    errdefer alloc.destroy(service);
     const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), owned_options);
-    handle.lite_inference_models_dir = models_dir;
-    handle.lite_inference_io = io_impl;
-    handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
+    service.* = .{
+        .alloc = alloc,
+        .io = io_impl,
+        .models_dir = models_dir,
+        .lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner },
+    };
+    handle.lite_inference = service;
     // Report the policy the node actually resolved (host-detected by
     // default, or the caller's explicit override) rather than leaving
     // `lite_inference_status` at the pre-open placeholder values.
@@ -362,6 +368,8 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
         cfg.value.namespace_generation = 0;
         cfg.value.inline_managed = true;
         cfg.value.retired = false;
+        cfg.value.replacement_index = "";
+        cfg.value.replacement_resolver = "";
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
@@ -2399,6 +2407,8 @@ pub const LiteResolvedOpenOptions = struct {
     /// Internal: the connection boundary owns the cross-process path lease.
     externally_locked: bool = false,
     artifact_reader_fence: bool = false,
+    /// Borrowed only during open, under the connection's publication fence.
+    allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2605,14 +2615,27 @@ pub fn openLiteHandleAllocWithRuntime(
     borrowed_io: ?std.Io,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !*Handle {
+    return openLiteHandleAllocWithSharedInference(alloc, path, resolved, create, borrowed_io, backend_runtime, null);
+}
+
+pub fn openLiteHandleAllocWithSharedInference(
+    alloc: Allocator,
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    borrowed_io: ?std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    inference_source: ?*Handle,
+) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
+    var handle_owns_resources = false;
     // Each cached generation owns its storage pool. Retired cursors may keep
     // an older generation alive while the same index roots reopen in this one.
     var owned_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = if (resolved.externally_locked and backend_runtime == null)
         try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedIo(alloc)
     else
         null;
-    errdefer if (owned_runtime) |*runtime| runtime.deinit();
+    errdefer if (!handle_owns_resources) if (owned_runtime) |*runtime| runtime.deinit();
     var backend = if (create)
         try lite_backend.Handle.createWithOptions(alloc, path, .{
             .externally_locked = resolved.externally_locked,
@@ -2627,7 +2650,11 @@ pub fn openLiteHandleAllocWithRuntime(
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
         });
-    errdefer backend.deinit();
+    errdefer if (!handle_owns_resources) backend.deinit();
+    if (resolved.allocator_verification_owner) |verified| {
+        if (!resolved.externally_locked) return error.InvalidArgument;
+        try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
+    }
     if (resolved.externally_locked) {
         backend.native_docstore.?.file.externally_locked = true;
         backend.native_docstore.?.maintenance_start_suppressed = true;
@@ -2674,7 +2701,7 @@ pub fn openLiteHandleAllocWithRuntime(
     opts.identity_namespace = identity.identity_namespace;
     opts.prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace;
     var db = try db_mod.DB.open(alloc, path, opts);
-    errdefer db.close();
+    errdefer if (!handle_owns_resources) db.close();
 
     if (create) {
         // Antfly Lite databases provision the same default full-text index
@@ -2684,7 +2711,7 @@ pub fn openLiteHandleAllocWithRuntime(
     }
 
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_resources) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .db = db,
@@ -2697,22 +2724,27 @@ pub fn openLiteHandleAllocWithRuntime(
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
         .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
-    // Only the native profile runs background enrichment automatically;
-    // only builds that both advertise (lite-local-inference-runtime) and
-    // actually link (capi_build_options.inference_enabled) the local
-    // inference runtime may construct one. Every other combination -- flag
-    // unset, default build, hosted profile -- leaves the handle exactly as
-    // it was before this feature existed.
+    // Transfer the complete generation before configuring producers. From this
+    // point even a failed open must drain the actual DB stored in the handle,
+    // then release inference, storage and IO in the ordinary close order.
+    handle_owns_resources = true;
+    errdefer {
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    // Native builds link local inference. The native profile starts a service
+    // only when the caller requests it and the target advertises support;
+    // hosted/freestanding surfaces retain caller-supplied inference.
     if (resolved.profile == .native and
         resolved.inference.local_runtime_configured and
         capi_build_options.inference_enabled and
         lite_backend.capabilitiesForProfile(.native).local_inference_runtime)
     {
-        // `backend.deinit()`, `db.close()`, and `alloc.destroy(handle)` are
-        // already registered as `errdefer`s above (in that unwind order);
-        // adding any of that cleanup here too would run it twice on this
-        // error path. Only unwind the state this function itself owns.
-        try startLiteEmbeddedInference(handle, alloc, path, .{
+        if (if (inference_source) |source| source.lite_inference else null) |service| {
+            service.retain();
+            handle.lite_inference = service;
+            handle.lite_inference_status = inference_source.?.lite_inference_status;
+        } else try startLiteEmbeddedInference(handle, alloc, path, .{
             .models_dir = resolved.inference.models_dir,
             .host_budget_mb = resolved.inference.host_budget_mb,
             .backend_budget_mb = resolved.inference.backend_budget_mb,
@@ -2727,16 +2759,9 @@ pub fn openLiteHandleAllocWithRuntime(
     // default full-text index, so this is a no-op there). Must run after
     // `startLiteEmbeddedInference` so an embedded local provider is already
     // attached to the handle when this reads it.
-    refreshLiteManagedEmbeddingRuntime(handle) catch |err| {
-        stopLiteEmbeddedInference(handle);
-        return err;
-    };
+    try refreshLiteManagedEmbeddingRuntime(handle);
     @import("entity_sink.zig").attach(handle, &handle.db);
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        stopLiteEmbeddedInference(handle);
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    try @import("tables.zig").loadCatalog(handle);
     if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
@@ -3011,8 +3036,18 @@ pub fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) ca
         .capabilities = capabilities,
     };
 
-    const bytes = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(status, .{})}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
-    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const status_json = std.json.Stringify.valueAlloc(a, status, .{}) catch |err| return capi.mapError(err);
+    var value = std.json.parseFromSliceLeaky(std.json.Value, a, status_json, .{}) catch |err| return capi.mapError(err);
+    if (comptime capi_build_options.inference_enabled) if (handle.lite_inference) |service| {
+        const admission = inference_provider.embeddedMemoryAdmissionStats(service.lifetime.handle) catch |err| return capi.mapError(err);
+        const bytes = std.json.Stringify.valueAlloc(a, admission, .{}) catch |err| return capi.mapError(err);
+        const admission_value = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch |err| return capi.mapError(err);
+        value.object.getPtr("inference").?.object.put(a, "memory_admission", admission_value) catch |err| return capi.mapError(err);
+    };
+    out.* = stringifyJson(value) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
@@ -4712,6 +4747,16 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
     defer jobs.deinit();
     var rows: std.ArrayList(std.json.Value) = .empty;
     for (jobs.value) |job| {
+        const upstream = if (database.enrichment_runtime) |runtime| runtime.stats() else db_mod.types.EnrichmentStats{};
+        const replaying = job.phase != .failed and !job.producer_replay_complete;
+        const waiting = job.phase != .failed and job.producer_replay_target > upstream.applied_sequence;
+        const producer_pending = replaying or waiting;
+        const blocked_reason: ?[]const u8 = if (replaying) "replaying_producer_sources" else if (waiting) "waiting_for_producer_enrichment" else null;
+        // A malformed failed declaration must not hide its retry/error status.
+        const producers = database.graphReplacementProducerNamesAlloc(a, job) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => try a.alloc([]u8, 0),
+        };
         const status = try std.json.Stringify.valueAlloc(a, .{
             .name = job.name,
             .replaces = job.old,
@@ -4720,6 +4765,13 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
             .applied_sequence = job.applied_sequence,
             .target_sequence = database.core.nextDerivedSequence(),
             .last_error = job.last_error,
+            .blocked_reason = blocked_reason,
+            .producer_artifacts = producers,
+            .producer_replay_target = job.producer_replay_target,
+            .producer_applied_sequence = upstream.applied_sequence,
+            .upstream_last_error = if (producer_pending and upstream.last_error_code.len > 0) upstream.last_error_code.slice() else @as(?[]const u8, null),
+            .upstream_retrying = producer_pending and upstream.retrying,
+            .upstream_next_retry_at_ms = if (producer_pending) upstream.next_retry_at_ms else 0,
             .retry_count = job.retry_count,
             .total_retry_count = job.total_retry_count,
             .max_total_retries = db_mod.DB.replacement_total_retry_limit,
@@ -5339,8 +5391,11 @@ pub fn antfly_db_stats_json(
 }
 
 pub fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
-    const stats = try handle.database().*.stats(handle.alloc);
+    var stats = try handle.database().*.stats(handle.alloc);
     defer db_mod.types.freeDBStats(handle.alloc, stats);
+
+    const context = handle.lite_connection_context orelse if (handle.parent_handle) |parent| parent.lite_connection_context else null;
+    if (context) |connection| connection.owner.overlayTtlStats(handle.database(), &stats.ttl_cleanup);
 
     const indexes = try dbIndexStatsProjectionAlloc(handle.alloc, stats);
     defer if (indexes.len > 0) handle.alloc.free(indexes);
@@ -7501,13 +7556,20 @@ pub fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice
     while (true) {
         if (builtin.is_test) if (test_index_before_wait_quantum) |hook|
             hook(handle_ptr) catch |err| return capi.mapError(err);
+        var background_owner = false;
         const pending = blk: {
             const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
             defer guard.leave();
             if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
             const database = guard.handle.database();
+            const context = guard.handle.lite_connection_context orelse if (guard.handle.parent_handle) |parent| parent.lite_connection_context else null;
+            background_owner = if (context) |connection| connection.owner.worker != null else false;
             const now = monotonicNowNs();
-            const quantum_ms = @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+            // Native Lite already owns a detached builder. Foreground build
+            // quanta compete with its larger pages and repeatedly invalidate
+            // its captured inputs. Observe that owner's generation instead;
+            // manual/hosted and directory runtimes retain their inline driver.
+            const quantum_ms = if (background_owner) 0 else @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
             database.waitGraphReplacement(name, generation, quantum_ms) catch |err| switch (err) {
                 error.Busy => break :blk true,
                 else => return capi.mapError(err),
@@ -7515,8 +7577,10 @@ pub fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice
             break :blk false;
         };
         if (!pending) return .ok;
-        if (monotonicNowNs() >= deadline) return capi.mapError(error.Busy);
-        handleLockIo().sleep(.fromMilliseconds(1), .awake) catch |err| return capi.mapError(err);
+        const now = monotonicNowNs();
+        if (now >= deadline) return capi.mapError(error.Busy);
+        const delay_ns = @min(deadline - now, (if (background_owner) @as(u64, 25) else 1) * std.time.ns_per_ms);
+        handleLockIo().sleep(.fromNanoseconds(@intCast(delay_ns)), .awake) catch |err| return capi.mapError(err);
     }
 }
 
@@ -7650,7 +7714,8 @@ fn addIndexJsonRegistered(
     // resolution artifacts. Otherwise a new generation can be built while its
     // resolver is retired, then skip already-current resolutions on replay.
     // The undo buffer restores both active and retired state on failed admission.
-    if (kind == .graph) {
+    const shadow_replacement = !existing_index and replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null;
+    if (kind == .graph and !shadow_replacement) {
         registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
             rollback.?.restore();
             if (err == error.ResolverMergeNamespaceChange)
@@ -8653,4 +8718,46 @@ comptime {
         "antfly_db_finalize_split",
         "antfly_db_snapshot",
     });
+}
+
+test "inline resolver replacement C API admits the same public name with fresh artifacts" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("inline-resolver-public-replacement");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const handle = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .native }, true);
+    const id = try publishHandle(handle);
+    defer antfly_db_close(id);
+    const old =
+        \\{"name":"old","kind":"graph","config_json":{"artifact":{"name":"kg_v1","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"source":{"artifact":"kg_v1","format":"extraction_graph","mention_edge_type":"mentions"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg_v1","resolution_artifact":"resolved_v1","key_template":"entity/{{ slug _entity.text }}","promote":false}]}}
+    ;
+    const next =
+        \\{"name":"new","kind":"graph","replaces":"old","config_json":{"artifact":{"name":"kg_v2","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"source":{"artifact":"kg_v2","format":"extraction_graph","mention_edge_type":"mentions"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg_v2","resolution_artifact":"resolved_v2","key_template":"entity/{{ uslug _entity.text }}","promote":false}]}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(old)));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
+    // An identical pending admission joins its durable generation.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    {
+        const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const database = guard.handle.database();
+        const resolvers = try database.listResolvers(a);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(a);
+            a.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+        try std.testing.expectEqualStrings("concepts", resolvers[0].name);
+        try std.testing.expectEqualStrings("kg_v2", resolvers[0].source_artifact);
+        try std.testing.expectEqualStrings("resolved_v2", resolvers[0].resolution_artifact);
+        try std.testing.expectEqualStrings("entity/{{ uslug _entity.text }}", resolvers[0].key_template);
+        try std.testing.expect(database.indexGeneration("old") == null);
+    }
+    // Replaying the declarative config after activation remains idempotent.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
 }

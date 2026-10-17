@@ -360,6 +360,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
+    const sql_native_cells_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "SQL pgwire native", "SQL stateless fallback" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_native_cells_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
@@ -389,7 +396,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     raft_harness_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const introducer_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/introducer.zig"),
+        .root_source_file = b.path("pkg/antfly/src/introducer_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -585,10 +592,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, relational_index_system_mod, true, true);
     const relational_index_system_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{ "relational index system", "relational index records", "relational rows snapshot", "ordinal typed projection" },
+        .filters = &.{ "relational index system", "relational index records", "relational rows snapshot", "ordinal typed projection", "ordinal native SQL" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const native_ranked_hydration_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system query lease typed point hydration"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-native-ranked-hydration-test", "Verify ranked batch hydration ownership, quotas, snapshots and allocations")
+        .dependOn(&addFilteredTestRunArtifact(b, native_ranked_hydration_tests).step);
+    const native_row_projection_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "ordinal native SQL", "ordinal typed projection" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-native-row-projection-test", "Verify native row projection ownership, nulls and allocation bounds")
+        .dependOn(&addFilteredTestRunArtifact(b, native_row_projection_tests).step);
+
     const retained_transfer_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{ "relational index system rewrite", "relational index system retained", "relational index system merge tail", "relational index system source pin prepared crash", "storage.source_snapshot." },
@@ -847,6 +869,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_store_abi_provider_mod.addImport("antfly_platform", platform_mod);
     const secret_store_abi_provider = b.addLibrary(.{
         .name = "secret-store-abi-test-provider",
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .root_module = secret_store_abi_provider_mod,
         .linkage = .static,
     });
@@ -862,6 +885,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_store_abi_test_mod.linkLibrary(secret_store_abi_provider);
     const secret_store_abi_tests = b.addTest(.{
         .root_module = secret_store_abi_test_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .filters = &.{ "secret store operations retain their IO owner across runtime archives", "secret store archive boundary" },
     });
     const run_secret_store_abi_tests = b.addRunArtifact(secret_store_abi_tests);
@@ -877,6 +901,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const runtime_io_abi_provider = b.addLibrary(.{
         .name = "runtime-io-abi-test-provider",
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .linkage = .static,
         .root_module = runtime_io_abi_provider_mod,
     });
@@ -891,9 +916,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     antfly_imports.configureRuntimeContracts(runtime_io_abi_provider.root_module);
     antfly_imports.configureRuntimeContracts(runtime_io_abi_test_mod);
     antfly_imports.storage_boundary.configureSources(runtime_io_abi_test_mod, false, false);
+    for ([_]*std.Build.Module{ runtime_io_abi_provider_mod, runtime_io_abi_test_mod }) |module| {
+        module.addImport("antfly_platform", platform_mod);
+        module.addImport("antfly_hash", antfly_imports.hash);
+    }
     runtime_io_abi_test_mod.linkLibrary(runtime_io_abi_provider);
     const runtime_io_abi_tests = b.addTest(.{
         .root_module = runtime_io_abi_test_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .filters = &.{"executor archive boundary"},
     });
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
@@ -1082,6 +1112,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "antfly client pkg compiles",
             "personal connections",
+            "query builder transport",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
             "SQL client preserves typed parameters receipts and forbids replay",
@@ -2024,7 +2055,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const introducer_tests = b.addTest(.{
         .root_module = introducer_test_mod,
-        .filters = selectTestFilters(b, &.{}),
+        .filters = selectTestFilters(b, &.{"introducer."}),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -2046,15 +2077,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, secret_backend_test_mod, true, true);
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
+        .name = "secret-backends-tests",
         .root_module = secret_backend_test_mod,
         // ReleaseSafe peaks above the aggregate estimates on both platforms:
         // 12.88 GB measured on x86_64-linux in the VOPR qualification lane,
-        // above 10 GiB on macOS. Debug keeps the conservative default so the
-        // unit lanes retain their tighter scheduler claim.
-        .max_rss = @as(usize, switch (target.result.os.tag) {
+        // above 10 GiB on macOS. Native Darwin Debug has its own measured
+        // floor; other compilation profiles retain these authored claims.
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("secret-backends-tests", b.graph.host.result, target.result, optimize, @as(usize, switch (target.result.os.tag) {
             .macos => 13,
             else => if (optimize == .debug) 7 else 14,
-        }) * 1024 * 1024 * 1024,
+        }) * 1024 * 1024 * 1024),
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -2210,9 +2242,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const raft_unit_default_filters = [_][]const u8{ "raft.", "trace files preserve overlapping producers" };
     const raft_unit_tests = b.addTest(.{
+        .name = "raft-unit-tests",
         .root_module = antfly_test_mod,
-        // The broad server Raft fixture closure peaks at 11.06 GB on macOS.
-        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("raft-unit-tests", b.graph.host.result, target.result, optimize, if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0),
         .filters = selectTestFilters(b, &raft_unit_default_filters),
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
@@ -2663,7 +2695,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_integration_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_integration_tests = b.addTest(.{
         .root_module = lake_integration_mod,
-        .filters = &.{ "lake SQL", "external lake" },
+        .filters = selectTestFilters(b, &.{ "lake SQL", "external lake" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
@@ -2920,6 +2952,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
+    const graph_ttl_migration_tests = b.addTest(.{
+        .name = "graph-ttl-migration-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "graph ttl migration", "db graph ttl shared GC" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("graph-ttl-migration-test", "Run bounded graph expiry namespace migration and reader fences")
+        .dependOn(&addFilteredTestRunArtifact(b, graph_ttl_migration_tests).step);
+
+    const coordinated_read_set_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"relational index system coordinated read set"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-coordinated-read-set-test", "Verify merged page ownership and cursor failure lifetimes")
+        .dependOn(&addFilteredTestRunArtifact(b, coordinated_read_set_tests).step);
 
     const hot_standby_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -4933,18 +4981,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
+    const inference_host_test_step = b.step("antfly-inference-host-test", "Run inference host ABI, transport and preload conversion regressions");
     inline for (.{
         test_imports.runtime.inference_bridge,
         test_imports.runtime.inference_provider_failure,
         test_imports.runtime.inference_worker_wire,
     }) |module| {
-        lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        lib_standalone_runtime_test_step.dependOn(&run.step);
+        inference_host_test_step.dependOn(&run.step);
     }
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{
             "local generate message conversion preserves tool history and admission",
             "inference worker",
+            "standalone inference host placement",
+            "native call policy is scoped",
+            "memory admission diagnostics retain",
+            "session manager load clones preserve",
             "standalone numeric result ABI",
             "standalone raster embedding control",
             "encoded reader ABI enforces resolved model capabilities",
@@ -4960,8 +5015,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_inference_host_tests = b.addRunArtifact(inference_host_tests);
     lib_standalone_runtime_test_step.dependOn(&run_inference_host_tests.step);
-    b.step("antfly-inference-host-test", "Run inference host ABI and preload conversion regressions")
-        .dependOn(&run_inference_host_tests.step);
+    inference_host_test_step.dependOn(&run_inference_host_tests.step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
@@ -5569,6 +5623,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph committed intents survive canceled durability fences",
         "graph.query.",
         "index maintenance VOPR regression exact replay",
         // This bounded smoke shares the storage compilation with its unit coverage.
@@ -5980,6 +6035,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const graph_producer_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "inline resolver replacement replays graph producers without staged resolvers across reopen", "inline resolver replacement producer pages bound physical records bytes and deadlines", "inline resolver replacement preserves shared explicit and upstream producers", "capi resolver replacement retry budget resets only after durable progress" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-graph-replacement-producer-test", "Verify replacement producer replay, bounded pages and upstream dependencies")
+        .dependOn(&addFilteredTestRunArtifact(b, graph_producer_tests).step);
+
     const v02_upgrade_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },

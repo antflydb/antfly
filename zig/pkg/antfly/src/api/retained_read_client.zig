@@ -97,6 +97,7 @@ pub const Client = struct {
         if (body.len > rpc.max_request_bytes) return error.InvalidRetainedReadQuery;
         var timeout_buffer: [16]u8 = undefined;
         const headers = [_]http.RequestHeader{
+            .{ .name = "accept", .value = @import("retained_read_page.zig").compact_media_type },
             .{ .name = metadata.catalog_route_fence_header, .value = self.route },
             .{ .name = metadata.catalog_route_deadline_ms_header, .value = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout}) },
         };
@@ -291,6 +292,7 @@ fn consumerTests() type {
                 advances: usize = 0,
                 fail_delivery: bool = false,
                 lose_capture: bool = false,
+                legacy_pages: bool = false,
                 const scope = registry.Scope{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
                 const route = metadata.CatalogRouteFence{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } };
                 fn capture(raw: *anyopaque, _: std.mem.Allocator, _: metadata.CatalogRouteFence, _: u64, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.StatementReadFence {
@@ -334,7 +336,12 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     var parsed = try std.json.parseFromSlice(rpc.Request, alloc, request.body, .{ .parse_numbers = false });
                     defer parsed.deinit();
-                    const body = try rpc.execute(alloc, .{ .registry = self.registry_owner, .source = .{ .ptr = self, .route_fence = route, .remote_statement_fences_safe = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = capture } } }, scope, "rows", parsed.value);
+                    var native: @import("retained_read_page.zig").Format = .json;
+                    for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "accept")) {
+                        native = @import("retained_read_page.zig").formatForAccept(header.value);
+                    };
+                    if (self.legacy_pages) native = .json; // Older owners ignore the v2 Accept value.
+                    const body = try rpc.executeWithCodec(alloc, .{ .registry = self.registry_owner, .source = .{ .ptr = self, .route_fence = route, .remote_statement_fences_safe = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = capture } } }, scope, "rows", parsed.value, native);
                     errdefer alloc.free(body);
                     if ((self.fail_delivery and parsed.value.operation == .next) or (self.lose_capture and parsed.value.operation == .capture)) return error.ConnectionResetByPeer;
                     const headers = try alloc.alloc(http.Header, 1);
@@ -362,11 +369,18 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), proofs[1].generation);
             var page = try view.next(alloc, 1);
             defer page.deinit();
-            try std.testing.expectEqualStrings("9007199254740993", page.rows[0].value.object.get("n").?.number_string);
-            try std.testing.expect(!page.rows[0].sql_nulls.?[1]);
+            try std.testing.expect(page.rows[0].typed_cells != null);
+            try std.testing.expectEqualStrings("9007199254740993", (try page.rows[0].cell("n")).value.number_string);
+            try std.testing.expect(!(try page.rows[0].cell("j")).sql_null);
             try std.testing.expectEqual(@as([32]u8, @splat(17)), page.rows[0].expected_content_digest.?);
             try std.testing.expectEqualStrings("9007199254740993", page.rows[0].document.?.object.get("n").?.number_string);
             try std.testing.expect(page.rows[0].document.?.object.get("extra").?.object.get("retained").?.bool);
+            fixture.legacy_pages = true;
+            var legacy_page = try view.next(alloc, 1);
+            defer legacy_page.deinit();
+            try std.testing.expect(legacy_page.rows[0].typed_cells == null);
+            try std.testing.expectEqualStrings("9007199254740993", (try legacy_page.rows[0].cell("n")).value.number_string);
+            try std.testing.expect(!(try legacy_page.rows[0].cell("j")).sql_null);
             var normalized_arena = std.heap.ArenaAllocator.init(alloc);
             defer normalized_arena.deinit();
             const normalized = try view.normalize(normalized_arena.allocator(), &.{.{ .key = "a", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }});
@@ -376,7 +390,7 @@ fn consumerTests() type {
             fixture.fail_delivery = true;
             try std.testing.expectError(error.ConnectionResetByPeer, view.next(alloc, 1));
             try std.testing.expectError(error.RetainedReadRestartRequired, view.next(alloc, 1));
-            try std.testing.expectEqual(@as(usize, 2), fixture.advances);
+            try std.testing.expectEqual(@as(usize, 3), fixture.advances);
             view.deinit();
             try std.testing.expectEqual(@as(usize, 1), fixture.cursor_closed);
             // Capture completed on the owner, but its token never reached the

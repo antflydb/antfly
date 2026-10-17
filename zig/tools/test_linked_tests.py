@@ -143,6 +143,25 @@ test "fixture consumer" {
         self.assert_compile(output, "test_obj", "consumer", "success")
         self.assert_compile(output, "lib", "provider", "success")
 
+    @unittest.skipUnless(platform.system() == "Darwin", "native Mach-O linker")
+    def test_native_link_preserves_late_provider_inputs_and_inventory(self):
+        output = self.build("test", "-Dnative-link=true")
+        self.assertIn("provider-value=42", output)
+        self.assertIn("fixture implementation...", output)
+        self.assertNotRegex(output, r"compile exe fixture-consumer debug")
+        self.write(
+            "provider.zig",
+            'const c = @import("contract.zig");\nexport fn fixtureValue() u32 { return c.minimum + 1; }\n',
+        )
+        output = self.build("test", "-Dnative-link=true")
+        self.assertIn("provider-value=43", output)
+        self.assert_compile(output, "test_obj", "consumer", "cached")
+        self.assert_compile(output, "lib", "provider", "success")
+        output = self.build(
+            "test", "-Dnative-link=true", "--", "missing", succeeds=False
+        )
+        self.assertIn("test filter matched no declared tests: missing", output)
+
     def test_selection_and_failure_diagnostics(self):
         output = self.build("test", "--", "consumer")
         self.assertIn("1 passed", output)

@@ -768,6 +768,10 @@ pub const Detail = enum(c_int) {
     mapped_artifact_unavailable,
     read_scope_reset_unsupported,
     read_snapshot_fork_unsupported,
+    file_busy,
+    would_block,
+    inference_worker_executable_not_configured,
+    inference_worker_unavailable,
 };
 
 pub const Status = extern struct {
@@ -1164,6 +1168,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
         error.IncompletePublishedSnapshot => status(.retryable, .incomplete_published_snapshot),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
+        error.FileBusy => status(.retryable, .file_busy),
+        error.WouldBlock => status(.retryable, .would_block),
         error.WriterLocked => status(.retryable, .writer_locked),
         error.LsmRootWriterAlreadyOpen => status(.retryable, .lsm_root_writer_already_open),
         error.UnexpectedHttpStatus => status(.retryable, .unexpected_http_status),
@@ -1324,6 +1330,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.BodyCapacityExceeded => status(.retryable, .body_capacity_exceeded),
         error.BodyReadFailed => status(.unavailable, .body_read_failed),
         error.InferenceProviderFailure => status(.internal, .inference_provider_failure),
+        error.InferenceWorkerExecutableNotConfigured => status(.invalid_argument, .inference_worker_executable_not_configured),
+        error.InferenceWorkerUnavailable => status(.retryable, .inference_worker_unavailable),
         error.KernelJitRequiredDynamicLoad => status(.unsupported, .kernel_jit_required_dynamic_load),
         error.UnexpectedToken => status(.internal, .unexpected_token),
         error.EnrichmentWaitCanceled => status(.cancelled, .enrichment_wait_canceled),
@@ -1935,6 +1943,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .index_rebuilding => "IndexRebuilding",
         .incomplete_published_snapshot => "IncompletePublishedSnapshot",
         .table_visibility_timeout => "TableVisibilityTimeout",
+        .file_busy => "FileBusy",
+        .would_block => "WouldBlock",
         .writer_locked => "WriterLocked",
         .lsm_root_writer_already_open => "LsmRootWriterAlreadyOpen",
         .unexpected_http_status => "UnexpectedHttpStatus",
@@ -2136,6 +2146,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .body_capacity_exceeded => "BodyCapacityExceeded",
         .body_read_failed => "BodyReadFailed",
         .inference_provider_failure => "InferenceProviderFailure",
+        .inference_worker_executable_not_configured => "InferenceWorkerExecutableNotConfigured",
+        .inference_worker_unavailable => "InferenceWorkerUnavailable",
         .kernel_jit_required_dynamic_load => "KernelJitRequiredDynamicLoad",
         .unexpected_token => "UnexpectedToken",
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
@@ -2491,5 +2503,17 @@ test "storage callback boundaries retain capability integrity and bounded-read o
         const encoded = statusFromError(err);
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(encoded));
+    }
+}
+
+test "inference worker setup and transport failures retain distinct boundary semantics" {
+    const missing = statusFromError(error.InferenceWorkerExecutableNotConfigured);
+    const unavailable = statusFromError(error.InferenceWorkerUnavailable);
+    const capacity = statusFromError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), missing.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), unavailable.code);
+    try std.testing.expect(missing.detail != unavailable.detail and unavailable.detail != capacity.detail);
+    for ([_]anyerror{ error.InferenceWorkerExecutableNotConfigured, error.InferenceWorkerUnavailable }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.InferenceProviderFailure)));
     }
 }

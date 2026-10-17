@@ -83,7 +83,7 @@ test "SQL prepared parameter frames own typed arrays and bind shared programs on
     try std.testing.expectEqual(@as(i64, -1), (try bound_bounds.evaluate(none.allocator(), &.{}, .{})).value.integer);
     const array = frame.values[0].array.?;
     try std.testing.expectEqual(@as(i32, 2), array.dimensions[1].lower);
-    try std.testing.expect(array.elements[3].sql_null);
+    try std.testing.expect(array.flatCell(3).sql_null);
     var matches: usize = 0;
     var nulls: usize = 0;
     const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
@@ -114,8 +114,8 @@ test "SQL typed parameter inference preserves element identity and guards compat
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const result = try (try program.bindParameters(&frame)).evaluate(arena.allocator(), &.{}, .{});
-    try std.testing.expectEqual(@as(i64, 2), result.array.?.elements[0].value.integer);
-    try std.testing.expectEqual(@as(i64, 2), result.array.?.elements[1].value.integer);
+    try std.testing.expectEqual(@as(i64, 2), result.array.?.flatCell(0).value.integer);
+    try std.testing.expectEqual(@as(i64, 2), result.array.?.flatCell(1).value.integer);
     var wrong = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .text }}, &.{.{ .text = "{1,2}" }}, .{});
     defer wrong.deinit();
     try std.testing.expectError(error.ConflictingSqlParameterTypes, program.bindParameters(&wrong));
@@ -192,9 +192,9 @@ test "SQL JSON parameter ingress owns typed envelopes and shares wire and work a
     input_owner.deinit();
     const value = frame.values[0].array.?;
     try std.testing.expectEqual(@as(i32, 0), value.dimensions[0].lower);
-    try std.testing.expect(!value.elements[0].sql_null and value.elements[0].value == .null);
-    try std.testing.expect(value.elements[1].sql_null);
-    try std.testing.expectEqualStrings("2", value.elements[2].value.object.get("x").?.array.items[1].number_string);
+    try std.testing.expect(!value.flatCell(0).sql_null and value.flatCell(0).value == .null);
+    try std.testing.expect(value.flatCell(1).sql_null);
+    try std.testing.expectEqualStrings("2", value.flatCell(2).value.object.get("x").?.array.items[1].number_string);
     const Faults = struct {
         fn run(backing: A, input: std.json.Value) !void {
             var owner = try Frame.prepareJson(backing, &.{descriptor}, &.{input}, .{});
@@ -273,7 +273,58 @@ test "SQL prepared parameter frames match PostgreSQL descriptors values and diag
         return error.ExpectedPostgresRejection;
     }
 }
+/// Immutable ingress payload ownership. A frame may borrow compact arrays
+/// only with an explicit lease, charged against its retained-memory budget.
+pub const PayloadLease = struct {
+    ptr: *anyopaque,
+    bytes: usize,
+    retain_fn: *const fn (*anyopaque) void,
+    release_fn: *const fn (*anyopaque) void,
+    pub fn retain(self: PayloadLease) void {
+        self.retain_fn(self.ptr);
+    }
+    pub fn release(self: PayloadLease) void {
+        self.release_fn(self.ptr);
+    }
+};
+
+/// Stable arena identity for transport decoding, independent of portal moves.
+/// After publishing lease(), callers must treat this region as immutable.
+pub const Ingress = struct {
+    alloc: A,
+    budget: MemoryBudget,
+    arena: std.heap.ArenaAllocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    pub fn create(a: A, bytes: usize) !*Ingress {
+        const self = try a.create(Ingress);
+        self.* = .{ .alloc = a, .budget = .{ .backing = a, .limit = bytes }, .arena = undefined };
+        self.arena = .init(self.budget.allocator());
+        return self;
+    }
+    pub fn allocator(self: *Ingress) A {
+        return self.arena.allocator();
+    }
+    pub fn lease(self: *Ingress) PayloadLease {
+        return .{ .ptr = self, .bytes = self.budget.live, .retain_fn = retainRaw, .release_fn = releaseRaw };
+    }
+    fn retainRaw(raw: *anyopaque) void {
+        const self: *Ingress = @ptrCast(@alignCast(raw));
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+    fn releaseRaw(raw: *anyopaque) void {
+        const self: *Ingress = @ptrCast(@alignCast(raw));
+        self.release();
+    }
+    pub fn release(self: *Ingress) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.arena.deinit();
+        std.debug.assert(self.budget.live == 0);
+        self.alloc.destroy(self);
+    }
+};
+
 pub const Limits = struct {
+    payload_owner: ?PayloadLease = null,
     error_context: ?*@import("errors.zig").Context = null,
     bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     wire_bytes: usize = @import("resource_limits.zig").request_bytes,
@@ -290,9 +341,9 @@ test "SQL prepared parameter frames bound admission and unwind every allocation 
             const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
             var frame = try Frame.prepare(a, &.{ .{ .kind = .array, .element_type = .jsonb }, .{ .kind = .array, .element_type = .text }, .{ .kind = .integer, .element_type = .int64 } }, &.{ .{ .text = "{\"[1,{\\\"a\\\":2}]\",NULL}" }, .{ .text = "{\"é,quoted\",NULL}" }, .{ .text = "9007199254740993" } }, .{});
             defer frame.deinit();
-            const json = frame.values[0].array.?.elements[0].value.array;
+            const json = frame.values[0].array.?.flatCell(0).value.array;
             try std.testing.expectEqual(@intFromPtr(frame.arena), @intFromPtr(json.allocator.ptr));
-            try std.testing.expect(frame.values[0].array.?.elements[1].sql_null);
+            try std.testing.expect(frame.values[0].array.?.flatCell(1).sql_null);
             try std.testing.expectEqual(@as(i64, 9007199254740993), frame.values[2].value.integer);
         }
     };
@@ -338,12 +389,14 @@ test "SQL prepared binary array frames reuse PostgreSQL codecs and stable JSON o
         defer frame.deinit();
         var work: arrays.Budget = .{};
         try std.testing.expectEqual(try expected.value.semanticHash(&work), try frame.values[0].array.?.semanticHash(&work));
-        if (entry.element_type == .jsonb) for (frame.values[0].array.?.elements) |element| {
+        if (entry.element_type == .jsonb) for (0..frame.values[0].array.?.cardinality()) |array_cell_0| {
+            const element = frame.values[0].array.?.flatCell(array_cell_0);
             if (element.value == .array) try std.testing.expectEqual(@intFromPtr(frame.arena), @intFromPtr(element.value.array.allocator.ptr));
         };
         const rank = std.mem.readInt(u32, wire[0..4], .big);
         var at: usize = 12 + 8 * @as(usize, rank);
-        for (expected.value.elements) |element| {
+        for (0..expected.value.cardinality()) |array_cell_0| {
+            const element = expected.value.flatCell(array_cell_0);
             const length = std.mem.readInt(i32, wire[at..][0..4], .big);
             at += 4;
             if (length == -1) continue;
@@ -380,7 +433,7 @@ test "SQL JSON array allocator references survive program and codec owner moves"
     defer program.deinit();
     var constants = program.constant_arrays.valueIterator();
     const cached = constants.next().?.*;
-    const allocator_ptr = cached.elements[0].value.array.allocator.ptr;
+    const allocator_ptr = cached.flatCell(0).value.array.allocator.ptr;
     const pinned_owner = for (program.constant_pool.?.regions.items) |region| {
         if (@intFromPtr(region) == @intFromPtr(allocator_ptr)) break region;
     } else return error.UnpinnedConstantAllocator;
@@ -388,19 +441,19 @@ test "SQL JSON array allocator references survive program and codec owner moves"
     var moved_program = program;
     var moved_constants = moved_program.constant_arrays.valueIterator();
     const moved_cached = moved_constants.next().?.*;
-    const moved_allocator = moved_cached.elements[0].value.array.allocator;
+    const moved_allocator = moved_cached.flatCell(0).value.array.allocator;
     const probe = try moved_allocator.alloc(u8, 256);
     defer moved_allocator.free(probe);
     @memset(probe, 7);
     try std.testing.expectEqual(@as(u8, 7), probe[255]);
-    try std.testing.expectEqual(@as(usize, 2), moved_cached.elements[0].value.array.items.len);
+    try std.testing.expectEqual(@as(usize, 2), moved_cached.flatCell(0).value.array.items.len);
     var owned = try text.decode(a, .jsonb, "{\"[1,2]\"}", .{});
     defer owned.deinit();
-    try std.testing.expectEqual(@intFromPtr(owned.arena), @intFromPtr(owned.value.elements[0].value.array.allocator.ptr));
+    try std.testing.expectEqual(@intFromPtr(owned.arena), @intFromPtr(owned.value.flatCell(0).value.array.allocator.ptr));
     var cloned = try arrays.Owned.init(a, owned.value, .{});
     defer cloned.deinit();
-    try std.testing.expectEqual(@intFromPtr(cloned.arena), @intFromPtr(cloned.value.elements[0].value.array.allocator.ptr));
-    var frame = try Frame.prepare(a, &.{.{ .kind = .json }}, &.{.{ .datum = owned.value.elements[0] }}, .{});
+    try std.testing.expectEqual(@intFromPtr(cloned.arena), @intFromPtr(cloned.value.flatCell(0).value.array.allocator.ptr));
+    var frame = try Frame.prepare(a, &.{.{ .kind = .json }}, &.{.{ .datum = owned.value.flatCell(0) }}, .{});
     defer frame.deinit();
     try std.testing.expectEqual(@intFromPtr(frame.arena), @intFromPtr(frame.values[0].value.array.allocator.ptr));
     try std.testing.expectEqual(@as(?arrays.ElementType, .jsonb), frame.descriptors[0].element_type);
@@ -424,6 +477,7 @@ test "SQL datetime parameters preserve signed epoch instants across JSON and tex
 }
 
 pub const Frame = struct {
+    payload_owner: ?PayloadLease = null,
     arena: *std.heap.ArenaAllocator,
     budget: *MemoryBudget,
     descriptors: []const scalar.Type,
@@ -455,6 +509,7 @@ pub const Frame = struct {
         self.budget.allocator().destroy(self.arena);
         std.debug.assert(self.budget.live == 0);
         backing.destroy(self.budget);
+        if (self.payload_owner) |owner| owner.release();
         self.* = undefined;
     }
 
@@ -464,15 +519,18 @@ pub const Frame = struct {
             try scalar.validateParameterType(descriptor);
             if (descriptor.kind == null) return error.UnknownSqlParameterType;
         }
+        const leased_bytes = if (limits.payload_owner) |owner| owner.bytes else 0;
+        if (leased_bytes > limits.bytes) return error.SqlProgramLimitExceeded;
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
-        budget.* = .{ .backing = backing, .limit = limits.bytes };
+        budget.* = .{ .backing = backing, .limit = limits.bytes - leased_bytes };
         const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
         errdefer budget.allocator().destroy(arena);
         arena.* = std.heap.ArenaAllocator.init(budget.allocator());
         errdefer arena.deinit();
         const decoded = prepareLeaky(arena.allocator(), descriptors, inputs, limits) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
-        return .{ .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
+        if (limits.payload_owner) |owner| owner.retain();
+        return .{ .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
     }
 };
 
@@ -528,7 +586,8 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             const array = value.array orelse return error.SqlTypeMismatch;
             if (array.element_type != kind) return error.ConflictingSqlParameterTypes;
             if (value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-            _ = try arrays.Value.initWithBudget(kind, array.dimensions, array.elements, .{ .bytes = limits.bytes, .elements = limits.elements }, work);
+            _ = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
+            if (array.stored != null and limits.payload_owner != null) return value;
             return operators.cloneDatum(a, value);
         }
         const value = try a.create(arrays.Value);
@@ -616,4 +675,61 @@ test "SQL NUL parameters retain position for nested JSONB strings keys and TEXT"
         try std.testing.expectEqual(@as(?usize, 2), diagnostic.parameter_index);
         try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "parameter $2") != null);
     }
+}
+
+test "SQL native parameter payload leases survive transport release and every allocation failure" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            const ingress = try Ingress.create(a, 1024 * 1024);
+            var transport_live = true;
+            defer if (transport_live) ingress.release();
+            const input = try ingress.allocator().create(arrays.Value);
+            input.* = (try text.decodeLeaky(ingress.allocator(), .text, "[-1:1]={\"é\",NULL,\"retained\"}", .{ .compact = true })).value;
+            const descriptor = [_]scalar.Type{.{ .kind = .array, .element_type = .text }};
+            var first = try Frame.prepare(a, &descriptor, &.{.{ .datum = .typedArray(input) }}, .{ .payload_owner = ingress.lease() });
+            var first_live = true;
+            defer if (first_live) first.deinit();
+            var second = try Frame.prepare(a, &descriptor, &.{.{ .datum = .typedArray(input) }}, .{ .payload_owner = ingress.lease() });
+            defer second.deinit();
+            try std.testing.expectEqual(@intFromPtr(input), @intFromPtr(second.values[0].array.?));
+            try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepare(a, &descriptor, &.{.{ .datum = .typedArray(input) }}, .{ .payload_owner = ingress.lease(), .bytes = ingress.lease().bytes - 1 }));
+            ingress.release();
+            transport_live = false;
+            first.deinit();
+            first_live = false;
+            try std.testing.expectEqualStrings("retained", second.values[0].array.?.flatCell(2).value.string);
+            try std.testing.expect(second.values[0].array.?.flatCell(1).sql_null);
+            try std.testing.expectEqual(@as(i32, -1), second.values[0].array.?.dimensions[0].lower);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "SQL native parameter payload leases avoid compact frame copies" {
+    const a = std.testing.allocator;
+    const test_alloc = @import("../storage/lite/test_allocator.zig");
+    const ingress = try Ingress.create(a, 1024 * 1024);
+    defer ingress.release();
+    const elements = try a.alloc(arrays.Element, 32768);
+    defer a.free(elements);
+    @memset(elements, .json(.{ .integer = 42 }));
+    const value = try arrays.Value.init(.int64, &.{.{ .length = 32768 }}, elements, .{});
+    const bytes = try @import("array_storage.zig").encodeAlloc(a, value, .{});
+    defer a.free(bytes);
+    const compact = try ingress.allocator().create(arrays.Value);
+    compact.* = try @import("array_storage.zig").viewLeaky(ingress.allocator(), .int64, bytes, .{});
+    var peaks: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |leased, i| {
+        var nr: test_alloc.NoResizeAllocator = .{ .backing = a };
+        var budget: test_alloc.BudgetAllocator = .{ .backing = nr.allocator() };
+        {
+            var frame = try Frame.prepare(budget.allocator(), &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(compact) }}, .{ .payload_owner = if (leased) ingress.lease() else null });
+            defer frame.deinit();
+            try std.testing.expectEqual(@as(i64, 42), frame.values[0].array.?.flatCell(32767).value.integer);
+            peaks[i] = budget.peak;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(peaks[1] < peaks[0] / 8);
+    std.debug.print("SQL native leased parameter frame: copied_peak={} leased_peak={} retained_payload={}\n", .{ peaks[0], peaks[1], ingress.lease().bytes });
 }

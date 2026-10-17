@@ -1170,7 +1170,10 @@ catalog transaction removes the temporary fence. Cancellation validates both
 in-memory and durable generation ownership before retiring anything; a foreign
 publication returns `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH` without mutation. A separate baseline preserves permanent resolver-feature
 requirements: a plain completed replacement returns to version 1, while actual
-authoritative resolver features retain version 2.
+authoritative resolver features retain version 2, and inline resolver handoffs
+or graph producer ownership metadata require version 3. Graph TTL expiry
+namespace migration requires permanent version 4; cancelling a shadow cannot
+remove that format fence.
 Deadline Busy means registration
 was accepted and the shadow continues in the background. Without wait, Busy is
 limited to bounded registration admission. Drain with `run_until_idle` to await
@@ -1194,9 +1197,11 @@ resolver owner. Index deletion only retires last-owner identities.
 
 The capabilities/status JSON reports the effective `minimum_reader_version`
 compatibility guard independently of package release: 1 for the baseline catalog,
-2 whenever
-extended identity/ownership/cache-policy catalog fields are present, including
-`inline_managed` or `retired`. The authoritative feature epoch is monotonic;
+2 for extended identity/ownership/cache-policy fields such as `inline_managed`
+or `retired`, 3 for inline resolver handoffs or graph producer ownership, and
+4 for the separate graph-expiry namespace.
+Producer-replay reservations also temporarily require epoch 3, even with explicit
+producers and no staged resolver; plain field-backed reservations require epoch 2. The authoritative feature epoch is monotonic;
 a pending replacement can temporarily raise its effective guard as described
 above. Opening checks the effective epoch before parsing resolver definitions.
 Extended catalogs also use a versioned object envelope, which pre-epoch array readers
@@ -1305,3 +1310,104 @@ without opening unrelated namespaces. Restore reconstructs only that explicit
 scope. Include dependency tables when exporting schemas with cross-table
 constraints or resolver references. Go and Rust expose `BackupJSON`/`backup_json`;
 all bindings expose replacement cancellation.
+
+## Inline resolvers during graph replacement
+
+Embedded `add_index` with `replaces` can transfer an inline resolver to a new
+graph version without changing its public resolver name. A changed resolver must
+use fresh extraction **and** resolution artifact names. An overlapping extraction
+subscription cannot already belong to a serving resolver or another pending
+replacement. Siblings within one replacement may share their private source;
+asset and chunk subscriptions remain disjoint unless either uses `any`. Ordinary
+resolver admission and reactivation cannot join a reserved private source until
+that replacement finishes or is cancelled. Publication revalidates this rule for
+reservations from older writers. Admission stages a
+separate execution contract alongside the serving resolver, records it with the
+durable shadow reservation, and resets the existing bounded resolution replay
+cursors. Inline extraction producers are admitted in that transaction too;
+existing documents are replayed in resumable pages before graph construction,
+without a corpus scan at admission or activation. This replay covers every
+artifact source required by the new graph and its upstream producers, including
+graphs with absent or unchanged resolvers and staged resolver sources that are
+not direct graph sources. A missing enrichment runtime is
+created on demand, including after reopen; manual owners retain synchronous
+execution without starting background workers. The old graph and public resolver
+remain authoritative during the build. Label exclusions, query routing, and
+sibling canonical-key dependencies use separate serving and per-replacement
+views, including for legacy reservations with shared input streams. Graph replay,
+relation endpoint maps, foreground projection and mention-state protection use
+only public resolvers plus the target graph's own private contracts. Serving
+graphs cannot consume staged decisions even when they share its extraction
+producer without declaring a resolver, or are admitted after staging. Every
+successor advances its revision and schedules bounded replay at cutover,
+including resolve-only contracts, to release decisions to those serving graphs.
+`run_until_idle` drains replay released by its final swap before returning,
+including on manual owners without background workers.
+Cancellation of fresh reservations
+never changes serving sibling revisions. Cancelling or failing a legacy shared-source
+reservation invalidates any potentially contaminated serving decisions durably. Cutover durably invalidates source-sharing
+siblings affected by retiring the predecessor, including canonical-key dependencies and resets their replay cursors in
+the catalog transaction. Explicit waits drive manual enrichment
+with the remaining caller deadline, without enabling background workers or
+resuming deliberately paused background owners. A named wait advances its own
+reservation and rechecks its generation under scheduler ownership, so an earlier
+corpus build or a cancelled-and-reused name cannot redirect its work.
+Resolution yields between source artifacts, after at most 32 keys per quantum,
+and checks the same monotonic deadline before each unit. Each source keeps its
+sibling resolver routing intact, including ordered receipt/read-set validation. An in-flight source/provider operation can overrun the deadline; a large
+journal batch cannot extend that into unbounded additional source operations.
+A durable intra-record cursor advances only after source output publication, and
+the resolution watermark stays pinned until the entire record completes. Restart
+and ordinary workers resume this cursor. The resident runtime retains one decoded
+record across quanta to avoid repeatedly parsing a large batch.
+The same deadline bounds indexed backfill discovery and legacy source-index
+repair. These scans count physical rows, including stale markers, and retain
+cursors behind unfinished sources. Replay is durable before discovery markers
+are repaired; a failed append cannot hide source work from a retry.
+Write-fenced and ordered owners leave prerequisites queued; waiting can still
+observe completion or reach its deadline without choosing local mutations.
+Producer replay yields after at most 4096 physical records, a 4 MiB byte budget,
+or a 100 ms quantum (and honors an earlier caller deadline). Byte and time
+budgets are checked between records, so a single oversized record still makes
+progress. Its durable cursor includes artifact-only pages, rather than counting
+only primary documents toward the work budget. The scan ends at the document
+namespace boundary; replay journals and identity state do not extend it.
+The successor takes the public name in the same transaction that activates the
+shadow graph; cancellation or terminal build failure retires only the staged
+execution contract. Staged resolver decisions cannot promote entity documents.
+Activation advances the successor's resolution revision and saves a bounded
+backfill cursor in the same transaction. That backfill releases promotions after
+cutover, including after a restart and when retained resolver work is disabled;
+serving resolver promotions continue during construction.
+
+Graph shorthand records producer ownership in the enrichment catalog. Removal,
+cancellation and cutover atomically remove owned producers with no surviving
+index, resolver, pending shadow or downstream producer references. Quarantined
+indexes retain their ownership and dependencies even without loaded runtimes;
+malformed quarantined definitions retain producers conservatively. Reachability
+walks each upstream dependency once. Explicit
+producer upserts adopt ownership, keeping those producers available independently.
+Older producer catalogs without ownership provenance are conservatively retained.
+Pending replacement and resolution work resume after reopen.
+
+The successor inherits durable merges and, when omitted in its declaration,
+inline aliases. Resolver mutations return `replacement_pending` during the build;
+finish or cancel the replacement before making further identity changes. A
+resolver independently created through the resolver API, or declared by another
+configured graph, including a quarantined one, cannot be taken over. An unchanged resolver contract can be reused
+without creating a new execution stream. Pending graph reservations participate
+in ownership checks too. A graph cannot acquire a resolver while its handoff is
+pending, and publication revalidates exclusive ownership before retiring the
+serving execution contract.
+
+Changing a key template is supported when no aliases, merges, or explicit
+namespace fence exist. Curated namespaces still require an explicit
+`set_resolver_namespace` migration with an endpoint mapping (or an explicit reset)
+before requesting a replacement with a different table or template. Replacement
+cannot infer an arbitrary old-key to new-key mapping and does not discard curated
+redirects to make that change succeed.
+
+Internal predecessor contracts remain retired so replay can recognize old
+resolution artifacts without executing the old resolver. They do not appear in
+public resolver or identity listings. Databases containing staged contracts
+require resolver reader version 3; older readers reject them before parsing.

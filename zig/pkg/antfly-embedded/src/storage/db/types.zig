@@ -1393,6 +1393,9 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Local output allocation policy; never parsed from public requests.
+    /// Raw copies and flat native projections already allocate exact bodies.
+    output_exact: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     /// Private metadata-coordinator probe. Public HTTP lookup parsing must
@@ -1590,6 +1593,7 @@ pub const ScanHash = struct {
 
 /// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
 /// duration of the callback; consumers that retain them must copy them.
+pub const BorrowedScanDocument = @import("../scan_document.zig").Borrowed;
 pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
@@ -1598,9 +1602,13 @@ pub const ScanVisitEntry = struct {
     relational_cursor: ?[]const u8 = null,
     json_null_fields: []const []const u8 = &.{},
     document_json: ?[]const u8 = null,
+    document_stream: ?BorrowedScanDocument = null,
 };
 
 pub const ScanVisitor = struct {
+    /// Opt in only when the callback consumes document_stream synchronously.
+    /// Ordinary collectors retain their existing document_json contract.
+    borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
@@ -1872,6 +1880,15 @@ pub const SearchRequest = struct {
     /// Authenticated internal two-phase hydration, never set by public parsing.
     document_authority_mode: document_authority.Mode = .none,
     document_authority_group: u64 = 0,
+    /// Synchronous native hydration output owner. Never serialized or parsed.
+    /// Keep it alive until the returned bodies are moved or the result retires.
+    document_output_allocator: ?Allocator = null,
+    /// Allocation policy captured before synchronization obscures the owner.
+    /// Exact bodies use reclaimable encoding scratch; never serialized.
+    document_output_exact: bool = false,
+    /// Immutable local projection borrowed until synchronous search completion.
+    /// Never serialized or populated by a public request.
+    document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2052,6 +2069,9 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "document_authority_mode",
     "document_authority_group",
+    "document_output_allocator",
+    "document_output_exact",
+    "document_projection_plan",
     "response_table_name",
     "prepared_read_table_id",
     "native_query_cut",
@@ -2916,6 +2936,9 @@ pub const ShardIdentityReadGeneration = struct {
 };
 
 pub const SearchResult = struct {
+    /// Only private hydration results may split body ownership from metadata.
+    /// Move bodies into the destination before retiring worker scratch.
+    stored_data_allocator: ?Allocator = null,
     document_authority_version: u32 = 0,
     alloc: Allocator,
     hits: []SearchHit,
@@ -2963,7 +2986,13 @@ pub const SearchResult = struct {
 
     pub fn deinit(self: *SearchResult) void {
         if (self.sort_profile_storage) |storage| self.alloc.free(storage);
-        for (self.hits) |*hit| hit.deinit(self.alloc);
+        for (self.hits) |*hit| {
+            if (self.stored_data_allocator) |body_allocator| {
+                if (hit.stored_data) |body| body_allocator.free(body);
+                hit.stored_data = null;
+            }
+            hit.deinit(self.alloc);
+        }
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);

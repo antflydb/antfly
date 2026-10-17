@@ -105,7 +105,7 @@ fn buildEntityDocAlloc(alloc: std.mem.Allocator, e: resolver_lib.ResolvedEntity)
 fn promotedKeysStateKeyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8 {
     var key = std.ArrayListUnmanaged(u8).empty;
     defer key.deinit(alloc);
-    try key.appendSlice(alloc, &.{ internal_keys.replay_namespace, 0xff, internal_keys.promoted_keys_state_kind });
+    try key.appendSlice(alloc, &internal_keys.promoted_keys_state_prefix);
     try internal_keys.appendEncodedComponent(&key, alloc, resolution_key);
     return try key.toOwnedSlice(alloc);
 }
@@ -288,7 +288,10 @@ fn processResolutionArtifactWithCatalog(
             {
                 // Resolve-only catalogs retain graph identities without creating
                 // entity documents. Previously admitted sink work is recovered above.
-                if (!cfg.promote) return 0;
+                // Shadow decisions are private until the graph swap commits.
+                // Activation advances the revision and durably backfills them,
+                // so consuming their journal records here cannot lose work.
+                if (!cfg.promote or cfg.replacement_index.len > 0) return 0;
                 current = true;
                 break;
             }
