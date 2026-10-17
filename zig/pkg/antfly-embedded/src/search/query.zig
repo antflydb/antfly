@@ -173,7 +173,7 @@ pub const PatternPrograms = struct {
             const failed = switch (self.execution.program) {
                 inline else => |program| program.allocation_failed,
             };
-            if (failed or self.execution.budget.isExhausted()) {
+            if (failed or self.execution.budget.isLocallyExhausted()) {
                 for (self.owner.entries) |entry| if (entry) |held| {
                     for (&held.executions) |*slot| if (slot.* == self.execution) {
                         slot.* = null;
@@ -192,7 +192,7 @@ pub const PatternPrograms = struct {
         try control.check();
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        for (entry.executions) |slot| if (slot) |execution| if (!execution.busy and !execution.budget.isExhausted()) {
+        for (entry.executions) |slot| if (slot) |execution| if (!execution.busy and !execution.budget.isLocallyExhausted()) {
             execution.busy = true;
             self.execution_hits += 1;
             return .{ .owner = self, .execution = execution };

@@ -46,6 +46,13 @@ fn lock(self: *Budget) void {
 pub fn allocator(self: *Budget) std.mem.Allocator {
     return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
+/// Reusable child owners distinguish local failed admission from a parent's
+/// historical failure; restoring parent headroom can admit healthy new work.
+pub fn isLocallyExhausted(self: *Budget) bool {
+    self.lock();
+    defer self.mutex.unlock();
+    return self.exhausted or self.admission_exhausted;
+}
 pub fn isExhausted(self: *Budget) bool {
     self.lock();
     const exhausted = self.exhausted or self.admission_exhausted;
@@ -248,6 +255,7 @@ test "SQL memory budget reports parent admission without misclassifying allocato
     defer child.allocator().free(bytes);
     try std.testing.expectError(error.OutOfMemory, child.allocator().alloc(u8, 17));
     try std.testing.expect(child.isExhausted());
+    try std.testing.expect(!child.isLocallyExhausted());
     try std.testing.expect(!child.exhausted);
     try std.testing.expectEqual(@as(usize, 16), parent.live);
     var empty: [0]u8 = .{};
@@ -264,6 +272,7 @@ test "SQL memory budget reports parent admission without misclassifying allocato
     var wrapped: Budget = .{ .backing = manager.allocator(), .limit = 128 };
     try std.testing.expectError(error.OutOfMemory, wrapped.allocator().alloc(u8, 17));
     try std.testing.expect(wrapped.isExhausted());
+    try std.testing.expect(!wrapped.isLocallyExhausted());
     try std.testing.expect(!wrapped.exhausted);
     locked.backing = fixed.allocator();
     try std.testing.expectError(error.OutOfMemory, wrapped.allocator().alloc(u8, 1));
