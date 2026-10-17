@@ -1729,6 +1729,8 @@ pub const BacktrackingPattern = struct {
     names: []const CaptureName,
     flags: Flags,
     subprograms: []u32,
+    candidate_prefix: []const u8,
+    prefix_steps: usize,
     jit: ?native_jit.Program = null,
     pub fn init(a: Allocator, text: []const u8, flags: Flags) Error!BacktrackingPattern {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -1768,13 +1770,39 @@ pub const BacktrackingPattern = struct {
             compiled[state.slot] = true;
             entries[state.slot] = try compiler.lower(body, accept);
         }
-        return .{ .arena = arena, .states = compiler.states.items, .start = start, .groups = parser.groups, .scratch_slots = compiler.scratch_slots, .names = parser.names.items, .flags = dialect, .subprograms = entries, .jit = native_jit.Program.compile(compiler.states.items) };
+        const prefix = try candidatePrefix(parser.a, compiler.states.items, start);
+        return .{ .arena = arena, .states = compiler.states.items, .start = start, .groups = parser.groups, .scratch_slots = compiler.scratch_slots, .names = parser.names.items, .flags = dialect, .subprograms = entries, .candidate_prefix = prefix.bytes, .prefix_steps = prefix.steps, .jit = native_jit.Program.compile(compiler.states.items) };
     }
     pub fn deinit(self: *BacktrackingPattern) void {
         if (self.jit) |*program| program.deinit();
         self.arena.deinit();
     }
 };
+// Only traverse a straight prefix of capture saves and case-sensitive ASCII
+// literals. Assertions, branches, calls and control effects stop extraction.
+// The counted VM steps let low match budgets retain their exact error behavior.
+fn candidatePrefix(a: Allocator, states: []const State, start: u32) Error!struct { bytes: []const u8, steps: usize } {
+    var bytes: [64]u8 = undefined;
+    var len: usize = 0;
+    var steps: usize = 0;
+    var pc = start;
+    while (steps < states.len and len < bytes.len) {
+        const state = states[pc];
+        switch (state.tag) {
+            .save => {},
+            .consume => {
+                const node = state.node.?;
+                if (node.tag != .literal or node.flags.insensitive or node.cp >= 128) break;
+                bytes[len] = @intCast(node.cp);
+                len += 1;
+            },
+            else => break,
+        }
+        steps += 1;
+        pc = state.first;
+    }
+    return .{ .bytes = try a.dupe(u8, bytes[0..len]), .steps = steps };
+}
 fn collectGroups(node: *const Node, out: []?*const Node) void {
     if (node.tag == .capture and out[node.group] == null) out[node.group] = node;
     if (node.child) |child| collectGroups(child, out);
@@ -1823,6 +1851,7 @@ pub const BacktrackingRunner = struct {
     committed: bool = false,
     absolute_start_allowed: bool = true,
     jit_enabled: bool = true,
+    ascii_repeat_enabled: bool = true,
     callout: ?*const fn (?*anyopaque, Callout) CalloutAction = null,
     callout_context: ?*anyopaque = null,
     max_steps: usize = 10_000_000,
@@ -2000,6 +2029,7 @@ pub const BacktrackingRunner = struct {
         const slots = (self.p.groups + 1) * 2 + self.p.scratch_slots;
         var pos = offset;
         while (pos <= text.len) {
+            if (self.p.candidate_prefix.len > 0 and self.max_steps >= self.p.prefix_steps) pos = literal.findExact(text, self.p.candidate_prefix, pos) orelse break;
             // PCRE2's match limit bounds each candidate start, rather than the
             // linear scan through an unanchored subject. Metadata from earlier
             // failed starts is also unreachable and can be recycled immediately.
@@ -2338,7 +2368,20 @@ pub const BacktrackingRunner = struct {
                 .repeat_consume => repeat: {
                     const node = state.node.?;
                     const utf8 = node.child.?.flags.unicode;
-                    if (!frame.repeat_retry) {
+                    if (!frame.repeat_retry and node.greedy and self.ascii_repeat_enabled and node.child.?.tag == .literal and !node.child.?.flags.insensitive and node.child.?.cp < 128) {
+                        const begin = frame.pos;
+                        const limit = @min(text.len - begin, node.max orelse std.math.maxInt(usize));
+                        const count = literal.equalPrefix(text[begin..][0..limit], @intCast(node.child.?.cp));
+                        if (count > self.steps) {
+                            self.steps = 0;
+                            return error.MatchLimitExceeded;
+                        }
+                        self.steps -= count;
+                        frame.pos += count;
+                        frame.repeat_count = count;
+                        if (count < node.min) break :repeat;
+                        frame.repeat_min_end = begin + node.min;
+                    } else if (!frame.repeat_retry) {
                         frame.repeat_count = 0;
                         while (frame.repeat_count < node.min) {
                             if (frame.pos == text.len) break :repeat;
@@ -2554,6 +2597,36 @@ test "duplicate names select participating captures and callouts can reject or a
     var r = try BacktrackingRunner.init(a, &quoted);
     defer r.deinit();
     try std.testing.expect(try r.find("ab", 0) != null);
+}
+
+test "vectorized repeats preserve scalar captures and exact step budgets" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "a+z", "(a{0,40})(a+)", "a{3,9}?a", "a{4}b", "a*?z", "a{0}z", "(a{1,64})a?z" }) |expression| {
+        var pattern = try BacktrackingPattern.init(a, expression, .{});
+        defer pattern.deinit();
+        var fast = try BacktrackingRunner.init(a, &pattern);
+        defer fast.deinit();
+        var scalar = try BacktrackingRunner.init(a, &pattern);
+        defer scalar.deinit();
+        scalar.jit_enabled = false;
+        scalar.ascii_repeat_enabled = false;
+        for ([_][]const u8{ "", "bb", "aaaab", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz" }) |text| for ([_]usize{ 0, 1, 2, 3, 4, 5, 8, 16, 32, 64, 128, 1024 }) |budget| {
+            fast.max_steps = budget;
+            scalar.max_steps = budget;
+            const actual = fast.find(text, 0) catch |err| {
+                try std.testing.expectError(err, scalar.find(text, 0));
+                try std.testing.expectEqual(scalar.steps, fast.steps);
+                continue;
+            };
+            const expected = try scalar.find(text, 0);
+            try std.testing.expectEqual(expected != null, actual != null);
+            if (actual) |match| {
+                try std.testing.expectEqual(expected.?.span, match.span);
+                try std.testing.expectEqualSlices(?Span, expected.?.captures, match.captures);
+            }
+            try std.testing.expectEqual(scalar.steps, fast.steps);
+        };
+    }
 }
 
 test "positive lookarounds inherit and return named marks to callouts" {

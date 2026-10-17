@@ -81,6 +81,26 @@ const Program = struct {
         };
     }
     fn compile(self: *Program, raw: []const u8, o: *const Options, order: usize) !void {
+        // Bare nonempty alternatives are an exact literal union. Keep source
+        // order for ties, so a|aa still chooses a at the same starting byte.
+        if (o.engine != .pcre2 and !o.fixed and !(o.multiline and o.whole_line) and std.mem.indexOfScalar(u8, raw, '|') != null and std.mem.indexOfAny(u8, raw, "\\.*+?()[]{}^$") == null) literal_union: {
+            var parts = std.mem.splitScalar(u8, raw, '|');
+            var count: usize = 0;
+            while (parts.next()) |part| {
+                count += 1;
+                if (part.len == 0 or count > 64) break :literal_union;
+            }
+            if (raw.len + count * @sizeOf(Literal) > o.regex_size_limit) break :literal_union;
+            const insensitive = o.ignore_case or (o.smart_case and !regex.hasUpperLiteral(self.a, raw, false, o.unicode));
+            parts.reset();
+            while (parts.next()) |part| {
+                if (o.unicode and !std.unicode.utf8ValidateSlice(part)) return error.InvalidRegex;
+                const bytes = try self.a.dupe(u8, part);
+                errdefer self.a.free(bytes);
+                try self.direct.append(self.a, .{ .bytes = bytes, .insensitive = insensitive, .order = order });
+            }
+            return;
+        }
         const direct = o.engine != .pcre2 and (o.fixed or std.mem.indexOfAny(u8, raw, "\\.*+?()[]{}^$|") == null) and !(o.multiline and o.whole_line);
         const insensitive = o.ignore_case or (o.smart_case and !regex.hasUpperLiteral(self.a, raw, o.fixed or direct, o.unicode));
         if (direct) {
@@ -239,6 +259,30 @@ pub const Matcher = struct {
         }
         for (self.program.regular.items) |item| if (item.pattern.prefilter.len == 0 or regex.literal.findExact(text, item.pattern.prefilter, 0) != null) return false;
         return true;
+    }
+    /// A successful proof also excludes NUL, so binary classification and
+    /// literal rejection can share one pass over an input window.
+    pub fn rejectLiteralAndBinary(self: *const Matcher, text: []const u8) bool {
+        if (self.program.direct.items.len != 1 or self.program.regular.items.len != 0 or self.program.advanced.items.len != 0) return false;
+        const item = self.program.direct.items[0];
+        return !item.insensitive and !regex.literal.mayContainOrByte(text, item.bytes, 0);
+    }
+    pub fn isLiteralSearch(self: *const Matcher) bool {
+        if (self.program.direct.items.len == 0 or self.program.regular.items.len != 0 or self.program.advanced.items.len != 0) return false;
+        for (self.program.direct.items) |item| if (item.insensitive) return false;
+        return true;
+    }
+    /// Whole records before the first possible literal match can be skipped
+    /// together. Keeping the candidate's record preserves word/line checks and
+    /// the normal rendering, counting and budget paths.
+    pub fn rejectPrefix(self: *const Matcher, text: []const u8, delimiter: u8) usize {
+        if (self.program.regular.items.len > 0 or self.program.advanced.items.len > 0 or self.program.direct.items.len == 0 or self.program.prefilter != null) return if (self.canReject(text)) text.len else 0;
+        var earliest = text.len;
+        for (self.program.direct.items) |item| {
+            if (regex.literal.find(text, item.bytes, 0, item.insensitive, self.options.unicode, false, false)) |span| earliest = @min(earliest, span.start);
+            if (earliest == 0) return 0;
+        }
+        return if (std.mem.lastIndexOfScalar(u8, text[0..earliest], delimiter)) |last| last + 1 else 0;
     }
     pub fn jitStats(self: *const Matcher) struct { programs: usize, bytes: usize } {
         var programs: usize = 0;

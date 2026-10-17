@@ -63,7 +63,10 @@ pub const Search = struct {
     binary_mode: bool = false,
     binary_stop: bool = false,
     binary_checked: bool = false,
+    literal_buffer_rejected: bool = false,
     color_enabled: bool = false,
+    stdout_tty: bool = false,
+    input_buffer: ?[]u8 = null,
     raw_line: ?[]const u8 = null,
     current_hits: ?[]const @import("matcher.zig").Match = null,
     current_hit_text: []const u8 = "",
@@ -90,13 +93,15 @@ pub const Search = struct {
         var matcher = try Matcher.initForSearch(a, o);
         errdefer matcher.deinit();
         const dictionary = if (o.search_zip and o.dictionary_path != null) try ExternalDictionary.load(a, io, o.dictionary_path.?, o.dictionary_size_limit, o.dictionary_format) else null;
-        return .{ .a = a, .io = io, .options = o, .matcher = matcher, .decider = decision.Client.init(a, io, o), .dictionary = dictionary };
+        const tty = std.Io.File.stdout().isTty(io) catch false;
+        return .{ .a = a, .io = io, .options = o, .matcher = matcher, .decider = decision.Client.init(a, io, o), .dictionary = dictionary, .stdout_tty = tty };
     }
     fn initShared(root: *Search) !Search {
         const matcher = try root.matcher.clone(root.a);
-        return .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options) };
+        return .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
     }
     pub fn deinit(self: *Search) void {
+        if (self.input_buffer) |buffer| self.a.free(buffer);
         if (self.index_worker) |worker| {
             worker.deinit();
             self.a.destroy(worker);
@@ -130,7 +135,7 @@ pub const Search = struct {
     }
     pub fn run(self: *Search) !u8 {
         const started = std.Io.Clock.awake.now(self.io);
-        if (self.options.debug or self.options.trace) std.debug.print("antfly-grep: engine={s} threads={d} encoding={s} multiline={}\n", .{ @tagName(self.options.engine), self.options.jobs, self.options.encoding, self.options.multiline });
+        if (self.options.debug or self.options.trace) std.debug.print("antfly-grep: engine={s} threads={d} encoding={s} multiline={}\n", .{ @tagName(self.options.engine), if (self.options.files) self.options.jobs else self.fileJobs(), self.options.encoding, self.options.multiline });
         if (self.options.debug or self.options.trace) {
             const jit = self.matcher.jitStats();
             std.debug.print("antfly-grep: native JIT programs={d} code_bytes={d} (VM fallback for other operations)\n", .{ jit.programs, jit.bytes });
@@ -138,12 +143,14 @@ pub const Search = struct {
         self.shared_limits = &self.limits;
         self.decider.limits = &self.limits;
         if (self.options.ask != null) try self.decider.ensureLocal();
+        const streaming_files = self.options.files and self.options.ask == null and !self.options.inventory and self.options.table_config == null and (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none"));
+        if (streaming_files) self.collecting = false;
 
         // Sorted and ranked output requires a complete inventory. Ordinary
         // searches instead discover into a bounded producer/consumer queue.
         const single_regular_file = self.options.paths.items.len == 1 and !self.hasStdinPath() and
             (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
-        const pipelined = self.options.paths.items.len > 0 and !single_regular_file and !self.hasStdinPath() and
+        const pipelined = !streaming_files and self.options.paths.items.len > 0 and !single_regular_file and !self.hasStdinPath() and
             self.options.ask == null and !self.options.inventory and !self.options.quiet and
             (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none")) and
             self.options.max_regions == std.math.maxInt(usize);
@@ -257,7 +264,7 @@ pub const Search = struct {
             }
         }.less);
         const sorted = self.options.sort != null and !std.mem.eql(u8, self.options.sort.?, "none");
-        const jobs = if (sorted or self.options.quiet or self.options.max_regions != std.math.maxInt(usize)) 1 else @min(@max(1, self.options.jobs), self.tasks.items.len);
+        const jobs = if (sorted or self.options.quiet or self.options.max_regions != std.math.maxInt(usize)) 1 else @min(self.fileJobs(), self.tasks.items.len);
         if (jobs == 1 and !self.options.jev_mode and !(self.options.ask != null and self.options.ranked and self.options.sort == null)) {
             self.collecting = false;
             for (self.tasks.items) |task| {
@@ -371,7 +378,7 @@ pub const Search = struct {
         threads: []std.Thread,
         started: usize = 0,
         fn start(root: *Search) !*Pipeline {
-            const jobs = @max(1, root.options.jobs);
+            const jobs = root.fileJobs();
             const self = try root.a.create(Pipeline);
             errdefer root.a.destroy(self);
             const slots = try root.a.alloc(Task, @min(256, jobs *| 4));
@@ -577,11 +584,38 @@ pub const Search = struct {
             var d = discovery.Discovery{ .a = self.a, .io = self.io, .options = self.options };
             defer d.deinit();
             try d.prepare(full);
-            try d.walk(full, if (std.mem.eql(u8, name, ".") and self.options.paths.items.len == 0) "" else name, self);
+            const display = if (std.mem.eql(u8, name, ".") and self.options.paths.items.len == 0) "" else name;
+            if (self.options.files or self.pipeline != null) try d.walkParallel(full, display, self) else try d.walk(full, display, self);
         } else if (stat.kind == .file) {
             self.explicit_file = true;
             try self.file(name, name);
         } else return error.NotRegularFile;
+    }
+    fn fileJobs(self: *const Search) usize {
+        const requested = @max(1, self.options.jobs);
+        // Profiles of cheap existence scans show filesystem contention above
+        // this point. Keep full concurrency for CPU-heavy matchers and always
+        // honor an explicitly selected worker count.
+        if (self.options.ask == null and self.options.jobs_auto and (self.options.files_with_matches or self.options.files_without_match) and !self.options.json and !self.options.stats and self.matcher.isLiteralSearch()) return @min(8, requested);
+        return requested;
+    }
+    pub fn discoveryStopped(self: *Search) bool {
+        return self.limits.cancel.load(.acquire);
+    }
+    pub fn concurrentFile(self: *Search, path: []const u8, display: []const u8) !bool {
+        // During a directory walk these producer settings are immutable. Each
+        // task owns its strings and Queue.push handles concurrent producers.
+        if (!self.collecting or self.pipeline == null) return false;
+        try self.file(path, display);
+        return true;
+    }
+    pub fn canBatchFileLists(self: *Search) bool {
+        return self.options.files and !self.collecting and !self.options.skip_oversize and !self.options.json and !self.options.line_buffered and self.options.max_output_bytes == std.math.maxInt(usize);
+    }
+    pub fn filesBatch(self: *Search, bytes: []const u8, count: usize) !void {
+        try self.write(bytes);
+        self.summary.files += count;
+        self.summary.matches += count;
     }
     pub fn file(self: *Search, path_name: []const u8, display: []const u8) !void {
         if (self.collecting) {
@@ -606,14 +640,21 @@ pub const Search = struct {
             } else try self.tasks.append(self.a, task);
             return;
         }
+        if (self.options.files and self.options.ask == null and !self.options.skip_oversize and !self.options.json) {
+            try self.write(display);
+            try self.write(if (self.options.null_paths) "\x00" else "\n");
+            self.summary.files += 1;
+            self.summary.matches += 1;
+            return;
+        }
         const local_uri = if (self.options.json) try @import("document.zig").localUri(self.a, self.io, path_name) else null;
         defer if (local_uri) |uri| self.a.free(uri);
         const previous_source = self.provenance;
         defer self.provenance = previous_source;
-        self.provenance = .{ .uri = local_uri, .observed_at = std.Io.Clock.real.now(self.io).toSeconds() };
+        self.provenance = .{ .uri = local_uri, .observed_at = if (self.options.json) std.Io.Clock.real.now(self.io).toSeconds() else null };
         const before = self.summary;
         self.file_output_start = self.output_bytes;
-        self.file_started = std.Io.Clock.awake.now(self.io);
+        self.file_started = if (self.options.json) std.Io.Clock.awake.now(self.io) else null;
         self.matcher.failure = null;
         self.current_hits = null;
         self.binary_mode = false;
@@ -666,7 +707,7 @@ pub const Search = struct {
         local.file_output_start = 0;
         local.replacement_absolute_start = true;
         local.replacement_file_context = false;
-        local.color_enabled = self.options.color == .always or (self.options.color == .auto and (std.Io.File.stdout().isTty(self.io) catch false));
+        local.color_enabled = self.options.color == .always or (self.options.color == .auto and self.stdout_tty);
         local.decider.requests = 0;
         local.decider.cache_hits = 0;
         local.decider.input_tokens = 0;
@@ -739,7 +780,7 @@ pub const Search = struct {
             if (scores[0] < 0.25) return;
         }
         self.header_printed = false;
-        self.color_enabled = self.options.color == .always or (self.options.color == .auto and (std.Io.File.stdout().isTty(self.io) catch false));
+        self.color_enabled = self.options.color == .always or (self.options.color == .auto and self.stdout_tty);
         if (self.options.files) {
             try self.write(display);
             try self.write(if (self.options.null_paths) "\x00" else "\n");
@@ -832,15 +873,22 @@ pub const Search = struct {
         if (!self.options.multiline and self.options.ask == null) {
             var file_handle = try std.Io.Dir.cwd().openFile(self.io, path_name, .{});
             defer file_handle.close(self.io);
-            const stat = try file_handle.stat(self.io);
-            const size = stat.size;
+            // Discovery already classified these entries as regular files.
+            // Avoid a metadata syscall for every small repository file; explicit
+            // paths still use size information to choose larger I/O buffers.
+            const stat = if (self.explicit_file) try file_handle.stat(self.io) else null;
+            const size = if (stat) |s| s.size else 0;
             // Upstream Linux ordinary-file replacement uses whole-file anchor
             // context under its automatic mmap policy. Preserve that visible
             // behavior even when our adaptive backend chooses buffered reads.
-            self.replacement_file_context = @import("builtin").os.tag == .linux and stat.kind == .file and (self.options.mmap or self.options.mmap_auto);
+            self.replacement_file_context = @import("builtin").os.tag == .linux and (if (stat) |s| s.kind == .file else true) and (self.options.mmap or self.options.mmap_auto);
             const capacity: usize = if (size >= 8 * 1024 * 1024) 256 * 1024 else 64 * 1024;
-            const buffer = try self.a.alloc(u8, capacity);
-            defer self.a.free(buffer);
+            if (self.input_buffer == null or self.input_buffer.?.len < capacity) {
+                const buffer = try self.a.alloc(u8, capacity);
+                if (self.input_buffer) |previous| self.a.free(previous);
+                self.input_buffer = buffer;
+            }
+            const buffer = self.input_buffer.?[0..capacity];
             var reader = file_handle.reader(self.io, buffer);
             _ = reader.interface.peek(4) catch &.{};
             try self.streamDecoded(display, &reader.interface);
@@ -920,7 +968,7 @@ pub const Search = struct {
         self.binary_offset = null;
         const before = self.summary;
         self.file_output_start = self.output_bytes;
-        self.file_started = std.Io.Clock.awake.now(self.io);
+        self.file_started = if (self.options.json) std.Io.Clock.awake.now(self.io) else null;
         self.json_started = false;
         self.readStdin() catch |err| {
             try self.jsonEnd("<stdin>", before);
@@ -932,7 +980,7 @@ pub const Search = struct {
         self.explicit_file = true;
         self.render_filename = self.options.filename orelse (self.options.paths.items.len > 1);
         self.header_printed = false;
-        self.color_enabled = self.options.color == .always or (self.options.color == .auto and (std.Io.File.stdout().isTty(self.io) catch false));
+        self.color_enabled = self.options.color == .always or (self.options.color == .auto and self.stdout_tty);
         var buffer: [16384]u8 = undefined;
         var reader = @import("interrupt.zig").Stdin.init(self.io, &(self.shared_limits orelse &self.limits).cancel, &buffer);
         const first = reader.interface.peekByte() catch |err| switch (err) {
@@ -981,16 +1029,32 @@ pub const Search = struct {
         reader: std.Io.Reader,
         position: usize = 0,
         scanned_until: usize = 0,
+        window_rejected: bool = false,
+        scratch: []u8,
+        fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            const self: *BinaryReader = @alignCast(@fieldParentPtr("reader", r));
+            self.search.literal_buffer_rejected = false;
+            if (r.buffer.ptr != self.scratch.ptr) {
+                const remaining = r.buffered();
+                @memcpy(self.scratch[0..remaining.len], remaining);
+                r.buffer = self.scratch;
+                r.seek = 0;
+                r.end = remaining.len;
+            }
+            return std.Io.Reader.defaultReadVec(r, data);
+        }
         fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *BinaryReader = @alignCast(@fieldParentPtr("reader", r));
             const search = self.search;
+            search.literal_buffer_rejected = false;
             if (search.binary_stop) return error.EndOfStream;
             _ = try self.source.peekByte();
             const available = self.source.buffered();
             if (self.position == self.scanned_until) {
                 const chunk = available[0..@min(65536, available.len)];
                 self.scanned_until = self.position + chunk.len;
-                if (search.binary_offset == null) if (std.mem.indexOfScalar(u8, chunk, 0)) |at| {
+                self.window_rejected = chunk.len == 65536 and !search.binary_mode and search.options.ask == null and !search.options.invert and !search.options.passthru and search.options.before == 0 and search.options.after == 0 and search.matcher.rejectLiteralAndBinary(chunk);
+                if (!self.window_rejected and search.binary_offset == null) if (std.mem.indexOfScalar(u8, chunk, 0)) |at| {
                     search.binary_offset = self.position + at;
                     if (!search.explicit_file and !search.options.binary) {
                         search.binary_stop = true;
@@ -1001,6 +1065,19 @@ pub const Search = struct {
             }
             const n = limit.minInt(@min(available.len, self.scanned_until - self.position));
             const bytes = available[0..n];
+            if (!search.binary_mode and r.seek == r.end and n == 65536) {
+                // The source window stays stable until the next refill. Claim
+                // one classified window and lend it directly to the scanner.
+                r.buffer = bytes;
+                r.seek = 0;
+                r.end = n;
+                // The proof belongs only to this borrowed window. readVec and
+                // stream clear it before any refill or buffer concatenation.
+                search.literal_buffer_rejected = self.window_rejected;
+                self.source.toss(n);
+                self.position += n;
+                return 0;
+            }
             var start: usize = 0;
             if (search.binary_mode) for (bytes, 0..) |ch, i| if (ch == 0) {
                 try w.writeAll(bytes[start..i]);
@@ -1017,9 +1094,12 @@ pub const Search = struct {
         if (self.options.text or self.options.null_data or self.binary_mode) return self.stream(path, input);
         const before = self.summary.matches;
         var buffer: [65536]u8 = undefined;
-        var checked = BinaryReader{ .search = self, .source = input, .reader = .{ .vtable = &.{ .stream = BinaryReader.stream }, .buffer = &buffer, .seek = 0, .end = 0 } };
+        var checked = BinaryReader{ .search = self, .source = input, .scratch = &buffer, .reader = .{ .vtable = &.{ .stream = BinaryReader.stream, .readVec = BinaryReader.readVec }, .buffer = &buffer, .seek = 0, .end = 0 } };
         self.binary_checked = true;
-        defer self.binary_checked = false;
+        defer {
+            self.binary_checked = false;
+            self.literal_buffer_rejected = false;
+        }
         try self.stream(path, &checked.reader);
         if (self.binary_offset != null and self.summary.matches > before and !self.options.quiet and !self.options.json and !self.options.count and !self.options.count_matches and !self.options.files_with_matches and !self.options.files_without_match) {
             const warning = if (self.binary_stop) "WARNING: stopped searching binary file after match" else "binary file matches";
@@ -1074,16 +1154,17 @@ pub const Search = struct {
                 const buffered = available[0..@min(256 * 1024, available.len)];
                 if (std.mem.lastIndexOfScalar(u8, buffered, delimiter)) |last| {
                     const whole = buffered[0 .. last + 1];
-                    if ((self.binary_checked or self.options.text or self.options.null_data or std.mem.indexOfScalar(u8, whole, 0) == null) and self.matcher.canReject(whole)) {
-                        if (whole.len > self.byteLimit() - offset) return error.StreamTooLong;
-                        if (self.shared_limits) |limits| if (!Limits.reserve(&limits.source_bytes, whole.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
-                        if (self.options.line_numbers or self.options.json or self.options.vimgrep or self.options.hyperlink_format != null or self.options.before > 0 or self.options.after > 0) line += std.mem.count(u8, whole, &.{delimiter});
-                        offset += whole.len;
-                        self.summary.bytes += whole.len;
-                        reader.toss(whole.len);
+                    prefilter_checked_until = offset + whole.len;
+                    const rejected = if (self.binary_checked or self.options.text or self.options.null_data or std.mem.indexOfScalar(u8, whole, 0) == null) (if (self.literal_buffer_rejected) whole.len else self.matcher.rejectPrefix(whole, delimiter)) else 0;
+                    if (rejected > 0) {
+                        if (rejected > self.byteLimit() - offset) return error.StreamTooLong;
+                        if (self.shared_limits) |limits| if (!Limits.reserve(&limits.source_bytes, rejected, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
+                        if (self.options.line_numbers or self.options.json or self.options.vimgrep or self.options.hyperlink_format != null or self.options.before > 0 or self.options.after > 0) line += std.mem.count(u8, whole[0..rejected], &.{delimiter});
+                        offset += rejected;
+                        self.summary.bytes += rejected;
+                        reader.toss(rejected);
                         continue;
                     }
-                    prefilter_checked_until = offset + whole.len;
                 }
             }
 

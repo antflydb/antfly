@@ -84,7 +84,13 @@
         "bench/results/macos-arm64-cli-capture-sample.json",
         "bench/results/macos-arm64-profile-monorepo.json",
         "bench/results/macos-arm64-cli-monorepo-sample.json",
-        "bench/results/macos-arm64-cli-reset-sample.json"
+        "bench/results/macos-arm64-cli-reset-sample.json",
+        "bench/results/macos-arm64-search-speedups.json",
+        "bench/results/macos-arm64-discovery-speedups-sample.json",
+        "bench/results/macos-arm64-file-worker-tuning.json",
+        "bench/results/macos-arm64-search-speedups-large.json",
+        "bench/results/macos-arm64-search-speedups-go-sdk.json",
+        "bench/results/macos-arm64-search-speedups-ts-sdk.json"
       ],
       "limits": "Tracks startup, first stdout byte, elapsed/CPU, RSS and throughput on large files, generated small files and native Zig/Go/TypeScript repositories. VM dispatch and native CLI CPU-stack profiles guide JIT work; VM/JIT checksums must agree. Host, corpus/binary hashes and per-run results are recorded; no general ripgrep performance parity claim."
     },
@@ -94,7 +100,10 @@
       "evidence": [
         "tests/harden.zig",
         "tests/fuzz.py",
-        "bench/results/macos-arm64-hardening.json"
+        "bench/results/macos-arm64-hardening.json",
+        "bench/results/macos-arm64-search-speedups-hardening.json",
+        "bench/results/linux-x86_64-search-speedups-differential.json",
+        "bench/results/search-speedups-validation.json"
       ],
       "limits": "ReleaseSafe regex, Python/Go/Rust/JS/TS parser and dictionary targets have allocation/input/work bounds and leak checks; VM/JIT comparisons include spans, captures, marks, errors and steps. Finite campaigns are evidence, not a proof of safety for arbitrary input."
     }

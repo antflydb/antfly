@@ -547,7 +547,7 @@ python3 pkg/antfly-grep/bench/compare.py zig-out/bin/antfly-grep --extended \
   --case repository-files --case repository-search --output .zig-cache/cli.json
 ```
 
-Final validation passed **112 CLI tests on macOS and Linux** (two and one
+The preceding hardening/profiling milestone passed **112 CLI tests on macOS and Linux** (two and one
 platform-specific skips), all **1,500 live generated oracle comparisons** with no
 failures/timeouts, and **153,992 additional coverage fuzz executions** across the
 three targets. Windows x86_64 cross-compilation passed; runtime checks remain
@@ -555,7 +555,7 @@ scoped to macOS/Linux. Reports retain executable identities and hardening source
 hashes: [live differential](bench/results/linux-x86_64-generated-differential.json),
 [fuzz campaigns](bench/results/macos-arm64-hardening.json).
 
-The final [paired CLI measurements](bench/results/macos-arm64-profile-local.json)
+The earlier [paired CLI measurements](bench/results/macos-arm64-profile-local.json)
 compare the original PR binary with the updated binary, using seven alternating
 rounds. Times include startup and I/O. These warm-cache macOS ARM64 measurements
 record host load and raw runs; they establish gains for specific workloads.
@@ -573,8 +573,9 @@ repository workloads remain broadly unchanged. The complete
 [monorepo run](bench/results/macos-arm64-profile-monorepo.json) covers 10,119 files
 and approximately 534 MiB; [Go SDK](bench/results/macos-arm64-profile-go-sdk.json)
 and [TypeScript SDK](bench/results/macos-arm64-profile-ts-sdk.json) runs cover
-additional source trees. Repository discovery/search and late-prefix reset search
-remain substantially slower than ripgrep in these measurements.
+additional source trees. Those earlier measurements identified repository
+discovery/search and late-prefix reset search as the next bottlenecks; the
+optimization results below supersede them for those workloads.
 
 [VM/JIT kernel profiles](bench/results/macos-arm64-capture-jit.json) record dispatch
 mixes and matching result checksums. Raw CLI CPU traces accompany the
@@ -596,3 +597,81 @@ python3 pkg/antfly-grep/bench/sample_cli.py zig-out/bin/antfly-grep /path/to/rep
 
 Fuzz campaigns and generated suites are finite evidence. They do not establish
 universal PCRE2/JIT parity, parser correctness, or performance parity.
+
+### Native search speedups
+
+Local discovery uses up to twelve workers for file lists and four workers for
+file-search discovery, with an opportunistic twelve-job queue:
+active workers continue depth-first traversal, sharing subtrees with idle
+workers. Jobs retain immutable compiled ignore rules. A full queue falls back
+to inline traversal, and completion/cancellation drains owned jobs before
+releasing configuration. Decision, tracing and symlink-following walks
+remain serial; sorted output still collects and sorts its inventory.
+
+A bounded directory lookahead (128 entries / 8 KiB of names) avoids opening
+missing ignore files without a second directory scan. Overflow retains the
+original ignore loader and streams the remaining entries. Path prefixes and
+64–256 KiB file buffers are reused; ordinary discovered files avoid redundant
+metadata calls. Automatic case-sensitive literal file-existence scans use at
+most eight scan workers to limit filesystem contention; explicit `-j` values
+remain authoritative. Plain file lists bypass file scans and batch up to 64 names /
+8 KiB per worker. Line buffering, JSON, sorted lists, metadata filters and finite
+output budgets retain their per-file behavior.
+
+Bare literal alternations bypass regex compilation while preserving alternative
+order. Literal prefilters skip complete nonmatching records before the first
+candidate, leaving the candidate record on the normal matching/rendering path.
+SIMD candidate searches reduce four vectors together; PCRE-style matching uses
+safe literal start filters and vectorized ASCII repeats with scalar-equivalent
+captures and step budgets. Binary-checked full reader windows can be borrowed
+without an extra copy. Single-literal misses fuse NUL detection and literal
+rejection in those windows; proofs expire at refill, and cross-window records
+stay on the normal matching path. Late-NUL classification windows remain unchanged.
+
+An intermediate [directory stack sample](bench/results/macos-arm64-discovery-speedups-sample.json)
+identified directory I/O and waiting; the [file-worker sweep](bench/results/macos-arm64-file-worker-tuning.json)
+motivated the automatic scan-worker cap. Stack samples include blocked time.
+
+The [final paired run](bench/results/macos-arm64-search-speedups.json) compares
+pre-optimization commit `01d5749023`, this implementation, and ripgrep over eleven
+alternating rounds. All five original cases are faster than ripgrep on this
+macOS ARM64 host. Times include startup and I/O; output digests and exit codes
+agree. The repository contains 10,133 files / 534.1 MiB.
+
+| Workload | Before ms | Native ms | ripgrep ms | rg / native |
+|---|---:|---:|---:|---:|
+| Repository search | 1493.86 | 157.84 | 196.53 | 1.25× |
+| File discovery | 191.57 | 20.72 | 22.87 | 1.10× |
+| Capture/reset count, 32 MiB | 677.09 | 46.55 | 84.95 | 1.83× |
+| Repeat count, 32 MiB | 59.44 | 16.22 | 36.79 | 2.27× |
+| Literal miss, 32 MiB | 8.48 | 6.85 | 7.38 | 1.08× |
+
+Repository search uses 28% less median total CPU time and 46% less peak
+recorded RSS than ripgrep (7.5 vs 14.0 MiB). Discovery also uses less CPU and
+RSS. The [128 MiB check](bench/results/macos-arm64-search-speedups-large.json)
+keeps literal-miss RSS near 3 MiB and records literal misses at
+13.82 vs 15.67 ms, capture/reset counts at
+171.15 vs 324.78 ms, and repeats at
+53.28 vs 133.06 ms.
+
+Seven-round [Go SDK](bench/results/macos-arm64-search-speedups-go-sdk.json) and
+[TypeScript SDK](bench/results/macos-arm64-search-speedups-ts-sdk.json) checks also
+beat ripgrep for discovery and file search. These are workload-specific warm-cache
+measurements, not universal performance parity. Reports retain binary/corpus
+hashes, versions, host load, first-result latency, CPU/RSS and individual runs.
+
+Optimization regression tests compare compiled globs with the original VM,
+vector repeats with scalar execution, and literal alternations/prefix skips
+with grouped regex execution across case, word, context, replacement and count
+options. They also cover directory-cache overflow, shared nested ignore scopes,
+wide frontiers, null-separated lists, finite output limits, line buffering,
+cancellation and broken-pipe cleanup.
+
+[Final validation](bench/results/search-speedups-validation.json) passes **118 CLI
+tests on macOS and Linux** (two and one platform-specific skips), native unit
+properties, all **1,500 live pinned-oracle comparisons** with no failures/timeouts,
+and the Linux hardening suite. Three refreshed [coverage campaigns](bench/results/macos-arm64-search-speedups-hardening.json)
+add **107,363 executions** across regex, parsers and dictionaries. Windows x86_64
+cross-compilation passes; runtime validation remains scoped to macOS/Linux.
+The validation report records source and executable hashes. Decision checks use
+local fixtures.

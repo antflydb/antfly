@@ -73,6 +73,20 @@ pub fn findAsciiFolded(text: []const u8, needle: []const u8, offset: usize) ?usi
 pub fn findExact(text: []const u8, needle: []const u8, offset: usize) ?usize {
     return findSimd(text, needle, offset, false);
 }
+/// Number of identical leading bytes, bounded by the supplied slice. Loads stay
+/// inside the input; the scalar tail also handles short or unaligned records.
+pub fn equalPrefix(text: []const u8, byte: u8) usize {
+    const width = std.simd.suggestVectorLength(u8) orelse 16;
+    const target: @Vector(width, u8) = @splat(byte);
+    var at: usize = 0;
+    while (text.len - at >= width) : (at += width) {
+        const chunk: @Vector(width, u8) = text[at..][0..width].*;
+        const different = chunk != target;
+        if (@reduce(.Or, different)) return at + @ctz(@as(@Int(.unsigned, width), @bitCast(different)));
+    }
+    while (at < text.len and text[at] == byte) : (at += 1) {}
+    return at;
+}
 fn folded(comptime insensitive: bool, byte: u8) u8 {
     return if (insensitive) std.ascii.toLower(byte) else byte;
 }
@@ -90,22 +104,66 @@ fn findSimd(text: []const u8, needle: []const u8, offset: usize, comptime insens
     var at = offset;
     var work: usize = 0;
     const budget = @max(256, (text.len - offset) *| 2);
-    while (end - at >= width) : (at += width) {
-        const front: @Vector(width, u8) = text[at..][0..width].*;
-        const back: @Vector(width, u8) = text[at + needle.len - 1 ..][0..width].*;
-        const candidates = ((if (insensitive) lower(width, front) else front) == first) & ((if (insensitive) lower(width, back) else back) == last);
-        var mask: @Int(.unsigned, width) = @bitCast(candidates);
-        while (mask != 0) {
-            const candidate = at + @ctz(mask);
-            if (equal(insensitive, text[candidate..][0..needle.len], needle)) return candidate;
-            work +|= needle.len;
-            if (work >= budget) return twoWay(text, needle, candidate + 1, insensitive);
-            mask &= mask - 1;
+    // On NEON, reducing a vector mask is more expensive than loading the
+    // next vector. Amortize the reduction over four independent chunks while
+    // retaining candidate order and the linear fallback's work budget.
+    inline for (.{ 4, 1 }) |lanes| {
+        while (end - at >= width * lanes) : (at += width * lanes) {
+            var candidates: [lanes]@Vector(width, bool) = undefined;
+            var any: @Vector(width, bool) = @splat(false);
+            inline for (0..lanes) |lane| {
+                const begin = at + lane * width;
+                const front: @Vector(width, u8) = text[begin..][0..width].*;
+                const back: @Vector(width, u8) = text[begin + needle.len - 1 ..][0..width].*;
+                candidates[lane] = ((if (insensitive) lower(width, front) else front) == first) & ((if (insensitive) lower(width, back) else back) == last);
+                any |= candidates[lane];
+            }
+            if (!@reduce(.Or, any)) continue;
+            inline for (0..lanes) |lane| {
+                var mask: @Int(.unsigned, width) = @bitCast(candidates[lane]);
+                while (mask != 0) {
+                    const candidate = at + lane * width + @ctz(mask);
+                    if (equal(insensitive, text[candidate..][0..needle.len], needle)) return candidate;
+                    work +|= needle.len;
+                    if (work >= budget) return twoWay(text, needle, candidate + 1, insensitive);
+                    mask &= mask - 1;
+                }
+            }
         }
     }
     while (at < end) : (at += 1) if (equal(insensitive, text[at..][0..needle.len], needle)) return at;
     return null;
 }
+/// A conservative fused literal/byte prefilter. False proves that neither
+/// needle nor the sentinel occurs; true may be a first/last-byte false positive.
+/// The sentinel check covers the literal's trailing overhang as well.
+pub fn mayContainOrByte(text: []const u8, needle: []const u8, other: u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > text.len) return std.mem.indexOfScalar(u8, text, other) != null;
+    const width = std.simd.suggestVectorLength(u8) orelse 16;
+    const first: @Vector(width, u8) = @splat(needle[0]);
+    const last: @Vector(width, u8) = @splat(needle[needle.len - 1]);
+    const sentinel: @Vector(width, u8) = @splat(other);
+    const end = text.len - needle.len + 1;
+    var at: usize = 0;
+    inline for (.{ 4, 1 }) |lanes| {
+        while (end - at >= width * lanes) : (at += width * lanes) {
+            var any: @Vector(width, bool) = @splat(false);
+            inline for (0..lanes) |lane| {
+                const begin = at + lane * width;
+                const front: @Vector(width, u8) = text[begin..][0..width].*;
+                const back: @Vector(width, u8) = text[begin + needle.len - 1 ..][0..width].*;
+                any |= ((front == first) & (back == last)) | (front == sentinel);
+            }
+            if (@reduce(.Or, any)) return true;
+        }
+    }
+    while (at < end) : (at += 1) {
+        if (text[at] == other or (text[at] == needle[0] and text[at + needle.len - 1] == needle[needle.len - 1])) return true;
+    }
+    return std.mem.indexOfScalar(u8, text[at..], other) != null;
+}
+
 const Factor = struct { cut: usize, period: usize };
 fn maximalSuffix(needle: []const u8, comptime insensitive: bool, comptime reverse: bool) Factor {
     var left: usize = 0; // maximal-suffix index plus one, avoiding a -1 sentinel
@@ -329,4 +387,23 @@ test "SIMD literal counts include Unicode equivalents and unaligned tails" {
         };
         try std.testing.expectEqual(count, countByte(bytes[offset..], 'a', false, true));
     }
+}
+
+test "fused literal and binary proofs cover vector and literal tails" {
+    var bytes: [160]u8 = undefined;
+    const needle: [200]u8 = @splat('a');
+    for (0..bytes.len + 1) |len| for ([_]usize{ 0, 1, 7, 40, 200 }) |size| {
+        const text = bytes[0..len];
+        @memset(text, 'x');
+        try std.testing.expectEqual(size == 0, mayContainOrByte(text, needle[0..size], 0));
+        for (0..len) |at| {
+            text[at] = 0;
+            try std.testing.expect(mayContainOrByte(text, needle[0..size], 0));
+            text[at] = 'x';
+        }
+        if (size <= len) {
+            @memcpy(text[len - size ..], needle[0..size]);
+            try std.testing.expect(mayContainOrByte(text, needle[0..size], 0));
+        }
+    };
 }

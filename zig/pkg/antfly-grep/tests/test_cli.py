@@ -2709,6 +2709,173 @@ class CliTests(unittest.TestCase):
             {b"./a.txt", b"./private.txt"},
         )
 
+    def test_literal_alternation_shortcut_matches_grouped_vm(self):
+        self.write(
+            "alternatives.txt",
+            "a aa baa aA A\nfoo foobar bar\nα Σ σ\na\naa\nab\nba\nα\nΣ\nfoo\nfoobar\nbar\n",
+        )
+        for pattern in ("a|aa", "aa|a", "α|Σ", "a|b|A", "foo|foobar|bar", "ab|ba"):
+            for flags in ([], ["-i"], ["-S"], ["-w"], ["-x"], ["-i", "-w"]):
+                for mode in (["-o"], ["-c"], ["-r", "<$0:$1>"]):
+                    with self.subTest(pattern=pattern, flags=flags, mode=mode):
+                        fast = self.raw_cli(
+                            *flags, *mode, "-e", pattern, "alternatives.txt"
+                        )
+                        reference = self.raw_cli(
+                            *flags, *mode, "-e", f"(?:{pattern})", "alternatives.txt"
+                        )
+                        self.assertEqual(fast.stdout, reference.stdout)
+
+    def test_automatic_literal_file_concurrency_honors_explicit_threads(self):
+        self.write("threads/file.txt", "hit\n")
+        auto = self.raw_cli("--debug", "-l", "hit", "threads")
+        workers = int(auto.stderr.split(b"threads=", 1)[1].split()[0])
+        self.assertGreaterEqual(workers, 1)
+        self.assertLessEqual(workers, 8)
+        for jobs in (1, 12):
+            explicit = self.raw_cli("--debug", f"-j{jobs}", "-l", "hit", "threads")
+            self.assertIn(f"threads={jobs} ".encode(), explicit.stderr)
+            self.assertEqual(explicit.stdout, auto.stdout)
+
+    def test_fused_binary_literal_proof_keeps_cross_window_matches(self):
+        needle = b"unfindable-literal"
+        for offset in (65520, 65535, 65536, 131066):
+            with self.subTest(offset=offset):
+                self.write("boundary.txt", b"x" * offset + needle + b" tail\nsuffix\n")
+                expected = str(offset).encode() + b":" + needle + b"\n"
+                self.assertEqual(
+                    self.raw_cli("-Fbo", needle.decode(), "boundary.txt").stdout,
+                    expected,
+                )
+                self.assertEqual(
+                    self.raw_cli(
+                        "--no-mmap", "-Fbo", needle.decode(), "boundary.txt"
+                    ).stdout,
+                    expected,
+                )
+
+    def test_literal_prefix_skipping_preserves_records_and_output(self):
+        self.write(
+            "prefix.txt",
+            "miss first\n" * 500
+            + "noise needle\nnoise xneedleSuffix\nnoise K\nlast NEEDLE\n",
+        )
+        for flags in (
+            [],
+            ["-i"],
+            ["-w"],
+            ["-x"],
+            ["-i", "-w"],
+            ["-A1"],
+            ["-B1"],
+            ["-m1"],
+        ):
+            for mode in (["-nH"], ["-l"], ["-c"], ["-o"], ["-r", "<$0>"]):
+                with self.subTest(flags=flags, mode=mode):
+                    expected_code = 1 if "-x" in flags else 0
+                    fast = self.raw_cli(
+                        *flags,
+                        *mode,
+                        "-e",
+                        "needle|NEEDLE|K",
+                        "prefix.txt",
+                        code=expected_code,
+                    )
+                    reference = self.raw_cli(
+                        *flags,
+                        *mode,
+                        "-e",
+                        "(?:needle|NEEDLE|K)",
+                        "prefix.txt",
+                        code=expected_code,
+                    )
+                    self.assertEqual(fast.stdout, reference.stdout)
+
+    def test_directory_lookahead_preserves_ignore_precedence_and_overflow(self):
+        # Exercise both cache limits and streaming fallback. Ignore files are
+        # created after entries so their rules must apply to earlier entries.
+        self.write(".git/config", "")
+        for label, count, width in [
+            ("small", 12, 8),
+            ("entries", 140, 8),
+            ("names", 90, 120),
+        ]:
+            for i in range(count):
+                self.write(f"{label}/{i:04}-{'x' * width}.txt", "hit\n")
+            self.write(f"{label}/.gitignore", "*.txt\n!keep.txt\n")
+            self.write(f"{label}/.ignore", "!*.txt\nblocked.txt\n")
+            self.write(f"{label}/keep.txt", "hit\n")
+            self.write(f"{label}/blocked.txt", "hit\n")
+            paths = set(self.raw_cli("--files", label).stdout.splitlines())
+            self.assertEqual(len(paths), count + 1)
+            self.assertIn(f"{label}/keep.txt".encode(), paths)
+            self.assertNotIn(f"{label}/blocked.txt".encode(), paths)
+            self.assertEqual(
+                paths, set(self.raw_cli("-l", "hit", label).stdout.splitlines())
+            )
+            self.assertEqual(
+                len(self.raw_cli("--files", "--no-ignore", label).stdout.splitlines()),
+                count + 2,
+            )
+
+    def test_parallel_discovery_matches_serial_with_nested_scopes_and_wide_frontier(
+        self,
+    ):
+        self.write(".ignore", "*.log\n")
+        for i in range(150):
+            prefix = f"tree/{i:03}"
+            self.write(f"{prefix}/.ignore", "*.txt\n!keep.txt\n")
+            self.write(f"{prefix}/keep.txt", "hit\n")
+            self.write(f"{prefix}/blocked.txt", "hit\n")
+            self.write(f"{prefix}/blocked.log", "hit\n")
+            self.write(f"{prefix}/child/.ignore", "!blocked.txt\n")
+            self.write(f"{prefix}/child/blocked.txt", "hit\n")
+        serial = set(self.raw_cli("--files", "-j1", "tree").stdout.splitlines())
+        self.assertEqual(len(serial), 300)
+        nul = self.raw_cli("--files", "-0", "-j4", "tree").stdout
+        self.assertTrue(nul.endswith(b"\0"))
+        self.assertEqual(set(nul[:-1].split(b"\0")), serial)
+        bounded = self.raw_cli(
+            "--files", "-j4", "--max-output-bytes=64", "tree", code=2
+        )
+        self.assertLessEqual(len(bounded.stdout), 64)
+        self.assertIn(b"OutputBudgetExceeded", bounded.stderr)
+        self.assertEqual(
+            set(
+                self.raw_cli(
+                    "--files", "-j4", "--line-buffered", "tree"
+                ).stdout.splitlines()
+            ),
+            serial,
+        )
+        for jobs in (2, 4, 12):
+            with self.subTest(jobs=jobs):
+                parallel = self.raw_cli(
+                    "--files", f"-j{jobs}", "tree"
+                ).stdout.splitlines()
+                self.assertEqual(len(parallel), len(serial))
+                self.assertEqual(set(parallel), serial)
+                self.assertEqual(
+                    set(
+                        self.raw_cli(
+                            "-l", f"-j{jobs}", "hit", "tree"
+                        ).stdout.splitlines()
+                    ),
+                    serial,
+                )
+        self.assertEqual(
+            self.raw_cli("--files", "--sort=path", "tree").stdout.splitlines(),
+            sorted(serial),
+        )
+        self.assertEqual(
+            set(
+                self.raw_cli(
+                    "--files", "-j4", "--max-depth=2", "tree"
+                ).stdout.splitlines()
+            ),
+            {p for p in serial if b"/child/" not in p},
+        )
+
     def test_subtree_keeps_ancestor_ignores(self):
         self.write(".gitignore", "*.log\n")
         self.write("sub/a.log", "hit\n")

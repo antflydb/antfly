@@ -19,6 +19,7 @@ const Options = @import("options.zig").Options;
 const Allocator = std.mem.Allocator;
 
 const Rule = struct {
+    references: std.atomic.Value(usize) = .init(1),
     base: []const u8,
     pattern: regex.PreparedPattern,
     negate: bool,
@@ -27,18 +28,22 @@ const Rule = struct {
     priority: u8 = 0,
     insensitive: bool = false,
     fn deinit(self: *Rule, a: Allocator) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
         self.pattern.deinit();
         a.free(self.base);
+        a.destroy(self);
     }
-    fn matches(self: *const Rule, a: Allocator, path: []const u8, is_dir: bool) !bool {
+    fn matches(self: *const Rule, a: Allocator, path: []const u8, name: []const u8, is_dir: bool, ancestor: bool) !bool {
         if (self.directory and !is_dir) return false;
-        if (!std.mem.startsWith(u8, path, self.base)) return false;
+        if (!ancestor and !std.mem.startsWith(u8, path, self.base)) return false;
         var relative = path[self.base.len..];
         if (relative.len > 0 and relative[0] == '/') relative = relative[1..] else if (self.base.len != 0 and !std.mem.endsWith(u8, self.base, "/")) return false;
+        if (self.basename and !self.pattern.consumes_slash and !self.insensitive) return self.pattern.matches(a, name);
         const lowered = if (self.insensitive) try std.ascii.allocLowerString(a, relative) else null;
         defer if (lowered) |v| a.free(v);
         relative = lowered orelse relative;
         if (!self.basename) return self.pattern.matches(a, relative);
+        if (!self.pattern.consumes_slash) return self.pattern.matches(a, std.fs.path.basename(relative));
         // globset's basename rules may begin at every path component. A
         // negated class can consume '/', unlike '?' and nonrecursive '*'.
         // Preserve that upstream behavior rather than truncating to basename.
@@ -50,12 +55,48 @@ const Rule = struct {
     }
 };
 
+// Entry names must outlive the iterator's next refill. Keep a small fixed
+// name arena on the heap so deep directory trees do not enlarge thread stacks.
+const DirectoryEntries = struct {
+    entries: [128]std.Io.Dir.Entry = undefined,
+    names: [8192]u8 = undefined,
+    len: usize = 0,
+    used: usize = 0,
+    complete: bool = false,
+    gitignore: bool = false,
+    ignore: bool = false,
+    overflow: ?std.Io.Dir.Entry = null,
+    fn read(self: *DirectoryEntries, io: std.Io, it: *std.Io.Dir.Iterator) !void {
+        while (try it.next(io)) |entry| {
+            if (self.len == self.entries.len or entry.name.len > self.names.len - self.used) {
+                self.overflow = entry;
+                return;
+            }
+            const name = self.names[self.used..][0..entry.name.len];
+            @memcpy(name, entry.name);
+            self.used += name.len;
+            self.entries[self.len] = entry;
+            self.entries[self.len].name = name;
+            self.len += 1;
+            self.gitignore = self.gitignore or std.mem.eql(u8, name, ".gitignore");
+            self.ignore = self.ignore or std.mem.eql(u8, name, ".ignore");
+        }
+        self.complete = true;
+    }
+};
+
+const Dispatcher = struct {
+    ptr: *anyopaque,
+    submit: *const fn (*anyopaque, *Discovery, []const u8, []const u8) anyerror!bool,
+};
+
 const Override = struct { pattern: regex.PreparedPattern, basename: bool, include: bool, directory: bool = false, insensitive: bool = false };
 pub const Discovery = struct {
     a: Allocator,
     io: std.Io,
     options: *const Options,
-    rules: std.ArrayList(Rule) = .empty,
+    rules: std.ArrayList(*Rule) = .empty,
+    dispatcher: ?*Dispatcher = null,
     overrides: std.ArrayList(Override) = .empty,
     has_include: bool = false,
     git_root: ?[]const u8 = null,
@@ -90,7 +131,7 @@ pub const Discovery = struct {
     }
     fn popTo(self: *Discovery, n: usize) void {
         while (self.rules.items.len > n) {
-            var r = self.rules.pop().?;
+            const r = self.rules.pop().?;
             r.deinit(self.a);
         }
     }
@@ -224,7 +265,47 @@ pub const Discovery = struct {
             try self.loadDirectory(ancestors.items[i]);
         }
     }
+    /// Directory parallelism is independent of file scanning. The queue is
+    /// bounded; a producer traverses inline when it is full, so workers never
+    /// deadlock waiting for space that only another producer could release.
+    pub fn walkParallel(self: *Discovery, path: []const u8, display: []const u8, context: anytype) !void {
+        if (self.options.jobs <= 1 or self.options.follow or self.options.quiet or self.options.ask != null or self.options.trace or self.options.inventory) return self.walk(path, display, context);
+        const Pool = WalkPool(@TypeOf(context));
+        var pool = Pool{ .root = self, .context = context };
+        if (@hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "canBatchFileLists")) pool.batch_files = context.canBatchFileLists();
+        pool.dispatcher = .{ .ptr = &pool, .submit = Pool.submit };
+        var threads: [11]std.Thread = undefined;
+        const worker_limit = if (self.options.files) threads.len else 3;
+        var started: usize = 0;
+        defer for (threads[0..started]) |thread| thread.join();
+        // Root counts as one pending job, including when thread creation fails.
+        var root_done = false;
+        defer if (!root_done) pool.finish();
+        for (threads[0..@min(worker_limit, self.options.jobs - 1)]) |*thread| {
+            thread.* = try std.Thread.spawn(.{}, Pool.worker, .{&pool});
+            started += 1;
+        }
+        const previous = self.dispatcher;
+        self.dispatcher = &pool.dispatcher;
+        defer self.dispatcher = previous;
+        var callbacks = Pool.Callbacks{ .pool = &pool };
+        defer callbacks.deinit();
+        self.walk(path, display, &callbacks) catch |err| pool.fail(err);
+        callbacks.flush() catch |err| pool.fail(err);
+        pool.finish();
+        root_done = true;
+        // Help drain the queue instead of leaving the calling thread idle.
+        // next() waits for pending jobs before borrowed configuration expires.
+        pool.worker();
+        pool.mutex.lockUncancelable(self.io);
+        const failure = pool.failure;
+        pool.mutex.unlock(self.io);
+        if (failure) |err| return err;
+    }
     pub fn walk(self: *Discovery, path: []const u8, display: []const u8, context: anytype) anyerror!void {
+        return self.walkAt(path, display, context, .cwd(), path);
+    }
+    fn walkAt(self: *Discovery, path: []const u8, display: []const u8, context: anytype, parent: std.Io.Dir, entry_name: []const u8) anyerror!void {
         if (context.stopped()) return;
         if (self.depth > self.options.max_depth) return;
         self.depth += 1;
@@ -243,18 +324,61 @@ pub const Discovery = struct {
         };
         const old = self.rules.items.len;
         defer self.popTo(old);
-        if (!self.options.no_ignore) try self.loadDirectory(path);
-        if (@hasDecl(@TypeOf(context.*), "directoryAllowed")) if (!try context.directoryAllowed(path)) return;
-        var dir = try std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
+        // Decision traversal keeps its pruning callback ahead of directory I/O.
+        const lookahead = !self.options.no_ignore and self.options.ask == null;
+        if (!lookahead) {
+            if (!self.options.no_ignore) try self.loadDirectory(path);
+            if (@hasDecl(@TypeOf(context.*), "directoryAllowed")) if (!try context.directoryAllowed(path)) return;
+        }
+        var dir = try parent.openDir(self.io, entry_name, .{ .iterate = true });
         defer dir.close(self.io);
         var it = dir.iterate();
-        while (try it.next(self.io)) |entry| {
+        // Most directories contain no ignore files. A bounded lookahead avoids
+        // two failing opens per directory without a second directory scan or
+        // an unbounded inventory. Large directories use the original loader.
+        const cache = if (lookahead) try self.a.create(DirectoryEntries) else null;
+        defer if (cache) |v| self.a.destroy(v);
+        if (cache) |v| {
+            v.* = .{};
+            try v.read(self.io, &it);
+            try self.loadDirectoryKnown(path, !v.complete or v.gitignore, !v.complete or v.ignore);
+            if (@hasDecl(@TypeOf(context.*), "directoryAllowed")) if (!try context.directoryAllowed(path)) return;
+        }
+        // Reuse each directory's path prefixes across its children. Callbacks
+        // borrow them only for the duration of the call; queued tasks own copies.
+        var full_path: std.ArrayList(u8) = .empty;
+        defer full_path.deinit(self.a);
+        var shown_path: std.ArrayList(u8) = .empty;
+        defer shown_path.deinit(self.a);
+        try full_path.appendSlice(self.a, path);
+        if (path.len > 0 and !std.fs.path.isSep(path[path.len - 1])) try full_path.append(self.a, std.fs.path.sep);
+        try shown_path.appendSlice(self.a, display);
+        if (display.len > 0 and !std.fs.path.isSep(display[display.len - 1])) try shown_path.append(self.a, std.fs.path.sep);
+        const full_prefix = full_path.items.len;
+        const shown_prefix = shown_path.items.len;
+        var cached: usize = 0;
+        while (true) {
+            const entry = if (cache) |v| blk: {
+                if (cached < v.len) {
+                    const entry = v.entries[cached];
+                    cached += 1;
+                    break :blk entry;
+                }
+                if (v.overflow) |entry| {
+                    v.overflow = null;
+                    break :blk entry;
+                }
+                if (v.complete) break;
+                break :blk (try it.next(self.io)) orelse break;
+            } else (try it.next(self.io)) orelse break;
             if (context.stopped()) break;
             if (entry.kind != .directory and entry.kind != .file and !(self.options.follow and entry.kind == .sym_link)) continue;
-            const full = try std.fs.path.join(self.a, &.{ path, entry.name });
-            defer self.a.free(full);
-            const shown = if (display.len == 0) try self.a.dupe(u8, entry.name) else try std.fs.path.join(self.a, &.{ display, entry.name });
-            defer self.a.free(shown);
+            full_path.shrinkRetainingCapacity(full_prefix);
+            shown_path.shrinkRetainingCapacity(shown_prefix);
+            try full_path.appendSlice(self.a, entry.name);
+            try shown_path.appendSlice(self.a, entry.name);
+            const full = full_path.items;
+            const shown = shown_path.items;
             var kind = entry.kind;
             if (kind == .sym_link) {
                 const st = std.Io.Dir.cwd().statFile(self.io, full, .{}) catch |err| {
@@ -272,8 +396,14 @@ pub const Discovery = struct {
                 if (@hasDecl(@TypeOf(context.*), "skipped")) context.skipped();
                 continue;
             }
-            if (is_dir) self.walk(full, shown, context) catch |err| {
-                try context.reportError(shown, err);
+            if (is_dir) {
+                const queued = if (self.dispatcher) |dispatcher| dispatcher.submit(dispatcher.ptr, self, full, shown) catch |err| {
+                    try context.reportError(shown, err);
+                    continue;
+                } else false;
+                if (!queued) self.walkAt(full, shown, context, dir, entry.name) catch |err| {
+                    try context.reportError(shown, err);
+                };
             } else context.file(full, shown) catch |err| {
                 try context.reportError(shown, err);
             };
@@ -290,12 +420,22 @@ pub const Discovery = struct {
                 if (std.mem.eql(u8, name, ".env") or std.mem.startsWith(u8, name, ".env.") or std.mem.endsWith(u8, name, ".pem") or std.mem.endsWith(u8, name, ".key") or std.mem.startsWith(u8, name, "id_rsa") or std.mem.startsWith(u8, name, "credentials")) return false;
             }
         }
+        const basename = std.fs.path.basename(path);
         var ignored = false;
-        var priority: u8 = 0;
-        for (self.rules.items) |*r| if (r.priority >= priority and try r.matches(self.a, path, dir)) {
-            ignored = !r.negate;
-            priority = r.priority;
-        };
+        var priority: ?u8 = null;
+        // Last rule wins within each priority. Once one matches, only higher
+        // priorities can change the outcome; earlier peers cannot override it.
+        var rule_index = self.rules.items.len;
+        while (rule_index > 0) {
+            rule_index -= 1;
+            const r = self.rules.items[rule_index];
+            if (priority) |p| if (r.priority <= p) continue;
+            if (try r.matches(self.a, path, basename, dir, self.depth > 0)) {
+                ignored = !r.negate;
+                priority = r.priority;
+                if (r.priority == 4) break;
+            }
+        }
         // Explicit globs are evaluated last. Positive globs restrict files but
         // cannot prune directories that may contain an included descendant.
         var override: ?bool = null;
@@ -463,12 +603,15 @@ pub const Discovery = struct {
         return pattern.matches(self.a, lower_target orelse target);
     }
     fn loadDirectory(self: *Discovery, dir: []const u8) !void {
-        if (!self.options.no_ignore_vcs and (!self.options.require_git or (self.git_root != null and std.mem.startsWith(u8, dir, self.git_root.?)))) {
+        return self.loadDirectoryKnown(dir, true, true);
+    }
+    fn loadDirectoryKnown(self: *Discovery, dir: []const u8, gitignore: bool, ignore: bool) !void {
+        if (gitignore and !self.options.no_ignore_vcs and (!self.options.require_git or (self.git_root != null and std.mem.startsWith(u8, dir, self.git_root.?)))) {
             const path = try std.fs.path.join(self.a, &.{ dir, ".gitignore" });
             defer self.a.free(path);
             try self.load(path, dir, 2);
         }
-        if (self.options.no_ignore_dot) return;
+        if (!ignore or self.options.no_ignore_dot) return;
         const path = try std.fs.path.join(self.a, &.{ dir, ".ignore" });
         defer self.a.free(path);
         try self.load(path, dir, 3);
@@ -511,10 +654,196 @@ pub const Discovery = struct {
             errdefer pattern.deinit();
             const owned_base = try self.a.dupe(u8, base);
             errdefer self.a.free(owned_base);
-            try self.rules.append(self.a, .{ .base = owned_base, .pattern = pattern, .negate = negate, .directory = directory, .priority = priority, .insensitive = self.options.ignore_file_case_insensitive, .basename = !anchored and std.mem.indexOfScalar(u8, p, '/') == null });
+            const rule = try self.a.create(Rule);
+            errdefer self.a.destroy(rule);
+            rule.* = .{ .base = owned_base, .pattern = pattern, .negate = negate, .directory = directory, .priority = priority, .insensitive = self.options.ignore_file_case_insensitive, .basename = !anchored and std.mem.indexOfScalar(u8, p, '/') == null };
+            try self.rules.append(self.a, rule);
         }
     }
 };
+
+// Jobs own their paths and retain compiled rules. Rule compilation and matching
+// use independent arenas/scratch; immutable patterns can outlive parent walks.
+fn WalkPool(comptime Context: type) type {
+    return struct {
+        const Self = @This();
+        const Job = struct { discovery: Discovery, path: []u8, display: []u8 };
+        root: *Discovery,
+        context: Context,
+        dispatcher: Dispatcher = undefined,
+        slots: [12]Job = undefined,
+        head: usize = 0,
+        count: usize = 0,
+        pending: usize = 1,
+        failure: ?anyerror = null,
+        batch_files: bool = false,
+        idle: std.atomic.Value(usize) = .init(0),
+        stop: std.atomic.Value(bool) = .init(false),
+        mutex: std.Io.Mutex = .init,
+        callbacks_mutex: std.Io.Mutex = .init,
+        changed: std.Io.Condition = .init,
+        const Callbacks = struct {
+            pool: *Self,
+            names: std.ArrayList(u8) = .empty,
+            count: usize = 0,
+            fn deinit(self: *@This()) void {
+                self.names.deinit(self.pool.root.a);
+            }
+            fn flush(self: *@This()) !void {
+                if (@hasDecl(@typeInfo(Context).pointer.child, "filesBatch")) {
+                    if (self.count == 0) return;
+                    const pool = self.pool;
+                    defer {
+                        self.names.clearRetainingCapacity();
+                        self.count = 0;
+                    }
+                    pool.callbacks_mutex.lockUncancelable(pool.root.io);
+                    defer pool.callbacks_mutex.unlock(pool.root.io);
+                    if (pool.stop.load(.acquire)) return;
+                    try pool.context.filesBatch(self.names.items, self.count);
+                    if (pool.context.stopped()) pool.stop.store(true, .release);
+                }
+            }
+            pub fn stopped(self: *@This()) bool {
+                if (self.pool.stop.load(.acquire)) return true;
+                if (@hasDecl(@typeInfo(Context).pointer.child, "discoveryStopped")) return self.pool.context.discoveryStopped();
+                return false;
+            }
+            pub fn file(self: *@This(), path: []const u8, display: []const u8) !void {
+                const pool = self.pool;
+                // Batch only ordinary unrestricted file lists. Line buffering,
+                // metadata, JSON, sorting and finite output budgets retain the
+                // per-file callback and its precise observable behavior.
+                if (pool.batch_files and display.len < 8192) {
+                    if (self.names.items.len + display.len + 1 > 8192) try self.flush();
+                    try self.names.appendSlice(pool.root.a, display);
+                    try self.names.append(pool.root.a, if (pool.root.options.null_paths) 0 else '\n');
+                    self.count += 1;
+                    if (self.count == 64) try self.flush();
+                    return;
+                }
+                try self.flush();
+                // The file-scan queue owns its synchronization. Its producer
+                // copies immutable path/render settings and may run without
+                // serializing discovery behind a second callback mutex.
+                if (@hasDecl(@typeInfo(Context).pointer.child, "concurrentFile")) {
+                    if (try pool.context.concurrentFile(path, display)) return;
+                }
+                pool.callbacks_mutex.lockUncancelable(pool.root.io);
+                defer pool.callbacks_mutex.unlock(pool.root.io);
+                if (pool.stop.load(.acquire)) return;
+                try pool.context.file(path, display);
+                if (pool.context.stopped()) pool.stop.store(true, .release);
+            }
+            pub fn reportError(self: *@This(), path: []const u8, err: anyerror) !void {
+                try self.flush();
+                const pool = self.pool;
+                pool.callbacks_mutex.lockUncancelable(pool.root.io);
+                defer pool.callbacks_mutex.unlock(pool.root.io);
+                try pool.context.reportError(path, err);
+            }
+            pub fn skipped(self: *@This()) void {
+                if (@hasDecl(@typeInfo(Context).pointer.child, "skipped")) {
+                    const pool = self.pool;
+                    pool.callbacks_mutex.lockUncancelable(pool.root.io);
+                    defer pool.callbacks_mutex.unlock(pool.root.io);
+                    pool.context.skipped();
+                }
+            }
+        };
+        fn submit(ptr: *anyopaque, source: *Discovery, path: []const u8, display: []const u8) !bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            // Share subtrees only with idle workers. Keeping active producers
+            // in their own DFS avoids path/rule copies and queue contention for
+            // every directory, while idle workers can still steal later work.
+            if (self.idle.load(.monotonic) == 0) return false;
+            const a = self.root.a;
+            const io = self.root.io;
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.stop.load(.acquire)) return true;
+            if (self.count == self.slots.len or self.count >= self.idle.load(.monotonic)) return false;
+            const owned_path = try a.dupe(u8, path);
+            errdefer a.free(owned_path);
+            const owned_display = try a.dupe(u8, display);
+            errdefer a.free(owned_display);
+            var rules: std.ArrayList(*Rule) = .empty;
+            errdefer rules.deinit(a);
+            try rules.appendSlice(a, source.rules.items);
+            for (rules.items) |rule| _ = rule.references.fetchAdd(1, .monotonic);
+            const job: Job = .{
+                .path = owned_path,
+                .display = owned_display,
+                .discovery = .{
+                    .a = a,
+                    .io = io,
+                    .options = source.options,
+                    .rules = rules,
+                    .overrides = source.overrides,
+                    .has_include = source.has_include,
+                    .git_root = source.git_root,
+                    .git_directory = source.git_directory,
+                    .cwd = source.cwd,
+                    .root_device = source.root_device,
+                    .depth = source.depth,
+                    .dispatcher = &self.dispatcher,
+                },
+            };
+            self.slots[(self.head + self.count) % self.slots.len] = job;
+            self.count += 1;
+            self.pending += 1;
+            self.changed.signal(io);
+            return true;
+        }
+        fn next(self: *Self) ?Job {
+            const io = self.root.io;
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            while (self.count == 0 and self.pending != 0) {
+                _ = self.idle.fetchAdd(1, .monotonic);
+                self.changed.waitUncancelable(io, &self.mutex);
+                _ = self.idle.fetchSub(1, .monotonic);
+            }
+            if (self.count == 0) return null;
+            const job = self.slots[self.head];
+            self.head = (self.head + 1) % self.slots.len;
+            self.count -= 1;
+            return job;
+        }
+        fn finish(self: *Self) void {
+            const io = self.root.io;
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.pending -= 1;
+            if (self.pending == 0) self.changed.broadcast(io);
+        }
+        fn fail(self: *Self, err: anyerror) void {
+            self.mutex.lockUncancelable(self.root.io);
+            defer self.mutex.unlock(self.root.io);
+            if (self.failure == null) self.failure = err;
+            self.stop.store(true, .release);
+        }
+        fn worker(self: *Self) void {
+            var callbacks = Callbacks{ .pool = self };
+            defer callbacks.deinit();
+            while (self.next()) |value| {
+                var job = value;
+                const a = self.root.a;
+                defer self.finish();
+                defer {
+                    job.discovery.popTo(0);
+                    job.discovery.rules.deinit(a);
+                    a.free(job.path);
+                    a.free(job.display);
+                }
+                job.discovery.walk(job.path, job.display, &callbacks) catch |err| {
+                    callbacks.reportError(job.display, err) catch |failure| self.fail(failure);
+                };
+                callbacks.flush() catch |err| self.fail(err);
+            }
+        }
+    };
+}
 
 // Join escaped physical newlines before interpreting values. Comments stop
 // escape processing outside quotes; an escaped backslash is not a continuation.
@@ -672,6 +1001,28 @@ test "git-style globs preserve slashes and recursive zero-directory matches" {
     try std.testing.expect(!try q.matches(a, "src/sub/main.go"));
 }
 
+test "compiled glob shortcuts agree with the Thompson VM on path components" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "a", "*.a", "a*", "a*b", "**", "**/a", "a/**/b", "a[!x]b", "[ab]*", "{a,b}*", "a?b" }) |pattern| {
+        var prepared = try glob(a, pattern);
+        defer prepared.deinit();
+        var reference = prepared;
+        reference.fast = .{};
+        var bytes: [5]u8 = undefined;
+        for (0..3906) |number| {
+            var value = number;
+            var len: usize = 0;
+            while (value > 0 and len < bytes.len) : (len += 1) {
+                value -= 1;
+                bytes[len] = "/ab.c"[value % 5];
+                value /= 5;
+            }
+            const text = bytes[0..len];
+            try std.testing.expectEqual(try reference.matches(a, text), try prepared.matches(a, text));
+        }
+    }
+}
+
 // A closing bracket inside a quoted subsection or a trailing comment does not
 // terminate the section header. Backslashes only escape within quotes.
 fn configSectionEnd(line: []const u8) ?usize {
@@ -690,4 +1041,52 @@ fn configSectionEnd(line: []const u8) ?usize {
         if (!quoted and c == ']') return i;
     }
     return null;
+}
+
+test "parallel directory jobs release shared ignore rules on completion and cancellation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ignore", .data = "*.bad\n" });
+    for (0..150) |i| {
+        var buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, "{d}", .{i});
+        var dir = try tmp.dir.createDirPathOpen(io, path, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = ".ignore", .data = "*.txt\n!keep.txt\n" });
+        try dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "hit\n" });
+        try dir.writeFile(io, .{ .sub_path = "skip.txt", .data = "hit\n" });
+        try dir.writeFile(io, .{ .sub_path = "skip.bad", .data = "hit\n" });
+    }
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    const Context = struct {
+        count: usize = 0,
+        cancel: bool = false,
+        broken: bool = false,
+        pub fn stopped(self: *@This()) bool {
+            return self.cancel and self.count > 0;
+        }
+        pub fn file(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.count += 1;
+            if (self.broken) return error.BrokenPipe;
+        }
+        pub fn reportError(_: *@This(), _: []const u8, err: anyerror) anyerror!void {
+            return err;
+        }
+    };
+    for (0..3) |mode| {
+        var options = Options{ .jobs = 4, .no_ignore_parent = true, .no_ignore_global = true, .no_ignore_vcs = true };
+        var d = Discovery{ .a = a, .io = io, .options = &options };
+        defer d.deinit();
+        try d.prepare(path);
+        var context = Context{ .cancel = mode == 1, .broken = mode == 2 };
+        if (context.broken) {
+            try std.testing.expectError(error.BrokenPipe, d.walkParallel(path, "", &context));
+        } else {
+            try d.walkParallel(path, "", &context);
+            try std.testing.expectEqual(@as(usize, if (context.cancel) 1 else 150), context.count);
+        }
+    }
 }

@@ -97,6 +97,7 @@ pub const Options = struct {
     max_columns_preview: bool = false,
     max_depth: usize = std.math.maxInt(usize),
     jobs: usize = 0,
+    jobs_auto: bool = false,
     color: enum { auto, always, never } = .auto,
     replacement: ?[]const u8 = null,
     sort: ?[]const u8 = null,

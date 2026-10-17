@@ -45,6 +45,24 @@ const corpus: [seeds.len][]const u8 = blk: {
     break :blk encoded;
 };
 fn regexOne(bytes: []const u8) !void {
+    {
+        var memory = Budget{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+        defer std.debug.assert(memory.live == 0);
+        const a = memory.allocator();
+        if (@import("antfly_regex").PreparedPattern.init(a, bytes[0..@min(bytes.len, 128)])) |compiled| {
+            var prepared = compiled;
+            defer prepared.deinit();
+            var reference = prepared;
+            reference.fast = .{};
+            const subject = bytes[0..@min(bytes.len, 128)];
+            try std.testing.expectEqual(try reference.matches(a, subject), try prepared.matches(a, subject));
+        } else |_| {}
+    }
+    const split = @min(bytes.len, 16);
+    if (!regex.literal.mayContainOrByte(bytes[split..], bytes[0..split], 0)) {
+        try std.testing.expect(std.mem.indexOfScalar(u8, bytes[split..], 0) == null);
+        try std.testing.expect(regex.literal.findExact(bytes[split..], bytes[0..split], 0) == null);
+    }
     try regexCheck(bytes[0..@min(bytes.len, 128)], if (bytes.len > 128) bytes[128..] else "aaab éé xyz\n");
     const patterns = [_][]const u8{ "((a)(b))\\K(c)?", "(?<n>[a-z]+)\\k<n>", "(?<=(a))b|é+", "(a|ab)*?b", "(?i)([a-z])([0-9])", "(a(?1)?b)" };
     try regexCheck(patterns[if (bytes.len == 0) 0 else bytes[0] % patterns.len], bytes[0..@min(bytes.len, 128)]);
@@ -57,11 +75,16 @@ fn regexCheck(expression: []const u8, subject: []const u8) !void {
     defer p.deinit();
     var fast = try regex.BacktrackingRunner.init(a, &p);
     defer fast.deinit();
-    var vm = try regex.BacktrackingRunner.init(a, &p);
+    // A borrowed pattern view also disables candidate skipping in the scalar
+    // oracle. The original pattern retains ownership of its arena and JIT.
+    var unfiltered = p;
+    unfiltered.candidate_prefix = "";
+    var vm = try regex.BacktrackingRunner.init(a, &unfiltered);
     defer vm.deinit();
     fast.max_steps = 4096;
     vm.max_steps = 4096;
     vm.jit_enabled = false;
+    vm.ascii_repeat_enabled = false;
     for (0..@min(subject.len + 1, 16)) |offset| {
         const actual = fast.find(subject, offset) catch |err| {
             try std.testing.expectError(err, vm.find(subject, offset));
@@ -75,7 +98,9 @@ fn regexCheck(expression: []const u8, subject: []const u8) !void {
             try std.testing.expectEqual(expected.?.span, match.span);
             try std.testing.expectEqualSlices(?regex.Span, expected.?.captures, match.captures);
         }
-        try std.testing.expectEqual(vm.steps, fast.steps);
+        // Skipping an impossible start performs no VM work. A successful
+        // candidate and every budget error retain identical state accounting.
+        if (actual != null or p.candidate_prefix.len == 0) try std.testing.expectEqual(vm.steps, fast.steps);
         try std.testing.expectEqualStrings(vm.mark orelse "", fast.mark orelse "");
     }
     var regular = regex.Pattern.init(a, expression, .{}) catch return;

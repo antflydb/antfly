@@ -211,7 +211,10 @@ fn run(init: std.process.Init) !u8 {
         if ((no_color != null and no_color.?.len > 0) or std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) o.color = .never;
     }
     o.temporary_dir = init.environ_map.get("TMPDIR") orelse init.environ_map.get("TMP") orelse init.environ_map.get("TEMP");
-    if (o.jobs == 0) o.jobs = if (o.jev_mode) 32 else @min(12, std.Thread.getCpuCount() catch 4);
+    if (o.jobs == 0) {
+        o.jobs_auto = true;
+        o.jobs = if (o.jev_mode) 32 else @min(12, std.Thread.getCpuCount() catch 4);
+    }
     if (o.cache_dir == null) {
         if (init.environ_map.get("XDG_CACHE_HOME")) |dir| o.cache_dir = try std.fs.path.join(persistent, &.{ dir, "antfly-grep", "decisions" }) else if (init.environ_map.get("HOME")) |dir| o.cache_dir = try std.fs.path.join(persistent, &.{ dir, ".cache", "antfly-grep", "decisions" });
     }
