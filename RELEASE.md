@@ -75,7 +75,7 @@ development packages made with `--working-tree` cannot be promoted. The source
 archive is included in the checksum ledger and runtime publication scope.
 Schema 4 retains the native pkg-config shape without this source artifact.
 
-All release targets use `ReleaseFast`. Linux amd64 and GNU arm64 build on their
+All release targets use `fast` optimization. Linux amd64 and GNU arm64 build on their
 native Linux architectures; portable musl arm64 and macOS arm64 cross-compile
 from the amd64 Linux runner. The macOS build uses the pinned cross-compilation
 SDK and enables Metal and Accelerate.
