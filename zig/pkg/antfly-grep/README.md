@@ -848,3 +848,59 @@ report, earlier macOS reports, and their original hashes/trials are retained wit
 `before-precise`/`overlapped` names to show the allocation regression and timing
 noise that motivated the final workspace shape. No additional JIT expansion was
 justified by these measurements.
+
+
+The next review follow-up fixes completed negative line refinement (including
+inversion and inclusion-policy rejection) and makes output-budget exhaustion
+cancel indexed work, including blocked prefetched requests. Shared Decision API
+contexts are opt-in through `--decision-context shared-v1`; native server parsing,
+SDK models, completions, and the public guide cover the versioned format.
+
+Automatic file-worker growth reserves under the queue mutex, enqueues before
+spawning outside it, and falls back to existing workers if growth fails. Literal
+and literal-union scans use the eight-worker automatic cap; explicit worker
+counts remain authoritative. Indexed scans build candidate filters once per
+table and reuse the HTTP pool across tables. One persistent producer overlaps at
+most one page; continuation storage is independent of page lifetimes. Quiet and
+finite match-limit searches remain sequential. `prefetch: false` disables overlap.
+
+Final paired native macOS measurements (11 alternating rounds, warm cache,
+16 MiB codec corpus) compare the reviewed binary with this follow-up:
+
+| Workload | Reviewed (ms) | Current (ms) | rg (ms) |
+|---|---:|---:|---:|
+| Repetitive bzip2 | 107.34 | 107.42 | 64.91 |
+| High-entropy bzip2 | 490.49 | 450.83 | 549.22 |
+| Python SDK search | 31.73 | 31.39 | 38.13 |
+| Python SDK discovery | 8.09 | 8.07 | 12.26 |
+
+Repository search and discovery are approximately unchanged versus the reviewed
+binary. The adaptive 10-bit Huffman table accelerates longer codes while retaining
+the cheaper canonical probe for short codes and fallback through 20 bits. The
+move-to-front vector-copy experiment regressed and was removed; its report and
+the pre-tuning report remain checked in. The short stripped-binary CPU sample
+retains raw callsite offsets; unknown offsets are not attributed to Zig functions.
+See `next-review-compression-profile.json` and `next-review-macos*.json` under
+`bench/results/`. Host load is recorded; these are single-host measurements,
+not portable performance guarantees. Repetitive bzip2 still trails rg here.
+
+Synthetic Decision API transport sends the same 513 target/question evaluations
+and identical output with 10,548,999 → 1,412,265 request bytes
+(86.6% less). Warm disk-cache search over 2,048 lines
+uses zero provider requests in both binaries and takes 104.91 →
+39.44 ms. The eight-document indexed latency fixture takes
+970.21 → 518.25 ms while preserving all 17 requests and identical output;
+each simulated HTTP/provider request has 40 ms latency. These fixtures establish
+transport/cache/orchestration behavior, not live model quality or billed tokens.
+The five labeled repository fixtures retain precision/recall 1.0 with 304 target
+evaluations and 45 requests per question.
+
+`bench/results/next-review-validation.json` records the implementation commit,
+source hashes, and qualified macOS/Linux executable identities. Qualification
+includes 133 CLI tests on each platform (two macOS skips, one Linux skip), five
+real native-server indexed scenarios, 15 native decision-contract tests,
+canonical/lookup Huffman equivalence and malformed-input checks, 1,000 generated
+differential cases, and 10,167 codec fuzz runs. Linux executes ARM64 instructions
+inside a Linux VM/container on the ARM64 host with two CPUs; it is not independent
+Linux hardware. No live decision provider was contacted. Main PR CI still needs
+its commit-specific approval.
