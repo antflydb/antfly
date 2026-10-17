@@ -451,11 +451,11 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     // Full-context CPU execution otherwise retains several redundant Q/K/V
     // copies until attention returns, exceeding the admitted workspace.
     var names: [3][128]u8 = undefined;
-    const packed_rows = if (rows <= 512) try cb.linearPackedNamed(input, &.{
+    var packed_rows = try cb.linearPackedNamed(input, &.{
         try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.self_attn.q_proj.weight", .{layer}),
         try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.self_attn.k_proj.weight", .{layer}),
         try std.fmt.bufPrint(&names[2], "language_model.layers.{d}.self_attn.v_proj.weight", .{layer}),
-    }, &.{ heads * d, kv * d, kv * d }, rows, cfg.hidden_size) else null;
+    }, &.{ heads * d, kv * d, kv * d }, rows, cfg.hidden_size);
     defer if (packed_rows) |tensor| cb.free(tensor);
     const q = blk: {
         if (fused) {
@@ -569,6 +569,13 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
         break :blk try cb.embeddingLookup(gathered, ids, ids.len, d);
     };
     defer cb.free(vg);
+    // Every head output now owns its rows. Retire the packed producer before
+    // attention allocates score/work buffers; encoded consumers remain ordered
+    // by the backend's frame ownership and reuse barriers.
+    if (packed_rows) |tensor| {
+        cb.free(tensor);
+        packed_rows = null;
+    }
     const restricted = if (cfg.window(layer) != std.math.maxInt(u32)) vis.windowed orelse try windowedRanges(allocator, vis, cfg.window(layer)) else null;
     defer if (vis.windowed == null) if (restricted) |ranges| allocator.free(ranges);
     // windowedRanges already applies the exact position window, including
@@ -661,19 +668,17 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     var down: ?CT = blk: {
         const product = product: {
             var names: [2][128]u8 = undefined;
-            if (cb.kind() == .native or rows <= 512) {
-                if (try cb.linearPackedNamed(fnorm, &.{
-                    try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.mlp.gate_proj.weight", .{layer}),
-                    try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.mlp.up_proj.weight", .{layer}),
-                }, &.{ cfg.intermediate_size, cfg.intermediate_size }, rows, h)) |packed_rows| {
-                    defer cb.free(packed_rows);
-                    if (cb.vtable.packedGeluMultiply) |op| if (try op(cb.ptr, packed_rows, rows, cfg.intermediate_size)) |product| break :product product;
-                    const gate = try cb.sliceLastDim(packed_rows, 0, cfg.intermediate_size);
-                    defer cb.free(gate);
-                    const up = try cb.sliceLastDim(packed_rows, cfg.intermediate_size, cfg.intermediate_size * 2);
-                    defer cb.free(up);
-                    break :product (try cb.activationMultiply(gate, up, .gelu)) orelse return error.EmbeddingGemma2OperationUnavailable;
-                }
+            if (try cb.linearPackedNamed(fnorm, &.{
+                try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.mlp.gate_proj.weight", .{layer}),
+                try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.mlp.up_proj.weight", .{layer}),
+            }, &.{ cfg.intermediate_size, cfg.intermediate_size }, rows, h)) |packed_rows| {
+                defer cb.free(packed_rows);
+                if (cb.vtable.packedGeluMultiply) |op| if (try op(cb.ptr, packed_rows, rows, cfg.intermediate_size)) |product| break :product product;
+                const gate = try cb.sliceLastDim(packed_rows, 0, cfg.intermediate_size);
+                defer cb.free(gate);
+                const up = try cb.sliceLastDim(packed_rows, cfg.intermediate_size, cfg.intermediate_size * 2);
+                defer cb.free(up);
+                break :product (try cb.activationMultiply(gate, up, .gelu)) orelse return error.EmbeddingGemma2OperationUnavailable;
             }
             var gate: ?CT = try linear(cb, layer, "mlp.gate_proj.weight", fnorm, rows, h, cfg.intermediate_size);
             defer if (gate) |value| cb.free(value);

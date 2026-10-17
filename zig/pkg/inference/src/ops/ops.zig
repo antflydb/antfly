@@ -2620,6 +2620,10 @@ pub const ComputeBackend = struct {
 
         /// Optional exact graph-constant import. Copies bytes and shape; return
         /// null to retain the backend's legacy numeric-constant path.
+        /// Bounded model-owned prepared F32 constants. A null value performs
+        /// lookup; publication snapshots a completed value and returns a new
+        /// caller-owned handle. Keys describe immutable model computations.
+        modelConstant: ?*const fn (ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT = null,
         fromConstantBytes: ?*const fn (ctx: *anyopaque, data: []const u8, dtype: GraphDType, shape: []const i64) anyerror!?CT = null,
 
         /// Copy tensor data to a caller-owned f32 slice.
@@ -4744,6 +4748,17 @@ pub const ComputeBackend = struct {
             return op(self.ptr, data, shape);
         }
         return null;
+    }
+
+    pub fn modelConstant(self: *const ComputeBackend, key: []const u8, value: ?CT) !?CT {
+        const op = self.vtable.modelConstant orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, key, value);
+        errdefer if (result) |tensor| self.free(tensor);
+        // A completed immutable snapshot may remain cached on cancellation,
+        // but a canceled consumer must release its handle and return no value.
+        try self.checkExecutionControl();
+        return result;
     }
 
     pub fn fromConstantBytes(self: *const ComputeBackend, data: []const u8, dtype: GraphDType, shape: []const i64) !?CT {

@@ -19,6 +19,8 @@ const std = @import("std");
 /// also requires resident-tier admission and lives only with its model owner.
 pub const max_bytes: usize = 640 * 1024 * 1024;
 pub const max_entries: usize = 1536;
+pub const prepared_max_bytes: usize = 8 * 1024 * 1024;
+pub const prepared_max_entries: usize = 128;
 
 /// Vision linears have their own cap so warming a movie cannot consume the
 /// language cache's allowance. Both classes still reserve against the same
@@ -97,4 +99,40 @@ test "embeddinggemma2 media cache classes remain independently bounded" {
     try std.testing.expectEqual(MetalClass.audio, metalClass("embed_audio.embedding_projection.weight").?);
     try std.testing.expectEqual(@as(?MetalClass, null), metalClass("audio_tower.layers.0.self_attn.q_proj.linear.bias"));
     try std.testing.expectEqual(@as(?MetalClass, null), nativeClass("language_model.embed_tokens.weight"));
+}
+
+/// Canonical output-row groups. All request geometries share one backing
+/// matrix; an individual projection borrows its contiguous output-row span.
+pub const ProjectionGroup = struct {
+    prefix: []const u8,
+    suffixes: []const []const u8,
+    index: usize,
+
+    pub fn names(self: ProjectionGroup, storage: *[3][256]u8, result: *[3][]const u8) ![]const []const u8 {
+        for (self.suffixes, 0..) |suffix, i| result[i] = try std.fmt.bufPrint(&storage[i], "{s}{s}", .{ self.prefix, suffix });
+        return result[0..self.suffixes.len];
+    }
+};
+pub fn projectionGroup(name: []const u8) ?ProjectionGroup {
+    if (!std.mem.startsWith(u8, name, "language_model.layers.")) return null;
+    const families = [_][]const []const u8{
+        &.{ ".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight" },
+        &.{ ".mlp.gate_proj.weight", ".mlp.up_proj.weight" },
+    };
+    for (families) |suffixes| for (suffixes, 0..) |suffix, i| {
+        if (std.mem.endsWith(u8, name, suffix)) return .{ .prefix = name[0 .. name.len - suffix.len], .suffixes = suffixes, .index = i };
+    };
+    return null;
+}
+
+test "embeddinggemma2 canonical projection groups preserve unequal KV and reject unrelated names" {
+    const g = projectionGroup("language_model.layers.23.self_attn.k_proj.weight").?;
+    var storage: [3][256]u8 = undefined;
+    var names: [3][]const u8 = undefined;
+    const result = try g.names(&storage, &names);
+    try std.testing.expectEqual(@as(usize, 1), g.index);
+    try std.testing.expectEqualStrings("language_model.layers.23.self_attn.q_proj.weight", result[0]);
+    try std.testing.expectEqualStrings("language_model.layers.23.self_attn.v_proj.weight", result[2]);
+    try std.testing.expect(projectionGroup("other.layers.0.mlp.gate_proj.weight") == null);
+    try std.testing.expect(projectionGroup("language_model.layers.0.self_attn.o_proj.weight") == null);
 }

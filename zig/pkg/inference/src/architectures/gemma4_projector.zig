@@ -876,36 +876,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_subsample", subsampled.hidden);
     audioProfileMark(.subsample);
 
-    // Per-block `per_dim_scale` vectors; the loaded tensors keep their names
-    // until they are released, so the names outlive the loop.
-    var per_dim_names = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (per_dim_names.items) |name| allocator.free(name);
-        per_dim_names.deinit(allocator);
-    }
-    var per_dim_tensors = std.ArrayListUnmanaged(ProjectorF32).empty;
-    defer {
-        for (per_dim_tensors.items) |*tensor| tensor.deinit();
-        per_dim_tensors.deinit(allocator);
-    }
-    var per_dim_slices = std.ArrayListUnmanaged([]const f32).empty;
-    defer per_dim_slices.deinit(allocator);
-    for (0..cfg.block_count) |layer| {
-        // Each item is owned by its list as soon as the append succeeds, so
-        // the local cleanup must not outlive the append.
-        const name = try std.fmt.allocPrint(allocator, "a.blk.{d}.per_dim_scale.weight", .{layer});
-        {
-            errdefer allocator.free(name);
-            try per_dim_names.append(allocator, name);
-        }
-        var per_dim = try store.tensorF32(name);
-        {
-            errdefer per_dim.deinit();
-            try per_dim_tensors.append(allocator, per_dim);
-        }
-        try per_dim_slices.append(allocator, per_dim_tensors.items[per_dim_tensors.items.len - 1].data);
-    }
-    var layer_inputs = try AudioLayerInputs.init(cb, allocator, cfg, subsampled.valid_mask, per_dim_slices.items);
+    var layer_inputs = try AudioLayerInputs.initCached(cb, allocator, store, cfg, subsampled.valid_mask);
     defer layer_inputs.deinit(cb);
     layer_inputs.segments = subsampled.segments;
 
@@ -2235,11 +2206,19 @@ const AudioLayerInputs = struct {
     scales: []CT,
 
     fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, valid_mask: []const bool, per_dim_scales: []const []const f32) !AudioLayerInputs {
-        if (per_dim_scales.len != cfg.block_count) return error.InvalidTensorShape;
-        const positions = try audioRelativePositionEmbeddings(allocator, cfg);
-        defer allocator.free(positions);
-        const rel_shape = [_]i32{ @intCast(cfg.attention_context_left), @intCast(cfg.audio_hidden) };
-        const rel_in = try deviceResidentFromFloat32(cb, positions, &rel_shape);
+        return initInternal(cb, allocator, null, cfg, valid_mask, per_dim_scales);
+    }
+
+    fn initCached(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, valid_mask: []const bool) !AudioLayerInputs {
+        return initInternal(cb, allocator, store, cfg, valid_mask, &.{});
+    }
+
+    fn initInternal(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: ?*ProjectorWeights, cfg: AudioConfig, valid_mask: []const bool, per_dim_scales: []const []const f32) !AudioLayerInputs {
+        if (store == null and per_dim_scales.len != cfg.block_count) return error.InvalidTensorShape;
+        const cached = if (store) |weights| weights.gguf == null else false;
+        var key_buf: [192]u8 = undefined;
+        const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative.v1.{d}.{d}", .{ cfg.attention_context_left, cfg.audio_hidden });
+        const rel_in = if (cached) (try cb.modelConstant(rel_key, null)) orelse try prepareAudioRelative(cb, allocator, cfg, rel_key) else try prepareAudioRelative(cb, allocator, cfg, null);
         errdefer cb.free(rel_in);
 
         const valid = try allocator.alloc(f32, valid_mask.len);
@@ -2249,11 +2228,8 @@ const AudioLayerInputs = struct {
         const valid_ct = try deviceResidentFromFloat32(cb, valid, &valid_shape);
         errdefer cb.free(valid_ct);
 
-        const ones_host = try allocator.alloc(f32, cfg.output_hidden);
-        defer allocator.free(ones_host);
-        @memset(ones_host, 1.0);
-        const ones_shape = [_]i32{@intCast(cfg.output_hidden)};
-        const ones = try deviceResidentFromFloat32(cb, ones_host, &ones_shape);
+        const ones_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.ones.v1.{d}", .{cfg.output_hidden});
+        const ones = if (cached) (try cb.modelConstant(ones_key, null)) orelse try prepareAudioOnes(cb, allocator, cfg, ones_key) else try prepareAudioOnes(cb, allocator, cfg, null);
         errdefer cb.free(ones);
 
         const head_dim = cfg.headDim();
@@ -2267,17 +2243,31 @@ const AudioLayerInputs = struct {
             for (scales.items) |item| cb.free(item);
             scales.deinit(allocator);
         }
-        for (per_dim_scales) |per_dim| {
-            if (per_dim.len != head_dim) return error.InvalidTensorShape;
-            // Each item is owned by its list as soon as the append succeeds,
-            // so the local cleanup must not outlive the append.
-            const host = try audioQueryDimScales(allocator, head_dim, per_dim);
+        for (0..cfg.block_count) |layer| {
+            const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.query_scale.v1.{d}.{d}", .{ layer, head_dim });
+            var hit = if (cached) try cb.modelConstant(key, null) else null;
+            errdefer if (hit) |tensor| cb.free(tensor);
+            const host = if (hit != null) try allocator.alloc(f32, 0) else blk: {
+                var loaded: ?ProjectorF32 = null;
+                defer if (loaded) |*tensor| tensor.deinit();
+                const per_dim = if (store) |weights| dims: {
+                    var name_buf: [128]u8 = undefined;
+                    const name = try std.fmt.bufPrint(&name_buf, "a.blk.{d}.per_dim_scale.weight", .{layer});
+                    loaded = try weights.tensorF32(name);
+                    break :dims loaded.?.data;
+                } else per_dim_scales[layer];
+                if (per_dim.len != head_dim) return error.InvalidTensorShape;
+                break :blk try audioQueryDimScales(allocator, head_dim, per_dim);
+            };
             {
                 errdefer allocator.free(host);
                 try scales_host.append(allocator, host);
             }
-            const scales_shape = [_]i32{@intCast(head_dim)};
-            const ct = try deviceResidentFromFloat32(cb, host, &scales_shape);
+            const ct = hit orelse blk: {
+                const source = try deviceResidentFromFloat32(cb, host, &.{@intCast(head_dim)});
+                break :blk try publishAudioConstant(cb, key, source, cached);
+            };
+            hit = null;
             {
                 errdefer cb.free(ct);
                 try scales.append(allocator, ct);
@@ -2310,6 +2300,30 @@ const AudioLayerInputs = struct {
         self.allocator.free(self.scales);
     }
 };
+
+/// Cache publication returns a distinct owned handle. Failure or admission
+/// denial leaves the request's completed value usable and independently owned.
+fn publishAudioConstant(cb: *const ComputeBackend, key: []const u8, source: CT, enabled: bool) !CT {
+    errdefer cb.free(source);
+    if (enabled) if (try cb.modelConstant(key, source)) |snapshot| {
+        cb.free(source);
+        return snapshot;
+    };
+    return source;
+}
+fn prepareAudioRelative(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, key: ?[]const u8) !CT {
+    const host = try audioRelativePositionEmbeddings(allocator, cfg);
+    defer allocator.free(host);
+    const source = try deviceResidentFromFloat32(cb, host, &.{ @intCast(cfg.attention_context_left), @intCast(cfg.audio_hidden) });
+    return publishAudioConstant(cb, key orelse "", source, key != null);
+}
+fn prepareAudioOnes(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, key: ?[]const u8) !CT {
+    const host = try allocator.alloc(f32, cfg.output_hidden);
+    defer allocator.free(host);
+    @memset(host, 1);
+    const source = try deviceResidentFromFloat32(cb, host, &.{@intCast(cfg.output_hidden)});
+    return publishAudioConstant(cb, key orelse "", source, key != null);
+}
 
 /// A small host tensor pushed to the device now rather than by its first
 /// consumer, so nothing uploads inside the encoder frame.
@@ -2549,7 +2563,13 @@ fn audioSelfAttention(
     const v = remaining_v orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
     remaining_v = null;
     defer cb.free(v);
-    const rel = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
+    var key_buf: [192]u8 = undefined;
+    const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative_key.v1.{d}.{d}.{d}", .{ layer, cfg.attention_context_left, cfg.audio_hidden });
+    const cache_relative = store.gguf == null;
+    const rel = if (cache_relative) (try cb.modelConstant(rel_key, null)) orelse blk: {
+        const source = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
+        break :blk try publishAudioConstant(cb, rel_key, source, true);
+    } else try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
     defer cb.free(rel);
     audioProfileMark(.attn_proj);
 
@@ -2627,7 +2647,11 @@ fn audioLocalAttentionSingle(
     const rel_data = try cb.toFloat32(rel, allocator);
     defer allocator.free(rel_data);
     if (cfg.attention_context_right != 0) return error.UnsupportedTensorType;
-    const out = try audioLocalAttentionReference(allocator, audioLocalAttentionParams(cfg, rows), q_data, k_data, v_data, rel_data, inputs.scales_host[layer], inputs.valid_mask);
+    // Resident paths never download cached query scales. Only an explicit
+    // host/reference fallback materializes them, alongside its Q/K/V reads.
+    const downloaded_scale = if (inputs.scales_host[layer].len == 0) try cb.toFloat32(inputs.scales[layer], allocator) else null;
+    defer if (downloaded_scale) |values| allocator.free(values);
+    const out = try audioLocalAttentionReference(allocator, audioLocalAttentionParams(cfg, rows), q_data, k_data, v_data, rel_data, downloaded_scale orelse inputs.scales_host[layer], inputs.valid_mask);
     defer allocator.free(out);
     const out_shape = [_]i32{ @intCast(rows), @intCast(cfg.audio_hidden) };
     return cb.fromFloat32Shape(out, &out_shape);

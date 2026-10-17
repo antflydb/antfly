@@ -34,7 +34,9 @@ const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const RawMetalProvider = metal_runtime.RawMetalProvider;
 const RawMetalDecodeRuntime = metal_runtime.RawMetalDecodeRuntime;
 const tier_cache_mod = @import("../runtime/tier/cache.zig");
+pub const PreparedConstant = struct { tensor: MetalTensor, bytes: usize };
 pub const EmbeddingGemma2LinearCacheEntry = struct {
+    projection_widths: [3]usize = @splat(0),
     slot: usize,
     in_dim: usize,
     out_dim: usize,
@@ -98,6 +100,8 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     /// their names and raw slots, never a request tensor or allocator. The
     /// admission pointer belongs to the same drained model WeightStore.
     embeddinggemma2_linear_cache: std.StringHashMapUnmanaged(EmbeddingGemma2LinearCacheEntry) = .empty,
+    embeddinggemma2_constant_cache: std.StringHashMapUnmanaged(PreparedConstant) = .empty,
+    embeddinggemma2_constant_bytes: usize = 0,
     embeddinggemma2_linear_cache_bytes: usize = 0,
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
@@ -200,6 +204,20 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         const cache = self.embeddinggemma2_cache_admission orelse return 0;
         const policy = @import("../models/embedding_gemma2_weight_cache.zig");
         var reclaimed: usize = 0;
+        if (cache_class == .audio) {
+            while (self.embeddinggemma2_constant_cache.count() > 0) {
+                var constants = self.embeddinggemma2_constant_cache.iterator();
+                const key = constants.next().?.key_ptr.*;
+                var removed = self.embeddinggemma2_constant_cache.fetchRemove(key).?;
+                removed.value.tensor.deinit();
+                self.embeddinggemma2_constant_bytes -= removed.value.bytes;
+                self.embeddinggemma2_linear_cache_bytes -= removed.value.bytes;
+                self.embeddinggemma2_audio_linear_cache_bytes -= removed.value.bytes;
+                cache.noteRelease(.backend, removed.value.bytes);
+                reclaimed += removed.value.bytes;
+                std.heap.c_allocator.free(removed.key);
+            }
+        }
         // Restart iteration after removal; never retain an invalidated iterator
         // or allocate bookkeeping while recovering from memory pressure.
         while (true) {
@@ -309,6 +327,15 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.deberta_relative_embedding_cache.deinit();
         for (&self.deberta_relative_projection_cache) |*entry| entry.deinit();
         for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.releaseRawLinearSlot(self, slot);
+        var constants = self.embeddinggemma2_constant_cache.iterator();
+        while (constants.next()) |entry| {
+            entry.value_ptr.tensor.deinit();
+            std.heap.c_allocator.free(entry.key_ptr.*);
+            if (self.embeddinggemma2_cache_admission) |cache| cache.noteRelease(.backend, entry.value_ptr.bytes);
+        }
+        self.embeddinggemma2_constant_cache.deinit(std.heap.c_allocator);
+        self.embeddinggemma2_constant_cache = .empty;
+        self.embeddinggemma2_constant_bytes = 0;
         var embeddinggemma2_it = self.embeddinggemma2_linear_cache.iterator();
         while (embeddinggemma2_it.next()) |entry| {
             std.heap.c_allocator.free(entry.key_ptr.*);

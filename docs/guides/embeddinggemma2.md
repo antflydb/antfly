@@ -559,9 +559,8 @@ independent execution retries.
 
 Model-owned packed linears combine compatible backbone QKV, gate/up and audio
 QKV weights under the existing cache class limits. Audio QKV packing requires
-equal input clamps and preserves each output clamp. Large QKV/Metal FFN inputs
-retain streaming projection to bound activation storage; native packed FFNs
-consume interleaved gate/up rows directly with portable SIMD workers. Dense
+equal input clamps and preserves each output clamp. Packed FFNs consume
+interleaved gate/up rows directly with portable SIMD workers or a Metal kernel. Dense
 native GEMM output skips redundant zero initialization when beta is zero.
 
 Flat text arrays tokenize once and share length-sorted encoder calls, with at
@@ -579,6 +578,29 @@ forward call and retained until completion/cancellation. Vision FFNs share
 admitted packed gate/up weights and consume them directly on CPU/Metal without
 slice buffers. Image/video position lookups preserve typed table storage and
 gather the required rows instead of copying the full 60 MiB F32 position table.
+
+Language QKV and gate/up projections use one canonical packed snapshot for all
+admitted sequence lengths, including inputs above 512 rows. Native individual
+projections borrow output-row slices; Metal applies output-row views directly
+from the parent slot. Neither view creates a second persistent weight payload.
+The model lease protects views, and cache pressure reclaims the parent as one
+allocation. Packed QKV/head preparation and packed GELU avoid extraction copies;
+activation storage remains bounded by the existing admitted row envelope.
+
+Metal grouped attention folds query heads sharing a KV head into matrix rows,
+then batches distinct KV heads for dense key envelopes. Partial envelopes
+encode one QK/PV pair per KV head, avoiding padded RHS batch strides and K/V
+expansion. Range/window masking stays exact. Query packing and score/output
+storage are bounded by the current tile; padded tail rows are not multiplied.
+
+Audio relative-position inputs, query scales, normalization ones and completed
+per-layer relative-key projections are cached as immutable model constants.
+Prepared constants have an 8 MiB/128-entry ceiling within the audio class and
+shared memory admission. Device publication copies into fresh model-owned
+storage and waits for completion; failed copies are not published. Cancellation
+releases the consumer's handle; completed snapshots remain reusable on retry.
+Warm device execution performs no scale readback. Audio pressure reclamation and model
+unload release these constants alongside prepared weights.
 
 Embedding-only calls apply the final token RMSNorm, masked-mean pool hidden
 rows, then project once per item. Token-output callers retain the original

@@ -3148,7 +3148,7 @@ pub fn decoderRuntimeSegmentAttentionGroupedF32Device(self: anytype, q: MetalTen
     const score_stride = groupedScoreStride(r.ranges, tile);
     const score_values = try std.math.mul(usize, try std.math.mul(usize, tile, score_stride), r.num_heads);
     const score_bytes = try std.math.mul(usize, score_values, @sizeOf(f32));
-    const packed_values = try std.math.add(usize, try std.math.mul(usize, r.queries, hidden), try std.math.mul(usize, try std.math.mul(usize, r.keys, kv_hidden), 2));
+    const packed_values = try std.math.add(usize, try std.math.mul(usize, tile, hidden), try std.math.mul(usize, try std.math.mul(usize, r.keys, kv_hidden), 2));
     const workspace_bytes = try std.math.add(usize, score_bytes, try std.math.mul(usize, try std.math.add(usize, packed_values, try std.math.mul(usize, tile, hidden)), @sizeOf(f32)));
     const gemm = (r.head_dim == 512 or r.queries <= 512) and workspace_bytes <= @min(grouped.workspace_limit_bytes, 256 * 1024 * 1024) and !@import("antfly_platform").env.getenvBool("TERMITE_METAL_EMBEDDINGGEMMA2_DISABLE_GEMM_ATTENTION");
     var scores: ?MetalTensor = if (gemm) try MetalTensor.deviceAllocate(runtime, workspace_bytes, .private, &.{@intCast(workspace_bytes / @sizeOf(f32))}) else null;
@@ -10776,6 +10776,21 @@ pub fn decoderRuntimeTryApplyBf16GateUp(self: anytype, request: anytype) !?Metal
     errdefer output.deinit();
     const rc = termite_metal_decode_runtime_apply_bf16_gate_up_device(runtime, request.gate_slot, request.up_slot, request.input.deviceHandle(), request.input.deviceByteOffset(), rows, request.in_dim, request.out_dim, output.deviceHandle(), output.deviceByteOffset());
     if (rc != 0) return error.MetalBf16GateUpFailed;
+    return output;
+}
+
+/// Apply a contiguous output-row view of an owned packed F32 projection.
+/// The parent slot remains the sole owner and the sole admission charge.
+extern fn termite_metal_decode_runtime_apply_linear_rows_device(runtime: ?*RawMetalDecodeRuntime, slot: usize, input: ?*anyopaque, input_offset: usize, rows: usize, first: usize, width: usize, output: ?*anyopaque, output_offset: usize) c_int;
+pub fn decoderRuntimeApplyLinearRows(self: anytype, slot: usize, input: MetalTensor, first: usize, width: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (slot >= decoder_runtime_linear_slot_capacity or !self.raw_linear_slots_prepared[slot] or !input.isDevice() or input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0) return null;
+    const rows: usize = @intCast(input.dim(0));
+    if (self.raw_linear_slot_in_dims[slot] != @as(usize, @intCast(input.dim(1))) or width == 0 or first > self.raw_linear_slot_out_dims[slot] or width > self.raw_linear_slot_out_dims[slot] - first) return error.InvalidTensorShape;
+    const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+    var output = try MetalTensor.deviceAllocate(runtime, bytes, .private, &.{ @intCast(rows), @intCast(width) });
+    errdefer output.deinit();
+    if (termite_metal_decode_runtime_apply_linear_rows_device(runtime, slot, input.deviceHandle(), input.deviceByteOffset(), rows, first, width, output.deviceHandle(), output.deviceByteOffset()) != 0) return error.UnsupportedPrimitiveOp;
     return output;
 }
 

@@ -59,6 +59,9 @@ const run_memory = runtime.tier.memory;
 const DenseDequantCacheEntry = struct {
     data: []f32,
     bytes: usize,
+    prepared_shape: ?[]i64 = null,
+    projection_widths: [3]usize = @splat(0),
+    in_dim: usize = 0,
 };
 const embeddinggemma2_weight_cache = @import("../models/embedding_gemma2_weight_cache.zig");
 
@@ -863,6 +866,8 @@ pub const WeightStore = struct {
     quantized_prepare_lock: std.atomic.Mutex = .unlocked,
     embeddinggemma2_f32_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .empty,
     embeddinggemma2_f32_cache_bytes: usize = 0,
+    embeddinggemma2_constant_bytes: usize = 0,
+    embeddinggemma2_constant_count: usize = 0,
     embeddinggemma2_f32_class_bytes: [3]usize = @splat(0),
     embeddinggemma2_f32_readers: usize = 0,
     embeddinggemma2_f32_cache_lock: std.atomic.Mutex = .unlocked,
@@ -4605,11 +4610,14 @@ fn deinitEmbeddingGemma2F32Cache(data: *WeightStore) void {
     while (it.next()) |entry| {
         data.allocator.free(entry.key_ptr.*);
         data.allocator.free(entry.value_ptr.data);
+        if (entry.value_ptr.prepared_shape) |shape| data.allocator.free(shape);
         if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.value_ptr.bytes);
     }
     data.embeddinggemma2_f32_cache.deinit(data.allocator);
     data.embeddinggemma2_f32_cache = .empty;
     data.embeddinggemma2_f32_cache_bytes = 0;
+    data.embeddinggemma2_constant_bytes = 0;
+    data.embeddinggemma2_constant_count = 0;
     data.embeddinggemma2_f32_class_bytes = @splat(0);
 }
 
@@ -4630,6 +4638,11 @@ pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, class: embeddinggemma2_
         } orelse break;
         const entry = data.embeddinggemma2_f32_cache.fetchRemove(name).?;
         data.allocator.free(entry.value.data);
+        if (entry.value.prepared_shape) |shape| {
+            data.allocator.free(shape);
+            data.embeddinggemma2_constant_bytes -= entry.value.bytes;
+            data.embeddinggemma2_constant_count -= 1;
+        }
         data.allocator.free(entry.key);
         data.embeddinggemma2_f32_cache_bytes -= entry.value.bytes;
         data.embeddinggemma2_f32_class_bytes[@backingInt(class)] -= entry.value.bytes;
@@ -4639,9 +4652,69 @@ pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, class: embeddinggemma2_
     return released;
 }
 
+fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const policy = embeddinggemma2_weight_cache;
+    if (!self.cache_embeddinggemma2_bf16_weights or !std.mem.startsWith(u8, key, "audio_tower.prepared.")) return null;
+    const cache = if (self.data.tier_cache) |*cache| cache else return null;
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
+    platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+    defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+    if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+        if (!self.embeddinggemma2_cache_reader) {
+            self.data.embeddinggemma2_f32_readers += 1;
+            self.embeddinggemma2_cache_reader = true;
+        }
+        const tensor = try self.makeBuf(entry.data, false);
+        errdefer freeTensor(self, tensor);
+        return self.withLogicalShape(tensor, entry.prepared_shape orelse return error.InvalidTensorShape);
+    }
+    const input = value orelse return null;
+    const data = toBuf(input).data;
+    const bytes = try std.math.mul(usize, data.len, @sizeOf(f32));
+    const used = self.data.embeddinggemma2_f32_class_bytes[@backingInt(policy.MetalClass.audio)];
+    if (bytes == 0 or bytes > policy.prepared_max_bytes - self.data.embeddinggemma2_constant_bytes or self.data.embeddinggemma2_constant_count >= policy.prepared_max_entries or used > policy.audio_max_bytes or bytes > policy.audio_max_bytes - used or self.data.embeddinggemma2_f32_cache.count() >= policy.max_entries) return null;
+    cache.reserve(.host, bytes) catch {
+        cache.noteDenied(.host, bytes);
+        return null;
+    };
+    var committed = false;
+    errdefer if (!committed) cache.noteRelease(.host, bytes);
+    const shape = try tensorShapeOp(self, input, self.data.allocator);
+    errdefer if (!committed) self.data.allocator.free(shape);
+    const name = try self.data.allocator.dupe(u8, key);
+    errdefer if (!committed) self.data.allocator.free(name);
+    const snapshot = try self.data.allocator.dupe(f32, data);
+    errdefer if (!committed) self.data.allocator.free(snapshot);
+    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, name, .{ .data = snapshot, .bytes = bytes, .prepared_shape = shape });
+    self.data.embeddinggemma2_f32_cache_bytes += bytes;
+    self.data.embeddinggemma2_constant_bytes += bytes;
+    self.data.embeddinggemma2_constant_count += 1;
+    committed = true;
+    self.data.embeddinggemma2_f32_class_bytes[@backingInt(policy.MetalClass.audio)] += bytes;
+    // Insertion has committed. A failed request handle cannot unwind the
+    // model-owned allocation; publication must remain reusable on retry.
+    if (!self.embeddinggemma2_cache_reader) {
+        self.data.embeddinggemma2_f32_readers += 1;
+        self.embeddinggemma2_cache_reader = true;
+    }
+    const tensor = try self.makeBuf(snapshot, false);
+    errdefer freeTensor(self, tensor);
+    return self.withLogicalShape(tensor, shape);
+}
+
 fn cachedEmbeddingGemma2F32Weight(self: *NativeCompute, name: []const u8, source: *const tensor_mod.Tensor) !?[]f32 {
     if (!self.cache_embeddinggemma2_bf16_weights or source.dtype != .bf16) return null;
     const class = embeddinggemma2_weight_cache.nativeClass(name) orelse return null;
+    if (embeddinggemma2_weight_cache.projectionGroup(name)) |group| {
+        var storage: [3][256]u8 = undefined;
+        var names: [3][]const u8 = undefined;
+        const siblings = try group.names(&storage, &names);
+        var complete = true;
+        for (siblings) |sibling| complete = complete and (self.data.resident_weights.contains(sibling) or self.data.lazy_weights.contains(sibling));
+        if (complete) return null;
+    }
     const class_index = @backingInt(class);
     const limit = embeddinggemma2_weight_cache.classLimit(class);
     const cache = if (self.data.tier_cache) |*cache| cache else return null;
@@ -4965,6 +5038,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .linearTriple = &linearTripleOp,
     .linearTripleNoBias = &linearTripleNoBiasOp,
     .linearTripleNoBiasNamed = &linearTripleNoBiasNamedOp,
+    .modelConstant = &modelConstantOp,
     .linearPackedNamed = &linearPackedNamedOp,
     .zeroTensor = null,
     .linearLoRA = &linearLoRAOp,
@@ -5364,18 +5438,82 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     // key, whose lifetime also covers views after an early handle release.
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    const tensor = try loadWeight(self, stable_name, true);
+    const tensor = (try canonicalProjectionWeight(self, stable_name)) orelse try loadWeight(self, stable_name, true);
     toBuf(tensor).weight_handle_name = owned_name;
     toBuf(tensor).weight_handle_refs = 1;
     self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
     return tensor;
 }
 
+/// Resolve individual language projections through the same packed allocation
+/// used by batched linears. Source acquisition temporarily disables mirrors,
+/// so neither warm-up order can insert a second F32 representation.
+fn canonicalProjectionWeight(self: *NativeCompute, name: []const u8) !?CT {
+    if (!self.cache_embeddinggemma2_bf16_weights) return null;
+    const group = embeddinggemma2_weight_cache.projectionGroup(name) orelse return null;
+    var storage: [3][256]u8 = undefined;
+    var names: [3][]const u8 = undefined;
+    const siblings = try group.names(&storage, &names);
+    for (siblings) |sibling| if (!self.data.resident_weights.contains(sibling) and !self.data.lazy_weights.contains(sibling)) return null;
+    // A hot row view needs no checkpoint handle, conversion or staging.
+    const joined = try std.mem.join(self.allocator, "|", siblings);
+    defer self.allocator.free(joined);
+    const key = try std.mem.concat(self.allocator, u8, &.{ joined, ".qkv" });
+    defer self.allocator.free(key);
+    {
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+            if (!self.embeddinggemma2_cache_reader) {
+                self.data.embeddinggemma2_f32_readers += 1;
+                self.embeddinggemma2_cache_reader = true;
+            }
+            var offset: usize = 0;
+            for (entry.projection_widths[0..group.index]) |width| offset += width * entry.in_dim;
+            const width = entry.projection_widths[group.index];
+            if (width == 0 or entry.in_dim == 0) return error.InvalidTensorShape;
+            const view = try self.makeBufWithEntry(entry.data[offset..][0 .. width * entry.in_dim], false, self.data.resident_weights.getKey(name) orelse self.data.lazy_weights.getKey(name) orelse name, null, null, null);
+            errdefer freeTensor(self, view);
+            return self.withLogicalShape(view, &.{ @intCast(width), @intCast(entry.in_dim) });
+        }
+    }
+    var weights: [3]CT = undefined;
+    var widths: [3]usize = undefined;
+    var count: usize = 0;
+    defer for (weights[0..count]) |weight| freeTensor(self, weight);
+    var in_dim: usize = 0;
+    // Get shapes from the normal typed source path; these handles are released
+    // before returning and never become independent model mirrors.
+    self.cache_embeddinggemma2_bf16_weights = false;
+    const previous_borrow = self.borrow_typed_matrix_weights;
+    self.borrow_typed_matrix_weights = true;
+    {
+        defer self.cache_embeddinggemma2_bf16_weights = true;
+        defer self.borrow_typed_matrix_weights = previous_borrow;
+        for (siblings, 0..) |sibling, i| {
+            weights[i] = try getWeight(self, sibling);
+            count += 1;
+            const shape = try tensorShapeOp(self, weights[i], self.allocator);
+            defer self.allocator.free(shape);
+            if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0 or (i > 0 and shape[1] != in_dim) or toBuf(weights[i]).quantized_storage != null) return null;
+            widths[i] = @intCast(shape[0]);
+            in_dim = @intCast(shape[1]);
+        }
+    }
+    const packed_weight = (try packedMediaLinears(self, weights[0..count], in_dim, widths[0..count])) orelse return null;
+    defer freeTensor(self, packed_weight);
+    var offset: usize = 0;
+    for (widths[0..group.index]) |width| offset += width * in_dim;
+    const view = try self.makeBufWithEntry(toBuf(packed_weight).data[offset..][0 .. widths[group.index] * in_dim], false, self.data.resident_weights.getKey(name) orelse self.data.lazy_weights.getKey(name) orelse name, null, null, null);
+    errdefer freeTensor(self, view);
+    return self.withLogicalShape(view, &.{ @intCast(widths[group.index]), @intCast(in_dim) });
+}
+
 fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    return loadWeight(self, stable_name, true);
+    return (try canonicalProjectionWeight(self, stable_name)) orelse try loadWeight(self, stable_name, true);
 }
 
 fn getEmbeddingWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
@@ -8507,6 +8645,9 @@ fn linearPackedNamedOp(ctx: *anyopaque, input: CT, names: []const []const u8, wi
     {
         self.cache_embeddinggemma2_bf16_weights = false;
         defer self.cache_embeddinggemma2_bf16_weights = true;
+        const previous_borrow = self.borrow_typed_matrix_weights;
+        self.borrow_typed_matrix_weights = true;
+        defer self.borrow_typed_matrix_weights = previous_borrow;
         for (names, weights[0..names.len]) |name, *weight| {
             weight.* = try getWeight(ctx, name);
             count += 1;
@@ -8525,7 +8666,11 @@ fn packedMediaLinears(self: *NativeCompute, weights: []const CT, in_dim: usize, 
     const class = embeddinggemma2_weight_cache.nativeClass(toBuf(weights[0]).name) orelse return null;
     var out_dim: usize = 0;
     for (weights, widths) |weight, width| {
-        if (embeddinggemma2_weight_cache.nativeClass(toBuf(weight).name) != class or toBuf(weight).data.len != in_dim * width) return null;
+        const buf = toBuf(weight);
+        if (embeddinggemma2_weight_cache.nativeClass(buf.name) != class) return null;
+        if (buf.source_tensor) |source| {
+            if (source.dtype != .bf16 or source.data.len != in_dim * width * 2) return null;
+        } else if (buf.data.len != in_dim * width) return null;
         out_dim = try std.math.add(usize, out_dim, width);
     }
     const key = try packedLinearKey(self.allocator, weights, ".qkv");
@@ -8555,10 +8700,14 @@ fn packedMediaLinears(self: *NativeCompute, weights: []const CT, in_dim: usize, 
     errdefer self.data.allocator.free(combined_weight);
     var offset: usize = 0;
     for (weights, widths) |weight, width| {
-        @memcpy(combined_weight[offset..][0 .. in_dim * width], toBuf(weight).data);
+        const destination = combined_weight[offset..][0 .. in_dim * width];
+        const buf = toBuf(weight);
+        if (buf.source_tensor) |source| tensor_mod.widenBf16LittleEndian(source.data, destination) else @memcpy(destination, buf.data);
         offset += in_dim * width;
     }
-    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, name, .{ .data = combined_weight, .bytes = bytes });
+    var projection_widths: [3]usize = @splat(0);
+    @memcpy(projection_widths[0..widths.len], widths);
+    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, name, .{ .data = combined_weight, .bytes = bytes, .projection_widths = projection_widths, .in_dim = in_dim });
     self.data.embeddinggemma2_f32_cache_bytes += bytes;
     self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
     // Ownership has transferred to the model before allocating the handle.
@@ -53453,4 +53602,137 @@ test "embeddinggemma2 grouped portable shared KV scheduling benchmark" {
         }
         std.debug.print("grouped-portable rows={d} dim={d} kv={d} serial_ns={d} workers_ns={d}\n", .{ rows, dim, kv, serial_ns / 3, workers_ns / 3 });
     }
+}
+
+test "embeddinggemma2 canonical projection views share one BF16 snapshot in either warmup order" {
+    const a = std.testing.allocator;
+    const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+    for ([_]bool{ false, true }) |packed_first| {
+        var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 24 }) };
+        initPrefetchQueue(&store, a);
+        defer deinitPrefetchQueue(&store);
+        defer store.resident_weights.deinit(a);
+        defer deinitEmbeddingGemma2F32Cache(&store);
+        var first = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+        var second = [_]u16{ 0xbf80, 0x4000 };
+        try store.resident_weights.put(a, names[0], .{ .tensor = .{ .data = std.mem.sliceAsBytes(&first), .shape = &.{ 2, 2 }, .dtype = .bf16, .name = names[0], .allocator = a, .owns_data = false, .owns_shape = false } });
+        try store.resident_weights.put(a, names[1], .{ .tensor = .{ .data = std.mem.sliceAsBytes(&second), .shape = &.{ 1, 2 }, .dtype = .bf16, .name = names[1], .allocator = a, .owns_data = false, .owns_shape = false } });
+        for (0..2) |request| {
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ 2, 3 }, &.{ 1, 2 });
+            defer cb.free(input);
+            if (!packed_first or request > 0) {
+                const up = try cb.getWeight(names[1]);
+                defer cb.free(up);
+                const result = try cb.linearNoBias(input, up, 1, 2, 1);
+                defer cb.free(result);
+                try std.testing.expectEqualSlices(f32, &.{4}, getData(result));
+            }
+            const result = (try cb.linearPackedNamed(input, &names, &.{ 2, 1 }, 1, 2)).?;
+            defer cb.free(result);
+            try std.testing.expectEqualSlices(f32, &.{ 8, 18, 4 }, getData(result));
+            const up = try cb.acquireWeight(names[1]);
+            defer cb.free(up);
+            var it = store.embeddinggemma2_f32_cache.valueIterator();
+            const entry = it.next().?;
+            try std.testing.expectEqual(entry.data.ptr + 4, toBuf(up).data.ptr);
+            try std.testing.expectEqual(@as(usize, 1), store.embeddinggemma2_f32_cache.count());
+            try std.testing.expectEqual(@as(usize, 24), store.tier_cache.?.host_bytes);
+            // Snapshot lifetime is independent of checkpoint staging and the
+            // next request's allocator/handles.
+            @memset(&first, 0);
+            @memset(&second, 0);
+        }
+        try std.testing.expectEqual(@as(usize, 24), reclaimEmbeddingGemma2Weights(&store, .language));
+    }
+}
+
+test "embeddinggemma2 prepared constants snapshot shape survive requests and yield under audio pressure" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 16 }) };
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitEmbeddingGemma2F32Cache(&store);
+    for (0..2) |request| {
+        var compute = NativeCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.cache_embeddinggemma2_bf16_weights = true;
+        const cb = compute.computeBackend();
+        const key = "audio_tower.prepared.test.v1";
+        if (request == 0) {
+            const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer cb.free(input);
+            const result = (try cb.modelConstant(key, input)).?;
+            defer cb.free(result);
+            @memset(toBuf(input).data, 0);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, getData(result));
+            try std.testing.expect(try cb.modelConstant("audio_tower.prepared.denied", input) == null);
+        }
+        const result = (try cb.modelConstant(key, null)).?;
+        defer cb.free(result);
+        try std.testing.expect((try cb.tensorShapeMatches(result, &.{ 2, 2 })).?);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, getData(result));
+        try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&store, .audio));
+        try std.testing.expectEqual(@as(usize, 16), store.embeddinggemma2_constant_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 16), reclaimEmbeddingGemma2Weights(&store, .audio));
+    try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_constant_count);
+}
+
+test "embeddinggemma2 prepared constants allocation failures never leave unowned snapshots" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 }) };
+            initPrefetchQueue(&store, a);
+            defer deinitPrefetchQueue(&store);
+            defer deinitEmbeddingGemma2F32Cache(&store);
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer cb.free(input);
+            if (try cb.modelConstant("audio_tower.prepared.test.v1", input)) |result| cb.free(result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 prepared constant cancellation releases consumers and permits snapshot retry" {
+    const Probe = struct {
+        checks: usize = 0,
+        fail_at: usize,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return error.Cancelled;
+        }
+    };
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 16 }) };
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitEmbeddingGemma2F32Cache(&store);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    var cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(input);
+    const key = "audio_tower.prepared.cancel.v1";
+    var before = Probe{ .fail_at = 1 };
+    cb.execution_control = .{ .ptr = &before, .check_fn = Probe.check };
+    try std.testing.expectError(error.Cancelled, cb.modelConstant(key, input));
+    try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_constant_count);
+    var after = Probe{ .fail_at = 2 };
+    cb.execution_control = .{ .ptr = &after, .check_fn = Probe.check };
+    try std.testing.expectError(error.Cancelled, cb.modelConstant(key, input));
+    try std.testing.expectEqual(@as(usize, 1), store.embeddinggemma2_constant_count);
+    cb.execution_control = null;
+    const result = (try cb.modelConstant(key, null)).?;
+    defer cb.free(result);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, getData(result));
 }
