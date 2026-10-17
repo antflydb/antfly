@@ -1259,7 +1259,7 @@ savings, or full upstream PCRE2/JIT/CLI conformance.
 
 The cache fixture retains 1,754 source preparations versus 293, with zero warm
 inference calls for both binaries. Allocated cache storage is 45.8 MB versus
-45.0 MB, and peak RSS remains approximately 67 MB. This is improved reuse and
+45.0 MB, and peak RSS remains approximately 66 MiB. This is improved reuse and
 bounded growth, not a claim of smaller allocation in every workload. Some
 dense-output timings regress slightly; the reports retain every measured run.
 
