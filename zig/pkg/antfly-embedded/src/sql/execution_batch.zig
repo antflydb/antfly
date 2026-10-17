@@ -499,7 +499,7 @@ pub const Batch = union(enum) {
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
-                const value = try v.page.cell(a, index, definition.name);
+                const value = try v.page.typedCell(a, index, definition.name, definition.element_type == .numeric);
                 break :blk try @import("describe.zig").coerceDatum(a, value, definition.type, definition.element_type);
             },
         };

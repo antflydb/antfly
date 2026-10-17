@@ -482,6 +482,10 @@ const ColumnInput = struct {
             for (output, 0..) |*value, index| value.* = try self.cell(a, index, ordinal);
             return;
         };
+        if (column.values == .decimal128 or column.values == .encoded) {
+            for (output, 0..) |*value, row| value.* = try self.cell(a, row, ordinal);
+            return;
+        }
         if (column.values == .dictionary_bytes) {
             const dictionary = column.values.dictionary_bytes;
             const normalized = try a.alloc(?Datum, dictionary.values.len);
@@ -521,7 +525,7 @@ const ColumnInput = struct {
     }
     pub fn cell(self: ColumnInput, a: std.mem.Allocator, index: usize, ordinal: u32) !Datum {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
-        const value = try self.page.cell(a, index, self.columns[ordinal].name);
+        const value = try self.page.typedCell(a, index, self.columns[ordinal].name, self.columns[ordinal].element_type == .numeric);
         return @import("describe.zig").coerceDatum(a, value, self.columns[ordinal].type, self.columns[ordinal].element_type);
     }
 };
@@ -1236,4 +1240,22 @@ test "SQL physical string comparisons retain temporary payloads through numeric 
     const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
     defer freeEncodedMany(a, outputs);
     for (0..2) |row| try std.testing.expect((try outputs[0].?.cell(a, row, 0)).value.bool);
+}
+
+test "lake SQL fixed decimal string columns fill comparison kernels with null and duplicate selections" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var compiled = try @import("compiler.zig").compileScalar(a, "n = '1.2300'", .{});
+    defer compiled.deinit();
+    const columns = [_]scalar.Column{.{ .name = "n", .type = .string }};
+    var program = try scalar.bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" } }, .columns = &.{.{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 12300, -100 }, .precision = 5, .scale = 4 } }, .nulls = .{ .bytes = &.{ 0, 1 } } }} }, .selection = &.{ 0, 1, 0 } };
+    const result = (try evaluateColumns(ca, &program, page, &columns, &.{})).?;
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expect(result[0].value.bool);
+    try std.testing.expect(result[1].sql_null);
+    try std.testing.expect(result[2].value.bool);
 }

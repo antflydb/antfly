@@ -15,7 +15,7 @@
 
 //! Grace hash join: sequentially partition both relations, then retain one
 //! build partition. Oversized partitions repartition on remaining hash bits;
-//! indistinguishable/skewed keys keep the bounded disk-chain fallback.
+//! indistinguishable/skewed keys use bounded typed block nested loops.
 const std = @import("std");
 const operators = @import("operators.zig");
 const spill = @import("spill.zig");
@@ -63,6 +63,8 @@ pub const Join = struct {
     probe_input: ?spill.Sequential.InputBlock = null,
     probe_input_index: usize = 0,
     hash: ?*operators.HashJoin = null,
+    skew: ?*@import("skew_join.zig").Join = null,
+    skew_blocks_read: usize = 0,
     probe: ?operators.HashJoin.Probe = null,
     left: ?[]const Datum = null,
     matched: bool = false,
@@ -362,6 +364,8 @@ pub const Join = struct {
         if (self.probe_input) |*block| block.deinit();
         self.probe_input = null;
         self.probe_input_index = 0;
+        if (self.skew) |skew| skew.close();
+        self.skew = null;
         if (self.hash) |hash| hash.deinit();
         self.hash = null;
         self.probe = null;
@@ -422,6 +426,7 @@ pub const Join = struct {
     }
     pub fn accept(self: *Join, index: usize) !void {
         if (self.active_join) |child| return child.accept(index);
+        if (self.skew) |skew| return skew.accept(index);
         self.matched = true;
         if (self.outer_right) try self.hash.?.markMatched(index);
     }
@@ -434,7 +439,7 @@ pub const Join = struct {
         const parent = &self.active.?;
         const available = differences & ~parent.used_bits;
         // Identical key hashes cannot be separated. Cap depth and file count
-        // independently of relation size; those cases retain disk probing.
+        // independently of relation size; those cases use block nested loops.
         if (available == 0 or parent.depth == self.pending.len) return false;
         const bit = @as(u64, 1) << @as(u6, @intCast(@ctz(available)));
         var children = [_]Task{
@@ -487,8 +492,28 @@ pub const Join = struct {
         self.repartitions += 1;
         return true;
     }
+    fn compactSkewInput(self: *Join, source: *spill.Sequential) !void {
+        var compact = try spill.Sequential.init(self.manager, @max(512, @min(32 * 1024, self.limits.bytes / 16)));
+        errdefer compact.close();
+        compact.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 64));
+        source.rewind();
+        var offset: u64 = 0;
+        while (offset < source.size) {
+            var input = try source.readInputBlockBorrowed(offset);
+            defer input.deinit();
+            const block = input.view();
+            for (0..block.count()) |row| {
+                _ = self.scratch.reset(.retain_capacity);
+                _ = try compact.append(try block.row(self.scratch.allocator(), row), spill.none);
+            }
+            offset += block.count();
+        }
+        try compact.seal();
+        source.close();
+        source.* = compact;
+    }
     fn prepare(self: *Join) anyerror!bool {
-        while (self.hash == null) {
+        while (self.hash == null and self.skew == null) {
             try self.manager.check();
             if (self.active == null) {
                 if (self.pending_count != 0) {
@@ -515,7 +540,6 @@ pub const Join = struct {
             var repartitioned = false;
             if (self.active.?.build) |*file| {
                 var offset: u64 = 0;
-                var skew_fallback = false;
                 while (offset < file.size) {
                     var input = try file.readInputBlock(offset);
                     defer input.deinit();
@@ -532,11 +556,6 @@ pub const Join = struct {
                         const h = (try operators.HashJoin.keyHash(key.*)) orelse 0;
                         hash_union |= h;
                         hash_intersection &= h;
-                    }
-                    if (skew_fallback) {
-                        try self.hash.?.addBatch(self.a, values, keys[0..block.count()]);
-                        offset += block.count();
-                        continue;
                     }
                     const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
                     const following = offset + block.count();
@@ -560,18 +579,22 @@ pub const Join = struct {
                         repartitioned = true;
                         break;
                     }
-                    skew_fallback = true;
-                    // Restore the forward reader after lookahead. This also
-                    // handles admission stopping in the middle of a block.
+                    // No useful hash split remains. Keep the typed partition
+                    // and replay it per probe block, not per probe row.
+                    self.hash.?.deinit();
+                    self.hash = null;
+                    try self.compactSkewInput(file);
+                    if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
+                    self.skew = try @import("skew_join.zig").Join.create(self.manager, self.outer_left, self.outer_right);
                     file.rewind();
-                    var replay: u64 = 0;
-                    while (replay < offset) {
-                        const prior = try file.readBatchBorrowed(replay, @intCast(@min(256, offset - replay)));
-                        replay = prior.following;
-                    }
+                    break;
                 }
             }
             if (repartitioned) continue;
+            if (self.skew != null) {
+                self.partitions_loaded += 1;
+                return true;
+            }
             if (self.active.?.build) |*file| file.close();
             self.active.?.build = null;
             self.partitions_loaded += 1;
@@ -584,6 +607,15 @@ pub const Join = struct {
         _ = self.candidate.reset(.{ .retain_with_limit = @min(8192, self.limits.bytes / 32) });
         while (try self.prepare()) {
             try self.manager.check();
+            if (self.skew) |skew| {
+                if (try skew.next(&self.active.?.build.?, if (self.active.?.probes) |*file| file else null)) |pair| return .{ .left = pair.left, .right = pair.right, .match = pair.match };
+                self.skew_blocks_read += skew.blocks_read;
+                skew.close();
+                self.skew = null;
+                self.active.?.close();
+                self.active = null;
+                continue;
+            }
             if (self.probe) |*probe| {
                 if (try probe.next()) |match| return .{ .left = self.left, .right = try match.materializeValues(self.candidate.allocator()), .match = match.index };
                 self.probe = null;
@@ -995,4 +1027,61 @@ test "SQL compact probe blocks retain rows through duplicate matches and early c
             try std.testing.expect(join.probe_input == null);
         }
     }
+}
+
+test "SQL partitioned join block skew fallback preserves residual outer matches and bounded replay" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const join = try Join.create(a, &manager, 32 * 1024, 2000, 0, true, true);
+    defer join.close();
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..1200) |i| try join.add(true, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    for (0..40) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    var accepted: usize = 0;
+    var left_only: usize = 0;
+    var right_only: usize = 0;
+    while (try join.next()) |pair| {
+        if (pair.match) |match| {
+            if (pair.left.?[0].value.integer == pair.right.?[0].value.integer and pair.left.?[0].value.integer < 20) {
+                try join.accept(match);
+                accepted += 1;
+            }
+        } else if (pair.left != null) left_only += 1 else right_only += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 20), accepted);
+    try std.testing.expectEqual(@as(usize, 20), left_only);
+    try std.testing.expectEqual(@as(usize, 1180), right_only);
+    try std.testing.expect(join.skew_blocks_read != 0);
+    try std.testing.expect(join.skew_blocks_read < 1200 * 4);
+    std.debug.print("SQL skew join: candidates=48000 typed_build_block_decodes={d}\n", .{join.skew_blocks_read});
+}
+
+fn skewEarlyClose(a: A) !void {
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var build = try spill.Sequential.init(&manager, 1024);
+    defer build.close();
+    var probes = try spill.Sequential.init(&manager, 1024);
+    defer probes.close();
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..3) |i| _ = try build.append(.{ .values = &.{Datum.json(.{ .integer = @intCast(i) })}, .keys = &.{key}, .ordinal = i }, spill.none);
+    _ = try probes.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = 0 }, spill.none);
+    try build.seal();
+    try probes.seal();
+    const skew = try @import("skew_join.zig").Join.create(&manager, true, true);
+    defer skew.close();
+    const first = (try skew.next(&build, &probes)) orelse return error.TestUnexpectedResult;
+    try skew.accept(first.match orelse return error.TestUnexpectedResult);
+}
+
+test "SQL partitioned join block skew releases typed inputs and match state on early close and allocation faults" {
+    try skewEarlyClose(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, skewEarlyClose, .{});
 }

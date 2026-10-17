@@ -94,12 +94,15 @@ pub const ColumnKind = enum(u8) {
     dictionary_bytes = 7,
     dictionary_i64 = 8,
     dictionary_f64 = 9,
+    decimal128 = 10,
+    encoded = 11,
 
     pub fn logical(self: ColumnKind) ColumnKind {
         return switch (self) {
             .dictionary_bytes => .bytes,
             .dictionary_i64 => .i64,
             .dictionary_f64 => .f64,
+            .decimal128 => .bytes,
             else => self,
         };
     }
@@ -113,7 +116,7 @@ pub const DictionaryBytes = struct {
     pub fn at(self: DictionaryBytes, row: usize) []const u8 {
         return self.values[self.indices[row]];
     }
-    pub fn deinit(self: DictionaryBytes, a: Allocator) void {
+    pub fn deinit(self: DictionaryBytes, a: std.mem.Allocator) void {
         for (self.values) |value| a.free(value);
         a.free(self.values);
         a.free(self.indices);
@@ -130,13 +133,44 @@ pub fn DictionaryNumeric(comptime T: type) type {
         pub fn at(self: @This(), row: usize) T {
             return self.values[self.indices[row]];
         }
-        pub fn deinit(self: @This(), a: Allocator) void {
+        pub fn deinit(self: @This(), a: std.mem.Allocator) void {
             if (self.owned) a.free(self.values);
             a.free(self.indices);
         }
     };
 }
 
+/// Fixed scale belongs to the column; coefficients never pass through text
+/// inside the SQL pipeline. Payload ownership follows the enclosing page.
+pub const Decimal128 = struct {
+    values: []const i128,
+    precision: i32,
+    scale: i32,
+    pub fn text(self: @This(), a: std.mem.Allocator, row: usize) ![]u8 {
+        return @import("../../common/decimal128.zig").formatAlloc(a, self.values[row], self.precision, self.scale);
+    }
+    pub fn slice(self: @This(), begin: usize, count: usize) @This() {
+        var result = self;
+        result.values = self.values[begin..][0..count];
+        return result;
+    }
+};
+/// Borrowed encoded page evidence. Callbacks interpret only requested lanes;
+/// producers materialize survivors before returning an owning result batch.
+pub const EncodedOp = enum { eq, neq, lt, lte, gt, gte };
+pub const EncodedValues = struct {
+    ptr: *const anyopaque,
+    begin: usize,
+    count: usize,
+    kind: ColumnKind,
+    read: *const fn (*const anyopaque, usize) anyerror!std.json.Value,
+    dictionary_id: ?*const fn (*const anyopaque, usize) ?u32 = null,
+    mask: ?*const fn (*const anyopaque, usize, []bool, std.json.Value, EncodedOp) anyerror!bool = null,
+    pub fn at(self: @This(), row: usize) !std.json.Value {
+        if (row >= self.count) return error.RowSourceColumnLengthMismatch;
+        return self.read(self.ptr, std.math.add(usize, self.begin, row) catch return error.RowSourceColumnLengthMismatch);
+    }
+};
 pub const ColumnValues = union(ColumnKind) {
     bytes: []const []const u8,
     json: []const []const u8,
@@ -147,6 +181,23 @@ pub const ColumnValues = union(ColumnKind) {
     dictionary_bytes: DictionaryBytes,
     dictionary_i64: DictionaryNumeric(i64),
     dictionary_f64: DictionaryNumeric(f64),
+    decimal128: Decimal128,
+    encoded: EncodedValues,
+    pub fn jsonAt(self: @This(), a: std.mem.Allocator, row: usize) !std.json.Value {
+        return switch (self) {
+            .i64 => |v| .{ .integer = v[row] },
+            .dictionary_i64 => |v| .{ .integer = v.at(row) },
+            .f64 => |v| .{ .float = v[row] },
+            .dictionary_f64 => |v| .{ .float = v.at(row) },
+            .bool => |v| .{ .bool = v[row] },
+            .bytes => |v| .{ .string = v[row] },
+            .dictionary_bytes => |v| .{ .string = v.at(row) },
+            .decimal128 => |v| .{ .string = try v.text(a, row) },
+            .encoded => |v| try v.at(row),
+            .json => |v| try std.json.parseFromSliceLeaky(std.json.Value, a, v[row], .{ .parse_numbers = false }),
+            .vector_f32 => return error.RowSourceColumnKindMismatch,
+        };
+    }
 };
 
 pub const NullBitmap = struct {
@@ -165,7 +216,7 @@ pub const NullBitmap = struct {
         return .{ .bytes = if (self.bytes.len == 0) &.{} else self.bytes[begin..][0..count] };
     }
     /// Owning row-source boundaries materialize borrowed validity once.
-    pub fn dupeBytes(self: NullBitmap, a: Allocator, count: usize) ![]u8 {
+    pub fn dupeBytes(self: NullBitmap, a: std.mem.Allocator, count: usize) ![]u8 {
         try self.validate(count);
         if (self.bits == null) return a.dupe(u8, self.bytes);
         const bytes = try a.alloc(u8, count);
@@ -217,6 +268,7 @@ pub const ColumnVector = struct {
                 if (id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
                 break :blk id;
             },
+            .encoded => |values| if (values.dictionary_id) |id| id(values.ptr, std.math.add(usize, values.begin, row) catch return error.RowSourceColumnLengthMismatch) else null,
             else => null,
         };
     }
@@ -228,6 +280,8 @@ pub const ColumnVector = struct {
             .json => |values| values.len,
             .i64 => |values| values.len,
             .f64 => |values| values.len,
+            .decimal128 => |values| values.values.len,
+            .encoded => |values| values.count,
             .bool => |values| values.len,
             .vector_f32 => |values| values.len,
         };

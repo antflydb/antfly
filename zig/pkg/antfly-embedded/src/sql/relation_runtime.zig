@@ -1183,7 +1183,7 @@ fn Engine(comptime Context: type) type {
                             if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                             const values = try alloc.alloc(Datum, self.node.columns.len);
                             for (scan.source_columns, self.node.columns, values) |name, column, *out| {
-                                const cell = try page.cell(alloc, index, name);
+                                const cell = try page.typedCell(alloc, index, name, column.element_type == .numeric);
                                 // Values borrow the current page until the next pull.
                                 // Retaining operators own typed copies at admission.
                                 out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);

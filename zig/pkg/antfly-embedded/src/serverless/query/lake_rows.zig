@@ -1223,6 +1223,9 @@ fn projectedRowAllocatedBytes(
         total = std.math.add(usize, total, name.len) catch return std.math.maxInt(usize);
         if (column.nulls.isNull(row_idx)) continue;
         const payload_bytes = switch (column.values) {
+            .decimal128 => |values| @as(usize, @intCast(values.precision)) + 3,
+            .encoded => return error.UnsupportedSqlExecution,
+
             .bytes, .json => |items| items[row_idx].len,
             .dictionary_bytes => |items| items.at(row_idx).len,
             .vector_f32 => |items| std.math.mul(usize, items[row_idx].len, @sizeOf(f32)) catch return std.math.maxInt(usize),
@@ -1251,6 +1254,8 @@ fn cloneCellValueAlloc(
     row_idx: usize,
 ) !CellValue {
     return switch (values) {
+        .decimal128 => |items| .{ .bytes = try items.text(alloc, row_idx) },
+        .encoded => return error.UnsupportedSqlExecution,
         .bytes => |items| .{ .bytes = try alloc.dupe(u8, items[row_idx]) },
         .dictionary_bytes => |items| .{ .bytes = try alloc.dupe(u8, items.at(row_idx)) },
         .json => |items| .{ .json = try alloc.dupe(u8, items[row_idx]) },

@@ -43,7 +43,7 @@ pub const MaterializationLimits = struct {
     borrow_dictionary: bool = false,
     /// Legacy row scanners retain their approximate numeric contract. Native
     /// SQL and public typed lake rows explicitly select lossless decimal text.
-    decimal_representation: enum { approximate_number, exact_string } = .approximate_number,
+    decimal_representation: enum { approximate_number, exact_string, native_decimal } = .approximate_number,
     /// Internal page cursor: physical rows represented by the supplied page.
     page_row_count: ?usize = null,
     max_rows: usize = 1_000_000,
@@ -1709,6 +1709,7 @@ pub const OwnedColumns = struct {
 };
 
 const DecodedColumn = union(enum) {
+    decimal128: rowsource.Decimal128,
     i64: []i64,
     f64: []f64,
     bool: []bool,
@@ -1720,6 +1721,7 @@ const DecodedColumn = union(enum) {
 
     pub fn deinit(self: *DecodedColumn, alloc: Allocator) void {
         switch (self.*) {
+            .decimal128 => |values| alloc.free(values.values),
             .i64 => |values| alloc.free(values),
             .f64 => |values| alloc.free(values),
             .bool => |values| alloc.free(values),
@@ -2371,7 +2373,12 @@ fn buildPlainColumnsAlloc(
                 },
             },
             .decimal => |decimal_mode| {
-                if (limits.decimal_representation == .exact_string) {
+                if (limits.decimal_representation == .native_decimal) {
+                    if (row_count > (limits.max_decoded_bytes / projected_chunks.len) / (@sizeOf(i128) * 2 + @sizeOf([]u8) + 1)) return error.ParquetRowGroupTooLarge;
+                    const decoded = try scanDecimalNativeAlloc(alloc, input.bytes, compression, decimal_mode, input.dictionary);
+                    decoded_columns[idx] = .{ .decimal128 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                } else if (limits.decimal_representation == .exact_string) {
                     // Admit the expanded text, slice/null directories and
                     // temporary unscaled values before allocating output.
                     const bytes_per_row = @sizeOf([]u8) + @sizeOf(i128) + 1 + @as(usize, @intCast(decimal_mode.precision)) + 3;
@@ -2441,6 +2448,10 @@ fn buildPlainColumnsAlloc(
         initialized_decoded += 1;
         initialized_nulls += 1;
         columns[idx] = switch (decoded_columns[idx]) {
+            .decimal128 => |values| blk: {
+                if (values.values.len != row_count) return error.ParquetRowGroupRowCountMismatch;
+                break :blk .{ .name = column_names[idx], .values = .{ .decimal128 = values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
+            },
             .i64 => |values| blk: {
                 if (values.len != row_count) return error.ParquetRowGroupRowCountMismatch;
                 break :blk .{
@@ -3517,6 +3528,33 @@ fn scanDecimalBytesAlloc(alloc: Allocator, bytes: []const u8, compression: parqu
         };
     };
     return decoded;
+}
+fn scanDecimalNativeAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !struct { values: rowsource.Decimal128, nulls: []u8 } {
+    const decimal = @import("lake_decimal.zig");
+    if (mode.physical == .int32 or mode.physical == .int64) {
+        var input = if (mode.physical == .int32) try scanDecimalInt32UnscaledAlloc(alloc, bytes, compression, mode, dictionary) else try scanDecimalInt64UnscaledAlloc(alloc, bytes, compression, mode, dictionary);
+        defer input.deinit(alloc);
+        const values = try alloc.alloc(i128, input.values.len);
+        errdefer alloc.free(values);
+        for (input.values, values, 0..) |value, *out, index| {
+            out.* = if (input.nulls.len != 0 and input.nulls[index] != 0) 0 else value;
+            try decimal.validateCoefficient(out.*, mode.precision, mode.scale);
+        }
+        const nulls = input.nulls;
+        input.nulls = &.{};
+        return .{ .values = .{ .values = values, .precision = mode.precision, .scale = mode.scale }, .nulls = nulls };
+    }
+    var input = try scanDecimalBytesAlloc(alloc, bytes, compression, mode, dictionary);
+    defer input.deinit(alloc);
+    const values = try alloc.alloc(i128, input.values.len);
+    errdefer alloc.free(values);
+    for (input.values, values, 0..) |value, *out, index| {
+        out.* = if (input.nulls.len != 0 and input.nulls[index] != 0) 0 else try decimal.signedBigEndian(value);
+        try decimal.validateCoefficient(out.*, mode.precision, mode.scale);
+    }
+    const nulls = input.nulls;
+    input.nulls = &.{};
+    return .{ .values = .{ .values = values, .precision = mode.precision, .scale = mode.scale }, .nulls = nulls };
 }
 fn scanDecimalAsStringsAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !parquet_page.NullableByteArrayValues {
     const decimal = @import("lake_decimal.zig");

@@ -96,6 +96,42 @@ fn dictionary(comptime T: type, values: []const T, indices: []const u32, nulls: 
         }
     }
 }
+fn encoded(values: types.EncodedValues, nulls: types.NullBitmap, keep: []bool, literal: std.json.Value, op: Op) !void {
+    var memo: [8192]u8 = @splat(0);
+    var identities: [8192]u32 = undefined;
+    var cached: usize = 0;
+    for (keep, 0..) |*active, row| {
+        if (!active.*) continue;
+        if (nulls.isNull(row)) {
+            active.* = false;
+            continue;
+        }
+        const id = if (values.dictionary_id) |identify| identify(values.ptr, values.begin + row) else null;
+        var slot: usize = 0;
+        if (id) |value| {
+            slot = (value *% 2654435761) & (memo.len - 1);
+            while (memo[slot] != 0 and identities[slot] != value) slot = (slot + 1) & (memo.len - 1);
+            if (memo[slot] != 0) {
+                active.* = memo[slot] == 2;
+                continue;
+            }
+        }
+        const value = try values.at(row);
+        const order = switch (value) {
+            .integer => if (literal == .integer) orderValue(i64, value.integer, literal.integer) else return error.InvalidSqlBackendResponse,
+            .float => if (literal == .float) orderValue(f64, value.float, literal.float) else return error.InvalidSqlBackendResponse,
+            .string => if (literal == .string) orderValue([]const u8, value.string, literal.string) else return error.InvalidSqlBackendResponse,
+            .bool => if (literal == .bool) orderValue(bool, value.bool, literal.bool) else return error.InvalidSqlBackendResponse,
+            else => return error.InvalidSqlBackendResponse,
+        };
+        active.* = accepts(op, order);
+        if (id != null and cached < 4096) {
+            identities[slot] = id.?;
+            memo[slot] = if (active.*) 2 else 1;
+            cached += 1;
+        }
+    }
+}
 pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: catalog.Condition, keep: []bool) !bool {
     if (keep.len != batch.rowCount()) return error.InvalidSqlBackendResponse;
     const vector = batch.findColumn(condition.column) orelse return false;
@@ -108,6 +144,14 @@ pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: ca
     const definition = try table.column(condition.column);
     if (definition.element_type == .numeric) return false;
     const supported = switch (vector.values) {
+        .encoded => |values| switch (values.kind) {
+            .i64 => definition.type == .integer or definition.type == .datetime,
+            .f64 => definition.type == .number,
+            .bool => definition.type == .boolean,
+            .bytes => definition.type == .string,
+            else => false,
+        },
+
         .i64, .dictionary_i64 => definition.type == .integer or definition.type == .datetime,
         .f64, .dictionary_f64 => definition.type == .number,
         .bytes, .dictionary_bytes => definition.type == .string,
@@ -129,6 +173,11 @@ pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: ca
     // Untyped lake number coercion rejects nonfinite cells. Decline before
     // changing any mask so the established scalar boundary reports its error.
     switch (vector.values) {
+        .encoded => |values| if (values.kind == .f64 and values.mask == null) {
+            for (keep, 0..) |active, row| {
+                if (active and !vector.nulls.isNull(row) and !std.math.isFinite((try values.at(row)).float)) return false;
+            }
+        },
         .f64 => |values| for (keep, 0..) |active, row| {
             if (active and !vector.nulls.isNull(row) and !std.math.isFinite(values[row])) return false;
         },
@@ -146,6 +195,19 @@ pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: ca
     }
     const literal = (try @import("lake_values.zig").comparisonDatum(a, condition.datum(), definition)).value;
     switch (vector.values) {
+        .encoded => |values| {
+            if (values.mask) |mask| return mask(values.ptr, values.begin, keep, literal, switch (condition.op) {
+                .eq => .eq,
+                .neq => .neq,
+                .lt => .lt,
+                .lte => .lte,
+                .gt => .gt,
+                .gte => .gte,
+                else => unreachable,
+            });
+            try encoded(values, vector.nulls, keep, literal, condition.op);
+        },
+
         inline .i64, .dictionary_i64 => |values, tag| {
             if (literal != .integer) return false;
             if (tag == .i64) flat(i64, values, vector.nulls, keep, literal.integer, condition.op) else try dictionary(i64, values.values, values.indices, vector.nulls, keep, literal.integer, condition.op);
@@ -231,4 +293,28 @@ test "lake SQL native predicate masks match scalar null dictionary timestamp and
     var keep = [_]bool{ true, false };
     try std.testing.expect(try apply(alloc, batch, table, .{ .column = "k", .op = .eq, .value = .{ .integer = 7 } }, &keep));
     try std.testing.expect(keep[0] and !keep[1]);
+}
+
+test "lake SQL encoded predicates memoize dictionary values without materializing lanes" {
+    const Harness = struct {
+        ids: [8]u32 = .{ 0, 1, 0, 1, 0, 1, 0, 1 },
+        reads: usize = 0,
+        fn read(raw: *const anyopaque, row: usize) !std.json.Value {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.reads += 1;
+            return .{ .integer = if (self.ids[row] == 0) 7 else 99 };
+        }
+        fn id(raw: *const anyopaque, row: usize) ?u32 {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.ids[row];
+        }
+    };
+    var harness: Harness = .{};
+    const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{.{ .name = "k", .path = "k", .type = .integer }} };
+    const vector: types.ColumnVector = .{ .name = "k", .values = .{ .encoded = .{ .ptr = &harness, .begin = 1, .count = 6, .kind = .i64, .read = Harness.read, .dictionary_id = Harness.id } }, .nulls = .{ .bytes = &.{ 0, 0, 0, 0, 1, 0 } } };
+    const batch: types.ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .external_span = .{ .first = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 6 }, .columns = &.{vector} };
+    var keep = [_]bool{ true, false, true, true, true, true };
+    try std.testing.expect(try apply(std.testing.allocator, batch, table, .{ .column = "k", .op = .eq, .value = .{ .integer = 7 } }, &keep));
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, true, false, true }, &keep);
+    try std.testing.expectEqual(@as(usize, 2), harness.reads);
 }

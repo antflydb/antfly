@@ -55,19 +55,32 @@ lake cursors overlap up to four version-pinned projected range reads in a
 32 MiB lookahead batch through the existing I/O runtime. Cancellation reaches
 provider tokens; workers join before source metadata is released.
 
+SQL residual predicates can evaluate supported PLAIN/dictionary Parquet pages
+without allocating complete value vectors. Primitive page kernels dispatch by
+operator/type, compare dense numeric runs with SIMD, and memoize referenced
+dictionary values. NULLs, deletes and scalar coercion errors retain their existing
+semantics; unsupported layouts use the established decoder. Projected values are
+materialized only for surviving rows. Non-nullable pages use implicit positions.
+
 Blocking sorts, mergeable grouped aggregates (including DISTINCT), and hash-join
 build rows can spill through statement-owned temporary storage. Bounded merge
-runs support sorting and per-key state reduction; joins use a bounded bucket
-directory and persistent match markers for outer joins. The shared statement
+runs support sorting and per-key state reduction. SQL joins partition both
+relations into typed sequential blocks, recursively splitting oversized build
+partitions. Inseparable/skewed partitions replay build blocks once per probe
+block, with disk-backed accepted-match flags for right/full joins. Residual ON
+predicates mark matches only after acceptance. The shared statement
 spill quota defaults to 1 GiB and 64 open files. Private files are immediately
 unlinked and close on success/error/cancellation. Small inputs keep the existing
 in-memory paths. The exact datum codec preserves integers and SQL/JSON nulls.
 
-Native SQL and public typed lake scans decode decimal columns as lossless,
-fixed-scale strings through precision 38. INT32/INT64 and binary/fixed binary
-(up to 16 bytes), nullable pages and cached dictionaries share exact integer
-formatting. The older row-scanner numeric contract remains an explicit decoding
-mode. Timestamp predicates normalize wire strings and numeric operands to exact
+Native page scans retain decimal columns as signed i128 coefficient vectors
+with column precision/scale through precision 38. Declared SQL NUMERIC reads
+convert coefficients directly into exact numeric state without formatting or
+parsing text. Raw string columns and public result boundaries retain lossless,
+fixed-scale strings. INT32/INT64 and binary/fixed binary (up to 16 bytes), nullable
+pages and cached dictionaries share this contract. The older row-scanner numeric
+contract remains an explicit decoding mode. Timestamp predicates normalize wire
+strings and numeric operands to exact
 signed epoch nanoseconds; canonical SQL projections preserve pre-1970 values.
 
 Table creation can infer and persist columns/fingerprints from every Parquet

@@ -245,6 +245,8 @@ fn slice(columns: []rows.ColumnVector, batch: rows.ColumnBatch, begin: usize, en
         column.* = original;
         column.nulls = original.nulls.slice(begin, end - begin);
         column.values = switch (original.values) {
+            .decimal128 => |values| .{ .decimal128 = values.slice(begin, end - begin) },
+            .encoded => return error.UnsupportedSqlExecution,
             inline .dictionary_bytes, .dictionary_i64, .dictionary_f64 => |dictionary, tag| @unionInit(rows.ColumnValues, @tagName(tag), .{ .values = dictionary.values, .indices = dictionary.indices[begin..end] }),
             inline else => |values, tag| @unionInit(rows.ColumnValues, @tagName(tag), values[begin..end]),
         };

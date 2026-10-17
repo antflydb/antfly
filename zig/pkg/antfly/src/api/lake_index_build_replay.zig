@@ -309,11 +309,12 @@ pub const Replay = struct {
             };
             return if (column.nulls.isNull(row)) 0 else @as(u64, ids[row]) + 2;
         }
-        fn cell(raw: *anyopaque, _: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
+        fn cell(raw: *anyopaque, a: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             if (column.nulls.isNull(row)) return .{};
             return .{ .sql_null = false, .value = switch (column.values) {
+                .decimal128, .encoded => try column.values.jsonAt(a, row),
                 .i64 => |v| .{ .integer = v[row] },
                 .dictionary_i64 => |v| .{ .integer = v.at(row) },
                 .f64 => |v| .{ .float = v[row] },

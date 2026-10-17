@@ -1290,7 +1290,7 @@ pub const Stream = struct {
             fn cell(raw: *anyopaque, alloc: std.mem.Allocator, index: usize, ordinal: usize) anyerror!@import("scalar.zig").Datum {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
                 const cell_ = if (projection_.projections[ordinal]) |values| try values.cell(alloc, index, 0) else blk: {
-                    const raw_ = try projection_.page.cell(alloc, index, projection_.stream.fields[ordinal]);
+                    const raw_ = try projection_.page.typedCell(alloc, index, projection_.stream.fields[ordinal], projection_.stream.context.binding.columns[ordinal].element_type == .numeric);
                     break :blk raw_;
                 };
                 const column = projection_.stream.context.binding.columns[ordinal];

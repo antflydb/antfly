@@ -32,6 +32,7 @@ pub const Cursor = struct {
     position: u64 = 0,
     selected: []const bool = &.{},
     selected_values_decoded: usize = 0,
+    encoded_predicate_pages: usize = 0,
     /// Residual evidence is evaluated before projected payloads are decoded.
     filter: ?Filter = null,
     prune_ptr: ?*anyopaque = null,
@@ -41,6 +42,7 @@ pub const Cursor = struct {
     pages_decoded: usize = 0,
     output: std.heap.ArenaAllocator,
     pub const Filter = struct {
+        encoded: bool = false,
         ptr: *anyopaque,
         any_match: *const fn (*anyopaque, types.ColumnBatch) anyerror!bool,
         select: ?*const fn (*anyopaque, types.ColumnBatch) anyerror![]const bool = null,
@@ -240,7 +242,7 @@ pub const Cursor = struct {
             if (self.shared_reader) |reader| if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
                 // Resource policy is checked for each consumer, independently
                 // of the immutable physical interpretation of a page.
-                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v4", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
+                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v5", .chunk = column.chunk, .decimal_representation = "native_decimal", .preserve_dictionary = true }, .{});
                 defer self.a.free(interpretation);
                 cache_key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
                 if (reader.cache.decoded.lookup(cache_key.?)) |lease| {
@@ -313,9 +315,10 @@ pub const Cursor = struct {
             var survivors: usize = 0;
             for (self.selected[0..considered]) |active| survivors += @intFromBool(active);
             const sparse = considered != 0 and survivors <= considered / 2;
-            if (!column.required and sparse) {
+            if ((!column.required and sparse) or (column.required and self.filter != null and self.filter.?.encoded and self.filter.?.select != null and !std.mem.eql(u8, column.chunk.logical_type, "decimal"))) {
                 if (try @import("lake_parquet_selected.zig").create(self.a, column.chunk, parsed.header, encoded[parsed.header_len..], column.dictionary, self.limits.max_decoded_bytes / share *| 2 +| self.limits.max_struct_allocation_bytes / share)) |projection| {
                     column.projection = projection;
+                    self.encoded_predicate_pages += @intFromBool(column.required);
                     column.count = count;
                     column.consumed = @intCast(self.position - column.first);
                     self.pages_decoded += 1;
@@ -324,7 +327,7 @@ pub const Cursor = struct {
                 }
             }
             var limits = self.limits;
-            limits.decimal_representation = .exact_string;
+            limits.decimal_representation = .native_decimal;
             limits.max_decoded_bytes = self.limits.max_decoded_bytes / share - dictionary_bytes;
             limits.max_struct_allocation_bytes /= @max(@as(usize, 1), self.columns.len);
             limits.page_row_count = count;
@@ -391,7 +394,7 @@ pub const Cursor = struct {
         const entry = self.indexedPage(column) orelse return null;
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         if (column.offset >= end or entry.len > end - column.offset) return error.InvalidParquetMetadata;
-        const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v4", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
+        const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v5", .chunk = column.chunk, .decimal_representation = "native_decimal", .preserve_dictionary = true }, .{});
         defer self.a.free(interpretation);
         const key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = entry.len }, .purpose = .parquet_column_chunk }, interpretation);
         const lease = reader.cache.decoded.lookup(key) orelse return null;
@@ -523,7 +526,7 @@ pub const Cursor = struct {
         }
         try reader.prefetch(reads[0..count]);
     }
-    const DecodeStats = struct { pages: usize, dictionaries: usize };
+    const DecodeStats = struct { pages: usize, dictionaries: usize, encoded_predicates: usize };
     const DecodeAllocator = @import("../../sql/parallel_scheduler.zig").LockedAllocator;
     fn decode(template: Cursor, column: *Column, a: A) anyerror!DecodeStats {
         // A worker mutates its own column only. The scoped allocator serializes
@@ -532,8 +535,9 @@ pub const Cursor = struct {
         worker.a = a;
         worker.pages_decoded = 0;
         worker.dictionary_decodes = 0;
+        worker.encoded_predicate_pages = 0;
         try worker.advance(column);
-        return .{ .pages = worker.pages_decoded, .dictionaries = worker.dictionary_decodes };
+        return .{ .pages = worker.pages_decoded, .dictionaries = worker.dictionary_decodes, .encoded_predicates = worker.encoded_predicate_pages };
     }
     fn advanceColumns(self: *Cursor, required_only: bool) !void {
         // Scoped decode locks never escape into retained page allocators.
@@ -570,6 +574,7 @@ pub const Cursor = struct {
                     const stats = try decode(self.*, column, allocator.allocator());
                     self.pages_decoded += stats.pages;
                     self.dictionary_decodes += stats.dictionaries;
+                    self.encoded_predicate_pages += stats.encoded_predicates;
                     next_column += 1;
                     continue;
                 };
@@ -585,6 +590,7 @@ pub const Cursor = struct {
                 future.* = null;
                 self.pages_decoded += stats.pages;
                 self.dictionary_decodes += stats.dictionaries;
+                self.encoded_predicate_pages += stats.encoded_predicates;
             };
             if (failure) |err| return err;
         }
@@ -606,6 +612,11 @@ pub const Cursor = struct {
             if (required_only and !column.required) continue;
             if (column.projection) |projection| {
                 const begin: usize = @intCast(self.position - column.first);
+                if (required_only) {
+                    const evidence = (try projection.evidence(a, begin, count)) orelse return error.InvalidParquetPage;
+                    try vectors.append(a, evidence);
+                    continue;
+                }
                 if (count > self.selected.len) return error.InvalidParquetPage;
                 const previous = projection.converted;
                 try vectors.append(a, try projection.project(a, begin, self.selected[0..count]));
@@ -616,6 +627,8 @@ pub const Cursor = struct {
             const begin: usize = @intCast(self.position - column.first);
             var vector = decoded;
             vector.values = switch (decoded.values) {
+                .encoded => return error.InvalidParquetPage,
+                .decimal128 => |values| .{ .decimal128 = values.slice(begin, count) },
                 .dictionary_bytes => |values| .{ .dictionary_bytes = .{ .values = values.values, .indices = values.indices[begin..][0..count] } },
                 inline .dictionary_i64, .dictionary_f64 => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), .{ .values = values.values, .indices = values.indices[begin..][0..count] }),
                 inline else => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), values[begin..][0..count]),

@@ -168,6 +168,8 @@ fn cloneColumnAlloc(alloc: Allocator, column: rowsource.ColumnVector) !rowsource
 
 fn cloneColumnValuesAlloc(alloc: Allocator, values: rowsource.ColumnValues) !rowsource.ColumnValues {
     return switch (values) {
+        .encoded => return error.UnsupportedSqlExecution,
+        .decimal128 => |items| .{ .decimal128 = .{ .values = try alloc.dupe(i128, items.values), .precision = items.precision, .scale = items.scale } },
         .bytes => |items| .{ .bytes = try cloneByteSlicesAlloc(alloc, items) },
         inline .dictionary_i64, .dictionary_f64 => |items, tag| blk: {
             const T = std.meta.Elem(@TypeOf(items.values));
@@ -219,6 +221,8 @@ fn freeColumn(alloc: Allocator, column: rowsource.ColumnVector) void {
     alloc.free(@constCast(column.name));
     alloc.free(@constCast(column.nulls.bytes));
     switch (column.values) {
+        .encoded => {},
+        .decimal128 => |items| alloc.free(items.values),
         inline .dictionary_i64, .dictionary_f64 => |items| items.deinit(alloc),
         .dictionary_bytes => |items| items.deinit(alloc),
         .bytes, .json => |items| {

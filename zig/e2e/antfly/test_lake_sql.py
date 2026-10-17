@@ -24,6 +24,7 @@ import os
 import shutil
 import struct
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -4333,7 +4334,10 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+@pytest.mark.parametrize(
+    "physical_type",
+    ["integer", "decimal_string", "decimal128", "decimal128_dictionary"],
+)
 def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type):
     """NUMERIC seeks and covering filters agree beyond f64 precision, cold too."""
     pa = pytest.importorskip("pyarrow")
@@ -4351,13 +4355,17 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
             f"{i}.125" for i in range(2, count)
         ]
         targets = ["9007199254740993.125", "4095.125"]
-        values = pa.array(keys, type=pa.string())
+        values = (
+            pa.array([Decimal(k) for k in keys], type=pa.decimal128(38, 3))
+            if physical_type.startswith("decimal128")
+            else pa.array(keys, type=pa.string())
+        )
     path = tmp_path / "numeric.parquet"
     pq.write_table(
         pa.table({"k": values, "v": pa.array(range(count), type=pa.int64())}),
         path,
         compression="snappy",
-        use_dictionary=False,
+        use_dictionary=physical_type.endswith("_dictionary"),
         row_group_size=256,
     )
     payload = path.read_bytes()
@@ -4487,7 +4495,10 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+@pytest.mark.parametrize(
+    "physical_type",
+    ["integer", "decimal_string", "decimal128", "decimal128_dictionary"],
+)
 def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
     tmp_path, physical_type
 ):
@@ -4502,6 +4513,8 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
     values = (
         pa.array([int(k) for k in keys] + [None], type=pa.int64())
         if physical_type == "integer"
+        else pa.array([Decimal(k) for k in keys] + [None], type=pa.decimal128(38, 3))
+        if physical_type.startswith("decimal128")
         else pa.array(keys + [None])
     )
     root = tmp_path / "lake"
@@ -4509,7 +4522,10 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
     objects.mkdir(parents=True)
     path = tmp_path / "numeric.parquet"
     pq.write_table(
-        pa.table({"k": values}), path, compression="snappy", use_dictionary=False
+        pa.table({"k": values}),
+        path,
+        compression="snappy",
+        use_dictionary=physical_type.endswith("_dictionary"),
     )
     payload = path.read_bytes()
     header = (
@@ -5199,7 +5215,10 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+@pytest.mark.parametrize(
+    "physical_type",
+    ["integer", "decimal_string", "decimal128", "decimal128_dictionary"],
+)
 def test_numeric_predicates_use_only_compatible_parquet_pruning(
     tmp_path, physical_type
 ):
@@ -5214,6 +5233,8 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(
     values = (
         pa.array(keys, type=pa.int64())
         if physical_type == "integer"
+        else pa.array([Decimal(k) for k in keys], type=pa.decimal128(38, 0))
+        if physical_type.startswith("decimal128")
         else pa.array([str(k) for k in keys])
     )
     root = tmp_path / "lake"
@@ -5224,7 +5245,7 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(
         pa.table({"k": values}),
         path,
         compression=None,
-        use_dictionary=False,
+        use_dictionary=physical_type.endswith("_dictionary"),
         write_page_index=True,
         data_page_version="2.0",
     )
@@ -5620,6 +5641,13 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                 ["251", "x" * 256, "2.51", "kept"],
                 ["252", "x" * 256, "2.52", None],
             ]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount_decimal = '2.50' FROM skew_scan WHERE amount >= 250 AND amount <= 252 ORDER BY amount"
+                },
+            )["rows"] == [[True], [False], [False]]
             delivered = []
             with (
                 psycopg.connect(

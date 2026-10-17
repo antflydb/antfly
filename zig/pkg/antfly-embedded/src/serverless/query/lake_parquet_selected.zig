@@ -64,12 +64,13 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
     const alloc = self.arena.allocator();
     const payload = try page.decodePagePayloadAlloc(alloc, header, try parquet.compressionCodecForColumnChunk(chunk), encoded);
     var data: []const u8 = payload.bytes;
-    self.positions = try alloc.alloc(u32, self.count);
     var present: usize = 0;
     if (chunk.nullable) {
+        self.positions = try alloc.alloc(u32, self.count);
         const flat = try page.flatOptionalPage(header, data);
         if (flat.header.definition_level_bytes == 0 or flat.header.data_payload_offset > flat.payload.len) return error.InvalidParquetPage;
         const levels = try page.decodeHybridLevelsAlloc(alloc, flat.payload[0..flat.header.definition_level_bytes], 1, self.count);
+        defer alloc.free(levels);
         for (levels, self.positions) |level, *position| {
             if (level > 1) return error.InvalidParquetPage;
             position.* = if (level == 0) absent else @intCast(present);
@@ -77,7 +78,6 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
         }
         data = flat.payload[flat.header.data_payload_offset..];
     } else {
-        for (self.positions, 0..) |*position, i| position.* = @intCast(i);
         present = self.count;
     }
     self.data = data;
@@ -126,6 +126,9 @@ pub fn destroy(self: *Self) void {
     self.arena.deinit();
     a.destroy(self);
 }
+fn lanePosition(self: *const Self, row: usize) u32 {
+    return if (self.positions.len == 0) @intCast(row) else self.positions[row];
+}
 fn integer(self: *Self, position: usize) !i64 {
     if (self.dictionary) |dictionary| return switch (dictionary) {
         .i64 => |values| values[self.indices[position]],
@@ -152,6 +155,143 @@ fn bytes(self: *Self, position: usize) ![]const u8 {
     const length = std.mem.readInt(u32, self.data[offset..][0..4], .little);
     return self.data[offset + 4 ..][0..length];
 }
+fn predicateValue(self: *Self, comptime T: type, position: usize) !T {
+    if (T == i64) {
+        const factor: i64 = if (std.mem.eql(u8, self.chunk.logical_type, "timestamp_millis")) 1_000_000 else if (std.mem.eql(u8, self.chunk.logical_type, "timestamp_micros")) 1_000 else 1;
+        return std.math.mul(i64, try self.integer(position), factor) catch error.InvalidParquetPage;
+    }
+    if (T == f64) return self.number(position);
+    if (T == []const u8) return self.bytes(position);
+    if (T == bool) return self.data[position / 8] & (@as(u8, 1) << @as(u3, @intCast(position % 8))) != 0;
+    unreachable;
+}
+fn comparePredicate(comptime T: type, comptime op: types.EncodedOp, value: T, literal: T) bool {
+    const order = if (T == []const u8) std.mem.order(u8, value, literal) else if (T == bool) std.math.order(@intFromBool(value), @intFromBool(literal)) else std.math.order(value, literal);
+    return switch (op) {
+        .eq => order == .eq,
+        .neq => order != .eq,
+        .lt => order == .lt,
+        .lte => order != .gt,
+        .gt => order == .gt,
+        .gte => order != .lt,
+    };
+}
+fn predicateMask(self: *Self, comptime T: type, begin: usize, keep: []bool, literal: T, op: types.EncodedOp) !bool {
+    if (T == f64) if (!std.math.isFinite(literal)) return false;
+    // Decline before changing masks so the scalar coercion boundary retains
+    // authority over nonfinite source errors, including excluded lanes.
+    if (T == f64) for (keep, begin..) |active, row| {
+        const position = self.lanePosition(row);
+        if (active and position != absent and !std.math.isFinite(try self.number(position))) return false;
+    };
+    switch (op) {
+        inline else => |operation| try self.predicateMaskOp(T, operation, begin, keep, literal),
+    }
+    return true;
+}
+fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, begin: usize, keep: []bool, literal: T) !void {
+    var memo: [8192]u8 = @splat(0);
+    var identities: [8192]u32 = undefined;
+    var cached: usize = 0;
+    var lane: usize = 0;
+    while (lane < keep.len) {
+        if (T == i64 or T == f64) {
+            const timestamp = std.mem.startsWith(u8, self.chunk.logical_type, "timestamp_") and !std.mem.eql(u8, self.chunk.logical_type, "timestamp_nanos");
+            const position = self.lanePosition(begin + lane);
+            const dense = !timestamp and self.dictionary == null and lane + 4 <= keep.len and position != absent and for (keep[lane..][0..4], 0..) |active, offset| {
+                if (!active or self.lanePosition(begin + lane + offset) != position + offset) break false;
+            } else true;
+            if (dense) {
+                var native: [4]T = undefined;
+                for (&native, 0..) |*value, offset| value.* = try self.predicateValue(T, position + offset);
+                const left: @Vector(4, T) = native;
+                const right: @Vector(4, T) = @splat(literal);
+                keep[lane..][0..4].* = switch (op) {
+                    .eq => left == right,
+                    .neq => left != right,
+                    .lt => left < right,
+                    .lte => left <= right,
+                    .gt => left > right,
+                    .gte => left >= right,
+                };
+                lane += 4;
+                continue;
+            }
+        }
+        defer lane += 1;
+        if (!keep[lane]) continue;
+        const position = self.lanePosition(begin + lane);
+        if (position == absent) {
+            keep[lane] = false;
+            continue;
+        }
+        var slot: usize = 0;
+        var id: u32 = 0;
+        if (self.dictionary != null) {
+            id = self.indices[position];
+            slot = (id *% 2654435761) & (memo.len - 1);
+            while (memo[slot] != 0 and identities[slot] != id) slot = (slot + 1) & (memo.len - 1);
+            if (memo[slot] != 0) {
+                keep[lane] = memo[slot] == 2;
+                continue;
+            }
+        }
+        keep[lane] = comparePredicate(T, op, try self.predicateValue(T, position), literal);
+        if (self.dictionary != null and cached < 4096) {
+            identities[slot] = id;
+            memo[slot] = if (keep[lane]) 2 else 1;
+            cached += 1;
+        }
+    }
+}
+fn encodedMask(raw: *const anyopaque, begin: usize, keep: []bool, literal: std.json.Value, op: types.EncodedOp) !bool {
+    const self: *Self = @ptrCast(@alignCast(@constCast(raw)));
+    if (begin > self.count or keep.len > self.count - begin) return error.InvalidParquetPage;
+    return switch (self.kind) {
+        .integer => if (literal == .integer) self.predicateMask(i64, begin, keep, literal.integer, op) else false,
+        .number => if (literal == .float) self.predicateMask(f64, begin, keep, literal.float, op) else false,
+        .bytes => if (literal == .string) self.predicateMask([]const u8, begin, keep, literal.string, op) else false,
+        .boolean => if (literal == .bool) self.predicateMask(bool, begin, keep, literal.bool, op) else false,
+    };
+}
+fn encodedValue(raw: *const anyopaque, row: usize) !std.json.Value {
+    const self: *Self = @ptrCast(@alignCast(@constCast(raw)));
+    const position = self.lanePosition(row);
+    if (position == absent) return .null;
+    return switch (self.kind) {
+        .integer => blk: {
+            const factor: i64 = if (std.mem.eql(u8, self.chunk.logical_type, "timestamp_millis")) 1_000_000 else if (std.mem.eql(u8, self.chunk.logical_type, "timestamp_micros")) 1_000 else 1;
+            break :blk .{ .integer = std.math.mul(i64, try self.integer(position), factor) catch return error.InvalidParquetPage };
+        },
+        .number => .{ .float = try self.number(position) },
+        .bytes => .{ .string = try self.bytes(position) },
+        .boolean => .{ .bool = self.data[position / 8] & (@as(u8, 1) << @as(u3, @intCast(position % 8))) != 0 },
+    };
+}
+fn encodedId(raw: *const anyopaque, row: usize) ?u32 {
+    const self: *const Self = @ptrCast(@alignCast(raw));
+    return if (self.lanePosition(row) == absent) null else self.indices[self.lanePosition(row)];
+}
+pub fn evidence(self: *Self, a: A, begin: usize, count: usize) !?types.ColumnVector {
+    if (std.mem.eql(u8, self.chunk.logical_type, "decimal")) return null;
+    if (begin > self.count or count > self.count - begin) return error.InvalidParquetPage;
+    const nulls = try a.alloc(u8, count);
+    for (nulls, begin..) |*flag, row| flag.* = @intFromBool(self.lanePosition(row) == absent);
+    return .{ .name = self.chunk.column_id, .nulls = .{ .bytes = nulls }, .values = .{ .encoded = .{
+        .ptr = self,
+        .begin = begin,
+        .count = count,
+        .kind = switch (self.kind) {
+            .integer => .i64,
+            .number => .f64,
+            .bytes => .bytes,
+            .boolean => .bool,
+        },
+        .read = encodedValue,
+        .mask = encodedMask,
+        .dictionary_id = if (self.dictionary != null) encodedId else null,
+    } } };
+}
 pub fn project(self: *Self, a: A, begin: usize, keep: []const bool) !types.ColumnVector {
     if (begin > self.count or keep.len > self.count - begin) return error.InvalidParquetPage;
     const decimal = std.mem.eql(u8, self.chunk.logical_type, "decimal");
@@ -162,7 +302,7 @@ pub fn project(self: *Self, a: A, begin: usize, keep: []const bool) !types.Colum
         // expression/group kernels can work on referenced entries once.
         const indices = try a.alloc(u32, keep.len);
         for (keep, nulls, indices, begin..) |selected, *flag, *id, row| {
-            const position = self.positions[row];
+            const position = self.lanePosition(row);
             flag.* = @intFromBool(!selected or position == absent);
             id.* = if (flag.* == 0) self.indices[position] else 0;
             if (flag.* == 0) self.converted += 1;
@@ -174,14 +314,14 @@ pub fn project(self: *Self, a: A, begin: usize, keep: []const bool) !types.Colum
         };
         return vector;
     };
-    vector.values = if (decimal or self.kind == .bytes) .{ .bytes = try a.alloc([]const u8, keep.len) } else switch (self.kind) {
+    vector.values = if (decimal) .{ .decimal128 = .{ .values = try a.alloc(i128, keep.len), .precision = self.chunk.decimal_precision, .scale = self.chunk.decimal_scale } } else if (self.kind == .bytes) .{ .bytes = try a.alloc([]const u8, keep.len) } else switch (self.kind) {
         .integer => .{ .i64 = try a.alloc(i64, keep.len) },
         .number => .{ .f64 = try a.alloc(f64, keep.len) },
         .boolean => .{ .bool = try a.alloc(bool, keep.len) },
         .bytes => unreachable,
     };
     for (keep, nulls, begin.., 0..) |selected, *flag, row, lane| {
-        const position = self.positions[row];
+        const position = self.lanePosition(row);
         flag.* = @intFromBool(!selected or position == absent);
         switch (vector.values) {
             .bytes => |values_| {
@@ -190,10 +330,12 @@ pub fn project(self: *Self, a: A, begin: usize, keep: []const bool) !types.Colum
                     values[lane] = "";
                     continue;
                 }
-                if (decimal) {
-                    const unscaled: i128 = if (self.kind == .integer) try self.integer(position) else try @import("lake_decimal.zig").signedBigEndian(try self.bytes(position));
-                    values[lane] = try @import("lake_decimal.zig").formatAlloc(a, unscaled, self.chunk.decimal_precision, self.chunk.decimal_scale);
-                } else values[lane] = try self.bytes(position);
+                values[lane] = try self.bytes(position);
+            },
+            .decimal128 => |values| {
+                const value: i128 = if (flag.* != 0) 0 else if (self.kind == .integer) try self.integer(position) else try @import("lake_decimal.zig").signedBigEndian(try self.bytes(position));
+                try @import("lake_decimal.zig").validateCoefficient(value, values.precision, values.scale);
+                @constCast(values.values)[lane] = value;
             },
             .i64 => |values_| {
                 var value: i64 = if (flag.* != 0) 0 else try self.integer(position);
@@ -224,6 +366,15 @@ test "lake SQL selected page owns framing borrows strings and preserves nullable
             defer selected.destroy();
             var output = std.heap.ArenaAllocator.init(a);
             defer output.deinit();
+            const encoded_evidence = (try selected.evidence(output.allocator(), 0, 3)).?;
+            try std.testing.expectEqual(types.ColumnKind.encoded, encoded_evidence.kind());
+            try std.testing.expect(encoded_evidence.nulls.isNull(1));
+            try std.testing.expectEqualStrings("two", (try encoded_evidence.values.encoded.at(2)).string);
+            try std.testing.expectEqual(@as(usize, 0), selected.converted);
+            var string_mask = [_]bool{ true, true, true };
+            try std.testing.expect(try encodedMask(selected, 0, &string_mask, .{ .string = "one" }, .eq));
+            try std.testing.expectEqualSlices(bool, &.{ true, false, false }, &string_mask);
+
             const vector = try selected.project(output.allocator(), 0, &.{ false, true, true });
             try std.testing.expect(vector.nulls.isNull(0) and vector.nulls.isNull(1) and !vector.nulls.isNull(2));
             try std.testing.expectEqualStrings("two", vector.values.bytes[2]);
@@ -251,4 +402,51 @@ test "lake SQL selected page owns framing borrows strings and preserves nullable
     };
     try Helper.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Helper.run, .{});
+}
+
+test "lake SQL encoded numeric predicate runs preserve exact integers selections and nonfinite errors" {
+    const a = std.testing.allocator;
+    const values = [_]i64{ -9, 0, 7, 9007199254740993, 9007199254740992, 12, 17, 20 };
+    var payload: [values.len * 8]u8 = undefined;
+    for (values, 0..) |value, row| std.mem.writeInt(i64, payload[row * 8 ..][0..8], value, .little);
+    const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = payload.len, .uncompressed_page_size = payload.len, .value_count = values.len, .encoding = .plain };
+    const chunk: Chunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = payload.len, .physical_type = @constCast("int64") };
+    const selected = (try create(a, chunk, header, &payload, null, 65536)).?;
+    defer selected.destroy();
+    for ([_]types.EncodedOp{ .eq, .neq, .lt, .lte, .gt, .gte }) |op| {
+        var dense: [8]bool = @splat(true);
+        var sparse = [_]bool{ true, false, true, true, false, true, true, false };
+        try std.testing.expect(try encodedMask(selected, 0, &dense, .{ .integer = 9007199254740993 }, op));
+        try std.testing.expect(try encodedMask(selected, 0, &sparse, .{ .integer = 9007199254740993 }, op));
+        for (values, dense, sparse, 0..) |value, actual, filtered, row| {
+            const order = std.math.order(value, @as(i64, 9007199254740993));
+            const expected = switch (op) {
+                .eq => order == .eq,
+                .neq => order != .eq,
+                .lt => order == .lt,
+                .lte => order != .gt,
+                .gt => order == .gt,
+                .gte => order != .lt,
+            };
+            try std.testing.expectEqual(expected, actual);
+            try std.testing.expectEqual(expected and row != 1 and row != 4 and row != 7, filtered);
+        }
+    }
+    var float_payload: [16]u8 = undefined;
+    std.mem.writeInt(u64, float_payload[0..8], @bitCast(@as(f64, 7)), .little);
+    std.mem.writeInt(u64, float_payload[8..16], @bitCast(std.math.nan(f64)), .little);
+    var float_header = header;
+    float_header.value_count = 2;
+    float_header.compressed_page_size = float_payload.len;
+    float_header.uncompressed_page_size = float_payload.len;
+    var float_chunk = chunk;
+    float_chunk.physical_type = @constCast("double");
+    const floats = (try create(a, float_chunk, float_header, &float_payload, null, 65536)).?;
+    defer floats.destroy();
+    var keep = [_]bool{ true, true };
+    try std.testing.expect(!try encodedMask(floats, 0, &keep, .{ .float = 7 }, .eq));
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, &keep);
+    keep[1] = false;
+    try std.testing.expect(try encodedMask(floats, 0, &keep, .{ .float = 7 }, .eq));
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &keep);
 }

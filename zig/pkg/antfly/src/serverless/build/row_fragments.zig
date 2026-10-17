@@ -93,11 +93,13 @@ fn appendColumnFromVector(
     builder: *row_fragment.Builder,
     column: rowsource.ColumnVector,
 ) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
     const values = try alloc.alloc(row_fragment.CellValue, column.rowCount());
     defer alloc.free(values);
 
     for (values, 0..) |*out, idx| {
-        out.* = if (column.nulls.isNull(idx)) .null else try cellFromColumnValue(column.values, idx);
+        out.* = if (column.nulls.isNull(idx)) .null else try cellFromColumnValue(arena.allocator(), column.values, idx);
     }
 
     try builder.appendColumn(column.name, try fragmentColumnKind(column.kind()), values);
@@ -105,6 +107,8 @@ fn appendColumnFromVector(
 
 fn fragmentColumnKind(kind: rowsource.ColumnKind) !row_fragment.ColumnKind {
     return switch (kind) {
+        .decimal128 => .bytes,
+        .encoded => return error.UnsupportedSqlExecution,
         .bytes, .dictionary_bytes => .bytes,
         .json => .json,
         .i64, .dictionary_i64 => .i64,
@@ -114,8 +118,10 @@ fn fragmentColumnKind(kind: rowsource.ColumnKind) !row_fragment.ColumnKind {
     };
 }
 
-fn cellFromColumnValue(values: rowsource.ColumnValues, idx: usize) !row_fragment.CellValue {
+fn cellFromColumnValue(alloc: Allocator, values: rowsource.ColumnValues, idx: usize) !row_fragment.CellValue {
     return switch (values) {
+        .decimal128 => |items| .{ .bytes = try items.text(alloc, idx) },
+        .encoded => return error.UnsupportedSqlExecution,
         .bytes => |items| .{ .bytes = @constCast(items[idx]) },
         .dictionary_bytes => |items| .{ .bytes = @constCast(items.at(idx)) },
         .json => |items| .{ .json = @constCast(items[idx]) },

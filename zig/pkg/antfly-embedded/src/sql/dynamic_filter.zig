@@ -236,7 +236,7 @@ pub const Filter = struct {
                     if (!active.*) continue;
                     _ = scratch.reset(.retain_capacity);
                     const one: @import("catalog.zig").ColumnPage = .{ .batch = batch, .selection = &.{row} };
-                    const value = try definition.datum(scratch.allocator(), try one.cell(scratch.allocator(), 0, definition.name));
+                    const value = try definition.datum(scratch.allocator(), try one.typedCell(scratch.allocator(), 0, definition.name, definition.element_type == .numeric));
                     if (value.sql_null or (try scalar.compareDatums(value, domain.minimum.?)) == .lt or (try scalar.compareDatums(value, domain.maximum.?)) == .gt) {
                         active.* = false;
                         continue;

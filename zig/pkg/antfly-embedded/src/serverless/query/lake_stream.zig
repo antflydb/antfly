@@ -305,6 +305,9 @@ pub const Stream = struct {
         // Avoid recursively reserving scheduler slots from an admitted task.
         worker_reader.context.io = null;
         cursor.shared_reader = &worker_reader;
+        if (self.filter) |filter| {
+            if (filter.encoded) cursor.filter = filter;
+        }
         for (cursor.columns, required) |*column, needed| column.required = needed;
         try worker_reader.context.ensureActive();
         try cursor.prepareEvidence();
@@ -999,7 +1002,7 @@ pub const Stream = struct {
                         // A driver supplies row ordinals for ID-only or missing
                         // nullable predicates; other columns remain deferred.
                         if (required == 0 and self.page_cursor.?.columns.len != 0) self.page_cursor.?.columns[0].required = true;
-                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch, .select = if (self.filter.?.select != null) selectMask else null };
+                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch, .select = if (self.filter.?.select != null) selectMask else null, .encoded = self.filter.?.encoded };
                     }
                     const batch = try self.page_cursor.?.next();
                     if (batch == null) {

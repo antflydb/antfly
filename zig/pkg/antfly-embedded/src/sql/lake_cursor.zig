@@ -192,7 +192,7 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
     owner.stream.examined = &owner.examined;
     owner.stream.filter_columns = filter_columns.items;
     if (stream.selection != null or source.scanner.iceberg_delete_plan != null or conditions.len != 0 or after != null or before != null or primary_key != null)
-        owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch, .select = Owner.selectRows };
+        owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch, .select = Owner.selectRows, .encoded = true };
     var estimated_rows: u64 = 0;
     var estimated_bytes: u64 = 0;
     if (source.estimates()) |estimate| {
@@ -409,7 +409,7 @@ const Owner = struct {
         self.stream.columns = scan_columns.items;
         if (filter_columns.items.len != 0) self.stream.identity_only = false;
         self.stream.filter_columns = filter_columns.items;
-        self.stream.filter = .{ .ptr = self, .any_match = anyMatch, .select = selectRows };
+        self.stream.filter = .{ .ptr = self, .any_match = anyMatch, .select = selectRows, .encoded = true };
         self.stream.predicates = predicates.items;
         self.dynamic = filter;
         return true;
@@ -917,7 +917,7 @@ const Owner = struct {
 
 pub fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, table: catalog.Table, conditions: []const catalog.Condition) !bool {
     for (conditions) |condition| {
-        const cell = try page.cell(alloc, 0, condition.column);
+        const cell = try page.typedCell(alloc, 0, condition.column, (try table.column(condition.column)).element_type == .numeric);
         if (condition.op == .is_null) {
             if (!cell.sql_null) return false;
             continue;
@@ -2668,5 +2668,7 @@ test "lake SQL selected projections decode survivors across misaligned page boun
     }
     try std.testing.expectEqual(@as(usize, 11), count);
     const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
-    try std.testing.expectEqual(count, owner.stream.page_cursor.?.selected_values_decoded);
+    // Both predicate and projected payload now materialize only survivors.
+    try std.testing.expectEqual(count * 2, owner.stream.page_cursor.?.selected_values_decoded);
+    try std.testing.expectEqual(@as(usize, 4), owner.stream.page_cursor.?.encoded_predicate_pages);
 }

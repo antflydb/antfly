@@ -5472,3 +5472,45 @@ the run. Formatting, Python lint, whitespace, staged license headers and the
 Apache boundary (2,076 sources) passed. Latest fetched origin/main `968f037c9a`
 is included. Representative archive-scale latency/RSS and live-provider retention
 qualification remain deferred.
+
+### Native skew joins, encoded predicates, and fixed decimals (2026-10-17)
+
+This revision closes the wide-key aggregation admission regression and extends
+the existing native execution interfaces:
+
+- Encoded group retries switch to direct scalar lane reads at one row. Optional
+  provider physical evidence is validated one column at a time in separately
+  reclaimed admission scopes. Neither selection directories nor physical-view
+  arrays must fit alongside wide grouping state; real allocator failures and
+  invalid provider evidence still propagate. Input ordinals and scalar spill
+  behavior are preserved for both original singleton batches and retry windows.
+- Ordinary SQL joins already used Grace partitioning and typed sequential spill
+  blocks. The remaining inseparable-partition fallback now compacts its existing
+  build/probe runs into bounded blocks, then replays a build block across a probe
+  block. This replaces per-candidate linked disk records in that path. Accepted
+  build matches use a disk-backed byte map buffered per build block; probe match
+  flags stay bounded to one block. Residual ON predicates remain authoritative,
+  including both sides of full joins. The low-level reusable HashJoin disk API
+  retains its existing bucket-chain representation for callers that cannot spool
+  their probe relation. No general join reordering or SQL ordering contract changes.
+- SQL scan predicate evidence can borrow validated encoded Parquet pages. A
+  page-level mask callback dispatches once by type/operator, uses SIMD for dense
+  primitive numeric runs, and memoizes dictionary comparisons with bounded state.
+  Unsupported encodings/logical interpretations still use the complete decoder.
+  Nonfinite coercion failures decline before changing masks; excluded values and
+  projected payloads remain lazy. Required page framing and dictionary IDs remain
+  validated. Non-nullable pages no longer allocate identity-position arrays.
+- Native decimal scan vectors carry i128 coefficients plus precision/scale.
+  Declared NUMERIC cells enter base-10000 exact state directly, preserving display
+  scale and all 38 digits. Raw/string consumers format at their boundary. Native
+  coefficient ownership, slicing, result preparation, replay, deletes, index
+  construction and generated source/error catalogs follow the existing contracts.
+
+The skew regression fixture evaluates 48,000 candidate pairs using 1,204 typed
+build-block decodes, including its final unmatched-build pass. It verifies residual
+acceptance and both outer sides. Separate fault injection covers early close and
+match-state ownership. The misaligned-page fixture now materializes 11 predicate
+values and 11 payload values from 1,024 source rows, while evaluating four encoded
+predicate pages. These are bounded-work regression checks, not archive-scale
+latency/RSS measurements. Plain and dictionary decimal128 files are added to the
+real Parquet NUMERIC seek/join, algebraic aggregate, and pruning/restart E2Es.

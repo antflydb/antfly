@@ -346,6 +346,40 @@ pub fn parse(ctx: *Context, input: []const u8) !Owned {
     return finish(ctx.alloc, storage, @intCast(high), @intCast(scale), negative);
 }
 
+/// Convert a fixed coefficient directly to canonical base-10000 groups.
+/// Align fractional digits in bounded limbs without widening the coefficient.
+pub fn fromScaledInteger(ctx: *Context, coefficient: i128, scale: u16) !Owned {
+    if (scale > maximum_scale) return error.InvalidNumericRepresentation;
+    var coefficient_magnitude: u128 = @abs(coefficient);
+    const padding: u16 = @intCast(@mod(-@as(i32, scale), 4));
+    var reversed: [12]u16 = undefined;
+    var count: usize = 0;
+    while (coefficient_magnitude != 0) {
+        reversed[count] = @intCast(coefficient_magnitude % base);
+        coefficient_magnitude /= base;
+        count += 1;
+    }
+    try ctx.charge(count * 2 + 1);
+    if (count == 0) return zero(ctx.alloc, scale);
+    if (padding != 0) {
+        var carry: u32 = 0;
+        for (reversed[0..count]) |*digit| {
+            const shifted = @as(u32, digit.*) * powers[padding] + carry;
+            digit.* = @intCast(shifted % base);
+            carry = shifted / base;
+        }
+        if (carry != 0) {
+            reversed[count] = @intCast(carry);
+            count += 1;
+        }
+    }
+    const storage = try ctx.allocate(count);
+    errdefer ctx.alloc.free(storage);
+    for (storage, 0..) |*digit, index| digit.* = reversed[count - index - 1];
+    const weight = @as(i32, @intCast(count)) - 1 - @divTrunc(@as(i32, scale) + padding, 4);
+    return finish(ctx.alloc, storage, weight, scale, coefficient < 0);
+}
+
 fn radixDigit(byte: u8, radix: u8) ?u8 {
     const digit: u8 = switch (byte) {
         '0'...'9' => byte - '0',
@@ -1600,5 +1634,26 @@ test "SQL exact NUMERIC multiplication benchmark retains one bounded output allo
         try std.testing.expectEqual(@as(usize, 1), tracked.alloc_index);
         try std.testing.expectEqual(operand.value.digits.len * 2, result.value.digits.len);
         std.debug.print("NUMERIC multiply: decimal_digits={d} groups={d} allocations={d} work={d} elapsed_ns={d}\n", .{ digits, operand.value.digits.len, tracked.alloc_index, 8 * 1024 * 1024 - ctx.remaining, elapsed });
+    }
+}
+
+test "SQL scaled integer conversion preserves exact decimal128 coefficients without text" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { coefficient: i128, scale: u16, expected: []const u8 }{
+        .{ .coefficient = 0, .scale = 4, .expected = "0.0000" },
+        .{ .coefficient = 12300, .scale = 4, .expected = "1.2300" },
+        .{ .coefficient = -1, .scale = 38, .expected = "-0.00000000000000000000000000000000000001" },
+        .{ .coefficient = 9007199254740993125, .scale = 3, .expected = "9007199254740993.125" },
+        .{ .coefficient = 99999999999999999999999999999999999999, .scale = 2, .expected = "999999999999999999999999999999999999.99" },
+        .{ .coefficient = std.math.minInt(i128), .scale = 0, .expected = "-170141183460469231731687303715884105728" },
+    };
+    for (cases) |case| {
+        var context: Context = .{ .alloc = a };
+        var value = try fromScaledInteger(&context, case.coefficient, case.scale);
+        defer value.deinit();
+        const text = try format(&context, value.value);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+        try validateCanonical(&context, value.value);
     }
 }
