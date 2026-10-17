@@ -1716,6 +1716,8 @@ test "mixed domains and unbounded DAG reductions preserve exact path bags" {
         defer exact.deinit();
         var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
         defer result.deinit();
+        if (!dag and std.mem.indexOf(u8, pattern, "CITES|MENTIONS") != null)
+            try std.testing.expect(result.stats.explored_edges <= 13);
         var reference = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
         defer reference.deinit();
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, reference.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));

@@ -2502,9 +2502,15 @@ const Engine = struct {
                     const selected = if (domain.types.len == 0) true else for (domain.types) |name| {
                         if (std.mem.eql(u8, name, mapping.name)) break true;
                     } else false;
-                    if (selected) break :blk try self.loadLowerDomain(graph, position, index);
+                    if (selected) if (graph.nodes.items[position].domains.get(index)) |range| break :blk range;
                 }
-                return error.CypherInvalidBackendRelationship;
+                // Replaying a different overlapping type set may prefer a
+                // domain this node never loaded. Reuse any captured matching
+                // range; a genuine miss stays page-owned and uncached, rather
+                // than retaining page allocations in the statement capture.
+                const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, identity, direction, cursor, demand);
+                try self.accountEdges(page);
+                return page;
             } else blk: {
                 if (!graph.nodes.items[position].loaded) try self.loadLowerNode(graph, position);
                 break :blk .{ .first = 0, .last = graph.nodes.items[position].arcs.items.len };
