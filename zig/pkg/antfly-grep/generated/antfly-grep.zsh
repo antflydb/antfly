@@ -92,6 +92,7 @@ _arguments -s \
  '--max-requests[max-requests]:value:(unlimited)' \
  '--max-result-files[max-result-files]:value:' \
  '--max-source-bytes[max-source-bytes]:value:' \
+ '--max-spill-bytes[max-spill-bytes]:value:' \
  '--messages[messages]' \
  '--mmap[mmap]' \
  '--model[model]:value:' \

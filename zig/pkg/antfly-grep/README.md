@@ -1438,3 +1438,104 @@ Reproduce ranking comparisons with `bench/cache_scale.py --top-k 15 --threads 1`
 or `--threads 4`, passing the candidate/baseline binaries and native fixture
 library; omit `--top-k` for unlimited output. `bench/provenance_budget.py` runs the
 escaped-provenance HTTP fixture without a provider or model.
+
+
+### Prepared-source reuse, bounded discovery and external ranking
+
+Block-region construction now borrows the revision-validated source index from
+source preparation. Cold files parse once; valid warm preparations do not parse
+again. The additive `stats.source_parses` JSON summary counter records remaining
+preparation parses. Standalone callers can still use the parsing region-builder
+wrapper. Prepared/parsing equivalence tests cover nested Python, Go and Rust.
+
+Source V3 reads share immutable bucket snapshots across file workers, with a
+4 MiB total cap distributed over 16 locks. A positive key can reuse its verified,
+content-addressed bytes; absent keys reopen the current bucket, observing atomic
+replacements and migrations. Returned bodies belong to the file arena, so later
+snapshot eviction cannot invalidate evidence. Buckets above a stripe's 256 KiB
+allowance use bounded header/selected-record reads on the already-open descriptor
+rather than reading or retaining an oversized whole bucket. Score V10 and source
+V3 on-disk formats and authorization/revision scopes remain unchanged.
+
+Decision discovery now feeds the bounded worker queue. Explicit triage policies,
+unlimited file-count thresholds and a known single regular file start immediately.
+When automatic path triage depends on the total file count, eligible paths go to
+a private disk inventory until discovery finishes or crosses the threshold. The
+queue then consumes that inventory with the same policy for every file. A known
+single file runs on the calling thread while decision batches retain their own
+bounded concurrency. Default terminal searches of `.` also use bounded ranking;
+piped stdin retains its existing behavior. Worker
+errors/cancellation close the queue, waking blocked discovery. Finite region
+budgets keep serial file admission; final relevance ordering remains deterministic.
+
+Excerpt probabilities use an ordered cursor over disjoint coarse regions.
+Before/after context is a union of ordered intervals, with each mask position
+written at most once. Ordinary full-content rows and retained excerpts share this
+implementation. Large context settings and dense evidence no longer multiply
+line-by-region or line-by-context work. Independent line evidence is preserved.
+
+Per-file JSON elapsed time freezes when file processing finishes, then adds only
+that winner's actual rendering work. Waiting for other files and sorting no longer
+inflates per-file timing. A paired fixture exercises a fast file alongside a
+separate file delayed by 2.2 seconds.
+
+Unlimited relevance ranking keeps a bounded 256 KiB payload prefix and a
+512 KiB key chunk in memory (allocator capacity is additional). Small inputs need
+no scratch files. Larger payloads move once to disk, and key sets exceeding the
+chunk target merge through binary levels with at most 64 run slots. Disk payloads
+replay through a 64 KiB buffer; the complete output is not retained in RAM. Per-file serialization buffers still obey the shared
+`--max-pending-output` allowance; source/model/parser scratch and the bounded
+snapshot/key caches are additional. Explicit sorting, stdin and unranked modes
+retain their existing execution paths.
+
+`--max-spill-bytes` caps ordering payloads, a conservative allowance for merge
+keys, and any live discovery inventory together. The default is 1 GiB; integer
+bytes and K/M/G suffixes are accepted, and zero removes the cap. Filesystem block
+allocation overhead is additional. Scratch exhaustion preserves completed results,
+marks the search partial and exits 2. Finite JSON output stays record-atomic,
+including an oversized record after an emitted prefix. Cached-only mode still
+makes no provider calls or cache-artifact writes; ordering may use temporary
+scratch. POSIX scratch files are private and immediately unlinked, including on
+interruption; Windows files are removed when closed (runtime remains unqualified).
+
+All changes remain native Zig, using the monorepo and standard filesystem APIs.
+
+Final paired measurements against PR head `82ea997ae33a`, using warm filesystem
+caches and the same fixture inference library on this shared ARM64 Mac:
+
+| Workload | Median elapsed, before → after | Median peak RSS, before → after |
+|---|---:|---:|
+| Top 15, one worker / 2,048 files | 375.17 → 258.32 ms | 6.39 → 10.38 MiB |
+| Top 15, four workers / 2,048 files | 132.47 → 109.12 ms | 9.23 → 12.08 MiB |
+| Unlimited ranking / 2,048 files | 460.41 → 376.87 ms | 67.06 → 10.81 MiB |
+| 9,000-line evidence overview | 46.27 → 15.44 ms | 7.95 → 8.17 MiB |
+| Single small file | 8.44 → 7.75 ms | 4.91 → 4.27 MiB |
+
+The source snapshot cache trades a few MiB for fewer reads in finite-K workloads;
+unlimited ranking removes output growth from memory. Cached preparation hits do
+not parse, but bounded bucket collisions still produce misses (294 reparses in
+the one-worker 2,048-file fixture). Measured warm runs make zero inference calls.
+The small-file result is only a sub-millisecond difference and needs broader
+measurement. Dense-output controls are approximately flat: JSON 25.56 → 25.34 ms,
+color 11.95 → 12.08 ms, match-only 6.04 → 5.92 ms, regex color 12.64 → 12.42 ms.
+
+Evidence includes [single-worker ranking](bench/results/prepared-stream-topk-macos.json),
+[four-worker ranking](bench/results/prepared-stream-parallel-macos.json),
+[unlimited ranking](bench/results/prepared-stream-unlimited-macos.json),
+[line evidence](bench/results/prepared-stream-overview-macos.json),
+[small files](bench/results/prepared-stream-small-macos.json),
+[dense output controls](bench/results/prepared-stream-output-macos.json), and
+[the timing regression](bench/results/prepared-stream-timing.json). Reports retain
+binary/library hashes, versions, host details and per-run CPU/RSS observations.
+Source/binary identities and qualification limits are in
+[the validation record](bench/results/prepared-stream-validation.json).
+
+Qualification: 175 CLI tests on each of macOS and Linux ARM64 (two/one skips),
+native unit/hardening/tooling checks, seven focused ReleaseSafe cache/sort tests,
+six Linux hardening checks, 1,000 generated ripgrep/PCRE2 comparisons with no
+mismatches or timeouts, Windows cross-compilation, release packaging, formatting,
+license headers, Apache boundaries and 35 boundary-checker tests. These fixtures
+establish orchestration and output contracts, not live-model relevance or billing.
+Linux runs in a two-CPU VM on this Mac; independent Linux hardware/cold-cache
+performance, Windows runtime and full upstream PCRE2/JIT/CLI parity remain
+unqualified. Existing real-server scenarios were not rerun in this follow-up.

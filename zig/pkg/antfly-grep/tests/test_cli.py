@@ -4598,6 +4598,182 @@ class CliTests(unittest.TestCase):
             calls, len(self.server.requests), "ranking must reuse cached evaluation"
         )
 
+    @unittest.skipUnless(hasattr(os, "openpty"), "POSIX terminal fixture")
+    def test_implicit_terminal_directory_uses_bounded_ranking(self):
+        for i in range(48):
+            self.write(f"f{i:03}.py", "STOP()\n")
+        master, slave = os.openpty()
+        try:
+            result = subprocess.run(
+                [
+                    BINARY,
+                    *self.decision_args(),
+                    "--json",
+                    "--no-cache",
+                    "--no-refine",
+                    "--threads=2",
+                    "--max-files=0",
+                    "--max-result-files=2",
+                    "--max-pending-output=20000",
+                ],
+                stdin=slave,
+                cwd=self.root,
+                env=self.env,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            os.close(master)
+            os.close(slave)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(sum(row["type"] == "begin" for row in rows), 2)
+        self.assertEqual(rows[-1]["stats"]["files"], 48)
+        self.assertTrue(rows[-1]["stats"]["complete"])
+
+    def test_deferred_file_timing_excludes_other_files(self):
+        self.write("fast.py", "STOP(fast)\n")
+        self.write("slow.py", "STOP(slow)\n")
+        self.server.stagger_scores = True
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--json",
+            "--no-cache",
+            "--no-refine",
+            "--unit=line",
+            "--threads=1",
+            "--max-result-files=1",
+            "fast.py",
+            "slow.py",
+        )
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        end = next(row for row in rows if row["type"] == "end")
+        elapsed = end["data"]["stats"]["elapsed"]
+        self.assertLess(elapsed["secs"] + elapsed["nanos"] / 1e9, 1.1)
+        self.assertGreater(rows[-1]["data"]["elapsed_total"]["secs"], 1)
+
+    def test_prepared_source_is_not_reparsed_on_warm_block_search(self):
+        self.write("a.py", "class Retry:\n    def run(self):\n        STOP()\n")
+        args = [*self.decision_args(), "--no-refine", "--json", "--threads=1", "a.py"]
+        cold = json.loads(self.raw_cli(*args).stdout.splitlines()[-1])
+        warm = json.loads(self.raw_cli(*args).stdout.splitlines()[-1])
+        self.assertEqual(cold["stats"]["source_parses"], 1)
+        self.assertEqual(warm["stats"]["source_parses"], 0)
+        self.assertEqual(warm["stats"]["source_cache_hits"], 1)
+        self.assertEqual(warm["requests"], 0)
+
+    def test_unlimited_ranking_spills_with_equivalent_results_and_cleanup(self):
+        for i in range(48):
+            self.write(
+                f"src/f{i:03}.py",
+                f"def retry_{i}():\n    STOP {'HIGH' if i > 40 else 'LOW'}\n",
+            )
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        self.env["TMPDIR"] = str(scratch)
+        args = [*self.decision_args(), "--no-refine", "--max-files=0", "src"]
+
+        def signature(result):
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            identities = {
+                r["file_id"]: r["data"]["path"]
+                for r in rows
+                if r["type"] == "begin" and "file_id" in r
+            }
+            return [
+                (
+                    r["data"].get("path", identities.get(r.get("file_id"))),
+                    r["data"]["lines"],
+                    r["probability"],
+                    r["scope"],
+                )
+                for r in rows
+                if r["type"] == "match"
+            ], rows[-1]
+
+        expected, _ = signature(self.raw_cli(*args, "--json", "--max-result-files=48"))
+        for flag in ("--json", "--json-compact"):
+            for jobs in (1, 4):
+                result = self.raw_cli(
+                    *args,
+                    flag,
+                    f"--threads={jobs}",
+                    "--max-result-files=0",
+                    "--max-pending-output=32768",
+                )
+                actual, summary = signature(result)
+                self.assertEqual(actual, expected)
+                self.assertTrue(summary["stats"]["complete"])
+                self.assertEqual(summary["stats"]["files"], 48)
+                self.assertEqual(list(scratch.iterdir()), [])
+        limited = self.raw_cli(
+            *args, "--json", "--threads=1", "--max-output-bytes=8192", code=2
+        )
+        self.assertGreater(len(limited.stdout), 0)
+        self.assertLessEqual(len(limited.stdout), 8192)
+        self.assertNotEqual(
+            json.loads(limited.stdout.splitlines()[-1])["type"], "summary"
+        )
+        for line in limited.stdout.splitlines():
+            json.loads(line)
+        self.assertEqual(list(scratch.iterdir()), [])
+        self.write("large.py", "STOP " + "x" * 20000 + "\n")
+        prefix = self.raw_cli(
+            *self.decision_args(),
+            "--json",
+            "--no-refine",
+            "--threads=1",
+            "--max-result-files=0",
+            "--max-output-bytes=500",
+            "large.py",
+            code=2,
+        )
+        self.assertGreater(len(prefix.stdout), 0)
+        self.assertLessEqual(len(prefix.stdout), 500)
+        for line in prefix.stdout.splitlines():
+            json.loads(line)
+        self.assertEqual(list(scratch.iterdir()), [])
+        # Inventory failure must also clean its private scratch and owned paths.
+        self.raw_cli(
+            *args, "--threads=1", "--max-files=1500", "--max-spill-bytes=1", code=2
+        )
+        self.assertEqual(list(scratch.iterdir()), [])
+        # Exhausting scratch space preserves earlier complete results and stops discovery.
+        result = self.raw_cli(
+            *args, "--json", "--threads=1", "--max-spill-bytes=4096", code=2
+        )
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertTrue(any(r["type"] == "match" for r in rows))
+        self.assertTrue(any(r.get("message") == "SpillBudgetExceeded" for r in rows))
+        self.assertFalse(rows[-1]["stats"]["complete"])
+        self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_streamed_discovery_preserves_count_triggered_path_triage(self):
+        paths = [f"STOP_{i}.py" for i in range(6)]
+        for path in paths:
+            self.write(path, "STOP()\n")
+        for limit, expected in ((6, 0), (3, 6), (0, 0)):
+            self.server.requests.clear()
+            result = self.raw_cli(
+                *self.decision_args(),
+                "--json",
+                "--no-cache",
+                "--no-refine",
+                "--threads=2",
+                f"--max-files={limit}",
+                "--max-result-files=2",
+                *paths,
+            )
+            ids = [
+                item["id"]
+                for _, _, body in self.server.requests
+                for item in body.get("inputs", [])
+            ]
+            self.assertEqual(ids.count("file-path"), expected)
+            self.assertEqual(
+                json.loads(result.stdout.splitlines()[-1])["stats"]["files"], 6
+            )
+
     def test_top_k_output_budgets_preserve_complete_records_and_text_options(self):
         for i in range(6):
             self.write(f"f{i}.py", "before\nSTOP HIGH\ntail\n")

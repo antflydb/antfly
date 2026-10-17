@@ -27,6 +27,7 @@ const Allocator = std.mem.Allocator;
 pub const Summary = struct {
     index_requests: usize = 0,
     source_cache_hits: usize = 0,
+    source_parses: usize = 0,
     files: usize = 0,
     bytes: usize = 0,
     matches: usize = 0,
@@ -44,6 +45,8 @@ pub const Summary = struct {
 };
 pub const Line = @import("source_cache.zig").Line;
 const Limits = @import("budget.zig").Limits;
+const Spill = @import("spill.zig").Store;
+const Temp = @import("temporary.zig").File;
 const Task = struct { prepared: bool = false, path: []const u8, display: []const u8, filename: bool, explicit_file: bool = false, timestamp: i96 = 0, ordinal: usize = 0, result: ?[]u8 = null, score: f64 = 0 };
 const EvidenceRow = struct { line: usize, byte_offset: usize, text: []const u8, p: ?f64, region_p: ?f64, matched: bool };
 const EvidenceView = struct {
@@ -72,7 +75,7 @@ const Candidate = struct {
     summary: Summary = .{},
     filename: bool = true,
     color: bool = false,
-    started: ?std.Io.Timestamp = null,
+    elapsed_ns: i96 = 0,
     pub fn bytes(self: *const Candidate) usize {
         return @sizeOf(Candidate) + self.budget.live;
     }
@@ -121,6 +124,15 @@ fn retainedClone(comptime T: type, a: Allocator, value: T, depth: usize) error{ 
 const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
+    spill: ?*Spill = null,
+    owns_spill: bool = false,
+    discovery_stream: bool = false,
+    single_source: bool = false,
+    inventory_file: ?Temp = null,
+    inventory_bytes: u64 = 0,
+    inventory_reserved: usize = 0,
+    inventory_count: usize = 0,
+    source_views: ?*@import("source_views.zig").Store = null,
     ranking: ?*Ranking = null,
     owns_ranking: bool = false,
     deferred_candidate: ?*Candidate = null,
@@ -178,6 +190,7 @@ pub const Search = struct {
     compact_file_id: [64]u8 = undefined,
     file_output_start: usize = 0,
     file_started: ?std.Io.Timestamp = null,
+    file_elapsed_ns: ?i96 = null,
     evidence: ?*@import("evidence.zig").Evidence = null,
     pub fn init(a: Allocator, io: std.Io, o: *const Options) !Search {
         var matcher = try Matcher.initForSearch(a, o);
@@ -191,6 +204,8 @@ pub const Search = struct {
         var result: Search = .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
         result.decider.shareCache(&root.decider);
         result.ranking = root.ranking;
+        result.spill = root.spill;
+        result.source_cache_state.views = root.source_cache_state.views;
         return result;
     }
     pub fn deinit(self: *Search) void {
@@ -204,7 +219,17 @@ pub const Search = struct {
             self.ranking.?.deinit();
             self.a.destroy(self.ranking.?);
         }
+        if (self.owns_spill) {
+            self.spill.?.deinit();
+            self.a.destroy(self.spill.?);
+        }
+        if (self.inventory_file) |*scratch| scratch.deinit(self.a, self.io);
+        _ = self.limits.spill_bytes.fetchSub(self.inventory_reserved, .monotonic);
         if (self.dictionary) |dictionary| dictionary.release();
+        if (self.source_views) |views| {
+            views.deinit();
+            self.a.destroy(views);
+        }
         self.output_buffer.deinit(self.a);
         self.matcher.deinit();
         self.decider.deinit();
@@ -224,7 +249,7 @@ pub const Search = struct {
         defer if (self.pipeline) |pool| pool.context.mutex.unlock(self.io);
         self.summary.errors += 1;
         self.summary.complete = false;
-        if (err == error.RegionBudgetExceeded or err == error.RequestBudgetExceeded or err == error.SourceBudgetExceeded or err == error.PendingOutputBudgetExceeded or err == error.OutputBudgetExceeded or err == error.IndexDocumentBudgetExceeded) {
+        if (err == error.RegionBudgetExceeded or err == error.RequestBudgetExceeded or err == error.SourceBudgetExceeded or err == error.PendingOutputBudgetExceeded or err == error.SpillBudgetExceeded or err == error.OutputBudgetExceeded or err == error.IndexDocumentBudgetExceeded) {
             self.stop = true;
             if (self.shared_limits) |limits| limits.cancel.store(true, .monotonic);
         }
@@ -242,12 +267,19 @@ pub const Search = struct {
         self.shared_limits = &self.limits;
         self.decider.limits = &self.limits;
         if (self.options.ask != null) {
+            if (!self.options.no_cache and self.options.cache_dir != null) {
+                const views = try self.a.create(@import("source_views.zig").Store);
+                views.* = .{ .a = self.a };
+                self.source_views = views;
+                self.source_cache_state.views = views;
+            }
             self.decider.prepareCache();
             try self.decider.ensureLocal();
         }
+        const implicit_directory = self.options.ask != null and self.options.paths.items.len == 0 and self.options.table_config == null and (try std.Io.File.stdin().isTty(self.io));
         if (self.options.ask != null and self.options.ranked and self.options.sort == null and
             self.options.max_result_files != std.math.maxInt(usize) and !self.hasStdinPath() and
-            (self.options.paths.items.len > 0 or self.options.table_config != null) and
+            (self.options.paths.items.len > 0 or self.options.table_config != null or implicit_directory) and
             !self.options.quiet and !self.options.count and !self.options.count_matches and
             !self.options.files and !self.options.files_with_matches and !self.options.files_without_match and
             !self.options.inventory and !self.options.multiline)
@@ -257,21 +289,38 @@ pub const Search = struct {
             self.ranking = ranking;
             self.owns_ranking = true;
         }
+        const single_regular_file = self.options.paths.items.len == 1 and !self.hasStdinPath() and
+            (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
+        self.single_source = single_regular_file and self.options.table_config == null;
+        if (self.ranking == null and self.options.ask != null and self.options.ranked and self.options.sort == null and
+            self.options.max_result_files == std.math.maxInt(usize) and !self.hasStdinPath() and
+            (self.options.paths.items.len > 0 or self.options.table_config != null or implicit_directory) and
+            !self.options.quiet and !self.options.count and !self.options.count_matches and !self.options.files and
+            !self.options.files_with_matches and !self.options.files_without_match and !self.options.inventory and !self.options.multiline)
+        {
+            const spill = try self.a.create(Spill);
+            spill.* = .{ .a = self.a, .io = self.io, .directory = self.options.temporary_dir, .limits = &self.limits, .max_bytes = self.options.max_spill_bytes };
+            self.spill = spill;
+            self.owns_spill = true;
+        }
+        self.discovery_stream = self.ranking != null or self.spill != null;
+        if (self.discovery_stream and (self.single_source or self.options.triage or self.options.max_files == std.math.maxInt(usize))) {
+            self.file_path_triage = self.options.triage or (self.single_source and 1 > self.options.max_files);
+            self.pipeline = try Pipeline.start(self);
+        }
         const streaming_files = self.options.files and self.options.ask == null and !self.options.inventory and self.options.table_config == null and (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none"));
         if (streaming_files) self.collecting = false;
 
-        // Sorted and ranked output requires a complete inventory. Ordinary
-        // searches instead discover into a bounded producer/consumer queue.
-        const single_regular_file = self.options.paths.items.len == 1 and !self.hasStdinPath() and
-            (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
+        // Lexical scans and relevance ranking can overlap bounded discovery;
+        // explicit sorting retains its complete-inventory execution path.
         const pipelined = !streaming_files and self.options.paths.items.len > 0 and !single_regular_file and !self.hasStdinPath() and
             self.options.ask == null and !self.options.inventory and !self.options.quiet and
             (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none")) and
             self.options.max_regions == std.math.maxInt(usize);
-        if (pipelined and self.options.table_config == null) self.pipeline = try Pipeline.start(self);
+        if (pipelined and self.options.table_config == null and self.pipeline == null) self.pipeline = try Pipeline.start(self);
         defer if (self.pipeline) |pool| {
-            self.pipeline = null;
             pool.finish() catch {};
+            self.pipeline = null;
         };
 
         if (self.options.table_config != null) @import("indexed.zig").run(self) catch |err| {
@@ -293,9 +342,13 @@ pub const Search = struct {
                 try self.reportError(path, err);
             };
         }
+        if (self.inventory_file != null and !self.stopped()) try self.startInventory(false);
         if (self.pipeline) |pool| {
+            pool.finish() catch |err| {
+                self.pipeline = null;
+                return err;
+            };
             self.pipeline = null;
-            try pool.finish();
         }
         if (self.options.inventory) {
             try self.renderInventory();
@@ -303,6 +356,7 @@ pub const Search = struct {
         }
         try self.flushTasks();
         if (self.ranking != null) try self.emitRanked();
+        if (self.spill != null) try self.emitSpilled();
         if (self.limits.cancel.load(.acquire) and self.summary.complete and !self.options.quiet) {
             self.summary.complete = false;
             try self.reportError("<search>", error.Canceled);
@@ -361,6 +415,78 @@ pub const Search = struct {
         }
         try self.flushOutput();
     }
+    fn inventoryTask(self: *Search, task: Task) !void {
+        if (self.inventory_file == null) self.inventory_file = try Temp.create(self.a, self.io, self.options.temporary_dir);
+        const size = 17 + task.path.len + task.display.len;
+        if (!Limits.reserve(&self.limits.spill_bytes, size, self.options.max_spill_bytes)) return error.SpillBudgetExceeded;
+        self.inventory_reserved += size;
+        const record = try self.a.alloc(u8, size);
+        defer self.a.free(record);
+        std.mem.writeInt(u32, record[0..4], @intCast(task.path.len), .little);
+        std.mem.writeInt(u32, record[4..8], @intCast(task.display.len), .little);
+        std.mem.writeInt(u64, record[8..16], task.ordinal, .little);
+        record[16] = @as(u8, @intFromBool(task.filename)) | (@as(u8, @intFromBool(task.explicit_file)) << 1);
+        @memcpy(record[17..][0..task.path.len], task.path);
+        @memcpy(record[17 + task.path.len ..], task.display);
+        try self.inventory_file.?.file.writePositionalAll(self.io, record, self.inventory_bytes);
+        self.inventory_bytes += size;
+        self.inventory_count += 1;
+    }
+    fn startInventory(self: *Search, triage: bool) !void {
+        self.file_path_triage = self.options.triage or triage;
+        if (self.inventory_count == 1 and self.options.table_config == null) self.single_source = true;
+        if (self.pipeline == null) self.pipeline = try Pipeline.start(self);
+        var buffer: [65536]u8 = undefined;
+        var reader = self.inventory_file.?.file.reader(self.io, &buffer);
+        while (!self.stopped()) {
+            var h: [17]u8 = undefined;
+            const n = try reader.interface.readSliceShort(&h);
+            if (n == 0) break;
+            if (n != h.len) return error.InvalidSpill;
+            const plen = std.mem.readInt(u32, h[0..4], .little);
+            const dlen = std.mem.readInt(u32, h[4..8], .little);
+            if (plen > 1024 * 1024 or dlen > 1024 * 1024) return error.InvalidSpill;
+            const path = try self.a.alloc(u8, plen);
+            errdefer self.a.free(path);
+            const display = try self.a.alloc(u8, dlen);
+            errdefer self.a.free(display);
+            try reader.interface.readSliceAll(path);
+            try reader.interface.readSliceAll(display);
+            const accepted = try self.pipeline.?.submit(.{ .path = path, .display = display, .ordinal = @intCast(std.mem.readInt(u64, h[8..16], .little)), .filename = h[16] & 1 != 0, .explicit_file = h[16] & 2 != 0 });
+            if (!accepted) {
+                self.a.free(path);
+                self.a.free(display);
+                break;
+            }
+        }
+        self.inventory_file.?.deinit(self.a, self.io);
+        self.inventory_file = null;
+        _ = self.limits.spill_bytes.fetchSub(self.inventory_reserved, .monotonic);
+        self.inventory_reserved = 0;
+    }
+    fn emitSpilled(self: *Search) !void {
+        const spill = self.spill.?;
+        try spill.finish();
+        if (self.options.jev_mode and !self.options.json) {
+            const header = try std.fmt.allocPrint(self.a, "Search: {s}\n{d} files searched; {d} selected source lines; {s}\n", .{ self.options.ask.?, self.summary.files, self.summary.matches, if (self.summary.complete) "complete" else "incomplete" });
+            defer self.a.free(header);
+            try self.write(header);
+            try spill.visit(self, struct {
+                fn row(search: *Search, entry: @import("spill.zig").Entry) !void {
+                    const bytes = try std.fmt.allocPrint(search.a, "  {s}  {d:.3}\n", .{ entry.path, entry.score });
+                    defer search.a.free(bytes);
+                    try search.write(bytes);
+                }
+            }.row);
+            try self.write("\n");
+        }
+        try spill.visit(self, struct {
+            fn row(search: *Search, entry: @import("spill.zig").Entry) !void {
+                if (entry.length > search.options.max_output_bytes - search.output_bytes) return error.OutputBudgetExceeded;
+                try search.spill.?.stream(entry, search, Search.write);
+            }
+        }.row);
+    }
     fn flushTasks(self: *Search) !void {
         if (self.tasks.items.len == 0) return;
         self.file_path_triage = self.options.triage or self.tasks.items.len > self.options.max_files;
@@ -406,7 +532,7 @@ pub const Search = struct {
         for (threads[0..started]) |thread| thread.join();
         started = 0;
         if (context.failure) |err| return err;
-        if (self.ranking == null and self.options.ask != null and (self.options.ranked or self.options.jev_mode)) {
+        if (self.ranking == null and self.spill == null and self.options.ask != null and (self.options.ranked or self.options.jev_mode)) {
             if (self.options.ranked and self.options.sort == null) std.mem.sort(Task, self.tasks.items, {}, struct {
                 fn less(_: void, a: Task, b: Task) bool {
                     if (a.score != b.score) return a.score > b.score;
@@ -485,7 +611,7 @@ pub const Search = struct {
         growing: bool = false,
         growth_failed: bool = false,
         fn start(root: *Search) !*Pipeline {
-            const jobs = root.fileJobs();
+            const jobs = if (root.single_source or root.options.max_regions != std.math.maxInt(usize)) 1 else root.fileJobs();
             const self = try root.a.create(Pipeline);
             errdefer root.a.destroy(self);
             const slots = try root.a.alloc(Task, @min(256, jobs *| 4));
@@ -498,7 +624,7 @@ pub const Search = struct {
                 self.queue.close(root.io);
                 for (threads[0..self.started]) |thread| thread.join();
             }
-            for (threads[0..if (root.options.jobs_auto) @min(2, jobs) else jobs]) |*thread| {
+            for (threads[0..if (root.single_source) 0 else if (root.options.jobs_auto) @min(2, jobs) else jobs]) |*thread| {
                 thread.* = try std.Thread.spawn(.{}, Parallel.worker, .{&self.context});
                 self.started += 1;
             }
@@ -506,6 +632,17 @@ pub const Search = struct {
         }
         fn submit(self: *Pipeline, task: Task) !bool {
             const root = self.context.search;
+            if (root.single_source) {
+                // A known single source needs no discovery/file worker thread;
+                // decision batches may still use their own bounded concurrency.
+                std.debug.assert(self.started == 0 and self.queue.count == 0);
+                self.queue.head = 0;
+                self.queue.slots[0] = task;
+                self.queue.count = 1;
+                self.queue.closed = true;
+                Parallel.worker(&self.context);
+                return true;
+            }
             self.queue.mutex.lockUncancelable(root.io);
             while (self.queue.count == self.queue.slots.len and !self.queue.closed) self.queue.writable.waitUncancelable(root.io, &self.queue.mutex);
             if (self.queue.closed) {
@@ -607,6 +744,7 @@ pub const Search = struct {
         };
         fn worker(ctx: *Parallel) void {
             const root = ctx.search;
+            defer if (ctx.queue) |queue| queue.close(root.io);
             var local = Search.initShared(root) catch |err| {
                 ctx.fail(err);
                 return;
@@ -616,7 +754,7 @@ pub const Search = struct {
             local.file_path_triage = root.file_path_triage;
             local.shared_limits = &root.limits;
             local.decider.limits = &root.limits;
-            local.decider.allow_parallel = root.tasks.items.len == 1;
+            local.decider.allow_parallel = root.single_source or root.tasks.items.len == 1;
             local.decider.shared_local = if (root.decider.local) |provider| provider else null;
             while (!root.limits.cancel.load(.monotonic)) {
                 var queued: Task = undefined;
@@ -644,17 +782,28 @@ pub const Search = struct {
                 local.render_filename = task.filename;
                 local.explicit_file = task.explicit_file;
                 local.best_probability = 0;
+                if (root.spill != null) local.output_bytes = 0;
                 local.result_ordinal = task.ordinal;
                 const reserved_before = local.reserved_output;
                 local.file(task.path, task.display) catch |err| {
                     local.reportError(task.display, err) catch |failure| {
-                        streaming.release();
-                        ctx.fail(failure);
-                        return;
+                        if (root.spill != null and err == error.OutputBudgetExceeded and (failure == error.OutputBudgetExceeded or failure == error.PendingOutputBudgetExceeded)) {
+                            // reportError already marks the search partial and
+                            // cancels producers. Keep its complete record prefix.
+                            local.retaining_output = false;
+                            if (!root.options.no_messages) std.debug.print("antfly-grep: {s}: {s}\n", .{ task.display, @errorName(err) });
+                        } else {
+                            streaming.release();
+                            ctx.fail(failure);
+                            return;
+                        }
                     };
                 };
                 task.score = local.best_probability;
-                if (local.stop) root.limits.cancel.store(true, .monotonic);
+                if (local.stop) {
+                    root.limits.cancel.store(true, .monotonic);
+                    if (ctx.queue) |queue| queue.close(root.io);
+                }
                 if (root.ranking) |ranking| {
                     _ = root.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
                     ctx.mutex.lockUncancelable(root.io);
@@ -668,15 +817,33 @@ pub const Search = struct {
                         local.deferred_candidate = null;
                         candidate.summary = local.summary;
                         ranking.offer(candidate) catch |err| {
-                            ctx.mutex.lockUncancelable(root.io);
+                            if (root.pipeline == null) ctx.mutex.lockUncancelable(root.io);
                             root.reportError(task.display, err) catch |failure| {
-                                ctx.mutex.unlock(root.io);
+                                if (root.pipeline == null) ctx.mutex.unlock(root.io);
                                 ctx.fail(failure);
                                 return;
                             };
-                            ctx.mutex.unlock(root.io);
+                            if (root.pipeline == null) ctx.mutex.unlock(root.io);
                         };
                     }
+                } else if (root.spill) |spill| {
+                    spill.add(task.display, task.score, task.ordinal, output.written()) catch |err| {
+                        local.retaining_output = false;
+                        if (err == error.SpillBudgetExceeded) {
+                            if (root.pipeline == null) ctx.mutex.lockUncancelable(root.io);
+                            root.reportError(task.display, err) catch |failure| {
+                                if (root.pipeline == null) ctx.mutex.unlock(root.io);
+                                ctx.fail(failure);
+                                return;
+                            };
+                            if (root.pipeline == null) ctx.mutex.unlock(root.io);
+                            _ = root.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
+                            break;
+                        }
+                        ctx.fail(err);
+                        return;
+                    };
+                    _ = root.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
                 } else if (root.options.ask != null and (root.options.ranked or root.options.jev_mode)) {
                     task.result = output.toOwnedSlice() catch |err| {
                         ctx.fail(err);
@@ -692,7 +859,7 @@ pub const Search = struct {
             ctx.mutex.lockUncancelable(root.io);
             defer ctx.mutex.unlock(root.io);
             root.summary.occurrences_exact = root.summary.occurrences_exact and local.summary.occurrences_exact;
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits" }) |field| @field(root.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses" }) |field| @field(root.summary, field) += @field(local.summary, field);
             root.summary.complete = root.summary.complete and local.summary.complete;
             root.decider.requests += local.decider.requests;
             root.decider.input_tokens += local.decider.input_tokens;
@@ -709,6 +876,8 @@ pub const Search = struct {
     };
     pub fn directoryAllowed(self: *Search, path_name: []const u8) !bool {
         if ((!self.options.triage and !self.options.jev_mode) or self.options.ask == null or self.options.broad) return true;
+        if (self.pipeline) |pool| pool.context.mutex.lockUncancelable(self.io);
+        defer if (self.pipeline) |pool| pool.context.mutex.unlock(self.io);
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
@@ -798,6 +967,11 @@ pub const Search = struct {
                     self.a.free(shown);
                     return;
                 }
+            } else if (self.discovery_stream) {
+                try self.inventoryTask(task);
+                if (self.inventory_count > self.options.max_files) try self.startInventory(true);
+                self.a.free(task.path);
+                self.a.free(task.display);
             } else try self.tasks.append(self.a, task);
             return;
         }
@@ -814,6 +988,7 @@ pub const Search = struct {
         defer self.provenance = previous_source;
         self.provenance = .{ .uri = local_uri, .observed_at = if (self.options.json) std.Io.Clock.real.now(self.io).toSeconds() else null };
         const before = self.summary;
+        self.file_elapsed_ns = null;
         self.file_before = before;
         self.file_output_start = self.output_bytes;
         self.file_started = if (self.options.json) std.Io.Clock.awake.now(self.io) else null;
@@ -832,6 +1007,7 @@ pub const Search = struct {
         };
         if (self.matcher.failure) |err| return err;
         try self.jsonEnd(display, before);
+        if (self.deferred_candidate) |c| c.elapsed_ns = if (self.file_started) |start| @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)) else 0;
     }
     pub fn indexDocument(self: *Search, doc: @import("document.zig").Document) !void {
         if (doc.content.len > self.options.max_file_bytes) {
@@ -854,6 +1030,7 @@ pub const Search = struct {
             self.index_worker = worker;
             break :blk worker;
         };
+        local.file_elapsed_ns = null;
         local.summary = .{};
         local.file_before = .{};
         local.result_ordinal = self.next_ordinal;
@@ -901,7 +1078,7 @@ pub const Search = struct {
         local.retaining_output = ranked;
         local.sink = if (ranked) &output.writer else &forward.writer;
         defer {
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits" }) |field| @field(self.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits", "source_parses" }) |field| @field(self.summary, field) += @field(local.summary, field);
             self.summary.complete = self.summary.complete and local.summary.complete;
             self.summary.occurrences_exact = self.summary.occurrences_exact and local.summary.occurrences_exact;
             self.decider.requests += local.decider.requests;
@@ -927,8 +1104,14 @@ pub const Search = struct {
             if (local.deferred_candidate) |candidate| {
                 local.deferred_candidate = null;
                 candidate.summary = local.summary;
+                candidate.elapsed_ns = if (local.file_started) |start| @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)) else 0;
                 ranking.offer(candidate) catch |err| try self.reportError(doc.path, err);
             }
+            return;
+        }
+        if (self.spill) |spill| {
+            try spill.add(doc.path, local.best_probability, local.result_ordinal, output.written());
+            _ = self.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
             return;
         }
         if (!ranked) {
@@ -1148,6 +1331,7 @@ pub const Search = struct {
         self.binary_stop = false;
         self.binary_offset = null;
         const before = self.summary;
+        self.file_elapsed_ns = null;
         self.file_before = before;
         self.file_output_start = self.output_bytes;
         self.file_started = if (self.options.json) std.Io.Clock.awake.now(self.io) else null;
@@ -1619,6 +1803,7 @@ pub const Search = struct {
             var hit = false;
             prepared = try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
             self.summary.source_cache_hits += @intFromBool(hit);
+            self.summary.source_parses += @intFromBool(!hit);
             break :blk prepared.?.lines;
         } else try lineRangesWith(a, bytes, if (self.options.null_data) 0 else '\n', self.options.crlf);
         const selected = try a.alloc(bool, lines.len);
@@ -1789,7 +1974,7 @@ pub const Search = struct {
             if (count > 0) try self.retainCandidate(a, path_name, bytes, lines, selected, probabilities, false);
             return;
         }
-        try self.renderSelectedLines(path_name, bytes, lines, selected, probabilities);
+        try self.renderSelectedLines(a, path_name, bytes, lines, selected, probabilities);
     }
     fn retainCandidate(self: *Search, scratch: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool, probabilities: []const f64, jev: bool) !void {
         const ranking = self.ranking.?;
@@ -1812,20 +1997,14 @@ pub const Search = struct {
         c.before = self.file_before;
         c.filename = self.render_filename;
         c.color = self.color_enabled;
-        c.started = self.file_started;
+
         if (jev) {
             c.view = try retainedClone(EvidenceView, a, try self.evidenceView(scratch, bytes, lines, selected), 0);
         } else {
             var rows: std.ArrayList(RenderRow) = .empty;
             var last: ?usize = null;
-            for (lines, 0..) |line, i| {
-                var show = selected[i];
-                if (!show) for (selected[i -| self.options.after .. i + @min(self.options.before, lines.len - i - 1) + 1]) |yes| {
-                    if (yes) {
-                        show = true;
-                        break;
-                    }
-                };
+            const shown = try @import("evidence.zig").contextMask(scratch, selected, self.options.before, self.options.after);
+            for (lines, shown, 0..) |line, show, i| {
                 if (!show) continue;
                 const p = probabilities[i];
                 const independent = if (self.evidence) |e| std.math.isFinite(e.line_scores[i]) and e.line_scores[i] >= 0 and e.line_scores[i] == p else true;
@@ -1857,6 +2036,7 @@ pub const Search = struct {
         forward.started = true;
         renderer.sink = &forward.writer;
         for (ranking.items.items) |c| {
+            const render_started = std.Io.Clock.awake.now(self.io);
             render_options.max_output_bytes = self.options.max_output_bytes - self.output_bytes;
             renderer.summary = c.summary;
             renderer.best_probability = c.score;
@@ -1864,7 +2044,8 @@ pub const Search = struct {
             renderer.render_filename = c.filename;
             renderer.color_enabled = c.color;
             renderer.header_printed = false;
-            renderer.file_started = c.started;
+            renderer.file_started = null;
+            renderer.file_elapsed_ns = c.elapsed_ns;
             renderer.file_output_start = 0;
             renderer.output_bytes = 0;
             renderer.json_started = false;
@@ -1881,6 +2062,8 @@ pub const Search = struct {
                 renderer.independent_override = row.independent;
                 renderer.emit(c.path, row.raw[0..row.length], row.line, row.offset, row.matched, row.probability) catch |err| return forward.failure orelse err;
             }
+            // Add actual rendering work, excluding the wait for other candidates.
+            renderer.file_elapsed_ns = c.elapsed_ns + @as(i96, @intCast(@max(0, render_started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)));
             renderer.jsonEnd(c.path, c.before) catch |err| return forward.failure orelse err;
         }
         const omitted = ranking.considered - ranking.items.items.len;
@@ -1892,18 +2075,10 @@ pub const Search = struct {
             }
         }
     }
-    fn renderSelectedLines(self: *Search, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool, probabilities: []const f64) !void {
+    fn renderSelectedLines(self: *Search, a: Allocator, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []const bool, probabilities: []const f64) !void {
         var last_shown: ?usize = null;
-        for (lines, 0..) |line, i| {
-            var show = selected[i];
-            if (!show) {
-                const low = i -| self.options.after;
-                const high = i + @min(self.options.before, lines.len - i - 1) + 1;
-                for (selected[low..high]) |yes| if (yes) {
-                    show = true;
-                    break;
-                };
-            }
+        const shown = try @import("evidence.zig").contextMask(a, selected, self.options.before, self.options.after);
+        for (lines, shown, 0..) |line, show, i| {
             if (!show) continue;
             if (!self.options.json and last_shown != null and i > last_shown.? + 1 and (self.options.before > 0 or self.options.after > 0) and self.options.context_separator.len > 0) {
                 try self.write(self.options.context_separator);
@@ -2053,12 +2228,9 @@ pub const Search = struct {
         var included: usize = 0;
         var omitted_lines: usize = 0;
         var omitted_bytes: usize = 0;
-        const shown = try a.dupe(bool, selected);
+        const shown = try @import("evidence.zig").contextMask(a, selected, self.options.before, self.options.after);
         const allowed = try a.alloc(bool, lines.len);
         @memset(allowed, false);
-        for (selected, 0..) |yes, i| if (yes) {
-            @memset(shown[i -| self.options.before .. i + @min(self.options.after +| 1, lines.len - i)], true);
-        };
         // Keep scored evidence before spending the excerpt budget on context.
         for (0..2) |pass| for (lines, shown, selected, 0..) |line, show, yes, i| {
             if (!show or yes != (pass == 0)) continue;
@@ -2071,13 +2243,11 @@ pub const Search = struct {
                 included += size;
             }
         };
+        var region_cursor: @import("evidence.zig").RegionCursor = .{ .regions = evidence.regions.items };
         for (lines, allowed, selected, 0..) |line, allow, yes, i| {
             if (!allow) continue;
             const text = bytes[line.start..line.end];
-            var region_p: ?f64 = null;
-            for (evidence.regions.items) |region| if (region.start <= i + 1 and region.end >= i + 1) {
-                region_p = if (region_p) |p| @max(p, region.p) else region.p;
-            };
+            const region_p = region_cursor.probability(i + 1);
             const p = evidence.line_scores[i];
             try rows.append(a, .{ .line = i + 1, .byte_offset = line.start, .text = text, .p = if (std.math.isNan(p) or p < 0) null else p, .region_p = region_p, .matched = yes });
         }
@@ -2120,7 +2290,7 @@ pub const Search = struct {
     fn evaluate(self: *Search, a: Allocator, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !void {
         var regions: std.ArrayList(Region) = .empty;
         if (self.options.semantic_files_only) return;
-        const built = try @import("regions.zig").build(a, path_name, bytes, lines, self.options.chunk_lines);
+        const built = try @import("regions.zig").buildPrepared(a, bytes, lines, self.options.chunk_lines, self.evidence.?.index);
         for (built) |region| {
             var eligible = self.options.patterns.items.len == 0;
             if (!eligible) for (lines[region.start..region.end]) |line| if (try self.matcher.matches(bytes[line.start..line.end])) {
@@ -2789,7 +2959,7 @@ pub const Search = struct {
         if (!self.options.json or !self.json_started) return;
         var stats = self.jsonStats(before);
         stats.bytes_printed = self.output_bytes - self.file_output_start;
-        const elapsed = if (self.file_started) |start| @max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds) else 0;
+        const elapsed = self.file_elapsed_ns orelse if (self.file_started) |start| @max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds) else 0;
         const human = try std.fmt.allocPrint(self.a, "{d:.6}s", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000});
         defer self.a.free(human);
         stats.elapsed = .{ .secs = @intCast(@divFloor(elapsed, 1_000_000_000)), .nanos = @intCast(@mod(elapsed, 1_000_000_000)), .human = human };
@@ -2940,6 +3110,9 @@ test "line offsets preserve CRLF and unterminated final lines" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 test {
+    _ = @import("evidence.zig");
+    _ = @import("source_views.zig");
+    _ = @import("spill.zig");
     _ = @import("ranked.zig");
     _ = @import("batch_store.zig");
     _ = @import("concurrency.zig");
@@ -2971,4 +3144,20 @@ test "bounded span runs preserve sparse dense and zero width spans" {
     for (0..128) |j| search.appendSpanRun(.{ .start = j * j, .end = j * j + (j % 3) });
     try std.testing.expect(!search.span_runs_valid);
     try std.testing.expectEqual(@as(usize, 64), search.span_run_count);
+}
+
+test "inventory budget failure releases copied task paths" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const options: Options = .{ .ask = "test", .model = "fixture", .max_spill_bytes = 1, .temporary_dir = directory };
+    var search = try Search.init(a, io, &options);
+    defer search.deinit();
+    search.discovery_stream = true;
+    try std.testing.expectError(error.SpillBudgetExceeded, search.file("example.py", "example.py"));
+    try std.testing.expectEqual(@as(usize, 0), search.inventory_reserved);
+    try std.testing.expectEqual(@as(u64, 0), search.inventory_bytes);
 }

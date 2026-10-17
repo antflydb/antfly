@@ -126,12 +126,30 @@ pub const Cache = struct {
         h[32..64].* = digest(h, body);
         @memcpy(bucket[@intCast(self.bodyOffset(way))..][0..body.len], body);
     }
+    /// Borrow a verified record from an immutable bucket snapshot.
+    pub fn view(self: Cache, key: [32]u8, bytes: []const u8) ?[]const u8 {
+        if (bytes.len < self.ways * header_size) return null;
+        for (0..self.ways) |way| {
+            const h = bytes[way * header_size ..][0..header_size];
+            if (!self.validHeader(h) or !std.mem.eql(u8, h[0..32], &key)) continue;
+            const offset = self.payloadOffset(bytes, way);
+            const length = std.mem.readInt(u32, h[64..68], .little);
+            if (offset > bytes.len or length > bytes.len - offset) continue;
+            const body = bytes[@intCast(offset)..][0..length];
+            if (std.mem.eql(u8, h[32..64], &digest(h, body))) return body;
+        }
+        return null;
+    }
     pub fn load(self: Cache, a: A, io: std.Io, key: [32]u8) ?[]const u8 {
         std.debug.assert(self.ways <= max_ways and self.limit >= header_size);
         const name = self.path(a, key) catch return null;
         defer a.free(name);
         const file = std.Io.Dir.cwd().openFile(io, name, .{}) catch return null;
         defer file.close(io);
+        return self.loadFile(a, io, file, key);
+    }
+    /// Caller owns the descriptor; read just the headers and selected payload.
+    pub fn loadFile(self: Cache, a: A, io: std.Io, file: std.Io.File, key: [32]u8) ?[]const u8 {
         var headers: [header_size * max_ways]u8 = @splat(0);
         const n = file.readPositionalAll(io, headers[0 .. self.ways * header_size], 0) catch return null;
         for (0..n / header_size) |way| {

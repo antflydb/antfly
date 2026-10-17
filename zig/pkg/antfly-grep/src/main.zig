@@ -64,6 +64,7 @@ const help =
     \\      --table NAME         Select a configured table (repeatable)
     \\      --table-filter JSON  Server-side structured filter
     \\      --max-index-documents N  Exact scan document budget (default 100000)
+    \\      --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)
     \\      --max-pending-output N  Ranked output memory cap (default 64MiB)
     \\      --dictionary-format FORMAT  auto/raw/brotli/brotli-google
     \\      --max-dictionary-size SIZE  Dictionary payload cap (default 64M)

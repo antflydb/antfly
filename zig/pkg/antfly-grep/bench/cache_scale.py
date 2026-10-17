@@ -40,6 +40,12 @@ def main():
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument(
+        "--excerpt-lines",
+        type=int,
+        default=0,
+        help="Use one plain-text file and jevgrep line evidence to measure excerpt scaling",
+    )
+    parser.add_argument(
         "--compact",
         action="store_true",
         help="Use compact JSON for the candidate; reconstruct match payloads before comparison",
@@ -50,6 +56,8 @@ def main():
         parser.error(
             "files, rounds and threads must be positive; top-k must be nonnegative"
         )
+    if args.excerpt_lines < 0 or (args.excerpt_lines and args.files != 1):
+        parser.error("excerpt-lines requires --files=1 and a nonnegative line count")
     binaries = {
         "antfly-grep": str(args.binary.resolve()),
         "baseline": str(args.baseline.resolve()),
@@ -59,14 +67,16 @@ def main():
         "rounds": args.rounds,
         "top_k": args.top_k,
         "threads": args.threads,
+        "excerpt_lines": args.excerpt_lines,
         "fixture_only": True,
+        "fixture_library_sha256": hashlib.sha256(args.library.read_bytes()).hexdigest(),
         "host": {
             "platform": platform.platform(),
             "machine": platform.machine(),
             "cpu_count": os.cpu_count(),
         },
         "recorded_at_unix": time.time(),
-        "limitations": "Synthetic Python sources and native constant-score fixture; warm filesystem on one host; no model quality or billed tokens measured",
+        "limitations": "Synthetic Python or line-evidence sources and native constant-score fixture; warm filesystem on one host; no model quality or billed tokens measured",
         "binaries": {
             n: {
                 "sha256": hashlib.sha256(Path(b).read_bytes()).hexdigest(),
@@ -82,13 +92,18 @@ def main():
         root = Path(directory)
         source = root / "src"
         source.mkdir()
-        for i in range(args.files):
-            (source / f"module_{i:05d}.py").write_text(
-                "".join(
-                    f"def retry_{i}_{j}(value):\n    return STOP(value)\n\n"
-                    for j in range(16)
-                )
+        if args.excerpt_lines:
+            (source / "overview.txt").write_text(
+                "".join(f"STOP row_{i}\n" for i in range(args.excerpt_lines))
             )
+        else:
+            for i in range(args.files):
+                (source / f"module_{i:05d}.py").write_text(
+                    "".join(
+                        f"def retry_{i}_{j}(value):\n    return STOP(value)\n\n"
+                        for j in range(16)
+                    )
+                )
         env = {
             k: v
             for k, v in os.environ.items()
@@ -117,6 +132,16 @@ def main():
                 else "--json",
                 "src",
             ]
+            if args.excerpt_lines:
+                commands[name][1:2] = [
+                    "ask",
+                    "retry",
+                    f"--max-count={args.excerpt_lines}",
+                ]
+                commands[name][commands[name].index("--chunk-lines=1000")] = (
+                    "--unit=line"
+                )
+                commands[name][-1] = "src/overview.txt"
             if args.top_k:
                 commands[name].insert(1, f"--max-result-files={args.top_k}")
             result = subprocess.run(
@@ -138,6 +163,13 @@ def main():
             )
             rows = [json.loads(line) for line in result.stdout.splitlines()]
             report["cases"][name]["warm_summary"] = rows[-1]
+            if (
+                args.excerpt_lines
+                and rows[-1]["stats"]["matches"] != args.excerpt_lines
+            ):
+                raise RuntimeError(
+                    "excerpt fixture did not evaluate/select every source line"
+                )
             report["cases"][name]["median_seconds"] = statistics.median(
                 r["seconds"] for r in report["cases"][name]["warm_runs"]
             )
@@ -157,20 +189,40 @@ def main():
             for row in rows:
                 if row["type"] == "match" and "file_id" in row:
                     row["data"]["path"] = files[row["file_id"]]
-            signatures.append(
-                sorted(
-                    json.dumps(
+            canonical = []
+            for row in rows:
+                if row["type"] == "match":
+                    canonical.append(
                         {
                             "type": row["type"],
                             "data": row.get("data"),
                             "probability": row.get("probability"),
                             "scope": row.get("scope"),
-                        },
-                        sort_keys=True,
+                        }
                     )
-                    for row in rows
-                    if row["type"] == "match"
-                )
+                elif row["type"] == "file":
+                    canonical.append(
+                        {
+                            key: row.get(key)
+                            for key in (
+                                "type",
+                                "path",
+                                "relevance",
+                                "file_preview_score",
+                                "selection",
+                                "match",
+                                "reading_leads",
+                                "regions",
+                                "lines",
+                                "calls",
+                                "omitted",
+                                "parse_complete",
+                                "complete",
+                            )
+                        }
+                    )
+            signatures.append(
+                sorted(json.dumps(row, sort_keys=True) for row in canonical)
             )
         if signatures[0] != signatures[1]:
             raise RuntimeError("result payloads differ")

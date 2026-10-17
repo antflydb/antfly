@@ -15,6 +15,7 @@
 
 const std = @import("std");
 pub const Limits = struct {
+    spill_bytes: std.atomic.Value(usize) = .init(0),
     pending_output: std.atomic.Value(usize) = .init(0),
     active: std.atomic.Value(usize) = .init(0),
     lanes: std.atomic.Value(usize) = .init(0),

@@ -19,6 +19,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub const Region = struct { start: usize, end: usize, declaration: bool = false, label: []const u8 = "", label_line: usize = 0 };
 pub fn build(a: Allocator, path: []const u8, bytes: []const u8, lines: anytype, max: usize) ![]Region {
+    if (max == 1) return buildPrepared(a, bytes, lines, max, .{ .declarations = &.{}, .calls = &.{}, .complete = true });
+    var index = try @import("source.zig").parse(a, path, bytes);
+    defer index.deinit(a);
+    return buildPrepared(a, bytes, lines, max, index);
+}
+/// Borrow the revision-validated preparation; never parse a source twice.
+pub fn buildPrepared(a: Allocator, bytes: []const u8, lines: anytype, max: usize, index: @import("source.zig").Index) ![]Region {
     var out: std.ArrayList(Region) = .empty;
     errdefer out.deinit(a);
     if (max == 1) {
@@ -28,8 +35,6 @@ pub fn build(a: Allocator, path: []const u8, bytes: []const u8, lines: anytype, 
     const covered = try a.alloc(bool, lines.len);
     defer a.free(covered);
     @memset(covered, false);
-    var index = try @import("source.zig").parse(a, path, bytes);
-    defer index.deinit(a);
     const order = try a.alloc(usize, index.declarations.len);
     defer a.free(order);
     for (order, 0..) |*item, i| item.* = i;
@@ -88,4 +93,23 @@ test "masked braces cannot terminate a Go declaration" {
     const result = try build(alloc, "a.go", text, &lines, 80);
     try std.testing.expect(result[0].declaration);
     try std.testing.expectEqual(@as(usize, 4), result[0].end);
+}
+
+test "prepared and parsing region builders agree on nested declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { path: []const u8, text: []const u8 }{
+        .{ .path = "a.py", .text = "class Outer:\n    def retry(self):\n        def inner():\n            STOP()\n        inner()\n\nother()\n" },
+        .{ .path = "a.go", .text = "package main\nfunc retry() {\n STOP()\n}\n" },
+        .{ .path = "a.rs", .text = "impl Retry {\n fn run() { stop(); }\n}\n" },
+    }) |item| {
+        const rows = try @import("source_cache.zig").lines(a, item.text, '\n', false);
+        const index = try @import("source.zig").parse(a, item.path, item.text);
+        for ([_]usize{ 1, 2, 80 }) |max| {
+            const expected = try build(a, item.path, item.text, rows, max);
+            const actual = try buildPrepared(a, item.text, rows, max, index);
+            try std.testing.expectEqualDeep(expected, actual);
+        }
+    }
 }

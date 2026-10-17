@@ -92,6 +92,7 @@ complete -c antfly-grep -l max-regions -r
 complete -c antfly-grep -l max-requests -r -f -a 'unlimited'
 complete -c antfly-grep -l max-result-files -r
 complete -c antfly-grep -l max-source-bytes -r
+complete -c antfly-grep -l max-spill-bytes -r
 complete -c antfly-grep -l messages
 complete -c antfly-grep -l mmap
 complete -c antfly-grep -l model -r

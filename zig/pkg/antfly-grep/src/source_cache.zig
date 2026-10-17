@@ -19,7 +19,7 @@ const std = @import("std");
 const source = @import("source.zig");
 const A = std.mem.Allocator;
 pub const Line = struct { start: usize, end: usize };
-pub const State = struct { legacy: ?bool = null };
+pub const State = struct { legacy: ?bool = null, views: ?*@import("source_views.zig").Store = null };
 pub const Prepared = struct { lines: []Line, index: source.Index };
 const limit = 256 * 1024;
 fn cache(directory: []const u8) @import("artifact_cache.zig").Cache {
@@ -67,7 +67,7 @@ pub fn lines(a: A, bytes: []const u8, delimiter: u8, crlf: bool) ![]Line {
 }
 fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8, delimiter: u8, crlf: bool, migrate: bool, state: *State) ?Prepared {
     var legacy = false;
-    const record = cache(directory).load(a, io, key) orelse blk: {
+    const record = (if (state.views) |views| views.load(a, io, cache(directory), key) else cache(directory).load(a, io, key)) orelse blk: {
         if (state.legacy == null) state.legacy = @import("artifact_cache.zig").LegacyPresence.scan(io, directory).sources;
         if (!state.legacy.?) return null;
         const old: @import("artifact_cache.zig").Legacy = .{ .directory = directory, .namespace = "source-v2", .buckets = 1024, .limit = limit };
