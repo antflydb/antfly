@@ -1360,6 +1360,11 @@ test "multi-pattern pull cursor preserves full MATCH state across tiny pages" {
         "MATCH (a:Document)-[:CITES]->(b),(b)-[:CITES]->(c) RETURN a.id,b.id,c.id",
         "MATCH (a:Document)-[r:CITES]->(b),(a)-[r]->(b) RETURN a.id",
         "MATCH p=(a:Document)-[:CITES*0..2]->(b),(b:Document) RETURN length(p),a.id,b.id",
+        "MATCH p=(a:Document)-[l:CITES]->(m:Document)-[r:CITES]->(z:Document) WHERE antfly.documentKey(m)='b' RETURN a.id,z.id,[n IN nodes(p)|n.id],l.weight",
+        "MATCH p=(a:Document)-[l:CITES*0..2]->(m:Document)-[r:CITES]->(z:Document) WHERE antfly.documentKey(m)='b' RETURN [n IN nodes(p)|n.id],[e IN l|e.weight]",
+        "MATCH p=(a {id:z.id})-[:CITES]->(m:Document)-[:CITES]->(z) WHERE antfly.documentKey(m)='b' RETURN [n IN nodes(p)|n.id]",
+        "MATCH REPEATABLE ELEMENTS p=(a)-[:CITES]-(m:Document)-[:CITES]-(b) WHERE antfly.documentKey(m)='c' RETURN [n IN nodes(p)|n.id]",
+        "MATCH p=(a:Document)-[l:CITES]->(m:Document)-[r:CITES]->(n:Document)-[:CITES]->(z:Document) WHERE antfly.documentKey(n)='b' RETURN [n IN nodes(p)|n.id],l.weight,r.weight",
     };
     for (queries) |text| {
         var diagnostic: c.Diagnostic = .{};
@@ -1373,6 +1378,7 @@ test "multi-pattern pull cursor preserves full MATCH state across tiny pages" {
         table.expand = Paged.expand;
         const cursor = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = base.ptr, .vtable = &table }, graph, compiled.query, &.{}, .{})).?;
         defer cursor.close();
+        try std.testing.expectEqual(@as(?u64, @intCast(expected.rows.len)), try cursor.countRows());
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         var position: usize = 0;
@@ -1423,7 +1429,205 @@ test "pull planning preserves correlated interior anchors" {
     var compiled = try c.compile(std.testing.allocator, "MATCH (m:Document),(a:Document)-[:CITES]->(m)-[:CITES]->(z:Document) RETURN a.id,z.id", .{}, &diagnostic);
     defer compiled.deinit();
     var fixture: Fixture = .{};
-    // Retain the general producer's bound-interior seek rather than replacing
-    // it with an exhaustive endpoint scan in the pull cursor.
-    try std.testing.expect((try runtime.NodeCursor.open(std.testing.allocator, fixture.backend(), graph, compiled.query, &.{}, .{})) == null);
+    const Paged = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, demand: usize) !b.Page(*const v.Relationship) {
+            const all = try Fixture.expand(ptr, a, mapping, identity, direction, null, demand);
+            const start = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(all.items.len, start + demand);
+            return .{ .items = all.items[start..end], .next = if (end < all.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    const base = fixture.backend();
+    var callbacks = base.vtable.*;
+    callbacks.expand = Paged.expand;
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = base.ptr, .vtable = &callbacks }, graph, compiled.query, &.{}, .{})).?;
+    defer cursor.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var rows: usize = 0;
+    while (!cursor.done) {
+        rows += (try cursor.next(arena.allocator(), 1)).len;
+        _ = arena.reset(.free_all);
+    }
+    try std.testing.expectEqual(@as(usize, 6), rows);
+}
+
+const cypher = @import("root.zig");
+const hydration_graph: cypher.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "H", .table = "docs" }}, .relationships = &.{.{ .name = "R", .index = "links", .source_label = "H", .target_label = "H", .stored_type = "r" }} };
+const hydration_source: v.Node = .{ .identity = .{ .table = "docs", .key = "a" }, .properties = &.{.{ .name = "id", .value = .{ .string = "a" } }} };
+const hydration_target: v.Node = .{ .identity = .{ .table = "docs", .key = "b" }, .properties = &.{.{ .name = "score", .value = .{ .integer = 1 } }} };
+const HydrationFixture = struct {
+    edges: []const *const v.Relationship,
+    gets: usize = 0,
+    batches: usize = 0,
+    hidden: bool = false,
+    fn cast(p: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(p));
+    }
+    fn bind(_: *anyopaque, _: std.mem.Allocator, _: cypher.catalog.Graph) !void {}
+    fn checkpoint(_: *anyopaque) !void {}
+    fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, after: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+        return .{ .items = if (after == null) &.{&hydration_source} else &.{} };
+    }
+    fn get(p: *anyopaque, _: std.mem.Allocator, id: v.Identity) !?*const v.Node {
+        cast(p).gets += 1;
+        return if (id.eql(hydration_target.identity)) &hydration_target else null;
+    }
+    fn many(p: *anyopaque, a: std.mem.Allocator, ids: []const v.Identity) ![]const ?*const v.Node {
+        cast(p).batches += 1;
+        const out = try a.alloc(?*const v.Node, ids.len);
+        for (ids, out) |id, *item| item.* = if (!cast(p).hidden and id.eql(hydration_target.identity)) (try (v.Value{ .node = &hydration_target }).clone(a)).node else null;
+        return out;
+    }
+    fn expand(p: *anyopaque, a: std.mem.Allocator, _: cypher.catalog.Relationship, id: v.Identity, _: cypher.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+        if (!id.eql(hydration_source.identity)) return .{ .items = &.{} };
+        const edges = cast(p).edges;
+        const start = if (after) |s| try std.fmt.parseUnsigned(usize, s, 10) else 0;
+        const end = @min(edges.len, start + limit);
+        return .{ .items = edges[start..end], .next = if (end < edges.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+    }
+    fn backend(self: *@This()) b.Backend {
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_many = many, .expand = expand } };
+    }
+};
+test "pull traversal batches repeated endpoints across suspended pages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const edges = try a.alloc(*const v.Relationship, 1024);
+    for (edges, 0..) |*item, i| {
+        const edge = try a.create(v.Relationship);
+        edge.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "e{d}", .{i}) }, .index = "links", .type = "R", .source = hydration_source.identity, .target = hydration_target.identity };
+        item.* = edge;
+    }
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    var compiled = try cypher.compiler.compile(a, "MATCH (a:H {id:'a'})-[:R]->(b:H) RETURN b.score", .{}, &diagnostic);
+    defer compiled.deinit();
+    var native: HydrationFixture = .{ .edges = edges };
+    var result = try cypher.runtime.execute(a, native.backend(), hydration_graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 8), native.batches);
+    var sql: HydrationFixture = .{ .edges = edges };
+    const cursor = (try cypher.runtime.NodeCursor.open(a, sql.backend(), hydration_graph, compiled.query, &.{}, .{})).?;
+    defer cursor.close();
+    var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer page.deinit();
+    var rows: usize = 0;
+    while (!cursor.done) {
+        rows += (try cursor.next(page.allocator(), 128)).len;
+        _ = page.reset(.free_all);
+    }
+    try std.testing.expectEqual(@as(usize, 8), sql.batches);
+    try std.testing.expectEqual(@as(usize, 0), sql.gets);
+    try std.testing.expectEqual(@as(usize, 1024), rows);
+    // SQL postimage overlays must forward batches and retain null alignment.
+    const Host = struct {
+        fn identity(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool) !v.Identity {
+            return error.UnexpectedWrite;
+        }
+        fn commit(_: *anyopaque, _: std.mem.Allocator, _: []const b.Mutation) !void {
+            return error.UnexpectedWrite;
+        }
+    };
+    for ([_]bool{ false, true }) |hidden| {
+        var fixture: HydrationFixture = .{ .edges = edges, .hidden = hidden };
+        var overlay: cypher.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Host.identity, .commit = Host.commit }, .lazy = true };
+        const backend = overlay.backend();
+        try backend.vtable.bind(backend.ptr, a, hydration_graph);
+        try backend.vtable.begin.?(backend.ptr);
+        defer backend.vtable.rollback.?(backend.ptr);
+        const pull = (try runtime.NodeCursor.open(a, backend, hydration_graph, compiled.query, &.{}, .{})).?;
+        defer pull.close();
+        var total: usize = 0;
+        while (!pull.done) {
+            total += (try pull.next(page.allocator(), 128)).len;
+            _ = page.reset(.free_all);
+        }
+        try std.testing.expectEqual(@as(usize, if (hidden) 0 else 1024), total);
+        try std.testing.expectEqual(@as(usize, 8), fixture.batches);
+        try std.testing.expectEqual(@as(usize, 0), fixture.gets);
+    }
+}
+
+test "foldable scalar predicates produce typed seeks without suppressing residual errors" {
+    const Indexed = struct {
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            try std.testing.expectEqual(@as(usize, 1), filters.len);
+            try std.testing.expectEqualStrings("rank", filters[0].property);
+            const value = filters[0].value;
+            try std.testing.expect(value == .integer);
+            try std.testing.expect(value.integer == -1 or value.integer == 1);
+            return .{ .items = if (value.integer == 1) &.{&Fixture.nodes[0]} else &.{} };
+        }
+    };
+    for ([_][]const u8{
+        "MATCH (n:Document) WHERE n.rank=-1 RETURN n.rank",
+        "MATCH (n:Document) WHERE n.rank=1-2 RETURN n.rank",
+        "MATCH (n:Document) WHERE n.rank=-(-1) RETURN n.rank",
+        "MATCH (n:Document {rank:$base-2}) RETURN n.rank",
+    }, 0..) |text, index| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        const base = fixture.backend();
+        var callbacks = base.vtable.*;
+        callbacks.scan_where = Indexed.scan;
+        const backend: b.Backend = .{ .ptr = base.ptr, .vtable = &callbacks };
+        const parameters = &.{v.Entry{ .name = "base", .value = .{ .integer = 3 } }};
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, parameters, .{ .scanned_anchors = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (index < 2) 0 else 1), result.rows.len);
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, parameters, .{ .scanned_anchors = 1 })).?;
+        defer cursor.close();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectEqual(result.rows.len, (try cursor.next(arena.allocator(), 128)).len);
+    }
+    for ([_][]const u8{ "MATCH (n:Document) WHERE n.rank=1/0 RETURN n", "MATCH (n:Document) WHERE n.rank=9223372036854775807+1 RETURN n" }, [_]anyerror{ error.CypherDivisionByZero, error.CypherNumericOverflow }) |text, expected| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(expected, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "weighted endpoint reductions agree with exact cyclic and acyclic route bags" {
+    const Acyclic = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var output: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |relationship| if (!std.mem.eql(u8, relationship.identity.key, "ba")) try output.append(a, relationship);
+            return .{ .items = output.items };
+        }
+    };
+    for ([_]bool{ false, true }) |acyclic| for ([_][]const u8{ "", "REPEATABLE ELEMENTS ", "DIFFERENT RELATIONSHIPS " }) |mode| for ([_][]const u8{
+        "RETURN count(b),count(b.missing),count(*)",
+        "WHERE b.rank>=2 RETURN count(b)",
+        "RETURN b.rank,count(b),count(b.missing),count(*) ORDER BY b.rank",
+        "WHERE a.rank<b.rank RETURN a.rank,b.rank,count(*) ORDER BY a.rank,b.rank",
+    }) |tail| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const text = try std.fmt.allocPrint(a, "MATCH {s}(a:Document)-[:CITES*0..3]->(b:Document) {s}", .{ mode, tail });
+        const split = std.mem.indexOf(u8, tail, "RETURN").?;
+        const exact = try std.fmt.allocPrint(a, "MATCH {s}(a:Document)-[:CITES*0..3]->(b:Document) {s} UNWIND [1] AS ignored {s}", .{ mode, tail[0..split], tail[split..] });
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var reference = try c.compile(a, exact, .{}, &diagnostic);
+        defer reference.deinit();
+        var fixture: Fixture = .{};
+        const base = fixture.backend();
+        var callbacks = base.vtable.*;
+        if (acyclic) callbacks.expand = Acyclic.expand;
+        const backend: b.Backend = .{ .ptr = base.ptr, .vtable = &callbacks };
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var expected = try runtime.execute(a, backend, graph, &reference, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
+    };
 }

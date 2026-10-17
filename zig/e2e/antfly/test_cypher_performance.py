@@ -167,6 +167,8 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             )
         for predicate, anchors, values in (
             ("n.score>=1999", 1, ["1999"]),
+            ("n.score=-(-1999)", 1, ["1999"]),
+            ("n.score=2001-2", 1, ["1999"]),
             ("n.score IN [1999,1,1999,null]", 2, ["1", "1999"]),
         ):
             indexed = call(
@@ -329,6 +331,14 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
         )
         assert len(pulled["rows"]) == 1, pulled
+        call("/sql", {"statement": f"CREATE INDEX {hops}_score ON {hops}(score)"})
+        interior = call(
+            "/sql",
+            {
+                "statement": f"SELECT q.score FROM GRAPH_TABLE({hops} MATCH {path} WHERE m2.score=9 COLUMNS(b.score AS score)) q LIMIT 1"
+            },
+        )
+        assert len(interior["rows"]) == 1, interior
         counted = call(
             f"/graphs/{hops}/query",
             {
@@ -337,6 +347,27 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
         )
         assert counted["rows"] == [[{"type": "integer", "value": "31824"}]], counted
+        for tail in (
+            "RETURN count(b)",
+            "WHERE b.score>=0 RETURN count(*)",
+            "RETURN b.score,count(*) ORDER BY b.score",
+        ):
+            endpoint_counted = call(
+                f"/graphs/{hops}/query",
+                {
+                    "query": "MATCH (a:H)-[:R*6..6]->(b:H) " + tail,
+                    "limits": {"explored_edges": 1000, "intermediate_states": 30000},
+                },
+            )
+            if tail.startswith("RETURN b.score"):
+                assert (
+                    sum(int(row[1]["value"]) for row in endpoint_counted["rows"])
+                    == 31824
+                )
+            else:
+                assert endpoint_counted["rows"] == [
+                    [{"type": "integer", "value": "31824"}]
+                ]
         start = time.monotonic()
         counted_sql = call(
             "/sql",
@@ -389,6 +420,15 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             wait_for_index=True,
         )
         assert rare["rows"] == [[{"type": "integer", "value": "1"}]], rare
+        merged = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "UNWIND $ids AS id MERGE (n:D {id:id}) RETURN count(*)",
+                "parameters": {"ids": [f"new{i}" for i in range(800)]},
+                "limits": {"scanned_anchors": 0, "intermediate_states": 200000},
+            },
+        )
+        assert merged["rows"] == [[{"type": "integer", "value": "800"}]], merged
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

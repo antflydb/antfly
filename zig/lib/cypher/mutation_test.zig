@@ -1167,3 +1167,100 @@ test "Cypher node properties cannot invoke native ingestion controls" {
     defer result.deinit();
     try std.testing.expect(result.rows[0][0].boolean and result.rows[0][1].boolean);
 }
+
+test "lazy indexed MERGE uses incremental staged candidates with linear work" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    var previous: usize = 0;
+    const filtered_graph: root.catalog.Graph = .{ .name = "filtered", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Person", .table = "people", .predicate = &.{.{ .name = "kind", .value = .{ .integer = 1 } }} }}, .relationships = &.{} };
+    for ([_]usize{ 200, 400, 800 }) |count| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit }, .lazy = true };
+        const text = try std.fmt.allocPrint(fixture.arena.allocator(), "UNWIND range(1,{d}) AS id MERGE (n:Person {{age:id,kind:1}}) RETURN count(*)", .{count});
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), filtered_graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(count)), result.rows[0][0].integer);
+        try std.testing.expectEqual(count, overlay.nodes.items.len);
+        try std.testing.expectEqual(@as(usize, 0), result.stats.scanned_anchors);
+        if (previous != 0) try std.testing.expect(result.stats.intermediate_states < previous * 3);
+        previous = result.stats.intermediate_states;
+    }
+}
+
+test "staged equality and membership indexes follow replacement removal deletion and numeric equality" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const a = fixture.arena.allocator();
+    var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit }, .lazy = true };
+    const backend = overlay.backend();
+    try backend.vtable.bind(backend.ptr, a, graph);
+    try backend.vtable.begin.?(backend.ptr);
+    defer backend.vtable.rollback.?(backend.ptr);
+    const node: v.Node = .{ .identity = .{ .table = "people", .key = "p" }, .properties = &.{.{ .name = "age", .value = .{ .integer = 1 } }} };
+    try backend.vtable.mutate.?(backend.ptr, a, .{ .create_node = &node });
+    for ([_]u8{ 0, 1, 2, 3, 4 }) |stage| {
+        if (stage == 1) try backend.vtable.mutate.?(backend.ptr, a, .{ .set_properties = .{ .target = .{ .node = node.identity }, .properties = &.{.{ .name = "age", .value = .{ .integer = 2 } }}, .replace = true } });
+        if (stage == 2) try backend.vtable.mutate.?(backend.ptr, a, .{ .remove_properties = .{ .target = .{ .node = node.identity }, .names = &.{"age"} } });
+        if (stage == 3) try overlay.stageReadDocument(a, node.identity, &node);
+        if (stage == 4) try backend.vtable.mutate.?(backend.ptr, a, .{ .delete_node = .{ .identity = node.identity, .detach = false } });
+        for ([_]b.PropertyFilter{
+            .{ .property = "age", .value = .{ .number = 1.0 } },
+            .{ .property = "age", .op = .in, .value = .{ .list = &.{ .{ .integer = 1 }, .{ .number = 1.0 }, .null } } },
+        }) |filter| {
+            var after: ?[]const u8 = null;
+            var found: usize = 0;
+            while (true) {
+                const page = try backend.vtable.scan_where.?(backend.ptr, a, "people", &.{filter}, after, 1);
+                found += page.items.len;
+                after = page.next;
+                if (after == null) break;
+            }
+            try std.testing.expectEqual(@as(usize, if (stage == 0 or stage == 3) 1 else 0), found);
+        }
+    }
+}
+
+test "staged index candidates use authorized projected property values" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+        fn project(_: *anyopaque, a: A, node: *const v.Node) !?*const v.Node {
+            if ((v.Value{ .node = node }).property("age").integer < 0) return null;
+            const projected = try a.create(v.Node);
+            projected.* = node.*;
+            projected.properties = &.{.{ .name = "age", .value = .{ .integer = 1 } }};
+            return projected;
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const a = fixture.arena.allocator();
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.project_postimage = Host.project;
+    var overlay: root.transaction.Overlay = .{ .base = .{ .ptr = &fixture, .vtable = &callbacks }, .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit }, .lazy = true };
+    const backend = overlay.backend();
+    try backend.vtable.bind(backend.ptr, a, graph);
+    try backend.vtable.begin.?(backend.ptr);
+    defer backend.vtable.rollback.?(backend.ptr);
+    const node: v.Node = .{ .identity = .{ .table = "people", .key = "p" }, .properties = &.{.{ .name = "age", .value = .{ .integer = 5 } }} };
+    try backend.vtable.mutate.?(backend.ptr, a, .{ .create_node = &node });
+    for ([_]bool{ false, true }) |hidden| {
+        if (hidden) try backend.vtable.mutate.?(backend.ptr, a, .{ .set_properties = .{ .target = .{ .node = node.identity }, .properties = &.{.{ .name = "age", .value = .{ .integer = -1 } }}, .replace = false } });
+        var after: ?[]const u8 = null;
+        var found: usize = 0;
+        while (true) {
+            const page = try backend.vtable.scan_where.?(backend.ptr, a, "people", &.{.{ .property = "age", .value = .{ .integer = 1 } }}, after, 1);
+            found += page.items.len;
+            after = page.next;
+            if (after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (hidden) 0 else 1), found);
+    }
+}

@@ -1030,6 +1030,25 @@ def test_all_paths_count_uses_dag_states_for_native_and_sql(graph_db):
         )
         assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
         assert result["stats"]["explored_edges"] <= 1000
+    for tail in (
+        "RETURN count(b)",
+        "WHERE b.score>=0 RETURN count(*)",
+        "RETURN b.score,count(b),count(b.missing),count(*) ORDER BY b.score",
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D)-[:R*6..6]->(b:D) " + tail,
+                "limits": {"explored_edges": 1000, "intermediate_states": 25000, "memory_bytes": 4 << 20},
+            },
+        )
+        if tail.startswith("RETURN b.score"):
+            assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+                [str(endpoint), str(comb(endpoint, 6)), "0", str(comb(endpoint, 6))] for endpoint in range(6, size)
+            ]
+        else:
+            assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+        assert result["stats"]["explored_edges"] <= 1000
     rejected = db.cypher_json(
         "g",
         {
@@ -1072,3 +1091,77 @@ def test_all_path_product_states_preserve_endpoint_constraints_and_bags(graph_db
     relation = "GRAPH_TABLE(g MATCH (a IS D)-[r IS R]->(b IS D) COLUMNS(b.score AS score)) q"
     assert db.sql(f"SELECT count(*) FROM {relation} WHERE q.score+0=5")["rows"] == [["5"]]
     assert db.sql(f"SELECT count(*) FROM (SELECT q.score FROM {relation} LIMIT 3) limited")["rows"] == [["3"]]
+
+
+def test_indexed_bulk_merge_has_linear_staged_work(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    previous = 0
+    for count in (200, 400, 800):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "UNWIND $ids AS id MERGE (n:D {id:id}) RETURN count(*)",
+                "parameters": {"ids": [f"batch{count}_n{i}" for i in range(count)]},
+                "limits": {"intermediate_states": 200000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(count)}]]
+        assert result["stats"]["scanned_anchors"] == 0
+        work = result["stats"]["intermediate_states"]
+        if previous:
+            assert work < previous * 3
+        previous = work
+    repeated = db.cypher_json(
+        "g", {"query": "UNWIND $ids AS id MERGE (n:D {id:id}) RETURN count(*)", "parameters": {"ids": ["same"] * 800}}
+    )
+    assert repeated["rows"] == [[{"type": "integer", "value": "800"}]]
+    assert repeated["stats"]["scanned_anchors"] == 799
+    assert db.cypher_json("g", {"query": "MATCH (n:D {id:'same'}) RETURN count(*)"})["rows"] == [
+        [{"type": "integer", "value": "1"}]
+    ]
+
+
+def test_foldable_negative_predicates_seek_indexes(graph_db):
+    db = graph_db
+    populate(db, 1000)
+    db.sql("UPDATE docs SET score=-score-1")
+    db.sql("CREATE INDEX docs_score ON docs(score)")
+    for expression in ("-1", "1-2", "-$positive", "$zero-1"):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE n.score={expression} RETURN n.score",
+                "parameters": {"positive": 1, "zero": 0},
+                "limits": {"scanned_anchors": 1},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "-1"}]]
+        assert result["stats"]["scanned_anchors"] == 1
+
+
+def test_sql_interior_anchor_stops_at_outer_demand(graph_db):
+    import time
+
+    db = graph_db
+    db.sql("CREATE INDEX docs_score ON docs(score)")
+    db.cypher_json("g", {"query": "CREATE (:D {id:'center',score:0})"})
+    for start in range(0, 200, 25):
+        patterns = []
+        for index in range(start, start + 25):
+            patterns += [
+                f"(l{index}:D {{id:'l{index}',score:1}})",
+                f"(r{index}:D {{id:'r{index}',score:2}})",
+                f"(l{index})-[:R]->(m)",
+                f"(m)-[:R]->(r{index})",
+            ]
+        db.cypher_json("g", {"query": "MATCH (m:D {score:0}) CREATE " + ",".join(patterns)})
+    relation = (
+        "GRAPH_TABLE(g MATCH (a IS D)-[x IS R]->(m IS D)-[y IS R]->(b IS D) "
+        "WHERE m.score=0 COLUMNS(a.id AS a,b.id AS b)) q"
+    )
+    start = time.monotonic()
+    rows = db.sql(f"SELECT q.a,q.b FROM {relation} LIMIT 1")["rows"]
+    assert len(rows) == 1
+    assert rows[0][0].startswith("l") and rows[0][1].startswith("r")
+    assert time.monotonic() - start < 5

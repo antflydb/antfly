@@ -1297,7 +1297,7 @@ charging physical reads again. Their route
 enumeration remains combinatorial when uniqueness requires it; neither vertex
 compression nor early deduplication may discard valid qualifying trails.
 
-Eligible ALL-path count(*) reductions discover authorized adjacency from sparse
+Eligible ALL-path count reductions discover authorized adjacency from sparse
 (pattern edge, hop, identity) states. Rejected intermediate node predicates leave
 the branches behind those nodes unopened. Finite bounds and a DAG proof permit prefix
 compression under trail and node uniqueness; repeatable walks admit bounded
@@ -1310,6 +1310,30 @@ Intermediate counts saturate above the result range, so only qualifying endpoint
 counts can report overflow. SQL GRAPH_TABLE exposes this through the exact-count
 cursor hook under the same owner cut, with SQL residuals and ordinal selection
 retaining ordinary pulls.
+
+Endpoint-local predicates, grouping keys and non-distinct `count(expression)`
+consume weighted endpoint rows from those same states. Counts of nullable
+properties ignore NULL without discarding their groups. Expressions depending on
+intermediate entities, paths, DISTINCT or unsupported consumers retain exact
+route production. The optimizer never substitutes shortest-path semantics for ALL.
+
+SQL pull cursors retain the selective interior anchor, traverse a reversed prefix,
+restore source path order and resume the suffix with shared uniqueness and deferred
+constraints. Suspended frames pin bounded adjacency and endpoint-cache pages;
+endpoint hydration uses aligned, deduplicated native/owner batches, including NULL
+for missing or hidden nodes. The exact-count hook retains the original logical
+pattern independently of this cursor plan. Outer SQL demand can stop traversal
+without materializing either half of the path.
+
+Lazy write overlays maintain transaction-local property candidate indexes for
+scalar equality and membership predicates. They use Cypher's typed numeric hashes,
+retain collision residuals, and update postings for normalized creations, SET,
+REMOVE, SQL postimages and deletion. MERGE probes staged candidates without
+rescanning or sorting every previous insertion. Unindexed/range scans retain the
+ordered staged phase and opaque native continuation tokens. Bounded scalar
+constant folding shares checked runtime arithmetic when constructing seeks;
+failed folds remain residuals so overflow and division errors keep their runtime
+semantics.
 
 `antfly.search` no longer scans the table to enumerate allowed IDs. Unrestricted
 table labels without row policies use native indexed search directly. Restricted

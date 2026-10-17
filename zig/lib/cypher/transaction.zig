@@ -47,6 +47,7 @@ pub const Overlay = struct {
     node_order: ?[]const usize = null,
     staged_order: std.ArrayList(usize) = .empty,
     staged_order_valid: bool = false,
+    staged_indexes: std.ArrayList(StagedIndex) = .empty,
     references: std.HashMapUnmanaged(v.Identity, std.ArrayList(Reference), v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
     staged_read_documents: bool = false,
     nodes: std.ArrayList(Node) = .empty,
@@ -58,10 +59,110 @@ pub const Overlay = struct {
     max_anchors: usize = 1_000_000,
     max_edges: usize = 1_000_000,
     captured: b.StartupWork = .{},
+    const Positions = std.AutoArrayHashMapUnmanaged(usize, void);
+    const StagedIndex = struct {
+        table: []const u8,
+        property: []const u8,
+        buckets: std.AutoHashMapUnmanaged(u64, Positions) = .empty,
+        hashes: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    };
+    fn scalarHash(self: *Overlay, value: v.Value) !?u64 {
+        switch (value) {
+            .boolean, .integer, .number, .string => {},
+            else => return null,
+        }
+        var work = self.valueWork(self.alloc.?);
+        return (try work.info(value)).hash;
+    }
+    fn indexStagedNode(self: *Overlay, index: *StagedIndex, position: usize) !void {
+        const a = self.alloc.?;
+        try self.charge(1);
+        const node = self.nodes.items[position];
+        if (index.hashes.fetchRemove(position)) |old| {
+            _ = index.buckets.getPtr(old.value).?.swapRemove(position);
+        }
+        if (!node.dirty or node.deleted or node.value.labels.len == 0 or !std.mem.eql(u8, index.table, node.value.identity.table)) return;
+        // Candidate values use the same authorized postimage as residuals;
+        // masks and USING policies must not create false negatives.
+        const projected = (try projectNode(self, a, node.value)) orelse return;
+        const hash = (try self.scalarHash((v.Value{ .node = projected }).property(index.property))) orelse return;
+        const bucket = try index.buckets.getOrPut(a, hash);
+        if (!bucket.found_existing) bucket.value_ptr.* = .empty;
+        try bucket.value_ptr.put(a, position, {});
+        try index.hashes.put(a, position, hash);
+    }
+    fn refreshStagedIndexes(self: *Overlay, position: usize) !void {
+        for (self.staged_indexes.items) |*index| try self.indexStagedNode(index, position);
+    }
+    fn stagedCandidates(self: *Overlay, a: A, table: []const u8, filters: []const b.PropertyFilter) !?[]const usize {
+        var best_filter: ?b.PropertyFilter = null;
+        var best_index: usize = 0;
+        var smallest: usize = std.math.maxInt(usize);
+        for (filters) |filter| {
+            if (filter.op != .eq and filter.op != .in) continue;
+            const values = if (filter.op == .in) if (filter.value == .list) filter.value.list else continue else &.{filter.value};
+            var usable = true;
+            for (values) |value| switch (value) {
+                .null, .boolean, .integer, .number, .string => {},
+                else => {
+                    usable = false;
+                    break;
+                },
+            };
+            if (!usable) continue;
+            const retained = self.alloc.?;
+            var selected: ?usize = null;
+            for (self.staged_indexes.items, 0..) |index, position| if (std.mem.eql(u8, table, index.table) and std.mem.eql(u8, filter.property, index.property)) {
+                selected = position;
+                break;
+            };
+            if (selected == null) {
+                selected = self.staged_indexes.items.len;
+                try self.staged_indexes.append(retained, .{ .table = try retained.dupe(u8, table), .property = try retained.dupe(u8, filter.property) });
+                const index = &self.staged_indexes.items[selected.?];
+                for (0..self.nodes.items.len) |position| try self.indexStagedNode(index, position);
+            }
+            const index = &self.staged_indexes.items[selected.?];
+            var estimate: usize = 0;
+            for (values) |value| {
+                const hash = (try self.scalarHash(value)) orelse continue;
+                if (index.buckets.get(hash)) |bucket| estimate +|= bucket.count();
+            }
+            if (best_filter == null or estimate < smallest) {
+                best_filter = filter;
+                best_index = selected.?;
+                smallest = estimate;
+            }
+        }
+        const filter = best_filter orelse return null;
+        const values = if (filter.op == .in) filter.value.list else &.{filter.value};
+        const index = &self.staged_indexes.items[best_index];
+        var candidates: Positions = .empty;
+        for (values) |value| {
+            const hash = (try self.scalarHash(value)) orelse continue;
+            if (index.buckets.get(hash)) |bucket| {
+                for (bucket.keys()) |position| {
+                    try self.charge(1);
+                    try candidates.put(a, position, {});
+                }
+            }
+        }
+        const output = try a.alloc(usize, candidates.count());
+        @memcpy(output, candidates.keys());
+        try self.charge(output.len * (1 + std.math.log2_int(usize, @max(1, output.len))));
+        std.mem.sort(usize, output, self, stagedLess);
+        return output;
+    }
+    fn stagedLess(self: *Overlay, left: usize, right: usize) bool {
+        const x = self.nodes.items[left].value.identity;
+        const y = self.nodes.items[right].value.identity;
+        const tables = std.mem.order(u8, x.table, y.table);
+        return tables == .lt or (tables == .eq and std.mem.lessThan(u8, x.key, y.key));
+    }
     const Reference = struct { position: usize, version: usize };
     const Node = struct { value: *v.Node, deleted: bool = false, created: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
     const Relationship = struct { value: *v.Relationship, deleted: bool = false, created: bool = false, dirty: bool = false, version: usize = 0, from_base: bool = false };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_relationship = getRelationship, .expand = expand, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -246,6 +347,7 @@ pub const Overlay = struct {
         try self.node_positions.put(a, node.value.identity, self.nodes.items.len);
         self.nodes.appendAssumeCapacity(node);
         self.node_order = null;
+        if (node.dirty) try self.refreshStagedIndexes(self.nodes.items.len - 1);
     }
     fn findNode(self: *Overlay, identity: v.Identity) ?*Node {
         const position = self.node_positions.get(identity) orelse return null;
@@ -402,8 +504,10 @@ pub const Overlay = struct {
     fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) anyerror!b.Page(*const v.Node) {
         const self = cast(ptr);
         try checkpoint(ptr);
-        const filtered = self.base.vtable.scan_where orelse return scan(ptr, a, table, after, limit);
-        if (!self.active) return filtered(self.base.ptr, a, table, filters, after, limit);
+        if (!self.active) {
+            const filtered = self.base.vtable.scan_where orelse return scan(ptr, a, table, after, limit);
+            return filtered(self.base.ptr, a, table, filters, after, limit);
+        }
         if (!self.lazy or filters.len == 0) return scan(ptr, a, table, after, limit);
         return self.lazyNodes(a, table, filters, after, limit);
     }
@@ -433,8 +537,9 @@ pub const Overlay = struct {
             }
             return .{ .items = try found.toOwnedSlice(a), .examined = page.examined orelse page.items.len, .next = try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = page.next == null, .native = page.next }, .{}) };
         }
-        try self.prepareStagedOrder();
-        const order = self.staged_order.items;
+        const candidates = try self.stagedCandidates(a, table, filters);
+        if (candidates == null) try self.prepareStagedOrder();
+        const order = candidates orelse self.staged_order.items;
         if (cursor.offset > order.len) return error.CypherInvalidBackendCursor;
         var position = cursor.offset;
         if (position == 0) {
@@ -498,6 +603,36 @@ pub const Overlay = struct {
         if (!self.active) return self.base.vtable.get(self.base.ptr, a, identity);
         const node = (try self.ensureNode(a, identity)) orelse return null;
         return if (node.deleted) null else node.value;
+    }
+    fn getMany(ptr: *anyopaque, a: A, identities: []const v.Identity) ![]const ?*const v.Node {
+        const self = cast(ptr);
+        try checkpoint(ptr);
+        const output = try a.alloc(?*const v.Node, identities.len);
+        var pending: std.ArrayList(v.Identity) = .empty;
+        var offsets: std.ArrayList(usize) = .empty;
+        for (identities, output, 0..) |identity, *item, offset| {
+            item.* = null;
+            if (self.active) {
+                if (self.findNode(identity)) |node| {
+                    item.* = if (node.deleted) null else node.value;
+                    continue;
+                }
+                if (!self.lazy) continue;
+            }
+            try pending.append(a, identity);
+            try offsets.append(a, offset);
+        }
+        if (pending.items.len != 0) {
+            if (self.base.vtable.get_many) |batch| {
+                const nodes = try batch(self.base.ptr, a, pending.items);
+                if (nodes.len != pending.items.len) return error.CypherInvalidBackendPage;
+                for (nodes, pending.items, offsets.items) |node, identity, offset| {
+                    if (node) |value| if (!value.identity.eql(identity)) return error.CypherInvalidBackendPage;
+                    output[offset] = node;
+                }
+            } else for (pending.items, offsets.items) |identity, offset| output[offset] = try self.base.vtable.get(self.base.ptr, a, identity);
+        }
+        return output;
     }
     fn getRelationship(ptr: *anyopaque, a: A, identity: v.RelationshipIdentity) !?*const v.Relationship {
         const self = cast(ptr);
@@ -595,6 +730,7 @@ pub const Overlay = struct {
             try self.capacity();
             try self.appendNode(a, .{ .value = @constCast(copy), .deleted = postimage == null, .dirty = true });
         }
+        try self.refreshStagedIndexes(self.node_positions.get(identity).?);
         self.staged_read_documents = true;
         if (postimage != null) {
             try self.refreshDocumentRelationships(a, copy);
@@ -613,6 +749,7 @@ pub const Overlay = struct {
                 node.projection_cached = false;
                 if (self.base.vtable.normalize_node) |normalize| node.value.* = (try normalize(self.base.ptr, a, node.value, false)).*;
                 try self.relabel(a, node.value);
+                try self.refreshStagedIndexes(self.node_positions.get(identity).?);
                 try self.refreshDocumentRelationships(a, node.value);
             },
             .relationship => |identity| {
@@ -727,6 +864,7 @@ pub const Overlay = struct {
                 const current = self.findNode(deletion.identity).?;
                 current.deleted = true;
                 current.dirty = true;
+                try self.refreshStagedIndexes(self.node_positions.get(deletion.identity).?);
             },
         }
         try self.mutations.append(a, mutation);
@@ -752,6 +890,7 @@ pub const Overlay = struct {
         self.node_positions = .empty;
         self.node_order = null;
         self.staged_order = .empty;
+        self.staged_indexes = .empty;
         self.staged_order_valid = false;
         self.references = .empty;
         self.relationships = .empty;
