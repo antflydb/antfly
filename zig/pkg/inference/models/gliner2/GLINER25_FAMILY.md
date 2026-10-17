@@ -179,13 +179,16 @@ current CUDA attention kernel has a 512-token limit, which is enforced in
 planning and execution. A config accepting 7999 positions does not establish
 measured maximum-length performance or device qualification.
 
-The ModernBERT span path serves typed classification/Decide and, for the
-exact pinned FP32 artifact only, entity/relation extraction through its own
-marker span representations, GRU count slots, and span scoring heads (not the
-older DeBERTa CountLSTM implementation); see
+The ModernBERT span path serves typed classification/Decide. The exact pinned
+FP32 artifact also implements diagnostic entity/relation execution through its
+own marker span representations, GRU count slots, and span scoring heads; see
 [GLINER25.md](GLINER25.md#embedded-knowledge-graph-extraction-and-bounded-windows).
-The converted Q8 bundle does not advertise extraction. Pulling an unqualified decision artifact installs its bytes while
-withholding executable tasks and capabilities.
+Neither precision advertises entity/relation extraction: the retained upstream
+probes return empty results even at low thresholds. Numerical head parity
+alone does not establish useful graph extraction. See the
+[extraction investigation](../../scripts/gliner25/SPAN_1B_INVESTIGATION.md).
+Pulling an unqualified decision artifact withholds executable tasks and
+capabilities.
 
 The public 1B decision contract is separate from the encoder's saved position
 budget. For the exact pinned FP32 artifact it permits native or Metal, one
@@ -401,3 +404,90 @@ execution, maximum-length memory bounds, and throughput require separate
 evidence for each artifact/backend combination. See [GLINER25.md](GLINER25.md)
 for the boundary qualification policy and [GLINER25_DECIDE.md](GLINER25_DECIDE.md)
 for the existing DeBERTa Decide route.
+
+## Published split bundles and pull defaults (2026-10-17)
+
+Canonical repositories follow Fastino's checkpoint capitalization and omit a
+format suffix, matching `antflydb/gliner2-base-v1`'s multi-format repository
+layout:
+
+| Repository | Immutable layout revision | Current typed Decide contract |
+| --- | --- | --- |
+| [`antflydb/GLiNER2.5-Decide-1B`](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B) | `98ce73668cea4b940299396920671ec0a8abc57f` | Native/Metal, one item, one sequence, 198 complete prompt tokens |
+| [`antflydb/GLiNER2.5-Decide`](https://huggingface.co/antflydb/GLiNER2.5-Decide) | `358ae4b1263cedb79faf9e8b7984c3b4e5586874` | Not qualified; the DeBERTa Q8 exporter strips `decide` |
+
+The previous `gliner2.5-decide-1B-gguf` and `gliner2.5-decide-gguf` URLs redirect
+to these repositories. Both contain `gliner2-encoder.Q8_0.gguf`,
+`gliner2-head.Q8_0.gguf`, `antfly_inference_bundle.json`, and
+`antfly_inference_variants.json`. `Q8_0` in the pair's filenames identifies the
+bundle variant: auxiliary heads remain FP32. Renaming files changed none of
+the weight, tokenizer, or encoder configuration bytes. Historical captures and
+receipts retain their original paths; their `gliner_head.gguf` digest identifies
+the renamed head. The migration script is
+[`migrate_hub_bundles.py`](../../scripts/gliner25/migrate_hub_bundles.py).
+
+Pull selects a split bundle's encoder and head from its descriptor at the
+resolved immutable Hub commit. This supports the historical mixed-suffix
+layout as well as canonical paired filenames, rejects missing or unsafe
+references, and never substitutes an unrelated GGUF for a missing component.
+An explicitly requested quantization must match the declared encoder.
+
+Unversioned pulls of reviewed Fastino GLiNER2.5 checkpoints use the immutable
+revisions in `src/registry/gliner_catalog.zig`, including base-v1, multi-v1,
+multi-Decide, Decide, and Decide-1B. An explicit `:auto@main`, branch, tag or
+commit overrides that default and still undergoes loaded-artifact checks.
+This keeps an upstream configuration change from silently replacing the
+qualified artifact. Repository names and redirects do not grant capabilities.
+
+The SQL decision provider already emits one `state` per request in
+`antfly-embedded/src/functions/runtime.zig` (`Job.invoke`). Its `batch_size`
+controls concurrent independent requests, rather than combining several states
+into a model request. It need not be set to one for the 1B item limit; use one
+when serial admission is desirable on a memory-constrained host.
+
+Issue #1083 remains open for independently measured Q8 context expansion,
+non-empty upstream extraction evaluation, and ModernBERT span fine-tuning.
+The existing DeBERTa GLiNER trainer and the Laya trainer do not qualify a
+Decide-1B adapter. A future trainer must bind the exact encoder/head geometry,
+replay labeled decision and extraction holdouts, materialize a versioned bundle,
+and qualify that new artifact before publishing its capabilities. Neither the
+Hub rename nor existing FP32 evidence changes those requirements.
+
+### Q8 context probes
+
+The retained [Q8 probe receipt](../../testdata/gliner25/decide_1b_q8_context_probe.json)
+records 17 cases on Native and physical Metal: all 14 original frozen
+classification inputs plus independent upstream 55-, 65-, and 1024-token
+single-window captures. Each case ran one preflight and three measured
+invocations, with two CPU threads. Maximum raw-logit drift across the complete
+sweep was 0.02295 Native and 0.02270 Metal, below the predefined 0.05 probe
+tolerance. The 1024-token case alone differed by 0.001661 Native and 0.001581
+Metal. These timings describe a shared host, not a latency qualification.
+
+This is diagnostic evidence, not expanded serving qualification. It excludes
+HTTP/typed presentation, admission, schema splitting into 64 sequences, a
+natural-language long-context holdout, and non-empty extraction. The public Q8
+contract therefore remains one sequence of 198 tokens. Promotion requires
+those missing serving and calibration checks; FP32 evidence cannot substitute
+for Q8 measurements.
+
+Reproduce the capture with `benchmark-cases.json` and `validation.json` from
+the immutable bundle revision recorded in the receipt:
+
+```sh
+python3 zig/pkg/inference/scripts/gliner25/prepare_decide_quant_capture.py \
+  --cases /path/to/bundle/benchmark-cases.json \
+  --validation /path/to/bundle/validation.json --reference fp32 \
+  --window-reference zig/pkg/inference/src/extractors/testdata/knowledge_graph/decide_1b_windows.json \
+  --output /path/to/context-cases.json
+```
+
+Build `inference-bench-gliner-decide-quant-build` with Zig 0.17,
+`-Doptimize=fast -Dmetal=true -Dcuda=false`. Run the resulting
+`antfly-inference-gliner-decide-quant-bench` with `--model-dir` pointing to the
+complete canonical Q8 bundle, `--capture /path/to/context-cases.json`,
+`--backend native` or `metal`, `--warmups 0 --reps 3 --tolerance 0.05`, and
+`ANTFLY_INFERENCE_CPU_THREADS=2 VECLIB_MAXIMUM_THREADS=2`. Capture JSON stdout
+and diagnostic stderr separately. The capture preparer verifies the complete
+window-reference digest and excludes multi-window aggregate logits from raw
+per-sequence comparisons.

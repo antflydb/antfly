@@ -83,7 +83,7 @@ const legacy_tokenizer_config = FilePin{ .path = "tokenizer_config.json", .size_
 pub const decide_1b_production_qualified = true;
 const decide_1b_weight = FilePin{ .path = "model.safetensors", .size_bytes = 4_755_208_228, .sha256 = "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3" };
 const decide_1b_q8_encoder = FilePin{ .path = "gliner2-encoder.Q8_0.gguf", .size_bytes = 1_118_356_576, .sha256 = "9ba4aea751bc8ce3586e70c4dfb3db93d0a850da5023b39d1bb68d21247f1694" };
-const decide_1b_q8_head = FilePin{ .path = "gliner_head.gguf", .size_bytes = 617_195_872, .sha256 = "9a6c1a8ae0f58158404ea6875012e0c27e5923188906492ec7d948968741f558" };
+const decide_1b_q8_head = FilePin{ .path = "gliner2-head.Q8_0.gguf", .size_bytes = 617_195_872, .sha256 = "9a6c1a8ae0f58158404ea6875012e0c27e5923188906492ec7d948968741f558" };
 const decide_1b_config = FilePin{ .path = "config.json", .size_bytes = 464, .sha256 = "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2" };
 const decide_1b_encoder_config = FilePin{ .path = "encoder_config/config.json", .size_bytes = 2160, .sha256 = "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d" };
 const decide_1b_tokenizer = FilePin{ .path = "tokenizer.json", .size_bytes = 3_585_055, .sha256 = "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb" };
