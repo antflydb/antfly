@@ -767,7 +767,10 @@ pub const HashJoin = struct {
         }
         needed +|= self.value_columns.dictionaryGrowthBytes(batch.len()) *| 2;
         needed +|= self.key_columns.dictionaryGrowthBytes(keys.len) *| 2;
-        if (needed > self.budget.limit / 2 -| self.budget.live) return false;
+        // A final single row may cross the soft halfway mark, as scalar
+        // admission historically did. The allocator retains the hard ceiling.
+        const ceiling = if (keys.len == 1 and self.budget.live <= self.budget.limit / 2) self.budget.limit else self.budget.limit / 2;
+        if (needed > ceiling -| self.budget.live) return false;
         const hashes = try @import("batch_hash.zig").rows(a, keys, false);
         defer a.free(hashes);
         const retained = self.budget.allocator();
@@ -784,38 +787,58 @@ pub const HashJoin = struct {
         self.row_count += keys.len;
         return true;
     }
-    /// Gather each build row into reusable scratch and admit it directly into
-    /// retained typed state. Native payloads are copied exactly once.
+    /// Find a fitting native prefix without decoding rejected payloads. Each
+    /// failed reservation leaves retained state unchanged; descriptors are
+    /// reclaimed between attempts and source leases remain pinned by callers.
+    fn admitPrefix(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !usize {
+        if (self.disk != null) return 0;
+        var count = keys.len - begin;
+        var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
+        defer scratch.deinit();
+        while (count != 0) : (count /= 2) {
+            _ = scratch.reset(.retain_capacity);
+            const work = scratch.allocator();
+            const positions = try work.alloc(usize, count);
+            for (positions, begin..) |*position, index| position.* = index;
+            const selected = try batch.select(work, positions);
+            if (try self.admitBatch(work, selected, keys[begin..][0..count])) return count;
+        }
+        return 0;
+    }
+    /// Keep encoded columns through partial memory admission. Only the legacy
+    /// row-oriented disk chain or a genuinely oversized row needs scalar input.
     pub fn addBatch(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum) !void {
-        if (batch.len() != keys.len) return error.InvalidSqlBackendResponse;
-        if (try self.admitBatch(a, batch, keys)) return;
+        if (batch.len() != keys.len or self.sealed) return error.InvalidSqlBackendResponse;
+        if (keys.len > self.limits.rows -| self.row_count) return error.SqlProgramLimitExceeded;
+        var begin: usize = 0;
+        while (begin != keys.len) {
+            const count = try self.admitPrefix(a, batch, keys, begin);
+            if (count == 0) break;
+            begin += count;
+        }
+        if (begin == keys.len) return;
         const values = try a.alloc(Datum, batch.width());
         defer a.free(values);
-        var scratch = std.heap.ArenaAllocator.init(a);
+        var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
         defer scratch.deinit();
-        for (keys, 0..) |key, index| {
+        for (keys[begin..], begin..) |key, index| {
             _ = scratch.reset(.retain_capacity);
             for (values, 0..) |*value, column| value.* = try batch.cell(scratch.allocator(), index, column);
             try self.add(values, key);
         }
     }
-    /// Retain a bounded prefix without creating an intermediate disk chain.
-    /// The caller transfers this prefix once to its Grace partition sink.
+    /// Retain the largest affordable native prefix before transferring the
+    /// remainder to Grace partitions. Failed sizing never constructs a DOM.
     pub fn addBatchUntilFull(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum) !usize {
-        if (batch.len() != keys.len or self.disk != null) return error.InvalidSqlBackendResponse;
-        if (try self.admitBatch(a, batch, keys)) return keys.len;
-        const values = try a.alloc(Datum, batch.width());
-        defer a.free(values);
-        var scratch = std.heap.ArenaAllocator.init(a);
-        defer scratch.deinit();
-        for (keys, 0..) |key, index| {
-            _ = scratch.reset(.retain_capacity);
-            for (values, 0..) |*value, column| value.* = try batch.cell(scratch.allocator(), index, column);
-            const estimate = 4096 +| (try self.value_columns.appendBytes(values)) *| 4 +| (try self.key_columns.appendBytes(key)) *| 4;
-            if (self.budget.live > self.budget.limit / 2 or estimate > self.budget.limit -| self.budget.live) return index;
-            try self.add(values, key);
+        if (batch.len() != keys.len or self.disk != null or self.sealed) return error.InvalidSqlBackendResponse;
+        if (keys.len > self.limits.rows -| self.row_count) return error.SqlProgramLimitExceeded;
+        var begin: usize = 0;
+        while (begin != keys.len) {
+            const count = try self.admitPrefix(a, batch, keys, begin);
+            if (count == 0) break;
+            begin += count;
         }
-        return keys.len;
+        return begin;
     }
     fn addInner(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
         if (self.sealed or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
@@ -2686,4 +2709,84 @@ test "SQL encoded JSON hash join admission and repeated matches reuse retained p
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+const EncodedAdmissionFixture = struct {
+    bytes: []const u8,
+    scalar_reads: usize = 0,
+    allow_scalar: bool = false,
+    fn json(raw: *anyopaque, _: usize, _: usize) !?[]const u8 {
+        return @as(*@This(), @ptrCast(@alignCast(raw))).bytes;
+    }
+    fn cell(raw: *anyopaque, a: Allocator, _: usize, _: usize) !Datum {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.scalar_reads += 1;
+        if (!self.allow_scalar) return error.UnexpectedScalarMaterialization;
+        return Datum.json(try std.json.parseFromSliceLeaky(Json, a, self.bytes, .{ .parse_numbers = false }));
+    }
+    const Measurement = struct { count: usize, scalar_reads: usize, peak: usize, retained: usize };
+    fn run(a: Allocator, bytes: []const u8, limit: usize, count: usize, baseline: bool) !Measurement {
+        var budget: MemoryBudget = .{ .backing = a, .limit = 128 << 20 };
+        var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+        defer scratch.deinit();
+        const work = scratch.allocator();
+        const join = try HashJoin.create(budget.allocator(), .{ .bytes = limit });
+        defer join.deinit();
+        var source: @This() = .{ .bytes = bytes, .allow_scalar = baseline };
+        const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &source, .read = cell, .read_json = json, .count = count, .width = 1 } };
+        const values = try work.alloc(Datum, count);
+        const keys = try work.alloc([]const Datum, count);
+        for (values, keys, 0..) |*value, *key, index| {
+            value.* = Datum.json(.{ .integer = @intCast(index) });
+            key.* = @as(*[1]Datum, @ptrCast(value));
+        }
+        var admitted: usize = 0;
+        if (baseline) {
+            // Reference the former whole-batch-or-scalar algorithm.
+            if (try join.admitBatch(work, batch, keys)) admitted = count else {
+                var row_scratch = std.heap.ArenaAllocator.init(budget.allocator());
+                defer row_scratch.deinit();
+                for (keys, 0..) |key, index| {
+                    _ = row_scratch.reset(.retain_capacity);
+                    const value = try batch.cell(row_scratch.allocator(), index, 0);
+                    const estimate = 4096 +| (try join.value_columns.appendBytes(&.{value})) *| 4 +| (try join.key_columns.appendBytes(key)) *| 4;
+                    if (join.budget.live > join.budget.limit / 2 or estimate > join.budget.limit -| join.budget.live) break;
+                    try join.add(&.{value}, key);
+                    admitted += 1;
+                }
+            }
+        } else admitted = try join.addBatchUntilFull(work, batch, keys);
+        if (!baseline) {
+            try std.testing.expectEqual(@as(usize, 0), source.scalar_reads);
+            try std.testing.expect(admitted > 0);
+            for (0..admitted) |index| try std.testing.expectEqualStrings(bytes, (try join.value_columns.encodedJson(index, 0)).?);
+        }
+        return .{ .count = admitted, .scalar_reads = source.scalar_reads, .peak = budget.peak, .retained = join.budget.peak };
+    }
+};
+test "SQL encoded JSON join partial admission retains native prefixes through quota and allocation failures" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const result = try EncodedAdmissionFixture.run(a, "[1,2,3]", 64 << 10, 256, false);
+            try std.testing.expect(result.count < 256);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+test "native projection refinements benchmark encoded join prefix admission" {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    var text: std.Io.Writer.Allocating = .init(source.allocator());
+    try text.writer.writeByte('[');
+    for (0..1024) |i| {
+        if (i != 0) try text.writer.writeByte(',');
+        try text.writer.writeAll("{\"x\":1,\"s\":\"nested value\"}");
+    }
+    try text.writer.writeByte(']');
+    const before = try EncodedAdmissionFixture.run(std.testing.allocator, text.written(), 8 << 20, 64, true);
+    const after = try EncodedAdmissionFixture.run(std.testing.allocator, text.written(), 8 << 20, 64, false);
+    try std.testing.expectEqual(@as(usize, 64), after.count);
+    try std.testing.expect(before.count < after.count and before.retained > after.retained);
+    std.debug.print("JOIN_PREFIX before_rows={d} after_rows={d} before_scalar_reads={d} after_scalar_reads={d} before_retained_peak={d} after_retained_peak={d} before_backing_peak={d} after_backing_peak={d} wire_per_row={d}\n", .{ before.count, after.count, before.scalar_reads, after.scalar_reads, before.retained, after.retained, before.peak, after.peak, text.written().len });
 }

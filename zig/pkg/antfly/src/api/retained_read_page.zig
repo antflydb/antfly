@@ -318,7 +318,7 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
             const encoded = try r.required();
             if (!std.mem.startsWith(u8, encoded, if (compact) "NCB\x02" else block_magic)) return error.InvalidRetainedReadPage;
             try cache_blocks.ensureUnusedCapacity(a, 1);
-            block.* = try spill.decodeColumnarBlockWithCache(a, alloc, encoded, max_bytes);
+            block.* = try spill.decodeColumnarBlockForForwarding(a, alloc, encoded, max_bytes);
             cache_blocks.appendAssumeCapacity(block.*);
             if (block.count() != n or block.values.len != k or block.keys.len != 0) return error.InvalidRetainedReadPage;
             for (rows[first..][0..n], 0..) |row, index| {

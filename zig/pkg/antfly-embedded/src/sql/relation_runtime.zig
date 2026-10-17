@@ -1033,6 +1033,20 @@ fn Engine(comptime Context: type) type {
                     view.deinit();
                     self.join_view = null;
                 }
+                if (self.node.operation == .join and self.node.operation.join.membership == null and
+                    !Adapter.hasPatterns(self.node, 0) and
+                    (self.node.operation.join.condition == null or !@import("decision_eval.zig").hasExternal(&self.node.operation.join.condition.?)))
+                {
+                    const join = self.node.operation.join;
+                    self.prepareJoin(join) catch |err| {
+                        if (failure) |out| {
+                            out.* = err;
+                            return .{ .rows = &.{} };
+                        }
+                        return err;
+                    };
+                    if (self.partition_join == null) return self.nextHashJoinBatch(a, maximum, join, failure);
+                }
                 if (self.partition_join) |join| if (try join.nextTypedBatch(maximum)) |view| {
                     self.join_view = view;
                     const source = try a.create(@import("execution_batch.zig").Batch);
@@ -1989,8 +2003,165 @@ fn Engine(comptime Context: type) type {
                 };
                 return output;
             }
-            fn nextJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
-                if (join.membership != null) return self.nextMembership(alloc, join);
+            const JoinRow = struct { probe: ?usize, build: ?usize };
+            /// The iterator pins one probe cohort and its sealed build relation
+            /// until the next pull. Only bounded row-pair descriptors are staged.
+            const JoinBatch = struct {
+                probe: @import("execution_batch.zig").Batch,
+                build: *const @import("typed_store.zig").Store,
+                rows: []const JoinRow,
+                left_width: usize,
+                width: usize,
+                flipped: bool,
+                probe_complete: bool = true,
+                build_complete: bool = true,
+                const Location = struct { build: bool, index: ?usize, column: usize };
+                fn locate(self: @This(), row: usize, column: usize) !Location {
+                    if (row >= self.rows.len or column >= self.width) return error.InvalidSqlBackendResponse;
+                    const build = (column < self.left_width) == self.flipped;
+                    return .{ .build = build, .index = if (build) self.rows[row].build else self.rows[row].probe, .column = if (column < self.left_width) column else column - self.left_width };
+                }
+                fn cell(raw: *anyopaque, a: Allocator, row: usize, column: usize) anyerror!Datum {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const source = try self.locate(row, column);
+                    const index = source.index orelse return .{};
+                    return if (source.build) self.build.cell(a, index, source.column) else self.probe.cell(a, index, source.column);
+                }
+                fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const source = try self.locate(row, column);
+                    const index = source.index orelse return null;
+                    return if (source.build) self.build.encodedJson(index, source.column) else self.probe.encodedJson(index, source.column);
+                }
+                fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const source = try self.locate(row, column);
+                    const index = source.index orelse return null;
+                    return if (source.build) self.build.frozenJson(index, source.column) else self.probe.frozenJson(index, source.column);
+                }
+                fn identity(raw: *anyopaque, row: usize, column: usize) anyerror!?u64 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const source = try self.locate(row, column);
+                    // Identity availability must be uniform across the batch.
+                    // A producer may use every u64 identity, so an outer NULL
+                    // cannot safely borrow an otherwise unused sentinel.
+                    if (!(if (source.build) self.build_complete else self.probe_complete)) return null;
+                    const index = source.index orelse return null;
+                    return if (source.build) self.build.dictionaryId(index, source.column) else self.probe.dictionaryIdentity(index, source.column);
+                }
+                fn bytes(self: @This(), a: Allocator, row: usize) !usize {
+                    var total: usize = 0;
+                    for (0..self.width) |column| {
+                        const source = try self.locate(row, column);
+                        const index = source.index orelse continue;
+                        total +|= if (source.build) try self.build.cellBytes(a, index, source.column) else try self.probe.cellBytes(a, index, source.column);
+                    }
+                    return total;
+                }
+                fn conditionValues(self: *@This(), a: Allocator, program: scalar.Program) ![]const Datum {
+                    const values = try a.alloc(Datum, self.width);
+                    @memset(values, .{});
+                    const loaded = try a.alloc(bool, self.width);
+                    @memset(loaded, false);
+                    // Predicates reference bound column slots. Unreferenced
+                    // JSON payloads stay encoded even when ON has a residual.
+                    for (program.instructions) |instruction| if (instruction.operation == .column) {
+                        const column = instruction.operation.column;
+                        if (column >= self.width) return error.InvalidSqlBackendResponse;
+                        if (!loaded[column]) {
+                            values[column] = try cell(self, a, 0, column);
+                            loaded[column] = true;
+                        }
+                    };
+                    return values;
+                }
+                fn batch(self: *@This()) @import("execution_batch.zig").Batch {
+                    return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_identity = identity, .count = self.rows.len, .width = self.width } };
+                }
+            };
+            fn nextJoinRow(self: *Iterator, join: JoinPlan, may_advance: bool) anyerror!?JoinRow {
+                const kind = if (self.flipped_join) switch (join.kind) {
+                    .right => .left,
+                    .left => .right,
+                    else => join.kind,
+                } else join.kind;
+                while (true) {
+                    try self.engine.checkpoint();
+                    if (self.probe) |*probe| {
+                        while (try probe.next()) |match| {
+                            try self.engine.checkpoint();
+                            const pair: JoinRow = .{ .probe = self.probe_index - 1, .build = match.index };
+                            if (join.condition) |program| {
+                                _ = self.scratch.reset(.retain_capacity);
+                                var candidate: JoinBatch = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = &.{pair}, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join };
+                                const values = try candidate.conditionValues(self.scratch.allocator(), program);
+                                const accepted = try self.engine.context.evaluate(self.scratch.allocator(), program, values);
+                                if (accepted.sql_null) continue;
+                                if (accepted.value != .bool) return error.SqlTypeMismatch;
+                                if (!accepted.value.bool) continue;
+                            }
+                            self.left_matched = true;
+                            try self.hash_join.?.markMatched(match.index);
+                            return pair;
+                        }
+                        self.probe = null;
+                        if (!self.left_matched and (kind == .left or kind == .full))
+                            return .{ .probe = self.probe_index - 1, .build = null };
+                    }
+                    if (self.eof) {
+                        if (kind == .right or kind == .full) if (try self.hash_join.?.unmatched(&self.unmatched_index)) |match|
+                            return .{ .probe = null, .build = match.index };
+                        return null;
+                    }
+                    if (self.probe_index == self.probe_payload.len()) {
+                        // Previously delivered pairs still borrow this cohort.
+                        if (!may_advance) return null;
+                        if (!try self.fillProbes(if (self.flipped_join) join.right_keys else join.left_keys)) {
+                            self.eof = true;
+                            continue;
+                        }
+                    }
+                    if (self.probe_errors[self.probe_index]) |err| return err;
+                    self.left_values = null;
+                    self.left_matched = false;
+                    self.probe = self.probe_batch[self.probe_index];
+                    self.probe_index += 1;
+                }
+            }
+            fn nextHashJoinBatch(self: *Iterator, a: Allocator, maximum: usize, join: JoinPlan, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+                var rows: std.ArrayList(JoinRow) = .empty;
+                var bytes: usize = 0;
+                while (rows.items.len < maximum) {
+                    const pair = (self.nextJoinRow(join, rows.items.len == 0) catch |err| blk: {
+                        if (failure) |out| {
+                            out.* = err;
+                            break :blk null;
+                        }
+                        return err;
+                    }) orelse break;
+                    _ = self.scratch.reset(.retain_capacity);
+                    const candidate: JoinBatch = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = &.{pair}, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join };
+                    const cost = candidate.bytes(self.scratch.allocator(), 0) catch |err| {
+                        if (failure) |out| {
+                            out.* = err;
+                            break;
+                        }
+                        return err;
+                    };
+                    try rows.append(a, pair);
+                    bytes +|= cost;
+                    if (bytes >= self.engine.context.limits.retained_bytes / 32) break;
+                }
+                const view = try a.create(JoinBatch);
+                view.* = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = rows.items, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join };
+                for (rows.items) |row| {
+                    if (row.probe == null) view.probe_complete = false;
+                    if (row.build == null) view.build_complete = false;
+                }
+                return view.batch();
+            }
+            const JoinPlan = @FieldType(@FieldType(binding.Node, "operation"), "join");
+            fn prepareJoin(self: *Iterator, join: JoinPlan) anyerror!void {
                 const kind = if (self.flipped_join) switch (join.kind) {
                     .right => .left,
                     .left => .right,
@@ -2002,7 +2173,7 @@ fn Engine(comptime Context: type) type {
                     self.hash_join = cached;
                     self.borrowed_hash = true;
                 };
-                if (self.partition_join != null) return self.nextPartitionJoin(alloc, join);
+                if (self.partition_join != null) return;
                 if (self.hash_join == null) {
                     self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill });
                     if (!shared and kind != .left and kind != .full) try self.prepareScanFilter(if (self.flipped_join) join.right_keys else join.left_keys);
@@ -2073,13 +2244,23 @@ fn Engine(comptime Context: type) type {
                         // decode arena before building or probing a partition;
                         // return expressions execute before deferred cleanup.
                         _ = scratch.reset(.free_all);
-                        return self.nextPartitionJoin(alloc, join);
+                        return;
                     }
                     if (shared) {
                         try self.engine.static_hashes.put(self.engine.cache_arena.allocator(), self.node, self.hash_join.?);
                         self.borrowed_hash = true;
                     }
                 }
+            }
+            fn nextJoin(self: *Iterator, alloc: Allocator, join: JoinPlan) anyerror!?[]const Datum {
+                if (join.membership != null) return self.nextMembership(alloc, join);
+                try self.prepareJoin(join);
+                if (self.partition_join != null) return self.nextPartitionJoin(alloc, join);
+                const kind = if (self.flipped_join) switch (join.kind) {
+                    .right => .left,
+                    .left => .right,
+                    else => join.kind,
+                } else join.kind;
                 while (true) {
                     try self.engine.checkpoint();
                     if (self.probe) |*probe| {
@@ -2423,4 +2604,383 @@ test "SQL prepared native batches avoid row matrices across memory and spill blo
             try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ mode, false, project });
         }
     }
+}
+
+const EncodedJoinFixture = struct {
+    flip: bool = false,
+    allow_scalar: bool = false,
+    probe_error_after: ?usize = null,
+    scalar_reads: usize = 0,
+    frozen_payloads: ?[5]@import("execution_batch.zig").FrozenJson = null,
+    opened: usize = 0,
+    closed: usize = 0,
+    payloads: [5][]const u8 = .{ "{\"side\":\"L0\"}", "{\"side\":\"L1\"}", "{\"side\":\"R0\"}", "{\"side\":\"R1\"}", "{\"side\":\"R2\"}" },
+    fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+        return .{ .id = if (std.mem.eql(u8, name.table, "left_docs")) 1 else 2, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "k", .path = "k", .type = .integer }, .{ .name = "j", .path = "j", .type = .json } } };
+    }
+    const Cursor = struct {
+        a: Allocator,
+        fixture: *EncodedJoinFixture,
+        right: bool,
+        offset: usize = 0,
+        const Window = struct {
+            fixture: *EncodedJoinFixture,
+            right: bool,
+            begin: usize,
+            fn payload(self: @This(), row: usize) []const u8 {
+                return self.fixture.payloads[self.begin + row + if (self.right) @as(usize, 2) else 0];
+            }
+            fn cell(raw: *anyopaque, a: Allocator, row: usize, column: usize) !Datum {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (column == 0) return Datum.json(.{ .integer = if (self.right) ([_]i64{ 1, 1, 3 })[self.begin + row] else ([_]i64{ 1, 2 })[self.begin + row] });
+                self.fixture.scalar_reads += 1;
+                if (!self.fixture.allow_scalar) return error.UnexpectedScalarMaterialization;
+                return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, self.payload(row), .{ .parse_numbers = false }));
+            }
+            fn identity(raw: *anyopaque, row: usize, column: usize) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (column != 0) return null;
+                return @intCast(if (self.right) ([_]i64{ 1, 1, 3 })[self.begin + row] else ([_]i64{ 1, 2 })[self.begin + row]);
+            }
+            fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (column != 1) return null;
+                const values = self.fixture.frozen_payloads orelse return null;
+                return values[self.begin + row + if (self.right) @as(usize, 2) else 0];
+            }
+            fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (column == 1 and self.fixture.frozen_payloads != null) return error.UnexpectedTextMaterialization;
+                return if (column == 1) self.payload(row) else null;
+            }
+        };
+        fn columns(raw: *anyopaque, a: Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const total: usize = if (self.right) 3 else 2;
+            const cutoff = if (self.right == self.fixture.flip) self.fixture.probe_error_after else null;
+            if (cutoff) |at| if (self.offset >= at) return error.EncodedJoinProbeFailure;
+            const end = @min(@min(total, cutoff orelse total), self.offset + @min(limit, 2));
+            const window = try a.create(Window);
+            window.* = .{ .fixture = self.fixture, .right = self.right, .begin = self.offset };
+            const batch = try a.create(@import("execution_batch.zig").Batch);
+            batch.* = .{ .reader = .{ .ptr = window, .read = Window.cell, .read_identity = Window.identity, .read_json = Window.json, .read_frozen = Window.frozen, .count = end - self.offset, .width = 2 } };
+            const selection = try a.alloc(usize, batch.len());
+            for (selection, 0..) |*position, index| position.* = index;
+            self.offset = end;
+            return .{ .native = .{ .values = batch, .names = &.{ "k", "j" } }, .selection = selection, .after = if (end < total) "more" else null };
+        }
+        fn rows(_: *anyopaque, _: Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedRowAdapter;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.fixture.closed += 1;
+            self.a.destroy(self);
+        }
+    };
+    fn open(raw: *anyopaque, a: Allocator, table: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+        const fixture: *@This() = @ptrCast(@alignCast(raw));
+        const right = table.id == 2;
+        const cursor = try a.create(Cursor);
+        cursor.* = .{ .a = a, .fixture = fixture, .right = right };
+        fixture.opened += 1;
+        return .{ .ptr = cursor, .next = Cursor.rows, .next_columns = Cursor.columns, .close = Cursor.close, .estimated_rows = if (right == fixture.flip) 100 else 1 };
+    }
+    const Read = struct {
+        a: Allocator,
+        cursors: []catalog.Cursor,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (self.cursors) |cursor| cursor.close(cursor.ptr);
+            self.a.free(self.cursors);
+            self.a.destroy(self);
+        }
+    };
+    fn capture(raw: *anyopaque, a: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+        const owner = try a.create(Read);
+        errdefer a.destroy(owner);
+        const cursors = try a.alloc(catalog.Cursor, scans.len);
+        errdefer a.free(cursors);
+        var opened: usize = 0;
+        errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+        for (scans, cursors) |scan, *cursor| {
+            cursor.* = (try open(raw, a, scan.table, scan.request)).?;
+            opened += 1;
+        }
+        owner.* = .{ .a = a, .cursors = cursors };
+        return .{ .ptr = owner, .cursors = cursors, .close = Read.close };
+    }
+    fn check(_: *anyopaque) !void {}
+    fn backend(self: *@This()) catalog.Backend {
+        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = check, .open_scan = open, .open_statement = capture } };
+    }
+};
+
+test "SQL encoded JSON join batches preserve residual outer rows flips and retained page ownership" {
+    const Fixture = struct {
+        fn run(a: Allocator, flip: bool, kind: []const u8, pull: u32, reject: bool, frozen_mode: bool) !void {
+            var fixture: EncodedJoinFixture = .{ .flip = flip };
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            var blocks: std.ArrayList(@import("spill.zig").ColumnarBlock) = .empty;
+            defer {
+                for (blocks.items) |block| block.deinit();
+                blocks.deinit(a);
+            }
+            if (frozen_mode) {
+                var payloads: [5]@import("execution_batch.zig").FrozenJson = undefined;
+                for (fixture.payloads, &payloads) |text, *payload| {
+                    var root = try std.json.parseFromSliceLeaky(std.json.Value, sa, text, .{});
+                    try root.object.put(sa, "native", .{ .integer = 9007199254740993 });
+                    const rows = [_]operators.Row{.{ .values = &.{Datum.json(root)}, .keys = &.{}, .ordinal = 0 }};
+                    const encoded = try @import("spill.zig").encodeColumnarBlockVersionAlloc(sa, &rows, 1 << 20, .v2);
+                    try blocks.ensureUnusedCapacity(a, 1);
+                    const block = try @import("spill.zig").decodeColumnarBlockForForwarding(sa, a, encoded, 1 << 20);
+                    blocks.appendAssumeCapacity(block);
+                    payload.* = (try block.frozenJson(0, 0, false)).?;
+                }
+                fixture.frozen_payloads = payloads;
+            }
+            const query = try std.fmt.allocPrint(a, "SELECT l.j AS lj,r.j AS rj FROM left_docs l {s} JOIN right_docs r ON l.k=r.k{s}", .{ kind, if (reject) " AND l.k+r.k>100" else "" });
+            defer a.free(query);
+            var compiled = try @import("compiler.zig").compile(a, query, .{});
+            defer compiled.deinit();
+            var mask: u8 = 0;
+            var count: usize = 0;
+            {
+                const stream = (try @import("read_stream.zig").Stream.open(a, fixture.backend(), &compiled, &.{}, .{ .execution_batch_rows = 3, .page_rows = pull })).?;
+                defer stream.close();
+                var first = try stream.nextBatch(pull);
+                defer first.deinit();
+                const retained = if (first.values.len() == 0) null else if (try first.values.frozenJson(0, 0)) |value| value.bytes else try first.values.encodedJson(0, 0);
+                const Consume = struct {
+                    fn page(page_: *@import("read_stream.zig").BatchPage, rows: *usize, seen: *u8) !void {
+                        for (0..page_.values.len()) |row| {
+                            var labels: [2]?[]const u8 = .{ null, null };
+                            for (&labels, 0..) |*label, column| {
+                                const text = if (try page_.values.frozenJson(row, column)) |value| try @import("spill.zig").frozenJsonText(page_.arena.allocator(), value) else try page_.values.encodedJson(row, column);
+                                if (text) |bytes| {
+                                    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, page_.arena.allocator(), bytes, .{});
+                                    label.* = parsed.object.get("side").?.string;
+                                } else try std.testing.expect((try page_.values.cell(page_.arena.allocator(), row, column)).sql_null);
+                            }
+                            const bit: u3 = if (labels[0]) |left| if (labels[1]) |right| if (std.mem.eql(u8, right, "R0")) @as(u3, 0) else 1 else if (std.mem.eql(u8, left, "L0")) @as(u3, 4) else 2 else if (std.mem.eql(u8, labels[1].?, "R2")) @as(u3, 3) else if (std.mem.eql(u8, labels[1].?, "R0")) @as(u3, 5) else 6;
+                            seen.* |= @as(u8, 1) << bit;
+                            rows.* += 1;
+                        }
+                    }
+                };
+                try Consume.page(&first, &count, &mask);
+                var exhausted = first.exhausted;
+                while (!exhausted) {
+                    var next = try stream.nextBatch(pull);
+                    defer next.deinit();
+                    try Consume.page(&next, &count, &mask);
+                    exhausted = next.exhausted;
+                }
+                if (retained) |text| {
+                    const current = if (try first.values.frozenJson(0, 0)) |value| value.bytes else (try first.values.encodedJson(0, 0)).?;
+                    try std.testing.expectEqualSlices(u8, text, current);
+                }
+            }
+            const expected: u8 = if (reject) 124 else if (std.mem.eql(u8, kind, "FULL")) 15 else if (std.mem.eql(u8, kind, "LEFT")) 7 else if (std.mem.eql(u8, kind, "RIGHT")) 11 else 3;
+            try std.testing.expectEqual(expected, mask);
+            try std.testing.expectEqual(@as(usize, @popCount(expected)), count);
+            try std.testing.expectEqual(@as(usize, 0), fixture.scalar_reads);
+            try std.testing.expectEqual(fixture.opened, fixture.closed);
+        }
+    };
+    for ([_]bool{ false, true }) |frozen_mode| for ([_]bool{ false, true }) |flip| for ([_]u32{ 1, 3 }) |pull| {
+        for ([_][]const u8{ "INNER", "LEFT", "RIGHT", "FULL" }) |kind| try Fixture.run(std.testing.allocator, flip, kind, pull, false, frozen_mode);
+        try Fixture.run(std.testing.allocator, flip, "FULL", pull, true, frozen_mode);
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ true, @as([]const u8, "FULL"), @as(u32, 3), true, true });
+}
+
+test "native projection refinements benchmark encoded join output" {
+    const Measure = struct {
+        const Result = struct { ns: i96, peak: usize, reads: usize, checksum: u64, rows: usize };
+        fn now() i96 {
+            if (comptime @import("builtin").link_libc and (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .linux)) {
+                var stamp: std.c.timespec = undefined;
+                if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("thread CPU clock unavailable");
+                return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
+            }
+            return @import("antfly_platform").time.monotonicNs();
+        }
+        fn run(native: bool, payloads: [5][]const u8) !Result {
+            const Runtime = @import("runtime.zig");
+            var fixture: EncodedJoinFixture = .{ .payloads = payloads, .allow_scalar = !native };
+            const a = std.testing.allocator;
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            var compiled = try @import("compiler.zig").compile(a, "SELECT l.j,r.j FROM left_docs l JOIN right_docs r ON l.k=r.k", .{});
+            defer compiled.deinit();
+            const bound = try describe.bind(sa, fixture.backend(), &compiled, &.{});
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 128 << 20 };
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            const start = now();
+            const owner = try Source(Runtime.Context).create(.{ .alloc = budget.allocator(), .arena = arena.allocator(), .backend = fixture.backend(), .binding = bound, .parameters = &.{}, .limits = .{ .retained_bytes = 8 << 20, .execution_batch_rows = 4 }, .typed_output = true });
+            defer owner.close();
+            const iterator = owner.iterator.?;
+            try std.testing.expect(iterator.node.operation == .join);
+            var page = std.heap.ArenaAllocator.init(budget.allocator());
+            defer page.deinit();
+            var hash = std.hash.Wyhash.init(0);
+            var count: usize = 0;
+            while (true) {
+                _ = page.reset(.free_all);
+                const work = page.allocator();
+                if (native) {
+                    const batch = try iterator.nextBatch(work, 4, null);
+                    if (batch.len() == 0) break;
+                    try std.testing.expect(batch != .rows);
+                    for (0..batch.len()) |row| {
+                        for (iterator.node.columns, 0..) |definition, column| if (definition.type == .json) {
+                            const bytes = try batch.encodedJson(row, column);
+                            try std.testing.expect(bytes != null);
+                            hash.update(bytes.?);
+                        };
+                        count += 1;
+                    }
+                } else {
+                    // Reference scalar match reconstruction and the deep copy
+                    // formerly required by Iterator.nextBatch before delivery.
+                    const values = try iterator.next(work) orelse break;
+                    const copied = try work.alloc(Datum, values.len);
+                    for (values, copied) |value, *out| out.* = try operators.cloneDatum(work, value);
+                    for (iterator.node.columns, 0..) |definition, column| if (definition.type == .json) {
+                        hash.update(try std.json.Stringify.valueAlloc(work, copied[column].value, .{}));
+                    };
+                    count += 1;
+                }
+            }
+            const elapsed = now() - start;
+            try std.testing.expectEqual(@as(usize, 2), count);
+            return .{ .ns = elapsed, .peak = budget.peak, .reads = fixture.scalar_reads, .checksum = hash.final(), .rows = count };
+        }
+    };
+    var input = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer input.deinit();
+    const a = input.allocator();
+    var payloads: [5][]const u8 = undefined;
+    for (&payloads, [_][]const u8{ "L0", "L1", "R0", "R1", "R2" }) |*payload, label| {
+        var text: std.Io.Writer.Allocating = .init(a);
+        try text.writer.print("{{\"side\":\"{s}\",\"items\":[", .{label});
+        for (0..4096) |i| {
+            if (i != 0) try text.writer.writeByte(',');
+            try text.writer.writeAll("{\"x\":1,\"s\":\"nested value\"}");
+        }
+        try text.writer.writeAll("]}");
+        payload.* = text.written();
+    }
+    _ = try Measure.run(false, payloads);
+    _ = try Measure.run(true, payloads);
+    for (0..5) |sample| {
+        const first = try Measure.run(sample % 2 != 0, payloads);
+        const second = try Measure.run(sample % 2 == 0, payloads);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        try std.testing.expectEqual(@as(usize, 0), after.reads);
+        try std.testing.expect(after.peak < before.peak);
+        std.debug.print("ENCODED_JOIN_OUTPUT sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} before_scalar_reads={d} after_scalar_reads={d} rows={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.reads, after.reads, after.rows });
+    }
+}
+
+test "SQL encoded JSON join batches distinguish JSON null from outer SQL NULL" {
+    const Fixture = struct {
+        fn run(a: Allocator, flip: bool) !void {
+            var fixture: EncodedJoinFixture = .{ .flip = flip, .allow_scalar = true };
+            fixture.payloads[2] = "null";
+            var compiled = try @import("compiler.zig").compile(a, "SELECT r.j IS NULL AS missing FROM left_docs l LEFT JOIN right_docs r ON l.k=r.k", .{});
+            defer compiled.deinit();
+            const stream = (try @import("read_stream.zig").Stream.open(a, fixture.backend(), &compiled, &.{}, .{ .execution_batch_rows = 3 })).?;
+            defer stream.close();
+            var nulls: usize = 0;
+            var present: usize = 0;
+            while (true) {
+                var page = try stream.nextBatch(3);
+                defer page.deinit();
+                for (0..page.values.len()) |row| {
+                    const value = try page.values.cell(page.arena.allocator(), row, 0);
+                    try std.testing.expect(!value.sql_null and value.value == .bool);
+                    if (value.value.bool) nulls += 1 else present += 1;
+                }
+                if (page.exhausted) break;
+            }
+            try std.testing.expectEqual(@as(usize, 1), nulls);
+            try std.testing.expectEqual(@as(usize, 2), present);
+        }
+    };
+    try Fixture.run(std.testing.allocator, false);
+    try Fixture.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
+}
+
+test "SQL encoded JSON join batches deliver the successful prefix before probe errors" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var fixture: EncodedJoinFixture = .{ .probe_error_after = 1 };
+            var compiled = try @import("compiler.zig").compile(a, "SELECT l.j AS lj,r.j AS rj FROM left_docs l JOIN right_docs r ON l.k=r.k", .{});
+            defer compiled.deinit();
+            const stream = (try @import("read_stream.zig").Stream.open(a, fixture.backend(), &compiled, &.{}, .{ .execution_batch_rows = 4 })).?;
+            defer stream.close();
+            var page = try stream.nextBatch(7);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 2), page.values.len());
+            for (0..page.values.len()) |row| try std.testing.expectEqualStrings("{\"side\":\"L0\"}", (try page.values.encodedJson(row, 0)).?);
+            const result = stream.nextBatch(7);
+            if (result) |value| {
+                var unexpected = value;
+                unexpected.deinit();
+                return error.ExpectedProbeFailure;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.EncodedJoinProbeFailure, err);
+            }
+            try std.testing.expectEqual(@as(usize, 0), fixture.scalar_reads);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL encoded JSON join batches keep outer dictionary identity availability uniform" {
+    const Fixture = struct {
+        fn run(a: Allocator, flip: bool) !void {
+            var fixture: EncodedJoinFixture = .{ .flip = flip };
+            var compiled = try @import("compiler.zig").compile(a, "SELECT l.k,r.k FROM left_docs l FULL JOIN right_docs r ON l.k=r.k", .{});
+            defer compiled.deinit();
+            const stream = (try @import("read_stream.zig").Stream.open(a, fixture.backend(), &compiled, &.{}, .{ .execution_batch_rows = 3 })).?;
+            defer stream.close();
+            var count: usize = 0;
+            var nulls: usize = 0;
+            var sum: i64 = 0;
+            while (true) {
+                var page = try stream.nextBatch(7);
+                defer page.deinit();
+                for (0..2) |column| {
+                    // A mapped projection asks for a single dictionary and
+                    // rejects producers with identities on only some rows.
+                    const projected = try page.values.project(page.arena.allocator(), column);
+                    for (0..projected.len()) |row| {
+                        const value = try projected.cell(page.arena.allocator(), row, 0);
+                        if (value.sql_null) nulls += 1 else sum += value.value.integer;
+                    }
+                }
+                count += page.values.len();
+                if (page.exhausted) break;
+            }
+            try std.testing.expectEqual(@as(usize, 4), count);
+            try std.testing.expectEqual(@as(usize, 2), nulls);
+            try std.testing.expectEqual(@as(i64, 9), sum);
+        }
+    };
+    try Fixture.run(std.testing.allocator, false);
+    try Fixture.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
 }

@@ -733,7 +733,11 @@ pub fn frozenJsonText(a: Allocator, value: @import("execution_batch.zig").Frozen
     _ = decoder.walkJson(0, &json) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
     return output.toOwnedSlice();
 }
+/// Scalar consumers can construct incompatible native tags during validation.
+/// Forwarding consumers retain every validated compound as frozen bytes.
+pub const JsonConsumption = enum { scalar, forwarding };
 const Decoder = struct {
+    json_consumption: JsonConsumption = .scalar,
     validated_json: bool = false,
     eager_nontext: bool = false,
     borrow_compact: bool = false,
@@ -1072,21 +1076,27 @@ pub fn appendColumnarBatchVersion(output_alloc: Allocator, scratch: Allocator, b
 /// payload copy or per-row cell array is needed. The caller resets the arena
 /// only after all lanes drain, including on malformed input/allocation failure.
 pub fn decodeColumnarBlockInArena(a: Allocator, bytes: []const u8, max_bytes: usize) !ColumnarBlock {
-    return decodeColumnarBlockMode(a, null, bytes, max_bytes);
+    return decodeColumnarBlockMode(a, null, bytes, max_bytes, .scalar);
 }
 /// cache_backing must outlive the block. Temporary decode budgets/region
 /// descriptors are never retained. The caller retires block.deinit() before
 /// freeing the borrowed wire and metadata arena, including failure unwinds.
 pub fn decodeColumnarBlockWithCache(a: Allocator, cache_backing: Allocator, bytes: []const u8, max_bytes: usize) !ColumnarBlock {
-    return decodeColumnarBlockMode(a, cache_backing, bytes, max_bytes);
+    return decodeColumnarBlockMode(a, cache_backing, bytes, max_bytes, .scalar);
 }
-fn decodeColumnarBlockMode(a: Allocator, cache_backing: ?Allocator, bytes: []const u8, max_bytes: usize) !ColumnarBlock {
+/// Decode for spill/RPC/native column consumers. Scalar access stays available,
+/// but no compound tree is constructed until explicitly requested, even when
+/// its native numeric tags cannot advertise lossless canonical text.
+pub fn decodeColumnarBlockForForwarding(a: Allocator, cache_backing: Allocator, bytes: []const u8, max_bytes: usize) !ColumnarBlock {
+    return decodeColumnarBlockMode(a, cache_backing, bytes, max_bytes, .forwarding);
+}
+fn decodeColumnarBlockMode(a: Allocator, cache_backing: ?Allocator, bytes: []const u8, max_bytes: usize, consumption: JsonConsumption) !ColumnarBlock {
     if (bytes.len > max_bytes or bytes.len < columnar_v1_magic.len) return error.InvalidSqlSpill;
     const compact = std.mem.startsWith(u8, bytes, columnar_v2_magic);
     if (!compact and !std.mem.startsWith(u8, bytes, columnar_v1_magic)) return error.InvalidSqlSpill;
     var json_scratch: JsonScratch = .{ .a = @import("memory_budget.zig").reclaimingAllocator(a) };
     defer json_scratch.deinit();
-    var decoder: Decoder = .{ .json_scratch = &json_scratch, .lazy_json = cache_backing != null, .cache_backing = cache_backing, .borrow_compact = true, .compact_arrays = compact, .a = a, .bytes = bytes, .position = columnar_v1_magic.len };
+    var decoder: Decoder = .{ .json_consumption = consumption, .json_scratch = &json_scratch, .lazy_json = cache_backing != null, .cache_backing = cache_backing, .borrow_compact = true, .compact_arrays = compact, .a = a, .bytes = bytes, .position = columnar_v1_magic.len };
     errdefer if (decoder.json_owner) |owner| owner.deinit();
     const count = try decoder.count();
     const width = try decoder.count();
@@ -1786,7 +1796,7 @@ pub const Sequential = struct {
                         // Stop at the first tag that requires scalar semantics.
                         // Validate the remainder while constructing that scalar
                         // once, instead of validating then replaying the tree.
-                        decoder.eager_nontext = true;
+                        decoder.eager_nontext = decoder.json_consumption == .scalar;
                         const lossless = decoder.walkJson(0, null) catch |err| switch (err) {
                             error.ScalarJsonRequired => false,
                             else => return err,
@@ -1805,7 +1815,7 @@ pub const Sequential = struct {
                             @memset(lazy, null);
                         }
                         var materialized: ?std.json.Value = null;
-                        if (!lossless) {
+                        if (!lossless and decoder.json_consumption == .scalar) {
                             decoder.position = begin;
                             const metadata = decoder.a;
                             decoder.a = decoder.json_owner.?.arena.allocator();
@@ -2180,7 +2190,7 @@ pub const Sequential = struct {
             if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
             var json_scratch: JsonScratch = .{ .a = @import("memory_budget.zig").reclaimingAllocator(owned) };
             defer json_scratch.deinit();
-            var decoder: Decoder = .{ .json_scratch = &json_scratch, .lazy_json = true, .cache_backing = owner.a, .borrow_compact = true, .manager = file.manager, .a = owned, .bytes = payload };
+            var decoder: Decoder = .{ .json_consumption = .forwarding, .json_scratch = &json_scratch, .lazy_json = true, .cache_backing = owner.a, .borrow_compact = true, .manager = file.manager, .a = owned, .bytes = payload };
             const count_rows = try decoder.count();
             const width_values = try decoder.count();
             const width_keys = try decoder.count();
@@ -2191,6 +2201,7 @@ pub const Sequential = struct {
             const values = try owned.alloc(EncodedColumn, width_values);
             const keys = try owned.alloc(EncodedColumn, width_keys);
             for (values) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
+            decoder.json_consumption = .scalar;
             for (keys) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
             if (decoder.position != payload.len) return error.InvalidSqlSpill;
             owner.encoded = .{ .values = values, .keys = keys, .ordinals = ordinals, .json_owner = decoder.json_owner };
@@ -4568,11 +4579,11 @@ test "SQL lazy JSON blocks validate before publication preserve frozen tags and 
             const input = "{\"alpha\":[9007199254740993,1e-3,\"é\\n\"],\"bravo\":[]}";
             const root = try std.json.parseFromSliceLeaky(std.json.Value, a, input, .{ .parse_numbers = false });
             const rows = [_]Row{ .{ .values = &.{Datum.json(root)}, .keys = &.{}, .ordinal = 1 }, .{ .values = &.{.{}}, .keys = &.{}, .ordinal = 2 }, .{ .values = &.{Datum.json(.null)}, .keys = &.{}, .ordinal = 3 } };
-            for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+            for ([_]bool{ false, true }) |forwarding| for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
                 const bytes = try encodeColumnarBlockVersionAlloc(a, &rows, 1 << 20, version);
                 var metadata = std.heap.ArenaAllocator.init(backing);
                 defer metadata.deinit();
-                const block = try decodeColumnarBlockWithCache(metadata.allocator(), backing, bytes, 1 << 20);
+                const block = if (forwarding) try decodeColumnarBlockForForwarding(metadata.allocator(), backing, bytes, 1 << 20) else try decodeColumnarBlockWithCache(metadata.allocator(), backing, bytes, 1 << 20);
                 defer block.deinit();
                 const frozen = block.values[0].values.dynamic.json[0].?;
                 try std.testing.expect(frozen.value == null and frozen.text == null);
@@ -4604,7 +4615,8 @@ test "SQL lazy JSON blocks validate before publication preserve frozen tags and 
                 const second_key = std.mem.indexOf(u8, bad, "bravo").?;
                 @memcpy(bad[second_key..][0..5], "alpha");
                 for ([_][]const u8{ bad, bytes[0 .. bytes.len - 1] }) |invalid| {
-                    if (decodeColumnarBlockWithCache(metadata.allocator(), backing, invalid, 1 << 20)) |unexpected| {
+                    const decoded = if (forwarding) decodeColumnarBlockForForwarding(metadata.allocator(), backing, invalid, 1 << 20) else decodeColumnarBlockWithCache(metadata.allocator(), backing, invalid, 1 << 20);
+                    if (decoded) |unexpected| {
                         unexpected.deinit();
                         return error.ExpectedInvalidSpill;
                     } else |err| {
@@ -4612,7 +4624,7 @@ test "SQL lazy JSON blocks validate before publication preserve frozen tags and 
                         try std.testing.expectEqual(error.InvalidSqlSpill, err);
                     }
                 }
-            }
+            };
             // An integer DOM tag cannot silently become number_string on replay.
             var object: std.json.ObjectMap = .empty;
             try object.put(a, "x", .{ .integer = 7 });
@@ -4907,5 +4919,143 @@ test "native projection refinements benchmark frozen JSON transfer" {
         const after = if (sample % 2 == 0) second else first;
         try std.testing.expect(after.peak < before.peak);
         std.debug.print("FROZEN_JSON_TRANSFER sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} wire={d} rows=8\n", .{ sample, before.ns, after.ns, before.peak, after.peak, bytes.len });
+    }
+}
+
+test "SQL lazy JSON forwarding retains numeric tags without constructing scalar trees" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+                var source = std.heap.ArenaAllocator.init(a);
+                var source_live = true;
+                defer if (source_live) source.deinit();
+                const sa = source.allocator();
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"x\":[9007199254740993,1.25],\"s\":\"value\"}", .{});
+                const datum = Datum.json(root);
+                const rows = [_]Row{.{ .values = &.{datum}, .keys = &.{}, .ordinal = 0 }};
+                const bytes = try encodeColumnarBlockVersionAlloc(sa, &rows, 1 << 20, version);
+                const block = try decodeColumnarBlockForForwarding(sa, a, bytes, 1 << 20);
+                var block_live = true;
+                defer if (block_live) block.deinit();
+                const Probe = struct {
+                    block: ColumnarBlock,
+                    fn cell(_: *anyopaque, _: Allocator, _: usize, _: usize) !Datum {
+                        return error.UnexpectedScalarMaterialization;
+                    }
+                    fn json(_: *anyopaque, _: usize, _: usize) !?[]const u8 {
+                        return error.UnexpectedTextMaterialization;
+                    }
+                    fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+                        return @as(*@This(), @ptrCast(@alignCast(raw))).block.frozenJson(row, column, false);
+                    }
+                };
+                var probe: Probe = .{ .block = block };
+                const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &probe, .read = Probe.cell, .read_json = Probe.json, .read_frozen = Probe.frozen, .count = 1, .width = 1 } };
+                const mapped: @import("execution_batch.zig").Batch = .{ .mapped = .{ .source = &batch, .ordinals = &.{0}, .types = &.{.{ .kind = .json }}, .selection = &.{0} } };
+                const selected = try mapped.select(sa, &.{0});
+                const projected = try selected.project(sa, 0);
+                var store = @import("typed_store.zig").Store.init(a);
+                defer store.deinit();
+                try store.appendBatch(projected);
+                // Re-encode after destroying the producer to check that no
+                // frozen bytes or cache allocator borrow escaped its lease.
+                try std.testing.expect(block.values[0].values.dynamic.json[0].?.value == null);
+                try std.testing.expect(block.values[0].values.dynamic.json[0].?.text == null);
+                const expected_bytes = try a.dupe(u8, bytes);
+                defer a.free(expected_bytes);
+                const expected_text = try std.json.Stringify.valueAlloc(a, root, .{});
+                defer a.free(expected_text);
+                block.deinit();
+                block_live = false;
+                source.deinit();
+                source_live = false;
+                const retained: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &store, .count = 1 } };
+                const replay = try encodeColumnarBatchVersionAlloc(a, retained, &.{0}, 1 << 20, version);
+                defer a.free(replay);
+                try std.testing.expectEqualSlices(u8, expected_bytes, replay);
+                var consumer = std.heap.ArenaAllocator.init(a);
+                defer consumer.deinit();
+                const ca = consumer.allocator();
+                const value = try store.cell(ca, 0, 0);
+                try std.testing.expectEqual(@as(i64, 9007199254740993), value.value.object.get("x").?.array.items[0].integer);
+                try std.testing.expectEqual(@as(f64, 1.25), value.value.object.get("x").?.array.items[1].float);
+                const frozen = (try store.frozenJson(0, 0)).?;
+                try std.testing.expect(!frozen.lossless_text);
+                const text = try frozenJsonText(ca, frozen);
+                try std.testing.expectEqualStrings(expected_text, text);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "native projection refinements benchmark native numeric forwarding" {
+    const Probe = struct {
+        block: ColumnarBlock,
+        forward: bool,
+        const Measurement = struct { ns: i96, peak: usize, decode_peak: usize };
+        fn now() i96 {
+            if (comptime @import("builtin").link_libc and (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .linux)) {
+                var stamp: std.c.timespec = undefined;
+                if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("thread CPU clock unavailable");
+                return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
+            }
+            return @import("antfly_platform").time.monotonicNs();
+        }
+        fn cell(raw: *anyopaque, _: Allocator, row: usize, column: usize) !Datum {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).block.cell(row, column);
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.forward) self.block.frozenJson(row, column, false) else null;
+        }
+        fn measure(forward: bool, bytes: []const u8) !Measurement {
+            var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 128 << 20 };
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            const start = now();
+            // Compare the old eager transfer with the production lazy/frozen
+            // path. Both validate the same frame and emit identical v2 bytes.
+            const block = if (forward) try decodeColumnarBlockForForwarding(arena.allocator(), budget.allocator(), bytes, 16 << 20) else try decodeColumnarBlockInArena(arena.allocator(), bytes, 16 << 20);
+            defer block.deinit();
+            const decode_peak = budget.peak;
+            var probe: @This() = .{ .block = block, .forward = forward };
+            const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &probe, .read = cell, .read_frozen = frozen, .count = block.count(), .width = block.values.len } };
+            const replay = try encodeColumnarBatchVersionAlloc(budget.allocator(), batch, block.ordinals, 16 << 20, .v2);
+            defer budget.allocator().free(replay);
+            const elapsed = now() - start;
+            try std.testing.expectEqualSlices(u8, bytes, replay);
+            if (forward) for (block.values[0].values.dynamic.json) |json| {
+                try std.testing.expect(json.?.value == null);
+                try std.testing.expect(json.?.text == null);
+            };
+            return .{ .ns = elapsed, .peak = budget.peak, .decode_peak = decode_peak };
+        }
+    };
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    const a = source.allocator();
+    var input: std.Io.Writer.Allocating = .init(a);
+    try input.writer.writeByte('[');
+    for (0..4096) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"x\":9007199254740993,\"s\":\"nested value\"}");
+    }
+    try input.writer.writeByte(']');
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, input.written(), .{ .parse_numbers = true });
+    const cells = [_]Datum{Datum.json(root)};
+    var rows: [8]Row = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .values = &cells, .keys = &.{}, .ordinal = i };
+    const bytes = try encodeColumnarBlockVersionAlloc(a, &rows, 16 << 20, .v2);
+    _ = try Probe.measure(false, bytes);
+    _ = try Probe.measure(true, bytes);
+    for (0..5) |sample| {
+        const first = try Probe.measure(sample % 2 != 0, bytes);
+        const second = try Probe.measure(sample % 2 == 0, bytes);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expect(after.peak < before.peak);
+        std.debug.print("NUMERIC_FROZEN_TRANSFER sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} before_decode_peak={d} after_decode_peak={d} wire={d} rows=8\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.decode_peak, after.decode_peak, bytes.len });
     }
 }
