@@ -21,6 +21,7 @@ const operators = @import("operators.zig");
 const spill = @import("spill.zig");
 const Datum = @import("scalar.zig").Datum;
 const A = std.mem.Allocator;
+const Batch = @import("execution_batch.zig").Batch;
 pub const Pair = struct { left: ?[]const Datum, right: ?[]const Datum, match: ?usize = null };
 pub const Join = struct {
     pub const Evaluation = struct {
@@ -81,6 +82,7 @@ pub const Join = struct {
     parallel_builds: bool = false,
     evaluation: ?Evaluation = null,
     output: ?*@import("parallel_output.zig").Pipe = null,
+    native_pipe_view: ?@import("parallel_output.zig").Pipe.View = null,
     output_task: ?@import("parallel_scheduler.zig").Task(anyerror!bool) = null,
     parallel_partitions_completed: usize = 0,
     prepared: [8]?*Join = @splat(null),
@@ -102,29 +104,16 @@ pub const Join = struct {
         const evaluation = self.evaluation.?;
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
-        while (try self.next()) |pair| {
+        while (true) {
             _ = arena.reset(.retain_capacity);
             const a = arena.allocator();
-            if (pair.match) |index| {
-                if (evaluation.condition) |program| {
-                    const cells = try a.alloc(Datum, evaluation.left_width + evaluation.right_width);
-                    @memset(cells, .{});
-                    if (pair.left) |values| @memcpy(cells[0..evaluation.left_width], values);
-                    if (pair.right) |values| @memcpy(cells[evaluation.left_width..], values);
-                    const logical = if (!evaluation.flipped) cells else blk: {
-                        const reordered = try a.alloc(Datum, cells.len);
-                        @memcpy(reordered[0..evaluation.right_width], cells[evaluation.left_width..]);
-                        @memcpy(reordered[evaluation.right_width..], cells[0..evaluation.left_width]);
-                        break :blk reordered;
-                    };
-                    const accepted = try program.evaluate(a, logical, evaluation.parameters, .{});
-                    if (accepted.sql_null) continue;
-                    if (accepted.value != .bool) return error.SqlTypeMismatch;
-                    if (!accepted.value.bool) continue;
-                }
-                try self.accept(index);
-            }
-            try file.appendJoined(pair.left, pair.right, evaluation.left_width, evaluation.right_width);
+            const pair = try self.nextNativePair(a, true) orelse break;
+            var view: NativeRows = .{ .rows = &.{pair}, .evaluation = evaluation };
+            if (!try self.acceptNative(a, &view, pair.match)) continue;
+            const keys = [_]Datum{ Datum.json(.{ .bool = pair.left != null }), Datum.json(.{ .bool = pair.right != null }) };
+            // The queue owns one encoded copy before the next probe can retire
+            // its input block. Byte accounting also consumes native lengths.
+            try file.appendBatch(view.batch(), .{ .rows = &.{&keys} }, &.{0});
         }
     }
     fn nextOutput(self: *Join) !?Pair {
@@ -362,6 +351,8 @@ pub const Join = struct {
         self.a.destroy(self);
     }
     fn closeInputs(self: *Join) void {
+        if (self.native_pipe_view) |view| view.deinit();
+        self.native_pipe_view = null;
         if (self.probe_input) |*block| block.deinit();
         self.probe_input = null;
         self.probe_input_index = 0;
@@ -581,16 +572,149 @@ pub const Join = struct {
         }
         return true;
     }
+    const NativePair = struct { left: ?Batch, right: ?Batch, match: ?usize = null };
+    const NativeRows = struct {
+        rows: []const NativePair,
+        evaluation: Evaluation,
+        fn locate(self: *@This(), row: usize, column: usize) !struct { source: ?Batch, column: usize } {
+            if (row >= self.rows.len or column >= self.evaluation.left_width + self.evaluation.right_width) return error.InvalidSqlBackendResponse;
+            return if (column < self.evaluation.left_width) .{ .source = self.rows[row].left, .column = column } else .{ .source = self.rows[row].right, .column = column - self.evaluation.left_width };
+        }
+        fn cell(raw: *anyopaque, a: A, row: usize, column: usize) !Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const location = try self.locate(row, column);
+            return if (location.source) |source| source.cell(a, 0, location.column) else .{};
+        }
+        fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const location = try self.locate(row, column);
+            return if (location.source) |source| source.encodedJson(0, location.column) else null;
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const location = try self.locate(row, column);
+            return if (location.source) |source| source.frozenJson(0, location.column) else null;
+        }
+        fn batch(self: *@This()) Batch {
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .count = self.rows.len, .width = self.evaluation.left_width + self.evaluation.right_width } };
+        }
+    };
+    fn nativeProbe(self: *Join, a: A) !Batch {
+        const source = try a.create(Batch);
+        source.* = try self.probe_input.?.view().batch(a, false);
+        const selection = try a.alloc(usize, 1);
+        selection[0] = self.probe_input_index - 1;
+        return source.select(a, selection);
+    }
+    fn acceptNative(self: *Join, a: A, view: *NativeRows, match: ?usize) !bool {
+        if (match) |index| {
+            if (view.evaluation.condition) |program| {
+                const width = view.evaluation.left_width + view.evaluation.right_width;
+                const cells = try a.alloc(Datum, width);
+                @memset(cells, .{});
+                const loaded = try a.alloc(bool, width);
+                @memset(loaded, false);
+                for (program.instructions) |instruction| if (instruction.operation == .column) {
+                    const logical = instruction.operation.column;
+                    if (logical >= width) return error.InvalidSqlBackendResponse;
+                    if (loaded[logical]) continue;
+                    const physical = if (!view.evaluation.flipped) logical else if (logical < view.evaluation.right_width) view.evaluation.left_width + logical else logical - view.evaluation.right_width;
+                    cells[logical] = try NativeRows.cell(view, a, 0, physical);
+                    loaded[logical] = true;
+                };
+                const accepted = try program.evaluate(a, cells, view.evaluation.parameters, .{});
+                if (accepted.sql_null) return false;
+                if (accepted.value != .bool) return error.SqlTypeMismatch;
+                if (!accepted.value.bool) return false;
+            }
+            try self.accept(index);
+        }
+        return true;
+    }
+    /// Borrow one probe cohort and build partition until the next pull. Workers
+    /// copy encoded values only at the bounded queue's ownership boundary.
+    pub fn nextBatch(self: *Join, a: A, maximum: usize, failure: ?*?anyerror) anyerror!Batch {
+        if (self.native_pipe_view) |view| view.deinit();
+        self.native_pipe_view = null;
+        if (maximum == 0) return .{ .rows = &.{} };
+        try self.finishInputs();
+        if (self.parallel_builds) while (true) {
+            const typed = self.nextTypedBatch(maximum) catch |err| {
+                if (failure) |out| {
+                    out.* = err;
+                    return .{ .rows = &.{} };
+                }
+                return err;
+            };
+            if (typed) |view| {
+                self.native_pipe_view = view;
+                return view.values();
+            }
+            const child = self.active_join orelse return .{ .rows = &.{} };
+            // A scheduler-declined worker keeps the same native serial path.
+            const batch = try child.nextBatch(a, maximum, failure);
+            if (batch.len() != 0) return batch;
+            if (failure) |out| if (out.* != null) return batch;
+            self.partitions_loaded += child.partitions_loaded;
+            self.repartitions += child.repartitions;
+            child.close();
+            self.active_join = null;
+        };
+        var rows: std.ArrayList(NativePair) = .empty;
+        var bytes: usize = 0;
+        while (rows.items.len < maximum) {
+            const pair = (self.nextNativePair(a, rows.items.len == 0) catch |err| {
+                if (failure) |out| {
+                    out.* = err;
+                    break;
+                }
+                return err;
+            }) orelse break;
+            _ = self.scratch.reset(.retain_capacity);
+            const scratch = self.scratch.allocator();
+            var candidate: NativeRows = .{ .rows = &.{pair}, .evaluation = self.evaluation.? };
+            const accepted = self.acceptNative(scratch, &candidate, pair.match) catch |err| {
+                if (failure) |out| {
+                    out.* = err;
+                    break;
+                }
+                return err;
+            };
+            if (!accepted) continue;
+            const batch = candidate.batch();
+            var cost: usize = 0;
+            for (0..batch.width()) |column| cost +|= batch.cellBytes(scratch, 0, column) catch |err| {
+                if (failure) |out| {
+                    out.* = err;
+                    break;
+                }
+                return err;
+            };
+            if (failure) |out| if (out.* != null) break;
+            try rows.append(a, pair);
+            bytes +|= cost;
+            if (bytes >= self.limits.bytes / 32) break;
+        }
+        const view = try a.create(NativeRows);
+        view.* = .{ .rows = rows.items, .evaluation = self.evaluation.? };
+        return view.batch();
+    }
     pub fn next(self: *Join) anyerror!?Pair {
         try self.finishInputs();
         if (self.parallel_builds) return self.nextParallel();
         _ = self.candidate.reset(.{ .retain_with_limit = @min(8192, self.limits.bytes / 32) });
+        const a = self.candidate.allocator();
+        const pair = try self.nextNativePair(a, true) orelse return null;
+        return .{ .left = if (pair.left) |left| try left.row(a, 0) else null, .right = if (pair.right) |right| try right.row(a, 0) else null, .match = pair.match };
+    }
+    fn nextNativePair(self: *Join, a: A, may_advance: bool) anyerror!?NativePair {
+        if (!may_advance and self.hash == null) return null;
         while (try self.prepare()) {
             try self.manager.check();
             if (self.probe) |*probe| {
-                if (try probe.next()) |match| return .{ .left = self.left, .right = try match.materializeValues(self.candidate.allocator()), .match = match.index };
+                if (try probe.next()) |match| return .{ .left = try self.nativeProbe(a), .right = try match.valuesBatch(a), .match = match.index };
                 self.probe = null;
-                if (!self.matched and self.outer_left) return .{ .left = self.left, .right = null };
+                if (!self.matched and self.outer_left) return .{ .left = try self.nativeProbe(a), .right = null };
             }
             if (self.active.?.probes) |*file| {
                 if (self.probe_offset < file.size) {
@@ -598,6 +722,7 @@ pub const Join = struct {
                     // rows has drained. Expand only the current row at the
                     // join boundary, rather than boxing an entire typed block.
                     if (self.probe_input) |*input| if (self.probe_input_index == input.view().count()) {
+                        if (!may_advance) return null;
                         input.deinit();
                         self.probe_input = null;
                     };
@@ -606,30 +731,25 @@ pub const Join = struct {
                         self.probe_input_index = 0;
                     }
                     const block = self.probe_input.?.view();
-                    const row = if (block.encoded != null) row: {
-                        const width = block.width();
-                        const size = width + block.keyWidth();
-                        if (self.probe_cells.len < size) self.probe_cells = try self.a.realloc(self.probe_cells, size);
-                        const values = self.probe_cells[0..width];
-                        const keys = self.probe_cells[width..size];
-                        for (values, 0..) |*value, column| value.* = try block.cell(self.probe_input_index, column);
-                        for (keys, 0..) |*key, column| key.* = try block.keyCell(self.probe_input_index, column);
-                        break :row operators.Row{ .values = values, .keys = keys, .ordinal = block.ordinal(self.probe_input_index) };
-                    } else block.rows[self.probe_input_index];
+                    const width = block.keyWidth();
+                    if (self.probe_cells.len < width) self.probe_cells = try self.a.realloc(self.probe_cells, width);
+                    const keys = self.probe_cells[0..width];
+                    for (keys, 0..) |*key, column| key.* = try block.keyCell(self.probe_input_index, column);
                     self.probe_input_index += 1;
                     self.probe_offset += 1;
-                    self.left = row.values;
                     self.matched = false;
-                    self.probe = try self.hash.?.probe(row.keys);
+                    self.probe = try self.hash.?.probe(keys);
                     continue;
                 }
+                if (!may_advance) return null;
                 if (self.probe_input) |*input| input.deinit();
                 self.probe_input = null;
                 self.probe_input_index = 0;
                 file.close();
                 self.active.?.probes = null;
             }
-            if (self.outer_right) if (try self.hash.?.unmatched(&self.unmatched)) |match| return .{ .left = null, .right = try match.materializeValues(self.candidate.allocator()) };
+            if (self.outer_right) if (try self.hash.?.unmatched(&self.unmatched)) |match| return .{ .left = null, .right = try match.valuesBatch(a) };
+            if (!may_advance) return null;
             self.hash.?.deinit();
             self.hash = null;
             self.active = null;
@@ -997,5 +1117,258 @@ test "SQL compact probe blocks retain rows through duplicate matches and early c
             for (seen, 0..) |mask, index| try std.testing.expectEqual(@as(u8, if (index % 97 == 0) 8 else 7), mask);
             try std.testing.expect(join.probe_input == null);
         }
+    }
+}
+
+const NativeJoinFixture = struct {
+    text: []const u8 = "{\"x\":9007199254740993,\"items\":[1,2,3]}",
+    frozen: ?@import("execution_batch.zig").FrozenJson = null,
+    begin: usize,
+    extra: bool = false,
+    fn cell(raw: *anyopaque, _: A, row: usize, column: usize) !Datum {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (column == 0) return Datum.json(.{ .integer = @intCast(self.begin + row) });
+        if (column == 2 and self.extra) return Datum.json(.{ .integer = 99 });
+        return error.UnexpectedScalarMaterialization;
+    }
+    fn json(raw: *anyopaque, _: usize, column: usize) !?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (column == 1 and self.frozen == null) self.text else null;
+    }
+    fn tokens(raw: *anyopaque, _: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (column == 1) self.frozen else null;
+    }
+    fn add(self: *@This(), a: A, join: *Join, build: bool, count: usize) !void {
+        const integers = try a.alloc(Datum, count);
+        defer a.free(integers);
+        const keys = try a.alloc([]const Datum, count);
+        defer a.free(keys);
+        for (integers, keys, 0..) |*integer, *key, index| {
+            integer.* = try cell(self, a, index, 0);
+            key.* = @as(*[1]Datum, @ptrCast(integer));
+        }
+        try join.addBatch(build, .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = tokens, .count = count, .width = if (self.extra) 3 else 2 } }, keys, 0);
+    }
+};
+
+test "SQL native partition batches preserve frozen outer rows residuals and retained ownership" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const Fixture = struct {
+        fn run(a: A, parallel: bool, flipped: bool, frozen: bool, decline_worker: bool) !void {
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            var left: NativeJoinFixture = .{ .begin = 16 };
+            var right: NativeJoinFixture = .{ .begin = 0, .extra = true };
+            if (frozen) {
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, left.text, .{});
+                const wire = try spill.encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+                const block = try spill.decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+                defer block.deinit();
+                left.frozen = (try block.frozenJson(0, 0, false)).?;
+                right.frozen = left.frozen;
+            }
+            var compiled = try @import("compiler.zig").compileScalar(a, "l = r AND l <> 17 AND extra = 99", .{});
+            defer compiled.deinit();
+            const columns: []const @import("scalar.zig").Column = if (flipped) &.{ .{ .name = "r", .type = .integer }, .{ .name = "rj", .type = .json }, .{ .name = "extra", .type = .integer }, .{ .name = "l", .type = .integer }, .{ .name = "lj", .type = .json } } else &.{ .{ .name = "l", .type = .integer }, .{ .name = "lj", .type = .json }, .{ .name = "r", .type = .integer }, .{ .name = "rj", .type = .json }, .{ .name = "extra", .type = .integer } };
+            var condition = try @import("scalar.zig").bind(a, compiled.expression, columns, &.{}, .{});
+            defer condition.deinit();
+            const join = try Join.create(a, &manager, 1 << 20, 10000, 0, true, true);
+            defer join.close();
+            join.parallel_builds = parallel;
+            join.build_lanes = 2;
+            join.evaluation = .{ .condition = &condition, .left_width = 2, .right_width = 3, .flipped = flipped };
+            try right.add(a, join, true, 32);
+            try left.add(a, join, false, 32);
+            // Exercise the scheduler-declined branch after selecting parallel
+            // lanes, without changing the process-wide scheduler's settings.
+            if (decline_worker) {
+                try join.finishInputs();
+                const child = try Join.createWithLanes(&manager, join.limits.bytes, join.limits.rows, 0, true, true, 1, true);
+                child.evaluation = join.evaluation;
+                child.partitions = 0;
+                child.finished = true;
+                child.active = .{ .build = join.build[0], .probes = join.probes[0], .used_bits = join.partitions - 1 };
+                join.build[0] = null;
+                join.probes[0] = null;
+                join.partition = 1;
+                join.active_join = child;
+            }
+            var matches: usize = 0;
+            var lefts: usize = 0;
+            var rights: usize = 0;
+            var retained = @import("typed_store.zig").Store.init(a);
+            defer retained.deinit();
+            var page = std.heap.ArenaAllocator.init(a);
+            defer page.deinit();
+            while (true) {
+                _ = page.reset(.free_all);
+                const batch = try join.nextBatch(page.allocator(), 7, null);
+                if (batch.len() == 0) break;
+                if (retained.len == 0) try retained.appendBatch(batch);
+                for (0..batch.len()) |row| {
+                    const l = try batch.cell(page.allocator(), row, 0);
+                    const r = try batch.cell(page.allocator(), row, 2);
+                    const extra = try batch.cell(page.allocator(), row, 4);
+                    if (r.sql_null) try std.testing.expect(extra.sql_null) else try std.testing.expectEqual(@as(i64, 99), extra.value.integer);
+                    if (!l.sql_null and !r.sql_null) {
+                        try std.testing.expectEqual(l.value.integer, r.value.integer);
+                        try std.testing.expect(l.value.integer != 17);
+                        matches += 1;
+                    } else if (l.sql_null) rights += 1 else lefts += 1;
+                    for ([_]usize{ 1, 3 }) |column| {
+                        const missing = if (column == 1) l.sql_null else r.sql_null;
+                        if (missing) {
+                            try std.testing.expect((try batch.cell(page.allocator(), row, column)).sql_null);
+                        } else if (try batch.frozenJson(row, column)) |value| {
+                            if (frozen) try std.testing.expect(!value.lossless_text);
+                        } else try std.testing.expectEqualStrings(left.text, (try batch.encodedJson(row, column)).?);
+                    }
+                    // Frozen forwarding must not populate the source DOM cache.
+                    if (join.probe_input) |*input| if (input.view().encoded) |block| {
+                        for (block.values) |column| if (column.values == .dynamic) for (column.values.dynamic.json) |value| if (value) |json_| try std.testing.expect(json_.value == null);
+                    };
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 15), matches);
+            try std.testing.expectEqual(@as(usize, 17), lefts);
+            try std.testing.expectEqual(@as(usize, 17), rights);
+            // Retaining consumers own payloads beyond all input/partition pulls.
+            for (0..retained.len) |row| {
+                _ = try retained.cell(page.allocator(), row, 0);
+                for ([_]usize{ 1, 3 }) |column| {
+                    if (try retained.frozenJson(row, column)) |value| {
+                        const decoded = try spill.materializeFrozenJson(page.allocator(), value);
+                        const number = decoded.value.object.get("x").?;
+                        if (frozen) try std.testing.expectEqual(@as(i64, 9007199254740993), number.integer) else try std.testing.expectEqualStrings("9007199254740993", number.number_string);
+                    } else if (try retained.encodedJson(row, column)) |text| try std.testing.expectEqualStrings(left.text, text) else try std.testing.expect((try retained.cell(page.allocator(), row, column)).sql_null);
+                }
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |parallel| for ([_]bool{ false, true }) |flipped| for ([_]bool{ false, true }) |frozen| try Fixture.run(std.testing.allocator, parallel, flipped, frozen, false);
+    try Fixture.run(std.testing.allocator, true, true, true, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ false, false, true, false });
+}
+
+test "native projection refinements benchmark native partition delivery" {
+    const Measure = struct {
+        const Result = struct { ns: i96, peak: usize, checksum: u64, rows: usize };
+        fn now() i96 {
+            if (comptime @import("builtin").link_libc and (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .linux)) {
+                var stamp: std.c.timespec = undefined;
+                if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("thread CPU clock unavailable");
+                return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
+            }
+            return @import("antfly_platform").time.monotonicNs();
+        }
+        fn check(_: *anyopaque) !void {}
+        fn run(native: bool, text: []const u8) !Result {
+            var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 64 << 20 };
+            const a = budget.allocator();
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            const join = try Join.create(a, &manager, 1 << 20, 10000, 0, false, false);
+            defer join.close();
+            join.parallel_builds = false;
+            join.evaluation = .{ .left_width = 2, .right_width = 2 };
+            var source: NativeJoinFixture = .{ .begin = 0, .text = text };
+            try source.add(a, join, true, 32);
+            try source.add(a, join, false, 32);
+            var page = std.heap.ArenaAllocator.init(a);
+            defer page.deinit();
+            var hash = std.hash.Wyhash.init(0);
+            var count: usize = 0;
+            const start = now();
+            while (true) {
+                _ = page.reset(.free_all);
+                const work = page.allocator();
+                const batch: Batch = if (native) try join.nextBatch(work, 7, null) else blk: {
+                    const pair = try join.next() orelse break;
+                    const values = try work.alloc(Datum, 4);
+                    @memcpy(values[0..2], pair.left.?);
+                    @memcpy(values[2..4], pair.right.?);
+                    if (pair.match) |index| try join.accept(index);
+                    const rows = try work.alloc([]const Datum, 1);
+                    rows[0] = values;
+                    break :blk .{ .rows = rows };
+                };
+                if (batch.len() == 0) break;
+                for (0..batch.len()) |row| {
+                    const one = try batch.select(work, &.{row});
+                    const bytes = try spill.encodeColumnarBatchVersionAlloc(a, one, &.{0}, 1 << 20, .v2);
+                    defer a.free(bytes);
+                    hash.update(bytes);
+                    count += 1;
+                }
+            }
+            const elapsed = now() - start;
+            try std.testing.expectEqual(@as(usize, 32), count);
+            return .{ .ns = elapsed, .peak = budget.peak, .checksum = hash.final(), .rows = count };
+        }
+    };
+    var input = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer input.deinit();
+    var text: std.Io.Writer.Allocating = .init(input.allocator());
+    try text.writer.writeByte('[');
+    for (0..256) |index| {
+        if (index != 0) try text.writer.writeByte(',');
+        try text.writer.writeAll("{\"x\":1,\"s\":\"nested value\"}");
+    }
+    try text.writer.writeByte(']');
+    _ = try Measure.run(false, text.written());
+    _ = try Measure.run(true, text.written());
+    for (0..5) |sample| {
+        const first = try Measure.run(sample % 2 != 0, text.written());
+        const second = try Measure.run(sample % 2 == 0, text.written());
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        try std.testing.expect(after.peak < before.peak);
+        std.debug.print("NATIVE_PARTITION_DELIVERY sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} rows={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak, after.rows });
+    }
+}
+
+test "SQL native partition batches deliver errors after a successful prefix" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |parallel| {
+        const a = std.testing.allocator;
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        defer manager.deinit();
+        var compiled = try @import("compiler.zig").compileScalar(a, "1/(1-l)>0", .{});
+        defer compiled.deinit();
+        var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{}, .{});
+        defer condition.deinit();
+        const join = try Join.create(a, &manager, 1 << 20, 10, 0, false, false);
+        defer join.close();
+        join.parallel_builds = parallel;
+        join.build_lanes = 2;
+        join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 1 };
+        const key = Datum.json(.{ .integer = 42 });
+        try join.add(true, &.{Datum.json(.{ .integer = 0 })}, &.{key}, 0);
+        for (0..2) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var failure: ?anyerror = null;
+        var count: usize = 0;
+        while (failure == null) {
+            _ = arena.reset(.free_all);
+            const batch = try join.nextBatch(arena.allocator(), 7, &failure);
+            for (0..batch.len()) |row| try std.testing.expectEqual(@as(i64, 0), (try batch.cell(arena.allocator(), row, 0)).value.integer);
+            count += batch.len();
+            if (batch.len() == 0 and failure == null) return error.ExpectedDivisionFailure;
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+        try std.testing.expectEqual(error.SqlDivisionByZero, failure.?);
     }
 }

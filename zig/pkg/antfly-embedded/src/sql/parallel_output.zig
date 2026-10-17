@@ -52,8 +52,8 @@ const Block = struct {
         for (0..values.len()) |row| {
             _ = scratch.reset(.retain_capacity);
             self.bytes +|= @sizeOf(operators.Row);
-            for (0..values.width()) |column| self.bytes +|= try operators.datumBytes(try values.cell(scratch.allocator(), row, column));
-            for (0..keys.width()) |column| self.bytes +|= try operators.datumBytes(try keys.cell(scratch.allocator(), row, column));
+            for (0..values.width()) |column| self.bytes +|= try values.cellBytes(scratch.allocator(), row, column);
+            for (0..keys.width()) |column| self.bytes +|= try keys.cellBytes(scratch.allocator(), row, column);
         }
     }
     fn close(self: *Block) void {
@@ -255,4 +255,46 @@ fn leaseScenario(a: A) !void {
 }
 test "SQL worker column leases survive pipe teardown and allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, leaseScenario, .{});
+}
+
+test "SQL native output pipe accounts frozen bytes without scalar access" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: A) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"x\":[9007199254740993,1.25]}", .{});
+            const wire = try spill.encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{@import("scalar.zig").Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+            const block = try spill.decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+            defer block.deinit();
+            const Reader = struct {
+                value: @import("execution_batch.zig").FrozenJson,
+                fn cell(_: *anyopaque, _: A, _: usize, _: usize) !@import("scalar.zig").Datum {
+                    return error.UnexpectedScalarMaterialization;
+                }
+                fn frozen(raw: *anyopaque, _: usize, _: usize) !?@import("execution_batch.zig").FrozenJson {
+                    return @as(*@This(), @ptrCast(@alignCast(raw))).value;
+                }
+            };
+            var reader: Reader = .{ .value = (try block.frozenJson(0, 0, false)).? };
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check };
+            defer manager.deinit();
+            const pipe = try Pipe.create(&manager, 8192);
+            var live = true;
+            defer if (live) pipe.close();
+            try pipe.appendBatch(.{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 1, .width = 1 } }, .{ .rows = &.{&.{}} }, &.{0});
+            pipe.finish(null);
+            const view = (try pipe.nextBatch(1)).?;
+            defer view.deinit();
+            pipe.close();
+            live = false;
+            try std.testing.expectEqualSlices(u8, reader.value.bytes, (try view.values().frozenJson(0, 0)).?.bytes);
+            const replay = try spill.encodeColumnarBatchVersionAlloc(sa, view.values(), &.{0}, 1 << 20, .v2);
+            try std.testing.expectEqualSlices(u8, wire, replay);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

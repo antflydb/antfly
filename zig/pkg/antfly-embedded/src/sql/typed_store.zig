@@ -275,7 +275,7 @@ const Column = struct {
         encoded: std.ArrayList(std.json.Value),
     };
     values: Values = .unknown,
-    json_bytes: ?*std.ArrayList(?JsonPayload) = null,
+    json_bytes: ?*std.ArrayList(?*JsonPayload) = null,
     json_cache: ?*JsonCache = null,
     nulls: std.ArrayList(u64) = .empty,
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
@@ -301,7 +301,7 @@ const Column = struct {
     }
     fn cell(self: Column, a: A, row: usize) !Datum {
         if (self.isNull(row)) return .{};
-        if (self.json_bytes) |bytes| if (bytes.items[row]) |*json| {
+        if (self.json_bytes) |bytes| if (bytes.items[row]) |json| {
             return self.json_cache.?.materialize(json, a);
         };
         const value: std.json.Value = switch (self.values) {
@@ -441,22 +441,16 @@ const Column = struct {
         }
         return true;
     }
-    fn appendJson(self: *Column, a: A, owned: A, scratch: A, row: usize, payload: JsonPayload) !void {
+    fn appendJson(self: *Column, a: A, owned: A, scratch: A, row: usize, payload: *JsonPayload) !void {
         if (self.json_bytes == null) {
-            const values = try a.create(std.ArrayList(?JsonPayload));
+            const values = try a.create(std.ArrayList(?*JsonPayload));
             values.* = .empty;
             self.json_bytes = values;
             try values.resize(a, row);
             @memset(values.items, null);
         }
         try self.append(a, owned, scratch, row, Datum.json(.null));
-        var retained = payload;
-        if (payload.text) |text| retained.text = try owned.dupe(u8, text);
-        if (payload.frozen) |value| {
-            retained.frozen = value;
-            retained.frozen.?.bytes = try owned.dupe(u8, value.bytes);
-        }
-        self.json_bytes.?.items[row] = retained;
+        self.json_bytes.?.items[row] = payload;
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
         if (self.json_bytes) |bytes| try bytes.append(a, null);
@@ -549,12 +543,37 @@ pub const Store = struct {
     initialized: bool = false,
     failed: bool = false,
     json_cache: ?*JsonCache = null,
+    // Content keys borrow only this store's owned immutable payloads. Small
+    // values avoid dictionary metadata; large fan-out rows share bytes/cache.
+    json_payloads: std.HashMapUnmanaged(JsonKey, *JsonPayload, JsonKeyContext, 80) = .empty,
+    const JsonKey = struct { representation: u8, bytes: []const u8 };
+    const JsonKeyContext = struct {
+        pub fn hash(_: @This(), key: JsonKey) u64 {
+            return std.hash.Wyhash.hash(key.representation, key.bytes);
+        }
+        pub fn eql(_: @This(), left: JsonKey, right: JsonKey) bool {
+            return left.representation == right.representation and std.mem.eql(u8, left.bytes, right.bytes);
+        }
+    };
+    fn ownJson(self: *Store, payload: JsonPayload) !*JsonPayload {
+        const key: JsonKey = if (payload.frozen) |value| .{ .representation = if (value.lossless_text) 3 else 2, .bytes = value.bytes } else .{ .representation = 1, .bytes = payload.text.? };
+        const dictionary = key.bytes.len >= 256;
+        if (dictionary) if (self.json_payloads.get(key)) |existing| return existing;
+        const owned = self.arena.allocator();
+        const result = try owned.create(JsonPayload);
+        result.* = payload;
+        const bytes = try owned.dupe(u8, key.bytes);
+        if (payload.frozen != null) result.frozen.?.bytes = bytes else result.text = bytes;
+        if (dictionary) try self.json_payloads.put(self.a, .{ .representation = key.representation, .bytes = bytes }, result);
+        return result;
+    }
     pub fn init(a: A) Store {
         return .{ .a = a, .arena = .init(a) };
     }
     pub fn deinit(self: *Store) void {
         for (self.columns) |*column| column.deinit(self.a);
         self.a.free(self.columns);
+        self.json_payloads.deinit(self.a);
         self.arena.deinit();
         if (self.json_cache) |cache| {
             cache.deinit();
@@ -673,12 +692,12 @@ pub const Store = struct {
                 _ = scratch.reset(.retain_capacity);
                 if (try batch.frozenJson(index, ordinal)) |frozen| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, .{ .frozen = frozen });
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .frozen = frozen }));
                     continue;
                 }
                 if (try batch.encodedJson(index, ordinal)) |bytes| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, .{ .text = bytes });
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .text = bytes }));
                     continue;
                 }
                 const value = try batch.cell(scratch.allocator(), index, ordinal);
@@ -730,7 +749,7 @@ pub const Store = struct {
     pub fn encodedJson(self: *const Store, index: usize, column: usize) !?[]const u8 {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         const values = self.columns[column].json_bytes orelse return null;
-        const payload = if (values.items[index]) |*payload| payload else return null;
+        const payload = values.items[index] orelse return null;
         return self.json_cache.?.encoded(payload);
     }
     pub fn frozenJson(self: *const Store, index: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
@@ -1063,4 +1082,104 @@ test "native projection refinements benchmark repeated retained JSON scalar read
     try std.testing.expect(store.json_cache.?.budget.live <= JsonCache.limit);
     try std.testing.expect(store.json_cache.?.budget.peak + budget.peak < baseline.peak);
     std.debug.print("RETAINED_JSON_CACHE before_peak={d} after_scratch_peak={d} cache_peak={d} wire={d} reads=16\n", .{ baseline.peak, budget.peak, store.json_cache.?.budget.peak, probe.bytes.len });
+}
+
+const SharedJsonFixture = struct {
+    text: []const u8,
+    frozen: ?@import("execution_batch.zig").FrozenJson = null,
+    fn cell(_: *anyopaque, _: A, _: usize, _: usize) !Datum {
+        return error.UnexpectedScalarMaterialization;
+    }
+    fn json(raw: *anyopaque, _: usize, _: usize) !?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (self.frozen == null) self.text else null;
+    }
+    fn tokens(raw: *anyopaque, _: usize, _: usize) !?@import("execution_batch.zig").FrozenJson {
+        return @as(*@This(), @ptrCast(@alignCast(raw))).frozen;
+    }
+    fn populate(self: *@This(), store: *Store, count: usize, reference: bool) !void {
+        if (!reference) return store.appendBatch(.{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = tokens, .count = count, .width = 1 } });
+        // Reference the former per-row payload-copy policy with the same
+        // retained column/cache structures, without content interning.
+        store.columns = try store.a.alloc(Column, 1);
+        store.columns[0] = .{};
+        store.initialized = true;
+        store.columns[0].json_cache = try store.jsonCache();
+        const owned = store.arena.allocator();
+        for (0..count) |row| {
+            const value = try owned.create(JsonPayload);
+            value.* = if (self.frozen) |frozen| .{ .frozen = .{ .bytes = try owned.dupe(u8, frozen.bytes), .lossless_text = frozen.lossless_text } } else .{ .text = try owned.dupe(u8, self.text) };
+            try store.columns[0].appendJson(store.a, owned, owned, row, value);
+            store.len += 1;
+        }
+    }
+};
+
+test "SQL shared JSON owns payloads and scalar caches across producers and representations" {
+    const Fixture = struct {
+        fn run(a: A, frozen_mode: bool) !void {
+            var store = Store.init(a);
+            defer store.deinit();
+            {
+                var source = std.heap.ArenaAllocator.init(a);
+                defer source.deinit();
+                const sa = source.allocator();
+                const padding: [512]u8 = @splat('x');
+                const text = try std.fmt.allocPrint(sa, "{{\"x\":9007199254740993,\"payload\":\"{s}\"}}", .{padding});
+                var fixture: SharedJsonFixture = .{ .text = text };
+                if (frozen_mode) {
+                    const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, text, .{});
+                    const wire = try @import("spill.zig").encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+                    const block = try @import("spill.zig").decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+                    defer block.deinit();
+                    fixture.frozen = (try block.frozenJson(0, 0, false)).?;
+                    try fixture.populate(&store, 3, false);
+                    // Text bytes and frozen numeric tags must never share a
+                    // cache, even when their rendered JSON means the same thing.
+                    fixture.frozen = null;
+                    try fixture.populate(&store, 1, false);
+                } else try fixture.populate(&store, 4, false);
+            }
+            try std.testing.expect(store.columns[0].json_bytes.?.items[0].? == store.columns[0].json_bytes.?.items[2].?);
+            if (frozen_mode) try std.testing.expect(store.columns[0].json_bytes.?.items[0].? != store.columns[0].json_bytes.?.items[3].?);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const first = try store.cell(scratch.allocator(), 0, 0);
+            const repeated = try store.cell(scratch.allocator(), 2, 0);
+            try std.testing.expect(first.value.object.values().ptr == repeated.value.object.values().ptr);
+            const number = first.value.object.get("x").?;
+            if (frozen_mode) try std.testing.expectEqual(@as(i64, 9007199254740993), number.integer) else try std.testing.expectEqualStrings("9007199254740993", number.number_string);
+            try std.testing.expectEqual(@as(usize, 512), first.value.object.get("payload").?.string.len);
+        }
+    };
+    for ([_]bool{ false, true }) |frozen| {
+        try Fixture.run(std.testing.allocator, frozen);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{frozen});
+    }
+}
+
+test "native projection refinements benchmark shared retained JSON payloads" {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    var text: std.Io.Writer.Allocating = .init(source.allocator());
+    try text.writer.writeAll("{\"payload\":\"");
+    try text.writer.splatByteAll('x', 12000);
+    try text.writer.writeAll("\"}");
+    var fixture: SharedJsonFixture = .{ .text = text.written() };
+    var peaks: [2]usize = undefined;
+    var sums: [2]u64 = undefined;
+    for ([_]bool{ true, false }, 0..) |reference, index| {
+        var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 64 << 20 };
+        var store = Store.init(budget.allocator());
+        defer store.deinit();
+        try fixture.populate(&store, 64, reference);
+        var hash = std.hash.Wyhash.init(0);
+        for (0..store.len) |row| hash.update((try store.encodedJson(row, 0)).?);
+        sums[index] = hash.final();
+        peaks[index] = budget.peak;
+        if (!reference) try std.testing.expectEqual(@as(usize, 1), store.json_payloads.count());
+    }
+    try std.testing.expectEqual(sums[0], sums[1]);
+    try std.testing.expect(peaks[1] * 8 < peaks[0]);
+    std.debug.print("SHARED_RETAINED_JSON rows=64 source_bytes={d} before_peak={d} after_peak={d}\n", .{ text.written().len, peaks[0], peaks[1] });
 }

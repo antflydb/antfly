@@ -2122,7 +2122,15 @@ pub const Sequential = struct {
             };
         }
         pub fn deinit(self: *InputBlock) void {
-            if (self.* == .owned) self.owned.release();
+            switch (self.*) {
+                .owned => |block| block.release(),
+                .borrowed => |*block| {
+                    // Metadata/wire borrow the file's read arena, but lazy
+                    // scalar/text caches have their own allocation lifetime.
+                    if (block.encoded) |encoded| encoded.deinit();
+                    block.encoded = null;
+                },
+            }
         }
     };
     /// Retaining consumers finish copying state before advancing this source.
@@ -5058,4 +5066,39 @@ test "native projection refinements benchmark native numeric forwarding" {
         try std.testing.expect(after.peak < before.peak);
         std.debug.print("NUMERIC_FROZEN_TRANSFER sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} before_decode_peak={d} after_decode_peak={d} wire={d} rows=8\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.decode_peak, after.decode_peak, bytes.len });
     }
+}
+
+test "SQL borrowed compact blocks retire lazy scalar cache allocations" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"x\":[9007199254740993,1.25],\"s\":\"owned value\"}", .{});
+            const values = [_][]const Datum{ &.{Datum.json(root)}, &.{Datum.json(root)} };
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 8 << 20 };
+            var dummy: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            {
+                var file = try Sequential.init(&manager, 128);
+                defer file.close();
+                try file.appendBatch(.{ .rows = &values }, .{ .rows = &.{ &.{}, &.{} } }, &.{ 0, 1 });
+                var input = try file.readInputBlockBorrowed(0);
+                var live = true;
+                defer if (live) input.deinit();
+                try std.testing.expect(input == .borrowed);
+                const before = budget.live;
+                _ = try input.view().cell(0, 0);
+                try std.testing.expect(budget.live > before);
+                input.deinit();
+                live = false;
+                try std.testing.expectEqual(before, budget.live);
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
