@@ -71,6 +71,11 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             )
             raise SystemExit(f"invalid release platform entry; missing {missing}")
         platform_id = platform["id"]
+        if platform["optimize"] not in ("debug", "safe", "fast", "small"):
+            raise SystemExit(
+                f"{platform_id} has invalid optimize mode {platform['optimize']!r}; "
+                "expected debug, safe, fast, or small"
+            )
         artifact_name = platform["artifact_name"]
         archive_key = (
             platform["archive_os"],

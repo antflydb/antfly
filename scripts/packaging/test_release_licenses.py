@@ -79,6 +79,10 @@ class ReleaseLicenseTests(unittest.TestCase):
                 'for shell in bash zsh fish; do echo fixture > "$1/antfly.$shell"; done\n'
             )
             completions.chmod(0o755)
+            policy = json.loads((ROOT / "scripts/release/platforms.json").read_text())
+            optimize = {
+                entry["zig_target"]: entry["optimize"] for entry in policy["platforms"]
+            }
             for product, target, steps, license_name in (
                 ("embedded", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("lite", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
@@ -99,6 +103,8 @@ class ReleaseLicenseTests(unittest.TestCase):
                             "test",
                             "--target",
                             target,
+                            "--optimize",
+                            optimize[target],
                             "--archive-name",
                             product + ".tar.gz",
                             "--out-dir",
