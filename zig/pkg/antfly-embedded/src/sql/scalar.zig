@@ -253,6 +253,10 @@ pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true, e
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
+    /// This spelling belongs to multiple visible relations. Keep it in the
+    /// binding environment so unused ambiguity is harmless; reject only an
+    /// actual reference, before any physical execution is admitted.
+    ambiguous: bool = false,
     nullable: bool = true,
     element_type: ?arrays.ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
@@ -2454,6 +2458,7 @@ const Binder = struct {
             } else literalType(value),
             .column => |name| blk: {
                 const column = self.columns[self.names.get(name) orelse return error.UnknownColumn];
+                if (column.ambiguous) return error.AmbiguousSqlColumn;
                 if (column.numeric_modifier) |modifier| {
                     if ((column.type != .number and column.type != .array) or column.element_type != .numeric) return error.InvalidSqlProgram;
                     try modifier.validate();

@@ -2,6 +2,8 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-conflict-scope-native-debug": {"command":["zig","build","antfly-sql-conflict-scope-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-conflict-scope-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_conflict_scope.py"],"cwd":".","timeout_seconds":180},
     "sql-original-nullability-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-nullability-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-nullability-lifecycle-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_catalog_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-original-table-creation-native-debug": {"command":["zig","build","antfly-api-sql-table-creation-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
@@ -14076,13 +14078,37 @@
     },
     {
       "id": "sql-1388",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original non-PostgreSQL expectation is superseded by actual PostgreSQL 18+ name resolution: unqualified target columns inside ON CONFLICT DO UPDATE assignments or its predicate are ambiguous with excluded and must fail with 42702. The exact unchanged original and parameters reject through mounted HTTP on empty and populated native primary-key tables, before source reads. Complete postimages, versions and digests remain unchanged; qualified controls still perform real updates. This is a tested semantic supersession, not an unsupported-feature rejection or a new successful SQL feature.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1389",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original non-PostgreSQL expectation is superseded by actual PostgreSQL 18+ name resolution: unqualified target columns inside ON CONFLICT DO UPDATE assignments or its predicate are ambiguous with excluded and must fail with 42702. The exact unchanged original and parameters reject through mounted HTTP on empty and populated native primary-key tables, before source reads. Complete postimages, versions and digests remain unchanged; qualified controls still perform real updates. This is a tested semantic supersession, not an unsupported-feature rejection or a new successful SQL feature.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1390",
@@ -14092,8 +14118,20 @@
     },
     {
       "id": "sql-1391",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original non-PostgreSQL expectation is superseded by actual PostgreSQL 18+ name resolution: unqualified target columns inside ON CONFLICT DO UPDATE assignments or its predicate are ambiguous with excluded and must fail with 42702. The exact unchanged original and parameters reject through mounted HTTP on empty and populated native primary-key tables, before source reads. Complete postimages, versions and digests remain unchanged; qualified controls still perform real updates. This is a tested semantic supersession, not an unsupported-feature rejection or a new successful SQL feature.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1392",
@@ -14391,8 +14429,20 @@
     },
     {
       "id": "sql-1438",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original non-PostgreSQL expectation is superseded by actual PostgreSQL 18+ name resolution: unqualified target columns inside ON CONFLICT DO UPDATE assignments or its predicate are ambiguous with excluded and must fail with 42702. The exact unchanged original and parameters reject through mounted HTTP on empty and populated native primary-key tables, before source reads. Complete postimages, versions and digests remain unchanged; qualified controls still perform real updates. This is a tested semantic supersession, not an unsupported-feature rejection or a new successful SQL feature.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1439",
@@ -14435,8 +14485,20 @@
     },
     {
       "id": "sql-1444",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original non-PostgreSQL expectation is superseded by actual PostgreSQL 18+ name resolution: unqualified target columns inside ON CONFLICT DO UPDATE assignments or its predicate are ambiguous with excluded and must fail with 42702. The exact unchanged original and parameters reject through mounted HTTP on empty and populated native primary-key tables, before source reads. Complete postimages, versions and digests remain unchanged; qualified controls still perform real updates. This is a tested semantic supersession, not an unsupported-feature rejection or a new successful SQL feature.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1445",
@@ -14691,18 +14753,54 @@
     },
     {
       "id": "sql-1478",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original non-PostgreSQL expectation is superseded by actual PostgreSQL 18+ name resolution: unqualified target columns inside ON CONFLICT DO UPDATE assignments or its predicate are ambiguous with excluded and must fail with 42702. The exact unchanged original and parameters reject through mounted HTTP on empty and populated native primary-key tables, before source reads. Complete postimages, versions and digests remain unchanged; qualified controls still perform real updates. This is a tested semantic supersession, not an unsupported-feature rejection or a new successful SQL feature.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1479",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original non-PostgreSQL expectation is superseded by actual PostgreSQL 18+ name resolution: unqualified target columns inside ON CONFLICT DO UPDATE assignments or its predicate are ambiguous with excluded and must fail with 42702. The exact unchanged original and parameters reject through mounted HTTP on empty and populated native primary-key tables, before source reads. Complete postimages, versions and digests remain unchanged; qualified controls still perform real updates. This is a tested semantic supersession, not an unsupported-feature rejection or a new successful SQL feature.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1480",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original alias-qualified ON CONFLICT predicate executes through mounted HTTP over a native relational table with its logical primary key. Independent PostgreSQL verifies matching-update and skipped-conflict outcomes. Complete stored postimages, primary versions and logical digests prove a false predicate does not rewrite the row. Qualified scalar and tuple/DEFAULT controls preserve target-only RETURNING scope. This is single-owner mutation evidence, not public index DDL or distributed publication activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_conflict_scope_test.zig",
+          "test": "httpx SQL original conflict references reject ambiguity before reads and preserve qualified writes",
+          "gate": "sql-conflict-scope-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1481",

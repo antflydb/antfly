@@ -488,6 +488,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
         .dependOn(&addFilteredTestRunArtifact(b, sql_native_cells_tests).step);
+    const sql_conflict_scope_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "SQL original conflict references", "SQL conflict scope", "compiler conflict row assignments" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-conflict-scope-test", "Verify PostgreSQL conflict scope, atomic rejection and qualified native writes")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_conflict_scope_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });

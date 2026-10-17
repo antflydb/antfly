@@ -1574,24 +1574,61 @@ const Parser = struct {
         try self.expectKeyword(.update);
         try self.expectKeyword(.set);
         var assignments: std.ArrayList(ast.Assignment) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (true) {
+            const tuple = self.take(.lparen);
             try self.node();
-            const column_name = try self.identifier();
-            for (assignments.items) |prior| if (std.mem.eql(u8, prior.field, column_name)) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
+            const first = try self.identifier();
+            if ((try seen.getOrPut(self.alloc, first)).found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
+            const targets: []const []const u8 = if (tuple) columns: {
+                var names: std.ArrayList([]const u8) = .empty;
+                try names.append(self.alloc, first);
+                while (self.take(.comma)) {
+                    try self.node();
+                    const column = try self.identifier();
+                    if ((try seen.getOrPut(self.alloc, column)).found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
+                    try names.append(self.alloc, column);
+                }
+                try self.expect(.rparen);
+                break :columns names.items;
+            } else &.{first};
             try self.expect(.eq);
-            if (self.keyword(.default)) {
-                try assignments.append(self.alloc, .{ .field = column_name, .use_default = true });
-                if (!self.take(.comma)) break;
-                continue;
-            }
-            const expression = try self.scalar(0, 0);
-            try self.checkScalarDepth(expression, 0);
-            try assignments.append(self.alloc, .{ .field = column_name, .expression = expression });
+            try self.assignmentValues(targets, tuple, &assignments, true);
             if (!self.take(.comma)) break;
         }
         const filter = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (filter) |expression| try self.checkScalarDepth(expression, 0);
         return .{ .columns = try columns.toOwnedSlice(self.alloc), .constraint_name = constraint_name, .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
+    }
+
+    fn assignmentValues(self: *Parser, targets: []const []const u8, tuple: bool, assignments: *std.ArrayList(ast.Assignment), comptime literal_expression: bool) Error!void {
+        if (tuple) {
+            _ = self.keyword(.row);
+            try self.expect(.lparen);
+            if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.select) or self.tokens[self.pos].isKeyword(.with))) {
+                try self.rowSubqueryAssignments(targets, assignments);
+                return;
+            }
+            for (targets, 0..) |column, i| {
+                if (i != 0) try self.expect(.comma);
+                if (self.keyword(.default)) {
+                    try assignments.append(self.alloc, .{ .field = column, .use_default = true });
+                    continue;
+                }
+                const expression = try self.scalar(0, 0);
+                try self.checkScalarDepth(expression, 0);
+                try assignments.append(self.alloc, if (!literal_expression and expression.* == .literal) .{ .field = column, .value = expression.literal } else .{ .field = column, .expression = expression });
+            }
+            if (!self.take(.rparen)) return self.fail(error.InvalidSqlSyntax, "row assignment value count does not match targets");
+        } else {
+            if (self.keyword(.default)) {
+                try assignments.append(self.alloc, .{ .field = targets[0], .use_default = true });
+            } else {
+                const expression = try self.scalar(0, 0);
+                try self.checkScalarDepth(expression, 0);
+                try assignments.append(self.alloc, if (!literal_expression and expression.* == .literal) .{ .field = targets[0], .value = expression.literal } else .{ .field = targets[0], .expression = expression });
+            }
+        }
     }
 
     fn update(self: *Parser) Error!ast.Update {
@@ -1619,34 +1656,7 @@ const Parser = struct {
             }
             if (tuple) try self.expect(.rparen);
             try self.expect(.eq);
-            if (tuple) {
-                _ = self.keyword(.row);
-                try self.expect(.lparen);
-                if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.select) or self.tokens[self.pos].isKeyword(.with))) {
-                    try self.rowSubqueryAssignments(targets.items, &assignments);
-                    if (!self.take(.comma)) break;
-                    continue;
-                }
-                for (targets.items, 0..) |column, i| {
-                    if (i != 0) try self.expect(.comma);
-                    if (self.keyword(.default)) {
-                        try assignments.append(self.alloc, .{ .field = column, .use_default = true });
-                        continue;
-                    }
-                    const expression = try self.scalar(0, 0);
-                    try self.checkScalarDepth(expression, 0);
-                    try assignments.append(self.alloc, if (expression.* == .literal) .{ .field = column, .value = expression.literal } else .{ .field = column, .expression = expression });
-                }
-                if (!self.take(.rparen)) return self.fail(error.InvalidSqlSyntax, "row assignment value count does not match targets");
-            } else {
-                if (self.keyword(.default)) {
-                    try assignments.append(self.alloc, .{ .field = targets.items[0], .use_default = true });
-                } else {
-                    const expression = try self.scalar(0, 0);
-                    try self.checkScalarDepth(expression, 0);
-                    try assignments.append(self.alloc, if (expression.* == .literal) .{ .field = targets.items[0], .value = expression.literal } else .{ .field = targets.items[0], .expression = expression });
-                }
-            }
+            try self.assignmentValues(targets.items, tuple, &assignments, false);
             if (!self.take(.comma)) break;
         }
         if (self.keyword(.from)) {
@@ -3074,6 +3084,32 @@ test "compiler owns folded and quoted identifiers and exact literals" {
     try std.testing.expectEqual(std.math.minInt(i64), insert.rows[0][2].integer);
     try std.testing.expectEqual(std.math.maxInt(i64), insert.rows[1][2].integer);
     try std.testing.expectEqual(@as(u32, 1), compiled.parameter_count);
+}
+
+test "compiler conflict row assignments preserve defaults simultaneous expressions and bounded ownership" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try compile(a, "INSERT INTO users (id,age) VALUES ('a',2) ON CONFLICT (id) DO UPDATE SET (name,age)=ROW(DEFAULT,users.age+excluded.age),active=true RETURNING age", .{});
+            defer compiled.deinit();
+            const assignments = compiled.statement.insert.conflict.?.assignments;
+            try std.testing.expectEqual(@as(usize, 3), assignments.len);
+            try std.testing.expectEqualStrings("name", assignments[0].field);
+            try std.testing.expect(assignments[0].use_default);
+            try std.testing.expectEqualStrings("age", assignments[1].field);
+            try std.testing.expectEqual(ast.Scalar.Binary.add, assignments[1].expression.?.binary.op);
+            try std.testing.expectEqualStrings("active", assignments[2].field);
+            try std.testing.expect(assignments[2].expression.?.literal.boolean);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    for ([_][]const u8{
+        "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (age,age)=ROW(1,2)",
+        "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (name,age)=ROW('x',2),age=3",
+    }) |sql| try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, sql, .{}));
+    for ([_][]const u8{
+        "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (name,age)=ROW('x')",
+        "INSERT INTO users(id) VALUES('a') ON CONFLICT(id) DO UPDATE SET (name,age)=ROW('x',2,3)",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
 }
 
 test "compiler keeps ON CONFLICT arbiter predicate separate from update predicate" {

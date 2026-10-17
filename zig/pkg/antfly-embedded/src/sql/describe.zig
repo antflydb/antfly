@@ -1079,6 +1079,36 @@ test "SQL describe owns ordered aliases and complete sparse parameter metadata w
     try std.testing.expectEqualStrings("table:immutable", result.binding.table.?.physical_name);
 }
 
+test "SQL conflict scope rejects ambiguous references before physical admission and preserves qualified targets" {
+    const a = std.testing.allocator;
+    var fake: FakeBackend = .{};
+    for ([_][]const u8{
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=age+excluded.age",
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=CASE WHEN age>0 THEN excluded.age ELSE 1 END",
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=excluded.age WHERE age>0",
+        "INSERT INTO things AS t (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=coalesce(age,excluded.age)",
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET (name,age)=ROW(DEFAULT,age+excluded.age)",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.AmbiguousSqlColumn, describe(a, fake.backend(), &compiled, &.{}));
+    }
+    for ([_][]const u8{
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=things.age+excluded.age RETURNING age",
+        "INSERT INTO things AS t (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=t.age+excluded.age WHERE t.age>0 RETURNING age",
+        "INSERT INTO public.things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=public.things.age+excluded.age RETURNING age",
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=excluded.age RETURNING age",
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET age=DEFAULT RETURNING age",
+        "INSERT INTO things (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO NOTHING RETURNING age",
+        "INSERT INTO things AS t (_id,age) VALUES ('new',2) ON CONFLICT (_id) DO UPDATE SET (name,age)=ROW(DEFAULT,t.age+excluded.age) RETURNING age",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try describe(a, fake.backend(), &compiled, &.{});
+        defer result.deinit();
+    }
+}
+
 test "SQL NUMERIC result modifiers survive derived CTE VALUES and set binding" {
     const a = std.testing.allocator;
     const Entry = struct { sql: []const u8, oid: u32, modifier: i32 };

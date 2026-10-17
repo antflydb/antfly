@@ -43,6 +43,7 @@ test {
     _ = @import("api/sql_execution.zig");
     _ = @import("api/sql_pgwire.zig");
     _ = @import("api/sql_catalog_campaign_test.zig");
+    _ = @import("api/sql_conflict_scope_test.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/tables.zig");

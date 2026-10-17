@@ -68,7 +68,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     const columns = try alloc.alloc(scalar.Column, count * 3 + clause.capture_count);
     for (0..count) |i| {
         const column = if (i == table.columns.len) try table.column("_id") else table.columns[i];
-        columns[i] = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+        columns[i] = .{ .name = column.name, .type = column.type, .ambiguous = true, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
         columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
         if (!aliased) {
             const scope = table.scope orelse if (name.namespace) |namespace| catalog.Table.Scope{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;

@@ -9,16 +9,49 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-531 implemented / 132 rejected / 113 superseded / 810 unresolved. Counts below
+532 implemented / 132 rejected / 120 superseded / 802 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
 | 1 | DDL, catalog and sessions | 303 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
-| 2 | Source/joined mutations and MERGE/recursion | 128 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
+| 2 | Source/joined mutations and MERGE/recursion | 126 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
+
+## PostgreSQL conflict-scope delivery (2026-10-17)
+
+Original-case qualification resumed with the mounted conflict-update path,
+rather than another owner-protocol prerequisite. `sql-1480` now has independent
+PostgreSQL and mounted native HTTP evidence for the alias-qualified predicate,
+including its true and false outcomes. The false outcome preserves complete
+row bytes, durable primary version and logical digest. Real logical primary-key
+ownership is used; qualified scalar and tuple/DEFAULT updates still succeed.
+
+The seven originals `sql-1388`, `sql-1389`, `sql-1391`, `sql-1438`, `sql-1444`,
+`sql-1478` and `sql-1479` require a tested PostgreSQL supersession, not a claim
+of seven new features: their unqualified conflict-assignment/predicate columns
+are ambiguous with `excluded` and PostgreSQL rejects them with `42702`, even
+with no input rows or conflicts. Native binding now rejects the same references
+before source reads. Empty and populated native fixtures verify full postimages
+and unchanged primary versions/digests; the immutable original SQL is not edited.
+
+Conflict updates also share UPDATE's tuple assignment-value parser instead of
+rejecting `SET (a,b) = ROW(...)` before semantic binding. Both parsers retain
+their existing literal representation and duplicate-target checks. All values
+still use the existing simultaneous conflict evaluation; DEFAULT and qualified
+target/excluded expressions receive independent PostgreSQL controls. The new
+scope marker is binding-only and adds no row-evaluation instruction or JSON
+parsing pass. Shape errors and allocation failures have focused Debug coverage.
+Row-subquery conflict assignments are not activated by this tuple-value change.
+
+Native evidence: `zig build antfly-sql-conflict-scope-test -Doptimize=Debug -j1`
+(three tests, 58/58 steps). Independent oracle: `test_sql_conflict_scope.py`
+against an owned PostgreSQL 18+ server. These close eight original contracts:
+one supported original and seven independently disproven expectations. They do
+not close public index DDL activation, distributed read cuts or the remaining
+catalog work; the original inventory remains the completion boundary.
 
 ## First delivery: catalog and index lifecycle
 
