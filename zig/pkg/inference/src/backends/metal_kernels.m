@@ -17491,6 +17491,21 @@ int termite_metal_decode_runtime_release_linear_views(termite_metal_decode_runti
     return 0;
 }
 
+// Transfer cached views to the encoding frame before reusing the cache for
+// its successor. Completion/cancellation releases them with that frame only.
+int termite_metal_decode_runtime_detach_linear_views(termite_metal_decode_runtime *runtime, size_t count) {
+    if (runtime == NULL || count > TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
+    if (runtime->active_frame_cb == nil) return -2;
+    for (size_t slot = 0; slot < count; ++slot) {
+        id views[] = { runtime->linear_mps_left[slot], runtime->linear_mps_right[slot], runtime->linear_mps_result[slot] };
+        for (size_t i = 0; i < 3; ++i) {
+            if (views[i] != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, views[i]) != 0) return -3;
+        }
+        termite_metal_decode_runtime_invalidate_linear_mps_matrices(runtime, slot);
+    }
+    return 0;
+}
+
 uint64_t termite_metal_decode_runtime_linear_view_bytes(termite_metal_decode_runtime *runtime, size_t count) {
     if (runtime == NULL || count > TERMITE_METAL_LINEAR_SLOT_CAPACITY) return UINT64_MAX;
     uint64_t bytes = 0;

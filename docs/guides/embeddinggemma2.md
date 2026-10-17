@@ -603,17 +603,19 @@ CPU row slices retain their source owner, including typed checkpoint mappings,
 instead of copying matrix weights. CPU per-layer input projections are grouped
 under a 16 MiB projected-output ceiling; long inputs keep the streamed path.
 Metal backbones above the small-input frame threshold encode one bounded layer
-group while its predecessor executes. Each pair drains before activation-view
-retirement. The two live groups share the existing 128 KiB/row layer envelope;
-scratch released by the successor cannot be recycled by predecessor completion.
+group while its predecessor executes. MPS activation views transfer to their
+encoding frame and retire on its completion. The schedule rolls forward without
+draining the successor. The two live groups share the existing 128 KiB/row layer
+envelope; scratch released by the successor cannot be recycled by predecessor completion.
 Cancellation drops unsubmitted work and drains submitted work before releasing
 owners. `ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER=1` selects serial
 submission for diagnostics.
 
 Mixed media cohorts use a bounded readiness scheduler. A group executes once
 all its required projected parts are available, while the next CPU preparation
-wave runs. A singleton may wait one preparation wave to coalesce a useful
-backbone batch; ready work cannot be deferred indefinitely. Waves remain
+wave runs. Completed CPU preparation buffers and their admission are released
+before running ready backbones. A singleton may wait one preparation wave to
+coalesce a useful backbone batch; ready work cannot be deferred indefinitely. Waves remain
 homogeneous batches of at most four items but can
 cross image/audio boundaries. Text-only groups can overlap the first media
 preparation wave. Finished groups release projected tokens promptly; public
@@ -669,6 +671,12 @@ storage and waits for completion; failed copies are not published. Cancellation
 releases the consumer's handle; completed snapshots remain reusable on retry.
 Warm device execution performs no scale readback. Audio pressure reclamation and model
 unload release these constants alongside prepared weights.
+
+Native audio local attention scales each query once per head in worker-local
+SIMD scratch, reusing it across keys. Softmax skips masked entries when their
+exponentials are guaranteed to round to zero in F32; other finite masks keep
+the general normalization path. Clip boundaries and cancellation remain local
+to each row.
 
 Backbone post-normalization/residual epilogues use one backend operation,
 including the final per-layer output scale. PLE GELU and multiplication share
@@ -734,7 +742,8 @@ This compares actual attention outputs and completed kernel times at several
 patch grids. It is a kernel diagnostic, not an end-to-end throughput gate.
 
 The prepared CPU matrix diagnostic reports cold panel setup, retained bytes,
-paired direct/prepared timings, and output agreement for each geometry:
+paired direct/prepared timings, and output agreement for each geometry, including
+1-, 4- and 15-row projections as well as larger encoder batches:
 
 ```sh
 zig build bench-linalg-prepared -Doptimize=ReleaseFast

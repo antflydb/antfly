@@ -2305,6 +2305,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         ) != 0) return error.MetalLinearViewReleaseFailed;
     }
 
+    /// Make encoded activation views completion-owned before rotating frames.
+    pub fn detachEmbeddingGemma2ActivationViews(cb: *const ops.ComputeBackend) !void {
+        if (cb.kind() != .metal) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (metal_runtime.termite_metal_decode_runtime_detach_linear_views(
+            self.provider_impl.raw_decode_runtime,
+            metal_runtime.decoder_runtime_linear_slot_capacity,
+        ) != 0) return error.MetalLinearViewReleaseFailed;
+    }
+
     /// Release slots keyed by a transient tensor after its GPU work completes,
     /// immediately before freeing the tensor wrapper and its identity.
     pub fn releaseDynamicSlotsForTensor(cb: *const ops.ComputeBackend, tensor: CT) void {
@@ -33464,6 +33474,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn releaseDynamicSlotsForTensor(_: *const ops.ComputeBackend, _: CT) void {}
 
     pub fn releaseEmbeddingGemma2ActivationViews(_: *const ops.ComputeBackend) !void {}
+    pub fn detachEmbeddingGemma2ActivationViews(_: *const ops.ComputeBackend) !void {}
 
     pub fn takeQuantizedStorage(
         _: *const ops.ComputeBackend,
@@ -40842,11 +40853,32 @@ fn exerciseEmbeddingGemma2ProjectionCache(name: []const u8, denied_name: []const
         try std.testing.expectError(error.MetalLinearViewReleaseFailed, MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb));
         try std.testing.expectEqual(view_bytes, metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity));
         if (iteration == 0) {
+            try MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+            try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity));
             try cb.decoderRuntimeCancelFrame();
         } else {
+            try std.testing.expect(cb.decoderRuntimeSetWhisperPipelinedFrames(true));
+            defer _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+            try MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+            try cb.decoderRuntimeSubmitFrame();
+            // The successor owns different matrix views of the same slot.
+            // Retiring its predecessor must leave the successor executable.
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            const successor = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = output, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedMetalLinear;
+            defer cb.free(successor);
+            try MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+            try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity));
+            try cb.decoderRuntimeWaitSubmittedFrame();
+            try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
             try cb.decoderRuntimeSubmitAndWaitFrame();
             try MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
-            try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.termite_metal_decode_runtime_linear_view_bytes(runtime, metal_runtime_mod.decoder_runtime_linear_slot_capacity));
+            const first_expected = try legacyGlinerMpsLinearOracle(a, input_values[0 .. rows * dim], &weights, &nonglobal_bias_values, false);
+            defer a.free(first_expected);
+            const next_expected = try legacyGlinerMpsLinearOracle(a, first_expected, &weights, &nonglobal_bias_values, false);
+            defer a.free(next_expected);
+            const next_actual = try cb.toFloat32(successor, a);
+            defer a.free(next_actual);
+            for (next_actual, next_expected) |value, ref| try std.testing.expectApproxEqAbs(ref, value, 1e-5);
             try std.testing.expectEqual(@as(usize, slot_bytes), controller.snapshot().backend_weight_bytes);
             const actual = try cb.toFloat32(output, a);
             defer a.free(actual);

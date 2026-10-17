@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [8192]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     const a = init.gpa;
-    for ([_][3]usize{ .{ 32, 512, 512 }, .{ 128, 512, 512 }, .{ 512, 512, 512 }, .{ 128, 4096, 512 }, .{ 128, 512, 2048 }, .{ 513, 1024, 512 }, .{ 127, 131, 65 } }) |shape| {
+    for ([_][3]usize{ .{ 1, 512, 512 }, .{ 4, 512, 512 }, .{ 15, 512, 512 }, .{ 15, 4096, 512 }, .{ 15, 512, 2048 }, .{ 32, 512, 512 }, .{ 128, 512, 512 }, .{ 512, 512, 512 }, .{ 128, 4096, 512 }, .{ 128, 512, 2048 }, .{ 513, 1024, 512 }, .{ 127, 131, 65 } }) |shape| {
         const m, const n, const k = .{ shape[0], shape[1], shape[2] };
         const x = try a.alloc(f32, m * k);
         defer a.free(x);

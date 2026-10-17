@@ -132,17 +132,19 @@ CPU row slices retain their source owner, including typed checkpoint mappings,
 instead of copying matrix weights. CPU per-layer input projections are grouped
 under a 16 MiB projected-output ceiling; long inputs keep the streamed path.
 Metal backbones above the small-input frame threshold encode one bounded layer
-group while its predecessor executes. Each pair drains before activation-view
-retirement. The two live groups share the existing 128 KiB/row layer envelope;
-scratch released by the successor cannot be recycled by predecessor completion.
+group while its predecessor executes. MPS activation views transfer to their
+encoding frame and retire on its completion. The schedule rolls forward without
+draining the successor. The two live groups share the existing 128 KiB/row layer
+envelope; scratch released by the successor cannot be recycled by predecessor completion.
 Cancellation drops unsubmitted work and drains submitted work before releasing
 owners. `ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER=1` selects serial
 submission for diagnostics.
 
 Mixed media cohorts use a bounded readiness scheduler. A group executes once
 all its required projected parts are available, while the next CPU preparation
-wave runs. A singleton may wait one preparation wave to coalesce a useful
-backbone batch; ready work cannot be deferred indefinitely. Waves remain
+wave runs. Completed CPU preparation buffers and their admission are released
+before running ready backbones. A singleton may wait one preparation wave to
+coalesce a useful backbone batch; ready work cannot be deferred indefinitely. Waves remain
 homogeneous batches of at most four items but can
 cross image/audio boundaries. Text-only groups can overlap the first media
 preparation wave. Finished groups release projected tokens promptly; public

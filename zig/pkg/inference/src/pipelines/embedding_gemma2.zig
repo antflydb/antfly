@@ -1067,11 +1067,11 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
                 first += tokens;
             }
         }
-        // The next bounded preparation wave was started above. Running
-        // ready backbones here overlaps it and retires projected owners.
-        try scheduler.run(&result, end == count);
+        // Projection owns its device output. Release CPU preparation and its
+        // admission before the backbone competes with the next producer wave.
         wave.deinit();
         live[current] = false;
+        try scheduler.run(&result, end == count);
         offset = end;
         current = next;
     }

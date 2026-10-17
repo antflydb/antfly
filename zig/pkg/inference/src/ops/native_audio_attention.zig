@@ -26,7 +26,7 @@ pub fn forward(a: std.mem.Allocator, io: ?std.Io, p: Params, q: []const f32, k: 
     errdefer a.free(out);
     @memset(out, 0);
     const count = if (io != null and p.rows >= 32) @min(@as(usize, 4), p.rows) else 1;
-    const scratch = try a.alloc(f32, count * p.context);
+    const scratch = try a.alloc(f32, count * (p.context + p.head_dim));
     defer a.free(scratch);
     var jobs: [4]Job = undefined;
     for (jobs[0..count], 0..) |*job, index| job.* = .{
@@ -38,7 +38,8 @@ pub fn forward(a: std.mem.Allocator, io: ?std.Io, p: Params, q: []const f32, k: 
         .scales = scales,
         .valid = valid,
         .out = out,
-        .scores = scratch[index * p.context ..][0..p.context],
+        .scores = scratch[index * (p.context + p.head_dim) ..][0..p.context],
+        .scaled_query = scratch[index * (p.context + p.head_dim) + p.context ..][0..p.head_dim],
         .first = p.rows * index / count,
         .last = p.rows * (index + 1) / count,
         .io = io,
@@ -66,6 +67,7 @@ const Job = struct {
     valid: []const f32,
     out: []f32,
     scores: []f32,
+    scaled_query: []f32,
     first: usize,
     last: usize,
     io: ?std.Io,
@@ -89,6 +91,8 @@ const Job = struct {
             const last = @min(p.context, @min(offset + p.context_left, (p.rows - block) + past));
             for (0..p.heads) |head| {
                 const qb = row * p.hidden + head * p.head_dim;
+                // The query and per-dimension scales are independent of keys.
+                scaleQuery(self.scaled_query, self.q[qb..][0..p.head_dim], self.scales);
                 @memset(self.scores, p.invalid_value);
                 var maximum: f32 = -std.math.inf(f32);
                 var keys: usize = 0;
@@ -97,7 +101,7 @@ const Job = struct {
                     if (key > row or row - key > past - @intFromBool(p.exclude_farthest_key) or self.valid[key] == 0) continue;
                     const kb = key * p.hidden + head * p.head_dim;
                     const rb = (c - offset) * p.hidden + head * p.head_dim;
-                    const score = dot(self.q[qb..][0..p.head_dim], self.k[kb..][0..p.head_dim], self.rel[rb..][0..p.head_dim], self.scales, p.k_scale);
+                    const score = dot(self.scaled_query, self.k[kb..][0..p.head_dim], self.rel[rb..][0..p.head_dim], p.k_scale);
                     const capped = std.math.tanh(score / p.logit_cap) * p.logit_cap;
                     self.scores[c] = capped;
                     maximum = @max(maximum, capped);
@@ -105,9 +109,19 @@ const Job = struct {
                 }
                 if (keys == 0) continue;
                 var sum: f32 = 0;
-                for (self.scores) |*score| {
-                    score.* = @exp(score.* - maximum);
-                    sum += score.*;
+                // exp(x) rounds to zero below -104 in binary32. The model's
+                // -1e9 mask therefore needs neither exp nor summation work.
+                // Keep general finite-mask semantics for other callers.
+                if (p.invalid_value - maximum < -104) {
+                    for (self.scores[first..@max(first, last)]) |*score| {
+                        score.* = if (score.* == p.invalid_value) 0 else @exp(score.* - maximum);
+                        sum += score.*;
+                    }
+                } else {
+                    for (self.scores) |*score| {
+                        score.* = @exp(score.* - maximum);
+                        sum += score.*;
+                    }
                 }
                 if (sum == 0) continue;
                 const dst = self.out[qb..][0..p.head_dim];
@@ -123,19 +137,26 @@ const Job = struct {
     }
 };
 
-fn dot(q: []const f32, k: []const f32, rel: []const f32, scales: []const f32, scale: f32) f32 {
+fn scaleQuery(dst: []f32, q: []const f32, scales: []const f32) void {
+    const V = @Vector(8, f32);
+    var d: usize = 0;
+    while (d + 8 <= q.len) : (d += 8) dst[d..][0..8].* = @as(V, q[d..][0..8].*) * @as(V, scales[d..][0..8].*);
+    while (d < q.len) : (d += 1) dst[d] = q[d] * scales[d];
+}
+
+fn dot(q: []const f32, k: []const f32, rel: []const f32, scale: f32) f32 {
     const V = @Vector(8, f32);
     var sums: V = @splat(0);
     var d: usize = 0;
     while (d + 8 <= q.len) : (d += 8) {
-        const scaled = @as(V, q[d..][0..8].*) * @as(V, scales[d..][0..8].*);
+        const scaled = @as(V, q[d..][0..8].*);
         sums += scaled * (@as(V, k[d..][0..8].*) * @as(V, @splat(scale)));
         sums += scaled * @as(V, rel[d..][0..8].*);
     }
     var result = @reduce(.Add, sums);
     while (d < q.len) : (d += 1) {
-        result += q[d] * scales[d] * (k[d] * scale);
-        result += q[d] * scales[d] * rel[d];
+        result += q[d] * (k[d] * scale);
+        result += q[d] * rel[d];
     }
     return result;
 }

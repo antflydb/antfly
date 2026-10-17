@@ -893,19 +893,21 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     defer frame_batch.deinit(cb);
     var shared_frame = false;
     const group_layers = metalLayerGroup(cfg, rows);
-    // One submitted predecessor and one encoding successor. Drain each pair
-    // before retiring MPS activation views, so owners remain within the same
-    // 128 KiB/row layer envelope as the serial schedule.
+    // Rolling two-slot schedule: retire only the completed predecessor.
+    // Encoded MPS views belong to their frame, keeping two groups within
+    // the admitted 128 KiB/row layer envelope without draining the successor.
     const pipeline = cb.kind() == .metal and rows > metalFrameRows() and
         !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER") and
         cb.decoderRuntimeSetWhisperPipelinedFrames(true);
     var pending_frame = false;
+    var pending_batch: LayerFrameBatch = .{};
     var pending_ple: ?CT = null;
     defer {
         if (shared_frame) cb.decoderRuntimeCancelFrame() catch {};
         if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {};
         if (pipeline) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
         if (pending_ple) |tensor| cb.free(tensor);
+        pending_batch.deinit(cb);
         @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
     }
     if (cb.kind() == .metal and cfg.num_hidden_layers <= frame_batch.slices.len) {
@@ -959,27 +961,34 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
             packed_ple = null;
         }
         if (shared_frame and (layer + 1) % group_layers == 0 and layer + 1 < cfg.num_hidden_layers) {
-            if (pipeline and !pending_frame) {
+            if (pipeline) {
+                // Detach before waiting: the successor owns its encoded views
+                // even while the predecessor's wrappers are being retired.
+                try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+                if (pending_frame) {
+                    try cb.decoderRuntimeWaitSubmittedFrame();
+                    pending_frame = false;
+                    if (pending_ple) |tensor| cb.free(tensor);
+                    pending_ple = null;
+                    pending_batch.deinit(cb);
+                    pending_batch.count = 0;
+                }
                 try cb.decoderRuntimeSubmitFrame();
                 shared_frame = false;
                 pending_frame = true;
+                pending_batch = frame_batch;
+                frame_batch.count = 0;
                 if (!whole_packed) {
                     pending_ple = packed_ple;
                     packed_ple = null;
                 }
             } else {
-                if (pending_frame) {
-                    try cb.decoderRuntimeWaitSubmittedFrame();
-                    pending_frame = false;
-                }
                 try cb.decoderRuntimeSubmitAndWaitFrame();
                 shared_frame = false;
                 if (!whole_packed) {
                     if (packed_ple) |tensor| cb.free(tensor);
                     packed_ple = null;
                 }
-                if (pending_ple) |tensor| cb.free(tensor);
-                pending_ple = null;
                 try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
                 frame_batch.deinit(cb);
                 frame_batch.count = 0;
@@ -1000,6 +1009,10 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     if (pending_frame) {
         try cb.decoderRuntimeWaitSubmittedFrame();
         pending_frame = false;
+        if (pending_ple) |tensor| cb.free(tensor);
+        pending_ple = null;
+        pending_batch.deinit(cb);
+        pending_batch.count = 0;
     }
     if (shared_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -1303,6 +1316,9 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
         cancel_at: usize,
         pending_runtime: ?*@import("../backends/metal_runtime.zig").RawMetalDecodeRuntime = null,
         saw_pending: bool = false,
+        first_pending_frame: ?u64 = null,
+        pending_frames: u64 = 0,
+        cancel_pending_at: u64 = 1,
         armed: bool = false,
         arms: usize = 0,
         disarms: usize = 0,
@@ -1313,7 +1329,10 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
             if (comptime @import("build_options").enable_metal) {
                 if (self.pending_runtime) |runtime| if (@import("../backends/metal_runtime.zig").hasSubmittedFrame(runtime)) {
                     self.saw_pending = true;
-                    return error.Cancelled;
+                    const count = @import("../backends/metal_runtime.zig").frameCommandBufferCount(runtime);
+                    if (self.first_pending_frame == null) self.first_pending_frame = count;
+                    self.pending_frames = count - self.first_pending_frame.? + 1;
+                    if (self.pending_frames >= self.cancel_pending_at) return error.Cancelled;
                 };
             }
             if (self.checks >= self.cancel_at) return error.Cancelled;
@@ -1397,16 +1416,19 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
                 const compute: *const @import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(backend.ptr));
                 const runtime = compute.provider_impl.raw_decode_runtime;
                 backend.deinit();
-                var cancellation = Cancel{ .cancel_at = std.math.maxInt(usize), .pending_runtime = runtime };
-                try std.testing.expectError(error.Cancelled, session.runWithControl(&.{ padded_input, padded_attention }, a, .{
-                    .ptr = &cancellation,
-                    .check_fn = Cancel.check,
-                    .hard_cancellation = .{ .ptr = &cancellation, .arm_fn = Cancel.arm, .disarm_fn = Cancel.disarm },
-                }));
-                try std.testing.expect(cancellation.saw_pending);
-                try std.testing.expect(!cancellation.armed);
-                if (comptime @import("build_options").enable_metal) try std.testing.expect(!@import("../backends/metal_runtime.zig").hasSubmittedFrame(runtime));
-                std.debug.print("embeddinggemma2 submitted-frame cancellation rows=514 drained=true\n", .{});
+                for ([_]u64{ 1, 3, 7 }) |pending_frames| {
+                    var cancellation = Cancel{ .cancel_at = std.math.maxInt(usize), .pending_runtime = runtime, .cancel_pending_at = pending_frames };
+                    try std.testing.expectError(error.Cancelled, session.runWithControl(&.{ padded_input, padded_attention }, a, .{
+                        .ptr = &cancellation,
+                        .check_fn = Cancel.check,
+                        .hard_cancellation = .{ .ptr = &cancellation, .arm_fn = Cancel.arm, .disarm_fn = Cancel.disarm },
+                    }));
+                    try std.testing.expect(cancellation.saw_pending);
+                    try std.testing.expectEqual(pending_frames, cancellation.pending_frames);
+                    try std.testing.expect(!cancellation.armed);
+                    if (comptime @import("build_options").enable_metal) try std.testing.expect(!@import("../backends/metal_runtime.zig").hasSubmittedFrame(runtime));
+                    std.debug.print("embeddinggemma2 submitted-frame cancellation rows=514 pending_frames={d} drained=true\n", .{pending_frames});
+                }
             }
         }
         for ([_]usize{ 9, 31 }) |cancel_at| {

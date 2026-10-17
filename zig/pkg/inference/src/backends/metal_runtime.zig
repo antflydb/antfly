@@ -20831,6 +20831,10 @@ pub extern fn termite_metal_decode_runtime_release_linear_views(
     runtime: ?*RawMetalDecodeRuntime,
     count: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_detach_linear_views(
+    runtime: ?*RawMetalDecodeRuntime,
+    count: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_linear_view_bytes(
     runtime: ?*RawMetalDecodeRuntime,
     count: usize,

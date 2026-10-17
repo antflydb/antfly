@@ -5613,10 +5613,10 @@ test "model aware media audio preflight matches independently prepared feature m
 
 test "embeddinggemma2 native SIMD audio local attention matches scalar masks tails chunks and parallel rows" {
     const a = std.testing.allocator;
-    for ([_]usize{ 1, 31, 65 }) |rows| for ([_]usize{ 7, 16 }) |dim| for ([_]bool{ false, true }) |exclude| {
+    for ([_]usize{ 1, 31, 65 }) |rows| for ([_]usize{ 7, 16 }) |dim| for ([_]bool{ false, true }) |exclude| for ([_]f32{ -1e9, -3 }) |invalid_value| {
         const heads = 2;
         const hidden = heads * dim;
-        const params = @import("../ops/ops.zig").Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = hidden, .heads = heads, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = -1e9, .exclude_farthest_key = exclude };
+        const params = @import("../ops/ops.zig").Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = hidden, .heads = heads, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = invalid_value, .exclude_farthest_key = exclude };
         const values = try a.alloc(f32, rows * hidden * 3 + 13 * hidden + dim);
         defer a.free(values);
         for (values, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173) * 0.4;
