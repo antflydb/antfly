@@ -56783,12 +56783,132 @@ fn implementationTests() type {
 
             var source = ProvisionedTableWriteSource.init(path, NoCatalog.iface());
             defer source.deinit();
+            const blocked = try catchUpManagedDb(&source, alloc, 7001, "docs", &reopened, false, .isolated, .all_debt, .{});
+            try std.testing.expect(blocked.had_debt);
+            try std.testing.expect(blocked.made_progress);
+            try std.testing.expect(!blocked.cleared_debt);
+            const blocked_promotion = reopened.pendingWorkStats().promotion;
+            try std.testing.expect(blocked_promotion.blocked);
+            try std.testing.expectEqualStrings("missing_entity_sink", blocked_promotion.blocked_reason);
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &reopened));
+
+            // Serving installs the sink before activating resolver replay.
+            // This empty-entity fixture must consume its durable promotion
+            // record without producing any entity writes once the sink exists.
+            const Sink = struct {
+                fn upsert(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+                    return error.UnexpectedEntityUpsert;
+                }
+            };
+            var sink_token: u8 = 0;
+            reopened.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
             const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &reopened, false, .isolated, .all_debt, .{});
             try std.testing.expect(result.had_debt);
             try std.testing.expect(result.made_progress);
             try std.testing.expect(result.cleared_debt);
             try std.testing.expect(!hasStartupOwnedResolverReplayDebt(reopened.pendingWorkStats(), .isolated));
             try std.testing.expect(!(try managedDbNeedsResidentReplayRecovery(alloc, &reopened)));
+        }
+
+        test "managed startup catch-up retains cursor-only resolver recovery on workerless reopen" {
+            const alloc = std.testing.allocator;
+            const resolver_catalog = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
+            const Sink = struct {
+                fn upsert(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+                    return error.UnexpectedEntityUpsert;
+                }
+            };
+            var sink_token: u8 = 0;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cursor-only-resolver-recovery", .{tmp.sub_path});
+            defer alloc.free(path);
+            const options: db_mod.OpenOptions = .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+                .start_resolver_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            };
+            var watermark: u64 = 0;
+            {
+                var db = try db_mod.DB.open(alloc, path, options);
+                defer db.close();
+                try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json =
+                    \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+                });
+                try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"relations\":{\"entities\":[]}}" }}, .sync_level = .full_index });
+                var cfg: index_manager_mod.ResolverConfig = .{
+                    .name = "kg",
+                    .table = "entities",
+                    .source_artifact = "relations_v1",
+                    .resolution_artifact = "resolution_v1",
+                    .key_template = "{{ _entity.text }}",
+                    .config_generation = 1,
+                };
+                {
+                    db.core.lockApply();
+                    defer db.core.unlockApply();
+                    _ = try db.core.upsertResolver(cfg);
+                }
+                db.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
+                try db.runUntilIdle();
+                const settled = db.pendingWorkStats();
+                watermark = settled.resolution.applied_sequence;
+                try std.testing.expect(watermark > 0);
+                try std.testing.expectEqual(watermark, settled.resolution.target_sequence);
+                try std.testing.expectEqual(watermark, settled.promotion.applied_sequence);
+                try std.testing.expect(!hasStartupOwnedResolverReplayDebt(settled, .isolated));
+
+                // Catalog edits can require corpus re-resolution without
+                // appending a new replay sequence. Only the durable cursors
+                // distinguish this state from the settled state above.
+                cfg.key_template = "{{ _entity.text }}-updated";
+                cfg.config_generation = 2;
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                _ = try db.core.upsertResolver(cfg);
+                try std.testing.expectEqual(watermark, db.core.nextDerivedSequence());
+            }
+            var workerless_options = options;
+            workerless_options.start_optional_runtimes = false;
+            var db = try db_mod.DB.open(alloc, path, workerless_options);
+            defer db.close();
+            const pending = db.pendingWorkStats();
+            try std.testing.expectEqual(watermark, pending.resolution.applied_sequence);
+            try std.testing.expectEqual(watermark, pending.resolution.target_sequence);
+            try std.testing.expect(pending.resolution.catch_up_required);
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &db));
+            try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, &db, .isolated));
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.delete(resolver_catalog.reresolve_resume_key);
+                try txn.commit();
+            }
+            // The independently persisted repair cursor must also admit work.
+            try std.testing.expect(db.pendingWorkStats().resolution.catch_up_required);
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &db));
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.delete(resolver_catalog.reresolve_repair_resume_key);
+                try txn.commit();
+            }
+            try std.testing.expect(!db.pendingWorkStats().resolution.catch_up_required);
+            try std.testing.expect(!(try managedDbNeedsResidentReplayRecovery(alloc, &db)));
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.put(resolver_catalog.reresolve_resume_key, "");
+                try txn.commit();
+            }
+            // An empty cursor denotes the first page; it is still durable debt.
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &db));
+            const status = try db.stats(alloc);
+            defer db_mod.types.freeDBStats(alloc, status);
+            try std.testing.expect(!status.resolver_replay.resolution_runtime_present);
+            try std.testing.expect(!status.resolver_replay.promotion_runtime_present);
         }
 
         test "managed startup catch-up invalidates stale cached writer status after replay clears debt" {
