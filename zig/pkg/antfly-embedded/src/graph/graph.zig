@@ -962,6 +962,7 @@ pub var test_abort_reverse_rebuild_after_batches: ?usize = null;
 pub var test_abort_prune_after_forward_commit = false;
 pub var test_abort_doc_clear_after_forward_commit = false;
 threadlocal var test_counter_publication_hook: ?*const fn (*GraphIndex, GraphIndex.Stats) anyerror!void = null;
+threadlocal var test_intent_sync_hook: ?*const fn (*GraphIndex) anyerror!void = null;
 threadlocal var test_ownership_sync_hook: ?*const fn (*GraphIndex) anyerror!void = null;
 threadlocal var test_ownership_commit_hook: ?*const fn (*GraphIndex) void = null;
 threadlocal var test_ownership_read_pair_hook: ?*const fn (*GraphIndex) void = null;
@@ -7408,11 +7409,20 @@ pub const GraphIndex = struct {
 
     pub fn publishContributionOrderingReady(self: *GraphIndex) !void {
         try self.sync(true);
-        var batch = try self.beginWriteReverseBatch();
-        errdefer batch.abort();
-        try batch.put(contribution_ordering_ready_key, "1");
-        try bumpReverseReadGeneration(&batch);
-        try batch.commit();
+        {
+            var batch = try self.beginWriteReverseBatch();
+            errdefer batch.abort();
+            try batch.put(contribution_ordering_ready_key, "1");
+            try bumpReverseReadGeneration(&batch);
+            try batch.commit();
+        }
+        try self.syncCommittedIntent();
+    }
+
+    // A successful commit consumes its batch. Keep the abort scope separate
+    // from the fallible durability fence, including snapshot cancellation.
+    fn syncCommittedIntent(self: *GraphIndex) !void {
+        if (builtin.is_test) if (test_intent_sync_hook) |hook| try hook(self);
         try self.reverse_owner.sync(true);
     }
 
@@ -7662,31 +7672,35 @@ pub const GraphIndex = struct {
         var clears_producer = false;
         for (deletes) |delete| clears_producer = clears_producer or delete.producer_clear;
         if (clears_producer) {
-            var intent_batch = try self.beginWriteReverseBatch();
-            errdefer intent_batch.abort();
-            for (deletes) |delete| {
-                if (!delete.producer_clear) continue;
-                const key = try legacyProducerKeyAlloc(self.alloc, delete.owner, self.index_name, delete.source, delete.edge_type, delete.target);
-                defer self.alloc.free(key);
-                try intent_batch.put(key, "");
+            {
+                var intent_batch = try self.beginWriteReverseBatch();
+                errdefer intent_batch.abort();
+                for (deletes) |delete| {
+                    if (!delete.producer_clear) continue;
+                    const key = try legacyProducerKeyAlloc(self.alloc, delete.owner, self.index_name, delete.source, delete.edge_type, delete.target);
+                    defer self.alloc.free(key);
+                    try intent_batch.put(key, "");
+                }
+                try intent_batch.commit();
             }
-            try intent_batch.commit();
-            try self.reverse_owner.sync(true);
+            try self.syncCommittedIntent();
         }
         // Range pruning already persisted a page intent containing every
         // outgoing key. Ordinary document clears need their own source-ordered
         // intents because replay discovers their edges through adjacency.
         if (clears_private_state and completed_intent == null) {
-            var intent_batch = try self.beginWriteReverseBatch();
-            errdefer intent_batch.abort();
-            for (deletes) |delete| {
-                if (!delete.clear_all_private_state) continue;
-                const intent_key = try relationshipClearIntentKeyAlloc(self.alloc, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
-                defer self.alloc.free(intent_key);
-                try intent_batch.put(intent_key, "1");
+            {
+                var intent_batch = try self.beginWriteReverseBatch();
+                errdefer intent_batch.abort();
+                for (deletes) |delete| {
+                    if (!delete.clear_all_private_state) continue;
+                    const intent_key = try relationshipClearIntentKeyAlloc(self.alloc, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
+                    defer self.alloc.free(intent_key);
+                    try intent_batch.put(intent_key, "1");
+                }
+                try intent_batch.commit();
             }
-            try intent_batch.commit();
-            try self.reverse_owner.sync(true);
+            try self.syncCommittedIntent();
         }
 
         var main_batch = try self.beginWriteOutgoingBatch();
@@ -39777,4 +39791,24 @@ test "graph metric native response adoption batch ownership context" {
         try std.testing.expectEqual(@as(usize, 1), fresh.len);
         std.debug.print("EDGE_READ_CONTEXT backend={s} keys=64 ownership_pairs=1 pinned_edges=2 fresh_edges=1\n", .{@tagName(kind)});
     }
+}
+
+test "graph committed intents survive canceled durability fences" {
+    const a = std.testing.allocator;
+    var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .lsm_memory });
+    defer g.close();
+    try g.addEdge("source", "target", "link", 1, 0, 0, "{}");
+    const Hook = struct {
+        fn cancel(_: *GraphIndex) !void {
+            return error.EnrichmentWaitCanceled;
+        }
+    };
+    test_intent_sync_hook = Hook.cancel;
+    defer test_intent_sync_hook = null;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, g.publishContributionOrderingReady());
+    try std.testing.expectError(error.EnrichmentWaitCanceled, g.batchApply(&.{}, &.{.{ .source = "source", .target = "target", .edge_type = "link", .clear_all_private_state = true }}));
+    try std.testing.expectError(error.EnrichmentWaitCanceled, g.batchApply(&.{}, &.{.{ .source = "source", .target = "target", .edge_type = "link", .owner = "producer", .producer_clear = true }}));
+    test_intent_sync_hook = null;
+    try g.batchApply(&.{}, &.{.{ .source = "source", .target = "target", .edge_type = "link", .clear_all_private_state = true }});
+    try std.testing.expectEqual(@as(usize, 0), (try g.getEdges(a, "source", "link", .out)).len);
 }

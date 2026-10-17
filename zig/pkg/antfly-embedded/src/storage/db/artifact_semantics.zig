@@ -118,12 +118,18 @@ fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []con
         if (raw.len == 0) continue;
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer parsed.deinit();
-        if (parsed.value != .array) return error.InvalidArtifactCatalogCommand;
-        if (parsed.value.array.items.len == 0) continue; // Preserve main/v14 empty-family identity.
+        // Reader envelopes fence physical representations; the logical
+        // producer identity still binds every resolver definition below.
+        const rows = if (std.mem.eql(u8, family, "resolvers"))
+            @import("catalog/resolver_catalog.zig").catalogRows(parsed.value) catch return error.InvalidArtifactCatalogCommand
+        else
+            parsed.value;
+        if (rows != .array) return error.InvalidArtifactCatalogCommand;
+        if (rows.array.items.len == 0) continue; // Preserve main/v14 empty-family identity.
         const Entry = struct { name: []const u8, value: std.json.Value };
-        const entries = try alloc.alloc(Entry, parsed.value.array.items.len);
+        const entries = try alloc.alloc(Entry, rows.array.items.len);
         defer alloc.free(entries);
-        for (parsed.value.array.items, entries) |value, *entry| {
+        for (rows.array.items, entries) |value, *entry| {
             if (value != .object) return error.InvalidArtifactCatalogCommand;
             const name = value.object.get("name") orelse return error.InvalidArtifactCatalogCommand;
             if (name != .string or name.string.len == 0) return error.InvalidArtifactCatalogCommand;
@@ -155,4 +161,29 @@ test "ordered artifact inventory semantic producer catalogs ignore order but bin
     const two = try digest(alloc, "", "", "[{\"name\":\"resolver\",\"config_generation\":2}]");
     try std.testing.expect(!std.mem.eql(u8, &one, &two));
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(alloc, "", "[{\"name\":\"a\"},{\"name\":\"a\"}]", ""));
+}
+
+test "ordered artifact inventory semantic producer catalogs accept versioned resolver envelopes" {
+    const a = std.testing.allocator;
+    const definitions = "[{\"name\":\"resolver\",\"config_generation\":1}]";
+    const legacy = try digest(a, "", "", definitions);
+    const empty = try digest(a, "", "", "[]");
+    for ([_]u32{ 2, 3, 4 }) |version| {
+        const envelope = try @import("catalog/resolver_catalog.zig").versionedCatalog(a, definitions, version);
+        defer a.free(envelope);
+        try std.testing.expectEqualDeep(legacy, try digest(a, "", "", envelope));
+        const empty_envelope = try @import("catalog/resolver_catalog.zig").versionedCatalog(a, "[]", version);
+        defer a.free(empty_envelope);
+        try std.testing.expectEqualDeep(empty, try digest(a, "", "", empty_envelope));
+    }
+    for ([_][]const u8{
+        "{\"version\":5,\"resolvers\":[]}",
+        "{\"version\":1,\"resolvers\":[]}",
+        "{\"version\":4}",
+        "{\"version\":4,\"resolvers\":{}}",
+        "{\"version\":4,\"resolvers\":[{\"name\":\"a\"},{\"name\":\"a\"}]}",
+    }) |invalid| try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", invalid));
+    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "{\"version\":4,\"enrichments\":[]}", "[]"));
+    const changed = try digest(a, "", "", "{\"version\":4,\"resolvers\":[{\"name\":\"resolver\",\"config_generation\":2}]}");
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &changed));
 }

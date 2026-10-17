@@ -5092,7 +5092,7 @@ pub const StorageRelationalRead = struct {
 
     pub fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
         errdefer page.deinit();
         const owned = page.arena.allocator();
         const rows = try owned.alloc(View.Row, page.rows.len);
@@ -5100,7 +5100,8 @@ pub const StorageRelationalRead = struct {
             .id = row.key,
             .version = row.version,
             .schema_version = session.reader.active.version(),
-            .value = row.typed orelse return error.InvalidResponse,
+            .value = row.typed orelse .null,
+            .typed_cells = row.typed_cells,
             .sql_nulls = row.sql_nulls,
             .expected_content_digest = row.expected_content_digest,
         };

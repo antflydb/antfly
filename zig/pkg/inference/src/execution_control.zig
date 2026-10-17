@@ -56,11 +56,11 @@ pub const ProgressSink = struct {
 };
 
 /// Describes the strongest interruption boundary required by an execution
-/// primitive. Cooperative work may run in-process. Driver calls which cannot be
-/// interrupted must be owned by a supervised worker process.
+/// primitive. Uninterruptible calls require either a supervised boundary or
+/// an explicit in-process policy from the runtime owner.
 pub const Interruption = enum {
     cooperative,
-    process_required,
+    uninterruptible,
 };
 
 /// Allocation-free view retained by a process watchdog while native code is
@@ -84,22 +84,13 @@ pub const MonitorControl = struct {
     }
 };
 
-/// Set once by a host that runs process-required backends (Metal, CUDA,
-/// ONNX loads) inside its own process instead of a supervised worker, as
-/// libantfly does: the host process is the caller's program, which cannot be
-/// killed and restarted. Such calls then run without a hard-cancellation
-/// boundary. Once one enters the backend it cannot be interrupted; its
-/// deadline and cancellation take effect when it returns, and a driver fault
-/// takes down the host.
-var uninterruptible_in_process = std.atomic.Value(bool).init(false);
-
-pub fn allowUninterruptibleInProcess() void {
-    uninterruptible_in_process.store(true, .release);
-}
-
-pub fn uninterruptibleInProcessAllowed() bool {
-    return uninterruptible_in_process.load(.acquire);
-}
+/// Chosen by the runtime owner, never by a process-global exception. Embedded
+/// callers retain buffers and sessions until native calls return. Server callers
+/// require a real watchdog boundary for calls which cannot stop cooperatively.
+pub const NativeCallPolicy = enum {
+    require_supervision,
+    in_process,
+};
 
 pub const HardCancellationBoundary = struct {
     ptr: *anyopaque,
@@ -144,6 +135,7 @@ pub const InferenceExecutionControl = struct {
     /// cannot notice that one particular request was cancelled while blocked
     /// in a driver.
     hard_cancellation: ?HardCancellationBoundary = null,
+    native_call_policy: NativeCallPolicy = .require_supervision,
     /// A cancelled request may finish an in-flight native call before the
     /// watchdog replaces the worker. Checks outside native calls stay immediate.
     cancellation_grace_ns: ?u64 = null,
@@ -215,9 +207,9 @@ pub const InferenceExecutionControl = struct {
         self: InferenceExecutionControl,
         interruption: Interruption,
     ) !UninterruptibleGuard {
-        if (interruption != .process_required) return .{};
+        if (interruption != .uninterruptible) return .{};
         const boundary = self.hard_cancellation orelse {
-            if (uninterruptibleInProcessAllowed()) return .{};
+            if (self.native_call_policy == .in_process) return .{};
             return error.ProcessIsolationRequired;
         };
         return .{
@@ -282,8 +274,21 @@ test "uninterruptible work fails closed without a process owner" {
     const control = InferenceExecutionControl{};
     try std.testing.expectError(
         error.ProcessIsolationRequired,
-        control.enterUninterruptible(.process_required),
+        control.enterUninterruptible(.uninterruptible),
     );
     var cooperative = try control.enterUninterruptible(.cooperative);
     cooperative.deinit();
+}
+
+test "native call policy is scoped to the execution control" {
+    const embedded = InferenceExecutionControl{ .native_call_policy = .in_process };
+    var guard = try embedded.enterUninterruptible(.uninterruptible);
+    defer guard.deinit();
+    try std.testing.expectError(error.ProcessIsolationRequired, (InferenceExecutionControl{}).enterUninterruptible(.uninterruptible));
+    const cancelled = InferenceExecutionControl{ .native_call_policy = .in_process, .check_fn = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    }.check };
+    try std.testing.expectError(error.Cancelled, cancelled.check());
 }

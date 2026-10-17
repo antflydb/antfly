@@ -460,7 +460,7 @@ Final-vector agreement, actual occupancy, scoped transfer counters and memory
 counter coverage are separate evidence. Runtime/model pools and bounded workspace
 are not interchangeable peak-memory measurements.
 
-Use [image campaigns](../../../zig/pkg/inference/scripts/embeddinggemma2/image_campaign.py) for pinned
+Use [image campaigns](scripts/embeddinggemma2/image_campaign.py) for pinned
 baseline/candidate order, hashes, complete vectors and HTTP concurrency 1/2/4/8.
 Warm distributions need ten warmups and at least 100 samples; cold first-forward
 runs use a separate process. Amortized batch seconds/image is not caller latency.
@@ -484,7 +484,7 @@ vectors download. The owner retains its creating backend through cleanup.
 and unsupported providers retain compatibility. Current audio-only handoff has
 its own qualification below.
 
-The [PDF benchmark](../../../zig/pkg/inference/scripts/embeddinggemma2/pdf_campaign.py)
+The [PDF benchmark](scripts/embeddinggemma2/pdf_campaign.py)
 measures actual parser/rendered rasters through embedding, with explicit document/
 page IDs, round-robin scheduling, at most four live pages, four private readers,
 256 MiB raster output, private 256 MiB scratch per worker and eight-million-pixel

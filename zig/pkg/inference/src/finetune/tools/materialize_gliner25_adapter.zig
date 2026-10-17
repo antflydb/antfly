@@ -103,7 +103,7 @@ fn workerMain(init: std.process.Init, options: Options, worker: *process.Worker)
     const watchdog = try internal.HardCancellationWatchdog.create(init.gpa);
     defer watchdog.destroy();
     try watchdog.start(init.io);
-    var guard = try (internal.InferenceExecutionControl{ .io = init.io, .ptr = worker, .check_fn = process.Worker.checkHard, .hard_cancellation = watchdog.boundary() }).enterUninterruptible(.process_required);
+    var guard = try (internal.InferenceExecutionControl{ .io = init.io, .ptr = worker, .check_fn = process.Worker.checkHard, .hard_cancellation = watchdog.boundary() }).enterUninterruptible(.uninterruptible);
     defer guard.deinit();
     var snapshot = try job.loadConfigSnapshot(init.gpa, init.io, options.config_path);
     defer snapshot.deinit();

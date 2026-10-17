@@ -8985,7 +8985,7 @@ test "managed direct compute guards construction and cleanup" {
     compute_vtable.deinitBackend = Probe.close;
     var managed = ManagedComputeBackend{
         .backend = .{ .ptr = &probe, .vtable = &compute_vtable },
-        .guard = try control.enterUninterruptible(.process_required),
+        .guard = try control.enterUninterruptible(.uninterruptible),
     };
     managed.deinit();
     managed.deinit();
