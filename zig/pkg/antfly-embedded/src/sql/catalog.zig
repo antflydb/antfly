@@ -297,8 +297,36 @@ pub const Table = struct {
     /// resolved name to validate an earlier table in a join or subquery.
     scope: ?Scope = null,
 
+    /// Hidden SQL columns owned by the row envelope, not the user schema.
+    /// Binders enumerate these explicitly so SELECT * keeps its stored shape.
+    const identity_virtual_columns = [_]Column{.{ .name = "_id", .path = "_id", .type = .string, .nullable = false }};
+    const document_virtual_columns = identity_virtual_columns ++ [_]Column{.{ .name = "_doc", .path = "_doc", .type = .json, .element_type = .jsonb, .nullable = false }};
+
+    pub fn virtualColumns(self: Table) []const Column {
+        return if (self.storage_mode == .document) &document_virtual_columns else &identity_virtual_columns;
+    }
+
+    /// A virtual JSONB value, never a stored property or a SELECT * column.
+    pub fn isDocumentRoot(self: Table, name: []const u8) bool {
+        if (self.storage_mode != .document) return false;
+        if (std.mem.eql(u8, name, "_doc")) return true;
+        if (!std.mem.endsWith(u8, name, "\x00_doc")) return false;
+        const resolved = self.column(name) catch return false;
+        return std.mem.eql(u8, resolved.name, "_doc");
+    }
+
+    pub fn validateDocumentWriteColumns(self: Table, names: []const []const u8) !void {
+        var root = false;
+        var fields = false;
+        for (names) |name| {
+            root = root or self.isDocumentRoot(name);
+            fields = fields or (!self.isDocumentRoot(name) and !std.mem.eql(u8, name, "_id"));
+        }
+        if (root and fields) return error.UnsupportedSqlShape;
+    }
+
     pub fn column(self: Table, name: []const u8) !Column {
-        if (std.mem.eql(u8, name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
+        for (self.virtualColumns()) |value| if (std.mem.eql(u8, value.name, name)) return value;
         for (self.columns) |value| if (std.mem.eql(u8, value.name, name)) return value;
         // Point predicate planning must use the same pinned logical authority
         // as relation binding; never strip a namespace before validating it.
@@ -306,7 +334,7 @@ pub const Table = struct {
         const scope = self.scope orelse return error.UndefinedColumn;
         if (!scope.matchesQualifier(name[0..separator])) return error.UndefinedColumn;
         const column_name = name[separator + 1 ..];
-        if (std.mem.eql(u8, column_name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
+        for (self.virtualColumns()) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         for (self.columns) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         return error.UndefinedColumn;
     }
@@ -364,7 +392,57 @@ pub const Condition = struct {
         return self.operand orelse @import("scalar.zig").Datum.fromJson(self.value);
     }
 };
+test "SQL document root virtual columns preserve narrow storage projections and authority" {
+    const table: Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{.{ .name = "title", .path = "title", .type = .string }}, .scope = .{ .database = "default", .namespace = "public", .name = "docs", .revision = 1 } };
+    const root = try table.column("_doc");
+    try std.testing.expectEqual(ast.ColumnType.json, root.type);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.jsonb, root.element_type.?);
+    try std.testing.expect(table.isDocumentRoot("public\x00docs\x00_doc"));
+    try std.testing.expect(!table.isDocumentRoot("other\x00docs\x00_doc"));
+    try std.testing.expectError(error.UndefinedColumn, table.column("other\x00docs\x00_doc"));
+    try std.testing.expectEqual(@as(usize, 1), table.columns.len);
+    var empty: std.heap.FixedBufferAllocator = .init(&.{});
+    const narrow: Scan = .{ .fields = &.{"title"}, .limit = 1 };
+    try std.testing.expect((try narrow.physicalFields(empty.allocator(), table)).ptr == narrow.fields.ptr);
+    try std.testing.expect(!narrow.needsDocument(table));
+    const whole: Scan = .{ .fields = &.{ "_doc", "title" }, .limit = 1 };
+    const fields = try whole.physicalFields(std.testing.allocator, table);
+    defer std.testing.allocator.free(fields);
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("title", fields[0]);
+    try std.testing.expect(whole.needsDocument(table));
+    var relational = table;
+    relational.storage_mode = .relational;
+    relational.columns = &.{.{ .name = "_doc", .path = "_doc", .type = .string }};
+    try std.testing.expectEqual(ast.ColumnType.string, (try relational.column("_doc")).type);
+    try std.testing.expect(!whole.needsDocument(relational));
+    try std.testing.expect((try whole.physicalFields(empty.allocator(), relational)).ptr == whole.fields.ptr);
+    const invalid: Row = .{ .id = "bad", .version = 1, .value = .null, .document = .null };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.cell("_doc"));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.hasField("_doc"));
+}
+
 pub const Scan = struct {
+    pub fn needsDocument(self: Scan, table: Table) bool {
+        if (self.include_document) return true;
+        for (self.fields) |name| if (table.isDocumentRoot(name)) return true;
+        return false;
+    }
+
+    /// Virtual document values travel as page-owned preimages, never as a
+    /// fictitious storage field. Ordinary narrow projections borrow unchanged.
+    pub fn physicalFields(self: Scan, alloc: std.mem.Allocator, table: Table) ![]const []const u8 {
+        var count: usize = 0;
+        for (self.fields) |name| count += @intFromBool(!table.isDocumentRoot(name));
+        if (count == self.fields.len) return self.fields;
+        const fields = try alloc.alloc([]const u8, count);
+        var index: usize = 0;
+        for (self.fields) |name| if (!table.isDocumentRoot(name)) {
+            fields[index] = name;
+            index += 1;
+        };
+        return fields;
+    }
     pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
     pub const IndexEquality = struct {
         name: []const u8,
@@ -386,7 +464,7 @@ pub const Scan = struct {
     row_goal: ?u64 = null,
     index_range: ?IndexRange = null,
     fields: []const []const u8,
-    /// Mutation-only full document preimage; ordinary reads remain projected.
+    /// Full document preimage for replacement preparation or explicit _doc.
     include_document: bool = false,
     include_primary_digest: bool = false,
     /// Ordered SQL must not be satisfied by an unrelated secondary-key order.
@@ -493,6 +571,10 @@ pub const Row = struct {
     /// projection's field names are literal names, never dotted JSON paths.
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
+        if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
+            if (document != .object) return error.InvalidSqlBackendResponse;
+            return Cell.json(document);
+        };
         if (self.typed_cells) |cells| {
             try self.validateTyped();
             const index = cells.layout.ordinals.get(name) orelse return .{};
@@ -530,6 +612,10 @@ pub const Row = struct {
     }
 
     pub fn hasField(self: Row, name: []const u8) !bool {
+        if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
+            if (document != .object) return error.InvalidSqlBackendResponse;
+            return true;
+        };
         if (self.typed_cells) |cells| {
             try self.validateTyped();
             const index = cells.layout.ordinals.get(name) orelse return false;

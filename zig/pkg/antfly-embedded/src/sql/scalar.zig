@@ -926,13 +926,39 @@ pub fn parameterElementType(descriptor: Type) !arrays.ElementType {
     return descriptor.element_type orelse try arrayElementType(descriptor.kind orelse return error.UnknownSqlParameterType);
 }
 
-/// Only an unresolved root string literal inherits the target array domain.
+/// Only an unresolved root string literal inherits the target assignment domain.
 /// Explicit text expressions retain their identity and require an SQL cast.
 pub fn assignmentExpression(alloc: Allocator, expression: *const ast.Scalar, expected: Type) !*const ast.Scalar {
-    if (expected.kind != .array or expression.* != .literal or expression.literal != .string) return expression;
+    const kind = expected.kind orelse return expression;
+    if (kind == .string or expression.* != .literal or expression.literal != .string) return expression;
+    if (kind == .array and expected.element_type == null) return error.SqlAssignmentTypeMismatch;
     const cast = try alloc.create(ast.Scalar);
-    cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = expected.element_type orelse return error.SqlAssignmentTypeMismatch } };
+    cast.* = .{ .cast = .{ .operand = expression, .type = kind, .element_type = expected.element_type, .numeric_modifier = expected.numeric_modifier } };
     return cast;
+}
+
+test "SQL assignment root literals inherit target domains without casting typed text" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { input: []const u8, target: Type }{
+        .{ .input = "{\"n\":9007199254740993.1250}", .target = .{ .kind = .json, .element_type = .jsonb } },
+        .{ .input = "A0EEBC999C0B4EF8BB6D6BB9BD380A11", .target = .{ .kind = .uuid, .element_type = .uuid } },
+        .{ .input = "32767", .target = .{ .kind = .integer, .element_type = .int16 } },
+        .{ .input = "9007199254740993.1250", .target = .{ .kind = .number, .element_type = .numeric } },
+        .{ .input = "true", .target = .{ .kind = .boolean, .element_type = .boolean } },
+        .{ .input = "[-1:1]={one,NULL,two}", .target = .{ .kind = .array, .element_type = .text } },
+    }) |case| {
+        const literal: ast.Scalar = .{ .literal = .{ .string = case.input } };
+        const expression = try assignmentExpression(a, &literal, case.target);
+        var program = try bind(std.testing.allocator, expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(case.target.kind, program.output_type.kind);
+        const value = try program.evaluate(a, &.{}, &.{}, .{});
+        try std.testing.expect(!value.sql_null);
+        const typed_text: ast.Scalar = .{ .cast = .{ .operand = &literal, .type = .string, .element_type = .text } };
+        try std.testing.expect(try assignmentExpression(a, &typed_text, case.target) == &typed_text);
+    }
 }
 
 /// Shared assignment coercion for typed source cursors and mutation cells.

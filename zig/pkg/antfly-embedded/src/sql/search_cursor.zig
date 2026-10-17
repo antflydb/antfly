@@ -69,13 +69,17 @@ pub fn Cursor(comptime Provider: type) type {
                 try names.append(temporary, column.name);
                 needs_document = needs_document or !metadata(column.path);
             };
+            if (table.isDocumentRoot("_doc") and paths.contains("_doc")) {
+                try names.append(temporary, "_doc");
+                needs_document = true;
+            }
             var path_iterator = paths.keyIterator();
             while (path_iterator.next()) |path_entry| {
                 const path = path_entry.*;
                 const exists = for (table.columns) |column| {
                     if (std.mem.eql(u8, column.path, path)) break true;
                 } else false;
-                if (!exists) return error.UndefinedColumn;
+                if (!exists and !table.isDocumentRoot(path)) return error.UndefinedColumn;
             }
             self.* = .{ .a = a, .projection = try documents.Projection.init(a, table, names.items), .result = result, .reader = reader, .lease = lease, .needs_document = needs_document };
             return self;
@@ -103,7 +107,7 @@ pub fn Cursor(comptime Provider: type) type {
                 if (typed == null and !Provider.hasSource(hit)) return error.SqlStatementReadUnavailable;
                 const document = if (typed) |row| row.typed orelse return error.InvalidSqlBackendResponse else if (self.needs_document) try Provider.document(&page, hit) else Json{ .object = .empty };
                 if (document != .object) return error.InvalidSqlBackendResponse;
-                const source: catalog.Row = .{ .id = hit.id, .version = if (typed) |row| row.version else 0, .value = document, .sql_nulls = if (typed) |row| row.sql_nulls else null };
+                const source: catalog.Row = .{ .id = hit.id, .version = if (typed) |row| row.version else 0, .value = document, .sql_nulls = if (typed) |row| row.sql_nulls else null, .document = if (self.projection.document_root) document else null };
                 const values = try pa.alloc(catalog.Row.Cell, self.projection.columns.len);
                 const presence = try pa.alloc(bool, values.len);
                 for (self.projection.columns, values, presence) |column, *value, *present| {
@@ -116,7 +120,7 @@ pub fn Cursor(comptime Provider: type) type {
                     // Document JSON null is a JSONB value; only a missing
                     // property is SQL NULL. Relational bitmaps remain decisive.
                     if (typed == null and !metadata(column.path) and column.type == .json and document.object.contains(column.path)) cell.sql_null = false;
-                    present.* = if (metadata(column.path)) !cell.sql_null else document.object.contains(column.path);
+                    present.* = if (metadata(column.path) or (self.projection.document_root and std.mem.eql(u8, column.name, "_doc"))) !cell.sql_null else document.object.contains(column.path);
                     if (cell.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
                     // Native readers can attest that their typed projection
                     // already belongs to this page. Borrowed hit/vector source
@@ -254,6 +258,29 @@ test "SQL captured search cursor metadata avoids document and highlight material
     defer a.free(fields);
     try std.testing.expectEqual(@as(usize, 1), fields.len);
     try std.testing.expectEqualStrings("text", fields[0]);
+}
+
+test "SQL captured search cursor document root is explicit and page owned" {
+    const a = std.testing.allocator;
+    var state: TestProvider.State = .{};
+    const hits = [_]TestProvider.Hit{.{ .id = "a", .state = &state }};
+    var table = test_table;
+    table.storage_mode = .document;
+    const C = Cursor(TestProvider);
+    const cursor = try C.init(a, table, &.{"_doc"}, .{ .hits = &hits, .state = &state }, null, .{ .state = &state });
+    var live = true;
+    defer if (live) C.close(cursor);
+    var page = try C.next(cursor, a, 1);
+    defer page.deinit();
+    C.close(cursor);
+    live = false;
+    const root = try page.rows[0].cell("_doc");
+    try std.testing.expect(!root.sql_null);
+    try std.testing.expect(root.value == .object);
+    try std.testing.expectEqual(@as(usize, 1), root.value.object.count());
+    try std.testing.expect(root.value.object.get("payload").? == .null);
+    try std.testing.expectEqual(@as(usize, 1), state.documents);
+    try std.testing.expectEqual(@as(usize, 1), state.results_closed);
 }
 
 test "SQL captured search cursor preserves document JSON null and demanded highlights" {

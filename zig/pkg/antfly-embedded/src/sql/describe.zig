@@ -810,6 +810,7 @@ const Context = struct {
     }
 
     fn insert(self: *Context, statement: ast.Insert) !void {
+        try self.table.validateDocumentWriteColumns(statement.columns);
         const columns = try self.allocator.alloc(catalog.Column, statement.columns.len);
         defer self.allocator.free(columns);
         const value_rows = if (statement.values_source_rows.len != 0) statement.values_source_rows else statement.rows;
@@ -823,6 +824,9 @@ const Context = struct {
         for (statement.columns, columns, 0..) |name, *column, i| {
             if ((try seen.getOrPut(self.allocator, name)).found_existing) return error.DuplicateColumn;
             column.* = try self.table.column(name);
+            if (self.table.isDocumentRoot(column.name)) {
+                for (value_rows, 0..) |_, row_index| if (statement.isDefault(row_index, i)) return error.SqlNotNullViolation;
+            }
             if (column.generated) {
                 if (value_rows.len == 0) return error.SqlGeneratedColumnWrite;
                 for (value_rows, 0..) |_, row_index| if (!statement.isDefault(row_index, i)) return error.SqlGeneratedColumnWrite;
@@ -860,6 +864,9 @@ const Context = struct {
 
     fn update(self: *Context, statement: ast.Update) !void {
         try self.predicate(statement.predicate);
+        var root_assignment = false;
+        for (statement.assignments) |assignment| root_assignment = root_assignment or self.table.isDocumentRoot(assignment.field);
+        if (root_assignment and statement.assignments.len != 1) return error.UnsupportedSqlShape;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(self.allocator);
         for (statement.assignments, 0..) |assignment, index| {

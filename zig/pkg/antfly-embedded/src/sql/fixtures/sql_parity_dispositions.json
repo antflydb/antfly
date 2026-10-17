@@ -2,6 +2,9 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-document-root-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL document root originals","-Dtest-filter=httpx SQL document campaign verifies exact native mutation and storage outcomes"],"cwd":"zig","timeout_seconds":1800},
+    "sql-document-root-unit-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j1","-Dtest-filter=SQL document root","-Dtest-filter=SQL assignment root literals","-Dtest-filter=SQL captured search cursor document root"],"cwd":"zig","timeout_seconds":1800},
+    "sql-document-root-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_document_root.py"],"cwd":".","timeout_seconds":180},
     "sql-nonunique-expression-index-native-debug": {"command":["zig","build","antfly-api-sql-nonunique-index-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-expression-index-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_expression_index_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-index-name-http-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL original index names and stream-only COPY"],"cwd":"zig","timeout_seconds":1800},
@@ -8436,13 +8439,23 @@
     },
     {
       "id": "sql-0881",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged whole-document INSERT executes through native HTTP, normal typed preparation and atomic storage. _doc is a hidden JSONB row-envelope value, not a stored wrapper property. Independent PostgreSQL execution verifies the original affected/RETURNING results and complete document postimages. Native controls additionally verify source inserts, replacements, exact unknown JSON numbers, schema-failure atomicity, unchanged versions/digests and cold reopen. Patch functions, _version results and root conflict updates remain unqualified.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document root originals prepare durable replacements and preserve rejected batches","gate":"sql-document-root-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/runtime.zig","test":"SQL document root reads replacements and source inserts share typed preparation","gate":"sql-document-root-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document root originals prepare durable replacements and preserve rejected batches","gate":"sql-document-root-postgres"}
+      ]
     },
     {
       "id": "sql-0882",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged whole-document INSERT executes through native HTTP, normal typed preparation and atomic storage. _doc is a hidden JSONB row-envelope value, not a stored wrapper property. Independent PostgreSQL execution verifies the original affected/RETURNING results and complete document postimages. Native controls additionally verify source inserts, replacements, exact unknown JSON numbers, schema-failure atomicity, unchanged versions/digests and cold reopen. Patch functions, _version results and root conflict updates remain unqualified.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document root originals prepare durable replacements and preserve rejected batches","gate":"sql-document-root-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/runtime.zig","test":"SQL document root reads replacements and source inserts share typed preparation","gate":"sql-document-root-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document root originals prepare durable replacements and preserve rejected batches","gate":"sql-document-root-postgres"}
+      ]
     },
     {
       "id": "sql-0883",

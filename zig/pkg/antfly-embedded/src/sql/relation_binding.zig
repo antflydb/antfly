@@ -1582,7 +1582,9 @@ const Builder = struct {
                 }
                 if (reference.mutation_presence and !reference.mutation_target) return error.InvalidSqlBackendResponse;
                 const metadata_count: usize = if (!reference.mutation_target) 0 else if (reference.mutation_presence) 4 else 3;
-                const columns = try self.alloc.alloc(Column, table.columns.len + 1 + metadata_count);
+                const virtual_columns = table.virtualColumns();
+                const virtual_count = virtual_columns.len;
+                const columns = try self.alloc.alloc(Column, table.columns.len + virtual_count + metadata_count);
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
                 for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields) |column, *out, *source_name, *field_name| {
@@ -1590,10 +1592,13 @@ const Builder = struct {
                     source_name.* = column.name;
                     field_name.* = column.path;
                 }
-                columns[table.columns.len] = .{ .name = "_id", .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = .string, .nullable = false, .visible = reference.search != null };
+                for (virtual_columns, table.columns.len..) |column, position| {
+                    columns[position] = .{ .name = column.name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .visible = reference.search != null and std.mem.eql(u8, column.name, "_id") };
+                    source_columns[position] = column.name;
+                }
                 for (@import("joined_mutation.zig").metadata_fields[0..metadata_count], 0..) |name, i| {
-                    columns[table.columns.len + 1 + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
-                    source_columns[table.columns.len + 1 + i] = name;
+                    columns[table.columns.len + virtual_count + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
+                    source_columns[table.columns.len + virtual_count + i] = name;
                 }
                 if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable });
                 source_columns[table.columns.len] = "_id";
@@ -2178,9 +2183,10 @@ pub fn lowerBoundExpression(alloc: Allocator, columns: []const Column, expressio
 /// evaluating the already-prepared mutation image.
 pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, aliased: bool, projections: []const ast.Projection) ![]const ast.Projection {
     var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = &.{} };
-    const columns = try alloc.alloc(Column, table.columns.len + 1);
+    const virtual_columns = table.virtualColumns();
+    const columns = try alloc.alloc(Column, table.columns.len + virtual_columns.len);
     for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
-    columns[table.columns.len] = .{ .name = "_id", .internal = "_id", .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = .string, .nullable = false, .visible = false };
+    for (virtual_columns, columns[table.columns.len..]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .visible = false };
     const source: Node = .{ .columns = columns, .operation = .singleton };
     return (try builder.lower(&source, .{ .table = name, .columns = projections })).columns;
 }

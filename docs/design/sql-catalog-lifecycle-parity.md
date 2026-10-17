@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `e37f9d3fd9` (2026-10-17). Earlier implementation and
+at `2de3e3780c` (2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -9,7 +9,7 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-540 implemented / 131 rejected / 125 superseded / 790 unresolved. Counts below
+542 implemented / 131 rejected / 125 superseded / 788 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
@@ -17,8 +17,41 @@ are unresolved family pools, not promises that one implementation closes them.
 | 1 | DDL, catalog and sessions | 291 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 126 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
-| 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
+| 4 | Document writes | 68 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
+
+## Whole-document SQL delivery (2026-10-17)
+
+Originals `sql-0881` and `sql-0882` now execute unchanged through native HTTP
+and normal typed document preparation, independently checked against PostgreSQL
+JSONB storage. `_doc` is an explicit, hidden JSONB row-envelope value on document
+tables: it does not become a stored wrapper property or appear in SELECT *.
+An ordinary relational column named `_doc` retains its stored-column semantics.
+
+SELECT, CTE/source queries, INSERT SELECT and replacement execution use the
+same owned values and atomic commit path. Narrow projections retain their
+original field slice without allocation and do not request full-document
+materialization.
+Explicit roots travel through the existing page-owned preimage capability;
+captured search hydration preserves their lifetime after cursor close.
+Joined UPDATE and MERGE replace the root rather than inserting a fake property.
+MERGE canonicalizes duplicate bound column slots and returns the prepared target
+postimage without overwriting the source image or private integrity preimage.
+Their shared assignment helper now gives unknown string literals their target
+domain, without implicitly casting already-typed text expressions.
+
+The recorded Debug gates verify both originals, complete durable postimages,
+exact unknown JSON numbers, source/replacement results, rejected later-row
+atomicity, unchanged primary versions/digests and cold reopen. All 49 prior
+document mutation controls remain passing. Core tests cover hidden-column
+authority, unchanged narrow projections, typed literal domains and root
+binding across joins/MERGE; these controls do not receive extra original IDs.
+
+This does not activate the legacy patch-function syntax, `_version` results,
+or root ON CONFLICT replacement. The latter rejects explicitly before admission
+until full old/excluded root ownership is implemented. Distributed owner and
+constraint requirements remain enforced by the existing adapters. The remaining
+document contracts, view mappings and broader catalog work are still open.
 
 ## Nonunique expression-index qualification (2026-10-17)
 

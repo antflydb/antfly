@@ -33,7 +33,7 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
     defer entries.deinit(alloc);
     for (schema.document_schemas) |document| {
         for (document.properties) |property| {
-            if (std.mem.eql(u8, property.name, "_id")) continue;
+            if (std.mem.eql(u8, property.name, "_id") or std.mem.eql(u8, property.name, "_doc")) continue;
             const kind = propertyType(property);
             const element_type = if (comptime @hasField(@TypeOf(property), "sql_type"))
                 if (property.sql_type) |identity| @import("../common/sql_builtin_type.zig").Type.fromWire(identity) else null
@@ -148,6 +148,7 @@ pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catal
 pub const Projection = struct {
     columns: []const catalog.Column,
     has_typed_cells: bool = false,
+    document_root: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, table: catalog.Table, fields: []const []const u8) !Projection {
         var declared: std.StringHashMapUnmanaged(catalog.Column) = .empty;
@@ -158,7 +159,7 @@ pub const Projection = struct {
         defer selected.deinit(alloc);
         for (fields) |name| {
             if (std.mem.eql(u8, name, "_id")) continue;
-            const column = declared.get(name) orelse return error.UndefinedColumn;
+            const column = if (table.isDocumentRoot(name)) try table.column(name) else declared.get(name) orelse return error.UndefinedColumn;
             try selected.put(alloc, name, column);
         }
         const columns = try alloc.alloc(catalog.Column, selected.count());
@@ -179,7 +180,7 @@ pub const Projection = struct {
             initialized += 1;
             has_typed_cells = has_typed_cells or column.type == .array or column.element_type == .numeric;
         }
-        return .{ .columns = columns, .has_typed_cells = has_typed_cells };
+        return .{ .columns = columns, .has_typed_cells = has_typed_cells, .document_root = table.storage_mode == .document };
     }
 
     pub fn deinit(self: Projection, alloc: std.mem.Allocator) void {
@@ -259,7 +260,7 @@ pub const Projection = struct {
             const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
             const presence = try alloc.alloc(bool, self.columns.len);
             for (self.columns, cells, presence) |column, *cell, *present| {
-                const raw = root.object.get(column.path);
+                const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else root.object.get(column.path);
                 present.* = raw != null;
                 const sql_null = raw == null or (raw.? == .null and column.type != .json);
                 if (sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
@@ -280,7 +281,7 @@ pub const Projection = struct {
         try object.ensureTotalCapacity(alloc, @intCast(self.columns.len));
         const nulls = try alloc.alloc(bool, self.columns.len);
         for (self.columns, nulls) |column, *sql_null| {
-            const raw = root.object.get(column.path);
+            const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else root.object.get(column.path);
             sql_null.* = raw == null or (raw.? == .null and column.type != .json);
             const value: Json = if (sql_null.*) .null else try coerce(alloc, raw.?, column.type);
             try object.put(alloc, try alloc.dupe(u8, column.name), value);

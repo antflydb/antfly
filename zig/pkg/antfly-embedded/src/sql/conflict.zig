@@ -91,6 +91,10 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         const target = try table.column(assignment.field);
         if (target.generated and !assignment.use_default) return error.SqlGeneratedColumnWrite;
         if (std.mem.eql(u8, target.name, "_id")) return error.UnsupportedSqlShape;
+        // Root replacement needs an owned full old/excluded image, not an
+        // ordinal into stored property assignments. Do not admit it as a
+        // missing property or silently drop it while that shape is absent.
+        if (table.isDocumentRoot(target.name)) return error.UnsupportedSqlShape;
         const ordinal = for (table.columns, 0..) |column, index| {
             if (std.mem.eql(u8, column.name, target.name)) break index;
         } else return error.InvalidSqlBackendResponse;

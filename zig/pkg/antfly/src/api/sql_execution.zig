@@ -890,20 +890,21 @@ pub const Adapter = struct {
         };
         // Borrow the already validated typed plan through the native call.
         // Archive/network adapters alone encode it at their actual boundary.
+        const fields = try request.physicalFields(alloc, table);
         var scan_request = helpers.OwnedScanKeysRequest{
             .from = if (request.primary_key == null) request.after orelse "" else "",
             .opts = .{
                 .include_range_proofs = self.range_reads != null,
-                .sql_document_preimage = request.include_document,
+                .sql_document_preimage = request.needsDocument(table),
                 .include_content_hashes = request.include_primary_digest,
                 .exclusive_to = true,
                 .include_documents = true,
                 .include_all_fields = false,
-                .fields = request.fields,
+                .fields = fields,
                 .limit = request.limit,
                 .relational_query = .{
                     .page_bytes = 256 * 1024,
-                    .fields = request.fields,
+                    .fields = fields,
                     .conditions = conditions,
                     .expression_equalities = request.expression_equalities,
                     .index = if (request.index_equality) |probe| probe.name else null,

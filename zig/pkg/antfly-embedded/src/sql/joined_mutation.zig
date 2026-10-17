@@ -150,6 +150,12 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     const alias = (if (deleting) compiled.statement.delete.alias else compiled.statement.update.alias) orelse name.table;
     const assignments: []const ast.Assignment = if (deleting) &.{} else compiled.statement.update.assignments;
     const returning = if (deleting) compiled.statement.delete.returning else compiled.statement.update.returning;
+    var root_assignment = false;
+    for (assignments) |assignment| if (table.isDocumentRoot(assignment.field)) {
+        root_assignment = true;
+        if (assignment.use_default) return error.SqlNotNullViolation;
+    };
+    if (root_assignment and assignments.len != 1) return error.UnsupportedSqlShape;
     for (assignments, 0..) |assignment, i| {
         const field = try table.column(assignment.field);
         if (field.generated and !assignment.use_default) return error.SqlGeneratedColumnWrite;
@@ -165,7 +171,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     var fields: std.ArrayList(catalog.Column) = .empty;
     var preserve: std.ArrayList(bool) = .empty;
     var default_paths: std.ArrayList([]const u8) = .empty;
-    for (table.columns) |field| {
+    const update_fields = if (root_assignment) try alloc.dupe(catalog.Column, &.{try table.column("_doc")}) else table.columns;
+    for (update_fields) |field| {
         if (deleting and returning == null) continue;
         if (!deleting and field.generated) continue;
         var expression: ?*const ast.Scalar = null;
@@ -440,7 +447,8 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
             const present = try presenceDirectory(temporary, values[4].value.string);
             var object: std.json.ObjectMap = .empty;
             var json_null_fields: std.ArrayList([]const u8) = .empty;
-            if (!bound.deleting and table.storage_mode == .document) {
+            const replaces_document = bound.fields.len == 1 and table.isDocumentRoot(bound.fields[0].name);
+            if (!bound.deleting and table.storage_mode == .document and !replaces_document) {
                 if (values[3].sql_null or values[3].value != .object) return error.InvalidSqlBackendResponse;
                 var iter = values[3].value.object.iterator();
                 while (iter.next()) |member| {
@@ -471,7 +479,12 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
             } else null;
             if (!bound.deleting) for (bound.fields, bound.preserve, values[5..][0..bound.fields.len], bound.input.columns[5..][0..bound.fields.len]) |field, preserve, datum, source_column| {
                 if (preserve and !present.contains(field.name)) continue;
-                try object.put(context.arena, field.path, try context.storageDatumTyped(datum, field, source_column.element_type));
+                const stored = try context.storageDatumTyped(datum, field, source_column.element_type);
+                if (table.isDocumentRoot(field.name)) {
+                    if (datum.sql_null) return error.SqlNotNullViolation;
+                    if (stored != .object) return error.SqlTypeMismatch;
+                    object = stored.object;
+                } else try object.put(context.arena, field.path, stored);
                 if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
             };
             try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous });

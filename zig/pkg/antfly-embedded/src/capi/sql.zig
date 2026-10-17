@@ -576,10 +576,11 @@ pub fn Adapter(comptime native: type) type {
             var owned = native.public_api.query.parsePublicQueryRequest(alloc, .{ .ptr = &resolver, .vtable = &.{ .resolve_dense_query = SemanticResolver.resolveDense } }, self.table_name, canonical) catch |err| return if (native.public_api.query.isPublicQueryValidationError(err)) error.InvalidSqlParameters else err;
             errdefer owned.deinit(alloc);
             if (owned.req.limit == 0 or owned.req.limit > 10000) return error.SqlProgramLimitExceeded;
-            const fields = try dependencies.sql_search_cursor.storageFields(alloc, projection);
+            const logical_scan: catalog.Scan = .{ .fields = projection, .limit = owned.req.limit };
+            const fields = try dependencies.sql_search_cursor.storageFields(alloc, try logical_scan.physicalFields(alloc, table));
             owned.req.include_stored = table.storage_mode == .document;
             owned.req.fields = if (fields.len == 0) &.{"_id"} else fields;
-            owned.req.include_all_fields = false;
+            owned.req.include_all_fields = logical_scan.needsDocument(table);
             const highlights = for (projection) |field| {
                 if (std.mem.eql(u8, field, "_highlights")) break true;
             } else false;
@@ -858,13 +859,14 @@ pub fn Adapter(comptime native: type) type {
             const from = request.primary_key orelse request.after orelse "";
             const to = if (request.primary_key) |key| try std.mem.concat(temporary, u8, &.{ key, "\x00" }) else "";
             if (table.storage_mode == .document) {
+                const fields = try request.physicalFields(temporary, table);
                 const session = try self.db.openDocumentReadSession(alloc, from, to, .{
-                    .sql_document_preimage = request.include_document,
+                    .sql_document_preimage = request.needsDocument(table),
                     .include_content_hashes = request.include_primary_digest,
                     .inclusive_from = request.primary_key != null,
                     .exclusive_to = true,
                     .limit = request.limit,
-                    .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version },
+                    .relational_query = .{ .page_bytes = 256 * 1024, .fields = fields, .conditions = conditions, .schema_version = table.schema_version },
                 });
                 errdefer session.deinit();
                 const cursor = try alloc.create(DocumentCursor);
