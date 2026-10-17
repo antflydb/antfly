@@ -19,6 +19,8 @@
 import base64
 import hashlib
 import json
+import math
+import struct
 import os
 import select
 import shutil
@@ -35,6 +37,31 @@ from pathlib import Path
 
 BINARY = str(Path(sys.argv.pop(1)).resolve())
 NATIVE_LIBRARY = str(Path(sys.argv.pop(1)).resolve())
+
+
+def read_batch(path):
+    data = path.read_bytes()
+    count = struct.unpack_from("<I", data, 64)[0]
+    values = [struct.unpack_from("<dq", data, 68 + i * 16) for i in range(count)]
+    return {
+        "key": data[:32].hex(),
+        "version": 8,
+        "scores": [score if math.isfinite(score) else None for score, _ in values],
+        "written": [
+            written if math.isfinite(score) else None for score, written in values
+        ],
+    }
+
+
+def write_batch(path, record):
+    body = struct.pack("<I", len(record["scores"]))
+    for score, written in zip(record["scores"], record["written"]):
+        body += struct.pack(
+            "<dq", score if score is not None else math.nan, written or 0
+        )
+    path.write_bytes(
+        bytes.fromhex(record["key"]) + hashlib.sha256(body).digest() + body
+    )
 
 
 class DecisionHandler(BaseHTTPRequestHandler):
@@ -185,6 +212,10 @@ class DecisionHandler(BaseHTTPRequestHandler):
         if "/tables/" in self.path:
             return self.index_query()
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if getattr(self.server, "stagger_scores", False) and any(
+            "STOP(slow)" in item["input"] for item in body.get("inputs", [])
+        ):
+            time.sleep(2.2)
         self.server.requests.append(
             (self.path, self.headers.get("Authorization"), body)
         )
@@ -402,6 +433,57 @@ class CliTests(unittest.TestCase):
                         actual.stdout, expected.stdout, (flags, pattern, source)
                     )
 
+    def test_finite_width_preserves_vimgrep_repetitions(self):
+        oracle = shutil.which("rg")
+        if not oracle:
+            self.skipTest("ripgrep unavailable")
+        for source in (b"aa aa\n", b"  aa aa\n"):
+            flags = ["--vimgrep", "--max-columns=100", "a+"]
+            expected = subprocess.run(
+                [oracle, *flags], input=source, capture_output=True, env=self.env
+            )
+            self.assertEqual(self.raw_cli(*flags, input=source).stdout, expected.stdout)
+
+    def test_dense_literal_output_at_batch_boundaries(self):
+        for count in (4095, 4096, 4097, 32768, 262144):
+            self.write("dense", "k " * count + "\n")
+            for flags in ([], ["--no-mmap"], ["--block-buffered"]):
+                with self.subTest(count=count, flags=flags):
+                    self.assertEqual(
+                        self.raw_cli("-o", *flags, "k", "dense").stdout, b"k\n" * count
+                    )
+
+    def test_replay_width_and_null_delimiters_match_rg(self):
+        oracle = shutil.which("rg")
+        if not oracle:
+            self.skipTest("ripgrep unavailable")
+        for source in (b"aa\n", b"  aa a\n\taa\n", b"aa\x00", b"aa\r\n"):
+            for pattern in ("a", "a+", "[ a]+", "a|$"):
+                for flags in (
+                    ["-o", "--max-columns=1"],
+                    ["-o", "--max-columns=1", "--max-columns-preview"],
+                    ["--color=always", "--max-columns=1", "--null-data"],
+                    [
+                        "--color=always",
+                        "--max-columns=1",
+                        "--null-data",
+                        "--max-columns-preview",
+                    ],
+                    ["-o", "--color=always", "--max-columns=1"],
+                    ["-o", "--trim", "--max-columns=1"],
+                ):
+                    with self.subTest(source=source, pattern=pattern, flags=flags):
+                        expected = subprocess.run(
+                            [oracle, *flags, pattern],
+                            input=source,
+                            capture_output=True,
+                            env=self.env,
+                        )
+                        actual = self.raw_cli(
+                            *flags, pattern, input=source, code=expected.returncode
+                        )
+                        self.assertEqual(actual.stdout, expected.stdout)
+
     def test_cached_only_reports_misses_and_never_calls_provider(self):
         self.write("a.py", "STOP\nnoise\n")
         args = [
@@ -483,9 +565,85 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args, "--model-revision=v2", "--cached-only", code=2)
         self.assertEqual(len(self.server.requests), count)
         self.assertLessEqual(
-            (self.root / ".cache/antfly-grep/decisions/scores-v1.bin").stat().st_size,
+            (self.root / ".cache/antfly-grep/decisions/scores-v2.bin").stat().st_size,
             4 * 1024 * 1024,
         )
+
+    def test_parallel_score_creation_times_survive_slow_siblings(self):
+        self.write("a.py", "STOP(slow)\n" + "".join(f"STOP({i})\n" for i in range(7)))
+        self.server.stagger_scores = True
+        self.raw_cli(
+            *self.decision_args(),
+            "--cache-dir=scores",
+            "--unit=line",
+            "--context-lines=0",
+            "--no-refine",
+            "--threads=4",
+            "--batch-size=2",
+            "a.py",
+        )
+        directory = self.root / "scores"
+        batches = [
+            timestamp
+            for path in directory.glob("batch-v8-*")
+            for timestamp in read_batch(path)["written"]
+            if timestamp is not None
+        ]
+        data = (directory / "scores-v2.bin").read_bytes()
+        scalars = [
+            struct.unpack_from("<q", data, offset + 32)[0]
+            for offset in range(0, len(data) - 63, 64)
+            if any(data[offset : offset + 32])
+            and data[offset + 48 : offset + 64]
+            == hashlib.sha256(data[offset : offset + 48]).digest()[:16]
+        ]
+        self.assertEqual(len(batches), 8)
+        # Concurrent disposable-cache collisions may evict individual records.
+        self.assertGreaterEqual(len(scalars), 2)
+        self.assertGreaterEqual(max(scalars) - min(scalars), 2)
+        self.assertLessEqual(min(batches), min(scalars))
+        self.assertGreaterEqual(max(batches), max(scalars))
+
+    def test_parallel_mixed_cache_wave_only_budgets_unresolved_inputs(self):
+        self.write("a.py", "".join(f"STOP({i})\n" for i in range(40)))
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--unit=line",
+            "--context-lines=0",
+            "--threads=4",
+            "--batch-size=2",
+            "--no-refine",
+            "a.py",
+        ]
+        self.raw_cli(*args)
+        before = len(self.server.requests)
+        self.write(
+            "a.py", "".join(f"STOP({i})\n" for i in range(39)) + "STOP(changed)\n"
+        )
+        repaired = self.raw_cli(*args, "--max-requests=1")
+        summary = json.loads(repaired.stdout.splitlines()[-1])
+        self.assertEqual(summary["requests"], 1)
+        self.assertEqual(summary["cache_hits"], 39)
+        self.assertTrue(summary["stats"]["complete"])
+        learned = self.server.requests[before:]
+        self.assertEqual(sum(len(body["inputs"]) for _, _, body in learned), 1)
+        before = len(self.server.requests)
+        self.write(
+            "a.py",
+            "STOP(another)\n"
+            + "".join(f"STOP({i})\n" for i in range(1, 39))
+            + "STOP(changed)\n",
+        )
+        partial = self.raw_cli(*args, "--cached-only", "--max-requests=0", code=2)
+        summary = json.loads(partial.stdout.splitlines()[-1])
+        self.assertEqual(summary["requests"], 0)
+        # The failed first wave contains eight inputs; its seven cached rows
+        # survive, while later waves are not visited after the explicit miss.
+        self.assertEqual(summary["cache_hits"], 7)
+        self.assertEqual(summary["stats"]["matches"], 7)
+        self.assertFalse(summary["stats"]["complete"])
+        self.assertEqual(len(self.server.requests), before)
 
     def test_source_preparation_cache_reuse_revision_and_corruption(self):
         self.write("a.py", "def retry():\n    STOP()\n")
@@ -495,7 +653,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
         )
-        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v1-*"))
+        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v2-*"))
         self.assertEqual(len(records), 1)
         if os.name != "nt":
             self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
@@ -525,15 +683,15 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args, "--batch-size=8")
         directory = self.root / "scores"
         self.raw_cli(*args, "--batch-size=3")
-        for path in directory.glob("batch-v7-*"):
-            data = json.loads(path.read_text())
-            self.assertEqual(data["version"], 7)
+        for path in directory.glob("batch-v8-*"):
+            data = read_batch(path)
+            self.assertEqual(data["version"], 8)
             data["written"] = [
                 1 if score is not None else None for score in data["scores"]
             ]
-            path.write_text(json.dumps(data))
+            write_batch(path, data)
         # The file itself is fresh; only the individual evidence is expired.
-        table = directory / "scores-v1.bin"
+        table = directory / "scores-v2.bin"
         data = bytearray(table.read_bytes())
         for offset in range(0, len(data), 64):
             record = data[offset : offset + 64]
@@ -558,12 +716,12 @@ class CliTests(unittest.TestCase):
         ]
         first = self.raw_cli(*args)
         directory = self.root / "scores"
-        for path in directory.glob("batch-v7-*"):
-            record = json.loads(path.read_text())
-            old = path.with_name(path.name.replace("batch-v7-", "batch-v6-"))
+        for path in directory.glob("batch-v8-*"):
+            record = read_batch(path)
+            old = path.with_name("batch-v6-" + record["key"])
             old.write_text(json.dumps({"version": 6, "scores": record["scores"]}))
             path.unlink()
-        (directory / "scores-v1.bin").unlink(missing_ok=True)
+        (directory / "scores-v2.bin").unlink(missing_ok=True)
         count = len(self.server.requests)
         self.assertEqual(self.raw_cli(*args, "--cached-only").stdout, first.stdout)
         self.assertEqual(len(self.server.requests), count)
@@ -614,6 +772,28 @@ class CliTests(unittest.TestCase):
         self.assertLess(len(self.server.index_requests), before)
         self.assertIn("filter_query", self.server.index_requests[0][2])
 
+    def test_indexed_source_scope_survives_disabled_score_caching(self):
+        config = self.table_config([self.indexed_doc()])
+        args = [
+            "--table-config",
+            config,
+            *self.decision_args(),
+            "--cache-ttl=0",
+            "--json",
+        ]
+        self.raw_cli(*args)
+        warm = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
+        )
+        self.server.index_documents[0]["_source"]["grep"]["permissions"]["readers"] = [
+            "new-reader"
+        ]
+        changed = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(changed.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 0
+        )
+
     def test_indexed_cache_scope_tracks_permissions_revision_and_principals(self):
         docs = [self.indexed_doc()]
         config = self.table_config(docs)
@@ -648,7 +828,7 @@ class CliTests(unittest.TestCase):
             "a",
         ]
         self.raw_cli(*args, "--batch-size=8")
-        table = self.root / "scores/scores-v1.bin"
+        table = self.root / "scores/scores-v2.bin"
         table.write_bytes(b"torn record")
         # Changed batching avoids the exact-batch tier, forcing table validation.
         self.raw_cli(*args, "--batch-size=1", "--cached-only", code=2)
@@ -1139,8 +1319,14 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args)
         self.assertEqual(len(self.server.requests), requests)
         for cache in (self.root / "scores").iterdir():
+            if cache.name.startswith("batch-v8-"):
+                record = read_batch(cache)
+                record["written"] = [
+                    1 if score is not None else None for score in record["scores"]
+                ]
+                write_batch(cache, record)
             os.utime(cache, (1, 1))
-        table = self.root / "scores/scores-v1.bin"
+        table = self.root / "scores/scores-v2.bin"
         data = bytearray(table.read_bytes())
         for offset in range(0, len(data), 64):
             record = data[offset : offset + 64]
@@ -1304,6 +1490,7 @@ class CliTests(unittest.TestCase):
         self.server.index_mode = "ok"
         self.server.mode = "ok"
         self.server.peak = 0
+        self.server.stagger_scores = False
         self.server.delay = 0
         self.server.barrier = None
 
@@ -4191,7 +4378,7 @@ class CliTests(unittest.TestCase):
             "a",
         ]
         first = self.raw_cli(*args)
-        records = list((self.root / "scores").glob("batch-v7-*"))
+        records = list((self.root / "scores").glob("batch-v8-*"))
         self.assertTrue(records)
         self.assertLess(len(records), 32)
         requests = len(self.server.requests)
@@ -4201,17 +4388,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(mtimes, [p.stat().st_mtime_ns for p in records])
         # Missing entries are reevaluated; valid zero scores remain cache hits.
         for path in records:
-            data = json.loads(path.read_text())
+            data = read_batch(path)
             data["scores"][0] = None
-            path.write_text(json.dumps(data))
-        (self.root / "scores/scores-v1.bin").unlink(missing_ok=True)
+            write_batch(path, data)
+        (self.root / "scores/scores-v2.bin").unlink(missing_ok=True)
         self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
         self.assertGreater(len(self.server.requests), requests)
         requests = len(self.server.requests)
         # Malformed/version-mismatched records must never supply evidence.
         for path in records:
             path.write_text('{"version":6,"scores":[2]}')
-        (self.root / "scores/scores-v1.bin").unlink(missing_ok=True)
+        (self.root / "scores/scores-v2.bin").unlink(missing_ok=True)
         self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
         self.assertGreater(len(self.server.requests), requests)
         self.assertFalse(list((self.root / "scores").glob("*.tmp")))
@@ -4260,7 +4447,7 @@ class CliTests(unittest.TestCase):
         self.server.requests.clear()
         self.assertEqual(expected, self.raw_cli(*args).stdout)
         self.assertEqual(len(self.server.requests), 0)
-        self.assertTrue(list(directory.glob("batch-v7-*")))
+        self.assertTrue(list(directory.glob("batch-v8-*")))
         for path in set(legacy):
             path.unlink()
         self.assertEqual(expected, self.raw_cli(*args).stdout)

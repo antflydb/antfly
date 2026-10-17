@@ -1109,15 +1109,24 @@ credential and policy identities must still match the records being read.
 Native local inference now has a shared lazy owner. Creating search or decision
 workers does not open a library or model. The first uncached invocation starts
 the runtime under a mutex; subsequent calls use the concurrent native ABI, and
-all workers finish before that owner is destroyed. Entirely cached parallel waves
+all workers finish before that owner is destroyed. Mixed parallel waves retain resolved scores and dispatch only unresolved inputs,
+reusing derived cache keys and preserving original timestamps. Entirely cached parallel waves
 also bypass worker dispatch. A regression removes the library after warming
 scores and verifies that both normal and cached-only searches still succeed.
 
-Decision batch cache v7 records each score's original creation time. Re-batching,
-legacy migration and partial-cache repairs cannot rejuvenate old evidence. V6
+Decision batch cache v8 records each score's original creation time. Re-batching,
+legacy migration and partial-cache repairs cannot rejuvenate old evidence. V6/V7
 batches and scoped v5 scalar files remain readable with their original file age;
-new records use a separate versioned filename. A second-level direct-mapped table
-holds 65,536 checksummed 64-byte records, for at most 4 MiB. It retains individual
+new records use a separate versioned namespace. V8 uses packed little-endian
+score/timestamp pairs in three size classes: 256-byte slots (4,096 buckets,
+16 ways), 1-KiB slots (2,048 buckets, 8 ways), and 4-KiB slots (512 buckets,
+8 ways), capped at 48 MiB of logical record bytes. Filesystem blocks and inode
+overhead are additional. Small batches do not consume maximum-size slots.
+Successful legacy reads migrate during writable searches;
+pre-existing legacy files remain until `cache clear`, avoiding startup sweeps
+and loss of evidence if migration writes fail. A second-level table
+holds 16,384 four-way buckets of checksummed 64-byte records (4 MiB).
+One positional read retrieves an entire bucket. It retains individual
 input identities when batch shapes change. Collisions are evictions and cause
 misses, never score substitution; concurrent torn writes also cause misses. The
 exact-batch tier keeps the ordinary one-record warm-hit path. Pinning
@@ -1128,7 +1137,11 @@ declarations and calls for exact content, path/language, delimiter/CRLF settings
 and authorization/revision scope. Its identity includes the projection source,
 Zig version and every pinned parser/grammar source byte; parser updates invalidate
 artifacts automatically. The private, atomically replaced artifacts occupy at
-most 1,024 slots of 1 MiB each. Full digest and checksum validation precedes reuse;
+most 1,024 four-way buckets of 256 KiB per slot (1 GiB total).
+V2 stores portable binary offset/index records rather than JSON and evicts the
+oldest written artifact in a full bucket. Old V1 source artifacts are disposable
+and no longer read; `cache clear` removes them. Full digest and checksum
+validation precedes reuse;
 collisions, oversized preparations or invalid records fall back to parsing. Source
 cache entries contain identifier names and ranges and are created with mode 0600.
 `stats.source_cache_hits` exposes actual reuse. All source bytes are still read
@@ -1199,3 +1212,58 @@ expected results but do not measure real model relevance. License headers,
 the Apache boundary and all 35 boundary-checker tests pass. Exact source and
 executable identities are in
 [`incremental-review-validation.json`](bench/results/incremental-review-validation.json).
+
+
+### Associative cache and output qualification
+
+This revision fixes match-only width limits and NUL-delimited long-line omissions,
+including preview coloring. Finite width limits preserve `--vimgrep` repetitions.
+Selection avoids a complete preliminary match count when only output spans are
+needed. Plain one-byte ASCII literal matches with no prefixes, trimming or color
+use a bounded bulk output path; other output retains ordinary span rendering.
+The tests compare bytes against ripgrep and cover full/partial output blocks.
+
+Mixed decision waves preserve resolved scores and their original timestamps,
+reuse derived identities, and dispatch only unresolved inputs. Workers return
+actual score creation times; waiting for a slow sibling cannot refresh earlier
+evidence. A staggered-response regression compares both cache tiers across a
+two-second completion gap. Cached-only misses
+retain evidence in the failed wave and stop without visiting subsequent waves.
+Indexed lexical/listing scans skip unused cache-scope serialization and hashing;
+decision preparation remains authorization-scoped even with score TTL zero.
+
+The source cache now uses packed, four-way associative artifacts, and the batch
+cache uses packed size classes. Capacity replaces the oldest written artifact in
+a full bucket; complete identities and checksums prevent substituted evidence.
+Size classes matter for cost: giving every small batch a maximum-size slot would
+waste capacity and cause avoidable model calls. The large fixture verifies zero
+warm inference calls as well as preparation reuse and output equivalence.
+
+Final paired results and binary/source identities are recorded in
+[`associative-review-validation.json`](bench/results/associative-review-validation.json).
+The output runs, repository-scale cache fixture, incremental HTTP fixture, and
+generated comparisons are recorded in the adjacent `associative-review-*.json`
+reports. The baseline is PR head `344de9822e`; these are warm-filesystem results
+on a shared Mac and a Linux ARM64 VM on that same host. They do not establish
+independent-hardware or cold-cache parity, real-model relevance, billed token
+savings, or full upstream PCRE2/JIT/CLI conformance.
+
+| Paired workload | Previous PR head | This revision | ripgrep |
+|---|---:|---:|---:|
+| Dense ASCII literal match-only, macOS | 14.25 ms | 7.50 ms | 18.11 ms |
+| Dense JSON, macOS | 33.46 ms | 34.91 ms | 81.69 ms |
+| Dense color, macOS | 16.29 ms | 15.83 ms | 23.59 ms |
+| Dense regex color, macOS | 17.78 ms | 17.61 ms | 30.76 ms |
+| Dense ASCII literal match-only, Linux VM | 20.14 ms | 10.31 ms | 29.63 ms |
+| Warm 2,048-file Python fixture, macOS | 9.41 s | 5.89 s | n/a |
+
+The cache fixture retains 1,754 source preparations versus 293, with zero warm
+inference calls for both binaries. Allocated cache storage is 45.8 MB versus
+45.0 MB, and peak RSS remains approximately 67 MB. This is improved reuse and
+bounded growth, not a claim of smaller allocation in every workload. Some
+dense-output timings regress slightly; the reports retain every measured run.
+
+Validation includes 160 CLI tests on each platform (two macOS skips, one Linux
+skip), native unit/hardening/tooling checks, six real-server indexed scenarios,
+1,000 generated differential cases, five labeled fixture questions and all 35
+Apache-boundary checker tests. Full upstream conformance remains unproven.

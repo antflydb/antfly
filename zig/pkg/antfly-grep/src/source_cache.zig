@@ -20,8 +20,10 @@ const source = @import("source.zig");
 const A = std.mem.Allocator;
 pub const Line = struct { start: usize, end: usize };
 pub const Prepared = struct { lines: []Line, index: source.Index };
-const limit = 1024 * 1024;
-const slots = 1024;
+const limit = 256 * 1024;
+fn cache(directory: []const u8) @import("artifact_cache.zig").Cache {
+    return .{ .directory = directory, .namespace = "source-v2", .buckets = 1024, .limit = limit };
+}
 const parser_digest = @import("grep_cache_options").parser_digest;
 fn identity(path: []const u8, bytes: []const u8, delimiter: u8, crlf: bool, scope: ?[32]u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -62,19 +64,11 @@ pub fn lines(a: A, bytes: []const u8, delimiter: u8, crlf: bool) ![]Line {
     if (start < bytes.len) try out.append(a, .{ .start = start, .end = bytes.len });
     return out.toOwnedSlice(a);
 }
-fn filename(a: A, directory: []const u8, key: [32]u8) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}/source-v1-{x:0>3}", .{ directory, std.mem.readInt(u16, key[0..2], .little) % slots });
-}
 fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8, delimiter: u8, crlf: bool) ?Prepared {
-    const path = filename(a, directory, key) catch return null;
-    defer a.free(path);
-    const record = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(limit)) catch return null;
-    // Returned strings borrow the record/parsed allocations in the caller arena.
-    if (record.len < 64 or !std.mem.eql(u8, record[0..32], &key)) return null;
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(record[64..], &digest, .{});
-    if (!std.mem.eql(u8, record[32..64], &digest)) return null;
-    const value = std.json.parseFromSliceLeaky(Prepared, a, record[64..], .{ .duplicate_field_behavior = .@"error" }) catch return null;
+    const record = cache(directory).load(a, io, key) orelse return null;
+    var reader = @import("cache_codec.zig").Reader{ .bytes = record };
+    const value = reader.get(Prepared, a) catch return null;
+    if (reader.bytes.len != 0) return null;
     // Verify line boundaries in one monotonic pass. No source-size x region
     // validation, and no cached offset can escape this exact content revision.
     var start: usize = 0;
@@ -100,25 +94,7 @@ fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8,
 fn store(a: A, io: std.Io, directory: []const u8, key: [32]u8, value: Prepared) void {
     var budget = @import("antfly_regex").Budget{ .backing = a, .limit = limit };
     const ba = budget.allocator();
-    const body = std.json.Stringify.valueAlloc(ba, value, .{}) catch return;
+    const body = @import("cache_codec.zig").encode(ba, value) catch return;
     defer ba.free(body);
-    if (body.len > limit - 64) return;
-    const path = filename(a, directory, key) catch return;
-    defer a.free(path);
-    std.Io.Dir.cwd().createDirPath(io, directory) catch return;
-    var nonce: [12]u8 = undefined;
-    io.random(&nonce);
-    const temporary = std.fmt.allocPrint(a, "{s}.{s}.tmp", .{ path, std.fmt.bytesToHex(nonce, .lower) }) catch return;
-    defer a.free(temporary);
-    defer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
-    {
-        const file = std.Io.Dir.cwd().createFile(io, temporary, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return;
-        defer file.close(io);
-        var header: [64]u8 = undefined;
-        header[0..32].* = key;
-        std.crypto.hash.sha2.Sha256.hash(body, header[32..64], .{});
-        file.writeStreamingAll(io, &header) catch return;
-        file.writeStreamingAll(io, body) catch return;
-    }
-    std.Io.Dir.cwd().rename(temporary, .cwd(), path, io) catch {};
+    cache(directory).store(a, io, key, body);
 }

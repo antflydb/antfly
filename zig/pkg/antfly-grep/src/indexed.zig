@@ -179,23 +179,25 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             // Scope evidence by the current authorized revision and endpoint.
             // Authorization is rechecked on every scan before any cached data
             // can be used; snapshots are deliberately not cache identities.
-            var scope = std.crypto.hash.sha2.Sha256.init(.{});
-            const permissions = try std.json.Stringify.valueAlloc(a, document.field(value, "permissions").?, .{});
-            for ([_][]const u8{ config.endpoint, search.options.table_token orelse "", table.name, id, doc.provenance.uri.?, doc.provenance.revision.?, permissions }) |part| {
-                var length: [8]u8 = undefined;
-                std.mem.writeInt(u64, &length, part.len, .little);
-                scope.update(&length);
-                scope.update(part);
+            if (search.options.ask != null and !search.options.no_cache and search.options.cache_dir != null) {
+                var scope = std.crypto.hash.sha2.Sha256.init(.{});
+                const permissions = try std.json.Stringify.valueAlloc(a, document.field(value, "permissions").?, .{});
+                for ([_][]const u8{ config.endpoint, search.options.table_token orelse "", table.name, id, doc.provenance.uri.?, doc.provenance.revision.?, permissions }) |part| {
+                    var length: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &length, part.len, .little);
+                    scope.update(&length);
+                    scope.update(part);
+                }
+                for (config.principals) |principal| {
+                    var length: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &length, principal.len, .little);
+                    scope.update(&length);
+                    scope.update(principal);
+                }
+                var scope_digest: [32]u8 = undefined;
+                scope.final(&scope_digest);
+                doc.cache_scope = scope_digest;
             }
-            for (config.principals) |principal| {
-                var length: [8]u8 = undefined;
-                std.mem.writeInt(u64, &length, principal.len, .little);
-                scope.update(&length);
-                scope.update(principal);
-            }
-            var scope_digest: [32]u8 = undefined;
-            scope.final(&scope_digest);
-            doc.cache_scope = scope_digest;
             search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
         if (!has_next) return;

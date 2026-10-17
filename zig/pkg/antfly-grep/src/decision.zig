@@ -25,6 +25,7 @@ pub const Input = struct {
     input: []const u8,
     context: []const u8 = "",
     context_hash: ?[32]u8 = null,
+    derived_key: ?[64]u8 = null,
     pub fn jsonStringify(self: Input, json: *std.json.Stringify) !void {
         try json.beginObject();
         try json.objectField("id");
@@ -53,6 +54,7 @@ pub const Client = struct {
     limits: ?*@import("budget.zig").Limits = null,
     cache_hits: usize = 0,
     allow_parallel: bool = true,
+    cache_checked: bool = false,
     local: ?*@import("local_decider.zig").Runtime = null,
     shared_local: ?*@import("local_decider.zig").Runtime = null,
     cache_scope: ?[32]u8 = null,
@@ -96,37 +98,69 @@ pub const Client = struct {
             }
             return;
         }
-        // Warm waves need neither worker startup nor a native runtime. Only
-        // all-hit waves take this shortcut; misses retain ordinary partial
-        // evidence and budget behavior in the worker path.
-        if (try self.cachedWave(inputs, scores)) return;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const caching = !self.options.no_cache and self.options.cache_ttl_seconds != 0 and self.options.cache_dir != null;
+        const keys = try a.alloc([64]u8, if (caching) inputs.len else 0);
+        const written = try a.alloc(?i64, inputs.len);
+        @memset(written, null);
+        if (caching) try self.cachedWave(a, inputs, scores, keys, written);
+        var missing: std.ArrayList(Input) = .empty;
+        var indices: std.ArrayList(usize) = .empty;
+        for (inputs, 0..) |input, i| {
+            if (std.math.isFinite(scores[i])) continue;
+            var copy = input;
+            if (caching) copy.derived_key = keys[i];
+            try missing.append(a, copy);
+            try indices.append(a, i);
+        }
+        if (missing.items.len == 0) return;
+        if (self.options.cached_only) return error.DecisionCacheMiss;
+        const unresolved = try a.alloc(f64, missing.items.len);
+        @memset(unresolved, std.math.nan(f64));
+        const learned_at = try a.alloc(?i64, missing.items.len);
+        @memset(learned_at, null);
         try self.ensureLocal();
         if (self.pool == null) self.pool = try Pool.create(self);
-        try self.pool.?.run(self, inputs, scores);
+        self.cache_checked = caching;
+        defer self.cache_checked = false;
+        var failure: ?anyerror = null;
+        self.pool.?.run(self, missing.items, unresolved, learned_at) catch |err| {
+            failure = err;
+        };
+        for (indices.items, unresolved, learned_at) |index, score, timestamp| {
+            scores[index] = score;
+            written[index] = timestamp;
+        }
+        if (caching) {
+            var offset: usize = 0;
+            while (offset < inputs.len) {
+                const n = @min(self.options.batch_size, inputs.len - offset);
+                self.storeBatch(a, &batchKey(keys[offset..][0..n]), scores[offset..][0..n], written[offset..][0..n]) catch {};
+                offset += n;
+            }
+        }
+        if (failure) |err| return err;
     }
     fn cachedEntry(self: *Client, a: Allocator, key_hex: *const [64]u8) !?@import("score_store.zig").Entry {
         return self.score_store.get(a, self.io, self.options, key_hex) orelse try self.cached(a, key_hex);
     }
-    fn cachedWave(self: *Client, inputs: []const Input, scores: []f64) !bool {
-        if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
-        var arena = std.heap.ArenaAllocator.init(self.a);
-        defer arena.deinit();
-        const a = arena.allocator();
+    fn cachedWave(self: *Client, a: Allocator, inputs: []const Input, scores: []f64, keys: [][64]u8, written: []?i64) !void {
+        for (inputs, keys) |input, *key_hex| key_hex.* = self.key(input);
         var offset: usize = 0;
         while (offset < inputs.len) {
             const n = @min(self.options.batch_size, inputs.len - offset);
-            const keys = try a.alloc([64]u8, n);
-            for (inputs[offset..][0..n], keys) |input, *key_hex| key_hex.* = self.key(input);
-            const written = try a.alloc(?i64, n);
-            @memset(written, null);
-            _ = try self.cachedBatch(a, &batchKey(keys), scores[offset..][0..n], written);
-            for (keys, scores[offset..][0..n]) |*key_hex, *score| {
-                if (!std.math.isFinite(score.*)) score.* = (try self.cachedEntry(a, key_hex) orelse return false).score;
-            }
+            _ = try self.cachedBatch(a, &batchKey(keys[offset..][0..n]), scores[offset..][0..n], written[offset..][0..n]);
             offset += n;
         }
-        self.cache_hits += inputs.len;
-        return true;
+        for (keys, scores, written) |*key_hex, *score, *timestamp| {
+            if (!std.math.isFinite(score.*)) if (try self.cachedEntry(a, key_hex)) |entry| {
+                score.* = entry.score;
+                timestamp.* = entry.written;
+            };
+            if (std.math.isFinite(score.*)) self.cache_hits += 1;
+        }
     }
     /// Stable worker storage and clients survive batch waves. A wave borrows
     /// its inputs until all workers acknowledge completion; no work queue grows
@@ -162,7 +196,7 @@ pub const Client = struct {
             self.a.free(self.workers);
             self.a.destroy(self);
         }
-        fn run(self: *Pool, parent: *Client, inputs: []const Input, scores: []f64) !void {
+        fn run(self: *Pool, parent: *Client, inputs: []const Input, scores: []f64, written: []?i64) !void {
             const wanted = @min(self.workers.len, (inputs.len + parent.options.batch_size - 1) / parent.options.batch_size);
             // The caller owns dispatch and waits for the previous wave. Spawn
             // outside the mutex; new workers start at the previous generation.
@@ -173,11 +207,15 @@ pub const Client = struct {
                 self.started += 1;
             }
             if (self.started == 0) {
-                parent.allow_parallel = false;
-                defer parent.allow_parallel = true;
-                return parent.decideBatches(inputs, scores);
+                var offset: usize = 0;
+                while (offset < inputs.len) {
+                    const n = @min(parent.options.batch_size, inputs.len - offset);
+                    try parent.decideTimed(inputs[offset..][0..n], scores[offset..][0..n], written[offset..][0..n]);
+                    offset += n;
+                }
+                return;
             }
-            var context = Batches{ .client = parent, .inputs = inputs, .scores = scores };
+            var context = Batches{ .client = parent, .inputs = inputs, .scores = scores, .written = written };
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.context = &context;
@@ -219,6 +257,7 @@ pub const Client = struct {
         client: *Client,
         inputs: []const Input,
         scores: []f64,
+        written: []?i64,
         index: std.atomic.Value(usize) = .init(0),
         mutex: std.Io.Mutex = .init,
         failure: ?anyerror = null,
@@ -232,12 +271,13 @@ pub const Client = struct {
             local.query = parent.query;
             local.stage = parent.stage;
             local.cache_scope = parent.cache_scope;
+            local.cache_checked = parent.cache_checked;
             local.shared_local = parent.shared_local orelse if (parent.local) |provider| provider else null;
             while (true) {
                 const start = ctx.index.fetchAdd(parent.options.batch_size, .monotonic);
                 if (start >= ctx.inputs.len) break;
                 const n = @min(parent.options.batch_size, ctx.inputs.len - start);
-                local.decide(ctx.inputs[start..][0..n], ctx.scores[start..][0..n]) catch |err| {
+                local.decideTimed(ctx.inputs[start..][0..n], ctx.scores[start..][0..n], ctx.written[start..][0..n]) catch |err| {
                     ctx.mutex.lockUncancelable(parent.io);
                     if (ctx.failure == null) ctx.failure = err;
                     ctx.mutex.unlock(parent.io);
@@ -253,6 +293,9 @@ pub const Client = struct {
         }
     };
     pub fn decide(self: *Client, inputs: []const Input, probabilities: []f64) !void {
+        return self.decideTimed(inputs, probabilities, null);
+    }
+    fn decideTimed(self: *Client, inputs: []const Input, probabilities: []f64, created: ?[]?i64) !void {
         if (self.limits) |limits| if (limits.cancel.load(.monotonic)) return error.Canceled;
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -264,13 +307,14 @@ pub const Client = struct {
         const batch_key = batchKey(keys);
         const written = try a.alloc(?i64, inputs.len);
         @memset(written, null);
-        const batch_hit = try self.cachedBatch(a, &batch_key, probabilities, written);
+        defer if (created) |out| @memcpy(out, written);
+        const batch_hit = if (self.cache_checked) false else try self.cachedBatch(a, &batch_key, probabilities, written);
         var missing: std.ArrayList(Input) = .empty;
         var indices: std.ArrayList(usize) = .empty;
         for (inputs, 0..) |input, i| {
             if (std.math.isFinite(probabilities[i])) {
                 self.cache_hits += 1;
-            } else if (if (caching) try self.cachedEntry(a, &keys[i]) else null) |entry| {
+            } else if (if (caching and !self.cache_checked) try self.cachedEntry(a, &keys[i]) else null) |entry| {
                 probabilities[i] = entry.score;
                 written[i] = entry.written;
                 self.cache_hits += 1;
@@ -295,13 +339,14 @@ pub const Client = struct {
             if (!std.math.isFinite(score)) continue;
             probabilities[index] = score;
             written[index] = std.Io.Clock.real.now(self.io).toSeconds();
-            if (caching) self.score_store.put(a, self.io, self.options, &keys[index], score);
+            if (caching) self.score_store.putEntry(a, self.io, self.options, &keys[index], .{ .score = score, .written = written[index].? });
             learned = true;
         }
         if (learned or !batch_hit) self.storeBatch(a, &batch_key, probabilities, written) catch {};
         if (failure) |err| return err;
     }
     fn key(self: *Client, input: Input) [64]u8 {
+        if (input.derived_key) |value| return value;
         var context_hash = input.context_hash orelse blk: {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(input.context, &digest, .{});
@@ -366,10 +411,51 @@ pub const Client = struct {
         hash.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
     }
+    fn batchCache(self: *Client, count: usize) @import("artifact_cache.zig").Cache {
+        // Size classes bound bytes without wasting a maximum-size slot on every
+        // tiny batch. More ways retain dense small-record working sets.
+        const size = 68 + count * 16;
+        return if (size <= 256)
+            .{ .directory = self.options.cache_dir.?, .namespace = "batch-v8-small", .buckets = 4096, .ways = 16, .limit = 256 }
+        else if (size <= 1024)
+            .{ .directory = self.options.cache_dir.?, .namespace = "batch-v8-medium", .buckets = 2048, .ways = 8, .limit = 1024 }
+        else
+            .{ .directory = self.options.cache_dir.?, .namespace = "batch-v8-large", .buckets = 512, .ways = 8, .limit = 4096 };
+    }
+    fn digestKey(hex: []const u8) [32]u8 {
+        var result: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&result, hex) catch unreachable;
+        return result;
+    }
+    const ScoreRecord = struct { bits: u64, written: u64 };
     fn cachedBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64, written: []?i64) !bool {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
-        if (try self.cachedBatchVersion(a, key_hex, scores, written, 7)) return true;
-        return self.cachedBatchVersion(a, key_hex, scores, written, 6);
+        if (self.batchCache(scores.len).load(a, self.io, digestKey(key_hex))) |bytes| cached: {
+            var reader = @import("cache_codec.zig").Reader{ .bytes = bytes };
+            const entries = reader.get([]ScoreRecord, a) catch break :cached;
+            if (reader.bytes.len != 0 or entries.len != scores.len) break :cached;
+            for (entries) |entry| {
+                const score: f64 = @bitCast(entry.bits);
+                if (!std.math.isNan(score) and (!std.math.isFinite(score) or (score < 0 and score != -1) or score > 1)) break :cached;
+            }
+            const now = std.Io.Clock.real.now(self.io).toSeconds();
+            for (entries, scores, written) |entry, *score, *timestamp| {
+                const value: f64 = @bitCast(entry.bits);
+                const created: i64 = @bitCast(entry.written);
+                const age = @as(i128, now) - created;
+                if (!std.math.isFinite(value) or age < -300 or age >= self.options.cache_ttl_seconds) continue;
+                score.* = value;
+                timestamp.* = created;
+            }
+            return true;
+        }
+        for ([_]u8{ 7, 6 }) |version| if (try self.cachedBatchVersion(a, key_hex, scores, written, version)) {
+            self.storeBatch(a, key_hex, scores, written) catch {};
+            // Keep legacy evidence until explicit cache cleanup: a best-effort
+            // write can fail (for example on a full disk) without losing it.
+            return true;
+        };
+        return false;
     }
     fn cachedBatchVersion(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64, written: []?i64, version: u8) !bool {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
@@ -396,27 +482,19 @@ pub const Client = struct {
     }
     fn storeBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []const f64, written: []const ?i64) !void {
         if (self.options.no_cache or self.options.cached_only or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return;
+        // Bound allocation before encoding; oversized shapes retain scalar reuse.
+        if (scores.len > (4096 - 68) / 16) return;
         var any = false;
-        const entries = try a.alloc(?f64, scores.len);
-        for (scores, entries) |score, *entry| {
-            entry.* = if (std.math.isFinite(score)) score else null;
-            any = any or entry.* != null;
+        const entries = try a.alloc(ScoreRecord, scores.len);
+        for (scores, written, entries) |score, timestamp, *entry| {
+            const valid = std.math.isFinite(score) and timestamp != null;
+            any = any or valid;
+            entry.* = .{ .bits = @bitCast(if (valid) score else std.math.nan(f64)), .written = @bitCast(timestamp orelse 0) };
         }
         if (!any) return;
-        std.Io.Dir.cwd().createDirPath(self.io, self.options.cache_dir.?) catch return;
-        const path = try std.fmt.allocPrint(a, "{s}/batch-v7-{s}", .{ self.options.cache_dir.?, key_hex });
-        var nonce: [12]u8 = undefined;
-        self.io.random(&nonce);
-        const suffix = std.fmt.bytesToHex(nonce, .lower);
-        const temporary = try std.fmt.allocPrint(a, "{s}.{s}.tmp", .{ path, suffix });
-        defer std.Io.Dir.cwd().deleteFile(self.io, temporary) catch {};
-        {
-            var file = std.Io.Dir.cwd().createFile(self.io, temporary, .{ .exclusive = true }) catch return;
-            defer file.close(self.io);
-            const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = 7, .scores = entries, .written = written }, .{});
-            file.writeStreamingAll(self.io, bytes) catch return;
-        }
-        std.Io.Dir.cwd().rename(temporary, .cwd(), path, self.io) catch {};
+        const bytes = try @import("cache_codec.zig").encode(a, entries);
+        defer a.free(bytes);
+        self.batchCache(scores.len).store(a, self.io, digestKey(key_hex), bytes);
     }
     fn request(self: *Client, inputs: []const Input, probabilities: []f64) !void {
         if (self.options.cached_only) return error.DecisionCacheMiss;

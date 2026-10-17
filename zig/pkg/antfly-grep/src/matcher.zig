@@ -302,6 +302,11 @@ pub const Matcher = struct {
         }
         return try a.realloc(result, i);
     }
+    pub fn singleByteLiteral(self: *const Matcher) ?u8 {
+        if (!self.isLiteralSearch() or self.program.direct.items.len != 1 or self.options.word or self.options.whole_line) return null;
+        const bytes = self.program.direct.items[0].bytes;
+        return if (bytes.len == 1 and bytes[0] < 128) bytes[0] else null;
+    }
     pub fn isLiteralSearch(self: *const Matcher) bool {
         if (self.program.direct.items.len == 0 or self.program.regular.items.len != 0 or self.program.advanced.items.len != 0) return false;
         for (self.program.direct.items) |item| if (item.insensitive) return false;

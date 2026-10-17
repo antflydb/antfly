@@ -1259,7 +1259,11 @@ pub const Search = struct {
                     matched = scores[0] >= 0 and ((scores[0] >= self.options.threshold) != self.options.invert);
                 } else if (context_limit == 0 and !self.options.invert and self.options.replacement == null and !self.options.vimgrep and (self.options.json or self.options.only_matching or self.color_enabled)) {
                     self.replay_spans = true;
-                    if (self.matcher.isLiteralSearch()) {
+                    if (self.options.only_matching and !self.options.json and !self.options.stats and !self.options.count and !self.options.count_matches) {
+                        // Output enumerates spans once. Plain match-only output
+                        // needs no preliminary full-row occurrence count.
+                        matched = try self.matcher.matches(text);
+                    } else if (self.matcher.isLiteralSearch()) {
                         const counted = try self.matcher.count(text, std.math.maxInt(usize), peek != null);
                         matched = counted.total != 0;
                         exact_occurrences = counted.total - @intFromBool(counted.terminal_empty);
@@ -2072,7 +2076,7 @@ pub const Search = struct {
             try self.write(if (self.options.null_data) "\x00" else "\n");
             return;
         }
-        if (self.options.only_matching and !self.options.json and self.options.replacement == null and !self.color_enabled and !self.render_filename and !self.options.line_numbers and !self.options.column and !self.options.byte_offset and !self.options.vimgrep and std.math.isNan(probability) and !self.options.invert and self.current_hits != null and self.current_hits.?.len > 0 and self.current_hit_text.ptr == text.ptr and self.current_hit_text.len == text.len) {
+        if (self.options.only_matching and !self.options.json and self.options.replacement == null and self.options.max_columns == std.math.maxInt(usize) and !self.options.trim and !self.color_enabled and !self.render_filename and !self.options.line_numbers and !self.options.column and !self.options.byte_offset and !self.options.vimgrep and std.math.isNan(probability) and !self.options.invert and self.current_hits != null and self.current_hits.?.len > 0 and self.current_hit_text.ptr == text.ptr and self.current_hit_text.len == text.len) {
             if (!matched) return;
             const delimiter: u8 = if (self.options.null_data) 0 else '\n';
             for (self.current_hits.?) |hit| {
@@ -2142,7 +2146,7 @@ pub const Search = struct {
                 self.header_printed = true;
             }
         }
-        if (self.replay_spans and matched and p == null and !self.options.invert) {
+        if ((self.replay_spans or (self.options.only_matching and !self.options.vimgrep and self.options.replacement == null and self.options.max_columns != std.math.maxInt(usize))) and matched and p == null and !self.options.invert) {
             return self.emitReplay(path_name, text, line, byte_offset, terminated);
         }
         if (self.options.only_matching and p == null) {
@@ -2180,7 +2184,7 @@ pub const Search = struct {
                     try output.writer.writeAll(text[0..self.options.max_columns]);
                     try output.writer.writeAll(" [... omitted end of long line]");
                 } else if (self.color_enabled and matched and p == null) try output.writer.print("[Omitted long line with {d} matches]", .{hits.items.len}) else try output.writer.print("[Omitted long {s} line]", .{if (matched) "matching" else "context"});
-                try output.writer.writeByte('\n');
+                try output.writer.writeByte(if (self.options.null_data) 0 else '\n');
                 try self.write(output.written());
                 return;
             }
@@ -2368,7 +2372,51 @@ pub const Search = struct {
         self.renderReplay(&output.writer, path, text, line, offset, terminated) catch |err| return self.outputError(&output, err);
         output.writer.flush() catch |err| return output.failure orelse err;
     }
+    fn renderPreview(self: *Search, writer: *std.Io.Writer, text: []const u8, from: usize, end: usize, original_end: usize, terminated: bool, only: bool) !void {
+        var spans = SpanIterator{ .matcher = &self.matcher, .text = text, .terminated = terminated, .cached = self.current_hits, .runs = self.cachedRuns() };
+        var position = from;
+        var remaining: usize = 0;
+        var highlight_end: ?usize = null;
+        while (spans.next()) |span| {
+            // The uncolored match-only printer uses match-relative excerpts.
+            const cutoff = if (only and !self.color_enabled) end - from else end;
+            const last = if (only and !self.color_enabled) original_end - from else original_end;
+            if (span.start >= cutoff and span.start < last) remaining += 1;
+            if (!self.color_enabled or span.end <= from or span.start >= end or span.start == span.end) continue;
+            const lo = @max(from, span.start);
+            const hi = @min(end, span.end);
+            if (highlight_end != null and highlight_end.? != lo) {
+                try writer.writeAll("\x1b[0m");
+                highlight_end = null;
+            }
+            if (position < lo) try writer.writeAll(text[position..lo]);
+            if (highlight_end == null) try @import("style.zig").start(writer, self.options, "match");
+            try writer.writeAll(text[lo..hi]);
+            position = hi;
+            highlight_end = hi;
+        }
+        if (highlight_end != null) try writer.writeAll("\x1b[0m");
+        try writer.writeAll(text[position..end]);
+        if (only or self.color_enabled or self.options.stats) {
+            try writer.print(" [... {d} more {s}]", .{ remaining, if (remaining == 1) "match" else "matches" });
+        } else try writer.writeAll(" [... omitted end of long line]");
+    }
     fn renderReplay(self: *Search, writer: *std.Io.Writer, path: []const u8, text: []const u8, line: usize, offset: usize, terminated: bool) !void {
+        const prefix_needed = (self.render_filename and !(self.options.heading orelse false)) or self.options.line_numbers or self.options.byte_offset or self.options.column;
+        if (self.options.only_matching and !prefix_needed and !self.color_enabled and !self.options.trim and self.options.max_columns >= 1 and self.current_hits == null) if (self.matcher.singleByteLiteral()) |byte| {
+            const counted = try self.matcher.count(text, std.math.maxInt(usize), terminated);
+            if (self.options.trace) std.debug.print("antfly-grep: bulk literal bytes={d} occurrences={d}\n", .{ text.len, counted.total });
+            const record = [_]u8{ byte, if (self.options.null_data) 0 else '\n' };
+            var block: [8192]u8 = undefined;
+            for (0..block.len / 2) |i| block[i * 2 ..][0..2].* = record;
+            var remaining = counted.total;
+            while (remaining >= block.len / 2) {
+                try self.write(&block);
+                remaining -= block.len / 2;
+            }
+            if (remaining != 0) try self.write(block[0 .. remaining * 2]);
+            return;
+        };
         var spans = SpanIterator{ .matcher = &self.matcher, .text = text, .terminated = terminated, .cached = self.current_hits, .runs = self.cachedRuns() };
         var hit = spans.next();
         const delimiter: u8 = if (self.options.null_data) 0 else '\n';
@@ -2379,21 +2427,27 @@ pub const Search = struct {
                 try writer.writeByte(delimiter);
             }
             while (hit) |span| : (hit = spans.next()) {
-                try self.prefix(writer, path, line, offset + span.start, span.start + 1, true);
+                if (prefix_needed) try self.prefix(writer, path, line, offset + span.start, span.start + 1, true);
                 const visible = if (self.options.trim) std.mem.trimStart(u8, text[span.start..span.end], " \t") else text[span.start..span.end];
-                if (self.color_enabled and visible.len != 0) try @import("style.zig").start(writer, self.options, "match");
-                try writer.writeAll(visible);
-                if (self.color_enabled and visible.len != 0) try writer.writeAll("\x1b[0m");
+                if (visible.len > self.options.max_columns) {
+                    if (self.options.max_columns_preview) {
+                        const from = span.end - visible.len;
+                        try self.renderPreview(writer, text, from, from + self.options.max_columns, span.end, terminated, true);
+                    } else try writer.writeAll("[Omitted long matching line]");
+                } else {
+                    if (self.color_enabled and visible.len != 0) try @import("style.zig").start(writer, self.options, "match");
+                    try writer.writeAll(visible);
+                    if (self.color_enabled and visible.len != 0) try writer.writeAll("\x1b[0m");
+                }
                 try writer.writeByte(delimiter);
             }
         } else {
             try self.prefix(writer, path, line, offset, if (hit) |span| span.start + 1 else 1, true);
             if (text.len > self.options.max_columns) {
                 if (self.options.max_columns_preview) {
-                    try writer.writeAll(text[0..self.options.max_columns]);
-                    try writer.writeAll(" [... omitted end of long line]");
+                    try self.renderPreview(writer, text, 0, self.options.max_columns, text.len, terminated, false);
                 } else if (self.color_enabled) try writer.print("[Omitted long line with {d} matches]", .{self.row_occurrences}) else try writer.writeAll("[Omitted long matching line]");
-                try writer.writeByte('\n');
+                try writer.writeByte(delimiter);
                 return;
             }
             const trim_start = if (self.options.trim) text.len - std.mem.trimStart(u8, text, " \t").len else 0;
