@@ -49404,3 +49404,39 @@ test "embeddinggemma2 generated Metal weight snapshot rejects partial replacemen
         for (try output.toHostSlice()) |value| try std.testing.expectApproxEqAbs(@as(f32, 2), value, 1e-6);
     }
 }
+
+test "metal native embeddinggemma2 two-frame scratch ownership survives wait and cancellation" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const provider_mod = @import("metal_native_provider.zig");
+    var provider = try provider_mod.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime;
+    if (runtime == null) return error.SkipZigTest;
+    try std.testing.expect(setWhisperPipelinedFrames(&provider, true));
+    defer _ = setWhisperPipelinedFrames(&provider, false);
+    for ([_]bool{ false, true }) |cancel| {
+        const first = try acquireScratch(runtime, 4096);
+        try beginFrame(runtime);
+        releaseScratch(runtime, first);
+        try submitFrame(runtime);
+        try beginFrame(runtime);
+        const second = try acquireScratch(runtime, 4096);
+        try std.testing.expect(first != second);
+        releaseScratch(runtime, second);
+        try waitFrame(runtime);
+        // Waiting the predecessor can release its slot, never the successor's.
+        const available = try acquireScratch(runtime, 4096);
+        try std.testing.expectEqual(first, available);
+        const another = try acquireScratch(runtime, 4096);
+        try std.testing.expect(second != another);
+        releaseScratch(runtime, available);
+        releaseScratch(runtime, another);
+        if (cancel) try cancelFrame(runtime) else {
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+        }
+        const memory = runtimeMemorySnapshot(runtime);
+        try std.testing.expectEqual(@as(u64, 0), memory.scratch_pool_pending_slots);
+        try std.testing.expectEqual(@as(u64, 0), memory.scratch_pool_in_use_slots);
+    }
+}

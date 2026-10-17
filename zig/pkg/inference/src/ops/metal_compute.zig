@@ -30802,6 +30802,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try metal_runtime.popPlannedComputeBarrierSuppression(runtime);
     }
 
+    fn decoderRuntimeHasSubmittedFrameOp(ctx: *anyopaque) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime);
+    }
+
     fn decoderRuntimeHasActiveFrameOp(ctx: *anyopaque) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
@@ -33378,6 +33383,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimePushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
         vt.decoderRuntimePopPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;
         vt.decoderRuntimeHasActiveFrame = decoderRuntimeHasActiveFrameOp;
+        vt.decoderRuntimeHasSubmittedFrame = decoderRuntimeHasSubmittedFrameOp;
         vt.decoderRuntimeBeginMoeCheckpoint = decoderRuntimeBeginMoeCheckpointOp;
         vt.decoderRuntimeFinishMoeCheckpoint = decoderRuntimeFinishMoeCheckpointOp;
         vt.decoderRuntimeSetMoeReplayMode = decoderRuntimeSetMoeReplayModeOp;

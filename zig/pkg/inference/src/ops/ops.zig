@@ -2847,6 +2847,8 @@ pub const ComputeBackend = struct {
 
         /// Return true when a backend-owned decoder frame is already active.
         decoderRuntimeHasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Submitted frames remain owned by the caller until explicitly waited.
+        decoderRuntimeHasSubmittedFrame: ?*const fn (ctx: *anyopaque) bool = null,
 
         /// Arm a per-layer MoE miss ledger for an optimistic decode frame.
         /// Returns false before encoding when the arena is not fully warm.
@@ -5228,6 +5230,11 @@ pub const ComputeBackend = struct {
         if (self.vtable.decoderRuntimeHasActiveFrame) |op| {
             return op(self.ptr);
         }
+        return false;
+    }
+
+    pub fn decoderRuntimeHasSubmittedFrame(self: *const ComputeBackend) bool {
+        if (self.vtable.decoderRuntimeHasSubmittedFrame) |op| return op(self.ptr);
         return false;
     }
 

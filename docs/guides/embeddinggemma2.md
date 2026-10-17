@@ -587,15 +587,28 @@ The model lease protects views, and cache pressure reclaims the parent as one
 allocation. Packed QKV/head preparation and packed GELU avoid extraction copies;
 activation storage remains bounded by the existing admitted row envelope.
 
-The pure Zig CPU backend also prepares immutable F32 GEMM panels for reused
-matrix weights. Panels use portable SIMD across output columns, 64-column
-panels, 256-element K blocks and bounded row blocks. Tiny inputs and system
-BLAS retain their existing kernels. Panels are admitted within the same model
-and class ceilings as dense snapshots; allocation/admission failure falls back
-to direct GEMM. Admission also protects space for unwarmed dense weights, so
-optional early panels cannot force late layers to widen on every request.
-A request reader pins both representations. Idle reclamation
-releases each parent and its panels together, and unload releases all owners.
+The pure Zig CPU backend uses model-owned F32 GEMM panels as its canonical
+prepared matrix representation. Panels are built directly from typed checkpoint
+rows, without first allocating a dense F32 mirror. Individual language projections
+and packed QKV/gate-up calls share one named panel owner; aligned output-row views
+borrow its panels. Portable SIMD operates across output columns with 64-column
+panels, 256-element K blocks and bounded row blocks. System BLAS retains its own
+kernels. Canonical panels obey the existing shared host budget and class ceilings;
+allocation or admission failure uses the typed/direct fallback. Request readers
+pin panel owners until teardown, and idle reclamation/unload releases their exact
+admission. Optional panels for pre-existing dense snapshots still reserve dense
+weight headroom.
+
+CPU row slices retain their source owner, including typed checkpoint mappings,
+instead of copying matrix weights. CPU per-layer input projections are grouped
+under a 16 MiB projected-output ceiling; long inputs keep the streamed path.
+Metal backbones above the small-input frame threshold encode one bounded layer
+group while its predecessor executes. Each pair drains before activation-view
+retirement. The two live groups share the existing 128 KiB/row layer envelope;
+scratch released by the successor cannot be recycled by predecessor completion.
+Cancellation drops unsubmitted work and drains submitted work before releasing
+owners. `ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER=1` selects serial
+submission for diagnostics.
 
 Mixed media cohorts use a bounded readiness scheduler. A group executes once
 all its required projected parts are available, while the next CPU preparation

@@ -795,7 +795,7 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
 
 pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
-    if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.EmbeddingGemma2ExternalFrame;
+    if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (ids.len != rows or mask.len != rows) return error.InvalidInputShape;
@@ -822,9 +822,10 @@ pub fn metalBatchCapacity(sequence: usize, maximum: usize) usize {
 fn metalLayerGroup(cfg: Config, rows: usize) usize {
     if (rows <= metalFrameRows()) return cfg.num_hidden_layers;
     // The existing run envelope supplies 192 KiB/row. Reserve one third for
-    // packed inputs, attention and outputs; group only fitting live layers.
+    // packed inputs, attention and outputs. Two groups may be live: the
+    // submitted predecessor and its encoding successor each receive 64 KiB/row.
     const per_row = (12 * cfg.hidden_size + 3 * cfg.intermediate_size + 4 * cfg.per_layer_input_dim) * @sizeOf(f32);
-    return @max(@as(usize, 1), @min(@as(usize, 8), (128 * 1024) / @max(per_row, 1)));
+    return @max(@as(usize, 1), @min(@as(usize, 8), (64 * 1024) / @max(per_row, 1)));
 }
 fn packPerLayerInputs(cfg: Config, rows: usize) bool {
     const elements = std.math.mul(usize, rows, cfg.num_hidden_layers * cfg.per_layer_input_dim) catch return false;
@@ -856,7 +857,7 @@ pub fn forwardPooledEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.A
 
 fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: ?usize) !CT {
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
-    if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.EmbeddingGemma2ExternalFrame;
+    if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (mask.len != rows) return error.InvalidEmbeddingInputLength;
@@ -892,6 +893,21 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     defer frame_batch.deinit(cb);
     var shared_frame = false;
     const group_layers = metalLayerGroup(cfg, rows);
+    // One submitted predecessor and one encoding successor. Drain each pair
+    // before retiring MPS activation views, so owners remain within the same
+    // 128 KiB/row layer envelope as the serial schedule.
+    const pipeline = cb.kind() == .metal and rows > metalFrameRows() and
+        !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER") and
+        cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+    var pending_frame = false;
+    var pending_ple: ?CT = null;
+    defer {
+        if (shared_frame) cb.decoderRuntimeCancelFrame() catch {};
+        if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        if (pipeline) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+        if (pending_ple) |tensor| cb.free(tensor);
+        @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
+    }
     if (cb.kind() == .metal and cfg.num_hidden_layers <= frame_batch.slices.len) {
         shared_frame = try cb.decoderRuntimeBeginFrame();
         if (!shared_frame) return error.EmbeddingGemma2OperationUnavailable;
@@ -899,6 +915,10 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     }
     // Registered after slice cleanup so cancellation happens before release.
     defer if (shared_frame) cb.decoderRuntimeCancelFrame() catch {};
+    const cpu_ple_group = if (cb.kind() == .native and rows >= 32)
+        @min(cfg.num_hidden_layers, @max(@as(usize, 1), (16 * 1024 * 1024) / (rows * cfg.per_layer_input_dim * @sizeOf(f32))))
+    else
+        1;
     const whole_packed = cb.kind() == .metal and packPerLayerInputs(cfg, rows);
     var packed_first: usize = 0;
     var packed_ple: ?CT = if (whole_packed and cfg.num_hidden_layers <= frame_batch.slices.len)
@@ -911,6 +931,14 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     defer if (owns_hidden) cb.free(hidden);
     for (0..cfg.num_hidden_layers) |layer| {
         try cb.checkExecutionControl();
+        if (cb.kind() == .native and cpu_ple_group > 1 and packed_ple == null) {
+            var group_cfg = cfg;
+            group_cfg.num_hidden_layers = @min(cpu_ple_group, cfg.num_hidden_layers - layer);
+            const slice = try cb.sliceRows2D(allocator, pw, layer * cfg.per_layer_input_dim, group_cfg.num_hidden_layers * cfg.per_layer_input_dim, cfg.hidden_size);
+            defer cb.free(slice);
+            packed_ple = try packedPerLayerInputs(cb, group_cfg, embeddings, slice, rows, false);
+            packed_first = layer;
+        }
         if (shared_frame and !whole_packed and packed_ple == null) {
             var group_cfg = cfg;
             group_cfg.num_hidden_layers = @min(group_layers, cfg.num_hidden_layers - layer);
@@ -926,16 +954,36 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
         if (owns_hidden) cb.free(hidden);
         hidden = next;
         owns_hidden = true;
+        if (cb.kind() == .native and packed_ple != null and (layer + 1 == cfg.num_hidden_layers or (layer + 1) % cpu_ple_group == 0)) {
+            cb.free(packed_ple.?);
+            packed_ple = null;
+        }
         if (shared_frame and (layer + 1) % group_layers == 0 and layer + 1 < cfg.num_hidden_layers) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            shared_frame = false;
-            if (!whole_packed) {
-                if (packed_ple) |tensor| cb.free(tensor);
-                packed_ple = null;
+            if (pipeline and !pending_frame) {
+                try cb.decoderRuntimeSubmitFrame();
+                shared_frame = false;
+                pending_frame = true;
+                if (!whole_packed) {
+                    pending_ple = packed_ple;
+                    packed_ple = null;
+                }
+            } else {
+                if (pending_frame) {
+                    try cb.decoderRuntimeWaitSubmittedFrame();
+                    pending_frame = false;
+                }
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                shared_frame = false;
+                if (!whole_packed) {
+                    if (packed_ple) |tensor| cb.free(tensor);
+                    packed_ple = null;
+                }
+                if (pending_ple) |tensor| cb.free(tensor);
+                pending_ple = null;
+                try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                frame_batch.deinit(cb);
+                frame_batch.count = 0;
             }
-            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
-            frame_batch.deinit(cb);
-            frame_batch.count = 0;
             try cb.checkExecutionControl();
             shared_frame = try cb.decoderRuntimeBeginFrame();
             if (!shared_frame) return error.EmbeddingGemma2OperationUnavailable;
@@ -949,6 +997,10 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     defer cb.free(projection);
     const result = if (dimensions) |dim| try poolProjectNormalize(cb, allocator, cfg, normalized, projection, mask, batch, seq, dim) else try cb.linearNoBias(normalized, projection, rows, cfg.hidden_size, cfg.embedding_dim);
     errdefer cb.free(result);
+    if (pending_frame) {
+        try cb.decoderRuntimeWaitSubmittedFrame();
+        pending_frame = false;
+    }
     if (shared_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         shared_frame = false;
@@ -1249,6 +1301,8 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
     const Cancel = struct {
         checks: usize = 0,
         cancel_at: usize,
+        pending_runtime: ?*@import("../backends/metal_runtime.zig").RawMetalDecodeRuntime = null,
+        saw_pending: bool = false,
         armed: bool = false,
         arms: usize = 0,
         disarms: usize = 0,
@@ -1256,6 +1310,12 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
         fn check(ctx: ?*anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.checks += 1;
+            if (comptime @import("build_options").enable_metal) {
+                if (self.pending_runtime) |runtime| if (@import("../backends/metal_runtime.zig").hasSubmittedFrame(runtime)) {
+                    self.saw_pending = true;
+                    return error.Cancelled;
+                };
+            }
             if (self.checks >= self.cancel_at) return error.Cancelled;
         }
 
@@ -1331,7 +1391,25 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
         defer padded_input.deinit();
         var padded_attention = try Tensor.initInt64(a, "attention_mask", &.{ 2, @intCast(padded_seq) }, padded_mask);
         defer padded_attention.deinit();
-        if (padded_seq == 256) for ([_]usize{ 9, 31 }) |cancel_at| {
+        if (comptime @import("build_options").enable_metal) {
+            if (metal and padded_seq == 257 and !env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_ENCODER")) {
+                var backend = try factory.getComputeBackend(session, a);
+                const compute: *const @import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(backend.ptr));
+                const runtime = compute.provider_impl.raw_decode_runtime;
+                backend.deinit();
+                var cancellation = Cancel{ .cancel_at = std.math.maxInt(usize), .pending_runtime = runtime };
+                try std.testing.expectError(error.Cancelled, session.runWithControl(&.{ padded_input, padded_attention }, a, .{
+                    .ptr = &cancellation,
+                    .check_fn = Cancel.check,
+                    .hard_cancellation = .{ .ptr = &cancellation, .arm_fn = Cancel.arm, .disarm_fn = Cancel.disarm },
+                }));
+                try std.testing.expect(cancellation.saw_pending);
+                try std.testing.expect(!cancellation.armed);
+                if (comptime @import("build_options").enable_metal) try std.testing.expect(!@import("../backends/metal_runtime.zig").hasSubmittedFrame(runtime));
+                std.debug.print("embeddinggemma2 submitted-frame cancellation rows=514 drained=true\n", .{});
+            }
+        }
+        for ([_]usize{ 9, 31 }) |cancel_at| {
             var cancellation = Cancel{ .cancel_at = cancel_at };
             try std.testing.expectError(error.Cancelled, session.runWithControl(&.{ padded_input, padded_attention }, a, .{
                 .ptr = &cancellation,
@@ -1341,8 +1419,8 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
             try std.testing.expectEqual(cancel_at, cancellation.checks);
             try std.testing.expect(!cancellation.armed);
             try std.testing.expectEqual(cancellation.arms, cancellation.disarms);
-            std.debug.print("embeddinggemma2 padded cancellation rows=512 metal={} checks={d}\n", .{ metal, cancellation.checks });
-        };
+            std.debug.print("embeddinggemma2 padded cancellation rows={d} metal={} checks={d}\n", .{ 2 * padded_seq, metal, cancellation.checks });
+        }
         const padded_outputs = try session.run(&.{ padded_input, padded_attention }, a);
         defer {
             for (padded_outputs) |*output| output.deinit();
@@ -1396,6 +1474,18 @@ fn checkPooledProjection(cb: ComputeBackend, _: ComputeBackend) !void {
     defer cb.free(input);
     const projection = try cb.fromFloat32Shape(&weights, &.{ 768, 4 });
     defer cb.free(projection);
+    if (cb.kind() == .metal) {
+        defer cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        defer if (cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {};
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        try std.testing.expectError(error.EmbeddingGemma2ExternalFrame, forwardCT(&cb, a, cfg, &.{0}, &.{1}, 1, 1));
+        try cb.decoderRuntimeSubmitFrame();
+        try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame());
+        try std.testing.expectError(error.EmbeddingGemma2ExternalFrame, forwardCT(&cb, a, cfg, &.{0}, &.{1}, 1, 1));
+        try std.testing.expectError(error.EmbeddingGemma2ExternalFrame, forwardEmbeddingsCT(&cb, a, cfg, input, &mask, 2, 3));
+        try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame());
+        try cb.decoderRuntimeWaitSubmittedFrame();
+    }
     for ([_]usize{ 128, 256, 512, 768 }) |dim| {
         var frame = false;
         if (cb.kind() == .metal) frame = try cb.decoderRuntimeBeginFrame();

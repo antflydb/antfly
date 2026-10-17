@@ -514,7 +514,11 @@ requires the pretrained/load qualification tools.
 Model execution uses named, model-owned packed vision QKV snapshots and fused
 normalization/2-D RoPE. Frame/window batches can cross the former 512-row
 backbone cutoff: packed per-layer input storage has a 64 MiB ceiling and larger
-backbones drain bounded layer groups, retiring activation views between groups.
+backbones use bounded pairs of layer groups, encoding a successor while its
+predecessor runs and retiring activation views after each pair drains. Both groups
+share the existing layer memory envelope; cancellation drains submitted work
+before releasing owners. CPU per-layer projections use retained weight-row views
+and bounded projection groups instead of copying each layer’s weight slice.
 Independent masks, positions and pooling remain per window. Shared admission,
 producer ownership and cancellation boundaries are unchanged. Cache admission
 failure retains bounded preparation; cache reclamation cannot invalidate active

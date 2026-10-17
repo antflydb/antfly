@@ -65399,7 +65399,12 @@ static void termite_metal_decode_runtime_clear_frame_resources(CFMutableArrayRef
 static void termite_metal_decode_runtime_finish_frame_scratch_releases(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL) return;
     for (size_t slot = 0; slot < TERMITE_METAL_SCRATCH_POOL_CAPACITY; ++slot) {
-        if (runtime->scratch_pool_pending_frame_release[slot] == 0) continue;
+        const uint8_t owner = runtime->scratch_pool_pending_frame_release[slot];
+        if (owner == 0) continue;
+        // 1 belongs to the encoding frame, 2 to its submitted predecessor.
+        // Waiting for the predecessor must not recycle successor scratch.
+        if (owner == 1 && runtime->active_frame_cb != nil) continue;
+        if (owner == 2 && runtime->submitted_frame_cb != nil) continue;
         runtime->scratch_pool_pending_frame_release[slot] = 0;
         runtime->scratch_pool_in_use[slot] = 0;
     }
@@ -65604,6 +65609,10 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     runtime->last_frame_encode_cpu_nanos = encode_cpu_nanos;
     runtime->active_frame_encode_started_nanos = 0;
     runtime->active_frame_encode_wait_nanos = 0;
+    for (size_t slot = 0; slot < TERMITE_METAL_SCRATCH_POOL_CAPACITY; ++slot) {
+        if (runtime->scratch_pool_pending_frame_release[slot] == 1)
+            runtime->scratch_pool_pending_frame_release[slot] = 2;
+    }
     [cb commit];
     runtime->frame_submit_count = termite_metal_u64_saturating_add(runtime->frame_submit_count, 1);
     runtime->submitted_frame_cb = cb;
@@ -67158,7 +67167,7 @@ void termite_metal_decode_runtime_release_scratch(
     for (size_t slot = 0; slot < TERMITE_METAL_SCRATCH_POOL_CAPACITY; ++slot) {
         if (runtime->scratch_pool_buffers[slot] == buffer) {
             if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) {
-                runtime->scratch_pool_pending_frame_release[slot] = 1;
+                runtime->scratch_pool_pending_frame_release[slot] = runtime->active_frame_cb != nil ? 1 : 2;
                 runtime->scratch_pool_in_use[slot] = 1;
             } else {
                 runtime->scratch_pool_pending_frame_release[slot] = 0;
