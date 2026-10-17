@@ -32,6 +32,25 @@ extern fn antfly_nvdec_close(*anyopaque) void;
 extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int) c_int;
 extern fn antfly_nvdec_finish(*anyopaque) void;
 
+extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
+
+fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32) callconv(.c) c_int {
+    const ctx: *context.CudaContext = @ptrCast(@alignCast(raw));
+    const bytes = @import("video_cache_budget.zig").envelope(width, height, surfaces) catch |err| {
+        ctx.video_cache_budget.failure = err;
+        return 0;
+    };
+    ctx.video_cache_budget.reserve(&ctx.device_allocations, bytes) catch |err| {
+        ctx.video_cache_budget.failure = err;
+        return 0;
+    };
+    return 1;
+}
+fn releaseDecoder(raw: *anyopaque) callconv(.c) void {
+    const ctx: *context.CudaContext = @ptrCast(@alignCast(raw));
+    ctx.video_cache_budget.release();
+}
+
 pub const max_frames = 60;
 pub const max_duration_us = 60_000_000;
 pub const Frame = struct {
@@ -116,6 +135,11 @@ const DecodeState = struct {
     embedding_sampler: ?EmbeddingSampler = null,
     stats: Stats = .{},
     failure: ?anyerror = null,
+    fn checkStatus(self: *DecodeState, status: c_int) !void {
+        if (self.failure) |err| return err;
+        if (self.ctx.video_cache_budget.failure) |err| return err;
+        try checkStatusCode(status);
+    }
     fn callback(user_data: *anyopaque, device: u64, pitch: u32, width: u32, height: u32, pts: i64, matrix: u32, full_range: u32) callconv(.c) c_int {
         const self: *@This() = @ptrCast(@alignCast(user_data));
         if (self.failure != null) return -1;
@@ -148,7 +172,7 @@ const DecodeState = struct {
     }
 };
 
-fn checkStatus(status: c_int) !void {
+fn checkStatusCode(status: c_int) !void {
     return switch (status) {
         0 => {},
         1 => error.NvdecUnavailable,
@@ -166,6 +190,7 @@ pub fn decodeMp4(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes:
 pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, consumer: Consumer, sampling: Sampling) !Stats {
     if (!build_options.enable_cuda or builtin.os.tag != .linux) return error.UnsupportedVideoBackend;
     if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
+    ctx.video_cache_budget.failure = null;
     var state = DecodeState{ .ctx = ctx, .consumer = consumer };
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = .{ .context = &state, .check_fn = sourceCheck } };
     var reader = try media.mp4.Reader.init(allocator, &source, .{ .max_samples = 18_000, .max_dimension = 4096 });
@@ -194,10 +219,11 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     }
     try ctx.makeCurrent();
     if (ctx.video_decoder_cache == null) {
-        try checkStatus(antfly_nvdec_open(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback));
+        try state.checkStatus(antfly_nvdec_open(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback));
         ctx.video_decoder_release = antfly_nvdec_close;
     }
     const decoder = ctx.video_decoder_cache;
+    antfly_nvdec_set_budget(decoder.?, ctx, reserveDecoder, releaseDecoder);
     var succeeded = false;
     defer {
         if (succeeded) antfly_nvdec_finish(decoder.?) else {
@@ -205,11 +231,11 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
             ctx.video_decoder_cache = null;
         }
     }
-    try checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, color.matrix, color.range));
+    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, color.matrix, color.range));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
     try avccHeaders(allocator, &annex, track.avcc);
-    try checkStatus(antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), 0, 0));
+    try state.checkStatus(antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), 0, 0));
     for (reader.packets, 0..) |packet, index| {
         try source.control.check();
         var lease = try reader.readPacket(index);
@@ -219,12 +245,12 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         const pts = try timestampUs(packet.pts, track.timescale);
         const result = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), pts, 0);
         if (state.failure) |err| return err;
-        try checkStatus(result);
+        try state.checkStatus(result);
         state.stats.compressed_bytes += lease.bytes.len;
     }
     const result = antfly_nvdec_packet(decoder.?, null, 0, 0, 1);
     if (state.failure) |err| return err;
-    try checkStatus(result);
+    try state.checkStatus(result);
     if (state.stats.selected_frames == 0) return error.EmptyVideo;
     if (state.embedding_sampler) |sampler| if (sampler.next != sampler.length) return error.VideoDecodeFailed;
     succeeded = true;
@@ -875,4 +901,8 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
             };
         }
     };
+}
+
+test {
+    _ = @import("video_cache_budget.zig");
 }

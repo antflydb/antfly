@@ -98,13 +98,16 @@ The native endpoint allows up to 64 groups, with 1–64 parts each. Existing exe
 aggregate media budgets can impose lower limits. `error_policy: "per_item"`
 returns valid groups with their original indexes and errors for invalid groups.
 
-The embedding response includes `model_identity`, a backend-independent SHA256
-identity for the exact config, weights, tokenizer, processor, SentenceTransformers
-sidecars and `embeddinggemma2-f32-mean-v6-webm-presentation` recipe. This identity
-currently does not distinguish CUDA BF16 execution from CPU/Metal F32 execution;
-it is an artifact/recipe pin rather than evidence of cross-precision parity. Supply that value as request
+The embedding response includes `model_identity`, a SHA256 identity for the exact
+config, weights, tokenizer, processor, SentenceTransformers sidecars and execution
+recipe. CPU and Metal preserve the existing
+`embeddinggemma2-f32-mean-v6-webm-presentation` identity. CUDA derives a separate
+identity from that artifact identity and `embeddinggemma2-cuda-bf16-mean-v1`.
+A pinned F32 identity therefore rejects CUDA BF16 execution, including backend
+fallbacks that cross precision recipes. Supply the returned value as request
 `model_identity` to reject a mismatched generation before encoding. Loaded
-artifacts are checked for changes before and after execution.
+artifacts are checked for changes before and after execution. Identity separation
+is not evidence of numerical parity; CUDA still requires hardware qualification.
 
 The linked provider exposes `embedDenseGroupsDirectWithControl` and uses the same
 validation, media policy, model pinning and admission. CLI examples:
@@ -1072,3 +1075,29 @@ Native CPU, Metal and actually executed Linux ARM64 preserve all rankings and
 top-k sets, with maximum coordinate error below `1e-6`. This includes two
 attributed real VP9/AV1 clips. WebM duration comes from the declared Segment
 Duration when present, preserving pinned FPS sampling at rounded PTS boundaries.
+
+### CUDA BF16 qualification
+
+Use `zig/pkg/inference/scripts/embeddinggemma2/compare.py` with the same pinned
+checkpoint and prepared suite for both runs. `--backend torch-cuda` loads BF16
+weights/activations, casts floating media inputs to BF16 and pools/normalizes in
+F32. `--backend cuda --binary <cuda-binary>` runs the native HTTP pipeline and
+requires CUDA rather than allowing fallback. Both reports declare `bfloat16`;
+CPU/Metal reports remain `float32`, and comparisons reject precision mismatches.
+For example, from `zig/pkg/inference` in the pinned reference environment:
+
+```sh
+python scripts/embeddinggemma2/compare.py --backend torch-cuda \
+  --model-dir "$MODEL" --suite "$SUITE" --output torch-cuda.json
+python scripts/embeddinggemma2/compare.py --backend cuda --binary "$BINARY" \
+  --model-dir "$MODEL" --suite "$SUITE" --reference torch-cuda.json --output cuda.json
+```
+
+The CUDA reference synchronizes completed device work and records device/runtime,
+allocated/reserved memory and their peaks. HTTP timing includes serialization and
+preprocessing, so compare its scope with the reference's preprocessing-inclusive
+measurement rather than treating encoder time as end-to-end time. The existing
+strict vector, ranking and routing gates remain in force. CUDA encoder-only
+benchmark mode is rejected until its measurement contract is implemented.
+Reports remain `production_qualified: false`; executing this harness on NVIDIA
+hardware and retaining its matched results is required before asserting parity.

@@ -1161,12 +1161,18 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     if (!cfg.vision) return error.NoVisionSession;
     const effective = control orelse Control{};
     try effective.check();
-    var permit = try session.admit(.{ .batch = 1, .sequence = @min(options.max_tokens, 4546), .input_bytes = bytes.len, .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = options.dimensions * @sizeOf(f32) });
-    defer permit.deinit();
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
+    const request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = @min(options.max_tokens, 4546), .input_bytes = bytes.len, .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = options.dimensions * @sizeOf(f32) };
+    var permit = session.admit(request) catch |err| reclaim: {
+        if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
+        if (try compute.ctx.evictVideoDecoder() == 0) return err;
+        break :reclaim try session.admit(request);
+    };
+    defer permit.deinit();
     const cb = &managed.backend;
     const scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
     defer scope.deinit();
@@ -1207,7 +1213,6 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     defer video_input.deinit(a, cb);
     if (options.timings) |t| t.pack_ns += mediaNow() - pack_started;
     const encoder_started = mediaNow();
-    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
     const vector = try compute.runEmbeddingGemma2(a, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, .{ .resident_embeddings = video_input.embeddings }, video_input.mask, 1, length, options.dimensions, cb.execution_control);
     errdefer a.free(vector);
     if (options.timings) |t| t.encoder_ns += mediaNow() - encoder_started;
@@ -3473,4 +3478,8 @@ test "embeddinggemma2 mixed preparation drains cancellation partial errors and d
     denied.join();
     try std.testing.expectEqual(error.MemoryBudgetExceeded, denied.failure.?);
     denied.deinit();
+}
+
+test "embeddinggemma2 NVDEC cache admission policy is linked on portable hosts" {
+    _ = @import("../ops/cuda/video_cache_budget.zig");
 }

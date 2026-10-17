@@ -90,6 +90,7 @@ pub const CudaContext = struct {
     // the decoder survives successful clips with compatible geometry.
     video_decoder_cache: ?*anyopaque = null,
     video_decoder_release: ?*const fn (*anyopaque) callconv(.c) void = null,
+    video_cache_budget: @import("video_cache_budget.zig").CacheBudget = .{},
     stats: RuntimeStats = .{},
     device_allocations: @import("allocation_budget.zig").Budget = .{},
     debug_graph_capture_active: bool = false,
@@ -135,6 +136,25 @@ pub const CudaContext = struct {
             .stream = stream,
             .info = info,
         };
+    }
+
+    /// Called under the session execution lock. Keep cache admission attached
+    /// to its original controller until the physical decoder has been evicted.
+    pub fn configureVideoAdmission(self: *CudaContext, admission: ?@import("video_cache_budget.zig").Admission) !void {
+        if (!std.meta.eql(self.video_cache_budget.admission, admission)) {
+            _ = try self.evictVideoDecoder();
+            self.video_cache_budget.admission = admission;
+        }
+    }
+
+    pub fn evictVideoDecoder(self: *CudaContext) !usize {
+        const decoder = self.video_decoder_cache orelse return 0;
+        try self.makeCurrent();
+        try self.synchronize();
+        const bytes = self.video_cache_budget.bytes;
+        self.video_decoder_release.?(decoder);
+        self.video_decoder_cache = null;
+        return bytes;
     }
 
     pub fn deinit(self: *CudaContext) void {

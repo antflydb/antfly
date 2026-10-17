@@ -383,3 +383,11 @@ indexes stay portable. WebM header indexes now carry packet bindings, codec
 configuration and colour metadata so VideoToolbox and Zig replay use the same
 logical selections. Apple release artifacts declare a macOS 15 deployment target;
 framework SDK availability does not imply a hardware decoder for every stream.
+
+CUDA video decoder caches retain their own shared backend scratch lease across
+request completion. Per-request media/model permits do not cover this retained
+state. Allocation is admitted before decoder creation, and eviction/destruction
+releases both the context and shared reservations. See
+[VIDEO.md](../video/VIDEO.md#cuda-decoder-cache-accounting) for the bounded surface
+envelope and NVIDIA hardware qualification requirement. Embedding identity pins
+also distinguish CUDA BF16 execution from the existing CPU/Metal F32 recipe.

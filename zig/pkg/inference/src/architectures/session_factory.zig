@@ -8593,11 +8593,23 @@ pub fn runFlorenceDecoderResident(
 }
 
 /// Get a ComputeBackend from an architecture session.
+fn bindCudaVideoAdmission(session: Session, cb: *const ops.ComputeBackend) !void {
+    if (comptime !build_options.enable_cuda) return;
+    if (cb.kind() != .cuda) return;
+    const compute: *cuda_compute_mod.CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    try compute.ctx.configureVideoAdmission(if (session.run_admission) |admission| .{
+        .controller = admission.controller,
+        .limits = admission.limits,
+        .check_live_memory = admission.check_live_memory,
+    } else null);
+}
+
 pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     var cb = try makeComputeBackend(self, allocator, null);
     errdefer cb.deinit();
+    try bindCudaVideoAdmission(session, &cb);
     try cb.beginRequest();
     return cb;
 }
@@ -9162,6 +9174,7 @@ pub fn getComputeBackendWithBudget(
     // unconditional request boundary here, before prompt-cache selection can
     // bypass KV-hook provisioning, so no graph or pinned-address ABI survives
     // from the preceding request.
+    try bindCudaVideoAdmission(session, &cb);
     try cb.beginRequest();
     return cb;
 }

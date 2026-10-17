@@ -7691,7 +7691,10 @@ pub const ModelManager = struct {
             },
         }
         const identity = if (man.embedding_style == .embedding_gemma2)
-            (try @import("../models/embedding_gemma2_identity.zig").snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control)).digest
+            @import("../models/embedding_gemma2_identity.zig").forBackend(
+                (try @import("../models/embedding_gemma2_identity.zig").snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control)).digest,
+                embeddingPlanningBackend(self.session_manager),
+            )
         else
             std.fmt.bytesToHex(revision, .lower);
         if (lease) |*active| try active.retain(plan.resident);
@@ -7989,7 +7992,7 @@ pub const ModelManager = struct {
         model.* = .{
             .chunk_planning = try chunkPlanningSnapshot(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision),
             .resolution_revision = resolution_revision,
-            .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
+            .embedding_identity = if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
             .manifest = man,
             .hf_tok = hf_tok,
@@ -14013,4 +14016,26 @@ test "memory admission diagnostics retain pressure and recover after release" {
     // The last denial remains observable after recovery; its timestamp/count
     // distinguish it from the current request and survive DB snapshot refresh.
     try std.testing.expectEqual(denied.denied_count, manager.memoryAdmissionDiagnostic().denied_count);
+}
+
+/// Planning does not construct a device. Execution validates its actual identity
+/// after selection, including when a preferred accelerator falls back to CPU.
+fn embeddingPlanningBackend(manager: backends.SessionManager) backends.BackendType {
+    if (manager.required_backend) |backend| return backend;
+    for (manager.preferred_backends) |backend| {
+        if (!backend.available()) continue;
+        if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
+        if (backend == .cuda or backend == .metal or backend == .native) return backend;
+    }
+    return .native;
+}
+
+test "embeddinggemma2 planning precision follows required backend before preferences" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = &.{ .cuda, .native };
+    try std.testing.expectEqual(if (backends.BackendType.cuda.available()) backends.BackendType.cuda else backends.BackendType.native, embeddingPlanningBackend(manager));
+    manager.required_backend = .metal;
+    try std.testing.expectEqual(backends.BackendType.metal, embeddingPlanningBackend(manager));
+    manager.required_backend = .native;
+    try std.testing.expectEqual(backends.BackendType.native, embeddingPlanningBackend(manager));
 }

@@ -18,6 +18,16 @@
 
 static unsigned creates, destroys, maps, unmaps, consumes;
 static int selection = 1, consume_result = 1;
+static unsigned reservations, releases, live_budgets;
+static int admit_decoder = 1, fail_create = 0;
+static int fake_reserve(void *user, unsigned width, unsigned height, unsigned surfaces) {
+    (void)user; assert(width && height && surfaces);
+    if (!admit_decoder) return 0;
+    reservations++; live_budgets++; return 1;
+}
+static void fake_release(void *user) {
+    (void)user; assert(live_budgets); live_budgets--; releases++;
+}
 static CUresult CUDAAPI fake_caps(CUVIDDECODECAPS *c) {
     c->bIsSupported = 1; c->nOutputFormatMask = 1;
     c->nMinWidth = c->nMinHeight = 48;
@@ -26,6 +36,7 @@ static CUresult CUDAAPI fake_caps(CUVIDDECODECAPS *c) {
 }
 static CUresult CUDAAPI fake_create(CUvideodecoder *out, CUVIDDECODECREATEINFO *c) {
     assert(c->ulNumDecodeSurfaces <= 32 && c->ulNumOutputSurfaces == 1);
+    if (fail_create) return (CUresult)2; // simulated allocation failure
     *out = (CUvideodecoder)(uintptr_t)1; creates++; return CUDA_SUCCESS;
 }
 static CUresult CUDAAPI fake_destroy(CUvideodecoder decoder) {
@@ -63,6 +74,7 @@ static Decoder decoder(void) {
     Decoder d = {0};
     d.expected_width = 160; d.expected_height = 96;
     d.matrix_override = d.range_override = -1;
+    d.reserve_budget = fake_reserve; d.release_budget = fake_release;
     d.caps = fake_caps; d.create_decoder = fake_create; d.destroy_decoder = fake_destroy;
     d.map = fake_map; d.unmap = fake_unmap; d.status = fake_status; d.frame = fake_frame;
     return d;
@@ -72,7 +84,7 @@ int main(void) {
     assert(sequence(&d, &f) == 4 && creates == 1);
     assert(sequence(&d, &f) == 4 && creates == 1);
     d.sequence_seen = 0;
-    assert(sequence(&d, &f) == 4 && creates == 1); // next compatible clip
+    assert(sequence(&d, &f) == 4 && creates == 1 && reservations == 1); // compatible clips retain one lease
     f.min_num_decode_surfaces = 5;
     assert(sequence(&d, &f) == 0 && d.failed == 2); // midclip change
     d.sequence_seen = 0; d.failed = 0;
@@ -86,7 +98,24 @@ int main(void) {
     assert(display(&d, &picture) == 0 && d.failed == 4 && maps == 2 && unmaps == 2);
     picture.progressive_frame = 0;
     assert(display(&d, &picture) == 0 && d.failed == 2 && maps == 2);
-    fake_destroy(d.decoder);
+    fake_destroy(d.decoder); release_budget(&d);
+    assert(reservations == 2 && releases == 2 && live_budgets == 0);
+    // Capacity denial must happen before decoder allocation.
+    d = decoder(); f = format(); admit_decoder = 0;
+    assert(sequence(&d, &f) == 0 && d.failed == 6 && creates == 2 && !live_budgets);
+    admit_decoder = 1; fail_create = 1; d = decoder();
+    assert(sequence(&d, &f) == 0 && d.failed == 3 && !live_budgets);
+    fail_create = 0;
+    assert(reservations == releases);
+    // Teardown releases a retained decoder even without a live request/parser.
+    Decoder *cached = malloc(sizeof(*cached)); assert(cached);
+    *cached = decoder();
+    assert(sequence(cached, &f) == 4 && live_budgets == 1);
+    antfly_nvdec_close(cached);
+    assert(!live_budgets && reservations == releases);
+    d = decoder(); d.reserve_budget = NULL;
+    assert(sequence(&d, &f) == 0 && d.failed == 6 && !live_budgets);
+
     for (unsigned i = 0; i < 9; i++) {
         d = decoder(); f = format();
         switch (i) {

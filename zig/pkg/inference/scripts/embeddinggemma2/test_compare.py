@@ -195,5 +195,34 @@ class ComparisonContracts(unittest.TestCase):
                 compare.compare_reference(bad, expected)
 
 
+class PrecisionTests(unittest.TestCase):
+    def test_bf16_reference_requires_declared_pooling(self):
+        result = {
+            "suite_sha256": "suite",
+            "checkpoint_receipt_sha256": "weights",
+            "precision": "bfloat16",
+            "status": "pass",
+            "cases": {},
+            "measurement_mode": "encoder",
+            "decision": {"status": "not_run"},
+        }
+        with self.assertRaisesRegex(ValueError, "F32 pooling"):
+            compare.compare_reference(result, result)
+        result["pooling_precision"] = "float32"
+        self.assertEqual(
+            compare.compare_reference(result, result)["decision_status"], "not_run"
+        )
+
+    def test_backend_precision_is_explicit_and_cannot_cross_recipes(self):
+        for backend in ("cuda", "torch-cuda"):
+            self.assertEqual(compare.execution_precision(backend), "bfloat16")
+            with self.assertRaises(ValueError):
+                compare.execution_precision(backend, "float32")
+        for backend in ("native", "metal", "cpu", "mps"):
+            self.assertEqual(compare.execution_precision(backend), "float32")
+            with self.assertRaises(ValueError):
+                compare.execution_precision(backend, "bfloat16")
+
+
 if __name__ == "__main__":
     unittest.main()

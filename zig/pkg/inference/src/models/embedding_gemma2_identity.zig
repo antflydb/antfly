@@ -20,6 +20,19 @@ const file = @import("../util/c_file.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const receipt = @import("../registry/managed_receipt.zig");
 pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
+/// CUDA also uses BF16-specific token scaling and media preparation. Version
+/// this complete execution recipe independently of the qualified F32 route.
+pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v1";
+
+pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
+    if (backend != .cuda) return artifact_identity;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(cuda_recipe);
+    hash.update(&.{0});
+    hash.update(&artifact_identity);
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
 pub const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
 pub const Snapshot = struct { digest: [64]u8, signature: [32]u8 };
 
@@ -201,4 +214,14 @@ test "embeddinggemma2 video processor sampling and token budgets fail closed" {
         try std.testing.expectError(error.InvalidEmbeddingGemma2Processor, validateProcessor(a, changed));
         value.* = original;
     }
+}
+
+test "embeddinggemma2 precision identities preserve F32 pins and isolate CUDA recipes" {
+    const artifacts = fromDigests(@splat(@splat(7)));
+    try std.testing.expectEqual(artifacts, forBackend(artifacts, .native));
+    try std.testing.expectEqual(artifacts, forBackend(artifacts, .metal));
+    const cuda = forBackend(artifacts, .cuda);
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &cuda));
+    try std.testing.expectEqual(cuda, forBackend(artifacts, .cuda));
+    try std.testing.expect(!std.mem.eql(u8, &cuda, &forBackend(fromDigests(@splat(@splat(8))), .cuda)));
 }

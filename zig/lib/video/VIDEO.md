@@ -526,3 +526,22 @@ failure retains bounded preparation; cache reclamation cannot invalidate active
 CPU borrowers or Metal commands. These mechanisms establish reuse and bounded
 lifetimes; speed comparisons require the pinned per-case performance gate in
 [the model guide](../../../docs/guides/embeddinggemma2.md#per-case-performance-gate).
+
+### CUDA decoder cache accounting
+
+Each cached NVDEC decoder owns its admission lease independently of the request
+that created it. Sequence negotiation reserves both the context's physical device
+budget and shared backend scratch admission before driver allocation. Compatible
+clips reuse the same reservation; resize, failed creation, error cleanup, eviction
+and context teardown release it after decoder destruction. Changing admission
+controllers first evicts the old decoder under the session execution lock. Video
+requests denied admission evict their idle decoder and retry admission once.
+
+NVDEC does not report an exact allocation size. The policy reserves 64 MiB of
+opaque driver headroom plus twice the aligned NV12 payload for decode surfaces,
+one mapped output and one working surface. Width is aligned to 256 bytes and
+height to 32 rows, with at most 4096 by 4096 pixels and 32 decode surfaces. This
+is a conservative policy envelope, not measured driver memory. NVIDIA hardware
+qualification must check that envelope against completed-driver memory deltas.
+See NVIDIA's [NVDEC programming guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/nvdec-video-decoder-api-prog-guide/index.html)
+for decode/output surface allocation behavior.

@@ -23,8 +23,14 @@
 // It must finish reading before returning. No pixels ever cross the host ABI.
 typedef int (*frame_callback)(void *, uint64_t, unsigned, unsigned, unsigned,
                              int64_t, unsigned, unsigned);
+typedef int (*reserve_decoder)(void *, unsigned, unsigned, unsigned);
+typedef void (*release_decoder)(void *);
 typedef struct {
     void *library, *user;
+    void *budget_user;
+    reserve_decoder reserve_budget;
+    release_decoder release_budget;
+    int budget_live;
     CUvideoparser parser;
     CUvideodecoder decoder;
     CUstream stream;
@@ -44,6 +50,16 @@ typedef struct {
     tcuvidMapVideoFrame64 *map;
     tcuvidUnmapVideoFrame64 *unmap;
 } Decoder;
+
+static void release_budget(Decoder *d) {
+    if (d->budget_live) {
+        d->release_budget(d->budget_user);
+        d->budget_live = 0;
+    }
+}
+void antfly_nvdec_set_budget(Decoder *d, void *user, reserve_decoder reserve, release_decoder release) {
+    d->budget_user = user; d->reserve_budget = reserve; d->release_budget = release;
+}
 
 static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     Decoder *d = opaque;
@@ -84,7 +100,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
         d->matrix = matrix; d->full_range = full_range;
         return d->surfaces;
     }
-    if (d->decoder) { d->destroy_decoder(d->decoder); d->decoder = NULL; }
+    if (d->decoder) { d->destroy_decoder(d->decoder); d->decoder = NULL; release_budget(d); }
     CUVIDDECODECAPS caps = {0};
     caps.eCodecType = f->codec; caps.eChromaFormat = f->chroma_format;
     if (d->caps(&caps) || !caps.bIsSupported || !(caps.nOutputFormatMask & 1) ||
@@ -103,7 +119,12 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     c.ulTargetWidth = w; c.ulTargetHeight = h; c.ulNumOutputSurfaces = 1;
     c.display_area.left = f->display_area.left; c.display_area.top = f->display_area.top;
     c.display_area.right = f->display_area.right; c.display_area.bottom = f->display_area.bottom;
-    if (d->create_decoder(&d->decoder, &c)) { d->failed = 3; return 0; }
+    if (!d->reserve_budget || !d->release_budget ||
+        !d->reserve_budget(d->budget_user, f->coded_width, f->coded_height, c.ulNumDecodeSurfaces)) {
+        d->failed = 6; return 0;
+    }
+    d->budget_live = 1;
+    if (d->create_decoder(&d->decoder, &c)) { release_budget(d); d->failed = 3; return 0; }
     d->width = w; d->height = h; d->coded_width = f->coded_width; d->coded_height = f->coded_height;
     d->matrix = matrix; d->full_range = full_range;
     d->display_left = f->display_area.left; d->display_top = f->display_area.top;
@@ -142,6 +163,7 @@ void antfly_nvdec_close(Decoder *d) {
     if (!d) return;
     if (d->parser) d->destroy_parser(d->parser);
     if (d->decoder) d->destroy_decoder(d->decoder);
+    release_budget(d);
     if (d->library) dlclose(d->library);
     free(d);
 }
