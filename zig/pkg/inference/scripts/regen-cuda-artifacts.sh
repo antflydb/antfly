@@ -192,12 +192,15 @@ else
   cuobjdump="$(command -v cuobjdump || true)"
 fi
 
-tmp_ptx="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.ptx")"
-tmp_fatbin="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.fatbin")"
-tmp_sm89="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.sm89.cubin")"
-trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"' EXIT
+tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX")"
+tmp_ptx="$tmp_root/kernels.ptx"
+tmp_fatbin="$tmp_root/kernels.fatbin"
+tmp_sm89="$tmp_root/kernels.sm89.cubin"
+trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"; rmdir "$tmp_root"' EXIT
 
 required_symbols=(
+  termite_embedding_gemma2_split_columns_bf16
+  termite_embedding_gemma2_vision_rope_pack_bf16
   termite_embedding_gemma2_lookup_bf16
   termite_embedding_gemma2_pillow_horizontal_rgb8
   termite_embedding_gemma2_pillow_vertical_patches_f32

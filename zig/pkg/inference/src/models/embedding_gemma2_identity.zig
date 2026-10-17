@@ -26,8 +26,16 @@ pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v1";
 
 pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
     if (backend != .cuda) return artifact_identity;
+    return forCudaPolicy(artifact_identity, @import("../ops/cuda/embedding_gemma2_policy.zig").configured());
+}
+
+pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/embedding_gemma2_policy.zig").Policy) [64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(cuda_recipe);
+    if (policy.arithmeticBits() != 0) {
+        hash.update("\x00optimized-v1");
+        hash.update(&.{policy.arithmeticBits()});
+    }
     hash.update(&.{0});
     hash.update(&artifact_identity);
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
@@ -224,4 +232,11 @@ test "embeddinggemma2 precision identities preserve F32 pins and isolate CUDA re
     try std.testing.expect(!std.mem.eql(u8, &artifacts, &cuda));
     try std.testing.expectEqual(cuda, forBackend(artifacts, .cuda));
     try std.testing.expect(!std.mem.eql(u8, &cuda, &forBackend(fromDigests(@splat(@splat(8))), .cuda)));
+}
+
+test "embeddinggemma2 CUDA optimized identities isolate every arithmetic profile" {
+    const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
+    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true } };
+    const artifacts = fromDigests(@splat(@splat(7)));
+    for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(!std.mem.eql(u8, &forCudaPolicy(artifacts, left), &forCudaPolicy(artifacts, right)));
 }

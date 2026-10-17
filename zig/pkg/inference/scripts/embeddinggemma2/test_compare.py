@@ -195,6 +195,23 @@ class ComparisonContracts(unittest.TestCase):
                 compare.compare_reference(bad, expected)
 
 
+class CudaRouteTests(unittest.TestCase):
+    def test_qualification_requires_executed_routes(self):
+        routes = compare.cuda_routes(
+            "extended_flash_launches_total=3 extended_flash_launches_total=9 embedding_graph_replays_total=4"
+        )
+        self.assertEqual(routes["extended_flash"], 9)
+        compare.require_cuda_routes(routes, ["extended_flash", "graph_replay"])
+        with self.assertRaisesRegex(ValueError, "fused_vision"):
+            compare.require_cuda_routes(routes, ["fused_vision"])
+        self.assertEqual(
+            compare.cuda_routes("extended_flash_launches_total=9garbage")[
+                "extended_flash"
+            ],
+            0,
+        )
+
+
 class PrecisionTests(unittest.TestCase):
     def test_bf16_reference_requires_declared_pooling(self):
         result = {

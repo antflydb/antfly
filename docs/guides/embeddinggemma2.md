@@ -1101,3 +1101,9 @@ strict vector, ranking and routing gates remain in force. CUDA encoder-only
 benchmark mode is rejected until its measurement contract is implemented.
 Reports remain `production_qualified: false`; executing this harness on NVIDIA
 hardware and retaining its matched results is required before asserting parity.
+
+Optional CUDA attention, projection, vision and graph profiles carry distinct
+identity pins and remain subject to matched BF16 qualification. See the repository
+`zig/pkg/inference/CUDA_TUNING.md` for profile controls, retained memory limits and
+route-evidence gates. Mixed CUDA inputs compose their ordered text/media rows on
+device; repeated video samples reuse projection while preserving logical slots.

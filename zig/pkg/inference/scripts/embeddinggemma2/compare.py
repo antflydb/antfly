@@ -433,6 +433,8 @@ def native(args, suite, result):
         endpoint.bind(("127.0.0.1", 0))
         port = endpoint.getsockname()[1]
     env = dict(os.environ, ANTFLY_INFERENCE_REQUIRED_BACKEND=args.backend)
+    if args.backend == "cuda":
+        env["ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS"] = "1"
     log_path = args.output.with_suffix(".server.log")
     url = f"http://127.0.0.1:{port}"
     with log_path.open("w") as log:
@@ -600,6 +602,33 @@ def native(args, suite, result):
     if f"selected backend {args.backend} " not in text:
         raise ValueError("required backend was not confirmed by server log")
     result["server_log_sha256"] = reference.sha256(log_path)
+    if args.backend == "cuda":
+        result["cuda_routes"] = cuda_routes(text)
+        require_cuda_routes(result["cuda_routes"], getattr(args, "require_route", []))
+
+
+CUDA_ROUTES = {
+    "extended_flash": "extended_flash_launches_total",
+    "fused_vision": "fused_vision_launches_total",
+    "packed_projections": "packed_projection_launches_total",
+    "graph_replay": "embedding_graph_replays_total",
+    "batched_vision": "vision_batched_executes_total",
+}
+
+
+def cuda_routes(text):
+    return {
+        route: max(
+            [int(value) for value in re.findall(rf"\b{counter}=(\d+)\b", text)] or [0]
+        )
+        for route, counter in CUDA_ROUTES.items()
+    }
+
+
+def require_cuda_routes(routes, required):
+    missing = [route for route in required if routes.get(route, 0) == 0]
+    if missing:
+        raise ValueError(f"CUDA routes were not observed: {', '.join(missing)}")
 
 
 def execution_precision(backend, requested=None):
@@ -860,6 +889,9 @@ def main():
     parser.add_argument(
         "--timing-mode", choices=["default", "encoder"], default="default"
     )
+    parser.add_argument(
+        "--require-route", action="append", choices=list(CUDA_ROUTES), default=[]
+    )
     parser.add_argument("--precision", choices=["float32", "bfloat16"])
     parser.add_argument("--max-vector-error", type=float, default=1e-4)
     parser.add_argument("--process-memory-budget-mb", type=int, default=8192)
@@ -881,6 +913,8 @@ def main():
         args.precision = execution_precision(args.backend, args.precision)
     except ValueError as error:
         parser.error(str(error))
+    if args.require_route and args.backend != "cuda":
+        parser.error("--require-route requires native CUDA HTTP execution")
     if args.backend == "cuda" and args.timing_mode == "encoder":
         parser.error(
             "CUDA uses completed HTTP pipeline timing; encoder timing is CPU/Metal only"
@@ -907,7 +941,11 @@ def main():
             key: value
             for key, value in os.environ.items()
             if key.startswith(
-                ("ANTFLY_EMBEDDINGGEMMA2_", "TERMITE_METAL_EMBEDDINGGEMMA2_")
+                (
+                    "ANTFLY_EMBEDDINGGEMMA2_",
+                    "TERMITE_METAL_EMBEDDINGGEMMA2_",
+                    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_",
+                )
             )
         },
         "vm_counter_order": ["pageouts", "swapins", "swapouts"],

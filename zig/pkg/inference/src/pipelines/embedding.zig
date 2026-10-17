@@ -20,6 +20,7 @@
 // backend Session (ONNX, native).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const antfly_image = @import("antfly_image");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
@@ -613,6 +614,28 @@ pub const EmbeddingPipeline = struct {
         const preprocessing_bytes = @max(128 * 1024 * 1024, self.config.max_audio_decode_working_bytes);
         var preprocess_permit = try self.session.admitHostPreprocess(std.math.add(usize, input_bytes, preprocessing_bytes) catch return error.ResourceLimitExceeded);
         defer preprocess_permit.deinit();
+        if (comptime build_options.enable_cuda) {
+            if (self.session.backend() == .cuda) {
+                try self.lockExecution();
+                defer self.unlockExecution();
+                var managed = try session_factory.getComputeBackendWithControl(self.session, allocator, self.execution_control);
+                defer managed.deinit();
+                const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
+                const request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = self.config.max_length, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = 768 * 4 };
+                var permit = self.session.admit(request) catch |err| retry: {
+                    if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
+                    try compute.evictEmbeddingGemma2Caches();
+                    break :retry try self.session.admit(request);
+                };
+                defer permit.deinit();
+                var prepared = try gemma2_content.prepareResident(&managed.backend, allocator, self.tok, self.config.text_prefix, parts, self.config.max_length, self.config.max_audio_decode_working_bytes, self.execution_control);
+                defer prepared.deinit();
+                const cfg = session_factory.getEmbeddingGemma2Config(self.session) orelse return error.UnsupportedEmbeddingGemma2Backend;
+                const result = try compute.runEmbeddingGemma2(allocator, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, .{ .resident_embeddings = prepared.resident_embeddings.? }, prepared.attention_mask, 1, prepared.sequence, 768, self.execution_control);
+                self.last_input_tokens +|= prepared.sequence;
+                return result;
+            }
+        }
         var prepared = prepare: {
             try self.lockExecution();
             defer self.unlockExecution();

@@ -67,22 +67,28 @@ pub const Prepared = struct {
     /// Row-major `[1, sequence, 512]` host input for the resident encoder.
     input_embeddings: []f32,
     sequence: usize,
+    resident_embeddings: ?ops.CT = null,
+    backend: ?*const ComputeBackend = null,
 
     pub fn deinit(self: *Prepared) void {
         self.allocator.free(self.input_ids);
         self.allocator.free(self.attention_mask);
         self.allocator.free(self.input_embeddings);
+        if (self.resident_embeddings) |tensor| self.backend.?.free(tensor);
         self.* = undefined;
     }
 };
 
 const Media = struct {
     kind: enum { image, audio },
-    embeddings: []f32,
+    embeddings: []f32 = &.{},
+    tensor: ?ops.CT = null,
+    backend: ?*const ComputeBackend = null,
     tokens: usize,
 
     fn deinit(self: *Media, allocator: std.mem.Allocator) void {
         allocator.free(self.embeddings);
+        if (self.tensor) |tensor| self.backend.?.free(tensor);
         self.* = undefined;
     }
 };
@@ -193,6 +199,17 @@ pub fn prepare(
     max_audio_decode_working_bytes: usize,
     control: ?InferenceExecutionControl,
 ) !Prepared {
+    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, max_audio_decode_working_bytes, control, false);
+}
+
+/// The caller keeps the backend and its execution lock alive through encoding.
+pub fn prepareResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, max_audio_decode_working_bytes: usize, control: ?InferenceExecutionControl) !Prepared {
+    if (comptime !@import("build_options").enable_cuda) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() != .cuda) return error.UnsupportedEmbeddingGemma2Backend;
+    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, max_audio_decode_working_bytes, control, true);
+}
+
+fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, max_audio_decode_working_bytes: usize, control: ?InferenceExecutionControl, resident: bool) !Prepared {
     if (parts.len == 0) return error.EmptyEmbeddingInput;
     if (max_tokens == 0 or max_tokens > 8192) return error.InvalidEmbeddingTokenLimit;
     // Video is outside this serving lane, including manual placeholders.
@@ -216,6 +233,17 @@ pub fn prepare(
             .text => {},
             .image => |bytes| {
                 if (bytes.len == 0) return error.InvalidImageInput;
+                if (resident) {
+                    // Preserve the CUDA Pillow policy and upload decoded RGB once.
+                    var pixels = try gemma4_projector.prepareEmbeddingGemma2ImageForBackend(allocator, bytes, .cuda);
+                    defer pixels.deinit();
+                    var encoded = try gemma4_projector.encodePreparedEmbeddingGemma2ImagesResident(cb, allocator, &.{pixels}, .{});
+                    defer encoded.deinit();
+                    const tensor = try cb.sliceRows2D(allocator, encoded.embeddings, 0, encoded.tokens_per_image[0], hidden_size);
+                    errdefer cb.free(tensor);
+                    try media.append(allocator, .{ .kind = .image, .tensor = tensor, .backend = cb, .tokens = encoded.tokens_per_image[0] });
+                    continue;
+                }
                 const encoded = try gemma4_projector.encodeEmbeddingGemma2Image(cb, allocator, bytes);
                 errdefer allocator.free(encoded.embeddings);
                 if (encoded.embeddings.len != std.math.mul(usize, encoded.tokens, hidden_size) catch return error.InvalidMediaEmbeddingShape)
@@ -224,6 +252,12 @@ pub fn prepare(
             },
             .audio => |clip| {
                 if (clip.bytes.len == 0) return error.InvalidAudioInput;
+                if (resident) {
+                    const encoded = try gemma4_projector.encodeEmbeddingGemma2AudioResidentBounded(cb, allocator, clip.bytes, clip.decode_options, max_audio_decode_working_bytes);
+                    errdefer cb.free(encoded.embeddings);
+                    try media.append(allocator, .{ .kind = .audio, .tensor = encoded.embeddings, .backend = cb, .tokens = encoded.tokens });
+                    continue;
+                }
                 const encoded = try gemma4_projector.encodeEmbeddingGemma2AudioBounded(cb, allocator, clip.bytes, clip.decode_options, max_audio_decode_working_bytes);
                 errdefer allocator.free(encoded.embeddings);
                 if (encoded.embeddings.len != std.math.mul(usize, encoded.tokens, hidden_size) catch return error.InvalidMediaEmbeddingShape)
@@ -284,6 +318,24 @@ pub fn prepare(
     @memset(attention_mask, 1);
 
     try checkControl(control);
+    if (resident) {
+        if (comptime @import("build_options").enable_cuda) {
+            const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+            const tensor = try compute.embeddingGemma2TokenRows(input_ids);
+            errdefer cb.free(tensor);
+            // Layout has already been validated. Copy complete contiguous media
+            // runs, preserving caller/manual-marker order without host readback.
+            var cursor: usize = 0;
+            for (media_order.items) |item| {
+                while (input_ids[cursor] != mediaTokenId(item.kind)) cursor += 1;
+                if (!try cb.copyRows2D(allocator, tensor, cursor, item.tensor.?, 0, item.tokens, hidden_size)) return error.ResidentImageOperationUnavailable;
+                cursor += item.tokens;
+            }
+            try checkControl(control);
+            return .{ .allocator = allocator, .input_ids = input_ids, .attention_mask = attention_mask, .input_embeddings = &.{}, .sequence = sequence, .resident_embeddings = tensor, .backend = cb };
+        }
+        return error.UnsupportedEmbeddingGemma2Backend;
+    }
     const embedding_weight = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(embedding_weight);
     const device_embeddings = try cb.embeddingLookup(embedding_weight, input_ids, sequence, hidden_size);
@@ -442,4 +494,45 @@ test "EmbeddingGemma2 text-only requests reject missing media and deferred video
     try std.testing.expectError(error.MediaPlaceholderMismatch, validateTextOnly("describe <|image|>"));
     try std.testing.expectError(error.MediaPlaceholderMismatch, validateTextOnly("listen <|audio|>"));
     try std.testing.expectError(error.MediaPlaceholderMismatch, validateTextOnly("summarize <|video|>"));
+}
+
+test "embeddinggemma2 CUDA resident ordered composition matches legacy BF16 boundaries" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const env = @import("antfly_platform").env;
+    const model = env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const oracle = env.getenv("ANTFLY_EMBEDDINGGEMMA2_MEDIA_ORACLE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const directory = std.fs.path.dirname(oracle).?;
+    const image_path = try std.fs.path.join(a, &.{ directory, "image.png" });
+    defer a.free(image_path);
+    const audio_path = try std.fs.path.join(a, &.{ directory, "audio.wav" });
+    defer a.free(audio_path);
+    const file = @import("../util/c_file.zig");
+    const image_bytes = try file.readFile(a, image_path);
+    defer a.free(image_bytes);
+    const audio_bytes = try file.readFile(a, audio_path);
+    defer a.free(audio_bytes);
+    const tokenizer_path = try std.fs.path.join(a, &.{ model, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try file.readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const hf = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer hf.deinitSelf();
+    const factory = @import("../architectures/session_factory.zig");
+    const session = try factory.createCudaSession(a, model);
+    defer session.close();
+    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    defer managed.deinit();
+    // Manual marker order intentionally differs from physical media order.
+    const parts = [_]Part{ .{ .audio = .{ .bytes = audio_bytes } }, .{ .text = "first <|image|> then <|audio|> last" }, .{ .image = image_bytes } };
+    var expected = try prepare(&managed.backend, a, hf.tokenizer(), "title: none | text: ", &parts, 8192, 64 * 1024 * 1024, null);
+    defer expected.deinit();
+    var actual = try prepareResident(&managed.backend, a, hf.tokenizer(), "title: none | text: ", &parts, 8192, 64 * 1024 * 1024, null);
+    defer actual.deinit();
+    try std.testing.expectEqualSlices(i64, expected.input_ids, actual.input_ids);
+    try std.testing.expectEqualSlices(i64, expected.attention_mask, actual.attention_mask);
+    const values = try managed.backend.toFloat32(actual.resident_embeddings.?, a);
+    defer a.free(values);
+    try std.testing.expectEqual(expected.input_embeddings.len, values.len);
+    for (expected.input_embeddings, values) |want, got| try std.testing.expectEqual(@as(u32, @bitCast(roundToBfloat16(want))), @as(u32, @bitCast(roundToBfloat16(got))));
 }

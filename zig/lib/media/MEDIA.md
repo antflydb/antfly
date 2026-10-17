@@ -391,3 +391,12 @@ releases both the context and shared reservations. See
 [VIDEO.md](../video/VIDEO.md#cuda-decoder-cache-accounting) for the bounded surface
 envelope and NVIDIA hardware qualification requirement. Embedding identity pins
 also distinguish CUDA BF16 execution from the existing CPU/Metal F32 recipe.
+
+CUDA mixed-content preparation now shares the existing ordered/manual-marker
+parser with the host frontend while retaining image/audio projections and
+composing text/media rows on device. BF16 text lookup/scaling occurs before media
+replacement; projected rows remain unscaled. Backend handles and execution locks
+outlive prepared tensors. Packed projection and graph caches hold separate
+retained admission, with bounded storage and synchronized ownership transitions.
+See [CUDA_TUNING.md](../../pkg/inference/CUDA_TUNING.md#embeddinggemma-2-encoder-optimization-profiles)
+for optional arithmetic profiles and qualification requirements.

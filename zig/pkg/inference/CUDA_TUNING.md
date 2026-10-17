@@ -13,7 +13,11 @@ per image. CUDA performs Pillow-compatible resizing and patch extraction. Only
 final vectors download (3,072 bytes per 768-dimensional FP32 vector). Grouped
 requests truncate to the requested dimensions on CUDA; the direct pipeline
 preserves its 768-dimensional return contract.
-Mixed text/media groups retain the ordered-content frontend.
+Mixed text/media groups retain the ordered-content frontend, including manual
+placeholders, and compose text/media rows on device. Text lookup/scaling retains
+the BF16 22.625 boundary. The ordered-content handoff no longer reads back
+intermediate embeddings; transfer telemetry still exposes diagnostic or operation
+fallbacks within the towers.
 
 CUDA image cohorts default to one image to preserve the existing BF16 arithmetic.
 `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_IMAGE_BATCH=1` enables experimental cohorts
@@ -1191,3 +1195,54 @@ accumulator and checks the returned rows remain intact.
 
 Production changes to video decoding, sampling, color conversion, or token
 packing require renewed endpoint parity and recovery checks on the target GPU.
+
+## EmbeddingGemma 2 encoder optimization profiles
+
+The checked-in artifacts use NVCC `V13.2.78`; regenerate with that compiler patch
+to preserve existing kernel code generation. New inference-only kernels are
+appended to the bundle so existing kernel numbering remains stable.
+
+The session snapshots the following optional profiles at construction. Each
+arithmetic profile (including image cohorts and graph bucket padding) has a
+distinct CUDA `model_identity`; CPU/Metal and default CUDA pins remain stable.
+Changing profiles requires reloading the model and qualifying the resulting
+vectors against the matching pinned BF16 reference. These profiles default off
+pending NVIDIA hardware qualification.
+
+| Control (`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_` prefix) | Execution |
+|---|---|
+| `EXTENDED_FLASH=1` | cuDNN global/local plans when available, otherwise bundled BF16 WMMA tiles across supported sequence lengths and SM80–SM120; masks and scalar tile tails remain explicit. Portable SM75 PTX never enters an empty WMMA body. |
+| `FUSED_VISION=1` | Fused F32 rotary/Q-scaling math directly into BF16 attention inputs, BF16 SDPA output directly into projection; one final widening at the tower boundary. Declined plans retain the existing path. |
+| `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and split columns without changing BF16 bits. |
+| `GRAPH_REPLAY=1` | Four retained arenas for singleton text inputs through 256 tokens, bucketed in multiples of 64; upload fresh input/masks before replay and read back the compact result afterward. |
+| `IMAGE_BATCH=1` | Existing image cohort opt-in also permits up to four staged video pictures. cuDNN vision plans carry the full batch dimension. |
+
+Packed weights retain up to 512 MiB, and each of the four graph arenas has a
+64 MiB ceiling. Every retained allocation holds both physical context accounting
+and shared backend scratch admission until synchronized eviction or teardown.
+Admission-policy changes evict these buffers before switching controllers.
+Video and mixed-input requests reclaim optional caches once on admission denial.
+Failed admission declines packing/capture before queueing work. Model unload
+releases graphs before their backing storage and weights.
+
+Graph keys distinguish sequence buckets and unmasked, prefix-masked and arbitrary
+mask layouts. A changed attention workspace pointer or packed-weight generation
+invalidates replay. Cancellation is checked before submission and after completed
+readback; captured driver execution follows the existing supervised CUDA
+interruption contract. Capture failure cannot return stale output.
+
+The comparison harness records CUDA controls and observed route counters. Use
+`--require-route extended_flash`, `--require-route fused_vision`,
+`--require-route packed_projections` or `--require-route graph_replay` to reject a
+qualification run where the requested optimization never executed. A workload
+must exercise the route: e.g. short repeated queries for replay, media for vision,
+and medium/long sequences for extended flash. `--require-route batched_vision`
+requires actual multi-image/frame execution, not just an enabled environment flag.
+
+NVIDIA qualification must run the GPU split/rotary differential tests, ordered
+resident composition versus legacy BF16 boundaries (with checkpoint/media oracle
+environment paths), masked
+local/global tile-tail tests, fresh-input graph replay test, pretrained matched
+BF16 comparison, and completed-device performance/memory measurements before
+promoting any profile. Compilation and portable policy tests do not establish a
+GPU speedup or numerical parity.

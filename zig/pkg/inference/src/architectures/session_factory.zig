@@ -8597,7 +8597,7 @@ fn bindCudaVideoAdmission(session: Session, cb: *const ops.ComputeBackend) !void
     if (comptime !build_options.enable_cuda) return;
     if (cb.kind() != .cuda) return;
     const compute: *cuda_compute_mod.CudaCompute = @ptrCast(@alignCast(cb.ptr));
-    try compute.ctx.configureVideoAdmission(if (session.run_admission) |admission| .{
+    try compute.configureEmbeddingGemma2Admission(if (session.run_admission) |admission| .{
         .controller = admission.controller,
         .limits = admission.limits,
         .check_live_memory = admission.check_live_memory,

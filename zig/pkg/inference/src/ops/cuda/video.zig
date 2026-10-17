@@ -61,11 +61,16 @@ pub const Frame = struct {
     timestamp_us: i64,
     matrix: u32,
     full_range: u32,
+    repetitions: usize = 1,
 };
 pub const Consumer = struct {
     context: *anyopaque,
     consume: *const fn (*anyopaque, Frame) anyerror!void,
     check: ?*const fn (*anyopaque) anyerror!void = null,
+    /// Consumers opting in stage mapped pixels into owned storage and fence
+    /// that staging here. Later model work need not delay surface unmapping.
+    surface_ready: ?*const fn (*anyopaque) anyerror!void = null,
+    coalesce_repetitions: bool = false,
 };
 pub const Stats = struct {
     decoded_frames: usize = 0,
@@ -155,15 +160,20 @@ const DecodeState = struct {
             }) 1 else 0;
         }
         const repetitions = if (self.embedding_sampler) |sampler| sampler.repetitions else 1;
-        for (0..repetitions) |_| {
-            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .timestamp_us = pts, .matrix = matrix, .full_range = full_range }) catch |err| {
+        for (0..if (self.consumer.coalesce_repetitions) @as(usize, 1) else repetitions) |_| {
+            self.consumer.consume(self.consumer.context, .{ .device = device, .pitch = pitch, .width = width, .height = height, .timestamp_us = pts, .matrix = matrix, .full_range = full_range, .repetitions = if (self.consumer.coalesce_repetitions) repetitions else 1 }) catch |err| {
                 self.failure = err;
                 break;
             };
         }
-        // cuvidUnmapVideoFrame must never release storage a queued kernel reads.
-        // Only selected frames reach this fence; all other frames stay in NVDEC.
-        self.ctx.synchronize() catch |err| {
+        // A staging fence may complete before queued vision execution. Error
+        // paths always drain the stream before releasing a mapped surface.
+        if (self.failure == null and self.consumer.surface_ready != null) {
+            self.consumer.surface_ready.?(self.consumer.context) catch |err| {
+                self.failure = err;
+                self.ctx.synchronize() catch {};
+            };
+        } else self.ctx.synchronize() catch |err| {
             self.failure = err;
         };
         if (self.failure != null) return -1;
@@ -905,4 +915,57 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
 
 test {
     _ = @import("video_cache_budget.zig");
+}
+
+test "embeddinggemma2 video staging fences coalesce repeats and drain consumer errors" {
+    const Mock = struct {
+        var synchronizations: usize = 0;
+        fn current(_: driver.CUcontext) callconv(.c) driver.CUresult {
+            return 0;
+        }
+        fn sync(_: driver.CUstream) callconv(.c) driver.CUresult {
+            synchronizations += 1;
+            return 0;
+        }
+        const State = struct {
+            calls: usize = 0,
+            copies: usize = 0,
+            ready: usize = 0,
+            fail: bool = false,
+            fn consume(raw: *anyopaque, frame: Frame) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                self.copies += frame.repetitions;
+                if (self.fail) return error.Cancelled;
+            }
+            fn surfaceReady(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ready += 1;
+            }
+        };
+    };
+    Mock.synchronizations = 0;
+    var ctx: context.CudaContext = undefined;
+    ctx.ctx = @ptrFromInt(1);
+    ctx.stream = @ptrFromInt(2);
+    ctx.stats = .{};
+    ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+    var consumer = Mock.State{};
+    var state = DecodeState{ .ctx = &ctx, .consumer = .{ .context = &consumer, .consume = Mock.State.consume, .surface_ready = Mock.State.surfaceReady, .coalesce_repetitions = true } };
+    // Three model slots can refer to one coded picture. One staging/vision
+    // call carries all repeats while retaining three logical sample slots.
+    var sampler = try EmbeddingSampler.init(1, 1_000_000, 1_000_000);
+    sampler.repetitions = 3;
+    state.embedding_sampler = sampler;
+    try std.testing.expectEqual(@as(c_int, 1), DecodeState.callback(&state, 1, 256, 160, 96, 0, 2, 0));
+    try std.testing.expectEqual(@as(usize, 1), consumer.calls);
+    try std.testing.expectEqual(@as(usize, 3), consumer.copies);
+    try std.testing.expectEqual(@as(usize, 1), consumer.ready);
+    try std.testing.expectEqual(@as(usize, 0), Mock.synchronizations);
+    consumer.fail = true;
+    try std.testing.expectEqual(@as(c_int, -1), DecodeState.callback(&state, 1, 256, 160, 96, 1, 2, 0));
+    try std.testing.expectEqual(@as(usize, 1), consumer.ready);
+    try std.testing.expectEqual(@as(usize, 1), Mock.synchronizations);
+    try std.testing.expectEqual(error.Cancelled, state.failure.?);
 }

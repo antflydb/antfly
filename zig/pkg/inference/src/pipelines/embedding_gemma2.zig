@@ -1169,7 +1169,7 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     const request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = @min(options.max_tokens, 4546), .input_bytes = bytes.len, .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = options.dimensions * @sizeOf(f32) };
     var permit = session.admit(request) catch |err| reclaim: {
         if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
-        if (try compute.ctx.evictVideoDecoder() == 0) return err;
+        try compute.evictEmbeddingGemma2Caches();
         break :reclaim try session.admit(request);
     };
     defer permit.deinit();
@@ -1232,8 +1232,8 @@ fn singleImageGroup(group: Group) bool {
 }
 
 fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
-    const embedding = @import("embedding.zig");
-    const parts = try a.alloc(embedding.EmbeddingContentPart, group.content.len);
+    const content = @import("embedding_gemma2_content.zig");
+    const parts = try a.alloc(content.Part, group.content.len);
     defer a.free(parts);
     for (group.content, parts) |part, *dest| dest.* = switch (part) {
         .text => |text| .{ .text = text },
@@ -1243,36 +1243,29 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     };
     const prefix = if (group.title) |title| try std.fmt.allocPrint(a, "title: {s} | text: ", .{title}) else try a.dupe(u8, try encoder.taskPrefix(options.task_type));
     defer a.free(prefix);
-    var pipeline = embedding.EmbeddingPipeline.init(a, session, tokenizer, .{
-        .max_length = options.max_tokens,
-        .strict_max_length = true,
-        .reject_truncation = true,
-        .normalize = true,
-        .pooling = .mean,
-        .text_prefix = prefix,
-        .trim_padding_to_batch_max = true,
-        .resident_text_encoder = true,
-        .resident_embedding_gemma2 = true,
-        .resident_image_handoff = false,
-    });
-    pipeline.execution_lock = lock;
-    pipeline.execution_control = control;
-    const vectors = try pipeline.embedContent(&.{.{ .content = parts }});
-    defer a.free(vectors);
-    if (vectors.len != 1) {
-        for (vectors) |vector| a.free(vector);
-        return error.InvalidEmbeddingOutput;
-    }
-    defer a.free(vectors[0]);
-    if (options.dimensions > vectors[0].len) return error.InvalidEmbeddingDimensions;
-    const output = try a.dupe(f32, vectors[0][0..options.dimensions]);
-    errdefer a.free(output);
-    var norm: f32 = 0;
-    for (output) |value| norm += value * value;
-    if (norm <= 0 or !std.math.isFinite(norm)) return error.InvalidEmbeddingOutput;
-    const scale = 1 / @sqrt(norm);
-    for (output) |*value| value.* *= scale;
-    return .{ .vector = output, .input_tokens = pipeline.last_input_tokens };
+    const effective = control orelse Control{};
+    try effective.check();
+    var input_bytes: usize = 0;
+    for (group.content) |part| input_bytes = try std.math.add(usize, input_bytes, partBytes(part).len);
+    if (lock) |mutex| try effective.lock(mutex);
+    defer if (lock) |mutex| mutex.unlock();
+    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    defer managed.deinit();
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
+    const request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = options.max_tokens, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = options.dimensions * 4 };
+    var permit = session.admit(request) catch |err| retry: {
+        if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
+        try compute.evictEmbeddingGemma2Caches();
+        break :retry try session.admit(request);
+    };
+    defer permit.deinit();
+    const before = MediaTransferSnapshot.init(&managed.backend);
+    defer observeResidentTransfers(&managed.backend, before, options);
+    var prepared = try @import("embedding_gemma2_content.zig").prepareResident(&managed.backend, a, tokenizer, prefix, parts, options.max_tokens, 64 * 1024 * 1024, control);
+    defer prepared.deinit();
+    const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
+    const output = try compute.runEmbeddingGemma2(a, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, .{ .resident_embeddings = prepared.resident_embeddings.? }, prepared.attention_mask, 1, prepared.sequence, options.dimensions, control);
+    return .{ .vector = output, .input_tokens = prepared.sequence };
 }
 
 const PreparedGroup = struct {
@@ -3482,4 +3475,6 @@ test "embeddinggemma2 mixed preparation drains cancellation partial errors and d
 
 test "embeddinggemma2 NVDEC cache admission policy is linked on portable hosts" {
     _ = @import("../ops/cuda/video_cache_budget.zig");
+    _ = @import("../ops/cuda/embedding_gemma2_execution.zig");
+    _ = @import("../ops/cuda/embedding_gemma2_policy.zig");
 }

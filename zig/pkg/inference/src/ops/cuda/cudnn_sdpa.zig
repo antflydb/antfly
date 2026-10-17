@@ -145,6 +145,7 @@ pub const Module = struct {
         plan_declines: u64 = 0,
         executes: u64 = 0,
         vision_executes: u64 = 0,
+        vision_batched_executes: u64 = 0,
         text_executes: u64 = 0,
         workspace_high_water: usize = 0,
     };
@@ -205,6 +206,15 @@ pub const Module = struct {
     pub fn execute(self: *Module, sequence: usize, q: usize, k: usize, v: usize, o: usize, workspace: usize) !bool {
         const result = try self.executeFor(.{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = sequence, .dim = 64, .scale = 0.125 }, q, k, v, o, workspace, 0);
         if (result) self.stats_.vision_executes += 1;
+        return result;
+    }
+
+    pub fn executeVision(self: *Module, key: Key, q: usize, k: usize, v: usize, o: usize, workspace: usize) !bool {
+        const result = try self.executeFor(key, q, k, v, o, workspace, 0);
+        if (result) {
+            self.stats_.vision_executes += 1;
+            if (key.batch > 1) self.stats_.vision_batched_executes += 1;
+        }
         return result;
     }
 
@@ -430,13 +440,15 @@ fn eligible(key: Key, version: usize) bool {
     if (key.batch == 0 or key.batch > 32 or key.sequence == 0 or !std.math.isFinite(key.scale)) return false;
     if (key.padding_mask and version < 91500) return false;
     const scale_bits: u32 = @bitCast(key.scale);
-    const vision = !key.padding_mask and key.local_window_radius == 0 and key.batch == 1 and key.q_heads == 12 and key.kv_heads == 12 and
+    const vision = !key.padding_mask and key.local_window_radius == 0 and key.batch <= 8 and key.q_heads == 12 and key.kv_heads == 12 and
         key.dim == 64 and key.sequence <= 3136 and scale_bits == @as(u32, @bitCast(@as(f32, 0.125)));
     const text_base = key.q_heads == 4 and key.kv_heads == 2 and key.dim == 256 and
         scale_bits == @as(u32, @bitCast(@as(f32, 1.0)));
     const text_plain = text_base and key.local_window_radius == 0 and key.sequence <= 513;
     const text_band = text_base and key.local_window_radius == 512 and key.sequence <= 8192 and version >= 92100;
-    return vision or text_plain or text_band;
+    const text_global = key.q_heads == 4 and key.kv_heads == 1 and key.dim == 512 and
+        key.local_window_radius == 0 and key.sequence <= 8192 and scale_bits == @as(u32, @bitCast(@as(f32, 1.0)));
+    return vision or text_plain or text_band or text_global;
 }
 
 fn scoreLayout(batch: usize, heads: usize, sequence: usize) !Layout {
@@ -511,4 +523,20 @@ test "cuDNN padded and unpadded plans have separate version-qualified keys" {
     try std.testing.expect(!eligible(padded, 92000));
     try std.testing.expect(eligible(padded, 92400));
     try std.testing.expect(!eligible(.{ .batch = 1, .q_heads = 12, .kv_heads = 12, .sequence = 512, .dim = 64, .scale = 0.125, .padding_mask = true }, 92400));
+}
+
+test "embeddinggemma2 cuDNN batched vision and global text plans retain shape and mask identity" {
+    const vision = Key{ .batch = 4, .q_heads = 12, .kv_heads = 12, .sequence = 560, .dim = 64, .scale = 0.125 };
+    try std.testing.expect(eligible(vision, 91300));
+    var single = vision;
+    single.batch = 1;
+    try std.testing.expect(!vision.eql(single));
+    try std.testing.expect(keyFingerprint(vision) != keyFingerprint(single));
+    var global = Key{ .batch = 2, .q_heads = 4, .kv_heads = 1, .sequence = 4546, .dim = 512 };
+    try std.testing.expect(eligible(global, 91300));
+    global.padding_mask = true;
+    try std.testing.expect(!eligible(global, 91400));
+    try std.testing.expect(eligible(global, 91500));
+    global.local_window_radius = 512;
+    try std.testing.expect(!eligible(global, 92400));
 }

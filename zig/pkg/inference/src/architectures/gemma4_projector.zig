@@ -315,6 +315,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
     var preprocessor = try video.Preprocessor.init(allocator, &compute.ctx);
     defer preprocessor.deinit();
     const State = struct {
+        const Pending = struct { hidden: ?CT, timestamp: i64, repetitions: usize };
         cb: *const ComputeBackend,
         allocator: std.mem.Allocator,
         weights: *ProjectorWeights,
@@ -326,41 +327,97 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
         timestamps: [video.max_frames]i64 = undefined,
         count: usize = 0,
         rows: usize = 0,
-        fn check(user_data: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(user_data));
+        scheduled: usize = 0,
+        scheduled_rows: usize = 0,
+        pending: [4]Pending = undefined,
+        pending_count: usize = 0,
+        capacity: usize,
+        geometry: ?Geometry = null,
+        batches: usize = 0,
+        maximum_batch: usize = 0,
+        staging_event: @import("../ops/cuda/driver.zig").CUevent,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
             try self.cb.checkExecutionControl();
         }
-        fn consume(user_data: *anyopaque, frame: video.Frame) !void {
-            const self: *@This() = @ptrCast(@alignCast(user_data));
+        fn ready(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const c: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            try c.ctx.driver.check(c.ctx.driver.fns.cuEventSynchronize(self.staging_event));
+        }
+        fn flush(self: *@This()) !void {
+            if (self.pending_count == 0) return;
+            try self.cb.checkExecutionControl();
+            const g = self.geometry.?;
+            const count = self.pending_count;
+            // Position/tower ownership consumes this combined input. Stage
+            // slots remain owned until all reads have entered the stream.
+            const input = if (count == 1) self.pending[0].hidden.? else (try self.cb.allocUninitF32Shape(&.{ @intCast(count * g.grid_x * g.grid_y), @intCast(self.cfg.vision_hidden) })) orelse return error.UnsupportedVideoBackend;
+            var owned = count != 1;
+            errdefer if (owned) self.cb.free(input);
+            if (count != 1) for (self.pending[0..count], 0..) |slot, i| {
+                if (!try self.cb.copyRows2D(self.allocator, input, i * g.grid_x * g.grid_y, slot.hidden.?, 0, g.grid_x * g.grid_y, self.cfg.vision_hidden)) return error.UnsupportedVideoBackend;
+            };
+            if (count == 1) self.pending[0].hidden = null;
+            owned = false;
+            const projected = try encodeVisionHiddenResident(self.cb, self.allocator, self.weights, self.cfg, input, g, count);
+            defer self.cb.free(projected.embeddings);
+            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(32 * 140), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+            for (self.pending[0..count], 0..) |slot, i| {
+                for (0..slot.repetitions) |_| {
+                    if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, i * projected.tokens, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
+                    self.tokens[self.count] = projected.tokens;
+                    self.timestamps[self.count] = slot.timestamp;
+                    self.count += 1;
+                    self.rows += projected.tokens;
+                }
+            }
+            for (self.pending[0..count]) |slot| if (slot.hidden) |tensor| self.cb.free(tensor);
+            self.pending_count = 0;
+            self.batches += 1;
+            self.maximum_batch = @max(self.maximum_batch, count);
+        }
+        fn consume(raw: *anyopaque, frame: video.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
             const g = targetGeometry(self.cfg, frame.width, frame.height);
-            if (self.count >= 32 or self.rows + g.tokenCount() + (self.count + 1) * 2 + 2 > self.max_tokens) return error.EmbeddingInputTooLong;
-            const cuda_compute: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-            const rgb = try self.preprocess.rgb8(cuda_compute, frame);
+            const repeated_rows = std.math.mul(usize, frame.repetitions, g.tokenCount()) catch return error.EmbeddingInputTooLong;
+            if (frame.repetitions == 0 or frame.repetitions > 32 - self.scheduled or self.scheduled_rows + repeated_rows + (self.scheduled + frame.repetitions) * 2 + 2 > self.max_tokens) return error.EmbeddingInputTooLong;
+            if (self.geometry) |previous| if (embeddingGemma2GeometryKey(previous) != embeddingGemma2GeometryKey(g)) try self.flush();
+            self.geometry = g;
+            const c: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            const rgb = try self.preprocess.rgb8(c, frame);
             defer self.cb.free(rgb);
-            const patches = try cuda_compute.preprocessEmbeddingGemma2ResidentRgb(rgb, frame.width, frame.height, @intCast(g.width), @intCast(g.height));
+            // Only RGB conversion borrows NVDEC pixels. Everything after this
+            // event reads owned storage, allowing decode/vision overlap.
+            try c.ctx.recordEvent(self.staging_event);
+            const patches = try c.preprocessEmbeddingGemma2ResidentRgb(rgb, frame.width, frame.height, @intCast(g.width), @intCast(g.height));
             defer self.cb.free(patches);
             const dim = self.cfg.patch_size * self.cfg.patch_size * 3;
             const weight = try projectorLinearWeightCt(self.cb, self.allocator, self.weights, "v.patch_embd.weight", dim, self.cfg.vision_hidden);
             const hidden = try self.cb.linearNoBias(patches, weight, g.grid_x * g.grid_y, dim, self.cfg.vision_hidden);
-            const projected = try encodeVisionHiddenResident(self.cb, self.allocator, self.weights, self.cfg, hidden, g, 1);
-            defer self.cb.free(projected.embeddings);
-            if (self.output == null) self.output = (try self.cb.allocUninitF32Shape(&.{ @intCast(32 * 140), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
-            if (!try self.cb.copyRows2D(self.allocator, self.output.?, self.rows, projected.embeddings, 0, projected.tokens, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
-            self.tokens[self.count] = projected.tokens;
-            self.timestamps[self.count] = frame.timestamp_us;
-            self.count += 1;
-            self.rows += projected.tokens;
+            self.pending[self.pending_count] = .{ .hidden = hidden, .timestamp = frame.timestamp_us, .repetitions = frame.repetitions };
+            self.pending_count += 1;
+            self.scheduled += frame.repetitions;
+            self.scheduled_rows += repeated_rows;
+            if (self.pending_count == self.capacity) try self.flush();
         }
     };
-    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .max_tokens = max_tokens };
-    defer if (state.output) |out| cb.free(out);
-    const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check }, .embedding_gemma2);
+    const staging_event = try compute.ctx.createStreamEvent();
+    defer _ = compute.ctx.driver.fns.cuEventDestroy(staging_event);
+    var state = State{ .cb = cb, .allocator = allocator, .weights = &weights, .cfg = cfg, .preprocess = &preprocessor, .max_tokens = max_tokens, .staging_event = staging_event, .capacity = if (compute.embedding_gemma2_policy.image_batch) 4 else 1 };
+    defer {
+        for (state.pending[0..state.pending_count]) |slot| if (slot.hidden) |tensor| cb.free(tensor);
+        if (state.output) |out| cb.free(out);
+    }
+    errdefer compute.ctx.synchronize() catch {};
+    const stats = try video.decodeMp4Sampled(allocator, &compute.ctx, bytes, .{ .context = &state, .consume = State.consume, .check = State.check, .surface_ready = State.ready, .coalesce_repetitions = true }, .embedding_gemma2);
+    try state.flush();
     const embeddings = try ownVideoRows(cb, allocator, state.output.?, state.rows, cfg.text_hidden);
     errdefer cb.free(embeddings);
     const counts = try allocator.dupe(usize, state.tokens[0..state.count]);
     errdefer allocator.free(counts);
     const timestamps = try allocator.dupe(i64, state.timestamps[0..state.count]);
-    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.count, .max_batch_executed = 1 }, .timestamps_us = timestamps, .stats = stats };
+    return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.batches, .max_batch_executed = state.maximum_batch }, .timestamps_us = timestamps, .stats = stats };
 }
 
 fn encodeResidentPatches(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, g: Geometry) !ResidentImage {
@@ -1067,16 +1124,28 @@ fn embeddingGemma2StageTensor(cb: *const ComputeBackend, a: std.mem.Allocator, n
 
 fn encodeSingleAudio(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, audio_bytes: []const u8) !EncodedAudio {
     if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, audio_bytes);
+    const result = try encodeSingleAudioResident(cb, allocator, store, cfg, audio_bytes);
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
+}
+
+pub fn encodeEmbeddingGemma2AudioResidentBounded(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, decode_options: audio.DecodeOptions, max_decode_working_bytes: usize) !ResidentEncodedAudio {
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    var cfg = embeddingGemma2AudioConfig();
+    cfg.audio_decode_options = decode_options;
+    cfg.max_audio_decode_working_bytes = max_decode_working_bytes;
+    return encodeSingleAudioResident(cb, allocator, &weights, cfg, bytes);
+}
+
+fn encodeSingleAudioResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, audio_bytes: []const u8) !ResidentEncodedAudio {
     var features = if (store.huggingface and cb.kind() == .cuda) bounded: {
         var prepared = try prepareAudioCpuBounded(allocator, audio_bytes, cfg.audio_decode_options, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, cfg.max_audio_decode_working_bytes, true);
         defer prepared.deinit();
         break :bounded try audioFeaturesFromPrepared(cb, allocator, &prepared);
     } else try prepareGemma4AudioFeatures(cb, allocator, audio_bytes, cfg.mel_bins);
     defer features.deinit();
-    const result = try encodeAudioFeaturesResident(cb, allocator, store, cfg, &features);
-    defer cb.free(result.embeddings);
-    const embeddings = try cb.toFloat32(result.embeddings, allocator);
-    return .{ .embeddings = embeddings, .tokens = result.tokens };
+    return encodeAudioFeaturesResident(cb, allocator, store, cfg, &features);
 }
 
 /// Each conformer sees one clip's mask/context. Only its compact projected rows

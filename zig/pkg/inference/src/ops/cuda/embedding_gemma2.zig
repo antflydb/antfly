@@ -45,6 +45,9 @@ pub const Stats = struct {
     attention_scalar_fallbacks: u64 = 0,
     scalar_matmul_fallbacks: u64 = 0,
     output_bytes: u64 = 0,
+    packed_projection_launches: u64 = 0,
+    fused_vision_launches: u64 = 0,
+    extended_flash_launches: u64 = 0,
 };
 
 pub const Contrastive = struct {
@@ -80,6 +83,8 @@ pub const Module = struct {
     rope_vjp: driver.CUfunction,
     training_rope: driver.CUfunction,
     training_rope_vjp: driver.CUfunction,
+    split_columns: driver.CUfunction,
+    vision_rope_pack: driver.CUfunction,
     attention: driver.CUfunction,
     local_flash_attention: driver.CUfunction,
     attention_softmax: driver.CUfunction,
@@ -140,6 +145,8 @@ pub const Module = struct {
             .rope_vjp = try function(ctx, m, "termite_embedding_gemma2_rope_vjp_f32"),
             .training_rope = try function(ctx, m, "termite_embedding_gemma2_training_rope_bf16"),
             .training_rope_vjp = try function(ctx, m, "termite_embedding_gemma2_training_rope_vjp_f32"),
+            .split_columns = try function(ctx, m, "termite_embedding_gemma2_split_columns_bf16"),
+            .vision_rope_pack = try function(ctx, m, "termite_embedding_gemma2_vision_rope_pack_bf16"),
             .attention = try function(ctx, m, "termite_embedding_gemma2_attention_bf16"),
             .local_flash_attention = try function(ctx, m, "termite_embedding_gemma2_attention_local_flash_bf16"),
             .attention_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_softmax_bf16"),
@@ -191,6 +198,15 @@ pub const Module = struct {
     }
     pub fn noteCublasF32Matmul(self: *Module) void {
         self.stats_.cublas_f32_matmuls += 1;
+    }
+    pub fn notePackedProjection(self: *Module) void {
+        self.stats_.packed_projection_launches += 1;
+    }
+    pub fn noteFusedVision(self: *Module) void {
+        self.stats_.fused_vision_launches += 1;
+    }
+    pub fn noteExtendedFlash(self: *Module) void {
+        self.stats_.extended_flash_launches += 1;
     }
     pub fn noteAttentionFallback(self: *Module) void {
         self.stats_.attention_scalar_fallbacks += 1;
@@ -530,6 +546,32 @@ pub const Module = struct {
         const token_rows = try std.math.mul(u32, shape.batch, shape.seq);
         try launch(ctx, self.training_rope_vjp, &args, .{ token_rows, (shape.head_dim / 2 + 127) / 128, shape.q_heads }, .{ 128, 1, 1 });
         self.stats_.launches += 1;
+    }
+
+    pub fn launchSplitColumns(self: *Module, ctx: *Context, outputs: [3]Buffer, input: Buffer, rows: u32, widths: [3]u32) !void {
+        const width = try std.math.add(u32, widths[0], try std.math.add(u32, widths[1], widths[2]));
+        const count = try std.math.mul(u32, rows, width);
+        if (rows == 0 or widths[0] == 0 or widths[1] == 0) return error.InvalidEmbeddingGemma2Shape;
+        try require(input, @as(usize, count) * 2);
+        for (outputs, widths) |output, w| try require(output, @as(usize, rows) * w * 2);
+        var pointers = [_]usize{ outputs[0].ptr, outputs[1].ptr, outputs[2].ptr, input.ptr };
+        var sizes = [_]u32{ rows, widths[0], widths[1], widths[2] };
+        var args: [8]?*anyopaque = undefined;
+        for (&pointers, 0..) |*ptr, i| args[i] = ptr;
+        for (&sizes, 4..) |*size, i| args[i] = size;
+        try self.launch1d(ctx, self.split_columns, &args, count);
+    }
+
+    pub fn launchVisionRopePack(self: *Module, ctx: *Context, qo: Buffer, ko: Buffer, q: Buffer, k: Buffer, positions: Buffer, count: u32, theta: f32, scale: f32) !void {
+        if (count == 0 or count % 64 != 0 or !std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(scale)) return error.InvalidEmbeddingGemma2Shape;
+        for ([_]Buffer{ qo, ko, q, k }) |buffer| try require(buffer, @as(usize, count) * 2);
+        try require(positions, @as(usize, count / 32) * 4);
+        var pointers = [_]usize{ qo.ptr, ko.ptr, q.ptr, k.ptr, positions.ptr };
+        var n = count;
+        var base = theta;
+        var multiplier = scale;
+        var args = [_]?*anyopaque{ &pointers[0], &pointers[1], &pointers[2], &pointers[3], &pointers[4], &n, &base, &multiplier };
+        try self.launch1d(ctx, self.vision_rope_pack, &args, count);
     }
 
     pub fn launchAttention(self: *Module, ctx: *Context, out: Buffer, q: Buffer, k: Buffer, v: Buffer, mask: Buffer, shape: Attention) !void {
@@ -1096,4 +1138,83 @@ test "EmbeddingGemma 2 resident contrastive objective bounds logical batch" {
     try std.testing.expectError(error.InvalidEmbeddingGemma2TrainingShape, (Contrastive{ .queries = 65, .candidates = 384, .width = 768, .temperature = 0.05, .objective_weight = 0.25 }).validate());
     try std.testing.expectError(error.InvalidEmbeddingGemma2TrainingShape, (Contrastive{ .queries = 1, .candidates = 1, .width = 768, .temperature = 0, .objective_weight = 1 }).validate());
     try std.testing.expectError(error.InvalidEmbeddingGemma2TrainingShape, (Contrastive{ .queries = 1, .candidates = 1, .width = 769, .temperature = 0.05, .objective_weight = 1 }).validate());
+}
+
+test "embeddinggemma2 CUDA packed column split preserves BF16 bits and row tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = try Context.initDefault();
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    var host: [17 * 11]u16 = undefined;
+    for (&host, 0..) |*value, i| value.* = @intCast(i * 17);
+    var input = try Buffer.alloc(&ctx, @sizeOf(@TypeOf(host)));
+    defer input.free(&ctx);
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&host));
+    var outputs: [3]Buffer = @splat(.{});
+    defer for (&outputs) |*output| output.free(&ctx);
+    const widths = [3]u32{ 3, 5, 3 };
+    for (&outputs, widths) |*output, width| output.* = try Buffer.alloc(&ctx, 17 * width * 2);
+    try module.launchSplitColumns(&ctx, outputs, input, 17, widths);
+    var offset: usize = 0;
+    for (outputs, widths) |output, width| {
+        var values: [17 * 5]u16 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(values[0 .. 17 * width]));
+        try ctx.synchronize();
+        for (0..17) |row| try std.testing.expectEqualSlices(u16, host[row * 11 + offset ..][0..width], values[row * width ..][0..width]);
+        offset += width;
+    }
+}
+
+test "embeddinggemma2 CUDA extended flash matches scalar attention with mask holes and tile tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = try Context.initDefault();
+    defer ctx.deinit();
+    if (!artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    for ([_]u32{ 64, 65, 129, 513 }) |sequence| {
+        for ([_]bool{ false, true }) |local| {
+            const shape = Attention{ .batch = 2, .seq = sequence, .q_heads = 4, .kv_heads = if (local) 2 else 1, .head_dim = if (local) 256 else 512, .local_radius = if (local) 512 else 0 };
+            const q_count = @as(usize, shape.batch) * sequence * shape.q_heads * shape.head_dim;
+            const kv_count = @as(usize, shape.batch) * sequence * shape.kv_heads * shape.head_dim;
+            const host = try allocator.alloc(u16, q_count);
+            defer allocator.free(host);
+            for (host, 0..) |*value, i| value.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(i % 31)) / 64 - 0.25)) >> 16);
+            const masks = try allocator.alloc(i64, shape.batch * sequence);
+            defer allocator.free(masks);
+            for (masks, 0..) |*value, i| value.* = @intFromBool(i % 17 != 0 and i % sequence < sequence - 3);
+            var q = try Buffer.alloc(&ctx, q_count * 2);
+            defer q.free(&ctx);
+            var k = try Buffer.alloc(&ctx, kv_count * 2);
+            defer k.free(&ctx);
+            var v = try Buffer.alloc(&ctx, kv_count * 2);
+            defer v.free(&ctx);
+            var mask = try Buffer.alloc(&ctx, masks.len * 8);
+            defer mask.free(&ctx);
+            var expected = try Buffer.alloc(&ctx, q_count * 2);
+            defer expected.free(&ctx);
+            var actual = try Buffer.alloc(&ctx, q_count * 2);
+            defer actual.free(&ctx);
+            try q.copyFromHost(&ctx, std.mem.sliceAsBytes(host));
+            try k.copyFromHost(&ctx, std.mem.sliceAsBytes(host[0..kv_count]));
+            try v.copyFromHost(&ctx, std.mem.sliceAsBytes(host[0..kv_count]));
+            try mask.copyFromHost(&ctx, std.mem.sliceAsBytes(masks));
+            try module.launchAttention(&ctx, expected, q, k, v, mask, shape);
+            try module.launchLocalFlashAttention(&ctx, actual, q, k, v, mask, shape);
+            const reference = try allocator.alloc(u16, q_count);
+            defer allocator.free(reference);
+            const result = try allocator.alloc(u16, q_count);
+            defer allocator.free(result);
+            try expected.copyToHost(&ctx, std.mem.sliceAsBytes(reference));
+            try actual.copyToHost(&ctx, std.mem.sliceAsBytes(result));
+            try ctx.synchronize();
+            for (reference, result) |want, got| {
+                const x: f32 = @bitCast(@as(u32, want) << 16);
+                const y: f32 = @bitCast(@as(u32, got) << 16);
+                try std.testing.expectApproxEqAbs(x, y, 0.005);
+            }
+        }
+    }
 }

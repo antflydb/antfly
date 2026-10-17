@@ -545,3 +545,21 @@ is a conservative policy envelope, not measured driver memory. NVIDIA hardware
 qualification must check that envelope against completed-driver memory deltas.
 See NVIDIA's [NVDEC programming guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/nvdec-video-decoder-api-prog-guide/index.html)
 for decode/output surface allocation behavior.
+
+### CUDA staged frame cohorts
+
+The EmbeddingGemma 2 NVDEC consumer converts each selected coded picture to owned
+RGB storage and records a CUDA event before resize/projection. Surface unmapping
+waits for that event, so subsequent vision work does not hold the decoder surface
+and CPU/NVDEC decoding can overlap queued vision execution. Consumer failures
+still drain all queued reads before unmapping.
+
+Repeated model samples of one coded picture share staging and vision projection;
+the projected token rows and timestamps are repeated in their original logical
+order. The default singleton route transfers its hidden tensor directly into the
+tower. The image-batch qualification profile permits bounded cohorts of four
+compatible pictures, flushes geometry changes and the final partial cohort, and
+preserves the 32-frame/model-token limits. Cleanup drains failed work and owns all
+partial staging slots. Batched cuDNN plans preserve independent attention per
+picture. Profile identity and NVIDIA qualification are documented in
+[CUDA_TUNING.md](../../pkg/inference/CUDA_TUNING.md#embeddinggemma-2-encoder-optimization-profiles).
