@@ -120,9 +120,12 @@ pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
     alloc.free(chunks);
 }
 
-/// The minimal/test owner has no model-aware media chunking runtime. Preserve
-/// the provider boundary without silently substituting text-only chunking.
-pub fn chunkInputWithConfigJsonAndProvider(_: Allocator, _: anytype, _: []const u8, _: anytype) error{UnsupportedPlatform}![]Chunk {
+/// Model-aware chunking belongs to the inference owner. Keep the control-side
+/// interface available without importing its physical implementation.
+pub fn chunkInputWithConfigJsonAndProvider(alloc: Allocator, _: anytype, config_json: []const u8, _: anytype) ![]Chunk {
+    var cfg = try chunking_types.parseConfigFromSlice(alloc, config_json);
+    defer cfg.deinit(alloc);
+    if (cfg.embedding == null or cfg.provider != .antfly) return error.InvalidChunkerConfig;
     return error.UnsupportedPlatform;
 }
 
@@ -229,4 +232,16 @@ test "chunker stub rejects antfly configured chunking" {
             \\{"provider":"antfly","model":"fixed"}
         ),
     );
+}
+
+test "chunker stub model-aware input retains validation without byte chunk fallback" {
+    try std.testing.expectError(error.UnsupportedPlatform, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"antfly","embedding":{"model":"model"}}
+    , null));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"antfly","model":"fixed"}
+    , null));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"mock","embedding":{"model":"model"}}
+    , null));
 }
