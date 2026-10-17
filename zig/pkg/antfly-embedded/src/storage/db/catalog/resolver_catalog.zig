@@ -455,7 +455,9 @@ pub const ResolverConfig = struct {
 
 /// Extended catalogs carry an explicit envelope. Pre-epoch readers parse only
 /// arrays, so they reject this shape even when they ignore unknown row fields.
-fn catalogRows(value: std.json.Value) !std.json.Value {
+/// Borrow the definition rows from a validated legacy array or reader envelope.
+/// The returned view has the lifetime of the caller's parsed JSON document.
+pub fn catalogRows(value: std.json.Value) !std.json.Value {
     if (value == .array) return value;
     if (value != .object) return error.InvalidResolverConfig;
     const version = value.object.get("version") orelse return error.InvalidResolverConfig;
@@ -466,9 +468,16 @@ fn catalogRows(value: std.json.Value) !std.json.Value {
 }
 
 pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]u8 {
+    return serializeCatalogWithMinimumVersion(alloc, resolvers, 1);
+}
+
+/// Preserve a loaded catalog's envelope independently of the feature versions
+/// inferred from its current definitions (which may now be empty).
+pub fn serializeCatalogWithMinimumVersion(alloc: Allocator, resolvers: []const ResolverConfig, minimum: u32) ![]u8 {
+    if (minimum == 0 or minimum > supported_reader_version) return error.UnsupportedResolverCatalogVersion;
     const rows = try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
     errdefer alloc.free(rows);
-    const version = try catalogReaderVersion(alloc, rows);
+    const version = @max(minimum, try catalogReaderVersion(alloc, rows));
     if (version == 1) return rows;
     const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, rows });
     alloc.free(rows);
@@ -909,4 +918,21 @@ test "graph ttl migration catalog epoch remains authoritative with replacement f
     try std.testing.expectEqual(@as(u32, 4), try catalogReaderVersion(a, fenced));
     try std.testing.expectEqualStrings("4", try readerVersionBytes(4));
     try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(5));
+}
+
+test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 1, 2, 3, 4 }) |version| {
+        const encoded = try serializeCatalogWithMinimumVersion(a, &.{}, version);
+        defer a.free(encoded);
+        try std.testing.expectEqual(version, try catalogReaderVersion(a, encoded));
+        const definitions = try deserializeCatalog(a, encoded);
+        defer a.free(definitions);
+        try std.testing.expectEqual(@as(usize, 0), definitions.len);
+        const roundtrip = try serializeCatalogWithMinimumVersion(a, definitions, version);
+        defer a.free(roundtrip);
+        try std.testing.expectEqualStrings(encoded, roundtrip);
+    }
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 0));
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 5));
 }

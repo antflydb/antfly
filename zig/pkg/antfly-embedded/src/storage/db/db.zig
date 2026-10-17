@@ -134147,6 +134147,96 @@ test "db ordered artifact inventory producer pages resume after restart without 
     }
 }
 
+test "db ordered artifact inventory reader epoch upgrade refreshes digest and immutable plans" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("reader-upgrade-inventory");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    // Establish a certified old catalog and retain its immutable foreground view.
+    const before = before: {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try inventory.refresh(&txn);
+        const binding = try inventory.local(&txn);
+        try txn.commit();
+        break :before binding;
+    };
+    var old = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer old.release();
+    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, 4);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const after = try inventory.local(&read);
+    try std.testing.expectEqual(before.epoch + 1, after.epoch);
+    const catalogs = try inventory.catalogs(&read);
+    try std.testing.expectEqualStrings("{\"version\":4,\"resolvers\":[]}", catalogs.resolvers);
+    try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(catalogs));
+    var current = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer current.release();
+    try std.testing.expect(current.plan() != old.plan());
+    try std.testing.expect(current.plan().matchesArtifactInventory(catalogs));
+    try std.testing.expect(!old.plan().matchesArtifactInventory(catalogs));
+    // The old plan remains valid for its pinned generation; a no-op upgrade
+    // neither advances the inventory epoch nor rebuilds the new plan.
+    try std.testing.expect(old.plan().matchesArtifactInventory(old.plan().artifact_catalogs.?));
+    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, 4);
+    var again = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer again.release();
+    try std.testing.expect(again.plan() == current.plan());
+    var latest = try db.core.store.beginReadTxn();
+    defer latest.abort();
+    try std.testing.expectEqual(after.epoch, (try inventory.local(&latest)).epoch);
+}
+
+test "db ordered artifact inventory graph TTL definitions retain reader envelope across mutations and reopen" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("ttl-inventory-envelope");
+    defer tmp.cleanup();
+    const Check = struct {
+        fn loaded(db: *DB) !void {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try inventory.local(&read);
+            const catalogs = try inventory.catalogs(&read);
+            // Shard transition admission consumes both the exact binding and
+            // its definition identity, not just loaded-index matching.
+            const command: inventory.Command = .{
+                .namespace = @splat(7),
+                .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(std.testing.allocator) },
+                .catalogs = catalogs,
+            };
+            try command.validate();
+            try std.testing.expectEqual(@as(u32, 4), try resolver_catalog_mod.catalogReaderVersion(std.testing.allocator, catalogs.resolvers));
+            try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(catalogs));
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try std.testing.expect(plan.plan().matchesArtifactInventory(catalogs));
+        }
+    };
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+        try Check.loaded(&db);
+        try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body" });
+        try Check.loaded(&db);
+        try std.testing.expect(try db.deleteIndex("g"));
+        // Removing the last TTL index cannot erase a permanent format fence.
+        try Check.loaded(&db);
+    }
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try Check.loaded(&db);
+    }
+    var readonly = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly });
+    defer readonly.close();
+    try Check.loaded(&readonly);
+}
+
 test "db ordered artifact inventory obsolete producer work is bounded and preserves pinned readers" {
     const alloc = std.testing.allocator;
     const publication = @import("artifact_publication.zig");
