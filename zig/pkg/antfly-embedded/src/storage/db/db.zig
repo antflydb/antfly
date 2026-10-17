@@ -40304,22 +40304,25 @@ pub const DB = struct {
                 if (directory.find(name)) |field| selected_bytes +|= field.length;
             }
             if (selected_bytes >= proof.bytes / 2) return null;
-            // Non-range backends borrow the body once, avoiding repeated full
-            // value reads for separate projected fields. Lite reads extents.
-            const body = if (!scope.supportsRange()) try scope.get(physical) else null;
             const output = try a.alloc(projection.FieldValue, fields.len);
+            var ranges: [512]@import("../value_ranges.zig").Range = undefined;
+            var values: [512][]const u8 = undefined;
+            var expected: [512][32]u8 = undefined;
             var count: usize = 0;
             for (fields) |name| if (directory.find(name)) |field| {
-                const value = if (body) |bytes| blk: {
-                    if (field.offset > bytes.len or field.length > bytes.len - field.offset) return error.InvalidDocumentContentAuthority;
-                    break :blk bytes[@intCast(field.offset)..][0..@intCast(field.length)];
-                } else try scope.getRange(physical, field.offset, std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority);
-                var digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
-                if (!std.mem.eql(u8, &digest, &field.digest)) return error.InvalidDocumentContentAuthority;
-                output[count] = .{ .name = field.name, .value = value };
+                if (count == ranges.len) return error.InvalidBatch;
+                ranges[count] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
+                expected[count] = field.digest;
+                output[count] = .{ .name = field.name, .value = undefined };
                 count += 1;
             };
+            try scope.getRanges(physical, ranges[0..count], values[0..count]);
+            for (values[0..count], expected[0..count], output[0..count]) |value, hash, *field| {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+                if (!std.mem.eql(u8, &digest, &hash)) return error.InvalidDocumentContentAuthority;
+                field.value = value;
+            }
             return output[0..count];
         }
 

@@ -49,8 +49,11 @@ pub fn encode(alloc: A, sequence: u64, rows: []const View.Row, after: ?[]const u
     return encodeVersion(alloc, sequence, rows, after, .v1);
 }
 pub fn encodeVersion(alloc: A, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
+    return encodeMode(true, alloc, sequence, rows, after, version);
+}
+fn encodeMode(comptime direct: bool, alloc: A, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
     var output_budget: sources.sql_memory_budget = .{ .backing = alloc, .limit = max_bytes };
-    return encodeBounded(alloc, &output_budget, sequence, rows, after, version) catch |err| {
+    return encodeBounded(direct, alloc, &output_budget, sequence, rows, after, version) catch |err| {
         if (output_budget.exhausted) return error.RetainedReadPageTooLarge;
         // Every writer in this memory-only codec is allocating. Preserve the
         // allocator failure identity rather than leaking Writer.WriteFailed.
@@ -103,7 +106,7 @@ const RowPlan = struct {
     }
 };
 
-fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
+fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
     if (rows.len > 4096) return error.InvalidRetainedReadPage;
     var out: std.Io.Writer.Allocating = .init(output_budget.allocator());
     defer out.deinit();
@@ -207,9 +210,20 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
             var ordinals: [256]u64 = undefined;
             for (ordinals[0..count], first..) |*ordinal, index| ordinal.* = index;
             const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .read_dictionary = Columns.dictionary, .count = count, .width = width } };
-            const bytes = try spill.encodeColumnarBatchVersionAlloc(b, batch, ordinals[0..count], max_bytes, version);
-            if (!std.mem.startsWith(u8, bytes, if (version == .v1) block_magic else "NCB\x02")) return error.InvalidRetainedReadPage;
-            try blob(w, bytes);
+            if (direct) {
+                var response = out.toArrayList();
+                defer out = .fromArrayList(output_budget.allocator(), &response);
+                const prefix = response.items.len;
+                if (prefix > max_bytes - 4) return error.RetainedReadPageTooLarge;
+                try response.appendNTimes(output_budget.allocator(), 0, 4);
+                const begin = response.items.len;
+                try spill.appendColumnarBatchVersion(output_budget.allocator(), b, &response, batch, ordinals[0..count], max_bytes, version);
+                std.mem.writeInt(u32, response.items[prefix..][0..4], @intCast(response.items.len - begin), .little);
+            } else {
+                // Frozen allocation path retained only as a test oracle.
+                const bytes = try spill.encodeColumnarBatchVersionAlloc(b, batch, ordinals[0..count], max_bytes, version);
+                try blob(w, bytes);
+            }
             column += width;
         }
         first += count;
@@ -327,6 +341,17 @@ fn consumerTests() type {
             for (values) |*value| value.* = Datum.json(.{ .integer = 42 });
             const rows = try sa.alloc(View.Row, 256);
             for (rows) |*row| row.* = .{ .id = "row", .version = 1, .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = values } };
+            for ([_]spill.ColumnarVersion{ .v1, .v2 }) |version| {
+                var old: sources.sql_memory_budget = .{ .backing = a, .limit = 8 << 20 };
+                const expected = try encodeMode(false, old.allocator(), 1, rows, "after", version);
+                defer old.allocator().free(expected);
+                var direct: sources.sql_memory_budget = .{ .backing = a, .limit = 8 << 20 };
+                const actual = try encodeMode(true, direct.allocator(), 1, rows, "after", version);
+                defer direct.allocator().free(actual);
+                try std.testing.expectEqualSlices(u8, expected, actual);
+                try std.testing.expect(direct.peak < old.peak);
+                std.debug.print("RESPONSE_APPEND version={s} before_peak={d} after_peak={d} wire={d}\n", .{ @tagName(version), old.peak, direct.peak, actual.len });
+            }
             var budget: sources.sql_memory_budget = .{ .backing = a, .limit = 8 << 20 };
             const bytes = try encodeVersion(budget.allocator(), 1, rows, null, .v2);
             defer budget.allocator().free(bytes);

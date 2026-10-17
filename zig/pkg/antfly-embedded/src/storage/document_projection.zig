@@ -62,7 +62,7 @@ pub fn build(a: A, bytes: []const u8, kind: u8, digest: [32]u8) !?[]u8 {
         if (err == error.OutOfMemory) return err;
         return null;
     }) != .object_begin) return null;
-    @import("antfly-json").scanValue(temp, &scanner, bytes.len, .{ .ctx = &sink, .member_fn = Sink.member }) catch |err| {
+    @import("antfly-json").scanValue(arena.child_allocator, &scanner, bytes.len, .{ .ctx = &sink, .member_fn = Sink.member }) catch |err| {
         if (err == error.OutOfMemory) return err;
         return null;
     };

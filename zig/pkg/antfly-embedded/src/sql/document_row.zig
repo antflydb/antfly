@@ -293,9 +293,55 @@ pub const Projection = struct {
             fn member(raw: *anyopaque, name: []const u8, bytes: []const u8) !void {
                 const target: *@This() = @ptrCast(@alignCast(raw));
                 if (std.mem.eql(u8, name, "score") or std.mem.eql(u8, name, "_highlights") or !target.projection.source_slots.contains(name)) return;
+                const first = target.projection.source_slots.get(name).?;
+                const column = target.projection.columns[first];
+                const homogeneous = blk: {
+                    var slot = first;
+                    while (slot != std.math.maxInt(usize)) {
+                        const definition = target.projection.columns[slot];
+                        if (definition.type != column.type or definition.element_type != column.element_type) break :blk false;
+                        slot = target.projection.next_source[slot];
+                    }
+                    break :blk true;
+                };
+                if (homogeneous and column.type == .array and !std.mem.eql(u8, std.mem.trim(u8, bytes, " \t\r\n"), "null")) {
+                    const decoded = try @import("array_wire.zig").decodeBytesLeakyMeasured(target.alloc, column.element_type orelse return error.InvalidSqlBackendResponse, bytes, .{});
+                    const value = try target.alloc.create(@import("array_value.zig").Value);
+                    value.* = decoded.value;
+                    var slot = first;
+                    while (slot != std.math.maxInt(usize)) {
+                        const definition = target.projection.columns[slot];
+                        if (definition.type != .array or definition.element_type != column.element_type) return error.InvalidSqlBackendResponse;
+                        target.cells[slot] = catalog.Row.Cell.typedArray(value);
+                        target.presence[slot] = true;
+                        slot = target.projection.next_source[slot];
+                    }
+                    return;
+                }
+                const work = @import("memory_budget.zig").reclaimingAllocator(target.scratch);
+                var scalar = std.json.Scanner.initCompleteInput(work, bytes);
+                defer scalar.deinit();
+                const type_ = try scalar.peekNextTokenType();
+                if (type_ != .object_begin and type_ != .array_begin) {
+                    const token = try scalar.nextAllocMax(work, .alloc_if_needed, bytes.len);
+                    defer switch (token) {
+                        .allocated_string, .allocated_number => |text| work.free(text),
+                        else => {},
+                    };
+                    const value: Json = switch (token) {
+                        .string, .allocated_string => |text| .{ .string = text },
+                        .number, .allocated_number => |text| .{ .number_string = text },
+                        .true => .{ .bool = true },
+                        .false => .{ .bool = false },
+                        .null => .null,
+                        else => return error.UnexpectedToken,
+                    };
+                    if (try scalar.next() != .end_of_document) return error.UnexpectedToken;
+                    return target.put(name, value);
+                }
                 // The temporary DOM dies after this selected field; put owns
                 // all returned payloads, including exact NUMERIC coefficients.
-                var parsed = try std.json.parseFromSlice(Json, target.scratch, bytes, .{ .parse_numbers = false });
+                var parsed = try std.json.parseFromSlice(Json, @import("memory_budget.zig").reclaimingAllocator(target.scratch), bytes, .{ .parse_numbers = false });
                 defer parsed.deinit();
                 try target.put(name, parsed.value);
             }
@@ -318,7 +364,7 @@ pub const Projection = struct {
                 var scanner = std.json.Scanner.initCompleteInput(scratch, bytes);
                 defer scanner.deinit();
                 if (try scanner.peekNextTokenType() != .object_begin) return error.InvalidSqlBackendResponse;
-                try @import("antfly-json").scanValue(scratch, &scanner, bytes.len, .{ .ctx = &sink, .member_fn = Sink.member });
+                try @import("antfly-json").scanValue(@import("memory_budget.zig").reclaimingAllocator(scratch), &scanner, bytes.len, .{ .ctx = &sink, .member_fn = Sink.member });
                 if (try scanner.next() != .end_of_document) return error.InvalidSqlBackendResponse;
             },
         }
@@ -764,4 +810,61 @@ test "SQL projected document directory validates ranges identities corruption an
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL document scanner scratch remains bounded across large sibling objects" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 4, 32 }) |siblings| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try input.writer.writeAll("{\"body\":\"selected\",\"objects\":[");
+        for (0..siblings) |n| {
+            if (n != 0) try input.writer.writeByte(',');
+            try input.writer.writeByte('{');
+            for (0..8192) |i| {
+                if (i != 0) try input.writer.writeByte(',');
+                try input.writer.print("\"k\\u0065y{d}\":0", .{i});
+            }
+            try input.writer.writeByte('}');
+        }
+        try input.writer.writeAll("]}");
+        var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 1024 * 1024 };
+        const directory = (try @import("../storage/document_projection.zig").buildAuthority(budget.allocator(), input.written(), @import("../storage/internal_keys.zig").primary_kind, @splat(0))).?;
+        budget.allocator().free(directory);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        const directory_peak = budget.peak;
+        budget.peak = 0;
+        var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+        defer scratch.deinit();
+        var output = std.heap.ArenaAllocator.init(a);
+        defer output.deinit();
+        const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "body", .path = "body", .type = .string }} };
+        const projection = try Projection.initSearch(a, table, &.{"body"});
+        defer projection.deinit(a);
+        const layout = try catalog.Row.TypedLayout.init(output.allocator(), &.{"body"});
+        const row = try projection.projectSearch(output.allocator(), scratch.allocator(), layout, "doc", .{ .bytes = input.written() }, .{});
+        try std.testing.expectEqualStrings("selected", (try row.cell("body")).value.string);
+        std.debug.print("BOUNDED_DIRECTORY siblings={d} source={d} directory_peak={d} raw_peak={d}\n", .{ siblings, input.written().len, directory_peak, budget.peak });
+    }
+}
+
+test "SQL projected range planner coalesces bounded spans and restores order" {
+    const ranges = @import("../storage/value_ranges.zig");
+    const Source = struct {
+        calls: usize = 0,
+        bytes: [ranges.maximum_span * 2]u8 = @splat('x'),
+        pub fn read(self: *@This(), offset: usize, len: usize) ![]const u8 {
+            self.calls += 1;
+            if (len > ranges.maximum_span) return error.UnboundedRead;
+            return self.bytes[offset..][0..len];
+        }
+    };
+    var source: Source = .{};
+    const requested = [_]ranges.Range{ .{ .offset = 100, .length = 5 }, .{ .offset = 2, .length = 7 }, .{ .offset = 100, .length = 5 }, .{ .offset = ranges.maximum_span + 10000, .length = 6 } };
+    var output: [requested.len][]const u8 = undefined;
+    try ranges.read(source.bytes.len, &requested, &output, &source);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    for (requested, output) |range, value| try std.testing.expectEqualSlices(u8, source.bytes[@intCast(range.offset)..][0..range.length], value);
+    try std.testing.expectEqual(output[0].ptr, output[2].ptr);
+    try std.testing.expectError(error.EndOfStream, ranges.read(source.bytes.len, &.{.{ .offset = source.bytes.len, .length = 1 }}, output[0..1], &source));
 }

@@ -6399,6 +6399,41 @@ pub const NativeFile = struct {
         return if (entry.external_value_root_page != 0) try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint) else try allocator.dupe(u8, entry.value);
     }
 
+    /// Resolve the pinned document once; nearby requested fields share one
+    /// extent read and independent spans reuse the same page reader.
+    pub fn readDocumentRangesAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+        if (ranges.len != output.len or ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
+        if (ranges.len == 0) return;
+        const page = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
+        var record: ValuePageReader = undefined;
+        record.init();
+        defer record.deinit(self);
+        const entry = try decodeDocumentEntry(try record.readPayload(self, checkpoint, page, 1, .document));
+        if (!std.mem.eql(u8, entry.key, key)) return error.InvalidDocumentIndex;
+        if (entry.is_delete) return error.NotFound;
+        var reader: ValuePageReader = undefined;
+        reader.init();
+        defer reader.deinit(self);
+        const Context = struct {
+            file: *NativeFile,
+            a: Allocator,
+            checkpoint: CheckpointSlot,
+            root: u64,
+            size: usize,
+            inline_value: []const u8,
+            reader: *ValuePageReader,
+            pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                if (ctx.root == 0) return ctx.a.dupe(u8, ctx.inline_value[begin..][0..len]);
+                const bytes = try ctx.a.alloc(u8, len);
+                errdefer ctx.a.free(bytes);
+                try ctx.file.readValuePagesRangeIntoReader(ctx.root, ctx.size, begin, bytes, ctx.checkpoint, ctx.reader);
+                return bytes;
+            }
+        };
+        const size = if (entry.external_value_root_page == 0) entry.value.len else entry.external_value_len;
+        try @import("../value_ranges.zig").read(size, ranges, output, Context{ .file = self, .a = allocator, .checkpoint = checkpoint, .root = entry.external_value_root_page, .size = size, .inline_value = entry.value, .reader = &reader });
+    }
+
     /// Extents and inline slices are resolved against the caller's checkpoint.
     pub fn readDocumentRangeAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, offset: u64, length: usize) ![]u8 {
         const page_id = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
@@ -8784,23 +8819,26 @@ pub const NativeFile = struct {
     }
 
     fn readValuePagesRangeInto(self: *NativeFile, root_page_id: u64, value_len: usize, range_start: usize, out: []u8, checkpoint: CheckpointSlot) !void {
+        var reader: ValuePageReader = undefined;
+        reader.init();
+        defer reader.deinit(self);
+        return self.readValuePagesRangeIntoReader(root_page_id, value_len, range_start, out, checkpoint, &reader);
+    }
+    fn readValuePagesRangeIntoReader(self: *NativeFile, root_page_id: u64, value_len: usize, range_start: usize, out: []u8, checkpoint: CheckpointSlot, reader: *ValuePageReader) !void {
         const range_len = out.len;
         if (range_start > value_len or range_len > value_len - range_start) return error.EndOfStream;
         if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
         if (range_len == 0) return;
 
-        var reader: ValuePageReader = undefined;
-        reader.init();
-        defer reader.deinit(self);
         const root_raw = try reader.read(self, checkpoint, root_page_id, 1);
         if (root_raw[4] == @backingInt(PageKind.value_extent)) {
             const payload = try reader.payload(root_raw, .value_extent);
             if (reader.lease) |lease| if (lease.extent_entries != null) {
                 if (lease.extent_length != value_len) return error.InvalidNativeValueChain;
-                return self.readCachedExtentRange(lease, checkpoint, range_start, out, &reader);
+                return self.readCachedExtentRange(lease, checkpoint, range_start, out, reader);
             };
             const node = try reader.extentNode(payload, value_len);
-            return self.readExtentNodeRange(node, checkpoint, range_start, out, &reader);
+            return self.readExtentNodeRange(node, checkpoint, range_start, out, reader);
         }
         const root_leaf = try decodeValuePage(try reader.payload(root_raw, .value));
         if (root_leaf.next_page == 0) {
@@ -18353,4 +18391,60 @@ test "lite decoded streaming plans initialize lazy state ownership" {
     try std.testing.expectEqual(@as(?f64, 3), output.value);
     try std.testing.expect(state.allocator != null);
     try std.testing.expect(resolved.storage == null);
+}
+
+test "lite native projected range cohorts bound IO preserve order and old checkpoints" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "projected-range-cohorts.aflite");
+    defer a.free(path);
+    const bytes = try a.alloc(u8, 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    for ([_]bool{ false, true }) |indexed| {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = indexed, .no_sync = true });
+        defer file.close();
+        try file.putDocument("doc", bytes);
+        try file.putDocument("small", bytes[0..32768]);
+        var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reader.close();
+        reader.page_cache_enabled.store(false, .monotonic);
+        const checkpoint = reader.activeCheckpoint();
+        try file.putDocument("doc", "replacement");
+        var ranges: [103]@import("../value_ranges.zig").Range = undefined;
+        for (ranges[0..100], 0..) |*range, i| range.* = .{ .offset = bytes.len - 2048 + (99 - i) * 8, .length = 7 };
+        ranges[100] = ranges[0];
+        ranges[101] = .{ .offset = ranges[1].offset + 1, .length = 3 };
+        ranges[102] = .{ .offset = bytes.len, .length = 0 };
+        const before = reader.test_backing_read_bytes.load(.monotonic);
+        for (ranges) |range| {
+            const value = try reader.readDocumentRangeAlloc(a, checkpoint, "doc", range.offset, range.length);
+            defer a.free(value);
+            try std.testing.expectEqualSlices(u8, bytes[@intCast(range.offset)..][0..range.length], value);
+        }
+        const scalar_reads = reader.test_backing_read_bytes.load(.monotonic) - before;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var output: [ranges.len][]const u8 = undefined;
+        const group_before = reader.test_backing_read_bytes.load(.monotonic);
+        try reader.readDocumentRangesAlloc(arena.allocator(), checkpoint, "doc", &ranges, &output);
+        const group_reads = reader.test_backing_read_bytes.load(.monotonic) - group_before;
+        for (ranges, output) |range, value| try std.testing.expectEqualSlices(u8, bytes[@intCast(range.offset)..][0..range.length], value);
+        try std.testing.expect(group_reads * 8 < scalar_reads);
+        try std.testing.expectError(error.EndOfStream, reader.readDocumentRangesAlloc(arena.allocator(), checkpoint, "doc", &.{.{ .offset = bytes.len - 1, .length = 2 }}, output[0..1]));
+        std.debug.print("PROJECTED_COHORT indexed={any} scalar_backing={d} grouped_backing={d}\n", .{ indexed, scalar_reads, group_reads });
+        // Exercise separate cohorts sharing a reader on both the extent tree
+        // and the older linked-page layout. Each cohort restarts chain state.
+        const separated = [_]@import("../value_ranges.zig").Range{
+            .{ .offset = 4, .length = 5 },
+            .{ .offset = 4100, .length = 8192 },
+            .{ .offset = 32000, .length = 7 },
+        };
+        for ([_][]const u8{ "doc", "small" }) |key| {
+            var parts: [separated.len][]const u8 = undefined;
+            try reader.readDocumentRangesAlloc(arena.allocator(), checkpoint, key, &separated, &parts);
+            for (separated, parts) |range, value| try std.testing.expectEqualSlices(u8, bytes[@intCast(range.offset)..][0..range.length], value);
+        }
+    }
 }

@@ -321,8 +321,21 @@ Every selected range carries its own digest. Lite resolves ranges against the
 captured checkpoint. New values of at least 64 KiB and vacuum output use the
 existing extent-tree format for direct seeks; old linked chains remain readable.
 Non-range backends borrow the body once and use the same
-field offsets. Selected fields feed native SQL cells directly, without rebuilding
-a JSON object. Selecting at least half the source bytes keeps the full-body path.
+field offsets. Native range batches resolve the document once, sort ranges, and
+restore caller order after coalescing nearby fields. Each read span is at most
+256 KiB, except an isolated oversized field; retained padding across a document
+is capped at 256 KiB. Overlapping and duplicate requests share span bytes.
+Selected fields feed native SQL cells directly, without rebuilding a JSON object.
+Selecting at least half the source bytes keeps the full-body path.
+
+Root-validation workspaces use reclaimable scratch beneath SQL quotas. Completed
+sibling objects release their tables instead of accumulating in a document arena.
+Scalar fields decode directly from tokens. Fixed-width array envelopes count null
+flags, then validate and emit values in one pass. Text arrays size their payload
+before writing canonical storage;
+NUMERIC and JSONB arrays retain only their native payloads and final cell vector.
+The parsed-envelope codec remains the admission and byte-compatibility oracle,
+including lower bounds, exact numbers, NULL flags, wire size, and logical work.
 
 An ordinary leader-gated authority backfill publishes directories for older roots
 in bounded, resumable pages. Manual owners can advance the same bounded entry
@@ -340,6 +353,10 @@ at a time. Cached relation replay passes borrowed compact batches directly to
 operators; prepared RETURNING inputs also pass native batches through a lazy
 ordinal/type mapping, including memory and spilled inputs. Scalar consumers use
 one reusable row of descriptors per reader.
+Transport appends column blocks directly to the final response buffer and patches
+the existing length prefix after emission. Output admission covers the whole
+response; working allocations keep their independent bounded owner. No block wire
+buffer or ownership copy is required. Both negotiated versions retain frozen bytes.
 Native dictionaries retain physical identities through encoding. Each referenced
 entry is hashed once, equal entries coalesce, and first-use ordering preserves
 frozen v1/v2 bytes and distinct SQL NULL/JSON null lanes. Retained transport adapters

@@ -1058,3 +1058,56 @@ test "native projection refinements benchmark physical dictionary encoding" {
         std.debug.print("physical_dictionary sample={d} old_ns={d} new_ns={d} old_peak={d} new_peak={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak });
     }
 }
+
+test "native projection refinements benchmark streaming selected arrays" {
+    const a = std.testing.allocator;
+    var fixture = std.heap.ArenaAllocator.init(a);
+    defer fixture.deinit();
+    const f = fixture.allocator();
+    const count = 8192;
+    const cells = try f.alloc(Datum, count);
+    for (cells, 0..) |*cell, i| cell.* = if (i % 17 == 0) .{} else Datum.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(i)) });
+    const array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = count, .lower = -3 }}, cells, .{});
+    const input = try @import("array_wire.zig").encodeAlloc(f, array, .{});
+    const Fixture = struct {
+        fn measure(bytes: []const u8, direct: bool) !ProjectionStats {
+            var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 64 << 20 };
+            var output = std.heap.ArenaAllocator.init(budget.allocator());
+            defer output.deinit();
+            var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+            defer scratch.deinit();
+            var checksum: u64 = 0;
+            var elapsed: i96 = 0;
+            for (0..16) |_| {
+                _ = output.reset(.free_all);
+                _ = scratch.reset(.free_all);
+                const begin = now();
+                const value = if (direct)
+                    (try @import("array_wire.zig").decodeBytesLeakyMeasured(output.allocator(), .int64, bytes, .{})).value
+                else blk: {
+                    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), bytes, .{ .parse_numbers = false });
+                    // Legacy document projection cloned the selected JSON
+                    // subtree before its native cells could borrow payloads.
+                    const owned = try @import("../storage/typed_json.zig").clone(output.allocator(), parsed);
+                    break :blk (try @import("array_wire.zig").decodeBorrowed(output.allocator(), .int64, owned, .{})).value;
+                };
+                elapsed += now() - begin;
+                for (0..value.cardinality()) |i| {
+                    const cell = value.flatCell(i);
+                    checksum +%= if (cell.sql_null) 1 else @as(u64, @bitCast(cell.value.integer));
+                }
+            }
+            return .{ .ns = elapsed, .peak = budget.peak, .allocations = 0, .checksum = checksum };
+        }
+    };
+    _ = try Fixture.measure(input, false);
+    _ = try Fixture.measure(input, true);
+    for (0..5) |sample| {
+        const first = try Fixture.measure(input, sample % 2 != 0);
+        const second = try Fixture.measure(input, sample % 2 == 0);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("STREAM_ARRAY sample={d} before_ns={d} after_ns={d} before_peak={d} after_peak={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak });
+    }
+}

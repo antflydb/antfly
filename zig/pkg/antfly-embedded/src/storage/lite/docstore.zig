@@ -3246,6 +3246,23 @@ pub const Txn = struct {
             return self.scratch.allocator();
         }
 
+        pub fn getRanges(self: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+            const a = self.resultAllocator();
+            const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });
+            defer if (self.parent.prefix.len > 0) a.free(full);
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const bytes = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                const Pending = struct {
+                    a: Allocator,
+                    bytes: []const u8,
+                    pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                        return ctx.a.dupe(u8, ctx.bytes[begin..][0..len]);
+                    }
+                };
+                return @import("../value_ranges.zig").read(bytes.len, ranges, output, Pending{ .a = a, .bytes = bytes });
+            }
+            return (try self.parent.readFile()).readDocumentRangesAlloc(a, self.parent.checkpoint, full, ranges, output);
+        }
         pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
             const a = self.resultAllocator();
             const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });
@@ -6430,10 +6447,16 @@ test "lite scoped write reads preserve copied values across pending mutations" {
     try txn.put("doc", "pending");
     const pending = try scope.get("doc");
     try std.testing.expectEqualStrings("end", try scope.getRange("doc", 1, 3));
+    var spans: [3][]const u8 = undefined;
+    try scope.getRanges("doc", &.{ .{ .offset = 1, .length = 3 }, .{ .offset = 0, .length = 1 }, .{ .offset = 1, .length = 3 } }, &spans);
+    try std.testing.expectEqualStrings("end", spans[0]);
+    try std.testing.expectEqualStrings("p", spans[1]);
+    try std.testing.expectEqual(spans[0].ptr, spans[2].ptr);
     try txn.delete("doc");
     try std.testing.expectError(error.NotFound, scope.get("doc"));
     try std.testing.expectEqualStrings("disk", disk);
     try std.testing.expectEqualStrings("pending", pending);
+    try std.testing.expectEqualStrings("end", spans[0]);
     try std.testing.expectEqual(@as(u32, 0), txn.snapshot_reads.count());
 }
 

@@ -490,8 +490,16 @@ const Encoder = struct {
     a: Allocator,
     bytes: *std.ArrayList(u8),
     limit: usize,
+    base: usize = 0,
+    scratch: ?Allocator = null,
+    fn reserve(self: *Encoder, len: usize) ![]u8 {
+        if (len > self.limit -| (self.bytes.items.len - self.base)) return error.SqlProgramLimitExceeded;
+        const start = self.bytes.items.len;
+        try self.bytes.resize(self.a, start + len);
+        return self.bytes.items[start..];
+    }
     fn append(self: *Encoder, bytes: []const u8) !void {
-        if (bytes.len > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
+        if (bytes.len > self.limit -| (self.bytes.items.len - self.base)) return error.SqlProgramLimitExceeded;
         try self.bytes.appendSlice(self.a, bytes);
     }
     fn word(self: *Encoder, value: u64) !void {
@@ -513,14 +521,11 @@ const Encoder = struct {
             if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
             const numeric = @import("numeric_value.zig");
             const binary = @import("numeric_binary.zig");
-            var context: numeric.Context = .{ .alloc = self.a, .max_output_bytes = self.limit };
+            var context: numeric.Context = .{ .alloc = self.scratch orelse self.a, .max_output_bytes = self.limit };
             const length = try binary.encodedSize(&context, number.*);
             try self.append(&.{10});
             try self.word(length);
-            if (length > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
-            const start = self.bytes.items.len;
-            try self.bytes.resize(self.a, start + length);
-            var writer: std.Io.Writer = .fixed(self.bytes.items[start..]);
+            var writer: std.Io.Writer = .fixed(try self.reserve(length));
             try binary.encode(&context, number.*, &writer);
         } else if (value.array) |array| {
             if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
@@ -531,13 +536,10 @@ const Encoder = struct {
                 if (array.stored) |stored| {
                     try self.text(stored.bytes);
                 } else {
-                    var prepared = try @import("array_storage.zig").Prepared.init(self.a, array.*, .{ .values = if (self.manager) |m| m.array_limits else .{}, .wire_bytes = self.limit });
+                    var prepared = try @import("array_storage.zig").Prepared.init(self.scratch orelse self.a, array.*, .{ .values = if (self.manager) |m| m.array_limits else .{}, .wire_bytes = self.limit });
                     defer prepared.deinit();
                     try self.word(prepared.encoded_size);
-                    if (prepared.encoded_size > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
-                    const start = self.bytes.items.len;
-                    try self.bytes.resize(self.a, start + prepared.encoded_size);
-                    try prepared.writeInto(self.bytes.items[start..]);
+                    try prepared.writeInto(try self.reserve(prepared.encoded_size));
                 }
                 return;
             }
@@ -802,18 +804,26 @@ pub fn encodeColumnarBlockVersionAlloc(a: Allocator, rows: []const Row, max_byte
 /// Encode a borrowed batch one bounded column at a time. The encoded bytes
 /// are identical to the row API; neither payloads nor a row matrix are staged.
 pub fn encodeColumnarBatchVersionAlloc(a: Allocator, values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion) ![]u8 {
-    if (values.len() == 0 or values.len() > 256 or values.width() > 1024 or ordinals.len != values.len()) return error.InvalidSqlSpill;
     const work = @import("memory_budget.zig").reclaimingAllocator(a);
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(work);
-    var encoder: Encoder = .{ .compact_arrays = version == .v2, .a = work, .bytes = &bytes, .limit = max_bytes };
+    try appendColumnarBatchVersion(work, work, &bytes, values, ordinals, max_bytes, version);
+    return if (work.ptr == a.ptr and work.vtable == a.vtable) bytes.toOwnedSlice(a) else a.dupe(u8, bytes.items);
+}
+/// Append directly to a caller-owned response, retaining frozen block bytes.
+/// Output capacity belongs to output_alloc; scratch never enters that owner.
+/// On failure the initialized output prefix is restored; capacity may grow.
+pub fn appendColumnarBatchVersion(output_alloc: Allocator, scratch: Allocator, bytes: *std.ArrayList(u8), values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion) !void {
+    if (values.len() == 0 or values.len() > 256 or values.width() > 1024 or ordinals.len != values.len()) return error.InvalidSqlSpill;
+    const start = bytes.items.len;
+    errdefer bytes.shrinkRetainingCapacity(start);
+    var encoder: Encoder = .{ .compact_arrays = version == .v2, .a = output_alloc, .scratch = @import("memory_budget.zig").reclaimingAllocator(scratch), .bytes = bytes, .base = start, .limit = max_bytes };
     try encoder.append(if (version == .v1) columnar_v1_magic else columnar_v2_magic);
     try encoder.word(values.len());
     try encoder.word(values.width());
     try encoder.word(0);
     for (ordinals) |ordinal| try encoder.word(ordinal);
     try Sequential.encodeBatchColumns(&encoder, values, 0, values.len());
-    return if (work.ptr == a.ptr and work.vtable == a.vtable) bytes.toOwnedSlice(a) else a.dupe(u8, bytes.items);
 }
 /// Payload bytes and decoded metadata borrow the caller's page arena. Fetch
 /// authenticated artifact bytes into that same arena before decoding, so no
@@ -930,7 +940,7 @@ pub const Sequential = struct {
         }
     }
     fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, begin: usize, end: usize) !void {
-        var scratch = std.heap.ArenaAllocator.init(encoder.a);
+        var scratch = std.heap.ArenaAllocator.init(encoder.scratch orelse encoder.a);
         defer scratch.deinit();
         const temporary = scratch.allocator();
         // One bounded column of borrowed cells feeds the shared physical codec.
@@ -940,7 +950,7 @@ pub const Sequential = struct {
         var positions: [256]usize = undefined;
         for (positions[0 .. end - begin], begin..) |*position, index| position.* = index;
         const selected = if (begin == 0 and end == batch.len()) batch else try batch.select(temporary, positions[0 .. end - begin]);
-        var column_scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(encoder.a));
+        var column_scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(encoder.scratch orelse encoder.a));
         defer column_scratch.deinit();
         for (0..batch.width()) |column| {
             if (!column_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
@@ -4094,4 +4104,32 @@ test "SQL column batch region owners bound actual backing memory and retain only
     try std.testing.expectEqual(@as(usize, bytes.len), budget.live);
     try std.testing.expect(parent.peak < 16 << 20);
     std.debug.print("region encoder: inner_peak={d} backing_peak={d} returned={d}\n", .{ budget.peak, parent.peak, bytes.len });
+}
+
+test "SQL column batch direct append preserves frozen prefixes quotas and allocator ownership" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const aa = arena.allocator();
+            const array = try @import("array_text.zig").decodeLeaky(aa, .int64, "{9007199254740993,NULL,-7}", .{ .compact = true });
+            const rows = [_]Row{ .{ .values = &.{Datum.typedArray(&array.value)}, .keys = &.{}, .ordinal = 9 }, .{ .values = &.{.{}}, .keys = &.{}, .ordinal = 10 } };
+            const batch: @import("execution_batch.zig").Batch = .{ .rows = &.{ rows[0].values, rows[1].values } };
+            for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+                const expected = try encodeColumnarBlockVersionAlloc(aa, &rows, 1 << 20, version);
+                var output: std.ArrayList(u8) = .empty;
+                defer output.deinit(a);
+                try output.appendSlice(a, "existing response");
+                try appendColumnarBatchVersion(a, aa, &output, batch, &.{ 9, 10 }, expected.len, version);
+                try std.testing.expectEqualSlices(u8, "existing response", output.items[0..17]);
+                try std.testing.expectEqualSlices(u8, expected, output.items[17..]);
+                const before = output.items.len;
+                // Force the quota failure before any output growth allocation.
+                try std.testing.expectError(error.SqlProgramLimitExceeded, appendColumnarBatchVersion(a, aa, &output, batch, &.{ 9, 10 }, 0, version));
+                try std.testing.expectEqual(before, output.items.len);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
