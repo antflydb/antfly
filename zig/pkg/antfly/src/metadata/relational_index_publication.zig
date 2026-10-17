@@ -29,6 +29,7 @@ const shape = @import("schema_publication_shape.zig");
 const lifecycle = @import("table_lifecycle_lock.zig");
 const Allocator = std.mem.Allocator;
 const native_control = local.storage_db_relational_index_owner_control;
+const raft_control = local.storage_db_relational_index_raft_contract;
 const readers = local.common_schema_readers;
 const root_enrollment = @import("store_root_enrollment.zig");
 
@@ -1011,9 +1012,20 @@ pub const OwnerDecision = struct {
     /// attempt is not interchangeable, even if it is otherwise well formed.
     /// This is neither transport authentication nor a cancellation lease.
     pub fn nativeExecutionIdentity(self: OwnerDecision, request: OwnerRequest) !native_control.Identity {
+        return self.executionIdentity(request, .native);
+    }
+
+    pub fn raftExecutionIdentity(self: OwnerDecision, request: OwnerRequest) !raft_control.Identity {
+        return self.executionIdentity(request, .raft);
+    }
+
+    fn executionIdentity(self: OwnerDecision, request: OwnerRequest, authority: progress.Authority) !raft_control.Identity {
         if (self.disposition != .execute) return error.InvalidGenerationPublication;
         try self.requireRequest(request);
-        return (self.dispatch orelse return error.InvalidGenerationPublication).nativeIdentity(self.owner.owner);
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        const identity = try dispatch.executionIdentity(self.owner.owner, authority);
+        try dispatch.requireIncarnation(self.metadata_incarnation);
+        return identity;
     }
 
     /// Use only a binding read from the physical owner's typed inspection, not
@@ -1027,6 +1039,24 @@ pub const OwnerDecision = struct {
             else => return error.InvalidGenerationPublication,
         };
         return self.boundNativeControl(request, observed, effect);
+    }
+
+    /// The receiver obtains this decision independently and inspects the real
+    /// local job. The command contains no claimed term, position or grant bit;
+    /// committed apply must still CAS the binding against its own durable job.
+    pub fn raftControl(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !raft_control.Command {
+        const effect: raft_control.Effect = switch (request.operation) {
+            .fence => .fenced,
+            .reserve => .reserved,
+            else => return error.InvalidGenerationPublication,
+        };
+        _ = try self.raftExecutionIdentity(request);
+        try self.requireRetainedBinding(observed, .raft);
+        if (observed.phase != .fencing and observed.phase != .reserved) return error.PrivateIndexOwnerJobChanged;
+        var command: raft_control.Command = .{ .effect = effect, .binding = observed };
+        command.binding.phase = .fencing;
+        try command.validate();
+        return command;
     }
 
     pub fn nativeCancellationControl(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding, effect: CancellationControlEffect) !native_control.Command {
@@ -1116,19 +1146,12 @@ pub const OwnerDecision = struct {
     /// Immutable identity only, not live execution permission. Checkpoints use
     /// this for retained acceptance after cancellation or publication as well.
     pub fn requireRetainedNativeBinding(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding) !void {
-        const identity = self.owner.owner;
+        try self.requireRetainedBinding(observed, .native);
+    }
+
+    fn requireRetainedBinding(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding, authority: progress.Authority) !void {
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
-        _ = try observed.encode();
-        if (observed.authority != .native or !std.mem.eql(u8, &observed.id, &identity.plan_id) or
-            !std.mem.eql(u8, &observed.plan_digest, &identity.plan_digest) or
-            !std.mem.eql(u8, &observed.owner_digest, &identity.fence_digest) or observed.ordinal != identity.ordinal or
-            !observed.fence.eql(try privateIndexFence(dispatch.id, dispatch.owner)) or
-            !std.mem.eql(u8, &observed.integrity_candidate, &self.head.candidate_digest) or
-            !std.mem.eql(u8, &observed.integrity_reserved, &self.head.reservation_digest) or
-            !std.mem.eql(u8, &observed.schema_before, &dispatch.native_schema_digest) or
-            !std.mem.eql(u8, &observed.inputs_digest, &dispatch.native_inputs_digest) or
-            observed.physical_reserved.schema_version != dispatch.table_guard.owner.schema_version or
-            observed.physical_candidate.schema_version != dispatch.successor_schema_version) return error.PrivateIndexOwnerJobChanged;
+        try dispatch.requireBinding(self.head, self.owner.owner, observed, authority, self.metadata_incarnation);
     }
 
     /// Cancel a never-visited owner without loading schema-sized inputs. This
@@ -1158,21 +1181,25 @@ pub const OwnerDecision = struct {
     /// caller-chosen physical binding. A fresh decision remains a permission
     /// observation, not a lease against later metadata cancellation.
     pub fn nativeAdmission(self: OwnerDecision) !native_control.Admission {
-        return self.nativeAdmissionImpl(false);
+        return self.admissionImpl(.native, false);
     }
 
     pub fn nativeCancellationAdmission(self: OwnerDecision) !native_control.Admission {
-        return self.nativeAdmissionImpl(true);
+        return self.admissionImpl(.native, true);
     }
 
-    fn nativeAdmissionImpl(self: OwnerDecision, comptime canceling: bool) !native_control.Admission {
-        const identity = try self.nativeExecutionIdentity(.{
+    pub fn raftAdmission(self: OwnerDecision) !raft_control.Admission {
+        return self.admissionImpl(.raft, false);
+    }
+
+    fn admissionImpl(self: OwnerDecision, authority: progress.Authority, comptime canceling: bool) !raft_control.Admission {
+        const identity = try self.executionIdentity(.{
             .table_id = self.head.table_id,
             .group_id = self.owner.owner.group_id,
             .id = self.head.plan_id,
             .operation = if (canceling) .cancel else .fence,
             .projection = .admission,
-        });
+        }, authority);
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         const inputs = self.inputs orelse return error.InvalidGenerationPublication;
         try inputs.requireHead(self.head);
@@ -1585,6 +1612,10 @@ pub const Inputs = struct {
     /// compiles the candidate against its actual catalog and verifies the head
     /// fingerprints; doing that compilation here as well would duplicate work.
     pub fn prepareNativeManifest(self: Inputs, a: Allocator, head: progress.Head) !native_control.Manifest {
+        return self.prepareManifest(a, head);
+    }
+
+    pub fn prepareManifest(self: Inputs, a: Allocator, head: progress.Head) !local.storage_db_relational_index_inputs.Prepared {
         try self.requireHead(head);
         try self.table_guard.validate();
         var budget: FrameBudget = .{};
@@ -1641,9 +1672,13 @@ pub const Dispatch = struct {
     owner: Owner,
 
     pub fn nativeIdentity(self: Dispatch, expected: progress.Owner) !native_control.Identity {
+        return self.executionIdentity(expected, .native);
+    }
+
+    fn executionIdentity(self: Dispatch, expected: progress.Owner, authority: progress.Authority) !raft_control.Identity {
         try self.requireOwner(expected);
-        if (self.owner.receipt_authority != .native) return error.InvalidGenerationPublication;
-        const identity: native_control.Identity = .{
+        if (self.owner.receipt_authority != authority) return error.InvalidGenerationPublication;
+        const identity: raft_control.Identity = .{
             .id = self.id,
             .plan_digest = self.plan_digest,
             .owner_digest = expected.fence_digest,
@@ -1653,6 +1688,32 @@ pub const Dispatch = struct {
         };
         try identity.validate();
         return identity;
+    }
+
+    /// Immutable provenance verification, not live permission. Recovery passes
+    /// its actual historical incarnation without fabricating an OwnerDecision.
+    pub fn requireBinding(self: Dispatch, head: progress.Head, identity: progress.Owner, observed: local.storage_db_relational_index_owner_job.Binding, authority: progress.Authority, incarnation: Digest) !void {
+        try head.validate();
+        if (head.table_id != identity.namespace.table_id or identity.ordinal >= head.owner_count or
+            !std.mem.eql(u8, &head.plan_id, &identity.plan_id) or !std.mem.eql(u8, &head.plan_digest, &identity.plan_digest)) return error.InvalidCatalogRecord;
+        try self.requireOwner(identity);
+        try self.requireIncarnation(incarnation);
+        _ = try observed.encode();
+        if (observed.authority != authority or identity.authority != authority or !std.mem.eql(u8, &observed.id, &identity.plan_id) or
+            !std.mem.eql(u8, &observed.plan_digest, &identity.plan_digest) or
+            !std.mem.eql(u8, &observed.owner_digest, &identity.fence_digest) or observed.ordinal != identity.ordinal or
+            !observed.fence.eql(try privateIndexFence(self.id, self.owner)) or
+            !std.mem.eql(u8, &observed.integrity_candidate, &head.candidate_digest) or
+            !std.mem.eql(u8, &observed.integrity_reserved, &head.reservation_digest) or
+            !std.mem.eql(u8, &observed.schema_before, &self.native_schema_digest) or
+            !std.mem.eql(u8, &observed.inputs_digest, &self.native_inputs_digest) or
+            observed.physical_reserved.schema_version != self.table_guard.owner.schema_version or
+            observed.physical_candidate.schema_version != self.successor_schema_version) return error.PrivateIndexOwnerJobChanged;
+    }
+
+    fn requireIncarnation(self: Dispatch, expected: Digest) !void {
+        const incarnation = std.fmt.bytesToHex(self.table_guard.incarnation, .lower);
+        if (!std.mem.eql(u8, &expected, &incarnation)) return error.GenerationPublicationChanged;
     }
 
     fn requireOwner(d: Dispatch, expected: progress.Owner) !void {
@@ -2416,6 +2477,116 @@ test "relational index publication signatures bind owner authority position and 
     }
 }
 
+test "relational index publication Raft decisions bind immutable admission and explicit authority" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const plan = try testPlan(arena.allocator());
+    var prepared = try plan.prepare(a);
+    defer prepared.deinit();
+    var dispatch = try std.json.parseFromSlice(Dispatch, a, prepared.dispatch[0], .{});
+    defer dispatch.deinit();
+    var inputs = try std.json.parseFromSlice(Inputs, a, prepared.inputs, .{});
+    defer inputs.deinit();
+    var decision: OwnerDecision = .{
+        .metadata_group_id = 13,
+        .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower),
+        .head = prepared.head,
+        .owner = prepared.owners[0],
+        .disposition = .execute,
+        .dispatch = dispatch.value,
+        .inputs = inputs.value,
+    };
+    try std.testing.expectEqual(.raft, decision.owner.owner.authority);
+    const admission = try decision.raftAdmission();
+    try admission.validate();
+    var foreign_cluster = decision;
+    foreign_cluster.metadata_incarnation = @splat('f');
+    try std.testing.expectError(error.GenerationPublicationChanged, foreign_cluster.raftAdmission());
+    var manifest = try inputs.value.prepareManifest(a, prepared.head);
+    defer manifest.deinit();
+    const decoded = try local.storage_db_relational_index_inputs.decode(manifest.bytes);
+    try std.testing.expectEqualStrings(plan.before.schema_json, decoded.before_json);
+    try std.testing.expectEqualStrings(plan.after.schema_json, decoded.after_json);
+    try std.testing.expectError(error.InvalidGenerationPublication, decision.nativeAdmission());
+    decision.inputs = null;
+    try std.testing.expectError(error.InvalidGenerationPublication, decision.raftAdmission());
+    const request: OwnerRequest = .{ .table_id = plan.before.table_id, .group_id = plan.owners[0].range.group_id, .id = plan.id, .operation = .fence };
+    const identity = try decision.raftExecutionIdentity(request);
+    try std.testing.expectEqual(admission.id, identity.id);
+    try std.testing.expectEqual(admission.owner_digest, identity.owner_digest);
+    try std.testing.expectError(error.InvalidGenerationPublication, decision.nativeExecutionIdentity(request));
+    // Projection conversion only. This binding and the supplied logical cuts
+    // are not storage evidence, a root signature or distributed qualification.
+    const binding: local.storage_db_relational_index_owner_job.Binding = .{
+        .id = admission.id,
+        .plan_digest = admission.plan_digest,
+        .owner_digest = admission.owner_digest,
+        .ordinal = admission.ordinal,
+        .authority = .raft,
+        .fence = admission.fence,
+        .integrity_before = admission.fence.catalog_digest,
+        .integrity_reserved = admission.reservation_digest,
+        .integrity_candidate = admission.candidate_digest,
+        .schema_before = dispatch.value.native_schema_digest,
+        .physical_before = null,
+        .physical_reserved = .{ .revision = 2, .schema_version = 1, .blob_digest = @splat(4) },
+        .physical_candidate = .{ .revision = 2, .schema_version = 2, .blob_digest = @splat(5) },
+        .index = .{ .generation = 2, .slot = 0 },
+        .inputs_digest = dispatch.value.native_inputs_digest,
+    };
+    const fence = try decision.raftControl(request, binding);
+    foreign_cluster = decision;
+    foreign_cluster.metadata_incarnation = @splat('f');
+    try std.testing.expectError(error.GenerationPublicationChanged, foreign_cluster.raftControl(request, binding));
+    try std.testing.expectEqual(.fenced, fence.effect);
+    try std.testing.expectEqualDeep(binding, fence.binding);
+    try std.testing.expect(fence.inputs_b64 == null);
+    inline for (.{ "id", "plan_digest", "owner_digest", "integrity_reserved", "integrity_candidate", "schema_before", "inputs_digest" }) |field| {
+        var changed = binding;
+        @field(changed, field)[0] ^= 1;
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, decision.raftControl(request, changed));
+    }
+    var changed = binding;
+    changed.authority = .native;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, decision.raftControl(request, changed));
+    changed = binding;
+    changed.phase = .installed;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, decision.raftControl(request, changed));
+    var wrong = request;
+    wrong.group_id += 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, decision.raftControl(wrong, binding));
+    wrong = request;
+    wrong.operation = .build;
+    try std.testing.expectError(error.InvalidGenerationPublication, decision.raftControl(wrong, binding));
+    const acknowledged = try progress.acknowledge(decision.head, decision.owner, decision.head.revision, .{
+        .owner = decision.owner.owner,
+        .action = .fenced,
+        .position = .{ .raft = .{ .term = 7, .index = 2 } },
+        .candidate_digest = admission.candidate_digest,
+        .reservation_digest = admission.reservation_digest,
+        .evidence_digest = @splat(9),
+    });
+    decision.head = acknowledged.head;
+    decision.owner = acknowledged.owner;
+    var reserve_request = request;
+    reserve_request.operation = .reserve;
+    var reserved = binding;
+    reserved.phase = .reserved;
+    const reserve = try decision.raftControl(reserve_request, reserved);
+    try std.testing.expectEqual(.reserved, reserve.effect);
+    try std.testing.expectEqual(.fencing, reserve.binding.phase);
+    try std.testing.expectEqual(.reserved, reserved.phase);
+    try std.testing.expectEqualDeep(binding, reserve.binding);
+    decision.disposition = .acknowledged;
+    try std.testing.expectError(error.InvalidGenerationPublication, decision.raftControl(reserve_request, reserved));
+    try dispatch.value.requireBinding(decision.head, decision.owner.owner, reserved, .raft, decision.metadata_incarnation);
+    try std.testing.expectError(error.GenerationPublicationChanged, dispatch.value.requireBinding(decision.head, decision.owner.owner, reserved, .raft, @splat('f')));
+    var wrong_head = decision.head;
+    wrong_head.plan_id[0] ^= 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, dispatch.value.requireBinding(wrong_head, decision.owner.owner, reserved, .raft, decision.metadata_incarnation));
+}
+
 test "relational index publication native dispatch binds exact admitted fence and packs raw manifest without recompilation" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -2432,7 +2603,7 @@ test "relational index publication native dispatch binds exact admitted fence an
     defer inputs.deinit();
     const decision: OwnerDecision = .{
         .metadata_group_id = 13,
-        .metadata_incarnation = @splat('1'),
+        .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower),
         .head = prepared.head,
         .owner = prepared.owners[0],
         .disposition = .execute,
@@ -2440,6 +2611,10 @@ test "relational index publication native dispatch binds exact admitted fence an
         .inputs = inputs.value,
     };
     const admission = try decision.nativeAdmission();
+    try std.testing.expectError(error.InvalidGenerationPublication, decision.raftAdmission());
+    var foreign_cluster = decision;
+    foreign_cluster.metadata_incarnation = @splat('f');
+    try std.testing.expectError(error.GenerationPublicationChanged, foreign_cluster.nativeAdmission());
     const request: OwnerRequest = .{
         .table_id = plan.before.table_id,
         .group_id = native_owner[0].range.group_id,

@@ -10441,3 +10441,59 @@ Checkpoint validation (Debug):
 - Source licensing, the 2,067-source Apache boundary, formatting, generated
   control-source catalog and immutable original inventory audit pass. Cache GC
   was previewed only; no caches or user data were deleted.
+
+### Authority-specific metadata binding and coherent Raft owner inspection
+
+Immutable index-owner identity is now a shared data-only contract, not a native
+execution capability. Native and Raft metadata conversion use the same immutable
+plan/owner/fence/schema/input binding checks, with explicit authority on every
+entry point. Native facades retain their existing shape. Raft admission accepts
+only a matching admission projection; hot fence/reserve commands need no manifest
+and canonicalize only the command copy, never the observed durable job phase.
+The manifest constructor is shared without repeating candidate compilation.
+Execution also binds the metadata cluster incarnation to the immutable catalog
+guard. Historical journal verification uses a pure dispatch/binding verifier
+with the actual recorded incarnation, not a fabricated zero-incarnation execution
+decision. The verifier separately checks the head/owner/plan linkage; matching
+historical provenance remains distinct from current permission. Native producer
+fixtures now derive their incarnation from the same guard, and both authority
+paths explicitly reject a valid but foreign cluster incarnation.
+
+The Raft owner inspection entry point takes the trusted actual group separately
+from the metadata identity. A single read snapshot checks the persisted namespace
+and Raft authority, exact job identity, phase receipts, applied watermark, topology
+fence, immutable inputs and schema/catalog preimage. It rejects hidden restore
+staging, mismatched identities and corrupt cuts; it never creates a receipt or
+advances the native clock. Absence is information, not permission or a cancel ACK.
+
+The metadata projection tests exercise both authority paths, admitted manifest
+identity, wrong-authority/request/binding rejection and reserved retries. Their
+synthetic bindings and supplied logical positions are conversion fixtures, NOT
+storage or distributed evidence. The LSM kernel contract separately verifies real
+owner inspection before/after admission, fencing and reservation, through cold
+reopen and receipt corruption, plus group/namespace/staging/native-alias rejection.
+
+The independently authorized receiver and compiled-owner observation/preparation
+bridge remain to be mounted. They must preserve the actual leader term and owner
+scope through protocol admission and recheck the decision/binding before proposal.
+Full source/build/claim/install/cancel/standby processing still needs real tagged
+positions throughout, retained recovery and distributed fault qualification.
+Qualification must also cover a busy drain rejection followed by transaction
+resolution and retry through the real server delegate, including both store
+watermarks and typed proposal outcomes, not only supplied-entry kernel calls.
+PrepareCut's unsupported-Raft guard and generic proposal nonadmission are unchanged;
+no standalone reporter namespace or retirement activation is enabled. Original
+dispositions remain 531 implemented / 132 rejected / 113 superseded / 810 unresolved.
+
+Final Debug evidence: full publication gate 72 contracts plus the coordinated
+decoder-floor companion, 60/60 steps, in
+`/private/tmp/antfly-sql-raft-index-metadata-scoped-history-debug.log`; focused real-store
+inspection contract 51/51 steps in
+`/private/tmp/antfly-sql-raft-index-owner-inspection-debug.log`; native ABI compatibility
+six contracts, 52/52 steps, in
+`/private/tmp/antfly-sql-raft-index-shared-identity-capi-debug.log`. These gates report
+no skips, failures or leaks. The full index gate passes 274 contracts plus its
+Raft snapshot companion, 51/51 steps, without skips/failures/leaks, in
+`/private/tmp/antfly-sql-raft-index-owner-inspection-full-debug.log`.
+Source boundary and generated control catalog checks
+pass; the Apache boundary now covers 2,068 source files.

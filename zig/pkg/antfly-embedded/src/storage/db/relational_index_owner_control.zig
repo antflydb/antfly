@@ -45,23 +45,7 @@ pub const Manifest = inputs.Prepared;
 
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 
-/// Metadata's immutable owner identity, without physical allocation choices or
-/// schema-sized inputs. Status is information, never publication permission.
-pub const Identity = struct {
-    id: [16]u8,
-    plan_digest: [32]u8,
-    owner_digest: [32]u8,
-    ordinal: u16,
-    namespace: @import("doc_identity.zig").Namespace,
-    owner_group_id: u64,
-
-    pub fn validate(self: Identity) !void {
-        if (std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.plan_digest, 0) or
-            std.mem.allEqual(u8, &self.owner_digest, 0) or self.owner_group_id == 0 or
-            self.namespace.table_id == 0 or self.namespace.shard_id == 0 or self.namespace.range_id == 0 or
-            self.ordinal >= @import("relational_index_publication_progress.zig").max_owners) return error.InvalidPrivateIndexOwnerJob;
-    }
-};
+pub const Identity = @import("relational_index_owner_identity.zig").Identity;
 
 /// Read-only canonical source observation. Absence and pending mirrors are
 /// information only; neither can produce a source-batch signature or ACK.

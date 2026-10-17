@@ -35,6 +35,7 @@ const Entry = receipts.OrderedApplyReceipt;
 const contract = @import("relational_index_raft_contract.zig");
 pub const Effect = contract.Effect;
 pub const Command = contract.Command;
+pub const Identity = contract.Identity;
 pub const validateBatchRequest = contract.validateBatchRequest;
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 pub const prefix = jobs.key ++ ":raft:";
@@ -151,6 +152,22 @@ fn currentState(txn: anytype, binding: jobs.Binding) !jobs.Binding {
     try requireCuts(txn, current);
     if (current.phase == .reserved) try jobs.requireReserved(txn, current);
     return current;
+}
+
+/// Coherent bounded observation for an independently authorized receiver.
+/// Absence grants nothing. Existing jobs must verify their durable phase cuts
+/// and catalog preimage in this same snapshot, not just deserialize a binding.
+pub fn inspect(txn: anytype, expected: Identity) !?jobs.Binding {
+    try expected.validate();
+    const actual = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+    if (!actual.eql(expected.namespace)) return error.IdentityNamespaceMismatch;
+    _ = try authority.require(txn, .raft, @import("online_source_contract.zig").namespaceBytes(actual));
+    const binding = (try jobs.load(txn)) orelse return null;
+    if (binding.authority != .raft or !std.mem.eql(u8, &binding.id, &expected.id) or
+        !std.mem.eql(u8, &binding.plan_digest, &expected.plan_digest) or
+        !std.mem.eql(u8, &binding.owner_digest, &expected.owner_digest) or binding.ordinal != expected.ordinal or
+        !binding.fence.namespace.eql(expected.namespace) or binding.fence.owner_group_id != expected.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+    return try currentState(txn, binding);
 }
 
 /// Read-only recovery never mints a cut from the current term/index.

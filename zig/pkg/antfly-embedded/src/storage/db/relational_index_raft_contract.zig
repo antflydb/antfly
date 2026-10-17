@@ -19,6 +19,8 @@ const jobs = @import("relational_index_owner_job.zig");
 const inputs = @import("relational_index_inputs.zig");
 
 pub const Effect = enum(u8) { admitted, fenced, reserved };
+pub const Identity = @import("relational_index_owner_identity.zig").Identity;
+pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 /// A control is one isolated store transaction. Reflect the request's default
 /// shape so future effects cannot accidentally be silently ignored here.
 pub fn validateBatchRequest(request: anytype) !void {

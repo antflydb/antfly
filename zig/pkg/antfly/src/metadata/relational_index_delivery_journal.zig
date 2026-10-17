@@ -580,14 +580,14 @@ fn anchored(reader: anytype, key: []const u8, expected: Digest) !?[]const u8 {
     } else if (nonzero(&expected)) return error.InvalidCatalogRecord;
     return bytes;
 }
-fn requireRetainedBinding(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, binding: jobs.Binding) !void {
+fn requireRetainedBinding(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, binding: jobs.Binding, incarnation: Digest) !void {
     if (binding.ordinal >= head.owner_count or binding.phase != .reserved or !std.mem.eql(u8, &binding.id, &head.plan_id) or !equal(binding.plan_digest, head.plan_digest)) return error.InvalidCatalogRecord;
     var buf: [192]u8 = undefined;
     const owner = try progress.OwnerState.decode(try reader.get(try publication.ownerKey(&buf, group, head.table_id, binding.ordinal)));
     if (owner.owner.namespace.table_id != head.table_id) return error.InvalidCatalogRecord;
     var dispatch = try publication.readDispatch(alloc, reader, group, owner.owner);
     defer dispatch.deinit();
-    try (publication.OwnerDecision{ .metadata_group_id = group, .metadata_incarnation = @splat(0), .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch.value }).requireRetainedNativeBinding(binding);
+    try dispatch.value.requireBinding(head, owner.owner, binding, .native, incarnation);
 }
 
 /// O(1) final-input projection. EOF completion freezes metadata acceptance;
@@ -668,10 +668,10 @@ pub fn verifyOwner(alloc: std.mem.Allocator, reader: anytype, group: u64, head: 
             try requireEnrollment(alloc, reader, group, complete.proof, incarnation);
             result.completed = 1;
         }
-        try requireRetainedBinding(alloc, reader, group, head, record.signed.value.data.source);
+        try requireRetainedBinding(alloc, reader, group, head, record.signed.value.data.source, incarnation);
         try requireEnrollment(alloc, reader, group, record.signed.value.proof, incarnation);
         for (record.signed.value.data.parts.items) |part| {
-            try requireRetainedBinding(alloc, reader, group, head, part.target.outcome.binding);
+            try requireRetainedBinding(alloc, reader, group, head, part.target.outcome.binding, incarnation);
             try requireEnrollment(alloc, reader, group, part.target.proof, incarnation);
         }
         result.sources = 1;
@@ -680,7 +680,7 @@ pub fn verifyOwner(alloc: std.mem.Allocator, reader: anytype, group: u64, head: 
     if (try anchored(reader, try targetKey(&buf, group, head.table_id, owner.owner.ordinal), owner.target_inventory)) |bytes| {
         const record = try TargetRecord.decode(bytes);
         if (!equal(record.inventory.metadata_incarnation, incarnation) or record.binding.ordinal != owner.owner.ordinal) return error.InvalidCatalogRecord;
-        try requireRetainedBinding(alloc, reader, group, head, record.binding);
+        try requireRetainedBinding(alloc, reader, group, head, record.binding, incarnation);
         result.targets = 1;
         result.target_rows = record.inventory.rows;
     }

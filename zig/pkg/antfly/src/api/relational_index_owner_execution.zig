@@ -2371,7 +2371,7 @@ test "relational index publication native cancellation receiver resumes one boun
     defer inputs.deinit();
     const permission: publication.OwnerDecision = .{
         .metadata_group_id = 13,
-        .metadata_incarnation = @splat('1'),
+        .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower),
         .head = try prepared.head.cancel(prepared.head.revision, .requested),
         .owner = prepared.owners[0],
         .disposition = .execute,
@@ -2446,7 +2446,7 @@ test "relational index publication native cancellation receiver uses fixed permi
     defer dispatch.deinit();
     const permission: publication.OwnerDecision = .{
         .metadata_group_id = 13,
-        .metadata_incarnation = @splat('1'),
+        .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower),
         .head = try prepared.head.cancel(prepared.head.revision, .requested),
         .owner = prepared.owners[0],
         .disposition = .execute,
@@ -2516,7 +2516,7 @@ test "relational index publication claim receiver binds fresh build permission w
     defer dispatch.deinit();
     var driver: TestDriver = .{ .value = .{
         .metadata_group_id = 13,
-        .metadata_incarnation = @splat('1'),
+        .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower),
         .head = prepared.head,
         .owner = prepared.owners[0],
         .disposition = .execute,
@@ -2546,7 +2546,7 @@ test "relational index publication claim receiver binds fresh build permission w
     const seed: [32]u8 = @splat(9);
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .public_key = pair.public_key.toBytes(), .root_incarnation = 7 };
-    const root_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
+    const root_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
     driver.value.native_signing = .{
         .identity = .{ .metadata_incarnation = root_binding.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
         .reporter_incarnation = 4,
@@ -3024,7 +3024,7 @@ test "relational index publication installed receiver binds fresh decision and r
     defer dispatch.deinit();
     var inputs = try std.json.parseFromSlice(publication.Inputs, alloc, prepared.inputs, .{});
     defer inputs.deinit();
-    var driver: TestDriver = .{ .value = .{ .metadata_group_id = 13, .metadata_incarnation = @splat('1'), .head = prepared.head, .owner = prepared.owners[0], .disposition = .execute, .dispatch = dispatch.value, .inputs = inputs.value } };
+    var driver: TestDriver = .{ .value = .{ .metadata_group_id = 13, .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .head = prepared.head, .owner = prepared.owners[0], .disposition = .execute, .dispatch = dispatch.value, .inputs = inputs.value } };
     const admission = try driver.value.nativeAdmission();
     var admitted = try driver.admitNativeIndexOwner(alloc, plan.owners[0].range.group_id, plan.before.name, admission, "synthetic", .{});
     defer admitted.deinit();
@@ -3040,7 +3040,7 @@ test "relational index publication installed receiver binds fresh decision and r
     driver.value.owner.source_completed = true;
     driver.value.owner.source_delivery = @splat(9);
     var build = try native.BuildRequest.init(try driver.value.nativeExecutionIdentity(.{ .table_id = plan.before.table_id, .group_id = plan.owners[0].range.group_id, .id = plan.id, .operation = .build }), binding, .{});
-    build.target_expectation = .{ .metadata_incarnation = @splat('1'), .binding_digest = integrity.hash(&try binding.encode()), .generation = @splat(2), .completion_revision = 1, .source_consumption_digest = @splat(3), .source_progress_digest = @splat(4), .table_name_digest = integrity.hash(plan.before.name), .rows = 1, .inventory_xor = @splat(5), .provenance = @splat(6) };
+    build.target_expectation = .{ .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .binding_digest = integrity.hash(&try binding.encode()), .generation = @splat(2), .completion_revision = 1, .source_consumption_digest = @splat(3), .source_progress_digest = @splat(4), .table_name_digest = integrity.hash(plan.before.name), .rows = 1, .inventory_xor = @splat(5), .provenance = @splat(6) };
     driver.inventory_finished = true;
     driver.generation_pages = 1;
     driver.audit_pages = 1;
@@ -3055,8 +3055,8 @@ test "relational index publication installed receiver binds fresh decision and r
     const seed: [32]u8 = @splat(9);
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .public_key = pair.public_key.toBytes(), .root_incarnation = 7 };
-    const owner_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
-    driver.value.native_signing = .{ .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key }, .reporter_incarnation = 4, .binding_digest = try owner_binding.digest() };
+    const owner_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
+    driver.value.native_signing = .{ .identity = .{ .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key }, .reporter_incarnation = 4, .binding_digest = try owner_binding.digest() };
     const command: local.storage_db_relational_index_validation.InstallCommand = .{ .validation = driver.value.native_install.?.validation, .metadata_decision = driver.value.native_install.?.decision_digest, .schema_digest = @splat(3), .activation_digest = @splat(4) };
     const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 9 };
     driver.installation_response = .{ .installed = .{ .physical = validated.physical, .logical = .{ .command = command, .position = position, .duplicate = false, .receipt = try command.receipt(position) } } };
@@ -3121,7 +3121,7 @@ test "relational index publication native receiver signs pinned authority and pr
     const seed: [32]u8 = @splat(9);
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .public_key = pair.public_key.toBytes(), .root_incarnation = 7 };
-    const binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
+    const binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
     const view: publication.NativeSigningView = .{
         .identity = .{ .metadata_incarnation = binding.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
         .reporter_incarnation = 4,
@@ -3262,7 +3262,7 @@ test "relational index publication native receiver stages one effect recovers pe
     defer inputs.deinit();
     const permission: publication.OwnerDecision = .{
         .metadata_group_id = 13,
-        .metadata_incarnation = @splat('1'),
+        .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower),
         .head = prepared.head,
         .owner = prepared.owners[0],
         .disposition = .execute,

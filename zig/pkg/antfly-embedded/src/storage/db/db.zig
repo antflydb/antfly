@@ -8138,6 +8138,19 @@ pub const DB = struct {
         try txn.commit();
     }
 
+    /// The trusted owner handle supplies its actual group separately from the
+    /// independently obtained metadata identity. No physical index allocation
+    /// or mutation.
+    pub fn raftIndexOwnerState(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !?@import("relational_index_owner_job.zig").Binding {
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
+        try expected.validate();
+        if (owner_group == 0 or owner_group != expected.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return RaftIndexOwnerControl.inspect(&txn, expected);
+    }
+
     /// Recovery reads the original committed phase cut; it never uses the
     /// current leader term or invents a receipt from the latest watermark.
     pub fn raftIndexOwnerReceipt(self: *DB, owner_group: u64, binding: @import("relational_index_owner_job.zig").Binding, effect: RaftIndexOwnerControl.Effect) !?@import("relational_index_publication_progress.zig").Receipt {
