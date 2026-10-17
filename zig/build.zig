@@ -943,6 +943,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
     const antfly_main = runtime.antfly_main;
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
+    // This fixture intentionally tests the inline host implementation. Compile
+    // its function-table export in the same image, so the shared storage owner
+    // resolves to that host instead of introducing a second codec/TLS owner.
+    owner_tests.lib_standalone_runtime_tests.root_module.addImport("antfly_inference_native_exports", embedded.native_inference.root_module);
+    if (production_antfly_imports.shared_inference_core) @import("build_support/embedded/source_owner.zig").registerLocalProvider(owner_tests.lib_standalone_runtime_tests.root_module, embedded.native_inference);
     const consumer_test_metadata = @import("lib/build_info/build_support.zig").create(b, .{
         .root = b.path("lib/build_info"),
         .target = target,
