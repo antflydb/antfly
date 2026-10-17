@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from subprocess_watchdog import run_with_progress_deadline
 
 import antfly_embedded
 from antfly_embedded._library import find_library
@@ -147,20 +148,31 @@ def test_index_readiness_visible_on_open_and_status_only_handles(aflite_path) ->
 @pytest.mark.parametrize("wait_mode", ["run_until_idle", "full_index"])
 def test_external_dense_index_wait_finishes(aflite_path, wait_mode: str) -> None:
     # The DocStore unit test proves the lock order. Exercise the real Lite
-    # workload here with a child-process deadline for each wait mode.
+    # workload here with a deadline for each native call, not for all 16
+    # batches combined. A slow runner must still detect an actual stalled call.
     library = find_library()
     assert library is not None
     env = os.environ.copy()
     env["ANTFLY_LIBRARY"] = str(library)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH"))))
-    result = subprocess.run(
-        [sys.executable, __file__, str(aflite_path), wait_mode],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-        env=env,
-    )
+    try:
+        result = run_with_progress_deadline(
+            [sys.executable, __file__, str(aflite_path), wait_mode],
+            env=env,
+            progress_prefix=f"{wait_mode}:",
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # The watchdog kills and joins the child before raising. Preserve its
+        # native diagnostics; pytest otherwise reports only the command, hiding
+        # whether this was a replay stall, startup panic, or teardown failure.
+        def output(value: str | bytes | None) -> str:
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+
+        pytest.fail(
+            f"{wait_mode} made no progress for 30 seconds\nstdout:\n{output(exc.stdout)}\nstderr:\n{output(exc.stderr)}",
+            pytrace=False,
+        )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -190,14 +202,19 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                     ),
                 }
             )
-        for batch in batches:
+        for ordinal, batch in enumerate(batches):
+            print(f"{wait_mode}: batch {ordinal} write", flush=True)
             inserts = {key: {field: expand(value) for field, value in doc.items()} for key, doc in batch.items()}
             request: dict[str, object] = {"inserts": inserts}
             if wait_mode == "full_index":
                 request["sync_level"] = "full_index"
             db.batch_json(request)
             if wait_mode == "run_until_idle":
+                print(f"{wait_mode}: batch {ordinal} drain", flush=True)
                 db.run_until_idle()
+            print(f"{wait_mode}: batch {ordinal} complete", flush=True)
+        print(f"{wait_mode}: closing", flush=True)
+    print(f"{wait_mode}: closed", flush=True)
 
 
 if __name__ == "__main__":
