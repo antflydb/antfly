@@ -5591,7 +5591,8 @@ metadata-only capability negotiation reuses the exact-key spooling contract.
 A biased-estimate runtime fixture refuses indexed source reads until its filter
 is installed; the real-file cold covering join exercises the durable path.
 
-Qualification: all 1,022 SQL tests passed (three opt-in benchmarks skipped), all
+Lake-kernel qualification before the final startup/linking merge: all 1,022 SQL
+tests passed (three opt-in benchmarks skipped), all
 525 native lake tests passed, and the runtime I/O ABI gate passed with zero
 failures or leaks. All 32 runtime error ABI tests passed. This includes the
 biased-estimate indexed-probe fixture, both spill-worker orientations, wide-key
@@ -5604,5 +5605,14 @@ modes. Source/error catalogs, Zig/Python formatting, Python lint, whitespace,
 license headers and the Apache product boundary (2,285 source files) passed.
 Fixtures and server roots were isolated under the worktree.
 
-Latest fetched origin/main `68a27a0225` is merged. Real-provider retention
-qualification and representative archive-scale latency/RSS remain deferred.
+Final main integration also merged origin/main `2de3e3780c` cleanly after it
+advanced during qualification. The rebuilt CLI passed all 62 post-merge E2Es
+in 353.60 seconds: the complete 56-case real Parquet/Iceberg suite and six
+credential-rejection startup cases across standalone, metadata and data roles.
+Its SHA-256 remained
+`60ec441d33f83bdc6142587305a9b04bb3f04254a6f3f6d051dd79ee9cc9f501`.
+The standalone runtime/linking gate passed, including the inline inference
+provider fixture, production-linked ABI probe and localhost TLS fixtures.
+Post-merge source/error catalog and Apache boundary checks passed. Real-provider
+retention qualification and representative archive-scale latency/RSS remain
+deferred.
