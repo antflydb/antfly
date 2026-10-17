@@ -252,6 +252,36 @@ pub const Batch = union(enum) {
     }
 };
 
+/// Operator-owned descriptors; decoded payloads and expression results belong
+/// to the caller's evaluation region. Never reset that region with the row.
+/// Each operator retains at most one vector, bounded by its bound schema width.
+pub const ScalarRow = struct {
+    values: std.ArrayList(scalar.Datum) = .empty,
+
+    pub fn deinit(self: *ScalarRow, a: A) void {
+        self.values.deinit(a);
+    }
+
+    pub fn prepare(self: *ScalarRow, owner: A, width: usize) ![]scalar.Datum {
+        if (self.values.items.len != width) {
+            try self.values.resize(owner, width);
+            @memset(self.values.items, .{});
+        }
+        return self.values.items;
+    }
+
+    pub fn fill(self: *ScalarRow, owner: A, payload: A, program: *const scalar.Program, batch: Batch, row_index: usize) ![]const scalar.Datum {
+        _ = try self.prepare(owner, batch.width());
+        // Binding already deduplicates dependencies. The evaluator reads only
+        // these slots, so other slots need neither decoding nor clearing.
+        for (program.required_columns) |column| {
+            if (column >= self.values.items.len) return error.InvalidSqlBackendResponse;
+            self.values.items[column] = try batch.cell(payload, row_index, column);
+        }
+        return self.values.items;
+    }
+};
+
 fn selectedDictionaryScenario(a: A) !void {
     const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
     const source: Batch = .{ .columns = .{ .definitions = &definitions, .page = .{
@@ -310,4 +340,41 @@ test "external lake mapped batches retain exact NUMERIC declarations before coer
         try std.testing.expectEqualStrings(text, try @import("numeric_value.zig").format(&context, value.numeric.?.*));
     }
     try std.testing.expect((try mapped.cell(a, 2, 0)).sql_null);
+}
+
+test "SQL scalar row descriptors reuse bounded storage without retiring expression results" {
+    const Fixture = struct {
+        fn read(_: *anyopaque, _: A, index: usize, column: usize) !scalar.Datum {
+            if (column != 127) return error.UnexpectedColumn;
+            return scalar.Datum.json(.{ .string = if (index % 2 == 0) "abcdef" else "ghijkl" });
+        }
+        fn run(a: A) !void {
+            var names: [128][16]u8 = undefined;
+            var columns: [128]scalar.Column = undefined;
+            for (&columns, &names, 0..) |*column, *name, index| column.* = .{ .name = try std.fmt.bufPrint(name, "unused{d}", .{index}), .type = .string };
+            columns[127] = .{ .name = "k", .type = .string };
+            var compiled = try @import("compiler.zig").compileScalar(a, "reverse(k)", .{});
+            defer compiled.deinit();
+            var program = try scalar.bind(a, compiled.expression, &columns, &.{}, .{});
+            defer program.deinit();
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 64 << 10 };
+            var region = std.heap.ArenaAllocator.init(budget.allocator());
+            defer region.deinit();
+            var scratch: ScalarRow = .{};
+            defer scratch.deinit(budget.allocator());
+            var dummy: u8 = 0;
+            const batch: Batch = .{ .reader = .{ .ptr = &dummy, .read = read, .count = 256, .width = 128 } };
+            var first: ?scalar.Datum = null;
+            for (0..batch.len()) |index| {
+                const values = try scratch.fill(budget.allocator(), region.allocator(), &program, batch, index);
+                const result = try program.evaluate(region.allocator(), values, &.{}, .{});
+                if (first == null) first = result;
+                try std.testing.expectEqualStrings(if (index % 2 == 0) "fedcba" else "lkjihg", result.value.string);
+            }
+            try std.testing.expectEqualStrings("fedcba", first.?.value.string);
+            try std.testing.expect(budget.peak < 32 << 10);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

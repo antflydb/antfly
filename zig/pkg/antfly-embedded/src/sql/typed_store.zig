@@ -659,6 +659,44 @@ pub const Store = struct {
         }
         return bytes;
     }
+    /// Estimate only new native JSON bodies, including duplicates within this
+    /// batch. Keys borrow the producer's immutable lease for this call only.
+    /// Per-cell descriptors and allocator growth remain separate reservations.
+    pub fn batchAppendBytes(self: *const Store, a: A, batch: @import("execution_batch.zig").Batch, maximum: usize) !usize {
+        var region = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
+        defer region.deinit();
+        const work = region.allocator();
+        var incoming: std.HashMapUnmanaged(JsonKey, void, JsonKeyContext, 80) = .empty;
+        var cell_region = std.heap.ArenaAllocator.init(work);
+        defer cell_region.deinit();
+        var bytes: usize = 0;
+        for (0..batch.width()) |column| for (0..batch.len()) |index| {
+            const key: ?JsonKey = if (try batch.frozenJson(index, column)) |frozen|
+                .{ .representation = if (frozen.lossless_text) 3 else 2, .bytes = frozen.bytes }
+            else if (try batch.encodedJson(index, column)) |text|
+                .{ .representation = 1, .bytes = text }
+            else
+                null;
+            if (key) |native| {
+                bytes +|= @sizeOf(?*JsonPayload) + 1;
+                if (bytes > maximum) return bytes;
+                if (native.bytes.len >= 256) {
+                    if (self.json_payloads.contains(native)) continue;
+                    const entry = try incoming.getOrPut(work, native);
+                    if (entry.found_existing) continue;
+                }
+                bytes +|= native.bytes.len +| @sizeOf(JsonPayload) +| 64;
+            } else {
+                _ = cell_region.reset(.retain_capacity);
+                bytes +|= try @import("operators.zig").datumBytes(try batch.cell(cell_region.allocator(), index, column));
+            }
+            // Reject oversized candidates before building an unbounded probe
+            // dictionary; the caller retries with a smaller prefix.
+            if (bytes > maximum) return bytes;
+        };
+        return bytes;
+    }
+
     /// Reserve dictionary replacement capacity before admitting a batch. Treat
     /// its incoming keys as distinct until their cardinality is established.
     pub fn dictionaryGrowthBytes(self: *const Store, rows: usize) usize {
@@ -1182,4 +1220,44 @@ test "native projection refinements benchmark shared retained JSON payloads" {
     try std.testing.expectEqual(sums[0], sums[1]);
     try std.testing.expect(peaks[1] * 8 < peaks[0]);
     std.debug.print("SHARED_RETAINED_JSON rows=64 source_bytes={d} before_peak={d} after_peak={d}\n", .{ text.written().len, peaks[0], peaks[1] });
+}
+
+test "SQL native JSON admission counts new payloads once and preserves representation identity" {
+    const Fixture = struct {
+        fn run(a: A, frozen_mode: bool) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const padding: [512]u8 = @splat('x');
+            const text = try std.fmt.allocPrint(sa, "{{\"payload\":\"{s}\"}}", .{padding});
+            var fixture: SharedJsonFixture = .{ .text = text };
+            if (frozen_mode) {
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, text, .{});
+                const wire = try @import("spill.zig").encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+                const block = try @import("spill.zig").decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+                defer block.deinit();
+                fixture.frozen = (try block.frozenJson(0, 0, false)).?;
+            }
+            var store = Store.init(a);
+            defer store.deinit();
+            const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &fixture, .read = SharedJsonFixture.cell, .read_json = SharedJsonFixture.json, .read_frozen = SharedJsonFixture.tokens, .count = 8, .width = 1 } };
+            // A candidate beyond its remaining allowance must decline before
+            // allocating even the first temporary dictionary entry.
+            var none = std.heap.FixedBufferAllocator.init(&.{});
+            try std.testing.expectEqual(@as(usize, @sizeOf(?*JsonPayload) + 1), try store.batchAppendBytes(none.allocator(), batch, 0));
+            const before = try store.batchAppendBytes(a, batch, std.math.maxInt(usize));
+            try fixture.populate(&store, 8, false);
+            const after = try store.batchAppendBytes(a, batch, std.math.maxInt(usize));
+            try std.testing.expectEqual(@as(usize, 8 * (@sizeOf(?*JsonPayload) + 1)), after);
+            try std.testing.expect(before > after + 512 and before < after + 1024);
+            if (frozen_mode) {
+                fixture.frozen.?.lossless_text = !fixture.frozen.?.lossless_text;
+                try std.testing.expectEqual(before, try store.batchAppendBytes(a, batch, std.math.maxInt(usize)));
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |frozen| {
+        try Fixture.run(std.testing.allocator, frozen);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{frozen});
+    }
 }

@@ -27,6 +27,7 @@ pub const Join = struct {
     pub const Evaluation = struct {
         condition: ?*const @import("scalar.zig").Program = null,
         parameters: []const std.json.Value = &.{},
+        limits: @import("scalar.zig").EvalLimits = .{},
         left_width: usize,
         right_width: usize,
         flipped: bool = false,
@@ -73,6 +74,7 @@ pub const Join = struct {
     finished: bool = false,
     probing_started: bool = false,
     probe_cells: []Datum = &.{},
+    scalar_row: @import("execution_batch.zig").ScalarRow = .{},
     scratch: std.heap.ArenaAllocator,
     candidate: std.heap.ArenaAllocator,
     output_arena: std.heap.ArenaAllocator,
@@ -344,6 +346,7 @@ pub const Join = struct {
         if (self.active_join) |owner| owner.close();
         self.closeInputs();
         if (self.output) |pipe| pipe.close();
+        self.scalar_row.deinit(self.a);
         self.scratch.deinit();
         self.candidate.deinit();
         self.output_arena.deinit();
@@ -609,20 +612,13 @@ pub const Join = struct {
     fn acceptNative(self: *Join, a: A, view: *NativeRows, match: ?usize) !bool {
         if (match) |index| {
             if (view.evaluation.condition) |program| {
-                const width = view.evaluation.left_width + view.evaluation.right_width;
-                const cells = try a.alloc(Datum, width);
-                @memset(cells, .{});
-                const loaded = try a.alloc(bool, width);
-                @memset(loaded, false);
-                for (program.instructions) |instruction| if (instruction.operation == .column) {
-                    const logical = instruction.operation.column;
-                    if (logical >= width) return error.InvalidSqlBackendResponse;
-                    if (loaded[logical]) continue;
+                const cells = try self.scalar_row.prepare(self.a, view.evaluation.left_width + view.evaluation.right_width);
+                for (program.required_columns) |logical| {
+                    if (logical >= cells.len) return error.InvalidSqlBackendResponse;
                     const physical = if (!view.evaluation.flipped) logical else if (logical < view.evaluation.right_width) view.evaluation.left_width + logical else logical - view.evaluation.right_width;
                     cells[logical] = try NativeRows.cell(view, a, 0, physical);
-                    loaded[logical] = true;
-                };
-                const accepted = try program.evaluate(a, cells, view.evaluation.parameters, .{});
+                }
+                const accepted = try program.evaluate(a, cells, view.evaluation.parameters, view.evaluation.limits);
                 if (accepted.sql_null) return false;
                 if (accepted.value != .bool) return error.SqlTypeMismatch;
                 if (!accepted.value.bool) return false;
@@ -1371,4 +1367,52 @@ test "SQL native partition batches deliver errors after a successful prefix" {
         try std.testing.expectEqual(@as(usize, 1), count);
         try std.testing.expectEqual(error.SqlDivisionByZero, failure.?);
     }
+}
+
+test "SQL native residual controls preserve cancellation and regex reuse across worker boundaries" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn cancel(_: ?*anyopaque) anyerror!void {
+            return error.QueryCanceled;
+        }
+        fn run(a: A, parallel: bool, canceled: bool) !void {
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            var compiled = try @import("compiler.zig").compileScalar(a, "l = r AND regexp_like(s, '^a')", .{});
+            defer compiled.deinit();
+            var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer }, .{ .name = "s", .type = .string } }, &.{}, .{});
+            defer condition.deinit();
+            var regex = @import("regex_execution.zig").init(a, 1 << 20);
+            defer regex.deinit();
+            const join = try Join.create(a, &manager, 1 << 20, 10000, 0, false, false);
+            defer join.close();
+            join.parallel_builds = parallel;
+            join.build_lanes = 2;
+            join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 2, .limits = .{ .regex_execution = &regex, .checkpoint = if (canceled) cancel else null, .regex_checkpoint = if (canceled) cancel else null } };
+            const key = Datum.json(.{ .integer = 1 });
+            for (0..4) |i| {
+                try join.add(true, &.{ key, Datum.json(.{ .string = "abc" }) }, &.{key}, i);
+            }
+            for (0..4) |i| try join.add(false, &.{key}, &.{key}, i);
+            var region = std.heap.ArenaAllocator.init(a);
+            defer region.deinit();
+            if (canceled) {
+                try std.testing.expectError(error.QueryCanceled, join.nextBatch(region.allocator(), 32, null));
+            } else {
+                var count: usize = 0;
+                while (true) {
+                    _ = region.reset(.free_all);
+                    const batch = try join.nextBatch(region.allocator(), 32, null);
+                    if (batch.len() == 0) break;
+                    count += batch.len();
+                }
+                try std.testing.expectEqual(@as(usize, 16), count);
+                const stats = regex.snapshot();
+                try std.testing.expect(stats.compilations > 0 and stats.hits > 0);
+                try std.testing.expectEqual(@as(usize, 0), stats.active);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |parallel| for ([_]bool{ false, true }) |canceled| try Fixture.run(std.testing.allocator, parallel, canceled);
 }

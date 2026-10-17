@@ -755,12 +755,6 @@ pub const HashJoin = struct {
         if (self.sealed or batch.len() != keys.len) return error.InvalidSqlBackendResponse;
         if (keys.len > self.limits.rows -| self.row_count) return error.SqlProgramLimitExceeded;
         var needed: usize = 4096 +| batch.len() *| (128 +| batch.width() *| 64);
-        var scratch = std.heap.ArenaAllocator.init(a);
-        defer scratch.deinit();
-        for (0..batch.width()) |column| for (0..batch.len()) |index| {
-            _ = scratch.reset(.retain_capacity);
-            needed +|= (try batch.cellBytes(scratch.allocator(), index, column)) *| 4;
-        };
         for (keys) |row| {
             if (row.len > 256 or (self.key_count != null and row.len != self.key_count.?)) return error.InvalidSqlBackendResponse;
             for (row) |value| needed +|= (try datumBytes(value)) *| 4;
@@ -770,7 +764,10 @@ pub const HashJoin = struct {
         // A final single row may cross the soft halfway mark, as scalar
         // admission historically did. The allocator retains the hard ceiling.
         const ceiling = if (keys.len == 1 and self.budget.live <= self.budget.limit / 2) self.budget.limit else self.budget.limit / 2;
-        if (needed > ceiling -| self.budget.live) return false;
+        const available = ceiling -| self.budget.live;
+        if (needed > available) return false;
+        needed +|= (try self.value_columns.batchAppendBytes(a, batch, (available - needed) / 4)) *| 4;
+        if (needed > available) return false;
         const hashes = try @import("batch_hash.zig").rows(a, keys, false);
         defer a.free(hashes);
         const retained = self.budget.allocator();
@@ -2742,8 +2739,14 @@ const EncodedAdmissionFixture = struct {
         }
         var admitted: usize = 0;
         if (baseline) {
-            // Reference the former whole-batch-or-scalar algorithm.
-            if (try join.admitBatch(work, batch, keys)) admitted = count else {
+            // Keep the reference independent of native payload sharing in
+            // production admission: the former estimate charged every body.
+            var former_needed: usize = 4096 +| count *| (128 +| batch.width() *| 64);
+            former_needed +|= bytes.len *| count *| 4;
+            for (keys) |row| for (row) |value| {
+                former_needed +|= (try datumBytes(value)) *| 4;
+            };
+            if (former_needed <= limit / 2 and try join.admitBatch(work, batch, keys)) admitted = count else {
                 var row_scratch = std.heap.ArenaAllocator.init(budget.allocator());
                 defer row_scratch.deinit();
                 for (keys, 0..) |key, index| {
@@ -2789,4 +2792,22 @@ test "native projection refinements benchmark encoded join prefix admission" {
     try std.testing.expectEqual(@as(usize, 64), after.count);
     try std.testing.expect(before.count < after.count and before.retained > after.retained);
     std.debug.print("JOIN_PREFIX before_rows={d} after_rows={d} before_scalar_reads={d} after_scalar_reads={d} before_retained_peak={d} after_retained_peak={d} before_backing_peak={d} after_backing_peak={d} wire_per_row={d}\n", .{ before.count, after.count, before.scalar_reads, after.scalar_reads, before.retained, after.retained, before.peak, after.peak, text.written().len });
+}
+
+test "SQL shared payload admission fits duplicate JSON within the hard budget" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            var text: std.Io.Writer.Allocating = .init(source.allocator());
+            try text.writer.writeAll("{\"payload\":\"");
+            try text.writer.splatByteAll('x', 12000);
+            try text.writer.writeAll("\"}");
+            const result = try EncodedAdmissionFixture.run(a, text.written(), 64 << 10, 64, false);
+            try std.testing.expectEqual(@as(usize, 64), result.count);
+            try std.testing.expect(result.retained < 64 << 10);
+            std.debug.print("SHARED_ADMISSION rows={d} retained_peak={d} backing_peak={d}\n", .{ result.count, result.retained, result.peak });
+        }
+    };
+    try Fixture.run(std.testing.allocator);
 }

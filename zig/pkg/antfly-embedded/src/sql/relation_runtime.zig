@@ -890,6 +890,7 @@ fn Engine(comptime Context: type) type {
             partition_join: ?*@import("partition_join.zig").Join = null,
             join_view: ?@import("parallel_output.zig").Pipe.View = null,
             probe: ?operators.HashJoin.Probe = null,
+            scalar_row: @import("execution_batch.zig").ScalarRow = .{},
             probe_arena: std.heap.ArenaAllocator,
             probe_payload: @import("execution_batch.zig").Batch = .{ .rows = &.{} },
             probe_batch: []operators.HashJoin.Probe = &.{},
@@ -992,6 +993,7 @@ fn Engine(comptime Context: type) type {
                 self.set_entries.deinit(self.engine.context.alloc);
                 self.set_heads.deinit(self.engine.context.alloc);
                 if (self.sample_arena) |*sample| sample.deinit();
+                self.scalar_row.deinit(self.engine.context.alloc);
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
@@ -1407,21 +1409,6 @@ fn Engine(comptime Context: type) type {
                 }
             }
 
-            fn programRow(a: Allocator, program: scalar.Program, batch: @import("execution_batch.zig").Batch, row: usize) ![]const Datum {
-                const values = try a.alloc(Datum, batch.width());
-                @memset(values, .{});
-                const loaded = try a.alloc(bool, batch.width());
-                @memset(loaded, false);
-                for (program.instructions) |instruction| if (instruction.operation == .column) {
-                    const column = instruction.operation.column;
-                    if (column >= values.len) return error.InvalidSqlBackendResponse;
-                    if (!loaded[column]) {
-                        values[column] = try batch.cell(a, row, column);
-                        loaded[column] = true;
-                    }
-                };
-                return values;
-            }
             fn batchProgram(self: *Iterator, a: Allocator, context: @TypeOf(self.engine.context), program: *const scalar.Program, batch: @import("execution_batch.zig").Batch, errors: []?anyerror) ![]const Datum {
                 const vector = @import("vector_eval.zig").evaluateBatch(a, program, batch, context.parameters) catch |err| switch (err) {
                     error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.InvalidSqlDateTime, error.SqlCardinalityViolation => null,
@@ -1430,7 +1417,7 @@ fn Engine(comptime Context: type) type {
                 if (vector) |values| return values;
                 const values = try a.alloc(Datum, batch.len());
                 for (values, 0..) |*value, index| {
-                    value.* = context.evaluate(a, program.*, try programRow(a, program.*, batch, index)) catch |err| blk: {
+                    value.* = context.evaluate(a, program.*, try self.scalar_row.fill(self.engine.context.alloc, a, program, batch, index)) catch |err| blk: {
                         if (err == error.OutOfMemory or err == error.QueryCanceled or err == error.DeadlineExceeded) return err;
                         errors[index] = errors[index] orelse err;
                         break :blk .{};
@@ -1895,7 +1882,7 @@ fn Engine(comptime Context: type) type {
                     };
                     for (0..count) |index| {
                         if (errors) |flags| if (flags[index] != null) continue;
-                        cells[index * programs.len + slot] = if (values) |vector| vector[index] else self.engine.context.evaluate(a, program.*, try programRow(a, program.*, batch, index)) catch |err| blk: {
+                        cells[index * programs.len + slot] = if (values) |vector| vector[index] else self.engine.context.evaluate(a, program.*, try self.scalar_row.fill(self.engine.context.alloc, a, program, batch, index)) catch |err| blk: {
                             if (errors) |flags| {
                                 flags[index] = err;
                                 break :blk .{};
@@ -2114,23 +2101,6 @@ fn Engine(comptime Context: type) type {
                     }
                     return total;
                 }
-                fn conditionValues(self: *@This(), a: Allocator, program: scalar.Program) ![]const Datum {
-                    const values = try a.alloc(Datum, self.width);
-                    @memset(values, .{});
-                    const loaded = try a.alloc(bool, self.width);
-                    @memset(loaded, false);
-                    // Predicates reference bound column slots. Unreferenced
-                    // JSON payloads stay encoded even when ON has a residual.
-                    for (program.instructions) |instruction| if (instruction.operation == .column) {
-                        const column = instruction.operation.column;
-                        if (column >= self.width) return error.InvalidSqlBackendResponse;
-                        if (!loaded[column]) {
-                            values[column] = try cell(self, a, 0, column);
-                            loaded[column] = true;
-                        }
-                    };
-                    return values;
-                }
                 fn batch(self: *@This()) @import("execution_batch.zig").Batch {
                     return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_identity = identity, .count = self.rows.len, .width = self.width } };
                 }
@@ -2150,7 +2120,7 @@ fn Engine(comptime Context: type) type {
                             if (join.condition) |program| {
                                 _ = self.scratch.reset(.retain_capacity);
                                 var candidate: JoinBatch = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = &.{pair}, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join };
-                                const values = try candidate.conditionValues(self.scratch.allocator(), program);
+                                const values = try self.scalar_row.fill(self.engine.context.alloc, self.scratch.allocator(), &program, candidate.batch(), 0);
                                 const accepted = try self.engine.context.evaluate(self.scratch.allocator(), program, values);
                                 if (accepted.sql_null) continue;
                                 if (accepted.value != .bool) return error.SqlTypeMismatch;
@@ -2280,6 +2250,7 @@ fn Engine(comptime Context: type) type {
                         if (!Adapter.hasPatterns(self.node, 0) and (join.condition == null or !@import("decision_eval.zig").hasExternal(&join.condition.?))) owner.evaluation = .{
                             .condition = if (self.node.operation.join.condition) |*program| program else null,
                             .parameters = self.engine.context.parameters,
+                            .limits = @import("decision_eval.zig").limitsFor(self.engine.context.backend),
                             .left_width = self.left.?.node.columns.len,
                             .right_width = self.right.?.node.columns.len,
                             .flipped = self.flipped_join,
