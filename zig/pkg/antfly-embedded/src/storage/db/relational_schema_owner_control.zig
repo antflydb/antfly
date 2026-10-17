@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native schema-owner effects over the existing metadata journal/outbox.
+//! Shared schema-owner preparation and native metadata journal/outbox effects.
 //! Trusted storage adapter only: metadata/root/cohort authorization and
 //! producer capability admission belong to the receiving owner. No public
 //! mutation escape hatch, signature, publication or fence release is provided.
@@ -38,8 +38,11 @@ pub const Command = struct {
     payload: []const u8 = "",
 
     pub fn validate(self: @This()) !void {
+        return self.validateFor(.native);
+    }
+    pub fn validateFor(self: @This(), authority: @FieldType(job.Binding, "authority")) !void {
         try self.binding.validate();
-        if (self.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        if (self.binding.authority != authority) return error.InvalidControlReceiptPosition;
         switch (self.action) {
             .begin => {
                 _ = try job.Candidate.parts(self.payload);
@@ -193,8 +196,16 @@ pub const Prepared = struct {
     payload: ?Payload = null,
 
     pub fn init(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
+        return initFor(a, core, command, context, .native);
+    }
+    /// Private committed-entry adapter. No position is accepted in command
+    /// bytes; the state machine supplies it separately when applying.
+    pub fn initRaft(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
+        return initFor(a, core, command, context, .raft);
+    }
+    fn initFor(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext, authority: @FieldType(job.Binding, "authority")) !@This() {
         try context.ensureActive();
-        try command.validate();
+        try command.validateFor(authority);
         if (!command.binding.fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
         var self: @This() = .{ .alloc = a, .command = command, .context = context };
         errdefer self.deinit();
@@ -265,6 +276,13 @@ pub const Prepared = struct {
     /// Standby/transport callers still use init's independent replay path.
     pub fn preparePage(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("relational_rows.zig").Budget, context: operation.RequestContext) !@This() {
         if (binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return preparePageFor(a, core, binding, budget, context);
+    }
+    pub fn prepareRaftPage(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("relational_rows.zig").Budget, context: operation.RequestContext) !@This() {
+        if (binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return preparePageFor(a, core, binding, budget, context);
+    }
+    fn preparePageFor(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("relational_rows.zig").Budget, context: operation.RequestContext) !@This() {
         var page = try job.PreparedPage.prepare(a, core, binding, budget, control(&context));
         errdefer page.deinit();
         const encoded = try (try page.command()).encode(a);
@@ -272,8 +290,12 @@ pub const Prepared = struct {
         return .{ .alloc = a, .command = .{ .binding = binding, .action = .page, .payload = encoded }, .context = context, .owned = encoded, .page = page };
     }
     pub fn validate(self: *const @This()) !void {
+        return self.validateAuthority(.native);
+    }
+    pub fn validateAuthority(self: *const @This(), authority: @FieldType(job.Binding, "authority")) !void {
         try self.context.ensureActive();
         try self.command.binding.validate();
+        if (self.command.binding.authority != authority) return error.InvalidControlReceiptPosition;
     }
     pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
         return self.command.binding.fence.namespace;
@@ -290,18 +312,34 @@ pub const Prepared = struct {
     }
     pub fn commitSchema(self: *@This(), core: *core_mod.DBCore, _: ?Native, participant: anytype) !Outcome {
         try self.validate();
+        const installed = try self.commitSchemaAt(core, null, participant);
+        return .{ .header = installed, .position = installed.updated.native, .duplicate = false };
+    }
+    pub fn commitRaftSchema(self: *@This(), core: *core_mod.DBCore, entry: @import("apply_receipts.zig").OrderedApplyReceipt, participant: anytype) !job.Header {
+        try self.validateAuthority(.raft);
+        return self.commitSchemaAt(core, entry, participant);
+    }
+    fn commitSchemaAt(self: *@This(), core: *core_mod.DBCore, entry: ?@import("apply_receipts.zig").OrderedApplyReceipt, participant: anytype) !job.Header {
         const data = if (self.schema_data) |*value| value else return error.SchemaValidationPublicationRequired;
         const writes = [_]@import("../docstore.zig").KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = data.json }, .{ .key = data.version_key, .value = data.json } };
-        const installed = try core.commitPreparedSchemaMetadataValidatedNullability(&data.prepared, &writes, self.command.payload[0..32].*, null, participant);
-        return .{ .header = installed, .position = installed.updated.native, .duplicate = false };
+        return core.commitPreparedSchemaMetadataValidatedNullability(&data.prepared, &writes, self.command.payload[0..32].*, entry, participant);
     }
     pub fn stage(self: *@This(), core: *core_mod.DBCore, txn: anytype, replay: ?Native) !Outcome {
         try self.validate();
+        const result = try self.stageAt(core, txn, null);
+        if (replay) |expected| if (!std.meta.eql(result.position.native, expected)) return error.InvalidControlReceiptPosition;
+        return .{ .header = result.header, .position = result.position.native, .duplicate = result.duplicate };
+    }
+    const Staged = struct { header: job.Header, position: positions.Position, duplicate: bool };
+    pub fn stageRaft(self: *@This(), core: *core_mod.DBCore, txn: anytype, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !job.Header {
+        try self.validateAuthority(.raft);
+        return (try self.stageAt(core, txn, entry)).header;
+    }
+    fn stageAt(self: *@This(), core: *core_mod.DBCore, txn: anytype, entry: ?@import("apply_receipts.zig").OrderedApplyReceipt) !Staged {
         if (self.requiresSchemaCommit()) return error.SchemaValidationPublicationRequired;
         if (try job.load(txn)) |header| if (std.meta.eql(header.binding, self.command.binding)) {
             const observed = try job.observe(self.alloc, txn, self.command.binding);
             if (try duplicate(self.command, observed)) |position| {
-                if (replay) |expected| if (!std.meta.eql(position, expected)) return error.InvalidControlReceiptPosition;
                 if (self.command.action == .install) try requireResident(core, observed);
                 return .{ .header = observed, .position = position, .duplicate = true };
             }
@@ -309,14 +347,13 @@ pub const Prepared = struct {
         var manager = try core.initTxnManager();
         defer manager.deinit();
         const header = switch (self.command.action) {
-            .begin => try job.stageBegin(self.alloc, txn, self.command.binding, if (self.candidate) |*value| value else return error.SchemaValidationJobRequired, null),
-            .freeze => try job.stageFrozen(self.alloc, txn, &manager, self.command.binding, null),
-            .page => try job.stagePage(self.alloc, txn, &manager, if (self.page) |*value| value else return error.SchemaValidationJobChanged, null),
-            .cancel => try job.stageCancel(self.alloc, txn, &manager, self.command.binding, null),
+            .begin => try job.stageBegin(self.alloc, txn, self.command.binding, if (self.candidate) |*value| value else return error.SchemaValidationJobRequired, entry),
+            .freeze => try job.stageFrozen(self.alloc, txn, &manager, self.command.binding, entry),
+            .page => try job.stagePage(self.alloc, txn, &manager, if (self.page) |*value| value else return error.SchemaValidationJobChanged, entry),
+            .cancel => try job.stageCancel(self.alloc, txn, &manager, self.command.binding, entry),
             .install => return error.SchemaValidationPublicationRequired,
         };
-        if (replay) |expected| if (!std.meta.eql(header.updated.native, expected)) return error.InvalidControlReceiptPosition;
-        return .{ .header = header, .position = header.updated.native, .duplicate = false };
+        return .{ .header = header, .position = header.updated, .duplicate = false };
     }
     pub fn preparePayload(self: *@This()) !void {
         if (self.payload == null) self.payload = try Payload.init(self.alloc, self.command);
@@ -343,7 +380,7 @@ fn control(context: *const operation.RequestContext) @import("relational_nullabi
     }.check };
 }
 
-fn duplicate(command: Command, header: job.Header) !?Native {
+fn duplicate(command: Command, header: job.Header) !?positions.Position {
     const position: ?positions.Position = switch (command.action) {
         .begin => if (header.phase == .canceled) return error.SchemaValidationCanceled else header.admitted,
         .freeze => if (header.phase == .canceled) return error.SchemaValidationCanceled else header.frozen,
@@ -355,7 +392,8 @@ fn duplicate(command: Command, header: job.Header) !?Native {
         } else null,
         .page => if (equal(header.last_effect, try (try job.PageCommand.decode(command.payload)).effect())) header.updated else null,
     };
-    return if (position) |value| if (value == .native) value.native else error.InvalidControlReceiptPosition else null;
+    if (position) |value| if ((value == .native) != (command.binding.authority == .native)) return error.InvalidControlReceiptPosition;
+    return position;
 }
 /// Capture beside the immutable store read under apply-shared, then verify
 /// expensive durable inputs off-lock. Pins survive later runtime publication.

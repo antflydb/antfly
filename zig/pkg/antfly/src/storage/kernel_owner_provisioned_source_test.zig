@@ -2260,6 +2260,15 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         },
         .background_fields => return error.UnexpectedBackgroundTextStats,
     }
+    {
+        // This is the stable four-document cut. Later artifact reprocessing
+        // accepts a new generation without waiting for child replacement, so
+        // its live document count must not be compared with this old cut.
+        var stable_statuses = (try write_source.source().localRuntimeStatuses(alloc, "articles")).?;
+        defer stable_statuses.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), stable_statuses.items.len);
+        try std.testing.expectEqual(@as(u64, 4), stable_statuses.items[0].stats.doc_count);
+    }
     try std.testing.expectError(
         error.IdentityReadGenerationChanged,
         read_source.source().textStatsGroupLocal(
@@ -2539,7 +2548,6 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 4), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(.fresh, statuses.items[0].metadata.freshness);
     try std.testing.expect(statuses.items[0].lsm_storage_stats != null);

@@ -11564,3 +11564,58 @@ release, and read-layout/full-text retirement semantics remain required before
 activation. No parity case is reclassified. The control-source catalog is
 regenerated because the mounted regression now explicitly imports physical
 storage configuration.
+
+### Shared preparation and Raft-authoritative schema owner apply
+
+The prepared schema-owner adapter now shares candidate ownership, bounded page
+preparation/replay, duplicate detection and index-preserving schema installation
+between native and Raft authorities. Native frame validation and WAL publication
+remain explicitly native-only. Raft preparation accepts no command-body
+position; its private apply entry point receives the actual owner group and
+committed term/index separately from the state machine.
+
+Begin, freeze, independently verified page, cancel and local installation join
+their actual ordered-apply watermark in one transaction. Installation uses the
+existing prepared-schema writer and a mandatory marker participant rather than
+committing a header and repairing the watermark afterward. Duplicate effects at
+a later committed entry retain their original phase cuts while advancing only
+the applied watermark. Conflicting same-index terms and regressing terms cannot
+advance it. Native admission rejects Raft commands, and native ASVC/WAL encoding
+cannot be used as an alternative transport for them.
+
+Real LSM primary/follower fixtures independently apply the same controls, close
+and reopen the follower, and cover cancellation and installation. A forced
+allocation failure during freeze aborts its effect and watermark together;
+forged ready evidence is rejected before installation. The Debug fault gate
+passes ten tests, zero skips/leaks and 51/51 build steps in
+`/private/tmp/antfly-sql-schema-raft-owner-fault-debug.log`. Final verification
+also checks that the historical AROW bytes remain unchanged and decode after
+cold reopen, and that Raft effects do not fabricate a native source sequence;
+the final Debug gate passes all ten tests with zero skips/leaks and 51/51 build
+steps in `/private/tmp/antfly-sql-schema-raft-owner-qualified-debug.log`.
+
+The strict historical-row comparison initially exposed nondeterministic test
+setup: independent initial mutations without an explicit committed timestamp
+produced different AROW timestamps and checksums before validation. Both owners
+now apply the identical timestamped initial command; the byte comparison and
+decoder checks remain strict. The earlier failure is retained in
+`/private/tmp/antfly-sql-schema-raft-owner-final-debug.log`.
+
+The broader cold-owner checkpoint run passed all 1,130 SQL tests with four
+opt-in benchmark skips, but its compiled owner-source gate passed 46/47: a
+document/artifact fixture compared a pre-reprocessing count of four against
+status after accepting asynchronous child-generation replacement. The exact
+four-document assertion now runs at the stable pre-reprocessing cut alongside
+the existing exact text statistics. Final freshness, ownership and publication
+assertions remain after the artifact operations. The original combined log is
+`/private/tmp/antfly-sql-schema-owner-catalog-source-sql-debug.log`; the corrected
+compiled-source gate is tracked separately in
+`/private/tmp/antfly-sql-schema-raft-owner-source-debug.log`.
+
+This closes the trusted local apply adapter, not ordered transport activation:
+the decoder-only contract/compiled-owner port, committed-entry ingress and
+capability admission still need integration. Configured standby mirrors fail
+closed until an ordered schema-control envelope is supported. Metadata plan
+admission/ACK acceptance, adoption, all-owner publication/release and read-layout
+retirement qualification also remain unfinished. No public SQL path is switched
+to this private adapter and no source case is reclassified for its coverage.

@@ -46,6 +46,9 @@ const NullabilityJobFixture = struct {
         return job.Candidate.init(alloc, namespace.table_id, before, after, predecessor, &.{"n"}, .{});
     }
     fn binding(db: *db_mod.DB, prepared: *const job.Candidate, id: u8) !job.Binding {
+        return bindingFor(db, prepared, id, .native);
+    }
+    fn bindingFor(db: *db_mod.DB, prepared: *const job.Candidate, id: u8, kind: source.Kind) !job.Binding {
         const identity = try db.relationalTopologyIdentity();
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -58,7 +61,7 @@ const NullabilityJobFixture = struct {
             .namespace = namespace,
             .catalog_digest = identity.catalog_digest,
             .role = .schema_validation,
-        }, .native);
+        }, kind);
     }
     const Action = enum { begin, freeze, cancel };
     fn apply(db: *db_mod.DB, prepared: *const job.Candidate, expected: job.Binding, action: Action) !job.Header {
@@ -101,6 +104,134 @@ const NullabilityJobFixture = struct {
         return @import("../write.zig").configureStorageKernelOwnerDbAtOpen(alloc, db, "rows", schema_json, indexes_json, null, null, null, null, null, historical);
     }
 };
+
+test "relational index system nullability job Raft committed controls preserve cuts installation and cold replay" {
+    const F = NullabilityJobFixture;
+    const controls = db_mod.DB.SchemaOwnerControl;
+    const Entry = @import("apply_receipts.zig").OrderedApplyReceipt;
+    const Driver = struct {
+        fn apply(database: *db_mod.DB, command: controls.Command, entry: Entry) !void {
+            var prepared = try database.prepareRaftSchemaOwnerControl(command, .{});
+            defer prepared.deinit();
+            try database.applyCommittedRaftSchemaOwnerControl(&prepared, F.namespace.shard_id, entry);
+        }
+    };
+    for ([_]bool{ true, false }) |cancel_only| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-schema-validation");
+        defer directory.cleanup();
+        const primary_path = try std.fs.path.join(alloc, &.{ directory.path(), "primary" });
+        defer alloc.free(primary_path);
+        const peer_path = try std.fs.path.join(alloc, &.{ directory.path(), "peer" });
+        defer alloc.free(peer_path);
+        var options = F.options;
+        options.online_source_authority = .raft;
+        var primary = try db_mod.DB.open(alloc, primary_path, options);
+        defer primary.close();
+        var peer = try db_mod.DB.open(alloc, peer_path, options);
+        var peer_live = true;
+        defer if (peer_live) peer.close();
+        for ([_]*db_mod.DB{ &primary, &peer }) |database| {
+            try database.setSchemaJson(alloc, F.before);
+            try database.applyOrderedCommittedMutation(.{ .timestamp_ns = 100, .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" } } }, .{ .term = 1, .index = 1 }, false);
+            try std.testing.expect(!try F.configure(database, F.before, "{\"old\":{\"type\":\"full_text\"}}", false));
+        }
+        var candidate = try F.candidate(&primary);
+        defer candidate.deinit();
+        const row_key = try internal.relationalRowKeyAlloc(alloc, "a");
+        defer alloc.free(row_key);
+        const predecessor_row = try primary.core.store.get(alloc, row_key);
+        defer alloc.free(predecessor_row);
+        const binding = try F.bindingFor(&primary, &candidate, 63, .raft);
+        const begin: controls.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
+        try std.testing.expectError(error.InvalidControlReceiptPosition, primary.prepareNativeSchemaOwnerControl(begin, .{}));
+        var admission = try primary.prepareRaftSchemaOwnerControl(begin, .{});
+        defer admission.deinit();
+        try std.testing.expectError(error.SchemaValidationJobChanged, primary.applyCommittedRaftSchemaOwnerControl(&admission, F.namespace.shard_id + 1, .{ .term = 2, .index = 10 }));
+        try std.testing.expectEqualDeep(@as(?Entry, .{ .term = 1, .index = 1 }), try primary.orderedApplyReceipt());
+        try primary.applyCommittedRaftSchemaOwnerControl(&admission, F.namespace.shard_id, .{ .term = 2, .index = 10 });
+        try Driver.apply(&peer, begin, .{ .term = 2, .index = 10 });
+        try std.testing.expectError(error.ConflictingOrderedApplyReceipt, primary.applyCommittedRaftSchemaOwnerControl(&admission, F.namespace.shard_id, .{ .term = 3, .index = 10 }));
+        try std.testing.expectError(error.InvalidOrderedApplyReceipt, primary.applyCommittedRaftSchemaOwnerControl(&admission, F.namespace.shard_id, .{ .term = 1, .index = 11 }));
+        {
+            var freezing = try primary.prepareRaftSchemaOwnerControl(.{ .binding = binding, .action = .freeze }, .{});
+            defer freezing.deinit();
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            freezing.alloc = failing.allocator();
+            // stageFrozen computes its effect before encoding the durable
+            // header. Failure must abort both that effect and the watermark.
+            try std.testing.expectError(error.OutOfMemory, primary.applyCommittedRaftSchemaOwnerControl(&freezing, F.namespace.shard_id, .{ .term = 2, .index = 11 }));
+            freezing.alloc = alloc;
+            try std.testing.expectEqual(F.job.Phase.fencing, (try F.current(&primary)).phase);
+            try std.testing.expectEqualDeep(@as(?Entry, .{ .term = 2, .index = 10 }), try primary.orderedApplyReceipt());
+        }
+        for ([_]*db_mod.DB{ &primary, &peer }) |database| {
+            try Driver.apply(database, .{ .binding = binding, .action = .freeze }, .{ .term = 2, .index = 11 });
+            // A retry at a later committed entry advances only the watermark,
+            // never the original phase cut or native source clock.
+            try Driver.apply(database, begin, .{ .term = 2, .index = 12 });
+            const state = try F.current(database);
+            try std.testing.expectEqual(@as(u64, 10), state.admitted.?.raft.index);
+            try std.testing.expectEqual(@as(u64, 11), state.updated.raft.index);
+            try std.testing.expect(!try F.configure(database, F.before, "{\"old\":{\"type\":\"full_text\"}}", false));
+        }
+        var applied_index: u64 = 13;
+        for (0..8) |_| {
+            var prepared = try primary.prepareRaftSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+            defer prepared.deinit();
+            const entry: Entry = .{ .term = 2, .index = applied_index };
+            try primary.applyCommittedRaftSchemaOwnerControl(&prepared, F.namespace.shard_id, entry);
+            // The follower executes the producer's bounded page independently.
+            try Driver.apply(&peer, prepared.command, entry);
+            try std.testing.expectEqualDeep(try F.current(&primary), try F.current(&peer));
+            applied_index += 1;
+            if ((try F.current(&primary)).phase == .ready) break;
+        } else return error.RaftSchemaValidationDidNotFinish;
+        const validated = try F.current(&primary);
+        var install_payload: [64]u8 = undefined;
+        @memset(install_payload[0..32], 91);
+        @memcpy(install_payload[32..64], &try validated.digest());
+        if (!cancel_only) {
+            var forged_payload = install_payload;
+            forged_payload[63] ^= 1;
+            try std.testing.expectError(error.SchemaValidationJobChanged, primary.prepareRaftSchemaOwnerControl(.{ .binding = binding, .action = .install, .payload = &forged_payload }, .{}));
+            try std.testing.expectEqualDeep(validated, try F.current(&primary));
+            try std.testing.expectEqualDeep(@as(?Entry, .{ .term = 2, .index = applied_index - 1 }), try primary.orderedApplyReceipt());
+        }
+        const terminal: controls.Command = .{ .binding = binding, .action = if (cancel_only) .cancel else .install, .payload = if (cancel_only) "" else &install_payload };
+        for ([_]*db_mod.DB{ &primary, &peer }) |database| {
+            try Driver.apply(database, terminal, .{ .term = 3, .index = applied_index });
+            try Driver.apply(database, terminal, .{ .term = 3, .index = applied_index + 1 });
+            const state = try F.current(database);
+            try std.testing.expectEqual(@as(u64, applied_index), state.updated.raft.index);
+            try std.testing.expectEqualDeep(@as(?Entry, .{ .term = 3, .index = applied_index + 1 }), try database.orderedApplyReceipt());
+            try std.testing.expectEqual(@as(u32, if (cancel_only) 1 else 2), database.core.schema.?.version);
+            try std.testing.expect(database.hasIndex("old"));
+            if (!cancel_only) {
+                try std.testing.expect(try F.configure(database, F.before, "{}", false));
+                try std.testing.expect(try F.configure(database, F.after, "{}", false));
+            }
+        }
+        peer.close();
+        peer_live = false;
+        peer = try db_mod.DB.open(alloc, peer_path, options);
+        peer_live = true;
+        try Driver.apply(&peer, terminal, .{ .term = 3, .index = applied_index + 2 });
+        try std.testing.expectEqualDeep(try F.current(&primary), try F.current(&peer));
+        try std.testing.expectEqual(@as(u32, if (cancel_only) 1 else 2), peer.core.schema.?.version);
+        const preserved_row = try peer.core.store.get(alloc, row_key);
+        defer alloc.free(preserved_row);
+        try std.testing.expectEqualSlices(u8, predecessor_row, preserved_row);
+        const decoded_row = (try peer.get(alloc, "a")).?;
+        defer alloc.free(decoded_row);
+        try std.testing.expectEqualStrings("{\"n\":1}", decoded_row);
+        var read = try peer.core.store.beginReadTxn();
+        defer read.abort();
+        const state = (try F.source.load(&read)).?;
+        try std.testing.expectEqual(F.source.Kind.raft, state.kind);
+        try std.testing.expectEqual(@as(u64, 0), state.sequence);
+        try std.testing.expectError(error.InvalidControlReceiptPosition, controls.Payload.init(alloc, terminal));
+    }
+}
 
 test "relational index system nullability job drains persists resumes and cancels without publishing" {
     const F = NullabilityJobFixture;

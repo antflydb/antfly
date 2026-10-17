@@ -8841,7 +8841,8 @@ pub const DB = struct {
 
     /// Preparation owns its off-lock payload; only its bounded effect stages
     /// under apply-exclusive, together with the transport marker and outbox.
-    pub const NativeSchemaOwnerControl = @import("relational_schema_owner_control.zig");
+    pub const SchemaOwnerControl = @import("relational_schema_owner_control.zig");
+    pub const NativeSchemaOwnerControl = SchemaOwnerControl;
 
     pub const SchemaOwnerCatalogPolicy = enum { unprotected, readable, deferred };
 
@@ -8923,6 +8924,70 @@ pub const DB = struct {
 
     pub fn prepareNativeSchemaOwnerPage(self: *DB, binding: @import("relational_nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
         return NativeSchemaOwnerControl.Prepared.preparePage(self.alloc, self.core, binding, budget, context);
+    }
+
+    pub fn prepareRaftSchemaOwnerControl(self: *DB, command: SchemaOwnerControl.Command, context: @import("../../api/operation.zig").RequestContext) !SchemaOwnerControl.Prepared {
+        return SchemaOwnerControl.Prepared.initRaft(self.alloc, self.core, command, context);
+    }
+
+    pub fn prepareRaftSchemaOwnerPage(self: *DB, binding: @import("relational_nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !SchemaOwnerControl.Prepared {
+        return SchemaOwnerControl.Prepared.prepareRaftPage(self.alloc, self.core, binding, budget, context);
+    }
+
+    /// Private committed-entry apply, not command-body authority. The actual
+    /// owner group and term/index come from the state machine. All five schema
+    /// effects join the ordered marker in the SAME store transaction; local
+    /// installation also publishes its prepared runtime in that commit.
+    pub fn applyCommittedRaftSchemaOwnerControl(self: *DB, prepared: *SchemaOwnerControl.Prepared, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
+        try prepared.validateAuthority(.raft);
+        if (owner_group == 0 or owner_group != prepared.command.binding.fence.owner_group_id) return error.SchemaValidationJobChanged;
+        if (!prepared.namespace().eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        // A configured standby needs an ordered envelope for this control.
+        // Do not silently commit unmirrored state or fabricate a native clock.
+        if (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_async_metadata_mirror != null or
+            self.local_execution.replication_async_effect_mirror != null or self.local_execution.replication_write_gate != null) return error.ReplicationPublisherUnavailable;
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const prior = try apply_receipts.readOrderedApplyReceiptTxn(&read);
+            if (try orderedApplyDisposition(prior, entry) == .already_applied) return;
+            if (prior) |value| if (entry.term < value.term) return error.InvalidOrderedApplyReceipt;
+        }
+        if (prepared.requiresSchemaCommit()) {
+            const Participant = struct {
+                entry: OrderedApplyReceipt,
+                pub fn validateBefore(participant: @This(), txn: anytype) !void {
+                    if (try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(txn), participant.entry) != .apply)
+                        return error.InvalidOrderedApplyReceipt;
+                }
+                pub fn stage(participant: @This(), txn: anytype, installed: @import("relational_nullability_job.zig").Header) !void {
+                    if (installed.updated != .raft or installed.updated.raft.term != participant.entry.term or
+                        installed.updated.raft.index != participant.entry.index) return error.InvalidControlReceiptPosition;
+                    var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+                    const marker = orderedApplyReceiptWrite(participant.entry, &bytes);
+                    try txn.put(marker.key, marker.value);
+                }
+            };
+            _ = try prepared.commitRaftSchema(self.core, entry, Participant{ .entry = entry });
+        } else {
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try prepared.stageRaft(self.core, &txn, entry);
+            var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+        }
     }
 
     /// Called only by committed standby ingress, preserving the native owner
