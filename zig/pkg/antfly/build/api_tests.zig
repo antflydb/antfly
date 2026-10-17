@@ -885,6 +885,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "segment doc ordinal sidecar roundtrip and merge preserve live order",
             "segment index sort metadata roundtrip",
             "segment merge drops index sort metadata until physical sort is preserved",
+            "segment sorted merge normalizes legacy mixed numeric index sort domains",
             "segment sorted merge preserves index sort and remaps doc addressed sections",
             "segment sorted merge rejects non-finite f64 index sort values",
             "match_all sorted segment seek merges sorted segments and applies cursors",
