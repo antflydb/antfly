@@ -607,8 +607,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
-        // Storage-backed Mach-O Debug codegen measured 13.51 GB.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        // Merged native macOS Debug SQL C API codegen peaked at 16,480,550,912
+        // bytes. 20 GiB reserves at least 25% headroom for that measured root;
+        // retain the existing reservations for other profiles.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos and optimize == .debug) 20 else if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .filters = selectTestFilters(b, &capi_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
