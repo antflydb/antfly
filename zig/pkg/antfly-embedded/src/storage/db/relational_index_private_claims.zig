@@ -125,9 +125,9 @@ pub const SourceStream = struct {
         pub fn requireFor(self: Accepted, binding: jobs.Binding, header: Header) !void {
             try self.validate();
             _ = try Header.decode(&header.bytes, binding, self.ordinal);
-            if (binding.authority != .native or binding.phase != .reserved or !std.mem.eql(u8, &self.binding_digest, &try bindingDigest(binding)) or
+            if (binding.phase != .reserved or !std.mem.eql(u8, &self.binding_digest, &try bindingDigest(binding)) or
                 !std.mem.eql(u8, &self.scope_digest, header.bytes[40..72]) or self.batch_rows != std.mem.readInt(u32, header.bytes[96..100], .little) or
-                self.source_sequence != (try header.position()).sequence or !std.mem.eql(u8, &self.batch_digest, &header.digest()) or
+                self.source_sequence != try orderedSequence(binding, try header.orderedPosition()) or !std.mem.eql(u8, &self.batch_digest, &header.digest()) or
                 @backingInt(self.state) != header.bytes[184]) return error.InvalidPrivateIndexClaimReceipt;
         }
         pub fn encode(self: Accepted) ![encoded_len]u8 {
@@ -160,7 +160,7 @@ pub const SourceStream = struct {
         batch_digest: integrity.Digest,
         decision_digest: integrity.Digest,
         rows: u64,
-        position: Native,
+        position: Position,
         pub fn digest(self: ConsumedPrefix) !integrity.Digest {
             try self.position.validate();
             if (self.ordinal == 0 or std.mem.allEqual(u8, &self.metadata_incarnation, 0) or std.mem.allEqual(u8, &self.binding_digest, 0) or std.mem.allEqual(u8, &self.batch_digest, 0) or std.mem.allEqual(u8, &self.decision_digest, 0)) return error.InvalidPrivateIndexClaimReceipt;
@@ -171,7 +171,7 @@ pub const SourceStream = struct {
             std.mem.writeInt(u64, numbers[0..8], self.ordinal, .little);
             std.mem.writeInt(u64, numbers[8..16], self.rows, .little);
             state.update(&numbers);
-            state.update(&try (@import("receipt_position.zig").Position{ .native = self.position }).encode());
+            state.update(&try self.position.encode());
             var result: integrity.Digest = undefined;
             state.final(&result);
             return result;
@@ -184,15 +184,15 @@ pub const SourceStream = struct {
         pub const encoded_len = 736;
         accepted: Accepted,
         header: Header,
-        position: Native,
+        position: Position,
         previous_digest: integrity.Digest,
         pub fn prefix(self: Consumption) ConsumedPrefix {
             return .{ .metadata_incarnation = self.accepted.metadata_incarnation, .binding_digest = self.accepted.binding_digest, .ordinal = self.accepted.ordinal, .batch_digest = self.accepted.batch_digest, .decision_digest = self.accepted.decision_digest, .rows = self.accepted.rows, .position = self.position };
         }
         pub fn requireFor(self: Consumption, binding: jobs.Binding) !void {
             try self.accepted.requireFor(binding, self.header);
-            try self.position.validate();
-            if (!self.position.namespace.eql(binding.fence.namespace) or self.position.sequence <= self.accepted.source_sequence or
+            const sequence = try orderedSequence(binding, self.position);
+            if (sequence <= self.accepted.source_sequence or self.position.term() < (try self.header.orderedPosition()).term() or
                 (self.accepted.ordinal == 1) != std.mem.allEqual(u8, &self.previous_digest, 0)) return error.InvalidPrivateIndexClaimInventory;
         }
         pub fn encode(self: Consumption, binding: jobs.Binding) ![encoded_len]u8 {
@@ -201,7 +201,7 @@ pub const SourceStream = struct {
             @memcpy(bytes[0..8], "AICC\x01\x00\x00\x00");
             @memcpy(bytes[8..312], &try self.accepted.encode());
             @memcpy(bytes[312..632], &self.header.bytes);
-            @memcpy(bytes[632..665], &try (@import("receipt_position.zig").Position{ .native = self.position }).encode());
+            @memcpy(bytes[632..665], &try self.position.encode());
             @memcpy(bytes[672..704], &self.previous_digest);
             @memcpy(bytes[704..736], &hash(bytes[0..704]));
             return bytes;
@@ -210,8 +210,7 @@ pub const SourceStream = struct {
             if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICC\x01\x00\x00\x00") or !std.mem.allEqual(u8, bytes[665..672], 0) or !std.mem.eql(u8, bytes[704..736], &hash(bytes[0..704]))) return error.InvalidPrivateIndexClaimInventory;
             const accepted = try Accepted.decode(bytes[8..312]);
             const cut = try @import("receipt_position.zig").Position.decode(bytes[632..665]);
-            if (cut != .native) return error.InvalidPrivateIndexClaimInventory;
-            const result: Consumption = .{ .accepted = accepted, .header = try Header.decode(bytes[312..632], binding, accepted.ordinal), .position = cut.native, .previous_digest = bytes[672..704].* };
+            const result: Consumption = .{ .accepted = accepted, .header = try Header.decode(bytes[312..632], binding, accepted.ordinal), .position = cut, .previous_digest = bytes[672..704].* };
             try result.requireFor(binding);
             return result;
         }
@@ -347,8 +346,14 @@ pub const SourceStream = struct {
             !std.mem.eql(u8, &record.accepted.batch_digest, &head.consumed_digest) or !std.mem.eql(u8, &record.accepted.scope_digest, &head.scope_digest)) return error.InvalidPrivateIndexClaimInventory;
         if (head.pending() == 0 and (head.consumed_rows != head.emitted_rows or head.consumed_sequence != head.last_sequence or !std.mem.eql(u8, &head.last_digest, &head.consumed_digest) or
             record.header.bytes[184] != @backingInt(head.state) or !std.mem.eql(u8, record.header.bytes[152..184], &head.progress_digest))) return error.InvalidPrivateIndexClaimInventory;
-        const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        if (record.position.sequence > current.sequence) return error.InvalidControlReceiptPosition;
+        const current = try authority.require(txn, if (binding.authority == .native) .native else .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        switch (record.position) {
+            .native => |cut| if (cut.sequence > current.sequence) return error.InvalidControlReceiptPosition,
+            .raft => |cut| {
+                const applied = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+                if (cut.index > applied.index or cut.term > applied.term or (cut.index == applied.index and cut.term != applied.term)) return error.InvalidControlReceiptPosition;
+            },
+        }
         return record;
     }
 
@@ -462,7 +467,7 @@ pub const SourceStream = struct {
             var head = (try load(txn, binding)) orelse Head{ .binding_digest = try bindingDigest(binding), .scope_digest = try self.scope.digest() };
             if (!std.mem.eql(u8, &head.scope_digest, &try self.scope.digest()) or head.state != .building or sequence <= head.last_sequence) return error.PrivateIndexOwnerJobChanged;
             if (head.emitted != 0 and binding.authority == .raft) {
-                const previous = try Header.decode((try optional(txn, &key(binding.id, head.emitted, false))) orelse return error.InvalidPrivateIndexClaimInventory, binding, head.emitted);
+                const previous = try latestHeader(txn, binding, head);
                 if ((try previous.orderedPosition()).raft.term > position.raft.term) return error.InvalidControlReceiptPosition;
             }
             const bytes: u64 = self.payload.len + header_len + 2 * @sizeOf(Key);
@@ -498,14 +503,18 @@ pub const SourceStream = struct {
         };
     }
 
+    fn latestHeader(txn: anytype, binding: jobs.Binding, head: Head) !Header {
+        if (head.pending() == 0) return ((try loadConsumption(txn, binding, head)) orelse return error.InvalidPrivateIndexClaimInventory).header;
+        return Header.decode((try optional(txn, &key(binding.id, head.emitted, false))) orelse return error.InvalidPrivateIndexClaimInventory, binding, head.emitted);
+    }
+
     pub fn requireLatestOrdered(txn: anytype, binding: jobs.Binding, source: Scope, position: Position, progress_digest: integrity.Digest, batch_digest: integrity.Digest) !Head {
         const sequence = try orderedSequence(binding, position);
         const head = (try load(txn, binding)) orelse return error.InvalidPrivateIndexClaimInventory;
         if (!std.mem.eql(u8, &head.last_digest, &batch_digest) or !std.mem.eql(u8, &head.scope_digest, &try source.digest()) or head.last_sequence != sequence or
             !std.mem.eql(u8, &head.progress_digest, &progress_digest)) return error.InvalidPrivateIndexClaimInventory;
-        if (head.pending() != 0) {
-            const raw = (try optional(txn, &key(binding.id, head.emitted, false))) orelse return error.InvalidPrivateIndexClaimInventory;
-            const header = try Header.decode(raw, binding, head.emitted);
+        {
+            const header = try latestHeader(txn, binding, head);
             if (!std.meta.eql(try header.orderedPosition(), position) or
                 !std.mem.eql(u8, header.bytes[40..72], &head.scope_digest) or
                 !std.mem.eql(u8, header.bytes[152..184], &head.progress_digest) or header.bytes[184] != @backingInt(head.state) or
@@ -530,9 +539,12 @@ pub const SourceStream = struct {
         const allocation = try requireRegistered(txn, binding);
         if (try orderedSequence(binding, cut) != head.last_sequence or progress_digest == null or batch_digest == null or
             !std.mem.eql(u8, &head.last_digest, &batch_digest.?) or !std.mem.eql(u8, &head.progress_digest, &progress_digest.?)) return error.InvalidPrivateIndexClaimInventory;
+        if (head.pending() == 0 and !std.meta.eql(try (try latestHeader(txn, binding, head)).orderedPosition(), cut)) return error.InvalidPrivateIndexClaimInventory;
         var previous = head.consumed_digest;
         var previous_sequence = head.consumed_sequence;
-        var previous_term: u64 = 0;
+        // A later consumption may retire an earlier batch while other pages
+        // are already pending. Compare producer cuts, not consumption time.
+        var previous_term: u64 = if (try loadConsumption(txn, binding, head)) |record| (try record.header.orderedPosition()).term() else 0;
         var bytes: u64 = 0;
         var rows: u64 = 0;
         for (0..@intCast(head.pending())) |i| {
@@ -658,16 +670,32 @@ pub const SourceStream = struct {
         /// All validation/encoding precedes the first write. The caller must
         /// abort on any stage/outbox error and commit this whole effect once.
         pub fn stage(self: *const PreparedConsumption, txn: anytype, replay: ?Native) !ConsumeResult {
+            if (self.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            return self.stageOrdered(txn, if (replay) |cut| .{ .native = cut } else null);
+        }
+        pub fn stageOrdered(self: *const PreparedConsumption, txn: anytype, replay: ?Position) !ConsumeResult {
+            if (self.binding.authority == .raft and replay == null) return error.InvalidControlReceiptPosition;
             try jobs.requireReserved(txn, self.binding);
             var head = (try load(txn, self.binding)) orelse return error.PrivateIndexRootRecoveryRequired;
             const previous = try loadConsumption(txn, self.binding, head);
             if (head.consumed == self.accepted.ordinal) {
                 const retained = previous orelse return error.InvalidPrivateIndexClaimInventory;
                 if (!std.mem.eql(u8, &retained.accepted.decision_digest, &self.accepted.decision_digest)) return error.InvalidPrivateIndexClaimReceipt;
-                if (replay) |cut| if (!std.meta.eql(cut, retained.position)) return error.InvalidControlReceiptPosition;
+                if (replay) |cut| {
+                    _ = try orderedSequence(self.binding, cut);
+                    if (self.binding.authority == .native and !std.meta.eql(cut, retained.position)) return error.InvalidControlReceiptPosition;
+                    if (cut == .raft and (cut.raft.index < retained.position.raft.index or cut.raft.term < retained.position.raft.term or
+                        (cut.raft.index == retained.position.raft.index and cut.raft.term != retained.position.raft.term))) return error.InvalidControlReceiptPosition;
+                }
                 return .{ .record = retained, .duplicate = true };
             }
             if (head.consumed == std.math.maxInt(u64) or self.accepted.ordinal != head.consumed + 1) return error.InvalidPrivateIndexClaimReceipt;
+            if (self.binding.authority == .raft) {
+                const cut = replay.?;
+                _ = try orderedSequence(self.binding, cut);
+                const prior = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+                if (cut.raft.index <= prior.index or cut.raft.term < prior.term) return error.InvalidControlReceiptPosition;
+            }
             const batch = if (self.batch) |*value| value else return error.PrivateIndexRootRecoveryRequired;
             try self.accepted.requireFor(self.binding, batch.header);
             try requirePrefix(self.accepted, head, previous);
@@ -676,9 +704,9 @@ pub const SourceStream = struct {
             const raw_body = try txn.get(&key(self.binding.id, self.accepted.ordinal, true));
             if (raw_body.len != batch.header.payloadLen() or !std.mem.eql(u8, &hash(raw_body), batch.header.bytes[224..256])) return error.InvalidPrivateIndexClaimInventory;
             const ns = @import("online_source_contract.zig").namespaceBytes(self.binding.fence.namespace);
-            const current = try authority.require(txn, .native, ns);
-            const sequence = std.math.add(u64, current.sequence, 1) catch return error.OnlineSourceCorrupt;
-            const position: Native = .{ .namespace = self.binding.fence.namespace, .sequence = sequence };
+            const current = try authority.require(txn, if (self.binding.authority == .native) .native else .raft, ns);
+            const position: Position = if (self.binding.authority == .raft) replay orelse return error.InvalidControlReceiptPosition else .{ .native = .{ .namespace = self.binding.fence.namespace, .sequence = std.math.add(u64, current.sequence, 1) catch return error.OnlineSourceCorrupt } };
+            _ = try orderedSequence(self.binding, position);
             if (replay) |cut| if (!std.meta.eql(cut, position)) return error.InvalidControlReceiptPosition;
             const record: Consumption = .{ .accepted = self.accepted, .header = batch.header, .position = position, .previous_digest = head.consumption_digest };
             const record_bytes = try record.encode(self.binding);
@@ -695,7 +723,7 @@ pub const SourceStream = struct {
             try txn.delete(&key(self.binding.id, self.accepted.ordinal, true));
             try txn.put(consumption_key, &record_bytes);
             try txn.put(head_key, &head_bytes);
-            _ = try authority.advance(txn, ns, sequence);
+            if (position == .native) _ = try authority.advance(txn, ns, position.native.sequence);
             return .{ .record = record, .duplicate = false };
         }
     };

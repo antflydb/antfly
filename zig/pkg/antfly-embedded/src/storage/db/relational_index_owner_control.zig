@@ -328,7 +328,10 @@ pub const Effect = union(enum) {
         switch (self) {
             .control, .cancel_control => |value| try value.validate(),
             .claims => |value| try value.validate(),
-            .consume => |value| try value.validate(),
+            .consume => |value| {
+                try value.validate();
+                if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            },
             .inventory_validation => |value| try value.validate(),
             .generation_validation => |value| try value.validate(),
             .validation_seal => |value| try value.validate(),
@@ -502,7 +505,7 @@ pub const ConsumeCommand = struct {
         try self.accepted.validate();
         var binding_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(&try self.binding.encode(), &binding_digest, .{});
-        if (self.binding.authority != .native or self.binding.phase != .reserved or
+        if (self.binding.phase != .reserved or
             !std.mem.eql(u8, &self.accepted.binding_digest, &binding_digest)) return error.InvalidPrivateIndexClaimReceipt;
     }
 };
@@ -522,7 +525,7 @@ pub const ConsumeOutcome = struct {
             self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
         const record = self.record orelse return error.InvalidPrivateIndexNativeReceipt;
         try record.requireFor(self.binding);
-        if (!std.mem.eql(u8, &record.accepted.decision_digest, &self.accepted.decision_digest) or !std.meta.eql(record.position, self.position)) return error.InvalidPrivateIndexNativeReceipt;
+        if (record.position != .native or !std.mem.eql(u8, &record.accepted.decision_digest, &self.accepted.decision_digest) or !std.meta.eql(record.position.native, self.position)) return error.InvalidPrivateIndexNativeReceipt;
     }
 };
 
@@ -568,17 +571,29 @@ pub const PreparedConsumption = struct {
     }
     pub fn stage(self: *PreparedConsumption, _: anytype, txn: anytype, replay: ?Native) !ConsumeOutcome {
         // The serialized apply lock may have waited past ingress cancellation.
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try self.context.ensureActive();
         try PreparedBuild.verifyRecovery(txn, self.command.binding);
         try self.context.ensureActive();
         const result = try self.prepared.stage(txn, replay);
-        return .{ .binding = self.command.binding, .accepted = self.command.accepted, .record = result.record, .position = result.record.position, .duplicate = result.duplicate };
+        return .{ .binding = self.command.binding, .accepted = self.command.accepted, .record = result.record, .position = result.record.position.native, .duplicate = result.duplicate };
+    }
+    pub fn stageRaft(self: *PreparedConsumption, _: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.context.ensureActive();
+        if (self.command.binding.authority != .raft or owner_group == 0 or owner_group != self.command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        try PreparedBuild.verifyRecovery(txn, self.command.binding);
+        try self.context.ensureActive();
+        _ = try self.prepared.stageOrdered(txn, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const PreparedConsumption) bool {
         return false;
     }
     pub fn populateReceipt(_: *const PreparedConsumption, _: anytype, _: *ConsumeOutcome) !void {}
     pub fn preparePayload(self: *PreparedConsumption) !void {
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "consume", self.command, max_cancellation_wire_bytes);
     }
     pub fn finalizePayload(self: *PreparedConsumption, position: Native) ![]const u8 {

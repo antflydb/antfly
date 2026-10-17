@@ -1951,6 +1951,115 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         }
         try db.core.store.putBatch(&.{.{ .key = build.checkpoint_key, .value = checkpoint_bytes }}, &.{});
     }
+    const owner_control = @import("relational_index_owner_control.zig");
+    const Consumption = struct {
+        fn prepare(database: *db_mod.DB, command: owner_control.ConsumeCommand) !owner_control.PreparedConsumption {
+            return prepareAlloc(alloc, database, command);
+        }
+        fn prepareAlloc(a: std.mem.Allocator, database: *db_mod.DB, command: owner_control.ConsumeCommand) !owner_control.PreparedConsumption {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            return owner_control.PreparedConsumption.init(a, &read, command);
+        }
+        fn allocations(a: std.mem.Allocator, database: *db_mod.DB, command: owner_control.ConsumeCommand) !void {
+            var prepared = try prepareAlloc(a, database, command);
+            defer prepared.deinit();
+        }
+    };
+    const first_accepted = accepted: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var batch = (try build.peekClaimSource(alloc, &read, reserved_binding)).?;
+        defer batch.deinit();
+        break :accepted try sourceDecision(reserved_binding, batch.header, null, @splat(10));
+    };
+    var consume = try Consumption.prepare(&db, .{ .binding = reserved_binding, .accepted = first_accepted });
+    defer consume.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Consumption.allocations, .{ &db, consume.command });
+    try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .consume = consume.command }).validate());
+    try std.testing.expectError(error.InvalidControlReceiptPosition, consume.preparePayload());
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexConsumption(&consume, 99, .{ .term = 5, .index = 58 }));
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.InvalidControlReceiptPosition, consume.prepared.stageOrdered(&txn, .{ .raft = .{ .term = 5, .index = 55 } }));
+        try std.testing.expectError(error.InvalidControlReceiptPosition, consume.prepared.stage(&txn, null));
+        try std.testing.expectError(error.NotFound, txn.get(source.consumption_key));
+    }
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try consume.stageRaft(db.core, &txn, 11, .{ .term = 5, .index = 58 });
+        var marker_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+        const marker_write = receipts.orderedApplyReceiptWrite(.{ .term = 5, .index = 58 }, &marker_bytes);
+        try txn.put(marker_write.key, marker_write.value);
+        const head = (try source.load(&txn, reserved_binding)).?;
+        try std.testing.expectEqual(@as(u64, 0), head.pending());
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try build.verifyRecovery(&read, reserved_binding);
+        try std.testing.expectEqual(@as(u64, 1), (try source.load(&read, reserved_binding)).?.pending());
+        try std.testing.expectEqual(@as(u64, 55), (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+        try std.testing.expectError(error.NotFound, read.get(source.consumption_key));
+    }
+    {
+        // Another page can already be queued before an earlier batch is
+        // consumed in a newer term. Recovery compares producer order, not
+        // the later consumption cut, and must retain that pending page.
+        var queued_terminal = (try build.prepareRaft(alloc, null, db.core, "usage_records", &retry, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
+        defer queued_terminal.deinit();
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try queued_terminal.stageRaft(db.core, &txn, 11, .{ .term = 6, .index = 60 });
+        var marker_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+        const producer_marker = receipts.orderedApplyReceiptWrite(.{ .term = 6, .index = 60 }, &marker_bytes);
+        try txn.put(producer_marker.key, producer_marker.value);
+        try consume.stageRaft(db.core, &txn, 11, .{ .term = 7, .index = 70 });
+        const consumption_marker = receipts.orderedApplyReceiptWrite(.{ .term = 7, .index = 70 }, &marker_bytes);
+        try txn.put(consumption_marker.key, consumption_marker.value);
+        try build.verifyRecovery(&txn, reserved_binding);
+        const head = (try source.load(&txn, reserved_binding)).?;
+        try std.testing.expectEqual(@as(u64, 1), head.pending());
+        try std.testing.expectEqual(@as(u64, 60), head.last_sequence);
+        try std.testing.expectEqual(@as(u64, 70), (try source.loadConsumption(&txn, reserved_binding, head)).?.position.raft.index);
+    }
+    try db.applyCommittedRaftIndexConsumption(&consume, 11, .{ .term = 5, .index = 58 });
+    try db.applyCommittedRaftIndexConsumption(&consume, 11, .{ .term = 5, .index = 58 });
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    var consume_retry = try Consumption.prepare(&db, consume.command);
+    defer consume_retry.deinit();
+    try std.testing.expect(consume_retry.prepared.batch == null);
+    try db.applyCommittedRaftIndexConsumption(&consume_retry, 11, .{ .term = 5, .index = 59 });
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.InvalidControlReceiptPosition, consume_retry.prepared.stageOrdered(&txn, .{ .raft = .{ .term = 5, .index = 57 } }));
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try build.verifyRecovery(&read, reserved_binding);
+        try std.testing.expect(try build.peekClaimSource(alloc, &read, reserved_binding) == null);
+        const head = (try source.load(&read, reserved_binding)).?;
+        try std.testing.expectEqual(@as(u64, 0), head.pending_bytes);
+        const retained = (try source.loadConsumption(&read, reserved_binding, head)).?;
+        try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = 5, .index = 58 } }, retained.position);
+        try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = 4, .index = 50 } }, try retained.header.orderedPosition());
+        _ = try retained.prefix().digest();
+        try std.testing.expectError(error.NotFound, read.get(&source.key(binding.id, 1, false)));
+        try std.testing.expectError(error.NotFound, read.get(&source.key(binding.id, 1, true)));
+    }
+    var forged_decision = first_accepted;
+    forged_decision.logical_digest[0] ^= 1;
+    forged_decision.decision_digest = forged_decision.computedDigest();
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, Consumption.prepare(&db, .{ .binding = reserved_binding, .accepted = forged_decision }));
+    // A producer must resume after its entire previous backlog was consumed:
+    // the previous header now lives only in the retained consumption record.
     var last = (try build.prepareRaft(alloc, null, db.core, "usage_records", &retry, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
     defer last.deinit();
     try std.testing.expectEqual(@as(usize, 0), last.page.records_examined);
@@ -1973,6 +2082,59 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         // Physical completion alone grants neither uniqueness nor publication.
         try std.testing.expectEqualDeep(reserved_binding, (try jobs.load(&read)).?);
     }
+    const last_accepted = accepted: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var batch = (try build.peekClaimSource(alloc, &read, reserved_binding)).?;
+        defer batch.deinit();
+        try std.testing.expectEqual(@as(usize, 0), batch.rows().len);
+        break :accepted try sourceDecision(reserved_binding, batch.header, first_accepted, @splat(11));
+    };
+    var terminal_consume = try Consumption.prepare(&db, .{ .binding = reserved_binding, .accepted = last_accepted });
+    defer terminal_consume.deinit();
+    terminal_consume.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, db.applyCommittedRaftIndexConsumption(&terminal_consume, 11, .{ .term = 6, .index = 70 }));
+    try std.testing.expectEqual(@as(u64, 60), (try db.orderedApplyReceipt()).?.index);
+    terminal_consume.context.deadline_ns = null;
+    try db.applyCommittedRaftIndexConsumption(&terminal_consume, 11, .{ .term = 6, .index = 70 });
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try build.verifyRecovery(&read, reserved_binding);
+        const head = (try source.load(&read, reserved_binding)).?;
+        try std.testing.expectEqual(@as(u64, 2), head.consumed);
+        try std.testing.expectEqual(@as(u64, 1), head.consumed_rows);
+        try std.testing.expectEqual(@as(u64, 0), head.pending_bytes);
+        const retained = (try source.loadConsumption(&read, reserved_binding, head)).?;
+        try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = 6, .index = 70 } }, retained.position);
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+        try std.testing.expect(try build.peekClaimSource(alloc, &read, reserved_binding) == null);
+    }
+    {
+        // Checksums are not commit authority: even a consistently re-encoded
+        // head and receipt must not invent consumption past the apply cut.
+        const saved_head = try db.core.store.get(alloc, source.head_key);
+        defer alloc.free(saved_head);
+        const saved_record = try db.core.store.get(alloc, source.consumption_key);
+        defer alloc.free(saved_record);
+        var future = try source.Consumption.decode(saved_record, reserved_binding);
+        future.position = .{ .raft = .{ .term = 6, .index = 71 } };
+        const future_bytes = try future.encode(reserved_binding);
+        var future_head = try source.Head.decode(saved_head);
+        future_head.consumption_digest = @import("relational_index_inputs.zig").digest(&future_bytes);
+        const future_head_bytes = try future_head.encode();
+        try db.core.store.putBatch(&.{ .{ .key = source.head_key, .value = &future_head_bytes }, .{ .key = source.consumption_key, .value = &future_bytes } }, &.{});
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.InvalidControlReceiptPosition, build.verifyRecovery(&read, reserved_binding));
+        }
+        try db.core.store.putBatch(&.{ .{ .key = source.head_key, .value = saved_head }, .{ .key = source.consumption_key, .value = saved_record } }, &.{});
+    }
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 
@@ -1994,7 +2156,10 @@ fn sourceDecision(binding: @import("relational_index_owner_job.zig").Binding, he
         .ordinal = std.mem.readInt(u64, header.bytes[104..112], .little),
         .rows = (if (previous) |value| value.rows else @as(u64, 0)) + count,
         .batch_rows = count,
-        .source_sequence = (try header.position()).sequence,
+        .source_sequence = switch (try header.orderedPosition()) {
+            .native => |cut| cut.sequence,
+            .raft => |cut| cut.index,
+        },
         .batch_digest = header.digest(),
         .logical_digest = logical_digest,
         .previous_decision = if (previous) |value| value.decision_digest else @splat(0),

@@ -35,13 +35,21 @@ the original effect position without advancing the standalone clock. Preparation
 reuses the compiled reservation outside apply exclusion, and follower replay
 uses the selected page rather than repeating a time-limited scan. Cold recovery
 verifies the checkpoint against the durable apply watermark and bounded source
-header chain. This does not yet wire replicated claim delivery, validation,
-installation, cancellation or publication release through the public receiver.
+header chain. Source consumption uses the same retained journal for either
+authority: batch deletion, debt accounting, the original producer cut, the
+consumption cut and the apply watermark commit together. Empty-backlog producer
+resumption recovers its previous header from that journal. Recovery distinguishes
+producer order from later consumption order when other pages are already queued.
+Native proof adapters still reject Raft records. This does not yet wire replicated
+claim delivery, validation, installation, cancellation or publication release
+through the public receiver.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
 passes 288 storage tests and one server test, with no skips or leaks. The Raft
 regression covers aborted apply, exact replay, retry cuts, physical membership,
-wrong-authority corruption, allocation failures and two cold reopens.
+wrong-authority corruption, allocation failures and cold reopens. Consumption
+controls additionally cover expired apply, future cuts with valid checksums,
+retained-cut retry and resumed production after full and partial backlog drain.
 
 ## Document conflict delivery (2026-10-17)
 

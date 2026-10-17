@@ -786,7 +786,7 @@ pub const ClaimResponse = union(enum) {
         if (self != .consumed) return error.InvalidPrivateIndexClaimReceipt;
         const value = self.consumed;
         if (value.outcome.replication_pending or value.outcome.error_name != null) return error.InvalidPrivateIndexClaimReceipt;
-        const result = delivery_journal.Consumed.fromRecord(value.outcome.record.?, value.proof orelse return error.InvalidPrivateIndexClaimReceipt);
+        const result = try delivery_journal.Consumed.fromRecord(value.outcome.record.?, value.proof orelse return error.InvalidPrivateIndexClaimReceipt);
         try result.verify();
         return result;
     }
@@ -804,7 +804,7 @@ pub const ClaimResponse = union(enum) {
                     !std.mem.eql(u8, &value.outcome.accepted.batch_digest, &wanted.batch_digest)) return error.InvalidPrivateIndexClaimReceipt;
                 if (value.proof) |proof| {
                     if (value.signing_failure != null or proof.root_generation != value.root_generation or value.outcome.replication_pending or value.outcome.error_name != null) return error.InvalidPrivateIndexClaimReceipt;
-                    try delivery_journal.Consumed.fromRecord(value.outcome.record.?, proof).verify();
+                    try (try delivery_journal.Consumed.fromRecord(value.outcome.record.?, proof)).verify();
                 }
             },
             .closed => |value| {
@@ -1805,10 +1805,10 @@ const TestDriver = struct {
             defer source.deinit();
             const header = source.outcome.batch.?.header;
             try command.accepted.requireFor(binding, header);
-            self.consumed_record = .{ .accepted = command.accepted, .header = header, .position = .{ .namespace = binding.fence.namespace, .sequence = 5 }, .previous_digest = @splat(0) };
+            self.consumed_record = .{ .accepted = command.accepted, .header = header, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 5 } }, .previous_digest = @splat(0) };
         }
         self.consumption_calls += 1;
-        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ConsumeOutcome, alloc, .{ .binding = command.binding, .accepted = command.accepted, .record = self.consumed_record, .position = self.consumed_record.?.position, .duplicate = duplicate }) };
+        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ConsumeOutcome, alloc, .{ .binding = command.binding, .accepted = command.accepted, .record = self.consumed_record, .position = self.consumed_record.?.position.native, .duplicate = duplicate }) };
     }
 
     pub fn stepNativeIndexOwnerInstallationAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, request: native.InstallationRequest, audit_root_incarnation: u128, context: operation.RequestContext) !struct { root_generation: u64, outcome: std.json.Parsed(native.InstallationResponse) } {

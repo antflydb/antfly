@@ -101,9 +101,12 @@ pub const Consumed = struct {
     position: positions.Native,
     proof: publication.RootProof,
 
-    pub fn fromRecord(record: Source.Consumption, proof: publication.RootProof) Consumed {
+    pub fn fromRecord(record: Source.Consumption, proof: publication.RootProof) !Consumed {
+        // This adapter still attests native consumers only. A Raft journal
+        // record is not proof of enrolled replicated execution.
+        if (record.position != .native) return error.InvalidPrivateIndexClaimReceipt;
         const consumed_prefix = record.prefix();
-        return .{ .metadata_incarnation = consumed_prefix.metadata_incarnation, .binding_digest = consumed_prefix.binding_digest, .ordinal = consumed_prefix.ordinal, .batch_digest = consumed_prefix.batch_digest, .decision_digest = consumed_prefix.decision_digest, .rows = consumed_prefix.rows, .position = consumed_prefix.position, .proof = proof };
+        return .{ .metadata_incarnation = consumed_prefix.metadata_incarnation, .binding_digest = consumed_prefix.binding_digest, .ordinal = consumed_prefix.ordinal, .batch_digest = consumed_prefix.batch_digest, .decision_digest = consumed_prefix.decision_digest, .rows = consumed_prefix.rows, .position = consumed_prefix.position.native, .proof = proof };
     }
 
     pub fn digest(self: Consumed) !Digest {
@@ -111,7 +114,7 @@ pub const Consumed = struct {
             !nonzero(&self.metadata_incarnation) or !nonzero(&self.binding_digest) or
             !nonzero(&self.batch_digest) or !nonzero(&self.decision_digest) or
             !equal(self.metadata_incarnation, self.proof.identity.metadata_incarnation)) return error.InvalidPrivateIndexClaimReceipt;
-        return (Source.ConsumedPrefix{ .metadata_incarnation = self.metadata_incarnation, .binding_digest = self.binding_digest, .ordinal = self.ordinal, .batch_digest = self.batch_digest, .decision_digest = self.decision_digest, .rows = self.rows, .position = self.position }).digest();
+        return (Source.ConsumedPrefix{ .metadata_incarnation = self.metadata_incarnation, .binding_digest = self.binding_digest, .ordinal = self.ordinal, .batch_digest = self.batch_digest, .decision_digest = self.decision_digest, .rows = self.rows, .position = .{ .native = self.position } }).digest();
     }
     pub fn verify(self: Consumed) !void {
         self.proof.verify(try self.digest()) catch return error.InvalidPrivateIndexClaimReceipt;

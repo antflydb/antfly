@@ -742,6 +742,9 @@ test "native index owner adapter executes fresh permission stages and recovers r
         var forged_consumption = signed_consumption;
         forged_consumption.position.sequence += 1;
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, forged_consumption.verify());
+        var wrong_authority = consumed.outcome.value.record.?;
+        wrong_authority.position = .{ .raft = .{ .term = 1, .index = accepted.source_sequence + 1 } };
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, @import("../metadata/relational_index_delivery_journal.zig").Consumed.fromRecord(wrong_authority, signed_consumption.proof));
         metadata.acceptance = null;
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{}));
         metadata.acceptance = accepted_head;

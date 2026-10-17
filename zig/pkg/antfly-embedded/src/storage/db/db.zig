@@ -8414,6 +8414,11 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
+    pub fn applyCommittedRaftIndexConsumption(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedConsumption, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
     fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
