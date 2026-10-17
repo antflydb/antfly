@@ -11130,3 +11130,69 @@ and inventory checks pass; dispositions remain 531 implemented / 132 rejected /
 superseded test binaries/objects were removed from this worktree's cache for
 verification headroom. Current verified artifacts, all logs, source and other
 worktrees were retained; these deleted build outputs can be regenerated.
+
+### Atomic local installation with admission retained
+
+The shared atomic schema commit path now accepts a distinct validation-only
+installation participant. It rechecks the exact ready predecessor inside the
+writer, stages the prepared schema and both catalogs, carries existing
+constraint activation progress, advances the actual owner commit clock and
+records an installed job cut. Its mandatory outer participant validates its
+own replay admission and stages replay/outbox effects before commit. Resident
+schema/index snapshots publish only after that writer commits. Ordinary schema
+commit still cannot consume this preparation.
+
+Only the exact active and versioned successor public schema writes are
+accepted by this installer; other control effects belong to its transaction
+participant, not arbitrary schema extras. Unchanged physical index identities
+and the existing table index state are retained. Native and Raft positions
+remain separate: a Raft participant must join the actual ordered apply marker
+before the installed record can be verified. No synthetic term/index is used
+for a native cut.
+
+Installed metadata binds the decision digest, complete ready predecessor,
+successor physical catalog, activation bytes and actual installed position.
+The header reconstructs the prior ready digest from retained position/effect,
+revision, cursor, counters and validation chain, rejecting altered counters
+beside an otherwise intact ready digest. Successor verification also requires
+both native/public schema histories, so old primary frames remain decodable.
+Read-only local replay/recovery checks return this exact durable record; they
+are not physical-root adoption proofs or signed distributed owner receipts.
+
+The owner fence is deliberately not released. Generic release remains denied,
+and ordinary cancellation is denied after installation so an installed
+successor cannot accidentally reopen writes against a canceled cohort. A
+private owner must authenticate metadata/root/cohort authority before invoking
+this transaction. The real DB command, deterministic replicated work, standby
+payload/replay, signed owner receipts and coordinated metadata publication and
+release adapters remain unfinished and unadvertised. The test participant
+stages a controlled local outbox record, not a qualified standby protocol.
+Public SET NOT NULL keeps its guarded rewrite, protocol version stays 54,
+and no original disposition receives completion credit.
+
+Final native Debug verification passes all five job tests, zero skips/leaks
+and 51/51 build steps in
+`/private/tmp/antfly-sql-nullability-installed-readiness-retry-debug.log`.
+Indexed/unindexed cases cover an injected failure after staging an outbox
+record (schema, both catalogs, source clock and job all roll back), installed
+restart verification, preserved incomplete CHECK coverage/cursor, wrong
+decision rejection, retained epoch-1 primary bytes and historical decoding
+under epoch 2. Existing READY index coverage survives the rebind and a cold
+named-index query succeeds without a rebuild. The initial query fixture used
+the physical-scan helper, which intentionally supplies no index snapshot;
+the corrected query pins both schema and index snapshots under apply-shared.
+No generation/readiness guard was weakened. A fixture enum typo was also
+corrected to the existing `.check` phase.
+
+The existing index-page/install gate passes 14 component plus 13 integration
+tests with zero skips/leaks and 53/53 build steps in
+`/private/tmp/antfly-sql-nullability-install-index-regression-debug.log`.
+The complete Debug SQL gate passes 896 portable plus 234 native tests, only
+the four existing opt-in benchmarks skipped, and 21/21 build steps in
+`/private/tmp/antfly-sql-nullability-installed-full-debug.log`. Formatting,
+control-catalog, Apache boundary (2,071 sources), license and inventory checks
+pass. Totals remain 531 implemented / 132 rejected / 113 superseded /
+810 unresolved. About 860 MiB of explicitly inspected inactive, superseded
+local test binaries/objects were removed for verification headroom; logs,
+source, current verified outputs and other worktrees were retained. These
+build outputs can be regenerated; no repository-wide destructive GC ran.

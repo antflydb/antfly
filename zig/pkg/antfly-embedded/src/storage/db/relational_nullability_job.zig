@@ -244,7 +244,19 @@ pub const Binding = struct {
     }
 };
 
-pub const Phase = enum { fencing, scanning, ready, failed, canceling, canceled };
+pub const Phase = enum { fencing, scanning, ready, failed, canceling, canceled, installed };
+/// Durable local installation evidence, not a signed publication receipt.
+/// The outer owner must authenticate decision/root/cohort authority before
+/// staging this record and commit its replay marker/outbox in the same txn.
+pub const Installation = struct {
+    decision: Digest,
+    ready_digest: Digest,
+    ready_position: positions.Position,
+    ready_last_effect: Digest,
+    physical_catalog: Digest,
+    activation: Digest,
+    position: positions.Position,
+};
 pub const Header = struct {
     binding: Binding,
     phase: Phase,
@@ -258,6 +270,7 @@ pub const Header = struct {
     chain: Digest,
     last_effect: Digest,
     failure_column: ?u16 = null,
+    installation: ?Installation = null,
 
     fn validate(self: Header) !void {
         try self.binding.validate();
@@ -267,16 +280,34 @@ pub const Header = struct {
             (self.phase == .failed) != (self.failure_column != null) or
             (self.failure_column != null and self.failure_column.? >= self.binding.columns) or
             (self.phase != .canceling and self.phase != .canceled and self.admitted == null) or
-            (self.frozen != null and self.admitted == null)) return error.InvalidSchemaValidationJob;
+            (self.frozen != null and self.admitted == null) or
+            (self.phase == .installed) != (self.installation != null)) return error.InvalidSchemaValidationJob;
         if (self.phase == .fencing and (self.frozen != null or self.records != 0 or self.rows_scanned != 0 or !eq(self.cursor_digest, hash(""))))
             return error.InvalidSchemaValidationJob;
-        if ((self.phase == .scanning or self.phase == .ready or self.phase == .failed) and self.frozen == null) return error.InvalidSchemaValidationJob;
+        if ((self.phase == .scanning or self.phase == .ready or self.phase == .failed or self.phase == .installed) and self.frozen == null) return error.InvalidSchemaValidationJob;
         for ([_]?positions.Position{ self.admitted, self.frozen, self.updated }) |maybe| if (maybe) |position| {
             try position.requireNamespace(self.binding.fence.namespace);
             if ((position == .native) != (self.binding.authority == .native)) return error.InvalidControlReceiptPosition;
             try precedesOrEqual(position, self.updated);
         };
         if (self.frozen) |cut| try precedes(self.admitted.?, cut);
+        if (self.installation) |installed| {
+            inline for (.{ "decision", "ready_digest", "ready_last_effect", "physical_catalog", "activation" }) |field|
+                if (std.mem.allEqual(u8, &@field(installed, field), 0)) return error.InvalidSchemaValidationJob;
+            if (!std.meta.eql(installed.position, self.updated)) return error.InvalidControlReceiptPosition;
+            try precedes(installed.ready_position, installed.position);
+            // Installation preserves the exact validation predecessor rather
+            // than adopting an opaque digest beside unrelated row counters.
+            var predecessor = self;
+            predecessor.phase = .ready;
+            predecessor.installation = null;
+            predecessor.updated = installed.ready_position;
+            predecessor.last_effect = installed.ready_last_effect;
+            predecessor.revision = std.math.sub(u64, self.revision, 1) catch return error.InvalidSchemaValidationJob;
+            if (predecessor.revision == 0) return error.InvalidSchemaValidationJob;
+            try precedesOrEqual(predecessor.frozen.?, predecessor.updated);
+            if (!eq(try predecessor.digest(), installed.ready_digest)) return error.InvalidSchemaValidationJob;
+        }
     }
     pub fn encode(self: Header, a: A) ![]u8 {
         try self.validate();
@@ -391,6 +422,66 @@ pub fn requireReady(txn: anytype, binding: Binding) !Header {
     const header = try workHeader(txn, binding);
     if (header.phase != .ready) return error.SchemaValidationNotReady;
     try binding.requireCurrent(txn);
+    return header;
+}
+
+fn requireSuccessor(a: A, txn: anytype, binding: Binding, installed: Installation) !void {
+    try binding.requireNamespace(txn);
+    if (!eq(binding.owner, try activation.ownership(txn)) or
+        !eq(binding.after_schema, try digestAt(txn, schema.schema_key)) or
+        !eq(binding.after_public, try digestAt(txn, public_key)) or
+        !eq(binding.after_catalog, try digestAt(txn, integrity.key)) or
+        !eq(installed.physical_catalog, try digestAt(txn, physical.head_key)) or
+        !eq(installed.activation, try digestAt(txn, activation.key))) return error.SchemaValidationJobChanged;
+    const catalog = try @import("table_catalog.zig").Catalog.decode((try optional(txn, @import("table_catalog.zig").key)) orelse return error.SchemaValidationJobChanged);
+    if (catalog.storage_mode != .relational or catalog.active_schema_version != binding.after_version) return error.SchemaValidationJobChanged;
+    // The old frames remain encoded with their original schema. Installation
+    // must retain both native/public histories, not only the active pointers.
+    for ([_]u32{ binding.before_version, binding.after_version }, [_]Digest{ binding.before_schema, binding.after_schema }, [_]Digest{ binding.before_public, binding.after_public }) |version, native_hash, public_hash| {
+        const native_key = try schema.schemaVersionKeyAlloc(a, version);
+        defer a.free(native_key);
+        const public_version = try api.versionedSchemaKeyAlloc(a, version);
+        defer a.free(public_version);
+        if (!eq(native_hash, try digestAt(txn, native_key)) or !eq(public_hash, try digestAt(txn, public_version))) return error.SchemaValidationJobChanged;
+    }
+}
+
+/// Called only after schema/catalog/activation writes have been staged by
+/// the exact prepared installer, with its ready predecessor checked before
+/// those writes. The containing transaction must also stage replay/outbox.
+/// No fence release, signature, public RPC or coordinator ACK occurs here.
+pub fn stageInstalled(a: A, txn: anytype, binding: Binding, ready_digest: Digest, decision: Digest, physical_catalog: Digest, entry: ?receipts.OrderedApplyReceipt) !Header {
+    var header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
+    try requireCommitted(txn, header);
+    if (!std.meta.eql(header.binding, binding) or header.phase != .ready or
+        !eq(try header.digest(), ready_digest) or std.mem.allEqual(u8, &decision, 0)) return error.SchemaValidationJobChanged;
+    const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
+    // Compute from the staged activation bytes; never promote independently
+    // incomplete coverage merely because nullability validation completed.
+    const position = try nextPosition(txn, binding, entry);
+    try precedes(header.updated, position);
+    const installed: Installation = .{ .decision = decision, .ready_digest = ready_digest, .ready_position = header.updated, .ready_last_effect = header.last_effect, .physical_catalog = physical_catalog, .activation = try digestAt(txn, activation.key), .position = position };
+    try requireSuccessor(a, txn, binding, installed);
+    header.phase = .installed;
+    header.installation = installed;
+    header.updated = position;
+    header.revision = try std.math.add(u64, header.revision, 1);
+    header.last_effect = hash("schema-validation-install/v1");
+    try save(a, txn, header);
+    return header;
+}
+
+/// Read-only replay/recovery check of a committed local installation. This
+/// does not authenticate a copied root or sign a distributed owner receipt.
+pub fn requireInstalled(a: A, txn: anytype, binding: Binding, decision: Digest) !Header {
+    const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
+    if (!std.meta.eql(header.binding, binding) or header.phase != .installed or
+        !eq(header.installation.?.decision, decision)) return error.SchemaValidationJobChanged;
+    try requireCommitted(txn, header);
+    const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
+    try requireSuccessor(a, txn, binding, header.installation.?);
     return header;
 }
 
@@ -524,6 +615,7 @@ pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
         // Cancellation is terminal progress, not permission to repair an
         // unproven restored/future cut by overwriting it with a local clock.
         try requireCommitted(txn, prior);
+        if (prior.phase == .installed) return error.SchemaValidationPublicationRequired;
         if (std.meta.eql(prior.binding, binding) and prior.phase == .canceled) {
             return prior;
         }

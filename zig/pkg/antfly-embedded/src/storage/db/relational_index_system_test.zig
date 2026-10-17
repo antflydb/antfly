@@ -369,6 +369,176 @@ test "relational index system nullability job prepares a compatible epoch withou
     }
 }
 
+test "relational index system nullability job installation joins schema catalog clock and outbox without releasing admission" {
+    const F = NullabilityJobFixture;
+    const api = @import("../../schema/mod.zig");
+    const Participant = struct {
+        fail: bool,
+        const outbox_key = "\x00\x00__metadata__:test_nullability_install_outbox";
+        pub fn validateBefore(_: @This(), _: anytype) !void {}
+        pub fn stage(self: @This(), txn: anytype, installed: F.job.Header) !void {
+            const value = try installed.encode(alloc);
+            defer alloc.free(value);
+            try txn.put(outbox_key, value);
+            if (self.fail) return error.InjectedSchemaInstallFailure;
+        }
+    };
+    for ([_]bool{ false, true }) |indexed| {
+        const prefix = "{{\"relational_indexes\":[{{\"name\":\"by_n\",\"keys\":[{{\"column\":\"n\"}}]}}],{s}";
+        const before = if (indexed) try std.fmt.allocPrint(alloc, prefix, .{F.before[1..]}) else try alloc.dupe(u8, F.before);
+        defer alloc.free(before);
+        const after = if (indexed) try std.fmt.allocPrint(alloc, prefix, .{F.after[1..]}) else try alloc.dupe(u8, F.after);
+        defer alloc.free(after);
+        const checked_before = try std.fmt.allocPrint(alloc, "{{\"checks\":[{{\"name\":\"positive\",\"column\":\"n\",\"op\":\"gt\",\"value\":0}}],{s}", .{before[1..]});
+        defer alloc.free(checked_before);
+        const checked_after = try std.fmt.allocPrint(alloc, "{{\"checks\":[{{\"name\":\"positive\",\"column\":\"n\",\"op\":\"gt\",\"value\":0}}],{s}", .{after[1..]});
+        defer alloc.free(checked_after);
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-installed-cold");
+        defer directory.cleanup();
+        var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        var live = true;
+        defer if (live) database.close();
+        try database.setSchemaJson(alloc, checked_before);
+        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} });
+        if (indexed) {
+            for (0..8) |_| {
+                if ((try database.relationalIndexBuildStatus("by_n")).state == .ready) break;
+                try database.buildRelationalIndexStep("by_n", .{ .time_ns = std.time.ns_per_s });
+            } else return error.ExistingIndexDidNotBecomeReady;
+        }
+        const primary = try internal.relationalRowKeyAlloc(alloc, "a");
+        defer alloc.free(primary);
+        const original = try database.core.store.get(alloc, primary);
+        defer alloc.free(original);
+        const predecessor = try database.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(predecessor);
+        var candidate = try F.job.Candidate.init(alloc, F.namespace.table_id, checked_before, checked_after, predecessor, &.{"n"}, .{});
+        defer candidate.deinit();
+        const binding = try F.binding(&database, &candidate, 41);
+        // Controlled pre-existing incomplete CHECK coverage. A nullability
+        // install must carry it, not claim the other constraint was validated.
+        const coverage = @import("relational_integrity_activation.zig");
+        {
+            var txn = try database.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, predecessor);
+            defer catalog.deinit();
+            var progress = try coverage.status(&txn, catalog);
+            progress.state = .validating;
+            progress.phase = .check;
+            progress.rows_scanned = 7;
+            progress.cursor = "retained-check-prefix";
+            const encoded = try progress.encode(alloc);
+            defer alloc.free(encoded);
+            try txn.put(coverage.key, encoded);
+            try txn.commit();
+        }
+        _ = try F.apply(&database, &candidate, binding, .begin);
+        _ = try F.apply(&database, &candidate, binding, .freeze);
+        var page = try F.job.PreparedPage.prepare(alloc, database.core, binding, .{ .time_ns = std.time.ns_per_s }, .{});
+        defer page.deinit();
+        const validated = try F.page(&database, &page);
+        try std.testing.expectEqual(F.job.Phase.ready, validated.phase);
+        var definition = try api.PreparedSchemaDefinition.init(alloc, checked_after);
+        defer definition.deinit(alloc);
+        const versioned = try api.versionedSchemaKeyAlloc(alloc, binding.after_version);
+        defer alloc.free(versioned);
+        const writes = [_]docstore.KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = checked_after }, .{ .key = versioned, .value = checked_after } };
+        const clock_before = try F.clock(&database);
+        const index_state = database.core.table_catalog.index_state;
+        const physical_before = if (database.core.relational_indexes.acquire()) |snapshot| blk: {
+            var retained = snapshot;
+            defer retained.deinit();
+            break :blk retained.plan.boundIndexes()[0].id();
+        } else null;
+        {
+            var prepared = try database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &writes, binding, &candidate);
+            defer prepared.deinit();
+            database.core.lockApply();
+            defer database.core.unlockApply();
+            try std.testing.expectError(error.InjectedSchemaInstallFailure, database.core.commitPreparedSchemaMetadataValidatedNullability(&prepared, &writes, @splat(91), null, Participant{ .fail = true }));
+        }
+        try std.testing.expectEqualDeep(validated, try F.current(&database));
+        try std.testing.expectEqual(clock_before, try F.clock(&database));
+        try std.testing.expectEqual(@as(u32, 1), database.core.schema.?.version);
+        try std.testing.expectError(error.NotFound, database.core.store.get(alloc, Participant.outbox_key));
+        try std.testing.expectError(error.NotFound, database.core.store.get(alloc, versioned));
+        const installed = blk: {
+            var prepared = try database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &writes, binding, &candidate);
+            defer prepared.deinit();
+            database.core.lockApply();
+            defer database.core.unlockApply();
+            break :blk try database.core.commitPreparedSchemaMetadataValidatedNullability(&prepared, &writes, @splat(91), null, Participant{ .fail = false });
+        };
+        try std.testing.expectEqual(F.job.Phase.installed, installed.phase);
+        try std.testing.expectEqualDeep(validated.updated, installed.installation.?.ready_position);
+        var damaged_predecessor = installed;
+        damaged_predecessor.records += 1;
+        try std.testing.expectError(error.InvalidSchemaValidationJob, damaged_predecessor.encode(alloc));
+        try std.testing.expect(installed.updated.native.sequence > clock_before);
+        try std.testing.expectEqual(index_state, database.core.table_catalog.index_state);
+        try std.testing.expectEqual(@as(u32, 2), database.core.schema.?.version);
+        if (indexed) {
+            var selected = database.core.relational_indexes.acquire().?;
+            defer selected.deinit();
+            try std.testing.expectEqual(physical_before.?, selected.plan.boundIndexes()[0].id());
+            try std.testing.expectEqual(@as(u32, 2), selected.plan.schemaView().version());
+        }
+        const outbox = try database.core.store.get(alloc, Participant.outbox_key);
+        defer alloc.free(outbox);
+        try std.testing.expectEqualDeep(installed, try F.job.Header.decode(outbox));
+        try std.testing.expectError(error.SchemaValidationPublicationRequired, F.apply(&database, &candidate, binding, .cancel));
+        try std.testing.expectError(error.IntegrityTopologyBusy, database.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} }));
+        database.close();
+        live = false;
+        database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        live = true;
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(installed, try F.job.requireInstalled(alloc, &read, binding, @splat(91)));
+        try std.testing.expectError(error.SchemaValidationJobChanged, F.job.requireInstalled(alloc, &read, binding, @splat(92)));
+        const carried = try coverage.Progress.decode(try read.get(coverage.key));
+        try std.testing.expectEqual(coverage.State.validating, carried.state);
+        try std.testing.expectEqual(@as(u32, 2), carried.schema_version);
+        try std.testing.expectEqual(@as(u64, 7), carried.rows_scanned);
+        try std.testing.expectEqualStrings("retained-check-prefix", carried.cursor);
+        {
+            var reader = try NullabilityScanFixture.open(&database, alloc, .{ .fields = &.{"n"} }, 0);
+            defer reader.deinit();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const decoded = (try reader.lookupTypedRow(arena.allocator(), "a")).?;
+            try std.testing.expectEqual(@as(u32, 2), reader.active.version());
+            try std.testing.expectEqual(@as(u32, 1), decoded.schema_version);
+            try std.testing.expectEqual(@as(i64, 1), decoded.typed.?.object.get("n").?.integer);
+        }
+        const actual = try database.core.store.get(alloc, primary);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, original, actual);
+        try std.testing.expectEqual(@as(u32, 1), try @import("algebraic/relational_row_codec.zig").rowSchemaVersion(actual));
+        try std.testing.expectEqual(@as(u32, 2), database.core.schema.?.version);
+        try std.testing.expect((try database.relationalTopologyStatus()).fence.?.eql(binding.fence));
+        if (indexed) {
+            try std.testing.expectEqual(@import("relational_index_jobs.zig").State.ready, (try database.relationalIndexBuildStatus("by_n")).state);
+            var index_reader = blk: {
+                database.core.lockApplyShared();
+                defer database.core.unlockApplyShared();
+                var view = database.core.acquireSchemaView().?;
+                defer view.release();
+                var selected = database.core.relational_indexes.acquire().?;
+                defer selected.deinit();
+                break :blk try rows.Reader.open(alloc, database.core.store, view, selected, .{ .index = "by_n", .fields = &.{"n"} }, 0);
+            };
+            defer index_reader.deinit();
+            var indexed_page = try index_reader.nextTypedPage(alloc, null, .{ .time_ns = std.time.ns_per_s });
+            defer indexed_page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), indexed_page.rows.len);
+            try std.testing.expectEqual(@as(i64, 1), indexed_page.rows[0].typed.?.object.get("n").?.integer);
+        }
+        try std.testing.expectError(error.IntegrityTopologyBusy, database.batch(.{ .writes = &.{.{ .key = "c", .value = "{\"n\":3}" }} }));
+    }
+}
+
 const NullabilityScanFixture = struct {
     const validation = @import("relational_nullability.zig");
     fn open(database: *db_mod.DB, a: std.mem.Allocator, request: rows.Request, now_ns: u64) !rows.Reader {

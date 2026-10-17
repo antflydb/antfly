@@ -155,6 +155,10 @@ pub const PreparedSchemaMetadata = struct {
     }
 };
 
+fn isSchemaValidationInstallation(comptime T: type) bool {
+    return if (T == @TypeOf(null)) false else @hasDecl(@typeInfo(T).pointer.child, "schema_validation_installation");
+}
+
 pub const PendingWorkStats = struct {
     derived_target_sequence: u64,
     has_async_indexes: bool,
@@ -1615,6 +1619,73 @@ pub const DBCore = struct {
         return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, null, null);
     }
 
+    /// Atomic local installation for an independently authorized validation
+    /// decision. The DB owner holds apply-exclusive, owns snapshot/replication
+    /// admission and authenticates metadata/root/cohort before calling. A
+    /// digest is not authority.
+    /// Its mandatory participant stages replay/outbox effects in this txn.
+    /// The topology fence stays held; this is not distributed publication.
+    pub fn commitPreparedSchemaMetadataValidatedNullability(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        decision: [32]u8,
+        entry: ?@import("apply_receipts.zig").OrderedApplyReceipt,
+        participant: anytype,
+    ) !@import("relational_nullability_job.zig").Header {
+        const job = @import("relational_nullability_job.zig");
+        if (comptime @TypeOf(participant) == @TypeOf(null)) @compileError("schema installation requires an authoritative replay/outbox participant");
+        const binding = (prepared.validated_nullability orelse return error.SchemaValidationJobRequired).binding;
+        const ready_digest = prepared.validated_nullability.?.ready_digest;
+        if (std.mem.allEqual(u8, &decision, 0) or metadata_writes.len != 2) return error.InvalidSchemaUpdateRequest;
+        const versioned = try public_schema_mod.versionedSchemaKeyAlloc(self.alloc, binding.after_version);
+        defer self.alloc.free(versioned);
+        var active = false;
+        var historical = false;
+        for (metadata_writes) |write| {
+            if (!std.mem.eql(u8, &job.hash(write.value), &binding.after_public)) return error.SchemaValidationJobChanged;
+            if (std.mem.eql(u8, write.key, public_schema_json_key) and !active) {
+                active = true;
+            } else if (std.mem.eql(u8, write.key, versioned) and !historical) {
+                historical = true;
+            } else return error.SchemaValidationJobChanged;
+        }
+        if (!active or !historical or !std.mem.eql(u8, &job.hash(prepared.encoded), &binding.after_schema) or
+            !std.mem.eql(u8, &job.hash((prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).value), &binding.after_catalog))
+            return error.SchemaValidationJobChanged;
+        const physical_catalog = if (prepared.relational_indexes) |indexes| job.hash(&indexes.metadata.head.encode()) else job.hash("");
+        const InstallState = struct {
+            pub const schema_validation_installation = true;
+            alloc: Allocator,
+            binding: job.Binding,
+            ready_digest: [32]u8,
+            decision: [32]u8,
+            physical_catalog: [32]u8,
+            entry: ?@import("apply_receipts.zig").OrderedApplyReceipt,
+            participant: @TypeOf(participant),
+            record: ?job.Header = null,
+
+            pub fn validateBefore(state: *@This(), txn: anytype) !void {
+                const current = try job.requireReady(txn, state.binding);
+                if (!std.mem.eql(u8, &try current.digest(), &state.ready_digest)) return error.SchemaValidationJobChanged;
+                try state.participant.validateBefore(txn);
+            }
+            pub fn stage(state: *@This(), txn: anytype, catalog: integrity_catalog_mod.Catalog) !void {
+                _ = catalog;
+                const installed = try job.stageInstalled(state.alloc, txn, state.binding, state.ready_digest, state.decision, state.physical_catalog, state.entry);
+                try state.participant.stage(txn, installed);
+                // In the Raft domain this also proves the participant joined
+                // the real ordered marker; native clocks remain independent.
+                const verified = try job.requireInstalled(state.alloc, txn, state.binding, state.decision);
+                if (!std.meta.eql(verified, installed)) return error.SchemaValidationJobChanged;
+                state.record = installed;
+            }
+        };
+        var installation: InstallState = .{ .alloc = self.alloc, .binding = binding, .ready_digest = ready_digest, .decision = decision, .physical_catalog = physical_catalog, .entry = entry, .participant = participant };
+        _ = try self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, false, null, &installation);
+        return installation.record orelse unreachable;
+    }
+
     /// Storage transaction for an independently authorized private index
     /// installation. The DB owner holds apply-exclusive and owns decision/root
     /// authentication, replication admission and payload preparation. Its
@@ -1718,10 +1789,16 @@ pub const DBCore = struct {
     ) !bool {
         // A reserved candidate is not ordinary DDL authority, even if its
         // fence disappears between preparation and commit.
-        if (prepared.validated_nullability != null) return error.SchemaValidationPublicationRequired;
-        if (comptime @TypeOf(installation) == @TypeOf(null)) {
-            if (prepared.reserved_index != null) return error.PrivateIndexPublicationRequired;
-        } else if (prepared.reserved_index == null or child_fence != null or rehydrate_only) return error.PrivateIndexPublicationRequired;
+        const validation_installation = comptime isSchemaValidationInstallation(@TypeOf(installation));
+        if (comptime validation_installation) {
+            if (prepared.validated_nullability == null or prepared.reserved_index != null or child_fence != null or rehydrate_only)
+                return error.SchemaValidationPublicationRequired;
+        } else {
+            if (prepared.validated_nullability != null) return error.SchemaValidationPublicationRequired;
+            if (comptime @TypeOf(installation) == @TypeOf(null)) {
+                if (prepared.reserved_index != null) return error.PrivateIndexPublicationRequired;
+            } else if (prepared.reserved_index == null or child_fence != null or rehydrate_only) return error.PrivateIndexPublicationRequired;
+        }
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);
@@ -1783,7 +1860,7 @@ pub const DBCore = struct {
             if (indexes.metadata.expected) |expected| expected.eql(indexes.metadata.head) else false
         else
             true;
-        if (!same_active_epoch or !same_index_catalog)
+        if (!validation_installation and (!same_active_epoch or !same_index_catalog))
             next_catalog.index_state = if (self.indexCount() == 0) .none else .pending;
         const previous_catalog_data = self.table_catalog.encode();
         const candidate_catalog_data = next_catalog.encode();
@@ -1804,7 +1881,7 @@ pub const DBCore = struct {
                 try participants.validateGuards(txn);
                 if (comptime @TypeOf(installation) != @TypeOf(null)) {
                     try participants.installation.validateBefore(txn);
-                    try participants.prepared.reserved_activation.?.validateBefore(txn);
+                    if (comptime !validation_installation) try participants.prepared.reserved_activation.?.validateBefore(txn);
                 }
             }
 
@@ -1824,7 +1901,8 @@ pub const DBCore = struct {
                 if (comptime @TypeOf(installation) != @TypeOf(null)) {
                     var manager = try participants.core.initTxnManager();
                     defer manager.deinit();
-                    try topology.requireDrained(txn, &manager, participants.prepared.reserved_index.?.fence);
+                    const expected = if (comptime validation_installation) participants.prepared.validated_nullability.?.binding.fence else participants.prepared.reserved_index.?.fence;
+                    try topology.requireDrained(txn, &manager, expected);
                 } else if (participants.child_fence) |expected| {
                     var manager = try participants.core.initTxnManager();
                     defer manager.deinit();
