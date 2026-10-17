@@ -18,7 +18,6 @@
 //! mutation fence or reopens an owner between pages.
 const std = @import("std");
 const View = @import("antfly_local_sources").storage_relational_read_view.View;
-const typed_json = @import("antfly_local_sources").storage_typed_json;
 const types = @import("antfly_local_sources").storage_db_types;
 
 pub const Set = struct {
@@ -150,25 +149,31 @@ pub const Set = struct {
         errdefer arena.deinit();
         const owned = arena.allocator();
         var rows: std.ArrayList(View.Row) = .empty;
+        var retained: std.ArrayList(View.Page) = .empty;
+        errdefer for (retained.items) |*page| page.deinit();
+        var retained_leases: std.AutoHashMapUnmanaged(usize, void) = .empty;
         try self.initialize();
         while (rows.items.len < limit) {
             const index = (try self.selected()) orelse break;
             const source = self.row(index);
-            const id = try owned.dupe(u8, source.id);
-            try rows.append(owned, .{
-                .id = id,
-                .version = source.version,
-                .schema_version = source.schema_version,
-                .value = try typed_json.clone(owned, source.value),
-                .expected_content_digest = source.expected_content_digest,
-                .document = if (source.document) |document| try typed_json.clone(owned, document) else null,
-                .sql_nulls = if (source.sql_nulls) |flags| try owned.dupe(bool, flags) else null,
-            });
+            // Pin a source page once per delivery page. Rows, column blocks,
+            // directories and large arrays remain borrowed instead of cloned.
+            const page = &self.owners[index].page.?;
+            const lease_id = if (page.lease) |lease| @intFromPtr(lease) else 0;
+            if (lease_id == 0 or !retained_leases.contains(lease_id)) {
+                try retained.ensureUnusedCapacity(owned, 1);
+                try retained_leases.ensureUnusedCapacity(owned, 1);
+                const held = try page.retain(self.alloc);
+                retained.appendAssumeCapacity(held);
+                retained_leases.putAssumeCapacity(@intFromPtr(held.lease.?), {});
+            }
+            try rows.append(owned, source);
+            const id = source.id;
             try self.advance(index, id);
         }
         const more = (try self.selected()) != null;
         self.failed = false;
-        return .{ .arena = arena, .rows = rows.items, .after = if (more) rows.items[rows.items.len - 1].id else null };
+        return .{ .arena = arena, .rows = rows.items, .retained_pages = retained.items, .after = if (more) rows.items[rows.items.len - 1].id else null };
     }
 
     fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
@@ -199,6 +204,7 @@ const Fixture = struct {
     closed: bool = false,
     fetches: usize = 0,
     empty_pages: u8 = 0,
+    native_array: bool = false,
 
     fn view(self: *Fixture) View {
         return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
@@ -218,6 +224,21 @@ const Fixture = struct {
         const count = @min(@min(limit, 1), self.ids.len - self.position);
         const result = try owned.alloc(View.Row, count);
         for (result, 0..) |*out, offset| out.* = .{ .id = try owned.dupe(u8, self.ids[self.position + offset]), .version = 9, .schema_version = 4, .value = .{ .number_string = try owned.dupe(u8, "9007199254740993") }, .expected_content_digest = self.digest, .document = self.document };
+        if (self.native_array) for (result) |*out| {
+            const src = @import("antfly_local_sources");
+            const names = try owned.alloc([]const u8, 2);
+            names[0] = try owned.dupe(u8, "a");
+            names[1] = try owned.dupe(u8, "missing");
+            const elements = try owned.alloc(src.sql_catalog.Row.Cell, 1);
+            elements[0] = .json(.{ .string = try owned.dupe(u8, out.id) });
+            const array = try owned.create(src.sql_array_value.Value);
+            array.* = try src.sql_array_value.Value.init(.text, &.{.{ .length = 1, .lower = 0 }}, elements, .{});
+            const values = try owned.alloc(src.sql_catalog.Row.Cell, 2);
+            values[0] = .typedArray(array);
+            values[1] = .{};
+            out.value = .null;
+            out.typed_cells = .{ .layout = try src.sql_catalog.Row.TypedLayout.init(owned, names), .values = values, .presence = &.{ true, false } };
+        };
         self.position += count;
         self.fetches += 1;
         return .{ .arena = arena, .rows = result, .after = if (self.position < self.ids.len) result[count - 1].id else null };
@@ -301,4 +322,36 @@ test "relational index system coordinated read set follows empty filtered contin
     try std.testing.expectEqualStrings("b", page.rows[1].id);
     try std.testing.expectEqualStrings("c", page.rows[2].id);
     try std.testing.expect(page.after == null);
+}
+
+fn nativeMergeFixture(alloc: std.mem.Allocator) !void {
+    var left: Fixture = .{ .ids = &.{ "a", "c" }, .native_array = true };
+    var right: Fixture = .{ .ids = &.{ "b", "d" }, .native_array = true };
+    const merged = try Set.create(alloc, &.{ left.view(), right.view() }, true);
+    var live = true;
+    defer if (live) merged.deinit();
+    var first = try merged.next(alloc, 2);
+    defer first.deinit();
+    var second = try merged.next(alloc, 2);
+    defer second.deinit();
+    merged.deinit();
+    live = false;
+    try std.testing.expect(left.closed and right.closed);
+    for ([_]View.Page{ first, second }) |page| {
+        try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+        try std.testing.expect(page.retained_pages.len != 0);
+        // The output pins source payloads; it does not deep-copy array cells.
+        try std.testing.expect(page.rows[0].typed_cells.?.values.ptr == page.retained_pages[0].rows[0].typed_cells.?.values.ptr);
+        for (page.rows) |out| {
+            const row = out.sqlRow();
+            try std.testing.expect(!try row.hasField("missing"));
+            const array = (try row.cell("a")).array.?;
+            try std.testing.expectEqual(@as(i32, 0), array.dimensions[0].lower);
+            try std.testing.expectEqualStrings(out.id, array.elements[0].value.string);
+        }
+    }
+}
+
+test "relational index system coordinated read set owns native arrays after source pages and cursors close" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, nativeMergeFixture, .{});
 }

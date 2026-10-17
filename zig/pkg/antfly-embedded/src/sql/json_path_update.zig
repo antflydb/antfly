@@ -28,19 +28,20 @@ pub fn set(owner: std.mem.Allocator, target: Json, path: *const arrays.Value, re
     if (path.element_type != .text) return error.SqlTypeMismatch;
     if (path.dimensions.len > 1) return error.SqlArraySubscriptError;
     if (target != .object and target != .array) return error.InvalidSqlParameters;
-    if (path.elements.len == 0) return .{ .value = target, .allocated_bytes = 0 };
+    if (path.cardinality() == 0) return .{ .value = target, .allocated_bytes = 0 };
     if (!create and (if (target == .object) target.object.count() else target.array.items.len) == 0) return .{ .value = target, .allocated_bytes = 0 };
     var frames: [128]Frame = undefined;
     var count: usize = 0;
     var current = target;
-    for (path.elements, 0..) |element, level| {
+    for (0..path.cardinality(), 0..) |array_cell_0, level| {
+        const element = path.flatCell(array_cell_0);
         try work.consume(1);
         if (element.sql_null) return error.SqlNullValueNotAllowed;
         if (element.array != null or element.value != .string) return error.SqlTypeMismatch;
         const key = element.value.string;
         try work.consume(key.len);
         if (count == frames.len) return error.SqlProgramLimitExceeded;
-        const final = level == path.elements.len - 1;
+        const final = level == path.cardinality() - 1;
         var frame: Frame = .{ .parent = current, .key = key };
         switch (current) {
             .object => |object| {

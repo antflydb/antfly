@@ -1593,6 +1593,7 @@ pub const ScanHash = struct {
 
 /// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
 /// duration of the callback; consumers that retain them must copy them.
+pub const BorrowedScanDocument = @import("../scan_document.zig").Borrowed;
 pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
@@ -1601,9 +1602,13 @@ pub const ScanVisitEntry = struct {
     relational_cursor: ?[]const u8 = null,
     json_null_fields: []const []const u8 = &.{},
     document_json: ?[]const u8 = null,
+    document_stream: ?BorrowedScanDocument = null,
 };
 
 pub const ScanVisitor = struct {
+    /// Opt in only when the callback consumes document_stream synchronously.
+    /// Ordinary collectors retain their existing document_json contract.
+    borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,

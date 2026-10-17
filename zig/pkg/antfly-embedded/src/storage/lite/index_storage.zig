@@ -108,7 +108,7 @@ fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
 }
 
 fn lockStore(store: *docstore.Store) void {
-    platform_sync.lockYielding(&store.mutex);
+    store.mutex.lock();
 }
 
 fn pinSnapshot(store: *docstore.Store) !docstore.Txn {

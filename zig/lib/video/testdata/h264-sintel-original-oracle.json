@@ -1,0 +1,339 @@
+{
+  "source": "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4",
+  "source_sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254",
+  "attribution": "Sintel, Blender Foundation / durian.blender.org, CC BY 3.0. Two-second stream-copy excerpt; no video re-encoding.",
+  "clip_sha256": "4f74ea595201ba3372c3430eb1b94372dcc70f95372ad82fbcf7083f9363e3cb",
+  "frames": [
+    {
+      "pts": 1020,
+      "sha256": "5d6d0ce8e9ce8c8c7904e3e7fac671ff8e4865f17dafab198d244cd80326014f",
+      "media_pts": 1024
+    },
+    {
+      "pts": 1532,
+      "sha256": "8cc87330493f90d3e8576b7ea1e2cc287e4f73402d8b82b9cb4605093d319603",
+      "media_pts": 1536
+    },
+    {
+      "pts": 2044,
+      "sha256": "d9e55393b489354053a0f88078bc059af748d621834aa4d8b40d7b798fdc5cea",
+      "media_pts": 2048
+    },
+    {
+      "pts": 2556,
+      "sha256": "dcfab26d82581170ac87a80b8b81ac0d338dcbeb1d4d0ddfd6d9aff6b7090823",
+      "media_pts": 2560
+    },
+    {
+      "pts": 3068,
+      "sha256": "2771f2f7cfb72d8bd6314b94675c7e886ef9ac620763c83663a8264f9d2a3dd5",
+      "media_pts": 3072
+    },
+    {
+      "pts": 3580,
+      "sha256": "7cee09f17d49a90a37566feacbff996a5d76fc94da2068fde703475645e3ae91",
+      "media_pts": 3584
+    },
+    {
+      "pts": 4092,
+      "sha256": "e9e0426b2bfa8409dcda3543b7fa5cd47c10c30a940eb75623c03997a8161a45",
+      "media_pts": 4096
+    },
+    {
+      "pts": 4604,
+      "sha256": "f492f39533a31e31a33862a8196f9a344653073948cd8fcaa093a71416c9a763",
+      "media_pts": 4608
+    },
+    {
+      "pts": 5116,
+      "sha256": "8f36df9167fba526480dbe704b605f7dd2652b6edd695ebe5e86a79923485c19",
+      "media_pts": 5120
+    },
+    {
+      "pts": 5628,
+      "sha256": "4fc289b200f1fc23dd7dba69a7b0b919a8b180d1fd97f717f4d428ede1eaf23e",
+      "media_pts": 5632
+    },
+    {
+      "pts": 6140,
+      "sha256": "2cedd5ccd1f09cec9f24a4c68abb8885b873c3eae9a0b92b68ccc13564f8d345",
+      "media_pts": 6144
+    },
+    {
+      "pts": 6652,
+      "sha256": "d2232e2c68024745cc32a71a8a53ab6425f18c99d729ca03b3d79e3224f2bb76",
+      "media_pts": 6656
+    },
+    {
+      "pts": 7164,
+      "sha256": "62ec15289eb01fc7fe034f748be6fbb5c6affdf1aed0617af508c3722d849890",
+      "media_pts": 7168
+    },
+    {
+      "pts": 7676,
+      "sha256": "4ab72fa21ef68179970e8e2e29558d1b21df0810ddb64bfbd3d7d98fc1339910",
+      "media_pts": 7680
+    },
+    {
+      "pts": 8188,
+      "sha256": "ad4da1485c9016c6e28cbe54bfe807ef57c7e2d8e0232ce570cad553566fc17f",
+      "media_pts": 8192
+    },
+    {
+      "pts": 8700,
+      "sha256": "34b79622449ad4f28c112c07d056ac1cf8e79045f6562ad83c8e51a339b8aaa7",
+      "media_pts": 8704
+    },
+    {
+      "pts": 9212,
+      "sha256": "a9f567aca9af4127124158e6edffc7a6c4cd7df304baa02993a92bc2c4e772f8",
+      "media_pts": 9216
+    },
+    {
+      "pts": 9724,
+      "sha256": "b2fa83f2c897e903795c3a10372ee73e3e4195c960847e035e289a987ff852ea",
+      "media_pts": 9728
+    },
+    {
+      "pts": 10236,
+      "sha256": "e48b57fada18d7c0195cef25808cd82e259fe20b6a05ae72dc2759c566139118",
+      "media_pts": 10240
+    },
+    {
+      "pts": 10748,
+      "sha256": "8ecd00faae03ae91a06cc8a5e9d45f043424c3e305802710e57c9dadab8f3c72",
+      "media_pts": 10752
+    },
+    {
+      "pts": 11260,
+      "sha256": "93ec4c27bd16d42e82151e47b54aff808866b723c36ed1f84f07fb3a8da2ca53",
+      "media_pts": 11264
+    },
+    {
+      "pts": 11772,
+      "sha256": "86f13484ccd0cce7ea91986dc035da2d3c174a6dc582c035f548fd79897b187d",
+      "media_pts": 11776
+    },
+    {
+      "pts": 12284,
+      "sha256": "fb287a449d50afb09be1cf4bda9e6864fd01f7b64ed4966270440481e9ce3aa6",
+      "media_pts": 12288
+    },
+    {
+      "pts": 12796,
+      "sha256": "b4f9e4841377ed04163d0efe2f6e493256552169e6070bffddf019a154f75925",
+      "media_pts": 12800
+    },
+    {
+      "pts": 13308,
+      "sha256": "821a007208cb09525de74de8a14478bed48a7cdb657aeb18702173fd07dc4d87",
+      "media_pts": 13312
+    },
+    {
+      "pts": 13820,
+      "sha256": "b67f41ab5563489a6d9afde7dff25376598420a390eaf5364d6c8d23d31185cf",
+      "media_pts": 13824
+    },
+    {
+      "pts": 14332,
+      "sha256": "4b9a74f5dba7efc5db64a58b1cbcb895506b6bbac65b01ef388fdb2d2cbda597",
+      "media_pts": 14336
+    },
+    {
+      "pts": 14844,
+      "sha256": "0df240d4be0727226265595055a2b30dea3eee621ee10a6e84a6c621e89fbab7",
+      "media_pts": 14848
+    },
+    {
+      "pts": 15356,
+      "sha256": "c65b023b3173f5b026f3313d173231ff7477503c6def9beee4cb8644cff860e2",
+      "media_pts": 15360
+    },
+    {
+      "pts": 15868,
+      "sha256": "58ec3fbd409380235eba0a152d52b2aa52eed419453f2b41ff0da93a90ad757d",
+      "media_pts": 15872
+    },
+    {
+      "pts": 16380,
+      "sha256": "85d06453527a358a96d66aaeb04dd007f58ca440701616643aecc4ccf69128d3",
+      "media_pts": 16384
+    },
+    {
+      "pts": 16892,
+      "sha256": "e092a14cc2ec31d3508e41ac6a883c2c3f87524dba80512b1105b4e2f68efbc3",
+      "media_pts": 16896
+    },
+    {
+      "pts": 17404,
+      "sha256": "e573b4be8a5854c22d25ddf3d8edf878475f683a6d69b6332e09b9b2cc4d3877",
+      "media_pts": 17408
+    },
+    {
+      "pts": 17916,
+      "sha256": "6651748b730b636a3b34ae193e96f4f41510ca3a5146acce5bc49086c0270941",
+      "media_pts": 17920
+    },
+    {
+      "pts": 18428,
+      "sha256": "81e23d749e147f2bfb4ca0e5c5d70846cc2f08ea54c836810ffb1bf0061f3cfa",
+      "media_pts": 18432
+    },
+    {
+      "pts": 18940,
+      "sha256": "21828b00206028d121d9797341cec275cc56710ffe7606273d115b307171de9b",
+      "media_pts": 18944
+    },
+    {
+      "pts": 19452,
+      "sha256": "df2be1e705fb0261310b0b9858fe954e3ffacd23f2da597b871addb1a653010c",
+      "media_pts": 19456
+    },
+    {
+      "pts": 19964,
+      "sha256": "b5753caa262b90bf97e041737c97ef1b6a93d7dc455955a6a3d0fd4edca2e221",
+      "media_pts": 19968
+    },
+    {
+      "pts": 20476,
+      "sha256": "ce1e4f2c7918b94ac477b5475231b266d99bbf60ec32f06af82888bb16917517",
+      "media_pts": 20480
+    },
+    {
+      "pts": 20988,
+      "sha256": "90521558014f05a1877a7f1e27b90e31ab0dca45012fa6533fe41717f2f70973",
+      "media_pts": 20992
+    },
+    {
+      "pts": 21500,
+      "sha256": "0ee02c945260a4b98cfda3674bdd8f85c3c36a1746a33201221f382ae3d23163",
+      "media_pts": 21504
+    },
+    {
+      "pts": 22012,
+      "sha256": "bbec6a36fe165386d54d092673b498fde170be7e1e0bc7f9ef8b467d42789449",
+      "media_pts": 22016
+    },
+    {
+      "pts": 22524,
+      "sha256": "d779717239a499e89041a69e4e39600ba330e8f88d8da6f2f4569a5771b2d286",
+      "media_pts": 22528
+    },
+    {
+      "pts": 23036,
+      "sha256": "a15cd010a0cccd23fc2671a663c4c8e37812b392ea34dac11add6e5a44f46c02",
+      "media_pts": 23040
+    },
+    {
+      "pts": 23548,
+      "sha256": "9c4ce4fbdabc7aaf28a41d9e2813266d5368a23a9c07c6dd07f4e6ca8c21f98a",
+      "media_pts": 23552
+    },
+    {
+      "pts": 24060,
+      "sha256": "5e343fed98a0f12e35fe3c1004477acb951e5f9e0a3b2086e20b5cb0ee6994ec",
+      "media_pts": 24064
+    },
+    {
+      "pts": 24572,
+      "sha256": "5c5636c8ea7a8427d8e3b56c7b055ac6cff401d53de1136a1a3678b0a422fcb9",
+      "media_pts": 24576
+    },
+    {
+      "pts": 25084,
+      "sha256": "6091b3e3f7509006575352346456cabb0ac28cca185477663e24b6177ee63370",
+      "media_pts": 25088
+    },
+    {
+      "pts": 25596,
+      "sha256": "3b4db97be3b753a61eb0ee65beef10a3a8713cd2b3417397fba1cb3eaf26405c",
+      "media_pts": 25600
+    },
+    {
+      "pts": 26108,
+      "sha256": "f51f18238af6a8640de21f57a3a6750630d2668de267527c59f1dd72290298e3",
+      "media_pts": 26112
+    },
+    {
+      "pts": 26620,
+      "sha256": "9f6f163e39d4273be580357c8cbb5ea45c717ddc3b0223725176a92f2ce17c00",
+      "media_pts": 26624
+    },
+    {
+      "pts": 27132,
+      "sha256": "75678558ffc72f5936c11ffb67d1efc19d3056638b429993c9836793ee08fe07",
+      "media_pts": 27136
+    },
+    {
+      "pts": 27644,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 27648
+    },
+    {
+      "pts": 28156,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 28160
+    },
+    {
+      "pts": 28668,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 28672
+    },
+    {
+      "pts": 29180,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 29184
+    },
+    {
+      "pts": 29692,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 29696
+    },
+    {
+      "pts": 30204,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 30208
+    },
+    {
+      "pts": 30716,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 30720
+    },
+    {
+      "pts": 31228,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 31232
+    },
+    {
+      "pts": 31740,
+      "sha256": "5f35108bb64acd053ce03970cbbbc5a221d4769786676ca9aae83b32bb17f4ca",
+      "media_pts": 31744
+    },
+    {
+      "pts": 32252,
+      "sha256": "aedb1f04795fad8c042f8a20740c33d2287373b7baa1a029ea370a54f3c65a69",
+      "media_pts": 32256
+    },
+    {
+      "pts": 32764,
+      "sha256": "027b9a011e487e08360b090fd62bee229ca37515555cf35c02084464d90ac832",
+      "media_pts": 32768
+    },
+    {
+      "pts": 33276,
+      "sha256": "26c79ce1e2886f3c754883546247e06644712f07d9bfdccafe7f07e759fa6767",
+      "media_pts": 33280
+    },
+    {
+      "pts": 33788,
+      "sha256": "fd52a81fcc2f90c378a408855e9e2dfa267bdb25b554f82029b3d16d91ca6ff0",
+      "media_pts": 33792
+    },
+    {
+      "pts": 34300,
+      "sha256": "688bef61476d83d068cca66846cd55c89db12b6c74ca2a529badf5574e1d1985",
+      "media_pts": 34304
+    }
+  ],
+  "clock_note": "FFmpeg applies a one-tick-different movie-edit rescale. Pixel hashes map by raw media PTS with ignore_editlist=1; native output PTS is tested against the indexed source timeline."
+}

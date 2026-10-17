@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
     var corpus = try loadCorpus(allocator, &dataset, opts.split);
     defer corpus.deinit();
 
-    internal.execution_control.allowUninterruptibleInProcess();
+    const control = internal.execution_control.InferenceExecutionControl{ .native_call_policy = .in_process };
     var sessions = backends.SessionManager.initWithIo(allocator, init.io);
     sessions.preferred_backends = switch (opts.backend) {
         .cuda => &.{.cuda},
@@ -117,15 +117,19 @@ pub fn main(init: std.process.Init) !void {
     };
     var models = model_manager.ModelManager.init(allocator, sessions);
     defer models.deinit();
-    const model = try models.loadFromDir(opts.model_dir);
+    var handle = try models.acquireFromDirWithControl(opts.model_dir, control);
+    defer handle.release();
+    const model = handle.get();
     var lease = model.acquireEmbeddingAssetLease(false);
     defer lease.release();
     model.lockEmbeddingAssets();
     var pipeline = pipeline: {
         defer model.unlockEmbeddingAssets();
-        try model.ensurePrimaryEmbeddingAssetsLocked(true, false);
+        try model.ensurePrimaryEmbeddingAssetsLockedWithControl(true, false, control);
         break :pipeline model.embeddingPipelineLocked(allocator);
     };
+
+    pipeline.execution_control = control;
 
     const document_vectors = try embedDocuments(allocator, &pipeline, corpus.documents.items, opts.embed_batch);
     defer freeVectors(allocator, document_vectors);

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const work_control = @import("work_control.zig");
 
 pub const Resample = enum(u32) {
     nearest = 0,

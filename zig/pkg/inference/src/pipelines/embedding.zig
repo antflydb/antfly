@@ -142,6 +142,8 @@ pub const EmbeddingConfig = struct {
     allow_audio: bool = true,
     /// Reject context overflow instead of allowing tokenizer truncation.
     strict_max_length: bool = false,
+    /// EmbeddingGemma 2 trims before normalization, including device readback.
+    embedding_gemma2_dimensions: usize = 768,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// Model-selected image preprocessing contract.
@@ -414,10 +416,8 @@ pub const EmbeddingPipeline = struct {
             defer std.debug.assert(bounded.live == 0);
             var scoped = self.*;
             scoped.allocator = bounded.allocator();
-            // The managed family contract advertises serial compatibility.
-            // Each row can use the full 8192-token workspace without a second
-            // valid row multiplying it beyond the request's allocation cap.
-            const temporary = scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false }) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
+            // Length buckets retain the admitted physical allocation ceiling.
+            const temporary = (if (self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
             defer {
                 for (temporary) |vector| scoped.allocator.free(vector);
                 scoped.allocator.free(temporary);
@@ -435,6 +435,81 @@ pub const EmbeddingPipeline = struct {
             return output;
         }
         return self.embedUnscoped(texts);
+    }
+
+    /// Tokenize once, retain real lengths, and execute bounded length buckets.
+    /// The outer Gemma2 owner accounts all tokenizer/packing storage physically.
+    fn embedGemma2Texts(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        const a = self.allocator;
+        const max_len = textSequenceLengthForInputs(self.textEncodingSession().inputInfo(), self.config.max_length);
+        const encoded = try a.alloc(EncodeResult, texts.len);
+        defer a.free(encoded);
+        var initialized: usize = 0;
+        defer for (encoded[0..initialized]) |*row| row.deinit();
+        const lengths = try a.alloc(usize, texts.len);
+        defer a.free(lengths);
+        const started = if (self.trace != null) embedding_trace.now() else 0;
+        for (texts, 0..) |text, i| {
+            if (self.execution_control) |control| try control.check();
+            const rendered = try std.fmt.allocPrint(a, "{s}{s}", .{ self.config.text_prefix, text });
+            defer a.free(rendered);
+            encoded[i] = try self.tok.encodeForModel(a, rendered, max_len + 1);
+            initialized += 1;
+            lengths[i] = activeTokenLength(encoded[i].attention_mask);
+            if (lengths[i] > max_len) return error.EmbeddingInputTooLong;
+        }
+        if (self.trace) |trace| trace.tokenize_ns += embedding_trace.now() -| started;
+        const order = try qwen_batch.order(a, lengths);
+        defer a.free(order);
+        std.mem.sort(usize, order, lengths, struct {
+            fn less(rows: []const usize, lhs: usize, rhs: usize) bool {
+                return if (rows[lhs] == rows[rhs]) lhs < rhs else rows[lhs] < rows[rhs];
+            }
+        }.less);
+        const vectors = try a.alloc([]f32, texts.len);
+        errdefer a.free(vectors);
+        var cursor: usize = 0;
+        errdefer for (order[0..cursor]) |i| a.free(vectors[i]);
+        while (cursor < order.len) {
+            var sorted_lengths: [4]usize = undefined;
+            const candidates = @min(@as(usize, 4), order.len - cursor);
+            for (order[cursor..][0..candidates], sorted_lengths[0..candidates]) |i, *length| length.* = lengths[i];
+            var count = @import("embedding_gemma2.zig").preparedCohortCount(sorted_lengths[0..candidates], candidates);
+            while (true) {
+                const seq = lengths[order[cursor + count - 1]];
+                const request = session_mod.RunRequest{ .batch = count, .sequence = seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = 256 * 1024 * 1024 + count * seq * 192 * 1024, .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
+                if (count > 1 and !try self.session.fitsRun(request)) {
+                    count -= 1;
+                    continue;
+                }
+                const ids = try a.alloc(i64, count * seq);
+                defer a.free(ids);
+                const mask = try a.alloc(i64, count * seq);
+                defer a.free(mask);
+                @memset(ids, 0);
+                @memset(mask, 0);
+                for (order[cursor..][0..count], 0..) |i, row| {
+                    for (encoded[i].ids[0..lengths[i]], encoded[i].attention_mask[0..lengths[i]], 0..) |id, active, col| {
+                        ids[row * seq + col] = id;
+                        mask[row * seq + col] = active;
+                    }
+                }
+                const result = self.embedTokenized(ids, mask, count, seq) catch |err| {
+                    if (count > 1 and (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable)) {
+                        count = (count + 1) / 2;
+                        continue;
+                    }
+                    return err;
+                };
+                defer a.free(result);
+                for (order[cursor..][0..count], result) |i, vector| vectors[i] = vector;
+                if (self.trace) |trace| trace.shape(sorted_lengths[0..count], count, seq);
+                if (self.batch_observation) |observation| observation.record(count);
+                cursor += count;
+                break;
+            }
+        }
+        return vectors;
     }
 
     fn embedUnscoped(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
@@ -972,6 +1047,10 @@ pub const EmbeddingPipeline = struct {
                 return error.ResourceLimitExceeded,
             .host_preprocess_bytes = std.math.mul(usize, total, 32) catch
                 return error.ResourceLimitExceeded,
+            .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
+                try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, total, 192 * 1024))
+            else
+                0,
         });
         defer run_permit.deinit();
         if (self.execution_control) |control| try control.check();
@@ -1009,6 +1088,37 @@ pub const EmbeddingPipeline = struct {
             trace.execute_pool_normalize_ns += embedding_trace.now() -| execute_started;
         };
         if (self.execution_control) |control| try control.check();
+
+        if (self.config.resident_text_encoder and (self.session.backend() == .metal or self.session.backend() == .native) and self.config.normalize and self.config.pooling == .mean and self.text_projection == null) {
+            if (session_factory.getEmbeddingGemma2Config(self.session)) |cfg| {
+                const dimensions = self.config.embedding_gemma2_dimensions;
+                if (!@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
+                var managed = try session_factory.getManagedComputeBackend(self.session, alloc, null, self.execution_control);
+                defer managed.deinit();
+                const mask = try alloc.alloc(i64, all_mask.len);
+                defer alloc.free(mask);
+                for (mask, all_mask) |*dest, source| dest.* = source;
+                const embeddings = if (batch * effective_len <= 8192)
+                    try @import("embedding_gemma2.zig").preparedTexts(&managed.backend, alloc, cfg, ids_i64, mask, batch, effective_len, dimensions)
+                else blk: {
+                    const vectors = try alloc.alloc([]f32, batch);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (vectors[0..initialized]) |vector| alloc.free(vector);
+                        alloc.free(vectors);
+                    }
+                    for (vectors, 0..) |*vector, index| {
+                        if (self.execution_control) |control| try control.check();
+                        vector.* = try @import("embedding_gemma2.zig").preparedText(&managed.backend, alloc, cfg, ids_i64[index * effective_len ..][0..effective_len], mask[index * effective_len ..][0..effective_len], dimensions);
+                        initialized += 1;
+                    }
+                    break :blk vectors;
+                };
+                self.last_resident_backend_timing = managed.backend.debugTimingSnapshot();
+                self.recordResidentProjection(.text, .success, "text.embeddinggemma2.pool_normalize.resident", batch, null);
+                return embeddings;
+            }
+        }
 
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(
@@ -1289,7 +1399,7 @@ pub const EmbeddingPipeline = struct {
     pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
         if (images.len > 0 and !self.config.allow_image) return error.UnsupportedInput;
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
-            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control, null);
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control, null);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
@@ -1322,7 +1432,7 @@ pub const EmbeddingPipeline = struct {
         if (images.len > 0 and !self.config.allow_image) return error.UnsupportedInput;
         if (errors.len != images.len) return error.InvalidInputShape;
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
-            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control, errors);
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control, errors);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
@@ -1556,7 +1666,7 @@ pub const EmbeddingPipeline = struct {
     pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
         if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
-            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
         const vectors = self.embedBorrowedRastersBatch(rasters) catch |err| {
@@ -1776,7 +1886,7 @@ pub const EmbeddingPipeline = struct {
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             if (self.config.gemma4_audio_batching) {
                 const grouped = @import("embedding_gemma2.zig");
-                const result = try grouped.embedAudios(self.allocator, self.session, self.tok, audio_clips, .{ .max_tokens = @min(self.config.max_length, 8192), .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, null);
+                const result = try grouped.embedAudios(self.allocator, self.session, self.tok, audio_clips, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, null);
                 self.allocator.free(result.input_tokens);
                 return result.vectors;
             }
@@ -1849,7 +1959,7 @@ pub const EmbeddingPipeline = struct {
         if (clips.len != errors.len) return error.InvalidInputShape;
         if (!self.config.resident_embedding_gemma2 and session_factory.getEmbeddingGemma2Config(self.session) != null) {
             if (self.config.gemma4_audio_batching) {
-                const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, clips, .{ .max_tokens = @min(self.config.max_length, 8192), .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, errors);
+                const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, clips, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, errors);
                 self.allocator.free(result.input_tokens);
                 return .{ .vectors = result.vectors, .execution = result.execution };
             }
@@ -2065,7 +2175,7 @@ pub const EmbeddingPipeline = struct {
         for (media, 0..) |bytes, index| {
             if (item_errors) |errors| errors[index] = null;
             const part: grouped.Part = if (images) .{ .image = bytes } else .{ .audio = bytes };
-            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control) catch |err| {
+            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control) catch |err| {
                 if (item_errors) |errors| {
                     if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded) return err;
                     errors[index] = err;
@@ -2208,7 +2318,7 @@ pub const EmbeddingPipeline = struct {
                 }
                 dst.* = .{ .pcm = .{ .samples = samples, .sample_rate = clip.sample_rate } };
             }
-            const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, prepared, .{ .max_tokens = @min(self.config.max_length, 8192), .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, null, self.execution_control, null);
+            const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, prepared, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions, .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, null, self.execution_control, null);
             self.allocator.free(result.input_tokens);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
@@ -2227,7 +2337,7 @@ pub const EmbeddingPipeline = struct {
             // bounded decoder, downmix, resample and HF processor as HTTP.
             const encoded = try audio.wav.encodeInterleaved(std.heap.smp_allocator, clip.samples, channels, .{ .audio_format = 3, .sample_rate = clip.sample_rate, .bits_per_sample = 32 });
             defer std.heap.smp_allocator.free(encoded);
-            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{ .max_tokens = @min(self.config.max_length, 8192) }, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{ .max_tokens = @min(self.config.max_length, 8192), .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
             vector.* = result.vector;
             initialized += 1;
         }

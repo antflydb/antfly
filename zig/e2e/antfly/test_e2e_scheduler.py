@@ -15,12 +15,14 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import subprocess
 import sys
 from collections import OrderedDict
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -34,9 +36,23 @@ from e2e_scheduler import (
     e2e_resource,
     normalize_nodeid,
     pytest_addoption,
-    pytest_configure,
     scheduling_group,
 )
+
+
+@pytest.fixture
+def isolated_scheduler(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    # Hook tests must not reconfigure the plugin reporting this very suite.
+    # A fresh module also isolates duration buffers and failure reporters from
+    # other hook tests, including when pytest runs without xdist workers.
+    spec = importlib.util.spec_from_file_location(
+        "_antfly_e2e_scheduler_under_test", Path(__file__).with_name("e2e_scheduler.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
 
 
 class FakeItem:
@@ -113,17 +129,21 @@ def test_process_slot_environment_default_uses_pytest_integer_parser(
 
 
 @pytest.mark.parametrize("slots", [0, -1])
-def test_process_slot_configuration_rejects_non_positive_values(slots: int) -> None:
+def test_process_slot_configuration_rejects_non_positive_values(
+    isolated_scheduler: ModuleType, slots: int
+) -> None:
     config = SimpleNamespace(getoption=lambda name: slots)
 
     with pytest.raises(
         pytest.UsageError,
         match="--e2e-process-slots must be a positive integer",
     ):
-        pytest_configure(config)  # type: ignore[arg-type]
+        isolated_scheduler.pytest_configure(config)  # type: ignore[arg-type]
 
 
-def test_process_worker_configuration_rejects_non_positive_values() -> None:
+def test_process_worker_configuration_rejects_non_positive_values(
+    isolated_scheduler: ModuleType,
+) -> None:
     options = {"e2e_process_slots": 2, "e2e_process_workers": 0}
     config = SimpleNamespace(
         getoption=lambda name, default=None: options.get(name, default)
@@ -133,13 +153,13 @@ def test_process_worker_configuration_rejects_non_positive_values() -> None:
         pytest.UsageError,
         match="--e2e-process-workers must be a positive integer",
     ):
-        pytest_configure(config)  # type: ignore[arg-type]
+        isolated_scheduler.pytest_configure(config)  # type: ignore[arg-type]
 
 
 def test_nested_pytest_does_not_publish_parent_duration_history(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    isolated_scheduler: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import e2e_scheduler as scheduler
+    scheduler = isolated_scheduler
 
     duration_file = tmp_path / "durations.json"
     options = {"e2e_process_slots": 2, "e2e_duration_file": str(duration_file)}
@@ -147,11 +167,11 @@ def test_nested_pytest_does_not_publish_parent_duration_history(
         getoption=lambda name, default=None: options.get(name, default)
     )
     monkeypatch.setenv(scheduler._DURATION_OWNER_PID, str(os.getpid() + 1))
-    pytest_configure(config)  # type: ignore[arg-type]
+    isolated_scheduler.pytest_configure(config)  # type: ignore[arg-type]
     assert scheduler._duration_history is None
 
     monkeypatch.delenv(scheduler._DURATION_OWNER_PID)
-    pytest_configure(config)  # type: ignore[arg-type]
+    isolated_scheduler.pytest_configure(config)  # type: ignore[arg-type]
     assert scheduler._duration_history is not None
     assert os.environ[scheduler._DURATION_OWNER_PID] == str(os.getpid())
     monkeypatch.setattr(scheduler, "_duration_history", None)
@@ -196,7 +216,9 @@ def test_one_process_worker_allows_mixed_group_and_parallel_light_work(
     assert scheduler._next_eligible_scope(other) == stateful_scope
 
 
-def test_parallel_configuration_rejects_incompatible_distribution_mode() -> None:
+def test_parallel_configuration_rejects_incompatible_distribution_mode(
+    isolated_scheduler: ModuleType,
+) -> None:
     options = {
         "e2e_process_slots": 2,
         "dist": "load",
@@ -213,7 +235,7 @@ def test_parallel_configuration_rejects_incompatible_distribution_mode() -> None
             "and --e2e-process-slots remain enforced"
         ),
     ):
-        pytest_configure(config)  # type: ignore[arg-type]
+        isolated_scheduler.pytest_configure(config)  # type: ignore[arg-type]
 
 
 def test_fixture_resource_decorator_rejects_inverted_order() -> None:
@@ -816,10 +838,11 @@ def test_duration_history_merges_observations_from_stale_writers(
 
 
 def test_duration_reports_exclude_skips_but_keep_full_executed_protocol(
+    isolated_scheduler: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    e2e_scheduler_module = sys.modules[DurationHistory.__module__]
+    e2e_scheduler_module = isolated_scheduler
     history = DurationHistory(tmp_path / "durations.json")
     monkeypatch.setattr(e2e_scheduler_module, "_duration_history", history)
     monkeypatch.setattr(e2e_scheduler_module, "_duration_report_totals", {})
@@ -852,9 +875,10 @@ def test_duration_reports_exclude_skips_but_keep_full_executed_protocol(
 
 
 def test_failed_report_flushes_diagnostic_before_session_finish(
+    isolated_scheduler: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = sys.modules[DurationHistory.__module__]
+    module = isolated_scheduler
     output: list[object] = []
     reporter = SimpleNamespace(
         write_sep=lambda separator, title: output.append(title),
@@ -880,9 +904,9 @@ def test_failed_report_flushes_diagnostic_before_session_finish(
 
 @pytest.mark.parametrize("worker", [False, True])
 def test_only_controller_emits_immediate_failure_diagnostics(
-    monkeypatch: pytest.MonkeyPatch, worker: bool
+    isolated_scheduler: ModuleType, monkeypatch: pytest.MonkeyPatch, worker: bool
 ) -> None:
-    module = sys.modules[DurationHistory.__module__]
+    module = isolated_scheduler
     reporter = object()
     config = SimpleNamespace(
         pluginmanager=SimpleNamespace(get_plugin=lambda name: reporter),
@@ -1825,8 +1849,10 @@ def test_completed_worker_removal_immediately_reuses_released_process_slot(
     assert scheduler._reserved_process_slots() == 1
 
 
-def test_ci_phase_report_retains_fixture_costs_and_skipped_setup(tmp_path, monkeypatch):
-    import e2e_scheduler as scheduler
+def test_ci_phase_report_retains_fixture_costs_and_skipped_setup(
+    isolated_scheduler: ModuleType, tmp_path, monkeypatch
+):
+    scheduler = isolated_scheduler
 
     monkeypatch.setenv("ANTFLY_E2E_REPORT_DIR", str(tmp_path / "reports"))
     monkeypatch.setattr(
@@ -1863,3 +1889,50 @@ def test_ci_phase_report_retains_fixture_costs_and_skipped_setup(tmp_path, monke
     history = DurationHistory(tmp_path / "durations.json")
     assert history.estimate("test_a.py::test_pass", process_owned=True) == 9
     assert "test_a.py::test_skip" not in history.tests
+
+
+def test_harness_hook_tests_preserve_live_failure_and_duration_reporting(tmp_path):
+    sentinel = tmp_path / "test_reporting_sentinel.py"
+    sentinel.write_text(
+        "def test_expected_failure():\n    assert False, 'reporting sentinel'\n"
+    )
+    test_file = Path(__file__).resolve()
+    report_dir = tmp_path / "reports"
+    env = os.environ.copy()
+    env.pop("ANTFLY_E2E_DURATION_OWNER_PID", None)
+    env["ANTFLY_E2E_DURATION_FILE"] = str(tmp_path / "durations.json")
+    env["ANTFLY_E2E_REPORT_DIR"] = str(report_dir)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            "-c",
+            str(test_file.with_name("pyproject.toml")),
+            f"{test_file}::test_process_slot_configuration_rejects_non_positive_values",
+            f"{test_file}::test_nested_pytest_does_not_publish_parent_duration_history",
+            str(sentinel),
+        ],
+        cwd=test_file.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "Immediate E2E failure:" in output, output
+    assert "reporting sentinel" in output, output
+    phases = json.loads((report_dir / "phase-durations.json").read_text())["tests"]
+    for name in (
+        "test_process_slot_configuration_rejects_non_positive_values",
+        "test_expected_failure",
+    ):
+        matching = [
+            values
+            for nodeid, values in phases.items()
+            if nodeid.rsplit("::", 1)[-1].split("[", 1)[0] == name
+        ]
+        assert matching and all("call" in values for values in matching), phases

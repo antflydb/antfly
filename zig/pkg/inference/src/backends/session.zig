@@ -814,6 +814,21 @@ pub const Session = struct {
         };
     }
 
+    /// Acquire only a later phase's additional peak while the original lease
+    /// remains live. Counters, live-memory checks and external ownership all
+    /// use ordinary admission; a rejected supplement leaves the base untouched.
+    /// Both owners must outlive every allocation covered by their union.
+    pub fn admitSupplement(self: Session, base: *const RunPermit, target: memory.AdmissionAmounts) !RunPermit {
+        if (base.session.ptr != self.ptr or base.session.vtable != self.vtable or base.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+        const admission = self.run_admission orelse return .{ .session = self, .lease = null };
+        const lease = base.lease orelse return error.InvalidAdmissionLeaseReduction;
+        if (lease.controller != admission.controller or lease.retain_backend_class != admission.backend_class) return error.InvalidAdmissionLeaseReduction;
+        var extra = memory.AdmissionAmounts{};
+        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(lease.amounts, name);
+        if (std.meta.eql(extra, memory.AdmissionAmounts{})) return .{ .session = self, .lease = null };
+        return .{ .session = self, .lease = try admission.acquireAmounts(extra) };
+    }
+
     /// Preserve the exact denial constraint for bounded batch planning. A
     /// failed reservation publishes no lease; a fit probe is never a permit.
     pub fn admitWithPressure(self: Session, request: RunRequest, pressure: *?memory.AdmissionPressure) !RunPermit {
@@ -961,6 +976,16 @@ pub const Session = struct {
             else
                 null,
         };
+    }
+
+    /// Owned media cache allocations can outlive a single execution permit.
+    /// Charge them independently until eviction, including full device buffers
+    /// retained by views rather than only their logical tensor payload.
+    pub fn admitRetainedMedia(self: Session, host_bytes: usize, device_bytes: usize) !RunPermit {
+        return .{ .session = self, .lease = if (self.run_admission) |admission|
+            try admission.acquireAmounts(.{ .host_scratch_bytes = host_bytes, .backend_scratch_bytes = device_bytes })
+        else
+            null };
     }
 
     pub fn admitResidentInputs(self: Session, inputs: []const ResidentInput) !RunPermit {
@@ -1271,6 +1296,18 @@ pub const RunPermit = struct {
         if (self.execution_yielded) return self.runResidentTextEmbeddingWithControl(inputs, request, allocator, null);
         const run_resident = self.session.vtable.runResidentTextEmbedding orelse return null;
         return run_resident(self.session.ptr, inputs, request, allocator);
+    }
+
+    /// Reduce an execution peak after preprocessing/vision has completed.
+    /// Re-estimate with the session profile and retained inputs; a phase may
+    /// never borrow capacity from its predecessor or another concurrent run.
+    pub fn retainForRun(self: *RunPermit, request: RunRequest) !void {
+        if (self.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+        if (self.lease) |*lease| {
+            const admission = self.session.run_admission orelse return error.InvalidAdmissionLeaseReduction;
+            try lease.retain(try admission.estimateRequest(request, self.session.outputInfo()));
+        }
+        self.request = request;
     }
 
     /// Reduce a host-only preprocessing lease to the bytes that remain live
@@ -1641,6 +1678,16 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
         controller.snapshot(),
     );
 
+    var phased = try admitted_session.admit(.{ .batch = 2, .sequence = 32, .input_bytes = 64, .host_preprocess_bytes = 512, .workspace_bytes = 4096, .output_bytes = 256 });
+    const peak = controller.snapshot().host_scratch_bytes;
+    try phased.retainForRun(.{ .batch = 2, .sequence = 4, .input_bytes = 64, .host_preprocess_bytes = 128, .workspace_bytes = 512, .output_bytes = 64 });
+    const retained = controller.snapshot().host_scratch_bytes;
+    try std.testing.expect(retained < peak);
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, phased.retainForRun(.{ .workspace_bytes = 16384 }));
+    try std.testing.expectEqual(retained, controller.snapshot().host_scratch_bytes);
+    phased.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+
     var preprocess_permit = try admitted_session.admitHostPreprocess(128);
     try std.testing.expectEqual(@as(usize, 128), controller.snapshot().host_scratch_bytes);
     var execution_permit = try admitted_session.admit(.{
@@ -1961,4 +2008,27 @@ test "session output admission has one owner on every allocation failure" {
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, null)});
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, .{})});
+}
+
+test "embeddinggemma2 stage supplements preserve base admission and reject overcommit" {
+    var controller = memory.AdmissionController{};
+    var probe = AdmissionProbeSession{ .controller = &controller };
+    const session = Session{ .ptr = &probe, .vtable = &AdmissionProbeSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var base = try session.admitHostPreprocess(256);
+    var extra = try session.admitSupplement(&base, .{ .host_scratch_bytes = 768 });
+    try std.testing.expectEqual(@as(usize, 768), controller.snapshot().host_scratch_bytes);
+    extra.deinit();
+    try std.testing.expectEqual(@as(usize, 256), controller.snapshot().host_scratch_bytes);
+    var peer = try session.admitHostPreprocess(256);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitSupplement(&base, .{ .host_scratch_bytes = 900 }));
+    try std.testing.expectEqual(@as(usize, 512), controller.snapshot().host_scratch_bytes);
+    peer.deinit();
+    var smaller = try session.admitSupplement(&base, .{ .host_scratch_bytes = 128 });
+    smaller.deinit();
+    try std.testing.expectEqual(@as(usize, 256), controller.snapshot().host_scratch_bytes);
+    var retry = try session.admitSupplement(&base, .{ .host_scratch_bytes = 900 });
+    try std.testing.expectEqual(@as(usize, 900), controller.snapshot().host_scratch_bytes);
+    retry.deinit();
+    base.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }

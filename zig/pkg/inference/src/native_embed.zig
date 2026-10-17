@@ -83,9 +83,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var opts = try parseArgs(allocator, args);
     defer opts.deinit(allocator);
 
-    // This one-shot command owns its process and accelerator lifetime. Enable
-    // the established offline boundary for managed media tower operations.
-    @import("execution_control.zig").allowUninterruptibleInProcess();
+    // This one-shot command retains its inputs until native calls finish.
+    const control = @import("execution_control.zig").InferenceExecutionControl{ .io = io, .native_call_policy = .in_process };
 
     if (opts.order.items.len == 0 and opts.content_json_path == null) {
         printUsage();
@@ -111,14 +110,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
-    var model_handle = try model_manager.acquireFromDir(opts.model_dir);
+    var model_handle = try model_manager.acquireFromDirWithControl(opts.model_dir, control);
     defer model_handle.release();
     const model = model_handle.get();
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
     if (model.manifest.embedding_style == .embedding_gemma2) {
         if (model.session.backend() == .cuda or opts.content_json_path != null) {
             try model.verifyEmbeddingIdentity();
-            try runEmbeddingGemma2(allocator, &stdout.interface, model, &opts);
+            try runEmbeddingGemma2(allocator, &stdout.interface, model, &opts, control);
             try model.verifyEmbeddingIdentity();
             return;
         }
@@ -131,12 +130,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             return error.SparseEmbeddingRequiresTextInput;
         }
 
-        try model.ensureEmbeddingAssets(opts.texts.items.len > 0, false, false);
+        {
+            try model.lockEmbeddingAssetsWithControl(control);
+            defer model.unlockEmbeddingAssets();
+            try model.ensureEmbeddingAssetsLockedWithControl(opts.texts.items.len > 0, false, false, control);
+        }
         const ensured_assets_at = std.Io.Timestamp.now(io, .awake);
         var sparse_pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
             .allocator = allocator,
             .session = model.session,
             .tok = model.getTokenizer(),
+            .execution_control = control,
             .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
         };
         const sparse_embeddings = try sparse_pipeline.embed(opts.texts.items);
@@ -174,14 +178,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         model.lockEmbeddingAssets();
         defer model.unlockEmbeddingAssets();
         if (opts.audio_paths.items.len > 0)
-            try model.ensureAudioEmbeddingAssetsLocked()
+            try model.ensureAudioEmbeddingAssetsLockedWithControl(control)
         else
-            try model.ensurePrimaryEmbeddingAssetsLocked(opts.texts.items.len > 0, opts.image_paths.items.len > 0);
+            try model.ensurePrimaryEmbeddingAssetsLockedWithControl(opts.texts.items.len > 0, opts.image_paths.items.len > 0, control);
         break :initial_pipeline model.embeddingPipelineLocked(allocator);
     };
     errdefer if (opts.audio_paths.items.len > 0) releaseAudioEmbeddingAssets(model);
     const ensured_initial_assets_at = std.Io.Timestamp.now(io, .awake);
     pipeline.print_timing = opts.print_timing;
+    pipeline.execution_control = control;
 
     const audio_bytes = try loadFiles(allocator, opts.audio_paths.items);
     const loaded_audio_at = std.Io.Timestamp.now(io, .awake);
@@ -197,7 +202,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         asset_lease.downgradeExclusiveToShared();
         model.lockEmbeddingAssets();
         defer model.unlockEmbeddingAssets();
-        try model.ensurePrimaryEmbeddingAssetsLocked(opts.texts.items.len > 0, opts.image_paths.items.len > 0);
+        try model.ensurePrimaryEmbeddingAssetsLockedWithControl(opts.texts.items.len > 0, opts.image_paths.items.len > 0, control);
         model.bindEmbeddingPipelineAssetsLocked(&pipeline);
     } else if (opts.audio_paths.items.len > 0) {
         asset_lease.release();
@@ -337,10 +342,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
     return opts;
 }
 
-fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, model: *model_manager_mod.LoadedModel, opts: *const Options) !void {
+fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, model: *model_manager_mod.LoadedModel, opts: *const Options, control: @import("execution_control.zig").InferenceExecutionControl) !void {
     if (opts.content_json_path != null and opts.order.items.len > 0) return error.ConflictingEmbeddingInputs;
     var pipeline = model.embeddingPipeline(allocator);
     pipeline.print_timing = opts.print_timing;
+    pipeline.execution_control = control;
     var dimensions = opts.dimensions;
     var task_type = opts.task_type orelse "RETRIEVAL_DOCUMENT";
     pipeline.config.text_prefix = try gemma2_model.taskPrefix(task_type);
@@ -546,7 +552,7 @@ fn cliContentPart(allocator: std.mem.Allocator, owned: *std.ArrayListUnmanaged([
 
 fn embedGemma2(a: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, model: *model_manager_mod.LoadedModel, opts: Options) !void {
     const grouped = @import("pipelines/embedding_gemma2.zig");
-    const watchdog = if (model.session.interruption() == .process_required) try @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    const watchdog = if (model.session.interruption() == .uninterruptible) try @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owned| owned.destroy();
     if (watchdog) |owned| try owned.start(io);
     const control = @import("execution_control.zig").InferenceExecutionControl{ .io = io, .hard_cancellation = if (watchdog) |owned| owned.boundary() else null };

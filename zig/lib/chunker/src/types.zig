@@ -30,6 +30,40 @@ pub const default_gif_max_frames: usize = 50;
 /// HTTP callers may select a smaller request-scoped ceiling.
 pub const default_max_chunk_owned_output_bytes: usize = 100 * 1024 * 1024;
 
+pub const ModelMetadata = struct {
+    descriptor: @import("planning.zig").Descriptor,
+    inference_id: []const u8,
+    source_fingerprint: []const u8,
+    source_version: []const u8,
+    plan_id: []const u8,
+    model: []const u8,
+    model_identity: []const u8,
+    model_revision: []const u8 = "",
+    task_type: []const u8,
+    dimensions: usize,
+    policy: @import("planning.zig").Policy,
+    embedding: ?[]const f32 = null,
+
+    pub fn clone(self: ModelMetadata, a: std.mem.Allocator) !*ModelMetadata {
+        const copy = try a.create(ModelMetadata);
+        copy.* = self;
+        inline for (.{ "inference_id", "source_fingerprint", "source_version", "plan_id", "model", "model_identity", "model_revision", "task_type" }) |name| @field(copy, name) = "";
+        copy.embedding = null;
+        copy.descriptor.coordinates.selected_pictures = null;
+        errdefer copy.deinit(a);
+        inline for (.{ "inference_id", "source_fingerprint", "source_version", "plan_id", "model", "model_identity", "model_revision", "task_type" }) |name| @field(copy, name) = try a.dupe(u8, @field(self, name));
+        if (self.descriptor.coordinates.selected_pictures) |pictures| copy.descriptor.coordinates.selected_pictures = try a.dupe(u64, pictures);
+        copy.embedding = if (self.embedding) |vector| try a.dupe(f32, vector) else null;
+        return copy;
+    }
+    pub fn deinit(self: *ModelMetadata, a: std.mem.Allocator) void {
+        if (self.descriptor.coordinates.selected_pictures) |pictures| a.free(pictures);
+        inline for (.{ "inference_id", "source_fingerprint", "source_version", "plan_id", "model", "model_identity", "model_revision", "task_type" }) |name| if (@field(self, name).len != 0) a.free(@field(self, name));
+        if (self.embedding) |vector| a.free(vector);
+        a.destroy(self);
+    }
+};
+
 pub const Chunk = struct {
     id: u32,
     mime_type: []const u8,
@@ -41,6 +75,8 @@ pub const Chunk = struct {
     end_time_ms: ?f32 = null,
     frame_index: ?u32 = null,
     frame_delay_ms: ?u32 = null,
+    metadata: ?*ModelMetadata = null,
+    owns_metadata: bool = false,
     owns_mime_type: bool = false,
     owns_text: bool = false,
     owns_data: bool = false,
@@ -73,6 +109,7 @@ pub const Chunk = struct {
     }
 
     pub fn deinit(self: *Chunk, alloc: std.mem.Allocator) void {
+        if (self.owns_metadata) if (self.metadata) |metadata| metadata.deinit(alloc);
         if (self.owns_mime_type) alloc.free(@constCast(self.mime_type));
         if (self.owns_text and self.text != null) alloc.free(self.text.?);
         if (self.owns_data and self.data != null) alloc.free(self.data.?);
@@ -139,9 +176,18 @@ pub const BinaryInput = struct {
     data: []const u8,
 };
 
+pub const SourceReference = struct {
+    uri: []const u8,
+    mime_type: []const u8,
+    version: []const u8,
+    version_kind: enum { strong_etag, s3_version_id } = .strong_etag,
+    length: u64,
+};
+
 pub const Input = union(enum) {
     text: []const u8,
     binary: BinaryInput,
+    source: SourceReference,
 };
 
 pub fn freeChunks(alloc: std.mem.Allocator, chunks: []Chunk) void {

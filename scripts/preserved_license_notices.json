@@ -62,6 +62,582 @@
   "zig/lib/platform/src/io_uring_compat.zig": {
     "file": "LICENSES/third-party/Zig-SHA256-MIT.txt"
   },
+  "zig/lib/video/src/codecs/av1/getbits.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/decode.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/filmgrain_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/ctx.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/cdef_apply_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/qm.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/cdef_apply_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/refmvs.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/lr_apply_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/lf_apply_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/ipred_prepare_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/recon_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/fg_apply_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/itx_1d.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/cdf.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/mem.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/thread_task.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/lr_apply_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/picture.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/ref.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/ipred_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/mc_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/scan.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/dequant_tables.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/looprestoration_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/ipred_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/cdef_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/common.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/loopfilter_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/msac.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/intra_edge.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/ipred_prepare_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/data.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/lib.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/recon_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/warpmv.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/cdef_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/tables.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/pal.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/root.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/loopfilter_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/lf_mask.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/wedge.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/lf_apply_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/itx_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/filmgrain_tmpl_16.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/mc_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/obu.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/itx_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/looprestoration_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/av1/fg_apply_tmpl_8.zig": {
+    "file": "LICENSES/third-party/dav1d-BSD-2-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_iface_common.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vpx_dsp_rtcd.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_common_data.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_entropymv.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_dsubexp.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_scale.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_reconinter.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_entropy.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_blockd.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_tile_common.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_loopfilter.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_dx_iface.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/loopfilter.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vpx_scale_rtcd.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_decodemv.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_seg_common.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_thread_common.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_detokenize.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_pred_common.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vpx_thread.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/inv_txfm.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vpx_mem.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_decoder.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/bitreader.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_quant_common.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/intrapred.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vpx_convolve.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/common.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_filter.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_scan.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_idct.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_rtcd.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_frame_buffers.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vpx_decoder.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/prob.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/root.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_decodeframe.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vpx_codec.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_reconintra.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_alloccommon.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/yv12config.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_entropymode.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/vp9_job_queue.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/video/src/codecs/vp9/bitreader_buffer.zig": {
+    "file": "LICENSES/third-party/libvpx-BSD-3-Clause.txt",
+    "required": [
+      "Maintained Antfly Zig port"
+    ]
+  },
+  "zig/lib/audio/src/aacplus/core.zig": {
+    "file": "LICENSES/third-party/PacketVideo-AAC-notice.txt",
+    "required": [
+      "Maintained Antfly Zig port; see PORTING.md and SOURCE_NOTICES.md."
+    ]
+  },
   "zig/pkg/inference/src/ops/cuda/video_headers/dynlink_cuda.h": {
     "file": "LICENSES/third-party/NV-Codec-CUDA-MIT.txt"
   },

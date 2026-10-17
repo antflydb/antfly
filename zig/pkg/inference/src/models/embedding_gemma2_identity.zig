@@ -19,7 +19,7 @@ const std = @import("std");
 const file = @import("../util/c_file.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const receipt = @import("../registry/managed_receipt.zig");
-pub const recipe = "embeddinggemma2-f32-mean-v1";
+pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
 pub const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
 pub const Snapshot = struct { digest: [64]u8, signature: [32]u8 };
 
@@ -151,6 +151,30 @@ pub fn snapshot(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights
     }
     if (!std.mem.eql(u8, &before, &try signature(a, io, directory, weights))) return error.ModelArtifactsChanging;
     return .{ .digest = fromDigests(digests), .signature = before };
+}
+
+/// Cache only fully verified digests, guarded by the same before/after file
+/// signature as execution. Warm planning does not touch checkpoint pages.
+pub fn snapshotCached(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8, control: Control) !Snapshot {
+    const Cache = struct {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var entries: [8]?Snapshot = @splat(null);
+        var next: usize = 0;
+    };
+    try control.check();
+    const current = try signature(a, io, directory, weights);
+    while (!Cache.mutex.tryLock()) std.atomic.spinLoopHint();
+    for (Cache.entries) |entry| if (entry) |cached| if (std.mem.eql(u8, &cached.signature, &current)) {
+        Cache.mutex.unlock();
+        return cached;
+    };
+    Cache.mutex.unlock();
+    const value = try snapshot(a, io, directory, weights, control);
+    while (!Cache.mutex.tryLock()) std.atomic.spinLoopHint();
+    defer Cache.mutex.unlock();
+    Cache.entries[Cache.next] = value;
+    Cache.next = (Cache.next + 1) % Cache.entries.len;
+    return value;
 }
 
 test "embeddinggemma2 processor changes fail closed" {

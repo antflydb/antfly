@@ -88,7 +88,7 @@ fn workerMain(init: std.process.Init, config: internal.finetune.embedding_gemma2
     const watchdog = try internal.HardCancellationWatchdog.create(init.gpa);
     defer watchdog.destroy();
     try watchdog.start(init.io);
-    var guard = try (internal.InferenceExecutionControl{ .io = init.io, .ptr = worker, .check_fn = process.Worker.checkHard, .hard_cancellation = watchdog.boundary() }).enterUninterruptible(.process_required);
+    var guard = try (internal.InferenceExecutionControl{ .io = init.io, .ptr = worker, .check_fn = process.Worker.checkHard, .hard_cancellation = watchdog.boundary() }).enterUninterruptible(.uninterruptible);
     defer guard.deinit();
     try worker.verifyFingerprint(fingerprint);
     var active = options;

@@ -573,7 +573,10 @@ def embedded_standalone_api(embedded_standalone_runtime):
 
 @pytest.fixture(scope="function")
 def embedded_standalone_cli(embedded_standalone_runtime):
-    binary = _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    binary = _resolve_binary_path(
+        os.environ.get("ANTFLY_CLI_BIN")
+        or os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    )
     env = os.environ.copy()
     env["ANTFLY_URL"] = embedded_standalone_runtime["public_url"]
 
