@@ -116,7 +116,7 @@ pub const Node = struct {
         scan: struct { index: usize, source_columns: []const []const u8 },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false, membership: ?struct { correlations: usize } = null },
         apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null, single_row: bool = false },
-        query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false, constant_refs: []const ConstantRef = &.{} },
+        query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false, output_needed: ?[]const bool = null, constant_refs: []const ConstantRef = &.{} },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
         /// Compiler-generated INSERT VALUES arms in input order. Each arm
         /// retains its own captured source dependencies, but execution opens
@@ -1760,6 +1760,12 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
     if (statement.predicate) |predicate| try markPredicate(alloc, needed, predicate);
     for (statement.group_by) |expression| try markExpression(alloc, needed, expression);
     if (statement.having) |expression| try markExpression(alloc, needed, expression);
+    // Lowering preserves named-window input demand even for an unused
+    // definition. Its staged scalar subqueries retain cardinality errors.
+    for (statement.windows) |definition| {
+        for (definition.window.partition) |expression| try markExpression(alloc, needed, expression);
+        for (definition.window.order) |order| if (order.expression) |expression| try markExpression(alloc, needed, expression) else if (order.position == null) try needed.put(alloc, order.field, {});
+    }
     for (statement.order_by) |order| if (order.expression) |expression| {
         try markExpression(alloc, needed, expression);
     } else if (order.position == null) {
@@ -1782,6 +1788,8 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             try projectScans(builder, source, needed);
         },
         .recursive => |recursive| {
+            for (recursive.seed.columns) |column| try needed.put(builder.alloc, column.internal, {});
+            for (recursive.step.columns) |column| try needed.put(builder.alloc, column.internal, {});
             // The working row is positional. Every recursive output is needed
             // to seed the next iteration even when the outer SELECT projects less.
             try projectScans(builder, recursive.seed, needed);
@@ -1811,17 +1819,42 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
         },
         .query => |query| {
             var required = query.statement;
-            // Transparent outputs retain ordinal slots, but cold forwarded
-            // columns must not become physical scan dependencies.
-            if (query.preserve_scope) required.columns = &.{};
+            const decisions = @import("decision_eval.zig");
+            const prunable = blk: {
+                if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or query.binding.order_keys.len != 0) break :blk false;
+                for (query.binding.scalars.projections) |*optional| if (optional.*) |*program| if (decisions.hasExternal(program)) break :blk false;
+                break :blk true;
+            };
+            if (prunable) {
+                const outputs = try builder.alloc.alloc(bool, node.columns.len);
+                for (outputs, node.columns, query.statement.columns) |*output, column, projection| {
+                    output.* = needed.contains(column.internal);
+                    if (!output.*) continue;
+                    if (projection.expression) |expression| try markExpression(builder.alloc, needed, expression) else try needed.put(builder.alloc, projection.field, {});
+                }
+                @constCast(node).operation.query.output_needed = outputs;
+                required.columns = &.{};
+            } else if (query.preserve_scope) {
+                required.columns = &.{};
+            }
             try markSelect(builder.alloc, needed, required);
+            if (prunable) {
+                var ordinals: std.ArrayList(u32) = .empty;
+                for (query.binding.scalars.required) |ordinal| if (needed.contains(query.binding.scalars.columns[ordinal].name)) try ordinals.append(builder.alloc, ordinal);
+                @constCast(node).operation.query.binding.scalars.required = try ordinals.toOwnedSlice(builder.alloc);
+            }
             try projectScans(builder, query.source, needed);
         },
         .set => |set| {
+            for (set.left.columns) |column| try needed.put(builder.alloc, column.internal, {});
+            for (set.right.columns) |column| try needed.put(builder.alloc, column.internal, {});
             try projectScans(builder, set.left, needed);
             try projectScans(builder, set.right, needed);
         },
-        .values => |arms| for (arms) |arm| try projectScans(builder, arm, needed),
+        .values => |arms| for (arms) |arm| {
+            for (arm.columns) |column| try needed.put(builder.alloc, column.internal, {});
+            try projectScans(builder, arm, needed);
+        },
     }
 }
 

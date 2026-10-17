@@ -5654,6 +5654,16 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                 ]
                 for bucket in range(5)
             ], derived
+            # Mixed exact-array/native outputs keep primitive lanes batched;
+            # unused derived expressions never fetch or evaluate cold payloads.
+            mixed = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT SUM(v), COUNT(arr) FROM (SELECT amount + 1 AS v, ARRAY[amount, amount+1]::int8[] AS arr, 1/0 AS unused FROM skew_scan) d"
+                },
+            )
+            assert mixed["rows"] == [[str(sum(expected) + total), str(total)]], mixed
             # Thousands of partial groups use hash-owned final reduction. The
             # final typed batches must preserve exact totals across cold starts.
             assert call(

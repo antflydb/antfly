@@ -190,6 +190,50 @@ pub const Grouped = struct {
         @memcpy(values[1..], inputs);
         try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
     }
+    /// Scatter bounded windows into partition-local column blocks. Hashes
+    /// are semantic grouping hashes already computed by the upstream census;
+    /// per-partition selections preserve input order and original ordinals.
+    pub fn addBatch(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, hashes: []const ?u64, ordinals: []const u64) !void {
+        if (!self.partitioned or inputs.len != self.specs.len or hashes.len != ordinals.len) return error.InvalidSqlSpill;
+        const Batch = @import("execution_batch.zig").Batch;
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        var begin: usize = 0;
+        while (begin < ordinals.len) {
+            try self.sort.manager.check();
+            _ = scratch.reset(.retain_capacity);
+            const a = scratch.allocator();
+            const length = @min(@as(usize, 256), ordinals.len - begin);
+            var positions: [256]usize = undefined;
+            var chosen_ordinals: [256]u64 = undefined;
+            const marker_indices: [256]u32 = @splat(0);
+            const columns = try a.alloc(Batch, inputs.len + 1);
+            columns[0] = .{ .dictionary = .{ .values = &.{Datum.json(.{ .bool = false })}, .indices = marker_indices[0..length] } };
+            var all_positions: [256]usize = undefined;
+            for (all_positions[0..length], begin..) |*row, i| row.* = i;
+            for (inputs, columns[1..]) |*column, *part| part.* = try column.select(a, all_positions[0..length]);
+            const values = try Batch.combine(a, columns, length);
+            const key_columns = try a.alloc(Batch, keys.len);
+            for (keys, key_columns) |*column, *part| part.* = try column.select(a, all_positions[0..length]);
+            const key_batch = try Batch.combine(a, key_columns, length);
+            for (0..self.partition_count) |partition| {
+                var count: usize = 0;
+                for (hashes[begin..][0..length], 0..) |hash, lane| {
+                    if ((hash orelse return error.InvalidSqlSpill) % self.partition_count != partition) continue;
+                    positions[count] = lane;
+                    chosen_ordinals[count] = ordinals[begin + lane];
+                    count += 1;
+                }
+                if (count == 0) continue;
+                if (self.partitions[partition] == null) {
+                    self.partitions[partition] = try spill.Sequential.init(self.sort.manager, @min(4096, self.bytes / 128));
+                    self.partitions[partition].?.buffer_bytes = 512;
+                }
+                try self.partitions[partition].?.appendBatch(try values.select(a, positions[0..count]), try key_batch.select(a, positions[0..count]), chosen_ordinals[0..count]);
+            }
+            begin += length;
+        }
+    }
     fn append(self: *Grouped, row: operators.Row) !void {
         if (!self.partitioned) return self.sort.add(row);
         var hash = std.hash.Wyhash.init(0);

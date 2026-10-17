@@ -5282,3 +5282,49 @@ are covered. Zig/Python formatting, Python lint, whitespace, licenses and the
 Apache product boundary (2,073 source files) passed. Current `origin/main`
 `ce578d9033` is included. Archive-scale latency/RSS benchmarking and live-provider
 retention qualification remain deferred.
+
+### Mixed projection delivery and pressure-aware grouping
+
+Derived streaming queries propagate output demand before physical scan planning.
+Unused expressions and their cold scan fields are omitted while schema widths
+and ordinals remain stable. Predicate and named-window input dependencies are
+retained, including scalar-subquery cardinality in unused definitions; ordered,
+aggregate, window, recursive, set and materialized domains conservatively retain
+the positional inputs they need. External projection providers retain their
+existing invocation contract. This is internal planning, with no new SQL syntax.
+
+A derived output batch may combine native primitives, compact dictionaries and
+exact scalar arrays/NUMERIC/JSON-null columns. Speculative encoded evaluation
+owns a separate reclaimable arena: an expression error releases that workspace
+before evaluating the existing scalar error prefix. Unsupported scalar columns
+are evaluated once alongside eligible native outputs. The mixed 49-column
+regression now succeeds under its existing 448 KiB working-memory limit.
+
+Expression kernels gather validated primitive/dictionary payloads from mapped,
+selected and physical-only readers directly into typed kernel lanes. Selection
+is pushed before coercion; SQL null masks, narrow integer checks, REAL rounding,
+nonfinite rules and scalar JSON-null/exact-NUMERIC fallbacks remain authoritative.
+Identity expressions borrow exact column views as well, avoiding full-row scratch
+when an aggregate consumes an array or NUMERIC field.
+
+Grouping admits distinct new state, variable-width winner growth, replacement
+vector/hash capacities and whole-column mixed-extrema/key promotions. Shared
+statement headroom participates in admission. Existing fixed-width groups remain
+batched above half quota; oversized censuses
+or reservations split into smaller prefixes instead of deoptimizing the entire
+input. Partitioned spill ingestion reuses semantic hashes, scatters bounded
+256-row windows and writes the existing native column-block codec, preserving
+per-partition input order, raw/partial markers and source ordinals. Order-sensitive
+and specialized exact aggregate paths retain their existing fallback contracts.
+
+Qualification of mixed projections, capacity-aware group admission and physical
+expression gathers (2026-10-16): the full SQL gate passed 990 tests, with three
+opt-in benchmarks skipped; all 505 native lake tests and the runtime I/O ABI
+gate passed, with zero failures or leaks. Focused final spill validation,
+allocation-failure, mixed cursor and named-window dependency checks also passed.
+All 50 real Parquet/Iceberg E2Es passed against the final Debug CLI in 642.72
+seconds. The expanded Parquet restart case checks mixed exact arrays/native
+outputs and unused-expression pruning. Zig/Python formatting, Python lint,
+whitespace, licenses and the Apache product boundary (2,073 sources) passed.
+Current `origin/main` `ce578d9033` is included. Archive-scale latency/RSS
+benchmarks and live-provider retention qualification remain deferred.

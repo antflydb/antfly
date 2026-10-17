@@ -152,6 +152,51 @@ pub const Column = struct {
         self.clear(a);
         self.values = .{ .dynamic = states };
     }
+    pub fn appendGrowth(self: *const Column, additional: usize) usize {
+        return switch (self.values) {
+            inline else => |values| blk: {
+                const required = values.items.len +| additional;
+                if (required <= values.capacity) break :blk 0;
+                break :blk (required *| 2 +| 8) *| @sizeOf(@TypeOf(values.items[0]));
+            },
+        };
+    }
+    /// Mixed extrema promote the entire state column, including untouched
+    /// groups. Admit that transient copy before changing any live state.
+    pub fn updateGrowth(self: *const Column, value: Datum, additional: usize) usize {
+        if (value.sql_null or (self.spec.kind != .min and self.spec.kind != .max)) return 0;
+        const compatible = switch (self.values) {
+            .integers => value.value == .integer,
+            .numbers => value.value == .float,
+            .booleans => value.value == .bool,
+            .bytes => value.value == .string,
+            .dynamic => true,
+            else => false,
+        };
+        if (compatible) return 0;
+        const count = switch (self.values) {
+            inline else => |values| values.items.len,
+        };
+        var bytes = (count +| additional) *| (2 * @sizeOf(operators.Aggregate) + 1024);
+        if (self.values == .bytes) for (self.values.bytes.items) |state| if (state.value) |text| {
+            bytes +|= text.len;
+        };
+        return bytes;
+    }
+    pub fn physicalUpdateGrowth(self: *const Column, physical: @import("execution_batch.zig").PhysicalColumn, additional: usize) !usize {
+        if (self.spec.kind != .min and self.spec.kind != .max) return 0;
+        const compatible = switch (self.values) {
+            .integers => physical.kind == .integer,
+            .numbers => physical.kind == .number,
+            .booleans => physical.kind == .boolean,
+            .bytes => physical.kind == .string,
+            .dynamic => true,
+            else => false,
+        };
+        if (compatible) return 0;
+        for (physical.selection, 0..) |row, lane| if (!physical.vector.nulls.isNull(row)) return self.updateGrowth(try physical.cell(lane), additional);
+        return 0;
+    }
     pub fn numericGrowth(self: *const Column, index: ?usize, weight: i32, length: usize) usize {
         var state: @import("numeric_aggregate.zig").State = .{};
         if (index) |slot| switch (self.values) {

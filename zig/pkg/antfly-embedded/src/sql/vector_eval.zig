@@ -143,8 +143,9 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
     const visited = try a.alloc(bool, programs.len);
     defer a.free(visited);
     @memset(visited, false);
-    // Identity column expressions borrow native vectors all the way into
-    // aggregate kernels. Coercing/effectful expressions keep fused evaluation.
+    // Identity expressions borrow column views, including exact arrays,
+    // NUMERIC and JSON-null values. Scalar consumers normalize at access;
+    // physical consumers validate only their final selected primitive lanes.
     for (programs, 0..) |program, index| {
         if (program.root != 0 or program.instructions.len != 1) continue;
         const ordinal = switch (program.instructions[0].operation) {
@@ -156,9 +157,6 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
         var published = false;
         defer if (!published) a.free(definitions);
         const physical: Batch = .{ .columns = .{ .page = page, .definitions = definitions } };
-        var scratch = std.heap.ArenaAllocator.init(a);
-        defer scratch.deinit();
-        if (try physical.physicalColumn(scratch.allocator(), 0) == null) continue;
         outputs[index] = physical;
         visited[index] = true;
         published = true;
@@ -422,8 +420,8 @@ const MemoInput = struct {
     base: ColumnInput,
     memo: []?[]const Datum,
     count: usize,
-    pub fn fillTyped(self: MemoInput, ordinal: u32, target: anytype) !bool {
-        return self.base.fillTyped(ordinal, target);
+    pub fn fillTyped(self: MemoInput, a: std.mem.Allocator, ordinal: u32, target: anytype) !bool {
+        return self.base.fillTyped(a, ordinal, target);
     }
     pub fn fillColumn(self: MemoInput, a: std.mem.Allocator, ordinal: u32, output: []Datum) !void {
         if (ordinal >= self.memo.len) return error.InvalidSqlBackendResponse;
@@ -448,6 +446,10 @@ const BatchInput = struct {
     pub fn cell(self: BatchInput, a: std.mem.Allocator, index: usize, ordinal: u32) !Datum {
         return self.batch.cell(a, index, ordinal);
     }
+    pub fn fillTyped(self: BatchInput, a: std.mem.Allocator, ordinal: u32, target: anytype) !bool {
+        const physical = (try self.batch.physicalColumn(a, ordinal)) orelse return false;
+        return target.fillPhysical(physical);
+    }
     pub fn fillColumn(self: BatchInput, a: std.mem.Allocator, ordinal: u32, output: []Datum) !void {
         for (output, 0..) |*value, index| value.* = try self.cell(a, index, ordinal);
     }
@@ -464,76 +466,14 @@ const ColumnInput = struct {
     page: @import("catalog.zig").ColumnPage,
     columns: []const scalar.Column,
     count: usize,
-    pub fn fillTyped(self: ColumnInput, ordinal: u32, target: anytype) !bool {
+    pub fn fillTyped(self: ColumnInput, a: std.mem.Allocator, ordinal: u32, target: anytype) !bool {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
         const definition = self.columns[ordinal];
         if (definition.element_type == .numeric) return false;
-        const sql_floating = definition.element_type == .float32 or definition.element_type == .float64;
-        if (self.page.native) |native| {
-            const index = for (native.names, 0..) |name, i| {
-                if (std.mem.eql(u8, name, definition.name)) break i;
-            } else return false;
-            // These batch representations read cells without allocating or
-            // coercing payloads. Other readers use the ordinary allocator path.
-            switch (native.values.*) {
-                .retained, .rows, .vectors, .dictionary => {},
-                else => return false,
-            }
-            for (self.page.selection, 0..) |physical, row| {
-                const value = try native.values.cell(std.heap.page_allocator, physical, index);
-                if (value.patterns != null) return false;
-                if (!value.sql_null) {
-                    const exact = switch (value.value) {
-                        .integer => definition.type == .integer or definition.type == .number,
-                        .float => definition.type == .number,
-                        .bool => definition.type == .boolean,
-                        .string => definition.type == .string,
-                        else => false,
-                    };
-                    if (!exact) return false;
-                    if (value.value == .float and !std.math.isFinite(value.value.float) and !sql_floating) return error.SqlTypeMismatch;
-                }
-                try target.set(row, value);
-            }
-            return true;
-        }
-        const column = self.page.batch.findColumn(definition.name) orelse return false;
-        const exact = switch (column.values) {
-            .i64, .dictionary_i64 => definition.type == .integer or definition.type == .number,
-            .f64, .dictionary_f64 => definition.type == .number,
-            .bool => definition.type == .boolean,
-            .bytes, .dictionary_bytes => definition.type == .string,
-            else => false,
-        };
-        if (!exact) return false;
-        for (self.page.selection, 0..) |physical, row| {
-            if (physical >= self.page.batch.rowCount()) return error.InvalidSqlBackendResponse;
-            if (column.nulls.isNull(physical)) {
-                try target.set(row, .{});
-                continue;
-            }
-            const value: std.json.Value = switch (column.values) {
-                .dictionary_i64 => |v| .{ .integer = v.at(physical) },
-                .dictionary_f64 => |v| blk: {
-                    if (!std.math.isFinite(v.at(physical)) and !sql_floating) return error.SqlTypeMismatch;
-                    break :blk .{ .float = v.at(physical) };
-                },
-                .i64 => |v| .{ .integer = v[physical] },
-                .f64 => |v| blk: {
-                    if (!std.math.isFinite(v[physical]) and !sql_floating) return error.SqlTypeMismatch;
-                    break :blk .{ .float = v[physical] };
-                },
-                .bool => |v| .{ .bool = v[physical] },
-                .bytes => |v| .{ .string = v[physical] },
-                .dictionary_bytes => |v| blk: {
-                    if (v.indices[physical] >= v.values.len) return error.InvalidSqlBackendResponse;
-                    break :blk .{ .string = v.values[v.indices[physical]] };
-                },
-                else => unreachable,
-            };
-            try target.set(row, Datum.json(value));
-        }
-        return true;
+        const batch: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = self.page, .definitions = &.{definition} } };
+        if (try batch.physicalColumn(a, 0)) |physical| return target.fillPhysical(physical);
+        // Row producers and JSON-null columns keep exact scalar semantics.
+        return false;
     }
     pub fn fillColumn(self: ColumnInput, a: std.mem.Allocator, ordinal: u32, output: []Datum) !void {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
@@ -1230,4 +1170,70 @@ test "SQL physical computed vectors share parallel scheduling and typed delivery
     try physical.validate();
     try std.testing.expectEqual(refs.len, physical.selection.len);
     for (integers, physical.vector.values.i64) |input, output| try std.testing.expectEqual(input * 3, output);
+}
+
+fn readerGatherScenario(a: std.mem.Allocator) !void {
+    const Batch = @import("execution_batch.zig").Batch;
+    const Physical = @import("execution_batch.zig").PhysicalColumn;
+    const Reader = struct {
+        fn cell(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !Datum {
+            return error.InvalidSqlBackendResponse;
+        }
+        fn physical(_: *anyopaque, alloc: std.mem.Allocator, _: usize, selection: ?[]const usize) !?Physical {
+            const source: Physical = .{ .vector = .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ 2, 7, std.math.maxInt(i64) }, .indices = &.{ 0, 2, 1 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } }, .selection = &.{ 0, 1, 2 }, .kind = .integer };
+            return if (selection) |rows| try source.select(alloc, rows) else source;
+        }
+    };
+    var raw: u8 = 0;
+    const source: Batch = .{ .reader = .{ .ptr = &raw, .read = Reader.cell, .read_physical_selected = Reader.physical, .count = 3, .width = 1 } };
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = &source, .names = &.{"n"} }, .selection = &.{ 2, 0 } };
+    var compiled = try @import("compiler.zig").compileScalar(a, "n+1", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const alloc = scratch.allocator();
+    const outputs = try evaluateColumnsEncodedMany(alloc, &.{&program}, page, &definitions, &.{}, null);
+    try std.testing.expect((try outputs[0].?.cell(alloc, 0, 0)).sql_null);
+    try std.testing.expectEqual(@as(i64, 3), (try outputs[0].?.cell(alloc, 1, 0)).value.integer);
+    var bad = page;
+    bad.selection = &.{1};
+    try std.testing.expectError(error.SqlNumericOutOfRange, evaluateColumnsEncodedMany(alloc, &.{&program}, bad, &definitions, &.{}, null));
+}
+test "SQL physical readers gather selected dictionary lanes without scalar reads" {
+    try readerGatherScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readerGatherScenario, .{});
+}
+
+test "SQL physical string comparisons retain temporary payloads through numeric gathers" {
+    const a = std.testing.allocator;
+    const Physical = @import("execution_batch.zig").PhysicalColumn;
+    const Reader = struct {
+        fn cell(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !Datum {
+            return error.InvalidSqlBackendResponse;
+        }
+        fn physical(_: *anyopaque, alloc: std.mem.Allocator, column: usize, selection: ?[]const usize) !?Physical {
+            var view: Physical = if (column == 0) .{ .vector = .{ .name = "n", .values = .{ .i64 = &.{ 1, 0 } } }, .selection = &.{ 0, 1 }, .kind = .integer } else blk: {
+                const strings = try alloc.alloc([]const u8, 2);
+                strings[0] = try alloc.dupe(u8, "alpha");
+                strings[1] = try alloc.dupe(u8, "omega");
+                break :blk .{ .vector = .{ .name = "txt", .values = .{ .bytes = strings } }, .selection = &.{ 0, 1 }, .kind = .string };
+            };
+            if (selection) |rows| view = try view.select(alloc, rows);
+            return view;
+        }
+    };
+    var raw: u8 = 0;
+    const source: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &raw, .read = Reader.cell, .read_physical_selected = Reader.physical, .width = 2, .count = 2 } };
+    const definitions = [_]scalar.Column{ .{ .name = "n", .type = .integer }, .{ .name = "txt", .type = .string } };
+    const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = &source, .names = &.{ "n", "txt" } }, .selection = &.{ 0, 1 } };
+    var compiled = try @import("compiler.zig").compileScalar(a, "(txt='alpha') = (n>0)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
+    defer freeEncodedMany(a, outputs);
+    for (0..2) |row| try std.testing.expect((try outputs[0].?.cell(a, row, 0)).value.bool);
 }

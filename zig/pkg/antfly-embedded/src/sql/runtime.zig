@@ -1041,9 +1041,12 @@ pub const Context = struct {
     /// The caller selects predicate/OFFSET/LIMIT survivors before calling this,
     /// so discarded rows never invoke projection providers.
     pub fn projectValuesBatch(self: Context, alloc: std.mem.Allocator, rows: []const catalog.Row, fields: []const []const u8, cells: []const []const Datum) ![]const []const Datum {
+        return self.projectValuesBatchDemand(alloc, rows, fields, cells, null);
+    }
+    pub fn projectValuesBatchDemand(self: Context, alloc: std.mem.Allocator, rows: []const catalog.Row, fields: []const []const u8, cells: []const []const Datum, needed: ?[]const bool) ![]const []const Datum {
         if (rows.len != cells.len) return error.InvalidSqlBackendResponse;
         const columns = try alloc.alloc(?[]const Datum, self.binding.scalars.projections.len);
-        for (self.binding.scalars.projections, columns) |optional, *values| values.* = if (optional) |*program|
+        for (self.binding.scalars.projections, columns, 0..) |optional, *values, index| values.* = if (needed != null and !needed.?[index]) null else if (optional) |*program|
             try @import("decision_eval.zig").evaluateBatchWithLimits(alloc, self.backend.decision_provider, program, cells, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
         else
             null;
@@ -1051,6 +1054,10 @@ pub const Context = struct {
         for (rows, output, 0..) |row, *values, row_index| {
             const projected = try alloc.alloc(Datum, fields.len);
             for (fields, self.binding.columns, projected, 0..) |field, column, *out, index| {
+                if (needed != null and !needed.?[index]) {
+                    out.* = .{};
+                    continue;
+                }
                 const input = if (index < columns.len and columns[index] != null) columns[index].?[row_index] else blk: {
                     const cell = try row.cell(field);
                     break :blk cell;

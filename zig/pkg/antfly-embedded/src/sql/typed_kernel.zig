@@ -51,6 +51,37 @@ const Vector = struct {
             }),
         };
     }
+    /// Gather validated native payloads directly into the kernel workspace.
+    /// Selection and SQL NULL stay separate from primitive lanes; no Datum
+    /// array or JSON tags are constructed for physical readers.
+    pub fn fillPhysical(self: Vector, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
+        if (physical.selection.len != self.states.len) return error.InvalidSqlBackendResponse;
+        const compatible = switch (physical.vector.values) {
+            .i64, .dictionary_i64 => self.kind == .integer or self.kind == .number,
+            .f64, .dictionary_f64 => self.kind == .number,
+            .bool => self.kind == .boolean,
+            .bytes, .dictionary_bytes => self.kind == .string,
+            else => false,
+        };
+        if (!compatible) return false;
+        try physical.validate();
+        for (physical.selection, 0..) |source, row| {
+            self.states[row] = if (physical.vector.nulls.isNull(source)) .sql_null else .value;
+            if (self.states[row] != .value) continue;
+            switch (physical.vector.values) {
+                inline .i64, .dictionary_i64 => |values| {
+                    const value = if (comptime @TypeOf(values) == []const i64) values[source] else values.at(source);
+                    if (self.kind == .integer) self.integers()[row] = value else self.numbers()[row] = @floatFromInt(value);
+                },
+                inline .f64, .dictionary_f64 => |values| self.numbers()[row] = if (comptime @TypeOf(values) == []const f64) values[source] else values.at(source),
+                .bool => |values| self.booleans()[row] = values[source],
+                .bytes => |values| self.strings()[row] = values[source],
+                .dictionary_bytes => |values| self.strings()[row] = values.at(source),
+                else => unreachable,
+            }
+        }
+        return true;
+    }
     pub fn set(self: Vector, row: usize, value: Datum) !void {
         if (value.patterns != null or value.array != null or value.numeric != null) return error.UnsupportedTypedKernel;
         self.states[row] = if (value.sql_null) .sql_null else if (value.value == .null) .json_null else .value;
@@ -362,6 +393,17 @@ fn evaluateImpl(comptime encoded: bool, a: A, programs: []const *const scalar.Pr
     var free_len = peak;
     var column_scratch: ?[]Datum = null;
     defer if (column_scratch) |values| a.free(values);
+    // Physical adapters may allocate selections, null masks or normalized
+    // lanes. Reclaim those independently of delivery vectors. Primitive
+    // gathers copy every lane and reuse one column's workspace; string
+    // comparison inputs remain alive until their final consuming node.
+    var physical_scratch = std.heap.ArenaAllocator.init(a);
+    defer physical_scratch.deinit();
+    var string_scratch = std.heap.ArenaAllocator.init(a);
+    defer string_scratch.deinit();
+    const string_output = for (roots[0..programs.len]) |root| {
+        if (kind(instructions[root].type) == .string) break true;
+    } else false;
     var slots: [512]usize = undefined;
     for (instructions[0..len], 0..) |instruction, i| {
         free_len -= 1;
@@ -382,7 +424,10 @@ fn evaluateImpl(comptime encoded: bool, a: A, programs: []const *const scalar.Pr
                 for (0..input.count) |row| try target.set(row, value);
             },
             .column => |ordinal| {
-                const filled = if (comptime @hasDecl(@TypeOf(input), "fillTyped")) try input.fillTyped(ordinal, target) else false;
+                _ = physical_scratch.reset(.retain_capacity);
+                // Escaping strings use the established scalar column ownership
+                // contract. Identity encoded outputs already borrow columns.
+                const filled = if (comptime @hasDecl(@TypeOf(input), "fillTyped")) if (target.kind == .string and string_output) false else try input.fillTyped(if (target.kind == .string) string_scratch.allocator() else physical_scratch.allocator(), ordinal, target) else false;
                 if (filled) {} else if (comptime @hasDecl(@TypeOf(input), "fillColumn")) {
                     if (column_scratch == null) column_scratch = try a.alloc(Datum, input.count);
                     try input.fillColumn(a, ordinal, column_scratch.?);

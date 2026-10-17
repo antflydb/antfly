@@ -529,6 +529,17 @@ pub const Store = struct {
             var repeated = false;
             if (!value.sql_null and index < self.columns.len) {
                 const column = self.columns[index];
+                const compatible = switch (column.values) {
+                    .unknown => false,
+                    .integers => value.value == .integer,
+                    .numbers => value.value == .float,
+                    .booleans => value.value == .bool,
+                    .strings => value.value == .string,
+                    .decimals => value.value == .number_string,
+                    .encoded => true,
+                };
+                if (!compatible) bytes +|= (self.len *| 2 +| 8) *| @sizeOf(std.json.Value);
+                if ((column.patterns.items.len == 0 and value.patterns != null) or (column.arrays.items.len == 0 and value.array != null) or (column.numerics.items.len == 0 and value.numeric != null)) bytes +|= (self.len *| 2 +| 8) *| @sizeOf(usize);
                 if (column.values == .strings and value.value == .string) repeated = column.values.strings.lookup.contains(value.value.string);
                 if (column.values == .decimals and value.value == .number_string) repeated = column.values.decimals.lookup.contains(value.value.number_string);
                 if (!repeated) {
@@ -538,6 +549,54 @@ pub const Store = struct {
             }
             bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytes(value);
             if (repeated and value.patterns != null) bytes +|= @sizeOf(?*scalar.PatternSet);
+        }
+        return bytes;
+    }
+    fn listGrowth(values: anytype, additional: usize) usize {
+        const required = values.items.len +| additional;
+        if (required <= values.capacity) return 0;
+        return (required *| 2 +| 8) *| @sizeOf(@TypeOf(values.items[0]));
+    }
+    fn tableGrowth(table: anytype, additional: usize) usize {
+        if (additional <= table.available) return 0;
+        const required = (table.count() +| additional) *| 100 / std.hash_map.default_max_load_percentage +| 1;
+        const capacity = std.math.ceilPowerOfTwo(usize, @max(8, required)) catch return std.math.maxInt(usize);
+        return capacity *| 32 +| 64;
+    }
+    /// Include replacement vector/hash capacities, not just retained cells.
+    /// Numeric/string dictionary sampling may temporarily own both formats.
+    pub fn appendGrowthBytes(self: *const Store, additional: usize) usize {
+        if (additional == 0) return 0;
+        var bytes: usize = 0;
+        for (self.columns) |column| {
+            const words = (self.len +| additional +| 63) / 64;
+            bytes +|= listGrowth(column.nulls, words -| column.nulls.items.len);
+            if (column.patterns.items.len != 0) bytes +|= listGrowth(column.patterns, additional);
+            if (column.arrays.items.len != 0) bytes +|= listGrowth(column.arrays, additional);
+            if (column.numerics.items.len != 0) bytes +|= listGrowth(column.numerics, additional);
+            switch (column.values) {
+                .unknown => {},
+                inline .booleans, .encoded => |values| bytes +|= listGrowth(values, additional),
+                inline .integers, .numbers => |values| {
+                    if (!values.encoded) {
+                        bytes +|= listGrowth(values.flat, additional);
+                        if (!values.sampled and values.flat.items.len +| additional > 256) bytes +|= 256 * 64;
+                    } else {
+                        bytes +|= listGrowth(values.values, additional);
+                        bytes +|= listGrowth(values.indices, additional);
+                        bytes +|= tableGrowth(values.lookup, additional);
+                        if (values.values.items.len +| additional >= 512) bytes +|= (self.len +| additional) *| 16;
+                    }
+                },
+                .strings, .decimals => |values| {
+                    if (values.flat) |flat| bytes +|= listGrowth(flat, additional) else {
+                        bytes +|= listGrowth(values.values, additional);
+                        bytes +|= listGrowth(values.indices, additional);
+                        bytes +|= values.growthBytes(additional);
+                        if (values.values.items.len +| additional >= 512) bytes +|= (self.len +| additional) *| 32;
+                    }
+                },
+            }
         }
         return bytes;
     }
