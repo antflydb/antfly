@@ -784,6 +784,7 @@ def _wait_for_entities(
                     raise
                 last_error = repr(exc)
                 continue
+            last_error = None
             last[key] = doc
             if doc is not None and expected_names[key] in _doc_text(doc):
                 found[key] = doc
@@ -827,6 +828,34 @@ def test_entity_deadline_retains_diagnostics_below_request_floor(monkeypatch, tm
     assert "pending=['entity:a']" in str(failure.value)
     assert "captured native stacks" in str(failure.value)
     assert "captured entity diagnostics" in str(failure.value)
+
+
+def test_entity_deadline_reports_recovered_transport_separately_from_missing_rows(
+    monkeypatch,
+):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    monkeypatch.setitem(globals(), "_capture_failure_stacks", lambda _: "stacks")
+
+    class Api:
+        _server = None
+        calls = 0
+
+        def lookup(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.ConnectionError("startup listener unavailable")
+            return None
+
+        def diagnostic(self):
+            return "rows still missing"
+
+    api = Api()
+    with pytest.raises(AssertionError, match="last_error=None") as failure:
+        _wait_for_entities(api, {"entity:a": "Alice"}, deadline=_Deadline(1.5))
+    assert api.calls > 1
+    assert "'entity:a': None" in str(failure.value)
 
 
 def _doc_text(doc: dict) -> str:

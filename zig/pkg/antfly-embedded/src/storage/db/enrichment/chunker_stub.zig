@@ -262,3 +262,15 @@ test "enrichment chunker stub rejects model-aware inputs without flattening medi
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Fixture.run, .{});
 }
+
+test "chunker stub model-aware input retains validation without byte chunk fallback" {
+    try std.testing.expectError(error.UnsupportedPlatform, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"antfly","embedding":{"model":"model"}}
+    , null));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"antfly","model":"fixed"}
+    , null));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"mock","embedding":{"model":"model"}}
+    , null));
+}
