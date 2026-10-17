@@ -700,6 +700,21 @@ pub const Owner = struct {
         return result;
     }
 
+    /// Trusted committed-entry ingress. The command is already encoded ASVR;
+    /// it cannot carry or override the actual state machine's term/index.
+    pub fn applyRaftSchemaOwnerControl(self: *Owner, table_name: []const u8, command: []const u8, term: u64, index: u64, options: QueryOptions) !void {
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_apply_raft_schema_control(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .command = .fromSlice(command),
+            .term = term,
+            .index = index,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft schema owner control");
+    }
+
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{

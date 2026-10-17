@@ -3906,11 +3906,16 @@ pub const DB = struct {
             );
             core_owned = false;
             core_owner_initialized = true;
+            const schema_validation_protected = if (opts.schema_before_index_load != null) protected: {
+                var read = try core_owner.store.beginReadTxn();
+                defer read.abort();
+                break :protected try @import("relational_nullability_job.zig").protectedOwnerCatalog(alloc, &read, core_owner.identity_namespace) != null;
+            } else false;
             // Reject a stale catalog-authoritative descriptor as soon as the
             // durable schema is known, before binding source authority or
             // starting any owner-side maintenance. Historical Raft apply is
             // allowed to replay against the newer on-disk schema instead.
-            if (opts.reject_stale_schema_before_index_load) {
+            if (opts.reject_stale_schema_before_index_load and !schema_validation_protected) {
                 if (opts.schema_before_index_load) |prepared_schema| {
                     if (core_owner.schema) |durable_schema| {
                         if (durable_schema.version > prepared_schema.runtime_schema.version)
@@ -4078,7 +4083,11 @@ pub const DB = struct {
                 // after this physical DB has durably installed a newer schema.
                 // Keep that newer epoch; the older entry's native applied
                 // marker decides whether it still needs its data mutation.
-                if (db.core.schema != null and db.core.schema.?.version > prepared_schema.runtime_schema.version) {
+                if (schema_validation_protected) {
+                    // The durable job owns this catalog, including an installed
+                    // but unpublished successor. Preserve it before index load;
+                    // the outer descriptor policy still controls public reads.
+                } else if (db.core.schema != null and db.core.schema.?.version > prepared_schema.runtime_schema.version) {
                     if (opts.reject_stale_schema_before_index_load) return error.SchemaVersionRegression;
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
@@ -8861,11 +8870,7 @@ pub const DB = struct {
         defer resident.deinit();
         self.core.unlockApplyShared();
         apply_shared = false;
-        const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return .unprotected;
-        if (fence.role != .schema_validation) return .unprotected;
-        if (!fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        const stored = (try job.load(&read)) orelse return error.SchemaValidationJobRequired;
-        const header = try job.observe(self.alloc, &read, stored.binding);
+        const header = (try job.protectedOwnerCatalog(self.alloc, &read, self.core.identity_namespace)) orelse return .unprotected;
         if (header.phase == .installed) try resident.require(header) else try resident.requireBefore(header.binding);
         if (historical or schema_json.len == 0) return .deferred;
         const digest = job.hash(schema_json);
@@ -8934,16 +8939,51 @@ pub const DB = struct {
         return SchemaOwnerControl.Prepared.prepareRaftPage(self.alloc, self.core, binding, budget, context);
     }
 
+    fn requireRaftSchemaOwnerScope(self: *DB, binding: @import("relational_schema_owner_contract.zig").Binding, owner_group: u64) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
+        try binding.validate();
+        if (binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.SchemaValidationJobChanged;
+        if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+    }
+
+    fn raftSchemaOwnerControlAlreadyApplied(self: *DB, binding: @import("relational_schema_owner_contract.zig").Binding, owner_group: u64, entry: OrderedApplyReceipt) !bool {
+        try self.requireRaftSchemaOwnerScope(binding, owner_group);
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        _ = try @import("../source_authority.zig").require(&read, .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        return try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(&read), entry) == .already_applied;
+    }
+
+    /// Complete trusted transport dispatch. Retired job inputs need not remain
+    /// preparable forever: a durable applied watermark skips their replay only
+    /// after checking the actual namespace, owner group and authority domain.
+    pub fn applyRaftSchemaOwnerCommand(self: *DB, command: SchemaOwnerControl.Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !void {
+        try context.ensureActive();
+        try command.validateFor(.raft);
+        if (try self.raftSchemaOwnerControlAlreadyApplied(command.binding, owner_group, entry)) return;
+        var prepared = self.prepareRaftSchemaOwnerControl(command, context) catch |err| {
+            // Another committed apply may have finished while preparation was
+            // reading a predecessor. Recovery must inspect durable truth, not
+            // turn that completed command into a replayable preparation error.
+            if (try self.raftSchemaOwnerControlAlreadyApplied(command.binding, owner_group, entry)) return;
+            return err;
+        };
+        defer prepared.deinit();
+        try self.applyCommittedRaftSchemaOwnerControl(&prepared, owner_group, entry);
+        // No fallible cancellation/deadline check after successful commit.
+    }
+
     /// Private committed-entry apply, not command-body authority. The actual
     /// owner group and term/index come from the state machine. All five schema
     /// effects join the ordered marker in the SAME store transaction; local
     /// installation also publishes its prepared runtime in that commit.
     pub fn applyCommittedRaftSchemaOwnerControl(self: *DB, prepared: *SchemaOwnerControl.Prepared, owner_group: u64, entry: OrderedApplyReceipt) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         try prepared.validateAuthority(.raft);
-        if (owner_group == 0 or owner_group != prepared.command.binding.fence.owner_group_id) return error.SchemaValidationJobChanged;
-        if (!prepared.namespace().eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        try self.requireRaftSchemaOwnerScope(prepared.command.binding, owner_group);
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         // A configured standby needs an ordered envelope for this control.

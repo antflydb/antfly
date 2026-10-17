@@ -111,17 +111,19 @@ pub fn add(
     physical_imports.boundary_profile = .owner;
     physical_imports.configureStorage(b, physical_module, true);
     @import("../../../build_support/embedded/storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
-    physical_imports.storage_boundary.configureProfile(physical_module, true, true, .owner);
+    physical_imports.storage_boundary.configureProfile(physical_module, false, true, .all);
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
-        .filters = &.{"storage owner handoff receipt survives shared-context hidden to public reopen"},
+        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner Raft schema controls cross the checked archive" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
         handoff_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
-    b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
-        .dependOn(&handoff_tests.run(b).step);
+    const run_physical_owners = handoff_tests.run(b);
+    runs[0].step.dependOn(&run_physical_owners.step);
+    b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner receipt and schema-control reopen regressions")
+        .dependOn(&run_physical_owners.step);
     return .{ .runs = runs, .benchmark = benchmark };
 }

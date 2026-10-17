@@ -11661,3 +11661,63 @@ owner mutation port, committed-entry ingress, capability/decoder admission,
 durable metadata plan/ACK acceptance, adoption and coordinated publication and
 release are still required. ASVR decoding is not metadata authorization or
 public feature activation. The original parity inventory remains unchanged.
+
+### Checked compiled-owner Raft schema mutation port and actual cold reopening
+
+The preceding contract checkpoint's compiled owner-source and full Debug SQL
+run completed successfully: 1,130 SQL tests and 47 owner-source tests passed,
+four opt-in benchmarks skipped, zero failures/leaks and 67/67 build steps in
+`/private/tmp/antfly-sql-schema-contract-source-sql-debug.log`.
+
+Private owner ABI 95 adds a synchronous applying-state-machine port for ASVR
+commands. The actual handle supplies group/table/namespace authority; committed
+term/index travel separately from command bytes. Version, pointer/length bounds,
+reserved fields and request controls are checked before decoding. Canonical
+decoding still grants no metadata admission or public mutation access. The host
+wrapper checks the originating failure boundary and operation. Failure ABI 67
+adds exact schema-control/page/replay/cancellation/publication and ordered-cut
+errors rather than flattening those outcomes to an internal failure.
+
+DB dispatch checks the actual namespace, owner group and durable Raft authority
+before using an applied watermark to skip old log entries. This permits replay
+of an admission that is no longer preparable after cancellation or retirement,
+without reviving the old job or inventing a new phase receipt. Preparation races
+recheck durable apply truth; successful commit is not followed by a fallible
+cancellation/deadline check. New effects retain the same atomic job/schema/marker
+writer and fail closed for unsupported standby envelopes.
+
+The real archive fixture exposed another startup boundary: `DB.open` rejected a
+predecessor descriptor before the later catalog-deferral policy could execute.
+Startup now verifies the durable schema-validation fence, namespace, committed
+phase cuts and catalog facts before suppressing descriptor-driven pre-index
+schema changes. Both the early stale-version rejection and later pre-index
+override respect that protection. Ordinary stale-descriptor rejection remains
+unchanged without a verified validation job. The outer descriptor policy still
+decides read admission; preserving an installed successor never publishes it.
+
+The physical oracle and linked owner use distinct LSM roots, identical committed
+initial timestamps and all five controls. They cover malformed wire/ABI requests,
+exact boundary failure identity, deadlines, conflicting terms, foreign namespace
+rejection even for old entries, independent page replay, cancellation/install,
+mid-validation reopening, installed reopening with a predecessor descriptor,
+terminal replay and persisted header/watermark/row decoding. The preexisting
+handoff fixture was wired to a control-only source profile; it now explicitly
+owns physical sources and the shared failure/owner/enrichment contracts. Both
+physical fixtures are dependencies of the standard compiled-owner CI gate,
+not merely an optional focused command.
+
+The final Debug gate passes 67 owner/job tests with zero skips/leaks and 104/104
+build steps in `/private/tmp/antfly-sql-schema-owner-abi95-qualified-debug.log`.
+The attached semantic failure-registry gate also succeeds. Earlier logs retain
+the build-profile error, stale-version startup rejection and fixed optional
+header coercion; none was bypassed by relaxing the test's cold-reopen assertion.
+Formatting, source ownership, product boundary, licenses and inventory checks
+pass. During these builds about 4.6 GiB of individually inspected obsolete
+archive/object pairs were reclaimed after checking live processes; current
+verified outputs, source, logs and other worktrees were preserved. Removed
+outputs are rebuildable; no broad cache sweep ran.
+
+Actual data-log ingress/proposal capability barriers, advisory owner preparation,
+durable metadata plan/ACK acceptance, root adoption, coordinated publication and
+release, and layout-preserving full-text retirement qualification remain
+required. The port is not a public producer and no parity case is reclassified.

@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 66;
+pub const abi_version: u32 = 67;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -764,6 +764,15 @@ pub const Status = enum(u32) {
     schema_validation_job_changed = 804,
     schema_validation_job_required = 805,
     schema_validation_runtime_recovery_required = 806,
+    invalid_schema_owner_control = 807,
+    invalid_schema_validation_page_command = 808,
+    invalid_nullability_replay = 809,
+    schema_validation_canceled = 810,
+    schema_validation_not_ready = 811,
+    schema_validation_publication_required = 812,
+    schema_validation_cancellation_required = 813,
+    invalid_ordered_apply_receipt = 814,
+    conflicting_ordered_apply_receipt = 815,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

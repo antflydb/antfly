@@ -350,6 +350,17 @@ pub fn observe(a: A, txn: anytype, binding: Binding) !Header {
     return workHeader(txn, binding);
 }
 
+/// Read-only catalog preservation, never descriptor/publication admission.
+/// Startup may use this before index runtimes exist. Only the actual durable
+/// fence, namespace, phase cuts and catalog facts can suppress reconciliation.
+pub fn protectedOwnerCatalog(a: A, txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace) !?Header {
+    const fence = (try topology.current(txn)) orelse return null;
+    if (fence.role != .schema_validation) return null;
+    if (!fence.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+    const stored = (try load(txn)) orelse return error.SchemaValidationJobRequired;
+    return try observe(a, txn, stored.binding);
+}
+
 pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candidate, entry: ?receipts.OrderedApplyReceipt) !Header {
     try binding.validate();
     try requireCandidate(binding, candidate);

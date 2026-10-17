@@ -4120,9 +4120,44 @@ pub fn storageOwnerRaftIndexPreparationJson(
     return .ok;
 }
 
-/// No ordinary-batch decoding or caller-selected replay position enters this
-/// boundary. Metadata permission is independently checked by the server worker;
-/// durable local job/catalog checks remain authoritative for each storage effect.
+/// Private applying-state-machine port. No ordinary batch parser or metadata
+/// hint may select the separate committed position accepted here.
+pub fn storageOwnerApplyRaftSchemaControl(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.RaftSchemaOwnerApplyRequest,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_failure.* = .{};
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftSchemaOwnerApplyRequest.operation);
+            return out.status;
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version)
+        return Failure.result(error.InvalidAbiVersion, out_failure);
+    const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+    if (request._reserved != 0 or request.table_name.len == 0 or request.table_name.ptr == null or
+        request.table_name.len > std.math.maxInt(usize) or request.command.ptr == null or
+        request.command.len < 48 or request.command.len > contract.Command.max_raft_wire_bytes or
+        request.term == 0 or request.index == 0 or request.control.has_execution_deadline > 1 or
+        request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0)
+        return Failure.result(error.InvalidArgument, out_failure);
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+        .cancellation = ownerQueryCancellation(&request.control),
+    };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    _ = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    const command = contract.Command.decodeRaft(request.command.slice()) catch |err| return Failure.result(err, out_failure);
+    handle.db.applyRaftSchemaOwnerCommand(command, handle.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context) catch |err|
+        return Failure.result(err, out_failure);
+    return .ok;
+}
+
+/// Read-only native schema observation; no caller-selected commit position.
 pub fn storageOwnerNativeSchemaObservationJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.NativeSchemaOwnerObservationRequest,

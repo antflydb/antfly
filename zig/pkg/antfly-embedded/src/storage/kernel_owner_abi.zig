@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 94;
+pub const abi_version: u32 = 95;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1244,6 +1244,24 @@ pub extern fn antfly_storage_owner_native_index_control_json(
     owner: ?*anyopaque,
     request: *const NativeIndexOwnerControlRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Trusted committed-entry ingress only. Command bytes carry no position;
+/// term/index are supplied by the applying state machine, never ordinary RPC.
+pub const RaftSchemaOwnerApplyRequest = extern struct {
+    pub const operation: u32 = 3;
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    command: BorrowedBytes = .{},
+    term: u64 = 0,
+    index: u64 = 0,
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_apply_raft_schema_control(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerApplyRequest,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 /// Read-only native schema progress. No caller-selected root, receipt position,

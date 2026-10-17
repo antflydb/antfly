@@ -20,6 +20,135 @@ const db_mod = @import("antfly_local_sources").storage_db_db;
 const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
 const handoff = @import("antfly_local_sources").storage_db_empty_generation_handoff;
 
+test "storage owner Raft schema controls cross the checked archive and recover terminal replay" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const job = local.storage_db_relational_nullability_job;
+    const contract = local.storage_db_relational_schema_owner_contract;
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":false}},"required":["n"],"additionalProperties":false}}}}
+    ;
+    const namespace: local.storage_db_doc_identity_namespace.Namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const Driver = struct {
+        fn header(database: *db_mod.DB) !contract.Header {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            return (try job.load(&read)).?;
+        }
+        fn apply(source: *db_mod.DB, target: *client.Owner, command: contract.Command, term: u64, index: u64) !void {
+            const bytes = try command.encodeRaft(std.testing.allocator);
+            defer std.testing.allocator.free(bytes);
+            try source.applyRaftSchemaOwnerCommand(command, 72, .{ .term = term, .index = index }, .{});
+            try target.applyRaftSchemaOwnerControl("rows", bytes, term, index, .{});
+        }
+    };
+    for ([_]bool{ true, false }) |cancel_only| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(root);
+        const primary_path = try std.fs.path.join(a, &.{ root, "primary" });
+        defer a.free(primary_path);
+        const peer_path = try std.fs.path.join(a, &.{ root, "peer" });
+        defer a.free(peer_path);
+        var primary = try db_mod.DB.open(a, primary_path, options);
+        defer primary.close();
+        {
+            var seed = try db_mod.DB.open(a, peer_path, options);
+            defer seed.close();
+            for ([_]*db_mod.DB{ &primary, &seed }) |database| {
+                try database.setSchemaJson(a, before);
+                try database.applyOrderedCommittedMutation(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 }, false);
+            }
+        }
+        const prior = try primary.core.store.get(a, local.storage_db_relational_integrity_catalog.key);
+        defer a.free(prior);
+        var candidate = try job.Candidate.init(a, namespace.table_id, before, after, prior, &.{"n"}, .{});
+        defer candidate.deinit();
+        const topology = try primary.relationalTopologyIdentity();
+        const binding = binding: {
+            var read = try primary.core.store.beginReadTxn();
+            defer read.abort();
+            break :binding try job.prepareBinding(&read, &candidate, @splat(31), @splat(32), .{ .role = .schema_validation, .transition_id = 33, .attempt = 1, .admission_epoch = topology.next_epoch, .owner_group_id = 72, .peer_group_id = 72, .namespace = namespace, .catalog_digest = topology.catalog_digest }, .raft);
+        };
+        var context: client.Context = .{};
+        try context.ensure();
+        defer context.deinit();
+        var deferred_catalog: u8 = 0;
+        const open: abi.OpenRequest = .{ .context = context.handle, .path = .fromSlice(peer_path), .table_name = .fromSlice("rows"), .group_id = 72, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .online_source_authority = 1, .schema_json = .fromSlice(before), .indexes_json = .fromSlice("{}"), .owner_catalog_deferred_out = &deferred_catalog };
+        var peer = try client.Owner.open(open);
+        var peer_live = true;
+        defer if (peer_live) peer.deinit();
+        const begin: contract.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
+        const wire = try begin.encodeRaft(a);
+        defer a.free(wire);
+        var failure: abi.FailureIdentity = .{};
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_apply_raft_schema_control(peer.handle, &.{ .version = abi.abi_version - 1, .command = .{ .ptr = @ptrFromInt(1), .len = 48 } }, &failure));
+        try std.testing.expectEqual(abi.FailureBoundary.storage_owner, failure.boundary);
+        try std.testing.expectEqual(abi.RaftSchemaOwnerApplyRequest.operation, failure.operation);
+        try std.testing.expectEqual(abi.abi_version, failure.boundary_version);
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_raft_schema_control(peer.handle, &.{ .table_name = .{ .len = 4 }, .command = .fromSlice(wire), .term = 2, .index = 10 }, &failure));
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_raft_schema_control(peer.handle, &.{ .table_name = .fromSlice("rows"), .command = .{ .ptr = @ptrFromInt(1), .len = contract.Command.max_raft_wire_bytes + 1 }, .term = 2, .index = 10 }, &failure));
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_raft_schema_control(peer.handle, &.{ .table_name = .fromSlice("rows"), .command = .fromSlice(wire), .term = 2, .index = 10, ._reserved = 1 }, &failure));
+        try std.testing.expectError(error.DeadlineExceeded, peer.applyRaftSchemaOwnerControl("rows", wire, 2, 10, .{ .execution_deadline_ns = 0 }));
+        wire[wire.len - 1] ^= 1;
+        try std.testing.expectError(error.InvalidSchemaOwnerControl, peer.applyRaftSchemaOwnerControl("rows", wire, 2, 10, .{}));
+        wire[wire.len - 1] ^= 1;
+        try Driver.apply(&primary, &peer, begin, 2, 10);
+        try std.testing.expectError(error.ConflictingOrderedApplyReceipt, peer.applyRaftSchemaOwnerControl("rows", wire, 3, 10, .{}));
+        try Driver.apply(&primary, &peer, .{ .binding = binding, .action = .freeze }, 2, 11);
+        peer.deinit();
+        peer_live = false;
+        peer = try client.Owner.open(open);
+        peer_live = true;
+        try std.testing.expectEqual(@as(u8, 0), deferred_catalog);
+        var index: u64 = 12;
+        for (0..8) |_| {
+            var page = try primary.prepareRaftSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+            defer page.deinit();
+            try Driver.apply(&primary, &peer, page.command, 2, index);
+            index += 1;
+            if ((try Driver.header(&primary)).phase == .ready) break;
+        } else return error.SchemaValidationDidNotFinish;
+        const ready = try Driver.header(&primary);
+        var payload: [64]u8 = @splat(91);
+        @memcpy(payload[32..64], &try ready.digest());
+        const terminal: contract.Command = .{ .binding = binding, .action = if (cancel_only) .cancel else .install, .payload = if (cancel_only) "" else &payload };
+        try Driver.apply(&primary, &peer, terminal, 3, index);
+        const completed = try Driver.header(&primary);
+        // Old admission is no longer preparable after cancellation. The actual
+        // applied watermark, not a synthetic phase receipt, makes replay safe.
+        try peer.applyRaftSchemaOwnerControl("rows", wire, 2, 10, .{});
+        var foreign = begin;
+        foreign.binding.fence.namespace.range_id += 1;
+        const foreign_wire = try foreign.encodeRaft(a);
+        defer a.free(foreign_wire);
+        try std.testing.expectError(error.IdentityNamespaceMismatch, peer.applyRaftSchemaOwnerControl("rows", foreign_wire, 2, 10, .{}));
+        peer.deinit();
+        peer_live = false;
+        {
+            var restored = try db_mod.DB.open(a, peer_path, options);
+            defer restored.close();
+            try std.testing.expectEqualDeep(completed, try Driver.header(&restored));
+            try std.testing.expectEqual(@as(u64, index), (try restored.orderedApplyReceipt()).?.index);
+            const row = (try restored.get(a, "a")).?;
+            defer a.free(row);
+            try std.testing.expectEqualStrings("{\"n\":1}", row);
+        }
+        peer = try client.Owner.open(open);
+        peer_live = true;
+        try std.testing.expectEqual(@as(u8, if (cancel_only) 0 else 1), deferred_catalog);
+        const terminal_wire = try terminal.encodeRaft(a);
+        defer a.free(terminal_wire);
+        try peer.applyRaftSchemaOwnerControl("rows", terminal_wire, 3, index + 1, .{});
+        try peer.applyRaftSchemaOwnerControl("rows", wire, 2, 10, .{});
+    }
+}
+
 test "storage owner handoff receipt survives shared-context hidden to public reopen" {
     const alloc = std.testing.allocator;
     const public_schema_json =
