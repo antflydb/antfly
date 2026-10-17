@@ -3992,7 +3992,9 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
         }
     };
     var probe = Probe{ .input = input.items };
-    const thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Probe.run, .{&probe});
+    // Include LLVM Debug's surrounding JSON/cleanup frames in this portable
+    // budget. The former property parser alone used about 276 KiB per level.
+    const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Probe.run, .{&probe});
     thread.join();
     if (probe.failure) |err| return err;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Probe.parse, .{input.items});
