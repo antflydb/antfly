@@ -1,0 +1,26 @@
+{
+  "provenance": "Original synthetic testsrc2 clips under Apache-2.0. decode-bframes is copied from the shared media fixture. NV12 is independent FFmpeg decode in presentation order, tightly packed 32x24 luma then interleaved 16x12 chroma, 20 pictures.",
+  "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "files": [
+    {
+      "file": "decode-bframes.mp4",
+      "sha256": "58de44f592e3df42aca292965394a3213b1bc7047e1269d5262652fb32a2dc18",
+      "bytes": 3311
+    },
+    {
+      "file": "decode-bframes.nv12",
+      "sha256": "0f4c80cd39e231c25692ba47fc4f257fa939ba05f6051e9eb530c3a2c462cf94",
+      "bytes": 23040
+    },
+    {
+      "file": "prepare-sdr.mp4",
+      "sha256": "bc6c7d41ded4bcbc63a17ea5497f679684804a06bf46a2174fd8dd26c232586b",
+      "bytes": 6165
+    },
+    {
+      "file": "decode-hardware.mp4",
+      "sha256": "56afd820084fc267cf15cc254d16c4b8fb23bd180e87e8e6f96e360e76c57a66",
+      "bytes": 35224
+    }
+  ]
+}

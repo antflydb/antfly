@@ -1,0 +1,378 @@
+/*
+  Copyright (c) 2010 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2010 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ *
+ *  Based on code from the OggTheora software codec source code,
+ *  Copyright (C) 2002-2010 The Xiph.Org Foundation and contributors.
+ */
+
+/*
+ *  Copyright (c) 2010 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ *
+ *  This code was originally written by: Gregory Maxwell, at the Daala
+ *  project.
+ */
+
+/*
+ *  Copyright (c) 2010 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ *
+ *  This code was originally written by: Nathan E. Egge, at the Daala
+ *  project.
+ */
+
+/*
+ *  Copyright (c) 2010 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2011 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2012 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2013 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2014 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2015 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2016 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed  by a BSD-style license that can be
+ *  found in the LICENSE file in the root of the source tree. An additional
+ *  intellectual property  rights grant can  be found in the  file PATENTS.
+ *  All contributing  project authors may be  found in the AUTHORS  file in
+ *  the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2016 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2017 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2018 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2019 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed  by a BSD-style license that can be
+ *  found in the LICENSE file in the root of the source tree. An additional
+ *  intellectual property  rights grant can  be found in the  file PATENTS.
+ *  All contributing  project authors may be  found in the AUTHORS  file in
+ *  the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2019 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2020 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2021 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2022 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2023 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright (c) 2024 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright 2011 The LibYuv Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS. All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright 2012 The LibYuv Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS. All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright 2013 The LibYuv Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS. All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ *  Copyright 2016 The LibYuv Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS. All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ * Copyright (c) 2010 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ * Copyright (c) 2021 Loongson Technology Corporation Limited
+ * Contributed by Jin Bo  <jinbo@loongson.cn>
+ * Contributed by Lu Wang <wanglu@loongson.cn>
+ *
+ * Use of this source code is governed by a BSD-style license
+ * that can be found in the LICENSE file in the root of the source
+ * tree. An additional intellectual property rights grant can be found
+ * in the file PATENTS.  All contributing project authors may
+ * be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ * Copyright (c) 2021 Loongson Technology Corporation Limited
+ * Contributed by Lu Wang <wanglu@loongson.cn>
+ *
+ * Use of this source code is governed by a BSD-style license
+ * that can be found in the LICENSE file in the root of the source
+ * tree. An additional intellectual property rights grant can be found
+ * in the file PATENTS.  All contributing project authors may
+ * be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ * Copyright (c) 2021 Loongson Technology Corporation Limited
+ * Contributed by Lu Wang <wanglu@loongson.cn>
+ *
+ * Use of this source code is governed by a BSD-style license
+ * that can be found in the LICENSE file in the root of the source
+ * tree. An additional intellectual property rights grant can be found
+ * in the file PATENTS. All contributing project authors may
+ * be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ * Copyright (c) 2022 Loongson Technology Corporation Limited
+ * Contributed by Hecai Yuan <yuanhecai@loongson.cn>
+ *
+ * Use of this source code is governed by a BSD-style license
+ * that can be found in the LICENSE file in the root of the source
+ * tree. An additional intellectual property rights grant can be found
+ * in the file PATENTS.  All contributing project authors may
+ * be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ * Copyright (c) 2022 The WebM project authors. All Rights Reserved.
+ *
+ * Use of this source code is governed by a BSD-style license
+ * that can be found in the LICENSE file in the root of the source
+ * tree. An additional intellectual property rights grant can be found
+ * in the file PATENTS.  All contributing project authors may
+ * be found in the AUTHORS file in the root of the source tree.
+ *
+ */
+
+/*
+ * Copyright (c) 2024 The WebM project authors. All Rights Reserved.
+ *
+ * Use of this source code is governed by a BSD-style license
+ * that can be found in the LICENSE file in the root of the source
+ * tree. An additional intellectual property rights grant can be found
+ * in the file PATENTS.  All contributing project authors may
+ * be found in the AUTHORS file in the root of the source tree.
+ */
+
+/*
+ * This code implements the MD5 message-digest algorithm.
+ * The algorithm is due to Ron Rivest.  This code was
+ * written by Colin Plumb in 1993, no copyright is claimed.
+ * This code is in the public domain; do with it what you wish.
+ *
+ * Equivalent code is available from RSA Data Security, Inc.
+ * This code has been tested against that, and is equivalent,
+ * except that you don't need to include two pages of legalese
+ * with every copy.
+ *
+ * To compute the message digest of a chunk of bytes, declare an
+ * MD5Context structure, pass it to MD5Init, call MD5Update as
+ * needed on buffers full of bytes, and then call MD5Final, which
+ * will fill a supplied 16-byte array with the digest.
+ *
+ * Changed so as no longer to depend on Colin Plumb's `usual.h' header
+ * definitions
+ *  - Ian Jackson <ian@chiark.greenend.org.uk>.
+ * Still in the public domain.
+ */
+
+/*
+ * This is the header file for the MD5 message-digest algorithm.
+ * The algorithm is due to Ron Rivest.  This code was
+ * written by Colin Plumb in 1993, no copyright is claimed.
+ * This code is in the public domain; do with it what you wish.
+ *
+ * Equivalent code is available from RSA Data Security, Inc.
+ * This code has been tested against that, and is equivalent,
+ * except that you don't need to include two pages of legalese
+ * with every copy.
+ *
+ * To compute the message digest of a chunk of bytes, declare an
+ * MD5Context structure, pass it to MD5Init, call MD5Update as
+ * needed on buffers full of bytes, and then call MD5Final, which
+ * will fill a supplied 16-byte array with the digest.
+ *
+ * Changed so as no longer to depend on Colin Plumb's `usual.h'
+ * header definitions
+ *  - Ian Jackson <ian@chiark.greenend.org.uk>.
+ * Still in the public domain.
+ */

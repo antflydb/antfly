@@ -1,0 +1,5 @@
+{
+  "source": "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8",
+  "sha256": "f2177c1350130e087f9d81af82f092ababfcfb34e5b01e52ff146a08b241e849",
+  "scope": "Public Apple HLS example configuration captured for master parsing/selection only. Referenced MPEG-TS/audio/subtitle media is not fetched or redistributed; this is not codec or MPEG-TS ingestion qualification."
+}

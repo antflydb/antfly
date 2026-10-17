@@ -59,6 +59,8 @@ pub const ChunkerConfig = struct {
     threshold: ?f32 = null,
     text: ?antfly_chunking_api_openapi.TextChunkOptions = null,
     audio: ?antfly_chunking_api_openapi.AudioChunkOptions = null,
+    embedding: ?antfly_chunking_api_openapi.ChunkEmbeddingTarget = null,
+    policy: ?antfly_chunking_api_openapi.MediaChunkPolicy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -71,6 +73,8 @@ pub const ChunkerConfig = struct {
         .{ "threshold", "threshold", true },
         .{ "text", "text", false },
         .{ "audio", "audio", false },
+        .{ "embedding", "embedding", false },
+        .{ "policy", "policy", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -121,6 +125,20 @@ pub const ChunkerConfig = struct {
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("audio");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("embedding");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("policy");
             try jw.write(@as(?u8, null));
         }
         try jw.endObject();

@@ -203,6 +203,7 @@ fn mergeLoraPairIntoWeight(base_weight: *LoadedWeight, adapter_a: Tensor, adapte
 }
 
 pub const WeightStore = struct {
+    scalar_bounds: @import("../models/embedding_gemma2_weight_cache.zig").ScalarBoundsCache = .{},
     allocator: std.mem.Allocator,
     resident_weight_estimate_bytes: usize = 0,
     prefix: []const u8,
@@ -298,6 +299,7 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
 /// Stops the worker and retires borrowed guards. Call before destroying
 /// lazy_weights, whose entries still refer to this queue's Io and mutex.
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
+    data.scalar_bounds.deinit(data.allocator);
     if (!data.prefetch_initialized) return;
     data.prefetch.stop();
     var lazy_it = data.lazy_weights.iterator();

@@ -9,3 +9,18 @@ Intended use:
 - migrate `/api/generate` toward an OpenAI-compatible core contract
 - add inference-native extensions such as `grammar`, `draft_model`, and `speculative_k`
 - keep API evolution for this repo unblocked from the external Antfly checkout
+
+Standalone inference POST routes accept the optional header
+`X-Antfly-Inference-Timeout-Ms`. Supply it exactly once as decimal milliseconds
+from 1 through 3,600,000. Its relative application budget starts at route dispatch
+and can shorten an existing deadline. Invalid or duplicate values return
+`400 INVALID_INFERENCE_TIMEOUT` before request admission. Omission retains the
+existing application deadline.
+
+The execution control checks this budget during preprocessing and model work;
+transport read/write limits remain separate. Cooperative expiration returns
+`504 INFERENCE_TIMEOUT` after cleanup. A process-required unsafe driver call can
+instead cause the hard watchdog to terminate its worker and close the connection;
+the supervisor replaces that generation. Group metrics are generation scoped.
+See [video deadline qualification](../../../../lib/video/testdata/deadline-model-validation/README.md)
+for tested shapes, failed historical runs and remaining recovery/performance scope.

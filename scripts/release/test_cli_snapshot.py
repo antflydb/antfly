@@ -89,6 +89,26 @@ class CLISnapshotTests(unittest.TestCase):
             with self.subTest(unsupported=unsupported), self.assertRaises(SystemExit):
                 snapshot.python_version_from_release(unsupported)
 
+    def test_darwin_deployment_target_matches_wheel_floor(self) -> None:
+        policy_module = load_module(
+            "apple_release_platforms",
+            REPO_ROOT / "scripts/release/release_platforms.py",
+        )
+        policy = policy_module.load_policy()
+        darwin = next(
+            row for row in policy["platforms"] if row["archive_os"] == "Darwin"
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = Path(raw_tmp) / "platforms.json"
+            darwin["wheel_platform"] = "macosx_11_0_arm64"
+            path.write_text(json.dumps(policy))
+            with self.assertRaisesRegex(SystemExit, "wheel tag must match"):
+                policy_module.load_policy(path)
+            darwin["zig_target"] = "aarch64-macos"
+            path.write_text(json.dumps(policy))
+            with self.assertRaisesRegex(SystemExit, "explicit macOS deployment target"):
+                policy_module.load_policy(path)
+
     def test_snapshot_rejects_mutated_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
@@ -100,7 +120,7 @@ class CLISnapshotTests(unittest.TestCase):
             for filename, package_name in NPM_PACKAGES.items():
                 write_npm_package(npm_dir / f"{filename}-{VERSION}.tgz", package_name)
             for platform in (
-                "macosx_11_0_arm64",
+                "macosx_15_0_arm64",
                 "manylinux_2_28_aarch64",
                 "manylinux_2_28_x86_64",
             ):

@@ -1,5 +1,11 @@
 # Image Support
 
+The proposed [video library](../video/VIDEO.md) reuses image processing and JPEG
+decoding where applicable, while [shared media](../media/MEDIA.md) owns container
+timelines. Model-specific device preparation and video integration are described
+in the [native video inference plan](../../../docs/plans/native-video-inference.md).
+These proposals do not add video codec support to the image runtime.
+
 This file describes the shared image-codec design used by `antfly-zig` and
 `antfly-inference-zig` (termite). It also documents the conformance strategy
 and corpus that back that design.
@@ -426,3 +432,7 @@ migration and are not implemented.
   COD writes the stored code-block exponent matching the encoder's
   OpenJPEG-style exponent, and detail-subband precinct assignment uses
   subband-local half-resolution precinct dimensions.
+
+The video preparation layer reuses the public `processing.BicubicAxis` and
+`buildPillowBicubicAxis` coefficient builder for its CPU/Metal resize comparison.
+The existing image resize implementation and public raster boundary are unchanged.

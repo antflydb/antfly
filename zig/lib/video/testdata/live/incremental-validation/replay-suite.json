@@ -1,0 +1,48 @@
+{
+  "cases": [
+    {
+      "id": "sintel-6s",
+      "path": "../../../../../../zig/pkg/inference/scripts/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
+      "init_end": 991,
+      "fragment_ends": [
+        5277,
+        7588,
+        14529,
+        22782,
+        28629,
+        35574
+      ],
+      "advance_ns": 1000000000,
+      "qualify_reader_cache": true,
+      "incremental_validation": false,
+      "sha256": "5c6b29872ef18dc0145ad2bd90d26ec33a232fd55afba0cb9b8784bdaef2b694"
+    },
+    {
+      "id": "sintel-6s-sparse",
+      "path": "../../../../../../zig/pkg/inference/scripts/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
+      "init_end": 991,
+      "fragment_ends": [
+        5277,
+        7588,
+        14529,
+        22782,
+        28629,
+        35574
+      ],
+      "advance_ns": 3000000000,
+      "qualify_reader_cache": true,
+      "incremental_validation": false,
+      "sha256": "5c6b29872ef18dc0145ad2bd90d26ec33a232fd55afba0cb9b8784bdaef2b694"
+    }
+  ],
+  "queries": [
+    {
+      "id": "dragon",
+      "text": "A dragon and a young woman."
+    },
+    {
+      "id": "landscape",
+      "text": "A wide landscape with mountains."
+    }
+  ]
+}

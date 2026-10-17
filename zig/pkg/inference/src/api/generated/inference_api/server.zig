@@ -134,7 +134,7 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
-    .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/decisions", .operation_id = "decide", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/dictate", .operation_id = "dictate", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
@@ -231,7 +231,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.chatCompletions(ctx);
         }
 
-        /// Chunk text into smaller segments
+        /// Chunk content with optional model-aware embeddings
         /// POST /chunk
         fn chunkText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chunkText(ctx);

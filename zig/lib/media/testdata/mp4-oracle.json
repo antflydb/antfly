@@ -1,0 +1,935 @@
+{
+  "provenance": "Original synthetic testsrc2 and sine fixtures; generated locally for Antfly under Apache-2.0. No downloaded media.",
+  "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "ffprobe": "ffprobe version 9.0.2 Copyright (c) 2007-2026 the FFmpeg developers",
+  "fixtures": [
+    {
+      "file": "bframes-tail.mp4",
+      "sha256": "58de44f592e3df42aca292965394a3213b1bc7047e1269d5262652fb32a2dc18",
+      "timescale": 10240,
+      "track_id": 1,
+      "width": 32,
+      "height": 24,
+      "packets": [
+        {
+          "dts": -2048,
+          "pts": 0,
+          "duration": 1024,
+          "offset": 48,
+          "size": 1133,
+          "sync": true
+        },
+        {
+          "dts": -1024,
+          "pts": 3072,
+          "duration": 1024,
+          "offset": 1181,
+          "size": 106,
+          "sync": false
+        },
+        {
+          "dts": 0,
+          "pts": 1024,
+          "duration": 1024,
+          "offset": 1287,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 1024,
+          "pts": 2048,
+          "duration": 1024,
+          "offset": 1300,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 2048,
+          "pts": 6144,
+          "duration": 1024,
+          "offset": 1313,
+          "size": 63,
+          "sync": false
+        },
+        {
+          "dts": 3072,
+          "pts": 4096,
+          "duration": 1024,
+          "offset": 1376,
+          "size": 14,
+          "sync": false
+        },
+        {
+          "dts": 4096,
+          "pts": 5120,
+          "duration": 1024,
+          "offset": 1390,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 5120,
+          "pts": 9216,
+          "duration": 1024,
+          "offset": 1403,
+          "size": 81,
+          "sync": false
+        },
+        {
+          "dts": 6144,
+          "pts": 7168,
+          "duration": 1024,
+          "offset": 1484,
+          "size": 28,
+          "sync": false
+        },
+        {
+          "dts": 7168,
+          "pts": 8192,
+          "duration": 1024,
+          "offset": 1512,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 8192,
+          "pts": 10240,
+          "duration": 1024,
+          "offset": 1525,
+          "size": 498,
+          "sync": true
+        },
+        {
+          "dts": 9216,
+          "pts": 13312,
+          "duration": 1024,
+          "offset": 2023,
+          "size": 41,
+          "sync": false
+        },
+        {
+          "dts": 10240,
+          "pts": 11264,
+          "duration": 1024,
+          "offset": 2064,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 11264,
+          "pts": 12288,
+          "duration": 1024,
+          "offset": 2077,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 12288,
+          "pts": 16384,
+          "duration": 1024,
+          "offset": 2090,
+          "size": 84,
+          "sync": false
+        },
+        {
+          "dts": 13312,
+          "pts": 14336,
+          "duration": 1024,
+          "offset": 2174,
+          "size": 27,
+          "sync": false
+        },
+        {
+          "dts": 14336,
+          "pts": 15360,
+          "duration": 1024,
+          "offset": 2201,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 15360,
+          "pts": 19456,
+          "duration": 1024,
+          "offset": 2214,
+          "size": 46,
+          "sync": false
+        },
+        {
+          "dts": 16384,
+          "pts": 17408,
+          "duration": 1024,
+          "offset": 2260,
+          "size": 17,
+          "sync": false
+        },
+        {
+          "dts": 17408,
+          "pts": 18432,
+          "duration": 1024,
+          "offset": 2277,
+          "size": 13,
+          "sync": false
+        }
+      ],
+      "side_data": []
+    },
+    {
+      "file": "vfr-front.mp4",
+      "sha256": "b1402c3273e5061a20cdfb08ff4afa9a9f850f0d8ef06d399f9e0cef627d5944",
+      "timescale": 10240,
+      "track_id": 1,
+      "width": 32,
+      "height": 24,
+      "packets": [
+        {
+          "dts": -6144,
+          "pts": 0,
+          "duration": 3072,
+          "offset": 949,
+          "size": 1184,
+          "sync": true
+        },
+        {
+          "dts": -3072,
+          "pts": 9216,
+          "duration": 3072,
+          "offset": 2133,
+          "size": 120,
+          "sync": false
+        },
+        {
+          "dts": 0,
+          "pts": 3072,
+          "duration": 3072,
+          "offset": 2253,
+          "size": 68,
+          "sync": false
+        },
+        {
+          "dts": 3072,
+          "pts": 6144,
+          "duration": 3072,
+          "offset": 2321,
+          "size": 38,
+          "sync": false
+        },
+        {
+          "dts": 6144,
+          "pts": 18432,
+          "duration": 3072,
+          "offset": 2359,
+          "size": 68,
+          "sync": false
+        },
+        {
+          "dts": 9216,
+          "pts": 12288,
+          "duration": 3072,
+          "offset": 2427,
+          "size": 26,
+          "sync": false
+        },
+        {
+          "dts": 12288,
+          "pts": 15360,
+          "duration": 1024,
+          "offset": 2453,
+          "size": 40,
+          "sync": false
+        }
+      ],
+      "side_data": []
+    },
+    {
+      "file": "rotated.mp4",
+      "sha256": "8d151f8b4dad913e9582eee2c4deb92eb22c2e02c3ebc281d2ab195b1e9d3e56",
+      "timescale": 10240,
+      "track_id": 1,
+      "width": 32,
+      "height": 24,
+      "packets": [
+        {
+          "dts": -2048,
+          "pts": 0,
+          "duration": 1024,
+          "offset": 48,
+          "size": 1133,
+          "sync": true
+        },
+        {
+          "dts": -1024,
+          "pts": 3072,
+          "duration": 1024,
+          "offset": 1181,
+          "size": 106,
+          "sync": false
+        },
+        {
+          "dts": 0,
+          "pts": 1024,
+          "duration": 1024,
+          "offset": 1287,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 1024,
+          "pts": 2048,
+          "duration": 1024,
+          "offset": 1300,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 2048,
+          "pts": 6144,
+          "duration": 1024,
+          "offset": 1313,
+          "size": 63,
+          "sync": false
+        },
+        {
+          "dts": 3072,
+          "pts": 4096,
+          "duration": 1024,
+          "offset": 1376,
+          "size": 14,
+          "sync": false
+        },
+        {
+          "dts": 4096,
+          "pts": 5120,
+          "duration": 1024,
+          "offset": 1390,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 5120,
+          "pts": 9216,
+          "duration": 1024,
+          "offset": 1403,
+          "size": 81,
+          "sync": false
+        },
+        {
+          "dts": 6144,
+          "pts": 7168,
+          "duration": 1024,
+          "offset": 1484,
+          "size": 28,
+          "sync": false
+        },
+        {
+          "dts": 7168,
+          "pts": 8192,
+          "duration": 1024,
+          "offset": 1512,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 8192,
+          "pts": 10240,
+          "duration": 1024,
+          "offset": 1525,
+          "size": 498,
+          "sync": true
+        },
+        {
+          "dts": 9216,
+          "pts": 13312,
+          "duration": 1024,
+          "offset": 2023,
+          "size": 41,
+          "sync": false
+        },
+        {
+          "dts": 10240,
+          "pts": 11264,
+          "duration": 1024,
+          "offset": 2064,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 11264,
+          "pts": 12288,
+          "duration": 1024,
+          "offset": 2077,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 12288,
+          "pts": 16384,
+          "duration": 1024,
+          "offset": 2090,
+          "size": 84,
+          "sync": false
+        },
+        {
+          "dts": 13312,
+          "pts": 14336,
+          "duration": 1024,
+          "offset": 2174,
+          "size": 27,
+          "sync": false
+        },
+        {
+          "dts": 14336,
+          "pts": 15360,
+          "duration": 1024,
+          "offset": 2201,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 15360,
+          "pts": 19456,
+          "duration": 1024,
+          "offset": 2214,
+          "size": 46,
+          "sync": false
+        },
+        {
+          "dts": 16384,
+          "pts": 17408,
+          "duration": 1024,
+          "offset": 2260,
+          "size": 17,
+          "sync": false
+        },
+        {
+          "dts": 17408,
+          "pts": 18432,
+          "duration": 1024,
+          "offset": 2277,
+          "size": 13,
+          "sync": false
+        }
+      ],
+      "side_data": [
+        {
+          "side_data_type": "Display Matrix",
+          "displaymatrix": "\n00000000:            0      -65536           0\n00000001:        65536           0           0\n00000002:            0           0  1073741824\n",
+          "rotation": 90
+        }
+      ]
+    },
+    {
+      "file": "video-audio.mp4",
+      "sha256": "86e513ac4dd2f561a120737fac02c88b336729ddc914c6e8322d528fd8b52bdb",
+      "timescale": 10240,
+      "track_id": 1,
+      "width": 32,
+      "height": 24,
+      "packets": [
+        {
+          "dts": -2048,
+          "pts": 0,
+          "duration": 1024,
+          "offset": 48,
+          "size": 1133,
+          "sync": true
+        },
+        {
+          "dts": -1024,
+          "pts": 3072,
+          "duration": 1024,
+          "offset": 1181,
+          "size": 106,
+          "sync": false
+        },
+        {
+          "dts": 0,
+          "pts": 1024,
+          "duration": 1024,
+          "offset": 1799,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 1024,
+          "pts": 2048,
+          "duration": 1024,
+          "offset": 2529,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 2048,
+          "pts": 6144,
+          "duration": 1024,
+          "offset": 3322,
+          "size": 63,
+          "sync": false
+        },
+        {
+          "dts": 3072,
+          "pts": 4096,
+          "duration": 1024,
+          "offset": 3779,
+          "size": 14,
+          "sync": false
+        },
+        {
+          "dts": 4096,
+          "pts": 5120,
+          "duration": 1024,
+          "offset": 4584,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 5120,
+          "pts": 9216,
+          "duration": 1024,
+          "offset": 4985,
+          "size": 81,
+          "sync": false
+        },
+        {
+          "dts": 6144,
+          "pts": 7168,
+          "duration": 1024,
+          "offset": 5868,
+          "size": 28,
+          "sync": false
+        },
+        {
+          "dts": 7168,
+          "pts": 8192,
+          "duration": 1024,
+          "offset": 6284,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 8192,
+          "pts": 10240,
+          "duration": 1024,
+          "offset": 7080,
+          "size": 498,
+          "sync": true
+        },
+        {
+          "dts": 9216,
+          "pts": 13312,
+          "duration": 1024,
+          "offset": 8383,
+          "size": 41,
+          "sync": false
+        },
+        {
+          "dts": 10240,
+          "pts": 11264,
+          "duration": 1024,
+          "offset": 8818,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 11264,
+          "pts": 12288,
+          "duration": 1024,
+          "offset": 9628,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 12288,
+          "pts": 16384,
+          "duration": 1024,
+          "offset": 10035,
+          "size": 84,
+          "sync": false
+        },
+        {
+          "dts": 13312,
+          "pts": 14336,
+          "duration": 1024,
+          "offset": 10913,
+          "size": 27,
+          "sync": false
+        },
+        {
+          "dts": 14336,
+          "pts": 15360,
+          "duration": 1024,
+          "offset": 11314,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 15360,
+          "pts": 19456,
+          "duration": 1024,
+          "offset": 12161,
+          "size": 46,
+          "sync": false
+        },
+        {
+          "dts": 16384,
+          "pts": 17408,
+          "duration": 1024,
+          "offset": 12597,
+          "size": 17,
+          "sync": false
+        },
+        {
+          "dts": 17408,
+          "pts": 18432,
+          "duration": 1024,
+          "offset": 13418,
+          "size": 13,
+          "sync": false
+        }
+      ],
+      "side_data": []
+    },
+    {
+      "file": "signed-cts.mp4",
+      "sha256": "c2c1a647d9ee675383ef0975214efce497608c42ed5b329220b3b92da8acebd7",
+      "timescale": 10240,
+      "track_id": 1,
+      "width": 32,
+      "height": 24,
+      "packets": [
+        {
+          "dts": -1024,
+          "pts": 0,
+          "duration": 1024,
+          "offset": 52,
+          "size": 1133,
+          "sync": true
+        },
+        {
+          "dts": 0,
+          "pts": 3072,
+          "duration": 1024,
+          "offset": 1185,
+          "size": 106,
+          "sync": false
+        },
+        {
+          "dts": 1024,
+          "pts": 1024,
+          "duration": 1024,
+          "offset": 1291,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 2048,
+          "pts": 2048,
+          "duration": 1024,
+          "offset": 1304,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 3072,
+          "pts": 6144,
+          "duration": 1024,
+          "offset": 1317,
+          "size": 63,
+          "sync": false
+        },
+        {
+          "dts": 4096,
+          "pts": 4096,
+          "duration": 1024,
+          "offset": 1380,
+          "size": 14,
+          "sync": false
+        },
+        {
+          "dts": 5120,
+          "pts": 5120,
+          "duration": 1024,
+          "offset": 1394,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 6144,
+          "pts": 9216,
+          "duration": 1024,
+          "offset": 1407,
+          "size": 81,
+          "sync": false
+        },
+        {
+          "dts": 7168,
+          "pts": 7168,
+          "duration": 1024,
+          "offset": 1488,
+          "size": 28,
+          "sync": false
+        },
+        {
+          "dts": 8192,
+          "pts": 8192,
+          "duration": 1024,
+          "offset": 1516,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 9216,
+          "pts": 10240,
+          "duration": 1024,
+          "offset": 1529,
+          "size": 498,
+          "sync": true
+        },
+        {
+          "dts": 10240,
+          "pts": 13312,
+          "duration": 1024,
+          "offset": 2027,
+          "size": 41,
+          "sync": false
+        },
+        {
+          "dts": 11264,
+          "pts": 11264,
+          "duration": 1024,
+          "offset": 2068,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 12288,
+          "pts": 12288,
+          "duration": 1024,
+          "offset": 2081,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 13312,
+          "pts": 16384,
+          "duration": 1024,
+          "offset": 2094,
+          "size": 84,
+          "sync": false
+        },
+        {
+          "dts": 14336,
+          "pts": 14336,
+          "duration": 1024,
+          "offset": 2178,
+          "size": 27,
+          "sync": false
+        },
+        {
+          "dts": 15360,
+          "pts": 15360,
+          "duration": 1024,
+          "offset": 2205,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 16384,
+          "pts": 19456,
+          "duration": 1024,
+          "offset": 2218,
+          "size": 46,
+          "sync": false
+        },
+        {
+          "dts": 17408,
+          "pts": 17408,
+          "duration": 1024,
+          "offset": 2264,
+          "size": 17,
+          "sync": false
+        },
+        {
+          "dts": 18432,
+          "pts": 18432,
+          "duration": 1024,
+          "offset": 2281,
+          "size": 13,
+          "sync": false
+        }
+      ],
+      "side_data": []
+    },
+    {
+      "file": "compact-co64.mp4",
+      "sha256": "3d466a0bde8d7d86fc6a12ca01d03e41bc8ba58c21bc7cdbac5942ee7f5662a0",
+      "timescale": 10240,
+      "track_id": 1,
+      "width": 32,
+      "height": 24,
+      "packets": [
+        {
+          "dts": -2048,
+          "pts": 0,
+          "duration": 1024,
+          "offset": 48,
+          "size": 1133,
+          "sync": true
+        },
+        {
+          "dts": -1024,
+          "pts": 3072,
+          "duration": 1024,
+          "offset": 1181,
+          "size": 106,
+          "sync": false
+        },
+        {
+          "dts": 0,
+          "pts": 1024,
+          "duration": 1024,
+          "offset": 1287,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 1024,
+          "pts": 2048,
+          "duration": 1024,
+          "offset": 1300,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 2048,
+          "pts": 6144,
+          "duration": 1024,
+          "offset": 1313,
+          "size": 63,
+          "sync": false
+        },
+        {
+          "dts": 3072,
+          "pts": 4096,
+          "duration": 1024,
+          "offset": 1376,
+          "size": 14,
+          "sync": false
+        },
+        {
+          "dts": 4096,
+          "pts": 5120,
+          "duration": 1024,
+          "offset": 1390,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 5120,
+          "pts": 9216,
+          "duration": 1024,
+          "offset": 1403,
+          "size": 81,
+          "sync": false
+        },
+        {
+          "dts": 6144,
+          "pts": 7168,
+          "duration": 1024,
+          "offset": 1484,
+          "size": 28,
+          "sync": false
+        },
+        {
+          "dts": 7168,
+          "pts": 8192,
+          "duration": 1024,
+          "offset": 1512,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 8192,
+          "pts": 10240,
+          "duration": 1024,
+          "offset": 1525,
+          "size": 498,
+          "sync": true
+        },
+        {
+          "dts": 9216,
+          "pts": 13312,
+          "duration": 1024,
+          "offset": 2023,
+          "size": 41,
+          "sync": false
+        },
+        {
+          "dts": 10240,
+          "pts": 11264,
+          "duration": 1024,
+          "offset": 2064,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 11264,
+          "pts": 12288,
+          "duration": 1024,
+          "offset": 2077,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 12288,
+          "pts": 16384,
+          "duration": 1024,
+          "offset": 2090,
+          "size": 84,
+          "sync": false
+        },
+        {
+          "dts": 13312,
+          "pts": 14336,
+          "duration": 1024,
+          "offset": 2174,
+          "size": 27,
+          "sync": false
+        },
+        {
+          "dts": 14336,
+          "pts": 15360,
+          "duration": 1024,
+          "offset": 2201,
+          "size": 13,
+          "sync": false
+        },
+        {
+          "dts": 15360,
+          "pts": 19456,
+          "duration": 1024,
+          "offset": 2214,
+          "size": 46,
+          "sync": false
+        },
+        {
+          "dts": 16384,
+          "pts": 17408,
+          "duration": 1024,
+          "offset": 2260,
+          "size": 17,
+          "sync": false
+        },
+        {
+          "dts": 17408,
+          "pts": 18432,
+          "duration": 1024,
+          "offset": 2277,
+          "size": 13,
+          "sync": false
+        }
+      ],
+      "side_data": []
+    }
+  ]
+}

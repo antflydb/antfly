@@ -5,6 +5,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.inference_chunk_embedding_response import InferenceChunkEmbeddingResponse
 from ...models.inference_chunk_request import InferenceChunkRequest
 from ...models.inference_chunk_response import InferenceChunkResponse
 from ...models.inference_error import InferenceError
@@ -33,9 +34,27 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
+) -> InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     if response.status_code == 200:
-        response_200 = InferenceChunkResponse.from_dict(response.json())
+
+        def _parse_response_200(data: object) -> InferenceChunkEmbeddingResponse | InferenceChunkResponse:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_inference_chunk_operation_response_type_0 = InferenceChunkResponse.from_dict(data)
+
+                return componentsschemas_inference_chunk_operation_response_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_inference_chunk_operation_response_type_1 = InferenceChunkEmbeddingResponse.from_dict(
+                data
+            )
+
+            return componentsschemas_inference_chunk_operation_response_type_1
+
+        response_200 = _parse_response_200(response.json())
 
         return response_200
 
@@ -48,6 +67,11 @@ def _parse_response(
         response_401 = InferenceError.from_dict(response.json())
 
         return response_401
+
+    if response.status_code == 409:
+        response_409 = InferenceError.from_dict(response.json())
+
+        return response_409
 
     if response.status_code == 500:
         response_500 = InferenceError.from_dict(response.json())
@@ -67,7 +91,9 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
+) -> Response[
+    InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
+]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -80,10 +106,24 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
-    r"""Chunk text into smaller segments
+) -> Response[
+    InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
+]:
+    r"""Chunk content with optional model-aware embeddings
 
-     Splits text into smaller chunks with the built-in fixed chunker.
+     Splits content into chunks. Without `embedding`, the fixed chunker and
+    legacy response remain unchanged. With `embedding`, the resolved target
+    model constrains boundaries for text, PDF pages, images or explicit tiles,
+    composited GIF frames, audio windows and consecutive video windows.
+
+    Each model-aware result pairs source coordinates and an optional vector
+    or error. `include_content` independently controls payload inclusion;
+    video uses the original source and sampling recipe. `execute: false`
+    plans without executing the embedding model. `stream: true` delivers
+    bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+    terminal record must not be treated as complete source coverage.
+    Continuations bind the original source version and semantic plan;
+    retries may deterministically recompute and must deduplicate chunk IDs.
 
     ## Models
 
@@ -101,7 +141,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]
+        Response[InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -119,10 +159,22 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
-    r"""Chunk text into smaller segments
+) -> InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
+    r"""Chunk content with optional model-aware embeddings
 
-     Splits text into smaller chunks with the built-in fixed chunker.
+     Splits content into chunks. Without `embedding`, the fixed chunker and
+    legacy response remain unchanged. With `embedding`, the resolved target
+    model constrains boundaries for text, PDF pages, images or explicit tiles,
+    composited GIF frames, audio windows and consecutive video windows.
+
+    Each model-aware result pairs source coordinates and an optional vector
+    or error. `include_content` independently controls payload inclusion;
+    video uses the original source and sampling recipe. `execute: false`
+    plans without executing the embedding model. `stream: true` delivers
+    bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+    terminal record must not be treated as complete source coverage.
+    Continuations bind the original source version and semantic plan;
+    retries may deterministically recompute and must deduplicate chunk IDs.
 
     ## Models
 
@@ -140,7 +192,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
+        InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
     """
 
     return sync_detailed(
@@ -153,10 +205,24 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
-    r"""Chunk text into smaller segments
+) -> Response[
+    InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
+]:
+    r"""Chunk content with optional model-aware embeddings
 
-     Splits text into smaller chunks with the built-in fixed chunker.
+     Splits content into chunks. Without `embedding`, the fixed chunker and
+    legacy response remain unchanged. With `embedding`, the resolved target
+    model constrains boundaries for text, PDF pages, images or explicit tiles,
+    composited GIF frames, audio windows and consecutive video windows.
+
+    Each model-aware result pairs source coordinates and an optional vector
+    or error. `include_content` independently controls payload inclusion;
+    video uses the original source and sampling recipe. `execute: false`
+    plans without executing the embedding model. `stream: true` delivers
+    bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+    terminal record must not be treated as complete source coverage.
+    Continuations bind the original source version and semantic plan;
+    retries may deterministically recompute and must deduplicate chunk IDs.
 
     ## Models
 
@@ -174,7 +240,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]
+        Response[InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]
     """
 
     kwargs = _get_kwargs(
@@ -190,10 +256,22 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceChunkRequest,
-) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
-    r"""Chunk text into smaller segments
+) -> InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
+    r"""Chunk content with optional model-aware embeddings
 
-     Splits text into smaller chunks with the built-in fixed chunker.
+     Splits content into chunks. Without `embedding`, the fixed chunker and
+    legacy response remain unchanged. With `embedding`, the resolved target
+    model constrains boundaries for text, PDF pages, images or explicit tiles,
+    composited GIF frames, audio windows and consecutive video windows.
+
+    Each model-aware result pairs source coordinates and an optional vector
+    or error. `include_content` independently controls payload inclusion;
+    video uses the original source and sampling recipe. `execute: false`
+    plans without executing the embedding model. `stream: true` delivers
+    bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+    terminal record must not be treated as complete source coverage.
+    Continuations bind the original source version and semantic plan;
+    retries may deterministically recompute and must deduplicate chunk IDs.
 
     ## Models
 
@@ -211,7 +289,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
+        InferenceChunkEmbeddingResponse | InferenceChunkResponse | InferenceError | InferenceTransientCapacityError
     """
 
     return (

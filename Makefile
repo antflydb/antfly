@@ -47,6 +47,7 @@ generate: graph-identifier-generate ## Regenerate openapi.yaml, Zig modules, SDK
 	$(SCRIPTS_PY) scripts/sync_rust_sdk_spec.py
 	$(MAKE) tidy
 	$(ZIG_MAKE) source-catalog-generate
+	$(ZIG_MAKE) engine-errors-generate
 	$(ZIG_MAKE) openapi-generate
 	$(call go_each,Generating in,$(GO) generate ./...)
 	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk generate

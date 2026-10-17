@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Geometry-qualified image cohorts and bounded audio-only cohorts. Loaded generation handles, encoded
+//! Geometry-qualified images, audio towers and prepared mixed/video cohorts. Loaded generation handles, encoded
 //! bytes/rasters, tokenizer and execution gate remain borrowed until submit
-//! drains. Mixed prompts keep their existing executor and error semantics.
+//! drains. Stage results never escape the admitted synchronous execution lane.
 const std = @import("std");
 const micro = @import("../server/executor_microbatch.zig");
 const grouped = @import("embedding_gemma2.zig");
@@ -63,12 +63,49 @@ pub fn shape(group: grouped.Group) !?micro.Shape {
     };
 }
 
+/// Header-only queue accounting. Video decode/index admission remains in the
+/// executor; callers already validated source policies and decoded-pixel limits.
+pub fn groupShape(group: grouped.Group) !micro.Shape {
+    var result = micro.Shape{ .tokens = 128 };
+    if (group.title) |title| result.bytes = title.len;
+    for (group.content) |part| switch (part) {
+        .text => |text| {
+            result.bytes = try std.math.add(usize, result.bytes, text.len);
+            result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, text.len));
+        },
+        .image, .raster => {
+            const item = (try shape(.{ .content = &.{part} })).?;
+            result.bytes = try std.math.add(usize, result.bytes, item.bytes);
+            result.pixels = try std.math.add(u64, result.pixels, item.pixels);
+            result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, item.tokens));
+        },
+        .audio => |bytes| {
+            result.bytes = try std.math.add(usize, result.bytes, bytes.len);
+            result.tokens = @min(@as(usize, 8192), result.tokens + 1024);
+        },
+        .pcm => |pcm| {
+            result.bytes = try std.math.add(usize, result.bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
+            result.tokens = @min(@as(usize, 8192), result.tokens + try projector.embeddingGemma2PcmSequenceLength(pcm.samples.len, pcm.sample_rate));
+        },
+        .video => |bytes| {
+            result.bytes = try std.math.add(usize, result.bytes, bytes.len);
+            result.tokens = 8192;
+        },
+        .sampled_video => |movie| {
+            result.bytes = try std.math.add(usize, result.bytes, if (movie.reader != null) 0 else movie.bytes.len);
+            result.tokens = 8192;
+        },
+    };
+    return result;
+}
+
 const Ticket = struct {
     session: Session,
     tokenizer: Tokenizer,
     gate: ?*std.atomic.Mutex,
     options: grouped.Options,
     part: grouped.Part,
+    group: ?grouped.Group = null,
     control: Control,
     input_tokens: usize,
 };
@@ -77,8 +114,16 @@ const Ticket = struct {
 /// A 200-us server default is bounded further by the broker's earliest deadline.
 pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, model: []const u8, generation: usize, session: Session, tokenizer: Tokenizer, gate: ?*std.atomic.Mutex, control: Control, groups: []const grouped.Group, options: grouped.Options, max_wait_us: u64, max_bytes: usize, max_pixels: u64, max_batch: usize) !?Result {
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return null;
-    const audio_mode = groups.len > 0 and groups[0].content.len == 1 and groups[0].content[0] == .audio;
-    if ((audio_mode and (!cfg.audio or !options.resident_audio)) or (!audio_mode and !cfg.vision) or options.timings != null or groups.len == 0 or !options.prepare_ahead or (session.backend() != .metal and session.backend() != .cuda)) return null;
+    if (options.timings != null or groups.len == 0 or !options.prepare_ahead or options.video_ahead != null or options.video_prepared != null or options.video_decoder.telemetry != null or (session.backend() != .native and session.backend() != .metal and session.backend() != .cuda)) return null;
+    var general = false;
+    for (groups) |group| {
+        grouped.validateGroup(group, options) catch return null;
+        if ((shape(group) catch return null) == null) general = true;
+        if (group.content.len != 1 or (groups[0].content.len == 1 and @backingInt(std.meta.activeTag(group.content[0])) != @backingInt(std.meta.activeTag(groups[0].content[0])))) general = true;
+    }
+    if (general and session.backend() == .cuda) return null;
+    const audio_mode = !general and groups[0].content.len == 1 and groups[0].content[0] == .audio;
+    if (!general and ((audio_mode and (!cfg.audio or !options.resident_audio)) or (!audio_mode and !cfg.vision))) return null;
     var capacity: usize = @min(@as(usize, 4), max_batch);
     if (capacity == 0) return error.InvalidImageBatch;
     try control.check();
@@ -93,25 +138,25 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     var largest_scratch: usize = 0;
     for (groups, 0..) |group, index| {
         grouped.validateGroup(group, options) catch return null;
-        shapes[index] = (shape(group) catch return null) orelse return null;
-        if ((group.content[0] == .audio) != audio_mode) return null;
+        shapes[index] = if (general) (groupShape(group) catch return null) else (shape(group) catch return null) orelse return null;
+        if (!general and (group.content[0] == .audio) != audio_mode) return null;
         const raw = group.content[0] == .raster;
         if (raster_mode) |mode| {
-            if (mode != raw) return null;
+            if (!general and mode != raw) return null;
         } else raster_mode = raw;
         const part = group.content[0];
         largest_input = @max(largest_input, shapes[index].bytes);
-        if (!audio_mode) {
+        if (!general and !audio_mode) {
             const info = if (raw) @import("image.zig").EncodedImageInfo{ .width = part.raster.width, .height = part.raster.height } else try @import("image.zig").inspectEncodedForInference(part.image, null);
             largest_scratch = @max(largest_scratch, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
         }
-        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = options, .part = part, .control = control, .input_tokens = shapes[index].tokens };
+        payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens };
         identities[index] = if (raw) .{ .item_id = part.raster.item_id, .source_fingerprint = part.raster.source_fingerprint, .page_number = part.raster.page_number } else .{};
     }
     // Plan against immutable policy limits without reserving GPU scratch.
     // A tighter policy decreases occupancy; an ineligible singleton retains
     // the original executor instead of making a previously valid call fail.
-    capacity = if (audio_mode) try fittingAudioCapacity(session, capacity, largest_input) else try fittingCapacity(session, capacity, largest_input, largest_scratch);
+    capacity = if (general) capacity else if (audio_mode) try fittingAudioCapacity(session, capacity, largest_input) else try fittingCapacity(session, capacity, largest_input, largest_scratch);
     if (capacity == 0) return null;
     const Probe = struct {
         fn canceled(ptr: *const anyopaque) bool {
@@ -121,7 +166,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         }
     };
     const shared = std.heap.smp_allocator;
-    const items = try broker.submitBatchControlled(Ticket, grouped.Result, io, shared, .{ .model = model, .generation = generation, .task = .embed, .schema = options.task_type, .option_key = @as(u64, @intCast(options.dimensions)) * 4 + @as(u64, @intFromBool(options.resident_images)) * 2 + @intFromBool(options.prepare_ahead), .transform = if (audio_mode) "gemma4-audio" else if (raster_mode.?) "gemma4-rgba" else "gemma4-encoded", .resource_class = if (session.backend() == .metal or session.backend() == .cuda) .gpu else .cpu }, .{ .mode = .native, .preferred_items = capacity, .max_items = capacity, .max_bytes = if (raster_mode.?) 512 * 1024 * 1024 else max_bytes, .max_pixels = max_pixels, .max_tokens = if (audio_mode) 4096 else 2048, .max_wait_us = max_wait_us }, shapes, identities, try deadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, broker, execute);
+    const items = try broker.submitBatchControlled(Ticket, grouped.Result, io, shared, .{ .model = model, .generation = generation, .task = .embed, .schema = options.task_type, .option_key = @as(u64, @intCast(options.dimensions)) * 64 + @as(u64, @backingInt(options.video_decoder.policy)) * 8 + @as(u64, @intFromBool(options.resident_audio)) * 4 + @as(u64, @intFromBool(options.resident_images)) * 2 + @intFromBool(options.prepare_ahead), .transform = if (general) "gemma4-prepared-groups" else if (audio_mode) "gemma4-audio" else if (raster_mode.?) "gemma4-rgba" else "gemma4-encoded", .resource_class = if (session.backend() == .metal or session.backend() == .cuda) .gpu else .cpu }, .{ .mode = .native, .preferred_items = capacity, .max_items = capacity, .max_bytes = if (!general and raster_mode.?) 512 * 1024 * 1024 else max_bytes, .max_pixels = max_pixels, .max_tokens = if (general) 4 * 8192 else if (audio_mode) 4096 else 2048, .max_wait_us = max_wait_us }, shapes, identities, try deadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, broker, execute);
     defer {
         for (items) |item| switch (item.result) {
             .value => |value| shared.free(value.vector),
@@ -182,7 +227,7 @@ fn execute(_: *anyopaque, items: []const micro.ExecuteItem) void {
 fn executeChecked(items: []const micro.ExecuteItem) !void {
     if (items.len == 0 or items.len > 4) return error.InvalidImageBatch;
     const first = items[0].payloadAs(Ticket);
-    if (first.part != .audio and @import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_IMAGE_BROKER_TRACE")) {
+    if (first.group == null and first.part != .audio and @import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_IMAGE_BROKER_TRACE")) {
         const geometry = (try shape(.{ .content = &.{first.part} })).?.geometry_key;
         std.debug.print("gemma4-image-cohort items={d} geometry={d}\n", .{ items.len, geometry });
     }
@@ -200,7 +245,39 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
     var errors: [4]?anyerror = @splat(null);
     var counts: [4]usize = undefined;
     for (items, 0..) |item, index| counts[index] = item.payloadAs(Ticket).input_tokens;
-    const batch: grouped.RasterBatchResult = if (first.part == .audio) blk: {
+    const batch: grouped.RasterBatchResult = if (first.group != null) blk: {
+        var groups: [4]grouped.Group = undefined;
+        for (items, 0..) |item, index| groups[index] = item.payloadAs(Ticket).group.?;
+        const result = grouped.embedGroupCohort(shared, first.session, first.tokenizer, groups[0..items.len], first.options, first.gate, control, errors[0..items.len]) catch |err| {
+            // Stage owners have fully drained before pressure falls back. A
+            // valid singleton must not fail solely because a cohort is larger.
+            if (err != error.BatchIncompatible and err != error.MemoryBudgetExceeded and err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+            const vectors = try shared.alloc([]f32, items.len);
+            @memset(vectors, &.{});
+            errdefer {
+                for (vectors) |vector| shared.free(vector);
+                shared.free(vectors);
+            }
+            @memset(errors[0..items.len], null);
+            for (items, groups[0..items.len], 0..) |item, group, index| {
+                item.control.check() catch |failure| {
+                    errors[index] = failure;
+                    continue;
+                };
+                const singleton = grouped.embed(shared, first.session, first.tokenizer, group, first.options, first.gate, control) catch |failure| {
+                    errors[index] = failure;
+                    continue;
+                };
+                vectors[index] = singleton.vector;
+                counts[index] = singleton.input_tokens;
+            }
+            break :blk .{ .vectors = vectors, .execution = .fallback };
+        };
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-cohort items={d} execution={s}\n", .{ items.len, @tagName(result.execution) });
+        defer shared.free(result.input_tokens);
+        @memcpy(counts[0..items.len], result.input_tokens);
+        break :blk .{ .vectors = result.vectors, .execution = result.execution };
+    } else if (first.part == .audio) blk: {
         var clips: [4]@import("audio_preparation.zig").Clip = undefined;
         for (items, 0..) |item, index| clips[index] = .{ .bytes = item.payloadAs(Ticket).part.audio };
         const result = try grouped.embedAudios(shared, first.session, first.tokenizer, clips[0..items.len], first.options, first.gate, control, errors[0..items.len]);
@@ -281,4 +358,22 @@ test "gemma4 audio broker bounds unknown lengths and rejects mixed modalities" {
     try std.testing.expectEqual(@as(usize, 1024), value.tokens);
     try std.testing.expectEqual(@as(usize, 7), value.bytes);
     try std.testing.expect(try shape(.{ .content = &.{ .{ .text = "query" }, .{ .audio = "encoded" } } }) == null);
+}
+
+test "embeddinggemma2 prepared broker accounts mixed and video groups before decoding" {
+    const pixels: [16]u8 = @splat(0);
+    const pcm: [321]f32 = @splat(0);
+    const group = grouped.Group{ .title = "title", .content = &.{
+        .{ .text = "caption" },
+        .{ .raster = .{ .bytes = &pixels, .width = 2, .height = 2, .stride_bytes = 8, .format = .rgba8 } },
+        .{ .pcm = .{ .samples = &pcm, .sample_rate = 16000 } },
+    } };
+    const header = try groupShape(group);
+    try std.testing.expectEqual(@as(usize, 5 + 7 + 16 + 321 * 4), header.bytes);
+    try std.testing.expectEqual(@as(u64, 4), header.pixels);
+    try std.testing.expect(header.tokens <= 8192);
+    // Invalid coded payloads have not entered decode or acquired device scratch.
+    const video = try groupShape(.{ .content = &.{ .{ .video = "coded bytes" }, .{ .text = "caption" } } });
+    try std.testing.expectEqual(@as(usize, 8192), video.tokens);
+    try std.testing.expectEqual(@as(usize, 18), video.bytes);
 }

@@ -107,6 +107,7 @@ pub fn decodeInterleavedPacketizedAlloc(
     defer samples.deinit(allocator);
 
     for (access_units, 0..) |packet, packet_index| {
+        try @import("work_control.zig").check();
         _ = packet_index;
         const decoded = try decodeFrameAlloc(allocator, cookie, packet);
         defer allocator.free(decoded);
@@ -122,6 +123,20 @@ pub fn decodeInterleavedPacketizedAlloc(
         .channels = @intCast(cookie.channels),
         .allocator = allocator,
     };
+}
+
+pub fn visitPacketized(allocator: std.mem.Allocator, decoder_config: []const u8, units: []const []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    const cookie = try parseMagicCookie(decoder_config);
+    if (cookie.bit_depth == 0 or cookie.bit_depth > 24 or cookie.channels == 0 or cookie.channels > 2) return error.UnsupportedAudioFormat;
+    for (units) |packet| {
+        try @import("work_control.zig").check();
+        const decoded = try decodeFrameAlloc(allocator, cookie, packet);
+        defer allocator.free(decoded);
+        const pcm = try allocator.alloc(f32, decoded.len);
+        defer allocator.free(pcm);
+        for (decoded, pcm) |sample, *out| out.* = @as(f32, @floatFromInt(sample)) / alacScaleForBitDepth(cookie.bit_depth);
+        try sink.push(pcm, cookie.sample_rate, cookie.channels);
+    }
 }
 
 pub fn extractMagicCookieFromMp4DecoderConfig(bytes: []const u8) ![]const u8 {

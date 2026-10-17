@@ -1,0 +1,18 @@
+{
+  "source": "CC BY 3.0 Sintel by Blender Foundation / durian.blender.org",
+  "source_sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254",
+  "derived_stream_sha256": "696d5305cb89b7b7a0d23873ad13b39bba71fecf168c79316dc7eed9c661ce97",
+  "modifications": "VP8 SDR transcode and stream-copy of six pictures beginning at second 30; full transcode recipe in benchmark corpus manifest",
+  "fixture_sha256": "e154bb49bd0ee5fd90526fbf05f4153cf512fbecbc2210439286c73698027db3",
+  "width": 854,
+  "height": 480,
+  "picture_sha256": [
+    "b76e544bc24185c212ebfe68fe2b750ad10b13082cf1090eac889f2a153a0ac3",
+    "66436d34073b01c468c6b6defa5f5e5da349deec9bfe31625584675f5031ed32",
+    "f0e21952d82964b57371bde7f51f7d1ac0aa40e85e190b31481c5972af2cbe88",
+    "465b53ea15ae0bab00a270c3871273c257395293112e345344af1a4a6d1e672c",
+    "574283c98b10d5abdfc9ee1bf273dd8bc5908594d9515d81874ff2f41e97f46c",
+    "71447df84dd300e6ed32b32fa44b531cda4e4aec4e6dad00416339258f5befc2"
+  ],
+  "oracle": "FFmpeg 9.0.2 independent VP8 decode + NV12 visible picture SHA-256; original frame 722 also agrees with libvpx decode"
+}

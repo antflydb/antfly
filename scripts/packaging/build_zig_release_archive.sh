@@ -278,7 +278,7 @@ run_zig_build_steps_with_retry() {
   case "$target:$optimize" in
     aarch64-linux-musl:small | \
     aarch64-linux-musl:fast | \
-    aarch64-macos:fast) ;;
+    aarch64-macos*:fast) ;;
     *) return "$status" ;;
   esac
   if ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"; then

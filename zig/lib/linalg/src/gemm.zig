@@ -40,8 +40,8 @@ const primitives = @import("primitives.zig");
 
 const vec_len = primitives.vec_len;
 
-/// Register-tile dimensions for the inner SGEMM kernels.  Both
-/// `sgemmTransBAddSlice` and `sgemmAddSlice` consume MR×NR vector
+/// Register-tile dimensions for ordinary SGEMM.
+/// `sgemmAddSlice` consumes MR×NR vector
 /// accumulators kept live across the K-loop; bigger tiles fill more of the
 /// FMA pipeline (4-cycle latency on x86, ≥ 8 in-flight FMAs needed to
 /// saturate two FMA pipes), at the cost of more vector registers.
@@ -80,9 +80,15 @@ pub const sgemm_tile: SgemmTile = blk: {
     break :blk .{ .MR = 4, .NR = 2 };
 };
 
-/// Multiply C in-place by beta.  Inline because it sits at the top of every
-/// public SGEMM entry point and beta=1.0 (the common case for GEMV
-/// accumulation) short-circuits to nothing.
+/// Transposed dot-product tiles retain all A and B vectors alongside the
+/// accumulators. Four-wide ARM64 vectors fit 16 accumulators plus eight
+/// input vectors within NEON's register file. Paired shape measurements
+/// qualify this separately from ordinary GEMM's wider output vectors.
+pub const transb_vector_width: usize = if (builtin.cpu.arch == .aarch64) 4 else vec_len;
+pub const transb_tile: SgemmTile = if (builtin.cpu.arch == .aarch64) .{ .MR = 4, .NR = 4 } else sgemm_tile;
+
+/// Multiply C in-place by beta. Inline because it sits at every SGEMM entry;
+/// beta=1.0 short-circuits to nothing.
 pub inline fn applyBeta(c_out: []f32, beta: f32) void {
     if (beta == 1.0) return;
     if (beta == 0.0) {
@@ -262,8 +268,16 @@ inline fn loadBScalarAsF32(comptime BT: type, b: []const BT, offset: usize) f32 
     return @floatCast(b[offset]);
 }
 
-fn sgemmTransBAddSliceGeneric(
+fn sgemmTransBAddSliceGeneric(comptime BT: type, m_start: usize, m_end: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const BT, c_out: []f32) void {
+    sgemmTransBAddSliceTiled(BT, transb_vector_width, transb_tile.MR, transb_tile.NR, m_start, m_end, n, k, alpha, a, b, c_out);
+}
+
+/// Register-tile arithmetic shared by production dispatch and qualification.
+pub fn sgemmTransBAddSliceTiled(
     comptime BT: type,
+    comptime V: usize,
+    comptime MR: usize,
+    comptime NR: usize,
     m_start: usize,
     m_end: usize,
     n: usize,
@@ -273,11 +287,7 @@ fn sgemmTransBAddSliceGeneric(
     b: []const BT,
     c_out: []f32,
 ) void {
-    const V = vec_len;
     const Vec = @Vector(V, f32);
-    const MR = sgemm_tile.MR;
-    const NR = sgemm_tile.NR;
-
     const m_main = m_start + ((m_end - m_start) / MR) * MR;
     var j: usize = 0;
     while (j + NR <= n) : (j += NR) {
@@ -480,4 +490,35 @@ pub fn sgemmSequential(
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     sgemmAddSlice(0, m, n, k, alpha, a, b, c_out);
+}
+
+test "transposed GEMM candidate tiles match independent F64 across tails and row slices" {
+    const alloc = std.testing.allocator;
+    var random = std.Random.DefaultPrng.init(95703);
+    inline for (.{ f32, f16 }) |BT| {
+        for ([_][3]usize{ .{ 7, 11, 5 }, .{ 64, 256, 64 }, .{ 63, 35, 257 }, .{ 17, 19, 65 }, .{ 64, 118, 64 } }) |shape| {
+            const m, const n, const k = .{ shape[0], shape[1], shape[2] };
+            const a = try alloc.alloc(f32, m * k);
+            defer alloc.free(a);
+            const b = try alloc.alloc(BT, n * k);
+            defer alloc.free(b);
+            const c = try alloc.alloc(f32, m * n);
+            defer alloc.free(c);
+            for (a) |*v| v.* = random.random().float(f32) - 0.5;
+            for (b) |*v| v.* = @floatCast(random.random().float(f32) - 0.5);
+            inline for (.{ .{ 8, 6, 2 }, .{ 4, 4, 4 }, .{ 4, 4, 3 } }) |tile| {
+                @memset(c, 0.375);
+                sgemmTransBAddSliceTiled(BT, tile[0], tile[1], tile[2], 1, m - 1, n, k, -0.75, a, b, c);
+                for (0..m) |row| for (0..n) |col| {
+                    var expected: f64 = 0.375;
+                    if (row != 0 and row != m - 1) {
+                        var dot: f64 = 0;
+                        for (0..k) |inner| dot += @as(f64, a[row * k + inner]) * @as(f64, b[col * k + inner]);
+                        expected += -0.75 * dot;
+                    }
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), c[row * n + col], 2e-5);
+                };
+            }
+        }
+    }
 }

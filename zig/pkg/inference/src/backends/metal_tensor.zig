@@ -876,6 +876,12 @@ pub const MetalTensor = struct {
         return 0;
     }
 
+    /// Physical allocation retained by a view, for lifetime admission.
+    pub fn retainedAllocationBytes(self: *const MetalTensor) usize {
+        if (self.device) |d| return d.ref.byte_len;
+        return self.len * @sizeOf(f32);
+    }
+
     pub fn deviceByteLen(self: *const MetalTensor) usize {
         if (self.device) |d| return d.byte_len;
         return self.len * @sizeOf(f32);

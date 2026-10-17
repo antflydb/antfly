@@ -140,7 +140,7 @@ pub const Wave = struct {
             for (self.clips, 0..) |clip, index| {
                 try self.control.check();
                 self.allocation_exceeded_budget = false;
-                self.gemma[self.retained] = (if (clip.pcm) |pcm| projector.prepareEmbeddingGemma2AudioPcm(self.allocator(), pcm) else projector.prepareEmbeddingGemma2Audio(self.allocator(), clip.bytes, clip.decode_options)) catch |err| {
+                self.gemma[self.retained] = (if (clip.pcm) |pcm| projector.prepareEmbeddingGemma2AudioPcmWithPacking(self.allocator(), pcm, self.session.backend() != .native) else projector.prepareEmbeddingGemma2AudioWithPacking(self.allocator(), clip.bytes, clip.decode_options, self.session.backend() != .native)) catch |err| {
                     // Retained clips may occupy the space needed to decode the
                     // next one. Finish this wave without consuming that clip;
                     // the owner retries it after releasing the current wave.

@@ -1,0 +1,15 @@
+{
+  "path": "../configuration-compaction-validation/sintel-avc3.mp4",
+  "sha256": "a664d4fec33430d4402568ec7236c178aa2be744d9d43a1748e8a1a80a60f1fa",
+  "source_sha256": "5c6b29872ef18dc0145ad2bd90d26ec33a232fd55afba0cb9b8784bdaef2b694",
+  "init_end": 1011,
+  "fragment_ends": [
+    5339,
+    7692,
+    14675,
+    22970,
+    28859,
+    35846
+  ],
+  "provenance": "Offline FFmpeg packet copy through h264_mp4toannexb and fragmented avc3 MP4 muxing; original encoded pictures/queries, repeated inline SPS/PPS on IDRs; trailing mfra removed."
+}

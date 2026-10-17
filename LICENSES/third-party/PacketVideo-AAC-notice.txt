@@ -1,0 +1,2 @@
+Copyright (C) 1998-2009 PacketVideo. Apache-2.0.
+Copyright (c) 2005-2008, The Android Open Source Project.

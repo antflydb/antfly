@@ -76,7 +76,7 @@ const tone_ogg_bytes = @embedFile("testdata/codec-corpus/tone-stereo.ogg");
 const tone_opus_bytes = @embedFile("testdata/codec-corpus/tone-stereo.opus");
 const tone_flac_bytes = @embedFile("testdata/codec-corpus/tone-stereo.flac");
 
-pub const checked_in_cases: [58]OpenCorpusCodecCase = inference_audio.conformance.buildCheckedInCodecCases(inference_audio.EncodedFormat, .{
+pub const checked_in_cases: [63]OpenCorpusCodecCase = inference_audio.conformance.buildCheckedInCodecCases(inference_audio.EncodedFormat, .{
     .tone_aac_bytes = tone_aac_bytes,
     .tone_aac_44k_mono_bytes = tone_aac_44k_mono_bytes,
     .transient_aac_44k_pns_bytes = transient_aac_44k_pns_bytes,

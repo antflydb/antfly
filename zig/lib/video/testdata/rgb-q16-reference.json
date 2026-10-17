@@ -1,0 +1,9 @@
+{
+  "generator_sha256": "f2cbd0ca2bf8b6611334f75346689cb57628630e7232b467a3df06d19f704559",
+  "width": 26,
+  "height": 16,
+  "input_sha256": "629a0f300134c204701c530c3d3ece110c1a37292fce54ff7f427b996824a026",
+  "output_sha256": "c87ddca7642940a4615f66921e80db6599dedf48ebe242d10bda47a4d925e1ea",
+  "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "policy": "default RGB24 from non-vector-aligned planar 8-bit rows; matrix/range explicit"
+}

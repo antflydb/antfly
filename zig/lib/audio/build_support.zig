@@ -34,6 +34,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) [2]*std.Bui
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, lib_audio_xiph_conformance.root_module, options.root.path(b, "../media"));
     lib_audio_xiph_conformance.root_module.link_libc = true;
 
     const lib_audio_misc_conformance = b.addExecutable(.{
@@ -44,6 +45,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) [2]*std.Bui
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, lib_audio_misc_conformance.root_module, options.root.path(b, "../media"));
     lib_audio_misc_conformance.root_module.link_libc = true;
 
     const run_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);

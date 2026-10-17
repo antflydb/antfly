@@ -754,6 +754,138 @@ fn allocRemainingBounded(reader: *std.Io.Reader, alloc: Allocator, max_size: usi
     return data;
 }
 
+/// Version-pinned range transport under the same URI, DNS and credential
+/// boundaries as ordinary downloads. No redirects or mutable-object fallback.
+pub const PinnedRange = struct {
+    pub const VersionKind = enum { strong_etag, s3_version_id };
+    allocator: Allocator,
+    context: DownloadContext,
+    security: ?*const ContentSecurityConfig,
+    uri: []u8 = &.{},
+    version: []u8 = &.{},
+    identity: []u8 = &.{},
+    kind: VersionKind,
+    length: u64,
+    bucket: []u8 = &.{},
+    key: []u8 = &.{},
+    backend: ?union(enum) { http: httpx.Client, s3: objectstore.S3.Client } = null,
+    headers: []const HTTPHeader = &.{},
+
+    pub fn create(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader) !*PinnedRange {
+        try context.check();
+        if (length == 0 or version.len == 0 or version.len > 4096 or uri.len > 16 * 1024 or headers.len > 128) return error.InvalidSourceReference;
+        if (kind == .strong_etag) {
+            if (version.len < 2 or version[0] != '"' or version[version.len - 1] != '"') return error.ImmutableVersionRequired;
+            for (version[1 .. version.len - 1]) |byte| if (byte < 0x21 or byte == 0x22 or byte == 0x7f) return error.ImmutableVersionRequired;
+        } else if (std.mem.eql(u8, version, "null")) return error.ImmutableVersionRequired;
+        const parsed = try std.Uri.parse(uri);
+        if (parsed.user != null or parsed.password != null or parsed.fragment != null) return error.InvalidSourceReference;
+        const self = try alloc.create(PinnedRange);
+        self.* = .{ .allocator = alloc, .context = context, .security = security, .kind = kind, .length = length, .headers = headers };
+        errdefer self.destroy();
+        self.uri = try alloc.dupe(u8, uri);
+        self.version = try alloc.dupe(u8, version);
+        if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
+            if (kind != .strong_etag) return error.InvalidSourceReference;
+            try validateHttpUri(parsed);
+            try validateUrlSecurity(parsed, security);
+            self.identity = try alloc.dupe(u8, uri);
+            for (headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "Range") or std.ascii.eqlIgnoreCase(header.name, "If-Match") or std.ascii.eqlIgnoreCase(header.name, "Accept-Encoding")) return error.InvalidSourceReference;
+                if (header.credential_base_url) |base| if (!httpUrlMatchesBase(parsed, base)) return error.CredentialUrlMismatch;
+            }
+            self.backend = .{ .http = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security)) };
+        } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
+            if (headers.len != 0) return error.InvalidSourceReference;
+            const cfg = credentials orelse return error.MissingS3Credentials;
+            var endpoint = try objectstore.resolveS3EndpointAlloc(alloc, cfg.endpoint orelse return error.MissingEndpoint, cfg.use_ssl orelse true);
+            defer endpoint.deinit(alloc);
+            const bucket, const key = try parseS3LocationAlloc(alloc, parsed, endpoint.endpoint, endpoint.use_ssl);
+            self.bucket = bucket;
+            self.key = key;
+            self.identity = try std.fmt.allocPrint(alloc, "s3:{s}:{s}:{s}/{s}", .{ if (endpoint.use_ssl) "https" else "http", endpoint.endpoint, bucket, key });
+            const joined = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ bucket, key });
+            defer alloc.free(joined);
+            try validateS3PathSecurity(joined, security);
+            var owned = try allocS3Credentials(alloc, endpoint.endpoint, endpoint.use_ssl, cfg);
+            const client = objectstore.S3.Client.initWithHttpContext(alloc, .{ .credentials = owned, .addressing_style = .path }, .{ .io = context.io, .timeout_ms = context.timeout_ms, .client_config = httpClientConfig(security) }) catch |err| {
+                owned.deinit(alloc);
+                return err;
+            };
+            self.backend = .{ .s3 = client };
+        } else return error.UnsupportedUrlScheme;
+        return self;
+    }
+    pub fn destroy(self: *PinnedRange) void {
+        if (self.backend) |*backend| switch (backend.*) {
+            .http => |*client| client.deinit(),
+            .s3 => |*client| client.deinit(),
+        };
+        const a = self.allocator;
+        a.free(self.uri);
+        a.free(self.version);
+        a.free(self.identity);
+        a.free(self.bucket);
+        a.free(self.key);
+        a.destroy(self);
+    }
+    pub fn readAt(self: *PinnedRange, offset: u64, out: []u8) !usize {
+        try self.context.check();
+        if (offset > self.length or out.len == 0 or out.len > self.length - offset) return error.InvalidRemoteRange;
+        if (out.len > maxDownloadSize(self.security)) return error.StreamTooLong;
+        const ceiling = try DownloadCeiling.init(self.context, self.security);
+        switch (self.backend.?) {
+            .http => |*client| {
+                const headers = try self.allocator.alloc([2][]const u8, self.headers.len + 3);
+                defer self.allocator.free(headers);
+                var range: [96]u8 = undefined;
+                headers[0] = .{ "Range", try std.fmt.bufPrint(&range, "bytes={d}-{d}", .{ offset, offset + out.len - 1 }) };
+                headers[1] = .{ "If-Match", self.version };
+                headers[2] = .{ "Accept-Encoding", "identity" };
+                for (self.headers, headers[3..]) |header, *dest| dest.* = .{ header.name, header.value };
+                var response = try client.get(self.uri, .{ .headers = headers, .max_response_size = out.len, .follow_redirects = false, .max_retries = 0, .cookies_enabled = false, .timeout_ms = try ceiling.remainingTimeoutMs(), .cancellation = if (self.context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null });
+                defer response.deinit();
+                try self.context.check();
+                if (response.status.code == 412) return error.SourceVersionChanged;
+                if (response.status.code != 206) return error.InvalidRemoteRange;
+                if (!std.mem.eql(u8, response.header("ETag") orelse return error.SourceVersionChanged, self.version)) return error.SourceVersionChanged;
+                if (response.header("Content-Encoding")) |encoding| if (!std.ascii.eqlIgnoreCase(encoding, "identity")) return error.InvalidRemoteRange;
+                const body = response.body orelse return error.InvalidRemoteRange;
+                if (body.len != out.len) return error.InvalidRemoteRange;
+                try validatePinnedContentRange(response.header("Content-Range") orelse return error.InvalidRemoteRange, offset, out.len, self.length);
+                @memcpy(out, body);
+            },
+            .s3 => |*client| {
+                var store = client.client();
+                var result = try store.getObject(self.bucket, self.key, .{ .version_id = if (self.kind == .s3_version_id) self.version else null, .if_match_etag = if (self.kind == .strong_etag) self.version else null, .range = .{ .offset = offset, .length = out.len }, .skip_metadata_probe = true, .max_response_bytes = out.len, .cancellation = self.context.cancellation });
+                defer result.deinit(self.allocator);
+                try self.context.check();
+                const range = result.response_range orelse return error.InvalidRemoteRange;
+                if (result.response_status != 206 or range.offset != offset or range.total != self.length or range.length != out.len or result.body.len != out.len) return error.InvalidRemoteRange;
+                if (self.kind == .strong_etag) {
+                    if (!result.response_etag_strong) return error.SourceVersionChanged;
+                    const etag = result.metadata.etag orelse return error.SourceVersionChanged;
+                    const normalized = if (etag.len >= 2 and etag[0] == '"' and etag[etag.len - 1] == '"') etag[1 .. etag.len - 1] else etag;
+                    if (!std.mem.eql(u8, normalized, self.version[1 .. self.version.len - 1])) return error.SourceVersionChanged;
+                } else if (!std.mem.eql(u8, result.metadata.version_id orelse return error.SourceVersionChanged, self.version)) return error.SourceVersionChanged;
+                @memcpy(out, result.body);
+            },
+        }
+        return out.len;
+    }
+};
+fn validatePinnedContentRange(value: []const u8, offset: u64, length: usize, total: u64) !void {
+    if (!std.mem.startsWith(u8, value, "bytes ")) return error.InvalidRemoteRange;
+    var parts = std.mem.splitScalar(u8, value[6..], '/');
+    const endpoints = parts.next() orelse return error.InvalidRemoteRange;
+    const wire_total = std.fmt.parseInt(u64, parts.next() orelse return error.InvalidRemoteRange, 10) catch return error.InvalidRemoteRange;
+    if (parts.next() != null or wire_total != total) return error.InvalidRemoteRange;
+    var range = std.mem.splitScalar(u8, endpoints, '-');
+    const first = std.fmt.parseInt(u64, range.next().?, 10) catch return error.InvalidRemoteRange;
+    const last = std.fmt.parseInt(u64, range.next() orelse return error.InvalidRemoteRange, 10) catch return error.InvalidRemoteRange;
+    if (range.next() != null or first != offset or last < first or last >= total or last - first + 1 != length) return error.InvalidRemoteRange;
+}
+
 fn downloadS3Alloc(
     alloc: Allocator,
     maybe_context: ?DownloadContext,
@@ -1858,6 +1990,8 @@ const TestHttpResponseServer = struct {
     server: *std.Io.net.Server,
     body: []const u8,
     content_encoding: ?[]const u8,
+    status_code: u16 = 200,
+    extra_headers: []const u8 = "",
     failure: ?anyerror = null,
 
     fn serve(self: *@This()) void {
@@ -1881,10 +2015,9 @@ const TestHttpResponseServer = struct {
 
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(self.io, &write_buffer);
-        writer.interface.writeAll(
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: text/plain; charset=utf-8\r\n" ++
-                "Connection: close\r\n",
+        writer.interface.print(
+            "HTTP/1.1 {d} OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n{s}",
+            .{ self.status_code, self.extra_headers },
         ) catch |err| {
             self.failure = err;
             return;
@@ -1982,4 +2115,40 @@ test "HTTP download enforces its size limit on decoded bytes" {
         error.StreamTooLong,
         downloadTestHttpResponseAlloc(alloc, &gzip, "gzip", 41),
     );
+}
+
+test "pinned remote ranges enforce immutable length and version without whole object fallback" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cases = [_]struct { status: u16, headers: []const u8, expected: ?anyerror }{
+        .{ .status = 206, .headers = "ETag: \"v1\"\r\nContent-Range: bytes 2-5/10\r\n", .expected = null },
+        .{ .status = 206, .headers = "ETag: \"v2\"\r\nContent-Range: bytes 2-5/10\r\n", .expected = error.SourceVersionChanged },
+        .{ .status = 206, .headers = "ETag: \"v1\"\r\nContent-Range: bytes 2-5/11\r\n", .expected = error.InvalidRemoteRange },
+        .{ .status = 200, .headers = "ETag: \"v1\"\r\n", .expected = error.InvalidRemoteRange },
+        .{ .status = 412, .headers = "", .expected = error.SourceVersionChanged },
+    };
+    for (cases) |case| {
+        var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+        var open = true;
+        defer if (open) server.deinit(io);
+        var fixture = TestHttpResponseServer{ .io = io, .server = &server, .body = "2345", .content_encoding = null, .status_code = case.status, .extra_headers = case.headers };
+        const uri = try std.fmt.allocPrint(a, "http://{f}/blob", .{server.socket.address});
+        defer a.free(uri);
+        var security = ContentSecurityConfig{ .block_private_ips = false };
+        const range = try PinnedRange.create(a, .{ .io = io }, uri, "\"v1\"", .strong_etag, 10, &security, null, &.{});
+        defer range.destroy();
+        var thread = try std.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
+        var out: [4]u8 = undefined;
+        const result = range.readAt(2, &out);
+        server.deinit(io);
+        open = false;
+        thread.await(std.testing.io);
+        if (fixture.failure) |err| return err;
+        if (case.expected) |err| try std.testing.expectError(err, result) else {
+            try std.testing.expectEqual(@as(usize, 4), try result);
+            try std.testing.expectEqualStrings("2345", &out);
+        }
+    }
 }

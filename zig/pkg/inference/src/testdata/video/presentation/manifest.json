@@ -1,0 +1,69 @@
+{
+  "generator_sha256": "c0580f84842afa9e808d8ae53c9557ea2de0c9367360990388bbca35c9bdb14f",
+  "scope": "Add presentation declarations without re-encoding synthetic WebM fixtures.\n\nSeekHead/Cues are removed because their segment-relative byte positions change.\nCompressed Cluster payloads are preserved byte for byte. No codec dependency.\n",
+  "cases": {
+    "vp9-crop-roll": {
+      "source": "zig/pkg/inference/src/testdata/video/vp9.webm",
+      "source_sha256": "2e0d62c79b2218cae6176456b718e0fe720456d9f3e341d57279307ccd6a190a",
+      "path": "vp9-crop-roll.webm",
+      "sha256": "9b9c16391516a02ef84b04acaebb137a1b2cab533ea123bea9b8bbd3a95c47d0",
+      "policy": {
+        "crop": [
+          1,
+          3,
+          5,
+          7
+        ],
+        "display": [
+          16,
+          9
+        ],
+        "roll": 90
+      },
+      "cluster_sha256": [
+        "f2132f1f5f350bcade4b86f2e57872ae35b6d4928a4af3d6b55c1b328c777c25",
+        "61d0f37a7a467f185beb4e730486ba403f7176339a07dde37dc9c2a5bd7960c6"
+      ]
+    },
+    "av1-crop-roll": {
+      "source": "zig/pkg/inference/src/testdata/video/av1.webm",
+      "source_sha256": "ea8e68c7029ac3e3361795eff2e351660d5cf9713094c8cf044a4178dbc89614",
+      "path": "av1-crop-roll.webm",
+      "sha256": "d4e6529a3f587b343b33d4f9d9c83b034fb55929b092cfc1f9a0667652c96321",
+      "policy": {
+        "crop": [
+          1,
+          3,
+          5,
+          7
+        ],
+        "display": [
+          16,
+          9
+        ],
+        "roll": -90
+      },
+      "cluster_sha256": [
+        "a3d20c073a9717d8735734e955fc4a4adfa4b5f5fee2e809cca4519540161777",
+        "5564eea7abd222992fff20de79858a1c05a321a9b77d55a082b3726847e60ebf"
+      ]
+    },
+    "vp8-colour": {
+      "source": "zig/pkg/inference/src/testdata/video/vp8.webm",
+      "source_sha256": "ef29c5a11930ece81cd00e4cf59c6ae088e6ecc62b44e7400e2f13ceab2e9b56",
+      "path": "vp8-colour.webm",
+      "sha256": "3217c23bdf4730b72df31ca3934410ae89dae9ea8e72d3a3b35d86ee64f16d82",
+      "policy": {
+        "colour": {
+          "matrix": 1,
+          "transfer": 1,
+          "primaries": 1,
+          "range": 2
+        }
+      },
+      "cluster_sha256": [
+        "8fa822878d45db068aa6b4c26f3b8690a72d274194754f7c2121bc00e3e7dfd3"
+      ]
+    }
+  }
+}

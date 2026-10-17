@@ -1,0 +1,15 @@
+{
+  "oracle": "official JM 19.0 decoder; encoder output is not the oracle",
+  "source_sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254",
+  "source_clock_seconds": 12,
+  "mp4_sha256": "ebc12d42ed5706080e75df7a4075c4ed41c48ef1c2cb0b82802e8312fab07704",
+  "elementary_sha256": "776b8eecd91e57f1590348510c58a7805e12f95f3db0a8f477dd29ca670094a7",
+  "bit_depth": 8,
+  "chroma_format": 1,
+  "frames": [
+    "e973638ff9802d34123c1d458631489e1aa6e72c48454ec4095f05d7555a05c8",
+    "80fef8772f19db5fb5d7d2307deaa26b02819a5b06e2a840274fa87c56ded52c",
+    "ea151e79417e66b275e39a503d08c1bb64a582c2f238ebae540cf19ad9132fc8",
+    "f4bb8d055c65ea53d85ede585da0499f520f0c932a95cde54851343a447fc6c8"
+  ]
+}

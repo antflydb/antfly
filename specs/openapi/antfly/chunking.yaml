@@ -67,6 +67,10 @@ components:
               $ref: "../shared/chunking.yaml#/components/schemas/TextChunkOptions"
             audio:
               $ref: "../shared/chunking.yaml#/components/schemas/AudioChunkOptions"
+            embedding:
+              $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTarget'
+            policy:
+              $ref: '../shared/chunking.yaml#/components/schemas/MediaChunkPolicy'
           required:
             - provider
       example:

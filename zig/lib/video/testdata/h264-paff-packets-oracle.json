@@ -1,0 +1,274 @@
+{
+  "cases": [
+    {
+      "name": "h264-paff-split-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "fe907eb6ef9bc191cfe197f4175d7abc9b5087db821ec46e9c63727d7ac6f55e",
+      "nv12_sha256": "1f42ae9110110213e81b77b939f449e057bf8ecc15557b6cb3c1363ccbfd885f"
+    },
+    {
+      "name": "h264-paff-long-paired-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": false,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "0310817012118357cba7b25977d39e90588b56da9097913f7b4d1a7037504485",
+      "nv12_sha256": "7697c7902b85be539d44382f5372765d9edcae4a6a73ebafdb5ba57cd9e2d4b4"
+    },
+    {
+      "name": "h264-paff-long-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "afde89f221b76b6d6a10844afa4f45b2fda4145b779001d681035972f41d1b61",
+      "nv12_sha256": "7697c7902b85be539d44382f5372765d9edcae4a6a73ebafdb5ba57cd9e2d4b4"
+    },
+    {
+      "name": "h264-paff-adaptive-paired-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": false,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "67912b1a50e1c6248d9bc8c657b2993813150f2b72da7551b5ac825117900f03",
+      "nv12_sha256": "6f51d410b19d6eb3814c6371dc7e2fe31daf696436f5ed7aa94fd7de05d7c17f"
+    },
+    {
+      "name": "h264-paff-adaptive-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "9461910f8b55ece42054ec89e1fa4d4d9ca169e46299250e76a1732090b43b50",
+      "nv12_sha256": "6f51d410b19d6eb3814c6371dc7e2fe31daf696436f5ed7aa94fd7de05d7c17f"
+    },
+    {
+      "name": "h264-paff-cabac-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "672c17eaa9cac096b006c38e4f99823249d1ce3701af07a983749a4ab08ba967",
+      "nv12_sha256": "c2c4db4a8d55e4e51a4089930f0f5cbb0ce80adad6abbe7c5a0bf7a313c140ae"
+    },
+    {
+      "name": "h264-paff-bottom-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "bf68273387b18a0a0bbb55622ea27d9ff569d1218711de7b02eecbe3242048b9",
+      "nv12_sha256": "c2c4db4a8d55e4e51a4089930f0f5cbb0ce80adad6abbe7c5a0bf7a313c140ae"
+    },
+    {
+      "name": "h264-paff-idr-long-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "99ceee6e979e34930b27b11d56431205f633b81f278a862fceccd1ebd9aeeb20",
+      "nv12_sha256": "c2c4db4a8d55e4e51a4089930f0f5cbb0ce80adad6abbe7c5a0bf7a313c140ae"
+    },
+    {
+      "name": "h264-paff-b-spatial-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "9145a0565cfc1406eacb8112cd620f7b5f65b38331ebaf5bc47b9982aa8dea7c",
+      "nv12_sha256": "a1841eabfa5529df7a0223caf5ca1d553637428eca110f8e663495380e1b1887"
+    },
+    {
+      "name": "h264-paff-b-temporal-packets-8-1",
+      "bit_depth": 8,
+      "chroma_format": 1,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "217aa4fc39662f12bedadc03d7f5a3ac085af2d86cd81ea1a03cb5c50949199d",
+      "nv12_sha256": "a1841eabfa5529df7a0223caf5ca1d553637428eca110f8e663495380e1b1887"
+    },
+    {
+      "name": "h264-paff-split-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "764cfad6cba3a650d58f9316c3d15bb8f2fa4a52909f40be82f2e77676d6c422",
+      "nv12_sha256": "bddbc2ec8fdad2e5f56cf04ae9b09f4f7281abcbfb4c334ad868a10cdac20f56"
+    },
+    {
+      "name": "h264-paff-long-paired-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": false,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "59d1e6dd647006021afa07e11815817d9512f622c9faa3fbf6bf5aefef46e6ae",
+      "nv12_sha256": "9ffa5ee3b655e649489ee21b09ea67709e256e73527cb94738ff675709fbd846"
+    },
+    {
+      "name": "h264-paff-long-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "c98e778acab6ff455001d662742f7ed081b6c382bc89367c1482f8523a0329a2",
+      "nv12_sha256": "9ffa5ee3b655e649489ee21b09ea67709e256e73527cb94738ff675709fbd846"
+    },
+    {
+      "name": "h264-paff-adaptive-paired-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": false,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "f15cddb68a14a7257ae21d1e3cf6f70ed98e13c16e4b454f430e2ee65e2a5211",
+      "nv12_sha256": "a10f708be3dc6be2b66208813d52f079ff8b56a16717aaa971ac221557fef49b"
+    },
+    {
+      "name": "h264-paff-adaptive-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "ced8126dbcb6c865f4d1e62465c9fb77cfb3c795ad8a21c707b94c306cfd74b2",
+      "nv12_sha256": "a10f708be3dc6be2b66208813d52f079ff8b56a16717aaa971ac221557fef49b"
+    },
+    {
+      "name": "h264-paff-cabac-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "42e5fd4085bbde5786cf3d88331a7aa1e48d4996dbf500590826e289647031d9",
+      "nv12_sha256": "d5d1cde45d4a7d2d4180ce039c0188db3d6030d3a81a8adfaf91c79fde2a23ca"
+    },
+    {
+      "name": "h264-paff-bottom-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "54628e4b6957bd698e24143028067ec90050d147feb1ed3640159d2f00a451b0",
+      "nv12_sha256": "d5d1cde45d4a7d2d4180ce039c0188db3d6030d3a81a8adfaf91c79fde2a23ca"
+    },
+    {
+      "name": "h264-paff-idr-long-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "2484224b3e45e1aa103620d9a8319dff8f32eb24beddb58ed25842836a816210",
+      "nv12_sha256": "d5d1cde45d4a7d2d4180ce039c0188db3d6030d3a81a8adfaf91c79fde2a23ca"
+    },
+    {
+      "name": "h264-paff-b-spatial-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "211f4cbf1d82923eb9d9c9e1c352e2f2fced0dc877887651ba533a44fd3e378b",
+      "nv12_sha256": "392c84e44f9236062133120120ddb7bb62f65231fcacb7f34e8aa3aadec80298"
+    },
+    {
+      "name": "h264-paff-b-temporal-packets-10-2",
+      "bit_depth": 10,
+      "chroma_format": 2,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "7a069a442732a235426ed521e6a65cdb1b0691780f2314f6ef28087643783102",
+      "nv12_sha256": "392c84e44f9236062133120120ddb7bb62f65231fcacb7f34e8aa3aadec80298"
+    },
+    {
+      "name": "h264-paff-split-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "41bcbd6f4eefca323bcf560b64e8777c8e1b4a07df6ab5bbac4b7f4f16283ea4",
+      "nv12_sha256": "0f6ed9f8fa2f3b93c940822f407ae8daff70f4cf15c4d6b455886ca853adee21"
+    },
+    {
+      "name": "h264-paff-long-paired-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": false,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "494bba57b34e6a6ef82595745c4d7f524432ac1a4028699673812302bd969ed8",
+      "nv12_sha256": "9a1f5bfd087023620c3ddb95987053e16ecfc65429eded3c0a1ee3a6bcca0e86"
+    },
+    {
+      "name": "h264-paff-long-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "09257aaf665b29b120cfc72af3128e75a1062421a1fb4287075cda3298723299",
+      "nv12_sha256": "9a1f5bfd087023620c3ddb95987053e16ecfc65429eded3c0a1ee3a6bcca0e86"
+    },
+    {
+      "name": "h264-paff-adaptive-paired-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": false,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "82337ac2824036bcb00c8c1b45ce13eaad14d271c3564a821fe406aeb7f03e46",
+      "nv12_sha256": "29b42b5ff5501342ad3525b3b253da7ed2eba26bc4924d6556c52bf079028109"
+    },
+    {
+      "name": "h264-paff-adaptive-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "c1c06facab6a4f986142ac1d3542612b4837bce136509485c608df1b5c1e3ec6",
+      "nv12_sha256": "29b42b5ff5501342ad3525b3b253da7ed2eba26bc4924d6556c52bf079028109"
+    },
+    {
+      "name": "h264-paff-cabac-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "292cbac0133822b0d30b93a6e8afed88f9082062fb380d811f743e99e78be1d2",
+      "nv12_sha256": "0dda37185bb29d410276a50e43fad5bdab361ba402afa4974cf450a78f615439"
+    },
+    {
+      "name": "h264-paff-bottom-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "ed835dbf7564f1d1d6527ba5a702795f8b46b8fc34e25dfc4ab80bc36614dec5",
+      "nv12_sha256": "0dda37185bb29d410276a50e43fad5bdab361ba402afa4974cf450a78f615439"
+    },
+    {
+      "name": "h264-paff-idr-long-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "f008507d32c5977c2a7a92b50414fbbefeddcb3956a3b44d58255e5b9882902b",
+      "nv12_sha256": "0dda37185bb29d410276a50e43fad5bdab361ba402afa4974cf450a78f615439"
+    },
+    {
+      "name": "h264-paff-b-spatial-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "ca68c2cf2046943dcb129ef3edac4b7748534e7d7c0124a862050a73cdfbf4e6",
+      "nv12_sha256": "baa14bc51dea98fff5634e43bb1544e6db10bb721d22c25117ea0dcf3decbfcf"
+    },
+    {
+      "name": "h264-paff-b-temporal-packets-14-3",
+      "bit_depth": 14,
+      "chroma_format": 3,
+      "standalone": true,
+      "oracle": "FFmpeg native planar samples match independently known values",
+      "mp4_sha256": "532ca2bd91e6d25169345613595e0114b3e151ba6ccab543e24961b79d988faa",
+      "nv12_sha256": "baa14bc51dea98fff5634e43bb1544e6db10bb721d22c25117ea0dcf3decbfcf"
+    }
+  ]
+}

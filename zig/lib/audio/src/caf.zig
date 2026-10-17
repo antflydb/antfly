@@ -82,6 +82,26 @@ const lpcm_flag_is_packed = 1 << 3;
 const lpcm_flag_is_non_interleaved = 1 << 5;
 
 pub fn decodeInterleaved(allocator: std.mem.Allocator, bytes: []const u8) !DecodedInterleaved {
+    return decodeTo(allocator, bytes, null);
+}
+
+/// Emit borrowed blocks of at most 1024 frames without retaining full PCM.
+pub fn visitInterleaved(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    var decoded = try decodeTo(allocator, bytes, sink);
+    defer decoded.deinit();
+}
+
+fn decodeTo(allocator: std.mem.Allocator, bytes: []const u8, sink: ?@import("pcm_sink.zig").Sink) !DecodedInterleaved {
+    const parsed = try parseLpcm(bytes);
+    return decodeLpcmPayload(allocator, parsed.format, parsed.data, sink);
+}
+
+pub fn isPcm(bytes: []const u8) bool {
+    _ = parseLpcm(bytes) catch return false;
+    return true;
+}
+
+fn parseLpcm(bytes: []const u8) !struct { format: LpcmFormat, data: []const u8 } {
     if (bytes.len < 8 or !std.mem.eql(u8, bytes[0..4], "caff")) return error.UnsupportedAudioFormat;
 
     var format: ?LpcmFormat = null;
@@ -111,7 +131,7 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, bytes: []const u8) !Decod
 
     const resolved_format = format orelse return error.UnsupportedAudioFormat;
     if (sample_data.len == 0) return error.UnsupportedAudioFormat;
-    return decodeLpcmPayload(allocator, resolved_format, sample_data);
+    return .{ .format = resolved_format, .data = sample_data };
 }
 
 pub fn demux(allocator: std.mem.Allocator, bytes: []const u8) !DemuxedAudio {
@@ -248,7 +268,7 @@ fn parseDecodeDescription(payload: []const u8) !LpcmFormat {
     };
 }
 
-fn decodeLpcmPayload(allocator: std.mem.Allocator, format: LpcmFormat, sample_data: []const u8) !DecodedInterleaved {
+fn decodeLpcmPayload(allocator: std.mem.Allocator, format: LpcmFormat, sample_data: []const u8, sink: ?@import("pcm_sink.zig").Sink) !DecodedInterleaved {
     const bytes_per_sample = switch (format.bits_per_sample) {
         8 => @as(usize, 1),
         16 => 2,
@@ -261,73 +281,82 @@ fn decodeLpcmPayload(allocator: std.mem.Allocator, format: LpcmFormat, sample_da
     if (frame_bytes == 0 or sample_data.len % frame_bytes != 0) return error.UnsupportedAudioFormat;
     const sample_count = sample_data.len / bytes_per_sample;
 
-    const samples = try allocator.alloc(f32, sample_count);
-    errdefer allocator.free(samples);
+    const capacity = if (sink != null) @min(sample_count, @as(usize, 1024) * format.channels) else sample_count;
+    const samples = try allocator.alloc(f32, capacity);
+    defer if (sink != null) allocator.free(samples);
+    errdefer if (sink == null) allocator.free(samples);
 
-    for (samples, 0..) |*sample, i| {
-        const offset = i * bytes_per_sample;
-        sample.* = switch (format.encoding) {
-            .signed_int => switch (format.bits_per_sample) {
-                8 => blk: {
-                    const raw: i8 = @bitCast(sample_data[offset]);
-                    break :blk @as(f32, @floatFromInt(raw)) / 128.0;
+    var base: usize = 0;
+    while (base < sample_count) {
+        try @import("work_control.zig").check();
+        const count = @min(capacity, sample_count - base);
+        for (samples[0..count], 0..) |*sample, i| {
+            const offset = (base + i) * bytes_per_sample;
+            sample.* = switch (format.encoding) {
+                .signed_int => switch (format.bits_per_sample) {
+                    8 => blk: {
+                        const raw: i8 = @bitCast(sample_data[offset]);
+                        break :blk @as(f32, @floatFromInt(raw)) / 128.0;
+                    },
+                    16 => blk: {
+                        const raw = std.mem.readInt(i16, sample_data[offset..][0..2], format.endian);
+                        break :blk @as(f32, @floatFromInt(raw)) / 32768.0;
+                    },
+                    24 => blk: {
+                        const raw = readI24(sample_data[offset..][0..3], format.endian);
+                        break :blk @as(f32, @floatFromInt(raw)) / 8388608.0;
+                    },
+                    32 => blk: {
+                        const raw = std.mem.readInt(i32, sample_data[offset..][0..4], format.endian);
+                        break :blk @as(f32, @floatFromInt(raw)) / 2147483648.0;
+                    },
+                    64 => blk: {
+                        const raw = std.mem.readInt(i64, sample_data[offset..][0..8], format.endian);
+                        break :blk @floatCast(@as(f64, @floatFromInt(raw)) / 9223372036854775808.0);
+                    },
+                    else => return error.UnsupportedAudioFormat,
                 },
-                16 => blk: {
-                    const raw = std.mem.readInt(i16, sample_data[offset..][0..2], format.endian);
-                    break :blk @as(f32, @floatFromInt(raw)) / 32768.0;
+                .unsigned_int => switch (format.bits_per_sample) {
+                    8 => (@as(f32, @floatFromInt(sample_data[offset])) - 128.0) / 128.0,
+                    16 => blk: {
+                        const raw = std.mem.readInt(u16, sample_data[offset..][0..2], format.endian);
+                        break :blk (@as(f32, @floatFromInt(raw)) - 32768.0) / 32768.0;
+                    },
+                    24 => blk: {
+                        const raw = readU24(sample_data[offset..][0..3], format.endian);
+                        break :blk (@as(f32, @floatFromInt(raw)) - 8388608.0) / 8388608.0;
+                    },
+                    32 => blk: {
+                        const raw = std.mem.readInt(u32, sample_data[offset..][0..4], format.endian);
+                        break :blk @as(f32, @floatCast((@as(f64, @floatFromInt(raw)) - 2147483648.0) / 2147483648.0));
+                    },
+                    64 => blk: {
+                        const raw = std.mem.readInt(u64, sample_data[offset..][0..8], format.endian);
+                        break :blk @floatCast((@as(f64, @floatFromInt(raw)) - 9223372036854775808.0) / 9223372036854775808.0);
+                    },
+                    else => return error.UnsupportedAudioFormat,
                 },
-                24 => blk: {
-                    const raw = readI24(sample_data[offset..][0..3], format.endian);
-                    break :blk @as(f32, @floatFromInt(raw)) / 8388608.0;
+                .float => switch (format.bits_per_sample) {
+                    32 => @bitCast(std.mem.readInt(u32, sample_data[offset..][0..4], format.endian)),
+                    64 => @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, sample_data[offset..][0..8], format.endian)))),
+                    else => return error.UnsupportedAudioFormat,
                 },
-                32 => blk: {
-                    const raw = std.mem.readInt(i32, sample_data[offset..][0..4], format.endian);
-                    break :blk @as(f32, @floatFromInt(raw)) / 2147483648.0;
+                .ulaw => switch (format.bits_per_sample) {
+                    8 => @as(f32, @floatFromInt(g711.decodeMuLaw(sample_data[offset]))) / 32768.0,
+                    else => return error.UnsupportedAudioFormat,
                 },
-                64 => blk: {
-                    const raw = std.mem.readInt(i64, sample_data[offset..][0..8], format.endian);
-                    break :blk @floatCast(@as(f64, @floatFromInt(raw)) / 9223372036854775808.0);
+                .alaw => switch (format.bits_per_sample) {
+                    8 => @as(f32, @floatFromInt(g711.decodeALaw(sample_data[offset]))) / 32768.0,
+                    else => return error.UnsupportedAudioFormat,
                 },
-                else => return error.UnsupportedAudioFormat,
-            },
-            .unsigned_int => switch (format.bits_per_sample) {
-                8 => (@as(f32, @floatFromInt(sample_data[offset])) - 128.0) / 128.0,
-                16 => blk: {
-                    const raw = std.mem.readInt(u16, sample_data[offset..][0..2], format.endian);
-                    break :blk (@as(f32, @floatFromInt(raw)) - 32768.0) / 32768.0;
-                },
-                24 => blk: {
-                    const raw = readU24(sample_data[offset..][0..3], format.endian);
-                    break :blk (@as(f32, @floatFromInt(raw)) - 8388608.0) / 8388608.0;
-                },
-                32 => blk: {
-                    const raw = std.mem.readInt(u32, sample_data[offset..][0..4], format.endian);
-                    break :blk @as(f32, @floatCast((@as(f64, @floatFromInt(raw)) - 2147483648.0) / 2147483648.0));
-                },
-                64 => blk: {
-                    const raw = std.mem.readInt(u64, sample_data[offset..][0..8], format.endian);
-                    break :blk @floatCast((@as(f64, @floatFromInt(raw)) - 9223372036854775808.0) / 9223372036854775808.0);
-                },
-                else => return error.UnsupportedAudioFormat,
-            },
-            .float => switch (format.bits_per_sample) {
-                32 => @bitCast(std.mem.readInt(u32, sample_data[offset..][0..4], format.endian)),
-                64 => @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, sample_data[offset..][0..8], format.endian)))),
-                else => return error.UnsupportedAudioFormat,
-            },
-            .ulaw => switch (format.bits_per_sample) {
-                8 => @as(f32, @floatFromInt(g711.decodeMuLaw(sample_data[offset]))) / 32768.0,
-                else => return error.UnsupportedAudioFormat,
-            },
-            .alaw => switch (format.bits_per_sample) {
-                8 => @as(f32, @floatFromInt(g711.decodeALaw(sample_data[offset]))) / 32768.0,
-                else => return error.UnsupportedAudioFormat,
-            },
-        };
+            };
+        }
+        if (sink) |consumer| try consumer.push(samples[0..count], format.sample_rate, format.channels);
+        base += count;
     }
 
     return .{
-        .samples = samples,
+        .samples = if (sink != null) try allocator.alloc(f32, 0) else samples,
         .sample_rate = format.sample_rate,
         .channels = format.channels,
         .allocator = allocator,

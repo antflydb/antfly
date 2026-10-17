@@ -1,0 +1,3 @@
+FROM scratch
+COPY bin/video-tests /video-tests
+ENTRYPOINT ["/video-tests"]

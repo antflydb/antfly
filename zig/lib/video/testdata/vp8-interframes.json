@@ -1,0 +1,120 @@
+{
+  "scope": "Pure Zig raw VP8 versions 0-3, 174 displayed pictures plus 3 hidden reference pictures. Planar pixels/frame hashes checked against independent FFmpeg/libvpx decoding. Generated streams and one real Sintel excerpt; not exhaustive WebM/model or VP9/AV1 qualification.",
+  "ffmpeg_version": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "generated_source": "FFmpeg testsrc2 patterns, Apache-2.0 first-party fixtures",
+  "sintel": {
+    "source_clip": "tools/embeddinggemma2/testdata/retrieval/scene-1-h264.mp4",
+    "sha256": "aa4bad5af54bd8c793b0206d3856b0c7a4cd53b8a80ea487a5f5c2555dafc570",
+    "provenance": {
+      "title": "Sintel trailer",
+      "attribution": "Blender Foundation, durian.blender.org",
+      "license": "CC BY 3.0",
+      "source": "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4",
+      "source_sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254",
+      "start_seconds": 20,
+      "duration_seconds": 2,
+      "encoding_command": [
+        "-v",
+        "error",
+        "-y",
+        "-ss",
+        "20",
+        "-i",
+        "/private/tmp/sintel-trailer-480p.mp4",
+        "-t",
+        "2",
+        "-an",
+        "-vf",
+        "scale=480:320",
+        "-r",
+        "24",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-x264-params",
+        "keyint=48:min-keyint=48:scenecut=0:bframes=2:no-deblock=1",
+        "-colorspace",
+        "smpte170m",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-color_range",
+        "tv",
+        "scene-1-h264.mp4"
+      ]
+    },
+    "modifications": "Resize scene at 20 seconds to 192x128, encode VP8 using libvpx, remove audio. Preserve CC BY 3.0 attribution."
+  },
+  "commands": {
+    "inter": "ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=2 -c:v libvpx -deadline best -cpu-used 0 -g 48 -auto-alt-ref 0 -b:v 100k vp8-inter.webm",
+    "altref": "ffmpeg -f lavfi -i testsrc2=size=98x66:rate=24:duration=2 -c:v libvpx -deadline best -cpu-used 0 -g 48 -auto-alt-ref 1 -lag-in-frames 25 -b:v 160k -pass 1/2 -passlogfile TEMP vp8-altref.webm (pass 1 to null)",
+    "partitions": "ffmpeg -f lavfi -i testsrc2=size=128x96:rate=15:duration=2 -c:v libvpx -deadline good -cpu-used 6 -g 8 -slices 4 -auto-alt-ref 0 -b:v 100k vp8-partitions.webm",
+    "versions": "ffmpeg -f lavfi -i testsrc2=size=98x66:rate=8:duration=1 -c:v libvpx -profile:v 1/2/3 -deadline best -auto-alt-ref 0 -g 16 -b:v 100k OUTPUT.webm",
+    "sintel": "ffmpeg -i tools/embeddinggemma2/testdata/retrieval/scene-1-h264.mp4 -an -vf scale=192:128 -c:v libvpx -deadline best -cpu-used 0 -auto-alt-ref 0 -g 48 -b:v 120k vp8-sintel.webm",
+    "independent_decode": "ffmpeg -i INPUT.webm -pix_fmt yuv420p -f rawvideo OUTPUT.yuv; Sintel stores each visible frame SHA-256 instead of all raw pixels"
+  },
+  "artifacts": {
+    "vp8-inter.webm": {
+      "sha256": "ef29c5a11930ece81cd00e4cf59c6ae088e6ecc62b44e7400e2f13ceab2e9b56",
+      "bytes": 4238
+    },
+    "vp8-inter.yuv": {
+      "sha256": "7335b70d07de0f2b89a753c69a1df6e47e41ea64118881fa0ef6466840166115",
+      "bytes": 110592
+    },
+    "vp8-altref.webm": {
+      "sha256": "2cd9e83323d7ff6a296e65f90ee71de037589ae57ede0172f881122fc0cf05f0",
+      "bytes": 36140
+    },
+    "vp8-altref.yuv": {
+      "sha256": "2c450b5e5625f11baea7b9aebfed82e608b6cb79946e5d6062635625074bc3ca",
+      "bytes": 465696
+    },
+    "vp8-bilinear.webm": {
+      "sha256": "4378aa1f791430b67146b6c4479a04b45a212ce64ae57bb871b55b20c4bb15d4",
+      "bytes": 12542
+    },
+    "vp8-bilinear.yuv": {
+      "sha256": "f4e735e5d32be39379594d7d068cec59e1097365f0c62f9f6a790bc96ca375e1",
+      "bytes": 77616
+    },
+    "vp8-version2.webm": {
+      "sha256": "409fb7eef60e8531ebf51db27aa50816e06fba1d6a9998fb0df00ceb28110048",
+      "bytes": 12493
+    },
+    "vp8-version2.yuv": {
+      "sha256": "a3d0d58b8f38b357aea627be38ef875505a0faa268e03a13d4eb1173be6e139e",
+      "bytes": 77616
+    },
+    "vp8-version3.webm": {
+      "sha256": "f3cf63a8eb016e26f9579f69fbb899ef7b714c927b56db21b36a331873289d74",
+      "bytes": 12415
+    },
+    "vp8-version3.yuv": {
+      "sha256": "e8847a0fae0ad686dbb57fbaeaf4c0ca4f09bb266ffed0a8adec8671e90e8721",
+      "bytes": 77616
+    },
+    "vp8-partitions.webm": {
+      "sha256": "033968ff30508ead824f5d040dd6e4928564862a8b089f8fe36edf5941a8ccbd",
+      "bytes": 29486
+    },
+    "vp8-partitions.yuv": {
+      "sha256": "385bcc2504e82645814c8f8a4ea45f571458aa4118b1474efe66f93572b03e2e",
+      "bytes": 552960
+    },
+    "vp8-sintel.webm": {
+      "sha256": "a7de51de41d9e94fb05d12f3226551634b2efbe1b190cc8b039c65efdc2e8f7e",
+      "bytes": 30212
+    },
+    "vp8-sintel.sha256": {
+      "sha256": "d1b90c94b93b0769f00bd06556c976426dbd55d337cd3340162a3286849c0fbe",
+      "bytes": 3120
+    }
+  }
+}

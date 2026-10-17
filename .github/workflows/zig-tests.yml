@@ -545,6 +545,14 @@ jobs:
       - name: Test portable Linux x86 inference kernel dispatch
         run: python3 zig/tools/verify_linux_x86_kernels.py
 
+      - name: Test native Linux x86 video decoding and logical indexing
+        working-directory: zig/lib/video
+        run: |
+          uname -srm
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+          zig build test-video -Dcpu=baseline -Doptimize=ReleaseSafe -j1 --summary all
+
       - name: Test optional OpenBLAS dispatch and fallback
         run: python3 zig/tools/verify_runtime_openblas.py --openblas-library /usr/lib/x86_64-linux-gnu/libopenblas.so.0
 

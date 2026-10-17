@@ -1,0 +1,19 @@
+{
+  "scope": "three displayed VP8 keyframes, native YUV420 plane comparison; no interframe qualification",
+  "source": "FFmpeg testsrc2 generated pattern",
+  "ffmpeg_version": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "commands": [
+    "ffmpeg -hide_banner -loglevel error -f lavfi -i 'testsrc2=size=48x32:rate=3:duration=1' -c:v libvpx -g 1 -deadline best -cpu-used 0 -b:v 0 -crf 20 -auto-alt-ref 0 -threads 1 -y vp8-keyframes.webm",
+    "ffmpeg -hide_banner -loglevel error -i vp8-keyframes.webm -pix_fmt yuv420p -f rawvideo -y vp8-keyframes.yuv"
+  ],
+  "artifacts": {
+    "vp8-keyframes.webm": {
+      "sha256": "5bff319c651e687b94777d915338c0477267de3307d09b690d12aa9fc36fb012",
+      "bytes": 3397
+    },
+    "vp8-keyframes.yuv": {
+      "sha256": "21b7139feea1da32e8b92996ecf0ceac0189d03f2a1472f0940a0e5f84121ee7",
+      "bytes": 6912
+    }
+  }
+}
