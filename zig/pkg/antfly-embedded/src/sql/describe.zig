@@ -240,9 +240,34 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     return result;
 }
 
+/// Lower COPY's relational read once, pinning the table used to expand its
+/// implicit column list. Generated columns are omitted only for table COPY;
+/// an explicit query or column list keeps exactly the requested projection.
+pub fn copyRead(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled) !struct { compiled: compiler.Compiled, binding_backend: catalog.Backend } {
+    var read = compiled.*;
+    const command = compiled.statement.copy_to;
+    var query = command.query.*;
+    var binding_backend = backend;
+    if (command.implicit_columns) {
+        const adapter = try allocator.create(@import("relation_binding.zig").ResolveAdapter);
+        adapter.* = .{ .backend = backend, .table = try backend.vtable.resolve(backend.ptr, allocator, query.table.?, .read) };
+        var projections: std.ArrayList(ast.Projection) = .empty;
+        for (adapter.table.columns) |column| if (!column.generated) try projections.append(allocator, .{ .field = column.name });
+        if (projections.items.len == 0) return error.UnsupportedSqlShape;
+        query.columns = try projections.toOwnedSlice(allocator);
+        binding_backend = adapter.iface();
+    }
+    read.statement = .{ .select = query };
+    return .{ .compiled = read, .binding_backend = binding_backend };
+}
+
 /// Internal plans retain full typed descriptors. Wire validation belongs only
 /// at the public statement boundary, never at a derived relation boundary.
 pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    if (compiled.statement == .copy_to) {
+        const read = try copyRead(allocator, backend, compiled);
+        return bindInternal(allocator, read.binding_backend, &read.compiled, explicit_parameter_types);
+    }
     var statement_backend = backend;
     if (statement_backend.parameter_invocation == null and compiled.parameter_count != 0) {
         const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(allocator, compiled.parameter_count);

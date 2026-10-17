@@ -417,6 +417,7 @@ pub const Session = struct {
     fn rebindCached(self: *Session, alloc: std.mem.Allocator, statement: []const u8, original: backend.Description) !backend.Description {
         const current = try self.describeTyped(alloc, statement, original.parameter_types, original.parameter_descriptors);
         if (!cachedColumnsEqual(original.columns, current.columns) or
+            (original.copy_out == null) != (current.copy_out == null) or
             original.parameter_types.len != current.parameter_types.len)
             return self.cachedPlanChanged();
         for (original.parameter_types, current.parameter_types, 0..) |before, after, i| {
@@ -959,6 +960,7 @@ pub const Session = struct {
                 try cursor.finish();
                 const text = try a.dupe(u8, statement.statement);
                 const description = backend.Description{
+                    .copy_out = current.copy_out,
                     .columns = current.columns,
                     .parameter_types = types,
                     .parameter_descriptors = current.parameter_descriptors,
@@ -1006,11 +1008,11 @@ pub const Session = struct {
                         try bytes.writer.writeInt(u16, @intCast(prepared.parameter_oids.len), .big);
                         for (prepared.parameter_oids) |oid| try bytes.writer.writeInt(u32, oid, .big);
                         try self.message('t', bytes.written());
-                        try self.rowDescription(description.columns, &.{});
+                        if (description.copy_out != null) try self.message('n', "") else try self.rowDescription(description.columns, &.{});
                     },
                     'P' => {
                         const portal = self.portals.get(name) orelse return error.InvalidPortalName;
-                        try self.rowDescription(portal.description.columns, portal.formats);
+                        if (portal.description.copy_out != null) try self.message('n', "") else try self.rowDescription(portal.description.columns, portal.formats);
                     },
                     else => return error.ProtocolViolation,
                 }
@@ -1113,6 +1115,7 @@ pub const Session = struct {
                 errdefer arena.deinit();
                 const a = arena.allocator();
                 const description = try self.describeTyped(a, prepare.statement, prepare.types, prepare.descriptors);
+                if (description.copy_out != null) return error.InvalidSqlSyntax;
                 if (prepare.types.len > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types, 0..) |*oid, kind, index| oid.* = if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
@@ -1207,6 +1210,7 @@ pub const Session = struct {
         var arena_moved = false;
         defer if (!arena_moved) arena.deinit();
         const description = try self.describe(arena.allocator(), statement, &.{});
+        if (description.copy_out != null) return error.InvalidSqlSyntax;
         if (description.parameter_types.len != 0) return error.InvalidParameter;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
@@ -1536,7 +1540,121 @@ pub const Session = struct {
         self.portals.clearRetainingCapacity();
     }
 
+    /// CopyData frames may split rows and fields. A fixed transport buffer
+    /// bounds frame size and checks cancellation even for a single large cell.
+    const CopyWriter = struct {
+        writer: std.Io.Writer,
+        session: *Session,
+        request: backend.Request,
+        failure: ?anyerror = null,
+
+        fn emit(self: *@This(), bytes: []const u8) std.Io.Writer.Error!void {
+            var rest = bytes;
+            while (rest.len != 0) {
+                const count = @min(rest.len, self.writer.buffer.len);
+                self.request.check() catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
+                self.session.message('d', rest[0..count]) catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
+                rest = rest[count..];
+            }
+        }
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            try self.emit(w.buffered());
+            w.end = 0;
+            var count: usize = 0;
+            for (data[0 .. data.len - 1]) |part| {
+                try self.emit(part);
+                count += part.len;
+            }
+            for (0..splat) |_| {
+                try self.emit(data[data.len - 1]);
+                count += data[data.len - 1].len;
+            }
+            return count;
+        }
+    };
+
+    fn executeCopyOut(self: *Session, portal: *Portal) !void {
+        // Admission already cleared cancellation before opening this stream.
+        // Do not erase a cancel received between open and the first COPY page.
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        var req = self.request(portal.statement, portal.parameters, portal.types);
+        req.parameter_cells = portal.parameter_cells;
+        req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
+        req.parameter_descriptors = portal.description.parameter_descriptors;
+        req.binding_guard = portal.description.binding_guard;
+        req.setting_epoch = portal.description.setting_epoch;
+        const stream = portal.stream orelse return error.InvalidResult;
+        const options = stream.copy_out orelse return error.InvalidResult;
+        if (!columnsEqual(portal.description.columns, stream.columns)) return error.CatalogGenerationChanged;
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const Copy = @import("copy_out.zig");
+        var encoder = try Copy.Encoder.init(self.alloc, arena.allocator(), stream.columns, options, self.limits.connection_bytes);
+        defer encoder.deinit();
+        if (self.limits.frame_bytes <= 4 or self.limits.result_rows == 0) return error.ProgramLimitExceeded;
+        try req.check();
+        var response: std.Io.Writer.Allocating = .init(self.alloc);
+        defer response.deinit();
+        try response.writer.writeByte(if (options.format == .binary) 1 else 0);
+        try response.writer.writeInt(i16, @intCast(stream.columns.len), .big);
+        for (stream.columns) |_| try response.writer.writeInt(i16, if (options.format == .binary) 1 else 0, .big);
+        try self.message('H', response.written());
+        var buffer: [16 * 1024]u8 = undefined;
+        var output: CopyWriter = .{
+            .writer = .{ .vtable = &.{ .drain = CopyWriter.drain }, .buffer = buffer[0..@min(buffer.len, self.limits.frame_bytes - 4)] },
+            .session = self,
+            .request = req,
+        };
+        encoder.start(&output.writer) catch |err| return output.failure orelse err;
+        var scratch: std.heap.ArenaAllocator = .init(self.alloc);
+        defer scratch.deinit();
+        while (!portal.stream_complete) {
+            try req.check();
+            var page_arena: std.heap.ArenaAllocator = .init(self.alloc);
+            defer page_arena.deinit();
+            const wanted = @min(self.limits.result_rows, 256);
+            var page = try stream.next(stream.context, page_arena.allocator(), req, wanted);
+            defer page.result.deinit();
+            const result = page.result;
+            if (result.rowCount() > wanted or !columnsEqual(stream.columns, result.columns) or
+                result.mutation_outcome != null or result.continuation != null or result.session_id != null or
+                (!page.exhausted and result.rowCount() == 0)) return error.InvalidResult;
+            if (result.sql_nulls) |flags| if (flags.len != result.rowCount()) return error.InvalidResult;
+            for (0..result.rowCount()) |row_index| {
+                try req.check();
+                if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = scratch.reset(.free_all);
+                encoder.row(scratch.allocator(), &output.writer, result, row_index) catch |err| return output.failure orelse err;
+            }
+            portal.offset = std.math.add(usize, portal.offset, result.rowCount()) catch return error.ProgramLimitExceeded;
+            portal.stream_complete = page.exhausted;
+            output.writer.flush() catch |err| return output.failure orelse err;
+            try self.writer.flush();
+        }
+        encoder.finish(&output.writer) catch |err| return output.failure orelse err;
+        output.writer.flush() catch |err| return output.failure orelse err;
+        try req.check();
+        stream.close(stream.context);
+        portal.stream = null;
+        try self.message('c', "");
+        var tag: [64]u8 = undefined;
+        try self.command(try std.fmt.bufPrint(&tag, "COPY {d}", .{portal.offset}));
+    }
+
     fn executeStream(self: *Session, portal: *Portal, requested: i32) !void {
+        if (portal.stream) |stream| if (stream.copy_out != null) return self.executeCopyOut(portal);
+        if (portal.stream_complete and portal.description.copy_out != null) {
+            var tag: [64]u8 = undefined;
+            return self.command(try std.fmt.bufPrint(&tag, "COPY {d}", .{portal.offset}));
+        }
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
@@ -1606,14 +1724,14 @@ pub const Session = struct {
             .parameter_cells = native_cells,
             .types = types,
             .formats = &.{},
-            .description = .{ .columns = stream.columns, .parameter_types = types, .parameter_descriptors = descriptors, .binding_guard = binding_guard, .setting_epoch = setting_epoch },
+            .description = .{ .copy_out = stream.copy_out, .columns = stream.columns, .parameter_types = types, .parameter_descriptors = descriptors, .binding_guard = binding_guard, .setting_epoch = setting_epoch },
             .stream = stream,
             .stream_opened = true,
         };
         defer portal.arena.deinit();
         defer if (portal.stream) |remaining| remaining.close(remaining.context);
         if (stream.columns.len > self.limits.columns) return error.ProgramLimitExceeded;
-        try self.rowDescription(stream.columns, &.{});
+        if (stream.copy_out == null) try self.rowDescription(stream.columns, &.{});
         try self.executeStream(&portal, 0);
         return true;
     }
@@ -1887,7 +2005,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.ForeignKeyParentMissing, error.ForeignKeyReferenced => "23503",
         error.InvalidParameter => "22P02",
         error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => "22P02",
-        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch, error.SqlJsonUnicodeEscape, error.SqlProtocolViolation, error.SqlJsonbUnsupportedVersion => @import("antfly_local_sources").sql_errors.describe(err).code,
+        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch, error.SqlJsonUnicodeEscape, error.SqlUntranslatableCharacter, error.SqlProtocolViolation, error.SqlJsonbUnsupportedVersion => @import("antfly_local_sources").sql_errors.describe(err).code,
         error.SqlNumericOutOfRange => "22003",
         error.SqlInvalidTextEncoding => "22021",
         error.SqlArraySubscriptError => "2202E",
@@ -1904,6 +2022,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.ProgramLimitExceeded => "54000",
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
+        error.DuplicateSqlColumn => "42701",
+        error.SqlInvalidParameterValue => "22023",
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
         error.UnsupportedReadVisibility => "0A000",
         error.ReadRequirementNotReady => "53300",

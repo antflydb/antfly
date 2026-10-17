@@ -467,7 +467,7 @@ const OwnedRead = struct {
         var plan = try server.sqlPlanCache().acquire(server.sqlPlanCacheIo(), .{ .statement = request.statement, .principal = credential.principal, .database = request.database orelse "default", .namespace = request.namespace orelse "public" }, &diagnostic);
         var moved = false;
         defer if (!moved) plan.release(server.sqlPlanCacheIo());
-        if (plan.compiled().statement != .select) return null;
+        if (plan.compiled().statement != .select and plan.compiled().statement != .copy_to) return null;
         var admission = try server.acquireSqlExecution(false);
         defer if (!moved) admission.release();
         const self = try alloc.create(OwnedRead);
@@ -533,7 +533,7 @@ const OwnedRead = struct {
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
+        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = if (plan.compiled().statement == .copy_to) std.math.maxInt(usize) else request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
@@ -576,7 +576,7 @@ const OwnedRead = struct {
         self.plan = plan;
         self.admission = admission;
         moved = true;
-        return .{ .context = self, .columns = columns, .next = next, .close = close, .detach = detach, .validate = validate };
+        return .{ .context = self, .columns = columns, .next = next, .close = close, .detach = detach, .validate = validate, .copy_out = if (plan.compiled().statement == .copy_to) plan.compiled().statement.copy_to.options else null };
     }
 
     pub fn validate(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request) !void {
@@ -910,7 +910,7 @@ const Job = struct {
         defer lease.release(self.adapter.server.sqlPlanCacheIo());
         const compiled = lease.compiled();
         const write = self.kind == .execute and switch (compiled.statement) {
-            .select, .explain => false,
+            .select, .explain, .copy_to => false,
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
         };
         const server = self.adapter.server;
@@ -970,6 +970,7 @@ const Job = struct {
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
+                .copy_out = if (compiled.statement == .copy_to) try compiled.statement.copy_to.options.clone(self.alloc) else null,
                 .columns = columns,
                 .parameter_types = parameter_types,
                 .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
@@ -1795,6 +1796,130 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     var replacement_identity = try replacement.identity(alloc);
     defer replacement_identity.deinit(alloc);
     try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(replacement_identity, "docs", .read)));
+}
+
+test "SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const db_mod = local.storage_db_selected_root.db;
+    const raft = @import("../raft/mod.zig");
+    const reads = @import("antfly_source_root").antfly_sources.table_reads;
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Copy = @import("../pgwire/copy_out.zig");
+    const Reference = struct { rows: []const []const std.json.Value, profiles: []const struct { options: Copy.Options, sql: []const u8, hex: []const u8 } };
+    const reference = try std.json.parseFromSlice(Reference, a, @embedFile("../pgwire/fixtures/copy_out_reference.json"), .{});
+    defer reference.deinit();
+    var declaration = try compiler.compile(a, "CREATE TABLE usage_records(id TEXT,status TEXT,generated TEXT GENERATED ALWAYS AS (id || status) STORED)", .{});
+    defer declaration.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, declaration.statement.create_table);
+    defer a.free(schema);
+    var directory = try local.common_test_directory.TestDirectory.init("sql-copy-out-native");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
+    defer db.close();
+    try db.setSchemaJson(a, schema);
+    for (reference.value.rows) |row| {
+        const json = try std.json.Stringify.valueAlloc(a, .{ .id = row[0].string, .status = row[1] }, .{});
+        defer a.free(json);
+        try db.batch(.{ .writes = &.{.{ .key = row[0].string, .value = json }} });
+    }
+    var ranges = [_]local.common_topology_records.RangeRecord{.{ .table_id = 7, .group_id = 7, .range_id = 1, .start_key = "", .doc_identity_shard_id = 1, .doc_identity_range_id = 1 }};
+    var source: Source = .{ .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }}, .reads = .{reads.BoundTableReadSource.init("usage_records", 7, &db, raft.read_gate.alreadyReadSafeBarrier())}, .ranges = &ranges };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = @import("antfly_casbin").MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var permission = try usermgr.Permission.initOwned(a, .table, "usage_records", .read);
+    defer permission.deinit(a);
+    var user = try manager.createUser("copy-reader", "secret", &.{permission});
+    defer user.deinit(a);
+    var server = http.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .auth_enabled = true, .user_manager = &manager }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var adapter: Adapter = .{ .server = &server };
+    const credential = try Credential.authenticate(a, &manager, "copy-reader", "secret");
+    defer Credential.release(credential, a);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    // These are the immutable original statements, not rewritten SELECTs.
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0373", "sql-0374", "sql-0383", "sql-0378" }, [_]usize{ 2, 0, 5, 0 }) |id, profile_index| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const original = try corpus.get(id);
+        const req: wire.Request = .{ .statement = original.sql, .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &canceled };
+        const description = try adapter.backend().vtable.describe(&adapter, arena.allocator(), .{ .context = credential, .release = Credential.release }, req);
+        try std.testing.expect(description.copy_out != null);
+        const stream = (try OwnedRead.open(&adapter, a, credential, req)).?;
+        defer stream.close(stream.context);
+        var encoder = try Copy.Encoder.init(a, arena.allocator(), stream.columns, stream.copy_out.?, 4096);
+        defer encoder.deinit();
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        try encoder.start(&output.writer);
+        var count: usize = 0;
+        while (true) {
+            var page_arena: std.heap.ArenaAllocator = .init(a);
+            defer page_arena.deinit();
+            var page = try stream.next(stream.context, page_arena.allocator(), req, 2);
+            defer page.result.deinit();
+            for (0..page.result.rowCount()) |index| try encoder.row(page_arena.allocator(), &output.writer, page.result, index);
+            count += page.result.rowCount();
+            if (page.exhausted) break;
+        }
+        try encoder.finish(&output.writer);
+        const profile = reference.value.profiles[profile_index];
+        const expected = try arena.allocator().alloc(u8, profile.hex.len / 2);
+        _ = try std.fmt.hexToBytes(expected, profile.hex);
+        try std.testing.expectEqualSlices(u8, expected, output.written());
+        try std.testing.expectEqual(reference.value.rows.len, count);
+    }
+    // Constant query COPY must preserve native JSONB semantics through the
+    // blocking read spool, not fall back to API JSON serialization.
+    {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const Jsonb = struct { profiles: []const struct { sql: []const u8, hex: []const u8 } };
+        const jsonb = try std.json.parseFromSliceLeaky(Jsonb, arena.allocator(), @embedFile("../pgwire/fixtures/copy_out_jsonb_reference.json"), .{ .ignore_unknown_fields = true });
+        for (jsonb.profiles) |profile| {
+            const request: wire.Request = .{ .statement = profile.sql, .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &canceled };
+            const output_stream = (try OwnedRead.open(&adapter, a, credential, request)).?;
+            defer output_stream.close(output_stream.context);
+            var encoder = try Copy.Encoder.init(a, arena.allocator(), output_stream.columns, output_stream.copy_out.?, 4096);
+            defer encoder.deinit();
+            var output: std.Io.Writer.Allocating = .init(a);
+            defer output.deinit();
+            try encoder.start(&output.writer);
+            {
+                var page = try output_stream.next(output_stream.context, arena.allocator(), request, 2);
+                defer page.result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
+                try std.testing.expect(page.exhausted);
+                try encoder.row(arena.allocator(), &output.writer, page.result, 0);
+            }
+            try encoder.finish(&output.writer);
+            const expected = try arena.allocator().alloc(u8, profile.hex.len / 2);
+            _ = try std.fmt.hexToBytes(expected, profile.hex);
+            try std.testing.expectEqualSlices(u8, expected, output.written());
+        }
+    }
+    // COPY uses the same per-page revocation fence as native SELECT cursors.
+    const req: wire.Request = .{ .statement = "COPY usage_records TO STDOUT", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &canceled };
+    const retained = (try OwnedRead.open(&adapter, a, credential, req)).?;
+    defer retained.close(retained.context);
+    var page_arena: std.heap.ArenaAllocator = .init(a);
+    defer page_arena.deinit();
+    {
+        var first = try retained.next(retained.context, page_arena.allocator(), req, 2);
+        defer first.result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), first.result.rowCount());
+        try std.testing.expect(!first.exhausted);
+    }
+    try manager.removePermissionFromUser("copy-reader", "usage_records", .table);
+    try std.testing.expectError(error.Forbidden, retained.next(retained.context, page_arena.allocator(), req, 2));
 }
 
 test "SQL pgwire native adapter admits sessions for principal scoped native validation" {

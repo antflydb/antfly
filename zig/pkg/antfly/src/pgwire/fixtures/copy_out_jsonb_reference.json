@@ -1,0 +1,20 @@
+{
+  "value": "{\"long\":1.2300,\"a\":[true,null]}",
+  "profiles": [
+    {
+      "format": "text",
+      "sql": "COPY (SELECT '{\"long\":1.2300,\"a\":[true,null]}'::jsonb AS j) TO STDOUT (FORMAT text)",
+      "hex": "7b2261223a205b747275652c206e756c6c5d2c20226c6f6e67223a20312e323330307d0a"
+    },
+    {
+      "format": "csv",
+      "sql": "COPY (SELECT '{\"long\":1.2300,\"a\":[true,null]}'::jsonb AS j) TO STDOUT (FORMAT csv)",
+      "hex": "227b22226122223a205b747275652c206e756c6c5d2c2022226c6f6e6722223a20312e323330307d220a"
+    },
+    {
+      "format": "binary",
+      "sql": "COPY (SELECT '{\"long\":1.2300,\"a\":[true,null]}'::jsonb AS j) TO STDOUT (FORMAT binary)",
+      "hex": "5047434f50590aff0d0a000000000000000000000100000024017b2261223a205b747275652c206e756c6c5d2c20226c6f6e67223a20312e323330307dffff"
+    }
+  ]
+}

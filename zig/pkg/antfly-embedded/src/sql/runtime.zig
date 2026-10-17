@@ -207,6 +207,9 @@ fn parameterFallbackType(value: Json) ?ast.ColumnType {
 }
 
 fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits, sink: ?RowSink) !Output {
+    // COPY has a streaming protocol contract, not a JSON SELECT result. Only
+    // the retained read-stream entry point may execute its underlying query.
+    if (compiled.statement == .copy_to) return error.UnsupportedSqlShape;
     if (compiled.statement == .explain) {
         const explanation = compiled.statement.explain;
         const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count };

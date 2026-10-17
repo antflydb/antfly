@@ -128,7 +128,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SettingAuthorityUnavailable => .{ .code = "53300", .message = "The metadata setting authority is not configured for this SQL operation.", .hint = "Ask an operator to configure trusted setting authority, then inspect schema state before resubmitting DDL. Do not automatically replay a mutation.", .retryable = false },
         error.SqlNumericOutOfRange => .{ .code = "22003", .message = "A numeric expression exceeds its supported range.", .retryable = false },
         error.SqlNonFiniteScalarStorage => .{ .code = "0A000", .message = "Scalar floating-point storage currently requires finite values.", .hint = "Use NUMERIC for stored NaN or Infinity values." },
-        error.SqlInvalidParameterValue => .{ .code = "22023", .message = "The SQL type modifier is outside its supported range.", .hint = "NUMERIC precision must be 1..1000 and scale -1000..1000.", .retryable = false },
+        error.SqlInvalidParameterValue => .{ .code = "22023", .message = "An SQL option or type modifier has an invalid value.", .hint = "Check option values and format compatibility. NUMERIC precision must be 1..1000 and scale -1000..1000.", .retryable = false },
         error.SqlSubstringError => .{ .code = "22011", .message = "The substring start or length is invalid.", .retryable = false },
         error.SqlInvalidNtileArgument => .{ .code = "22014", .message = "The argument of ntile must be greater than zero.", .retryable = false },
         error.InvalidSqlCharacterCode => .{ .code = "54000", .message = "The character code is not a nonzero Unicode scalar value.", .retryable = false },

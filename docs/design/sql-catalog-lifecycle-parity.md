@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `50bc9a68d9` (2026-10-17). Earlier implementation and
+at `d4d3a4a6ea` (2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -9,16 +9,40 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-532 implemented / 132 rejected / 120 superseded / 802 unresolved. Counts below
+535 implemented / 131 rejected / 121 superseded / 799 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
-| 1 | DDL, catalog and sessions | 303 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
+| 1 | DDL, catalog and sessions | 300 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 126 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
+
+## COPY output delivery (2026-10-17)
+
+Originals `sql-0373`, `sql-0374` and `sql-0383` now execute unchanged through
+authenticated retained native reads over durable typed rows, with complete COPY
+bytes independently checked against PostgreSQL. Table COPY omits generated
+columns by default. Text, CSV and binary output use the existing typed pgwire
+encoders; API JSON execution does not silently substitute SELECT for COPY.
+Scalar JSONB output shares the engine's canonical key ordering, whitespace and
+decimal-scale formatter, rather than serializing compact API JSON. Independent
+PostgreSQL fixtures cover text, CSV and binary JSONB through native query spools.
+
+The transport drains bounded pages and frames, including fields larger than a
+frame, without truncating at the ordinary row-result cap or suspending at an
+extended Execute row count. It checks cancellation and current read authority;
+failed streams do not send successful COPY completion. Tests cover exact NULL/
+empty/escaped bytes, CSV options, binary framing, 5,000-row delivery, large fields,
+permission revocation and cleanup. The reproducible gates are recorded on those
+three inventory entries. COPY FROM, server files, PROGRAM, write-returning query
+bodies and zero-column implicit projections are still unsupported. This closes
+three original output contracts, not the complete COPY family or SQL backlog.
+PostgreSQL also accepts the original `sql-0378` spelling `TO STDIN` as CopyOut.
+Its already-resolved historical rejection becomes a byte-verified PostgreSQL
+supersession, not another reduction in unresolved cases.
 
 ## PostgreSQL conflict-scope delivery (2026-10-17)
 

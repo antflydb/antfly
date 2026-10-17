@@ -421,7 +421,10 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         .boolean => if (value == .bool) try alloc.dupe(u8, if (value.bool) "t" else "f") else error.InvalidResult,
         .integer => try std.fmt.allocPrint(alloc, "{d}", .{try integer(value)}),
         .datetime => try timestampText(alloc, value),
-        .json => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+        .json => blk: {
+            var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+            break :blk try @import("antfly_local_sources").sql_jsonb_text.format(alloc, value, 16 * 1024 * 1024, &work);
+        },
         .uuid => if (value == .string) @import("antfly_local_sources").common_uuid.canonicalAlloc(alloc, value.string) catch |err| switch (err) {
             error.InvalidUuid => return error.InvalidResult,
             else => return err,
@@ -446,7 +449,8 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
             break :blk try encodeInteger(alloc, (try timestampFromValue(value)).micros);
         },
         .json => blk: {
-            const json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+            const json = try @import("antfly_local_sources").sql_jsonb_text.format(alloc, value, 16 * 1024 * 1024, &work);
             defer alloc.free(json);
             break :blk try std.mem.concat(alloc, u8, &.{ &.{1}, json });
         },
@@ -460,8 +464,9 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
 }
 
 /// Append a cell directly to a reusable DataRow buffer. Primitive and JSON
-/// values require no intermediate encoded allocation.
-pub fn encodeInto(_: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
+/// values require no intermediate encoded allocation; JSONB owns only its
+/// canonical key-ordering scratch, not a second complete encoded payload.
+pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
     if (kind == .array) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) {
@@ -480,7 +485,10 @@ pub fn encodeInto(_: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
                 const canonical = @import("antfly_local_sources").common_uuid.format(@import("antfly_local_sources").common_uuid.parse(value.string) catch return error.InvalidResult);
                 try writer.writeAll(&canonical);
             },
-            .json => try std.json.Stringify.value(value, .{}, writer),
+            .json => {
+                var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+                try @import("antfly_local_sources").sql_jsonb_text.write(a, value, writer, 16 * 1024 * 1024, &work, 0);
+            },
             else => if (value == .string) try writer.writeAll(value.string) else try std.json.Stringify.value(value, .{}, writer),
         }
         return;
@@ -507,7 +515,8 @@ pub fn encodeInto(_: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         },
         .json => {
             try writer.writeByte(1);
-            try std.json.Stringify.value(value, .{}, writer);
+            var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+            try @import("antfly_local_sources").sql_jsonb_text.write(a, value, writer, 16 * 1024 * 1024, &work, 0);
         },
         .uuid => {
             if (value != .string) return error.InvalidResult;

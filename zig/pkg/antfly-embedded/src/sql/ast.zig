@@ -376,7 +376,58 @@ pub const PolicyDdl = struct {
     with_check: ?*const Scalar = null,
     check_specified: bool = false,
 };
+pub const CopyOptions = struct {
+    format: enum { text, csv, binary } = .text,
+    delimiter: ?u8 = null,
+    null_string: ?[]const u8 = null,
+    quote: ?u8 = null,
+    escape: ?u8 = null,
+    header: bool = false,
+    force_quote_all: bool = false,
+    force_quote_columns: []const []const u8 = &.{},
+
+    /// Leaky clone into the caller's description/portal arena. Plan-cache
+    /// leases need not outlive Parse/Describe results.
+    pub fn clone(self: @This(), allocator: @import("std").mem.Allocator) !@This() {
+        var result = self;
+        if (self.null_string) |text| result.null_string = try allocator.dupe(u8, text);
+        const columns = try allocator.alloc([]const u8, self.force_quote_columns.len);
+        for (columns, self.force_quote_columns) |*out, column| out.* = try allocator.dupe(u8, column);
+        result.force_quote_columns = columns;
+        return result;
+    }
+
+    pub fn delimiterByte(self: @This()) u8 {
+        return self.delimiter orelse if (self.format == .csv) ',' else '\t';
+    }
+    pub fn nullBytes(self: @This()) []const u8 {
+        return self.null_string orelse if (self.format == .csv) "" else "\\N";
+    }
+    pub fn quoteByte(self: @This()) u8 {
+        return self.quote orelse '"';
+    }
+    pub fn escapeByte(self: @This()) u8 {
+        return self.escape orelse self.quoteByte();
+    }
+    pub fn validate(self: @This()) !void {
+        const std = @import("std");
+        if (self.format == .binary and (self.delimiter != null or self.null_string != null or self.header or self.quote != null or self.escape != null or self.force_quote_all or self.force_quote_columns.len != 0)) return error.SqlInvalidParameterValue;
+        if (self.format != .csv and (self.quote != null or self.escape != null or self.force_quote_all or self.force_quote_columns.len != 0)) return error.SqlInvalidParameterValue;
+        const delimiter = self.delimiterByte();
+        if (delimiter == 0 or delimiter >= 128 or delimiter == '\n' or delimiter == '\r') return error.SqlInvalidParameterValue;
+        if (self.format == .text and (delimiter == '\\' or delimiter == '.' or std.ascii.isDigit(delimiter) or std.ascii.isLower(delimiter))) return error.SqlInvalidParameterValue;
+        if (self.quoteByte() == 0 or self.quoteByte() >= 128 or self.escapeByte() == 0 or self.escapeByte() >= 128 or (self.format == .csv and delimiter == self.quoteByte())) return error.SqlInvalidParameterValue;
+        const nulls = self.nullBytes();
+        if (nulls.len > 1024 or std.mem.indexOfAny(u8, nulls, "\x00\n\r") != null or !std.unicode.utf8ValidateSlice(nulls)) return error.SqlInvalidParameterValue;
+        if (std.mem.indexOfScalar(u8, nulls, delimiter) != null) return error.SqlInvalidParameterValue;
+        if (self.format == .csv and std.mem.indexOfScalar(u8, nulls, self.quoteByte()) != null) return error.SqlInvalidParameterValue;
+    }
+};
+
 pub const Statement = union(enum) {
+    /// Read plan plus output contract. Ordinary execute must never silently
+    /// expose this as SELECT; the COPY-capable stream owns protocol framing.
+    copy_to: struct { query: *const Select, options: CopyOptions, implicit_columns: bool = false },
     explain: struct { statement: *const Statement, format: enum { text, json } = .text, verbose: bool = false },
     select: Select,
     insert: Insert,

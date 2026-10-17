@@ -79,11 +79,13 @@ const Fixture = struct {
     calls: usize = 0,
     cancel: bool = false,
     ordered: bool = false,
+    layout: ?[]const catalog.Column = null,
     fn backend(self: *Fixture) catalog.Backend {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
     }
-    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
-        return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
+    fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = self.layout orelse &.{.{ .name = "n", .path = "n", .type = .integer }} };
     }
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedStatelessScan;
@@ -300,6 +302,54 @@ test "SQL regex cursor reuses statement patterns across released pages" {
     try std.testing.expectEqual(@as(u64, 999), stats.replacement_hits);
     try std.testing.expectEqual(@as(usize, 0), stats.active);
     try std.testing.expect(stream.budget.peak <= stream.budget.limit);
+}
+
+test "SQL COPY native read stream pins implicit nongenerated columns and refuses eager execution" {
+    for ([_][]const u8{ "COPY docs TO STDOUT", "COPY docs(n) TO STDOUT", "COPY (SELECT n FROM docs) TO STDOUT" }) |sql| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .count = 5000, .layout = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "derived", .path = "derived", .type = .string, .generated = true } } };
+        try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.opened);
+        const stream = (try Stream.open(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{ .result_rows = std.math.maxInt(usize), .page_rows = 73, .retained_bytes = 256 * 1024 })).?;
+        defer stream.close();
+        try std.testing.expectEqual(@as(usize, 1), stream.context.binding.columns.len);
+        try std.testing.expectEqualStrings("n", stream.context.binding.columns[0].name);
+        var seen: usize = 0;
+        while (true) {
+            var page = try stream.next(73);
+            defer page.deinit();
+            for (page.output.rows) |row| {
+                try std.testing.expectEqual(@as(i64, @intCast(seen)), row[0].integer);
+                seen += 1;
+            }
+            if (page.exhausted) break;
+        }
+        try std.testing.expectEqual(@as(usize, 5000), seen);
+        try std.testing.expectEqual(@as(usize, 1), fixture.opened);
+        try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+        try std.testing.expect(stream.budget.peak < 256 * 1024);
+    }
+}
+
+test "SQL COPY query streams constant typed cells without inventing a table read" {
+    var compiled = try compiler.compile(std.testing.allocator, "COPY (SELECT 42::bigint AS n,true AS b,ARRAY[1,NULL,3]::bigint[] AS a,123.4500::numeric AS d) TO STDOUT (FORMAT binary)", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    backend.execution_io = std.testing.io;
+    const stream = (try Stream.open(std.testing.allocator, backend, &compiled, &.{}, .{ .result_rows = std.math.maxInt(usize) })).?;
+    defer stream.close();
+    var page = try stream.nextBatch(2);
+    defer page.deinit();
+    try std.testing.expect(page.exhausted);
+    try std.testing.expectEqual(@as(usize, 1), page.values.len());
+    const a = page.arena.allocator();
+    try std.testing.expectEqual(@as(i64, 42), (try page.values.cell(a, 0, 0)).value.integer);
+    try std.testing.expect((try page.values.cell(a, 0, 1)).value.bool);
+    try std.testing.expect((try page.values.cell(a, 0, 2)).array != null);
+    try std.testing.expect((try page.values.cell(a, 0, 3)).numeric != null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.opened);
 }
 
 test "SQL pull stream releases pages and streams beyond materialized result limit" {
@@ -884,7 +934,7 @@ pub const Stream = struct {
     /// selects the bounded materializing executor for unsupported shapes or
     /// when spilling is unavailable. No row reads occur on that decline path.
     pub fn open(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits) !?*Stream {
-        if (compiled.statement != .select) return null;
+        if (compiled.statement != .select and compiled.statement != .copy_to) return null;
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
         if (limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
         try backend.vtable.checkpoint(backend.ptr);
@@ -928,13 +978,15 @@ pub const Stream = struct {
             self.settings = view;
             statement_backend.settings_view = view;
         }
-        const binding = try describe.bind(arena, statement_backend, compiled, &.{});
+        const copy_read = if (compiled.statement == .copy_to) try describe.copyRead(arena, statement_backend, compiled) else null;
+        const executable = if (copy_read) |*read| &read.compiled else compiled;
+        const binding = try describe.bind(arena, if (copy_read) |read| read.binding_backend else statement_backend, executable, &.{});
         if (statement_backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, self.budget.allocator(), binding);
         statement_backend.execution_binding_validator = null;
         self.parameter_invocation = binding.parameter_invocation;
         statement_backend.parameter_invocation = binding.parameter_invocation;
         if (self.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(self.budget.allocator(), parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = limits.error_context, .payload_owner = limits.parameter_owner });
-        const statement = if (binding.relation) |relation| relation.statement else compiled.statement.select;
+        const statement = if (binding.relation) |relation| relation.statement else executable.statement.select;
         var execution_limits = limits;
         // The frame owns or leases its payloads; never retain transport parameter
         // pointers in a cursor that may outlive its opening request.
@@ -983,7 +1035,7 @@ pub const Stream = struct {
             };
             if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
-            if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+            if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or (binding.table == null and compiled.statement != .copy_to)) {
                 if (self.parameter_invocation) |invocation| invocation.deinitFrame();
                 if (self.settings) |view| view.deinit();
                 self.arena.deinit();
@@ -1009,7 +1061,7 @@ pub const Stream = struct {
             self.context.spill = manager;
             self.context.sink = .{ .ptr = owner, .append = Spool.append, .take_sorted = Spool.takeSorted };
             self.context.limits.result_rows = limits.scan_rows;
-            const output = try self.context.select(compiled.statement.select);
+            const output = try self.context.select(executable.statement.select);
             // Constant/count and bounded fallback paths return ordinary rows.
             for (output.rows, 0..) |row, index| {
                 var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());

@@ -2,6 +2,9 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-copy-out-native-debug": {"command":["zig","build","antfly-api-sql-native-cells-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-copy-out-protocol-debug": {"command":["zig","build","sql-test","pgwire-test","-Doptimize=Debug","-j1","-Dtest-filter=COPY","-Dtest-filter=SQL exact original rejection contracts"],"cwd":"zig","timeout_seconds":1800},
+    "sql-copy-out-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_copy_out.py"],"cwd":".","timeout_seconds":180},
     "sql-conflict-scope-native-debug": {"command":["zig","build","antfly-sql-conflict-scope-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-conflict-scope-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_conflict_scope.py"],"cwd":".","timeout_seconds":180},
     "sql-original-nullability-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-nullability-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
@@ -3858,13 +3861,23 @@
     },
     {
       "id": "sql-0373",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. COPY input and server-file/PROGRAM operations remain unsupported.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-native-debug"},
+        {"path":"zig/pkg/antfly/src/pgwire/protocol_test.zig","test":"pgwire COPY streams all rows in bounded pages for simple and extended protocols","gate":"sql-copy-out-protocol-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-postgres"}
+      ]
     },
     {
       "id": "sql-0374",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. COPY input and server-file/PROGRAM operations remain unsupported.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-native-debug"},
+        {"path":"zig/pkg/antfly/src/pgwire/protocol_test.zig","test":"pgwire COPY streams all rows in bounded pages for simple and extended protocols","gate":"sql-copy-out-protocol-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-postgres"}
+      ]
     },
     {
       "id": "sql-0375",
@@ -3883,14 +3896,12 @@
     },
     {
       "id": "sql-0378",
-      "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by UnsupportedSqlShape at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "status": "superseded",
+      "reason": "PostgreSQL accepts the unchanged COPY TO STDIN spelling as CopyOut, contrary to this historical rejection. Native execution matches its complete text output bytes over durable typed rows. This corrects an already-resolved disposition and does not reduce the unresolved count.",
       "evidence": [
-        {
-          "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
-          "test": "SQL exact original rejection contracts fail before backend access",
-          "gate": "sql-exact-rejection-contracts"
-        }
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-native-debug"},
+        {"path":"zig/pkg/antfly/src/pgwire/protocol_test.zig","test":"pgwire COPY streams all rows in bounded pages for simple and extended protocols","gate":"sql-copy-out-protocol-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-postgres"}
       ]
     },
     {
@@ -3922,8 +3933,13 @@
     },
     {
       "id": "sql-0383",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COPY TO STDOUT original executes through authenticated retained native read ownership over durable typed rows. PostgreSQL independently verifies complete COPY payload bytes, including NULL/empty/escaped fields and generated-column omission; wire tests cover simple/extended framing, bounded pages/frames, cancellation, revocation and nontruncation. COPY input and server-file/PROGRAM operations remain unsupported.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-native-debug"},
+        {"path":"zig/pkg/antfly/src/pgwire/protocol_test.zig","test":"pgwire COPY streams all rows in bounded pages for simple and extended protocols","gate":"sql-copy-out-protocol-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_pgwire.zig","test":"SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows","gate":"sql-copy-out-postgres"}
+      ]
     },
     {
       "id": "sql-0384",
