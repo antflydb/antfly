@@ -1725,3 +1725,55 @@ catalog conflicts. Formatting, Python lint, whitespace, staged license headers
 and the Apache boundary (2,074 sources) passed. Latest fetched origin/main
 `ce578d9033` is included. Representative archive-scale latency/RSS and
 live-provider retention qualification remain deferred.
+
+
+### Survivor projection and exact spill admission
+
+Scan-level SQL predicates pass an exact residual/delete/dynamic-filter mask
+into Parquet projection. Cursor-owned pages validate framing and retain decompressed wire
+payloads, definition coordinates and dictionary IDs. Projection converts only
+surviving primitive, timestamp and decimal values; strings borrow immutable page
+bytes. Eligible dictionary projections retain their dictionary identities for
+downstream expression/group kernels. Rejected positions remain masked SQL NULL
+placeholders in the original physical coordinate range. Misaligned column pages and later cohorts reuse the
+same validated framing. A partially projected vector never becomes a shared
+full-page cache entry. Broad page-local cohorts, complete cache hits and
+unsupported layouts retain their existing paths. Density uses the projection
+page intersection, even when predicate pages have different boundaries. Retained
+page allocators switch to stable cursor backing after workers join, before scoped
+locking adapters leave scope.
+
+Dynamic scan filters dispatch per primitive column and hash fixed 128-row stack
+windows, avoiding width-by-row Datum arrays. Dictionary memo state is bounded to
+one window. Exact NUMERIC, unsupported coercions and NaN domain bounds retain
+scalar semantics with reusable lane scratch. This applies equally to Parquet and
+Iceberg scans; complete index-driven dynamic joins keep their existing planner.
+
+AGS v2 checkpoint columns now restore exact NUMERIC SUM/AVG coefficients without
+Aggregate/OwnedRow reconstruction. Admission reserves the union of exponent
+ranges for every destination group before mutation. Raw NUMERIC spill blocks use
+the typed key census as well. Adaptive radix reduction includes exact states;
+file, descriptor and shared-workspace headroom constrain additional depth, and
+exact finalization leaves room for downstream delivery and sorting. DISTINCT and
+order-sensitive reducers retain their established exact paths. Wire formats and
+public tuning surfaces are unchanged.
+
+Retry selections have their own optional admission budget, so an oversized view
+can shrink before allocating from statement headroom. Required allocation
+failures still propagate. Vector-overlap qualification waits for archive entry
+and recognizes either lane-entry order. The real Parquet restart fixture also
+checks sparse wide/decimal/nullable projections; existing real Iceberg coverage
+exercises dictionary projections, schema evolution, partition pruning and deletes.
+
+Qualification: the full SQL gate passed 1,007 tests (three opt-in benchmarks
+skipped), all 513 native lake tests and the runtime I/O ABI gate passed with zero
+failures or leaks. Coverage includes retry-view pressure through direct and locked
+allocators, allocation-free dynamic filters, selected nullable/dictionary framing
+and ownership failures, exact coefficient unions, checkpoint truncation, and
+small-budget NUMERIC spill/sort execution. The archive/recent overlap fixture
+passed 10 consecutive focused runs. All 50 real Parquet/Iceberg E2Es passed in
+322.13 seconds against the final Debug CLI; its SHA-256 stayed unchanged across
+the run. Formatting, Python lint, whitespace, staged license headers and the
+Apache boundary (2,075 sources) passed. Latest fetched origin/main `ce578d9033`
+is included. Representative archive-scale latency/RSS and live-provider retention
+qualification remain deferred.

@@ -124,7 +124,7 @@ pub const Header = struct {
 /// Flat nullable V1 pages prefix the RLE definition stream with its byte length.
 /// Normalize the decompressed framing once; value kernels share V2 level logic.
 const FlatOptionalPage = struct { header: Header, payload: []const u8 };
-fn flatOptionalPage(original: Header, payload: []const u8) !FlatOptionalPage {
+pub fn flatOptionalPage(original: Header, payload: []const u8) !FlatOptionalPage {
     if (original.page_type != .data_page) return .{ .header = original, .payload = payload };
     if (original.definition_encoding != .rle) return error.UnsupportedParquetPage;
     if (payload.len < 4) return error.InvalidParquetPage;

@@ -3984,11 +3984,11 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
         gate: std.Io.Event = .unset,
         started: std.Io.Event = .unset,
         entered: std.Io.Event = .unset,
+        archive_entered: std.Io.Event = .unset,
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         calls: std.atomic.Value(usize) = .init(0),
         archive_active: std.atomic.Value(bool) = .init(false),
-        archive_overlap: std.atomic.Value(bool) = .init(false),
         fn part(raw: ?*anyopaque, alloc: A, _: types.SearchRequest, oversized: bool) !types.SearchResult {
             const execution = Execution.from(raw);
             const self: *@This() = @ptrCast(@alignCast(execution.server));
@@ -3997,8 +3997,8 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
             defer if (prefix == 0) {
                 self.archive_active.store(false, .release);
             };
-            if (prefix != 0 and self.archive_active.load(.acquire)) self.archive_overlap.store(true, .release);
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            if (prefix == 0) self.archive_entered.set(self.io);
             defer _ = self.active.fetchSub(1, .acq_rel);
             _ = self.calls.fetchAdd(1, .monotonic);
             self.entered.set(self.io);
@@ -4043,6 +4043,13 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
             try state.started.wait(io);
             try std.testing.expect(scheduling.io_workers > 0);
         }
+        if (mode == 0) {
+            try state.archive_entered.wait(io);
+            // The gate is still closed: archive plus at least one recent lane
+            // are simultaneously inside part(), independent of entry order.
+            try std.testing.expect(state.archive_active.load(.acquire));
+            try std.testing.expect(state.active.load(.acquire) >= 2);
+        }
         if (mode == 5) try state.entered.wait(io);
         joined = true;
         if (mode == 6) {
@@ -4061,7 +4068,6 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
         }
         if (mode == 0) {
             try std.testing.expect(state.peak.load(.acquire) >= 2);
-            try std.testing.expect(state.archive_overlap.load(.acquire));
         }
         if (mode == 1 or mode >= 4) try std.testing.expectEqual(@as(usize, 1), state.peak.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), state.active.load(.acquire));

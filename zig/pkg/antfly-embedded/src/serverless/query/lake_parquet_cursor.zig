@@ -30,6 +30,8 @@ pub const Cursor = struct {
     limits: parquet.MaterializationLimits,
     columns: []Column,
     position: u64 = 0,
+    selected: []const bool = &.{},
+    selected_values_decoded: usize = 0,
     /// Residual evidence is evaluated before projected payloads are decoded.
     filter: ?Filter = null,
     prune_ptr: ?*anyopaque = null,
@@ -41,9 +43,11 @@ pub const Cursor = struct {
     pub const Filter = struct {
         ptr: *anyopaque,
         any_match: *const fn (*anyopaque, types.ColumnBatch) anyerror!bool,
+        select: ?*const fn (*anyopaque, types.ColumnBatch) anyerror![]const bool = null,
     };
     const Column = struct {
         required: bool = true,
+        projection: ?*@import("lake_parquet_selected.zig") = null,
         directory: ?@import("lake_parquet_metadata.zig").PageDirectory = null,
         directory_lease: ?@import("lake_decoded_cache.zig").Lease = null,
         index_loaded: bool = false,
@@ -75,6 +79,7 @@ pub const Cursor = struct {
     }
     pub fn deinit(self: *Cursor) void {
         for (self.columns) |*column| {
+            if (column.projection) |projection| projection.destroyWithAllocator(self.a);
             if (column.decoded) |*decoded| decoded.deinit(self.a);
             if (column.cached) |lease| lease.release();
             if (column.directory_lease) |lease| lease.release() else if (column.directory) |*directory| directory.deinit();
@@ -156,6 +161,8 @@ pub const Cursor = struct {
         return try @import("lake_parquet_metadata.zig").parsePageDirectory(a, offsets.bytes, if (bounds) |v| v.bytes else null, column.chunk, self.group.row_count, self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len));
     }
     fn advance(self: *Cursor, column: *Column) !void {
+        if (column.projection) |projection| projection.destroyWithAllocator(self.a);
+        column.projection = null;
         if (column.decoded) |*decoded| decoded.deinit(self.a);
         column.decoded = null;
         if (column.cached) |lease| lease.release();
@@ -298,6 +305,24 @@ pub const Cursor = struct {
             }
             const count: usize = parsed.header.value_count;
             if (count == 0 or column.first + count > self.group.row_count) return error.ParquetRowGroupRowCountMismatch;
+            // A broad cohort benefits from a reusable complete decode. Choose
+            // sparse projection from this page's actual mask intersection,
+            // rather than a differently aligned predicate page's density.
+            const start: usize = @intCast(self.position - column.first);
+            const considered = @min(self.selected.len, count - start);
+            var survivors: usize = 0;
+            for (self.selected[0..considered]) |active| survivors += @intFromBool(active);
+            const sparse = considered != 0 and survivors <= considered / 2;
+            if (!column.required and sparse) {
+                if (try @import("lake_parquet_selected.zig").create(self.a, column.chunk, parsed.header, encoded[parsed.header_len..], column.dictionary, self.limits.max_decoded_bytes / share *| 2 +| self.limits.max_struct_allocation_bytes / share)) |projection| {
+                    column.projection = projection;
+                    column.count = count;
+                    column.consumed = @intCast(self.position - column.first);
+                    self.pages_decoded += 1;
+                    if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
+                    return;
+                }
+            }
             var limits = self.limits;
             limits.decimal_representation = .exact_string;
             limits.max_decoded_bytes = self.limits.max_decoded_bytes / share - dictionary_bytes;
@@ -511,6 +536,8 @@ pub const Cursor = struct {
         return .{ .pages = worker.pages_decoded, .dictionaries = worker.dictionary_decodes };
     }
     fn advanceColumns(self: *Cursor, required_only: bool) !void {
+        // Scoped decode locks never escape into retained page allocators.
+        defer for (self.columns) |column| if (column.projection) |projection| projection.stabilize(self.a);
         // Index arenas outlive this call. Their backing allocator must be the
         // cursor allocator, never the temporary worker locking adapter.
         for (self.columns) |*column| {
@@ -577,6 +604,14 @@ pub const Cursor = struct {
         var vectors: std.ArrayList(types.ColumnVector) = .empty;
         for (self.columns) |*column| {
             if (required_only and !column.required) continue;
+            if (column.projection) |projection| {
+                const begin: usize = @intCast(self.position - column.first);
+                if (count > self.selected.len) return error.InvalidParquetPage;
+                const previous = projection.converted;
+                try vectors.append(a, try projection.project(a, begin, self.selected[0..count]));
+                self.selected_values_decoded += projection.converted - previous;
+                continue;
+            }
             const decoded = if (column.cached) |lease| lease.item.payload.columns[0] else column.decoded.?.columns[0];
             const begin: usize = @intCast(self.position - column.first);
             var vector = decoded;
@@ -593,6 +628,7 @@ pub const Cursor = struct {
     pub fn next(self: *Cursor) !?types.ColumnBatch {
         while (self.position < self.group.row_count) {
             _ = self.output.reset(.free_all);
+            self.selected = &.{};
             if (self.columns.len == 0) {
                 const count: usize = @intCast(@min(@as(u64, 4096), self.group.row_count - self.position));
                 const result = try self.batch(count, false);
@@ -610,7 +646,21 @@ pub const Cursor = struct {
                 const rejected = for (self.columns) |column| {
                     if (column.required and column.pruned) break true;
                 } else false;
-                if (rejected or !try filter.any_match(filter.ptr, try self.batch(count, true))) {
+                if (rejected) {
+                    self.position += count;
+                    continue;
+                }
+                const evidence = try self.batch(count, true);
+                if (filter.select) |select| {
+                    self.selected = try select(filter.ptr, evidence);
+                    if (self.selected.len != count) return error.InvalidParquetPage;
+                    if (for (self.selected) |active| {
+                        if (active) break false;
+                    } else true) {
+                        self.position += count;
+                        continue;
+                    }
+                } else if (!try filter.any_match(filter.ptr, evidence)) {
                     self.position += count;
                     continue;
                 }

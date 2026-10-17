@@ -1250,33 +1250,51 @@ pub const Grouped = struct {
     }
     pub fn addEncodedColumnsIdentified(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !void {
         if (try self.addEncodedWindow(keys, inputs, count, identity)) return;
-        const Batch = @import("execution_batch.zig").Batch;
-        var scratch = std.heap.ArenaAllocator.init(self.backing);
-        defer scratch.deinit();
         var begin: usize = 0;
         var length = @max(@as(usize, 1), count / 2);
         while (begin < count) {
-            _ = scratch.reset(.free_all);
-            const a = scratch.allocator();
             length = @min(length, count - begin);
-            const selection = try a.alloc(usize, length);
-            for (selection, begin..) |*row, i| row.* = i;
-            const key_parts = try a.alloc(Batch, keys.len);
-            const input_parts = try a.alloc(Batch, inputs.len);
-            for (keys, key_parts) |*column, *part| part.* = try column.select(a, selection);
-            for (inputs, input_parts) |*column, *part| part.* = try column.select(a, selection);
-            const ids: ?InputIdentity = if (identity) |value| .{ .ordinals = value.ordinals[begin..][0..length], .hashes = value.hashes[begin..][0..length] } else null;
-            if (try self.addEncodedWindow(key_parts, input_parts, length, ids)) {
+            if (try self.retryEncodedWindow(keys, inputs, begin, length, identity)) {
                 begin += length;
                 length *|= 2;
             } else length = @max(@as(usize, 1), length / 2);
         }
     }
+    /// Selection construction is optional admission too. Release the whole
+    /// retry view before reducing its size; never pin a failed large prefix.
+    fn retryEncodedWindow(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, begin: usize, length: usize, identity: ?InputIdentity) !bool {
+        var workspace: MemoryBudget = .{ .backing = self.backing, .limit = @min(2 * 1024 * 1024, (MemoryBudget.headroom(self.backing) orelse 4 * 1024 * 1024) / 2) };
+        var scratch = std.heap.ArenaAllocator.init(workspace.allocator());
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const Parts = struct {
+            fn build(alloc: Allocator, columns: []const @import("execution_batch.zig").Batch, selected: []const usize) ![]@import("execution_batch.zig").Batch {
+                const parts = try alloc.alloc(@import("execution_batch.zig").Batch, columns.len);
+                for (columns, parts) |*column, *part| part.* = try column.select(alloc, selected);
+                return parts;
+            }
+        };
+        const selection = a.alloc(usize, length) catch |err| {
+            if (workspace.isExhausted() and length > 1) return false;
+            return err;
+        };
+        for (selection, begin..) |*row, i| row.* = i;
+        const key_parts = Parts.build(a, keys, selection) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted() and length > 1) return false;
+            return err;
+        };
+        const input_parts = Parts.build(a, inputs, selection) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted() and length > 1) return false;
+            return err;
+        };
+        const ids: ?InputIdentity = if (identity) |value| .{ .ordinals = value.ordinals[begin..][0..length], .hashes = value.hashes[begin..][0..length] } else null;
+        return self.addEncodedWindow(key_parts, input_parts, length, ids);
+    }
     /// Atomic admission probe for a native reducer page. False consumes no
     /// rows or retained groups, allowing an owning spill reader to switch modes.
     pub fn tryAddEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: InputIdentity) !bool {
         if (count < 2 or keys.len == 0 or self.external != null) return false;
-        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) return false;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or (spec.input_element == .numeric and !exactMergeable(spec))) return false;
         return self.addEncodedWindow(keys, inputs, count, identity);
     }
     /// Validate and admit a bounded columnar checkpoint window atomically.
@@ -1288,7 +1306,7 @@ pub const Grouped = struct {
         for (self.specs, self.state_columns) |spec, column| {
             if (!partial.fixedEligible(spec)) return false;
             switch (column.values) {
-                .counts, .integers, .booleans, .bytes => {},
+                .counts, .integers, .booleans, .bytes, .exact => {},
                 else => return false,
             }
         }
@@ -1307,7 +1325,7 @@ pub const Grouped = struct {
         const states = try a.alloc([]partial.Fixed, inputs.len);
         for (inputs, self.specs, states) |column, spec, *values| {
             values.* = try a.alloc(partial.Fixed, count);
-            for (values.*, 0..) |*state, row| state.* = (try partial.decodeFixed(try column.cell(a, row, 0), spec)) orelse return false;
+            for (values.*, 0..) |*state, row| state.* = (try partial.decodeFixed(a, try column.cell(a, row, 0), spec)) orelse return false;
         }
         const physical = try a.alloc(?@import("execution_batch.zig").PhysicalColumn, keys.len);
         for (keys, physical) |column, *view| {
@@ -1331,6 +1349,28 @@ pub const Grouped = struct {
         needed +|= self.key_columns.appendGrowthBytes(additional);
         for (self.state_columns, states) |*column, values| {
             needed +|= column.appendGrowth(additional);
+            if (column.values == .exact) {
+                // Admit the union of all coefficient exponents per destination,
+                // including multiple checkpoints for the same new group.
+                var high: [64]?i32 = @splat(null);
+                var low: [64]i64 = undefined;
+                for (values, census.rows) |state, representative| {
+                    const exact = state.numeric orelse return error.InvalidSqlSpill;
+                    if (exact.buckets.items.len == 0) continue;
+                    const bottom = @as(i64, exact.weight) - @as(i64, @intCast(exact.buckets.items.len)) + 1;
+                    if (high[representative]) |previous| {
+                        high[representative] = @max(previous, exact.weight);
+                        low[representative] = @min(low[representative], bottom);
+                    } else {
+                        high[representative] = exact.weight;
+                        low[representative] = bottom;
+                    }
+                }
+                for (census.representatives, 0..) |entry, index| if (high[index]) |weight| {
+                    const length: usize = @intCast(@as(i64, weight) - low[index] + 1);
+                    needed +|= column.numericGrowth(entry.existing, weight, length);
+                };
+            }
             if (column.values == .bytes) {
                 const maxima = try a.alloc(usize, census.representatives.len);
                 @memset(maxima, 0);
@@ -1467,7 +1507,7 @@ pub const Grouped = struct {
             }
         }
         var fast = self.external == null and count > 1;
-        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or (spec.input_element == .numeric and !exactMergeable(spec))) {
             fast = false;
         };
         // Optional census workspace is independently reclaimable. A declined
@@ -1520,6 +1560,37 @@ pub const Grouped = struct {
                 needed +|= self.key_columns.appendGrowthBytes(additional);
                 for (self.state_columns) |*state| needed +|= state.appendGrowth(additional);
             }
+            for (self.state_columns, inputs) |*state, column| if (state.values == .exact) {
+                const high = ca.alloc(?i32, groups_.representatives.len) catch |err| {
+                    if (err == error.OutOfMemory and census_budget.isExhausted() and count > 1) return false;
+                    return err;
+                };
+                const low = ca.alloc(i64, groups_.representatives.len) catch |err| {
+                    if (err == error.OutOfMemory and census_budget.isExhausted() and count > 1) return false;
+                    return err;
+                };
+                @memset(high, null);
+                for (groups_.rows, 0..) |representative, row| {
+                    const input = column.cell(ca, row, 0) catch |err| {
+                        if (err == error.OutOfMemory and census_budget.isExhausted() and count > 1) return false;
+                        return err;
+                    };
+                    if (input.sql_null) continue;
+                    const number = input.numeric orelse return error.SqlTypeMismatch;
+                    if (number.kind != .finite or number.digits.len == 0) continue;
+                    const bottom = @as(i64, number.weight) - @as(i64, @intCast(number.digits.len)) + 1;
+                    if (high[representative]) |previous| {
+                        high[representative] = @max(previous, number.weight);
+                        low[representative] = @min(low[representative], bottom);
+                    } else {
+                        high[representative] = number.weight;
+                        low[representative] = bottom;
+                    }
+                }
+                for (groups_.representatives, 0..) |representative, index| if (high[index]) |weight| {
+                    needed +|= state.numericGrowth(representative.existing, weight, @intCast(@as(i64, weight) - low[index] + 1));
+                };
+            };
             for (self.specs, self.state_columns, inputs, physical_inputs) |spec, *state, column, native| if (spec.kind == .min or spec.kind == .max) {
                 var growth: usize = 0;
                 if (native) |view| {
@@ -1538,7 +1609,7 @@ pub const Grouped = struct {
             // entire page. Admit bounded prefixes before spilling the suffix.
             // Existing fixed-width groups need no new retained allocation.
             var typed = self.external == null;
-            for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
+            for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or (spec.input_element == .numeric and !exactMergeable(spec))) {
                 typed = false;
             };
             if (typed and count > 1) return false;
@@ -3496,10 +3567,10 @@ test "SQL compact retained physical admission under shared pressure" {
     defer store.deinit();
     for (0..4096) |_| _ = try store.append(&.{Datum.json(.{ .integer = 7 })});
     const keys: Batch = .{ .retained = .{ .store = &store, .count = 4096 } };
-    for ([_]bool{ false, true }) |batched| for ([_]bool{ false, true }) |wrapped| {
+    for ([_]usize{ 960, 1000, 1008 }) |reserved| for ([_]bool{ false, true }) |batched| for ([_]bool{ false, true }) |wrapped| {
         var quota: MemoryBudget = .{ .backing = a, .limit = 1024 * 1024 };
         const qa = quota.allocator();
-        const reservation = try qa.alloc(u8, 960 * 1024);
+        const reservation = try qa.alloc(u8, reserved * 1024);
         defer qa.free(reservation);
         var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = qa };
         const group = try Grouped.create(if (wrapped) locked.allocator() else qa, &.{.{ .kind = .count }}, .{ .bytes = 64 * 1024 });
@@ -3507,4 +3578,46 @@ test "SQL compact retained physical admission under shared pressure" {
         if (batched) try group.addEncodedColumns(&.{keys}, &.{keys}, 4096) else for (0..4096) |_| try group.add(&.{Datum.json(.{ .integer = 7 })}, &.{Datum.json(.{ .integer = 7 })});
         try std.testing.expectEqual(@as(u64, 4096), group.rows_seen);
     };
+}
+
+test "SQL exact NUMERIC checkpoint columns admit exponent unions and preserve SUM AVG" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const specs = [_]AggregateSpec{ .{ .kind = .sum, .input_type = .number, .input_element = .numeric }, .{ .kind = .avg, .input_type = .number, .input_element = .numeric } };
+    var keys: [32]Datum = undefined;
+    var sums: [32]Datum = undefined;
+    var averages: [32]Datum = undefined;
+    var ordinals: [32]u64 = undefined;
+    var work: @import("array_value.zig").Budget = .{};
+    for (&keys, &sums, &averages, &ordinals, 0..) |*key, *sum, *average, *ordinal, i| {
+        key.* = Datum.json(.{ .integer = @intCast(i % 2) });
+        ordinal.* = 100 - i;
+        const input = try scalar.numericTextLeaky(pa, if (i % 4 < 2) "10000.0000" else "0.0001", &work);
+        var sum_state = try Aggregate.initTyped(a, .sum, .number, .numeric);
+        defer sum_state.deinit();
+        var avg_state = try Aggregate.initTyped(a, .avg, .number, .numeric);
+        defer avg_state.deinit();
+        try sum_state.update(input);
+        try avg_state.update(input);
+        sum.* = try @import("aggregate_partial.zig").cell(pa, sum_state);
+        average.* = try @import("aggregate_partial.zig").cell(pa, avg_state);
+    }
+    const Batch = @import("execution_batch.zig").Batch;
+    const grouped = try Grouped.create(a, &specs, .{ .bytes = 128 * 1024 });
+    defer grouped.deinit();
+    const key_batch: Batch = .{ .vectors = .{ .values = &.{&keys}, .count = keys.len } };
+    const sum_batch: Batch = .{ .vectors = .{ .values = &.{&sums}, .count = sums.len } };
+    const avg_batch: Batch = .{ .vectors = .{ .values = &.{&averages}, .count = averages.len } };
+    try std.testing.expect(try grouped.tryImportPartialBatch(&.{key_batch}, &.{ sum_batch, avg_batch }, 32, &ordinals));
+    var count: usize = 0;
+    while (try grouped.nextResult(pa)) |result| {
+        const expected_sum = try scalar.numericTextLeaky(pa, "80000.0008", &work);
+        const expected_avg = try scalar.numericTextLeaky(pa, "5000.00005", &work);
+        try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(expected_sum, result.aggregates[0]));
+        try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(expected_avg, result.aggregates[1]));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 }

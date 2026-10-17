@@ -268,8 +268,13 @@ pub const Grouped = struct {
     /// observed hashes must separate before another pass is admitted.
     fn repartitionShift(self: *Grouped, keys: []const Datum) !?u6 {
         if (self.repartition_depth >= 8 or keys.len == 0 or self.sort.manager.fileHeadroom() < 16) return null;
-        // Exponent-gap NUMERIC growth retains its precise ordered admission.
-        for (self.specs) |spec| if (spec.input_element == .numeric) return null;
+        // A radix child keeps its parent descriptor live. Leave room for a
+        // second (sorted) fallback plus decode/output work before adding depth.
+        // Descriptor admission matters independently of the spill-file count.
+        if (@import("memory_budget.zig").headroom(self.a)) |available| {
+            const reserve = 2 * @sizeOf(Grouped) + @sizeOf(operators.Grouped) + @min(self.bytes / 2, 256 * 1024) + 32 * 1024;
+            if (available < reserve) return null;
+        }
         const consumed = @as(usize, self.hash_shift) + std.math.log2_int(usize, self.partition_count);
         if (consumed >= 64) return null;
         const current = try keyHash(keys);
@@ -403,7 +408,15 @@ pub const Grouped = struct {
             const index = self.partition_index;
             self.partition_index += 1;
             if (self.partitions[index] == null and self.partition_inputs[index].items.len == 0) continue;
-            self.local = try operators.Grouped.create(self.a, self.specs, .{ .bytes = self.bytes / 2, .groups = std.math.maxInt(usize) });
+            var retained = self.bytes / 2;
+            for (self.specs) |spec| if (spec.input_element == .numeric) {
+                // Exact finalization can own a coefficient, a rendered result
+                // and downstream sort payload simultaneously. Reserve shared
+                // headroom for delivery before retaining this hash partition.
+                if (@import("memory_budget.zig").headroom(self.a)) |available| retained = @min(retained, available / 4);
+                break;
+            };
+            self.local = try operators.Grouped.create(self.a, self.specs, .{ .bytes = retained, .groups = std.math.maxInt(usize) });
             if (self.partitions[index]) |*file| {
                 try self.loadFile(file, 0);
                 file.close();
@@ -421,7 +434,7 @@ pub const Grouped = struct {
     }
     fn reduceNativeBlock(self: *Grouped, block: *spill.Sequential.OwnedBlock, ordinal_base: u64) !usize {
         if (self.fallback != null or block.count() < 2 or block.count() > 256 or block.width() != self.specs.len + 1) return 0;
-        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) return 0;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) return 0;
         const partial_state = (try block.cell(0, 0)).value == .bool and (try block.cell(0, 0)).value.bool;
         for (0..block.count()) |row| {
             const marker = try block.cell(row, 0);
@@ -445,7 +458,7 @@ pub const Grouped = struct {
         for (keys, 0..) |*column, i| column.* = try key_values.project(a, i);
         for (inputs, self.specs, 0..) |*column, spec, i| {
             column.* = try values.project(a, i + 1);
-            if (!partial_state and (spec.kind == .sum or spec.kind == .avg)) {
+            if (!partial_state and spec.input_element != .numeric and (spec.kind == .sum or spec.kind == .avg)) {
                 const native = (try column.physicalColumn(a, 0)) orelse return 0;
                 if (native.kind != .integer) return 0;
             }
@@ -987,4 +1000,45 @@ test "SQL partitioned native checkpoints merge columns and adaptive radix preser
     try refinementScenario(a, .pressured, 512);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, refinementScenario, .{ .partials, @as(usize, 4) });
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, refinementScenario, .{ .radix, @as(usize, 4) });
+}
+
+test "SQL exact NUMERIC raw and checkpoint blocks reduce typed columns" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .sum, .input_type = .number, .input_element = .numeric }, .{ .kind = .avg, .input_type = .number, .input_element = .numeric } };
+    for ([_]bool{ false, true }) |partial_state| {
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check, .async_writes = false };
+        defer manager.deinit();
+        var group = try Grouped.init(a, &manager, &specs, 1, 256 * 1024);
+        group.parallel = false;
+        defer group.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const pa = arena.allocator();
+        var work: @import("array_value.zig").Budget = .{};
+        const input = try scalar.numericTextLeaky(pa, "1.25", &work);
+        var states: [2]operators.Aggregate = undefined;
+        for (&states, specs) |*state, spec| state.* = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        defer for (&states) |*state| state.deinit();
+        for (&states) |*state| try state.update(input);
+        for (0..1024) |row| {
+            const key = Datum.json(.{ .integer = @intCast(row % 16) });
+            if (partial_state) try group.partial(&.{key}, &states, row) else try group.add(&.{key}, &.{ input, input }, row);
+        }
+        var output = std.heap.ArenaAllocator.init(a);
+        defer output.deinit();
+        var count: usize = 0;
+        while (true) {
+            _ = output.reset(.free_all);
+            const result = (try group.next(output.allocator())) orelse break;
+            const expected = try scalar.numericTextLeaky(output.allocator(), "80.00", &work);
+            try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(expected, result.aggregates[0]));
+            try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(input, result.aggregates[1]));
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 16), count);
+        try std.testing.expect(if (partial_state) group.partial_reduced_rows > 0 else group.native_reduced_rows > 0);
+    }
 }

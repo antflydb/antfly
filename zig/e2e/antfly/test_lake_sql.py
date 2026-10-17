@@ -5491,6 +5491,8 @@ def test_remote_transform_dependencies_bound_wide_candidate_sources(tmp_path):
 
 def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp_path):
     """A 20,000-row file plus tiny files exercises cold rolling scan workers."""
+    from decimal import Decimal
+
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     psycopg = pytest.importorskip("psycopg")
@@ -5509,6 +5511,14 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                     # Preserve >2 MiB of source bytes so ordinary SQL delivery
                     # admits its ordered worker path, regardless of compression.
                     "payload": ["x" * 256] * count,
+                    "amount_decimal": pa.array(
+                        [Decimal(i).scaleb(-2) for i in range(total, total + count)],
+                        type=pa.decimal128(20, 2),
+                    ),
+                    "maybe": [
+                        None if i % 7 == 0 else "kept"
+                        for i in range(total, total + count)
+                    ],
                 }
             ),
             path,
@@ -5597,6 +5607,19 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                         f"SELECT amount FROM skew_scan LIMIT {total}", size=137
                     )
                 ]
+            # Sparse survivor masks precede wide/decimal projection decoding.
+            # Check both a surviving NULL and a nonnull value after each restart.
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount, payload, amount_decimal, maybe FROM skew_scan WHERE amount >= 250 AND amount <= 252 ORDER BY amount"
+                },
+            )["rows"] == [
+                ["250", "x" * 256, "2.50", "kept"],
+                ["251", "x" * 256, "2.51", "kept"],
+                ["252", "x" * 256, "2.52", None],
+            ]
             delivered = []
             with (
                 psycopg.connect(

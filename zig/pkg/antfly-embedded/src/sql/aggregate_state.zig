@@ -490,6 +490,9 @@ pub const Column = struct {
             .counts => |*target| for (ids, states) |id, from| {
                 target.items[id] = try mergedCount(target.items[id], from.count);
             },
+            .exact => |*target| for (ids, states) |id, from| {
+                try target.items[id].merge(from.numeric orelse return error.InvalidSqlBackendResponse);
+            },
             .integers => |*target| for (ids, states) |id, from| {
                 const to = &target.items[id];
                 const count = try mergedCount(to.count, from.count);

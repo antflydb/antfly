@@ -370,6 +370,12 @@ pub const Stream = struct {
         return filter.any_match(filter.ptr, try self.logicalBatch(batch));
     }
 
+    fn selectMask(raw: *anyopaque, batch: types.ColumnBatch) anyerror![]const bool {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        const filter = self.filter.?;
+        return filter.select.?(filter.ptr, try self.logicalBatch(batch));
+    }
+
     fn pageMayMatch(raw: *anyopaque, chunk: external.ColumnChunk, page: @import("lake_parquet_metadata.zig").IndexedPage) bool {
         const self: *Stream = @ptrCast(@alignCast(raw));
         if (self.selection) |selection| {
@@ -993,7 +999,7 @@ pub const Stream = struct {
                         // A driver supplies row ordinals for ID-only or missing
                         // nullable predicates; other columns remain deferred.
                         if (required == 0 and self.page_cursor.?.columns.len != 0) self.page_cursor.?.columns[0].required = true;
-                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch };
+                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch, .select = if (self.filter.?.select != null) selectMask else null };
                     }
                     const batch = try self.page_cursor.?.next();
                     if (batch == null) {

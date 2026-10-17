@@ -231,25 +231,35 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
 
 /// Borrowed primitive checkpoint lanes. The AGS wire version and signature are
 /// identical to scalar restore; extrema borrow their winning payload until merge.
-pub const Fixed = struct { count: u64, sum: i128, boolean: bool, selected: Datum };
+pub const Fixed = struct { count: u64, sum: i128, boolean: bool, selected: Datum, numeric: ?@import("numeric_aggregate.zig").State = null };
 pub fn fixedEligible(spec: operators.AggregateSpec) bool {
-    return !spec.distinct and operators.exactMergeable(spec) and spec.input_element != .numeric and spec.kind != .pattern_set;
+    return !spec.distinct and operators.exactMergeable(spec) and spec.kind != .pattern_set;
 }
-pub fn decodeFixed(value: Datum, spec: operators.AggregateSpec) !?Fixed {
+pub fn decodeFixed(a: A, value: Datum, spec: operators.AggregateSpec) !?Fixed {
     if (!fixedEligible(spec)) return null;
     if (value.sql_null or value.value != .string or value.patterns != null or value.array != null or value.numeric != null) return error.InvalidSqlSpill;
-    var decoder: Decoder = .{ .a = undefined, .bytes = value.value.string };
+    var decoder: Decoder = .{ .a = a, .bytes = value.value.string };
     if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
     const signature = try decoder.raw(5);
     if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != 0 or signature[3] > 1 or signature[4] != elementId(spec.input_element)) return error.InvalidSqlSpill;
     const count = try decoder.integer(u64);
     if (count > std.math.maxInt(i64)) return error.InvalidSqlSpill;
     const sum = try decoder.integer(i128);
-    for (0..3) |_| {
-        const number: f64 = @bitCast(try decoder.integer(u64));
-        if (!std.math.isFinite(number)) return error.InvalidSqlSpill;
+    var numbers: [3]f64 = undefined;
+    for (&numbers) |*number| {
+        number.* = @bitCast(try decoder.integer(u64));
+        if (!std.math.isFinite(number.*)) return error.InvalidSqlSpill;
     }
-    if (try decoder.integer(u8) != 0) return error.InvalidSqlSpill;
+    const exact = spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg);
+    if (try decoder.integer(u8) != @intFromBool(exact)) return error.InvalidSqlSpill;
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+    var numeric: ?@import("numeric_aggregate.zig").State = if (exact) @import("numeric_aggregate.zig").decode(&context, try decoder.text()) catch |err| return switch (err) {
+        error.InvalidNumericAggregateState => error.InvalidSqlSpill,
+        else => err,
+    } else null;
+    var retained = false;
+    defer if (!retained) if (numeric) |*state| state.deinit(a);
+    if (numeric) |state| if (state.count != count or sum != 0 or numbers[0] != 0 or numbers[1] != 0 or numbers[2] != 0 or signature[3] != 0) return error.InvalidSqlSpill;
     const selected: Datum = switch (try decoder.integer(u8)) {
         0 => .{},
         2 => blk: {
@@ -274,7 +284,8 @@ pub fn decodeFixed(value: Datum, spec: operators.AggregateSpec) !?Fixed {
         if (!valid) return error.InvalidSqlSpill;
     }
     if (try decoder.integer(u64) != 0 or try decoder.integer(u64) != std.math.maxInt(u64) or decoder.position != decoder.bytes.len) return error.InvalidSqlSpill;
-    return .{ .count = count, .sum = sum, .boolean = signature[3] == 1, .selected = selected };
+    retained = true;
+    return .{ .count = count, .sum = sum, .boolean = signature[3] == 1, .selected = selected, .numeric = numeric };
 }
 
 pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggregate {
@@ -687,14 +698,35 @@ test "SQL partial primitive checkpoint lanes validate signatures truncation and 
         try state.update(value);
         const encoded = try cell(a, state);
         defer a.free(encoded.value.string);
-        const lane = (try decodeFixed(encoded, spec)).?;
+        const lane = (try decodeFixed(a, encoded, spec)).?;
         try std.testing.expectEqual(state.count, lane.count);
         try std.testing.expectEqual(state.integer_sum, lane.sum);
         try std.testing.expectEqual(state.boolean, lane.boolean);
         if (state.selected) |selected| try std.testing.expectEqualDeep(selected.row.values[0], lane.selected);
-        for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
+        for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
         var wrong = spec;
         wrong.input_type = .json;
-        if (fixedEligible(wrong) and spec.input_type != .json) try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(encoded, wrong));
+        if (fixedEligible(wrong) and spec.input_type != .json) try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, encoded, wrong));
+    }
+}
+
+test "SQL exact NUMERIC checkpoint lanes validate full signatures and truncated coefficients" {
+    const a = std.testing.allocator;
+    for ([_]operators.Aggregate.Kind{ .sum, .avg }) |kind| {
+        var state = try operators.Aggregate.initTyped(a, kind, .number, .numeric);
+        defer state.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var work: @import("array_value.zig").Budget = .{};
+        for ([_][]const u8{ "10000.0000", "0.0001", "-1.25", "Infinity", "-Infinity", "NaN" }) |text| try state.update(try @import("scalar.zig").numericTextLeaky(arena.allocator(), text, &work));
+        const encoded = try cell(a, state);
+        defer a.free(encoded.value.string);
+        const spec: operators.AggregateSpec = .{ .kind = kind, .input_type = .number, .input_element = .numeric };
+        var lane = (try decodeFixed(a, encoded, spec)).?;
+        defer lane.numeric.?.deinit(a);
+        try std.testing.expectEqual(state.count, lane.count);
+        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+        try std.testing.expect(try lane.numeric.?.equivalent(&context, state.numeric.?.state));
+        for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
     }
 }
