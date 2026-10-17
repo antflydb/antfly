@@ -25,6 +25,10 @@ test {
     // Preparation owns the schema compiler as well as SQL declaration
     // lowering. Discover its explicit cross-layer ownership contracts here.
     _ = @import("antfly_local_sources").schema_mod;
+    _ = @import("antfly_local_sources").storage_db_relational_nullability;
+    _ = @import("antfly_local_sources").storage_db_relational_predicate;
+    _ = @import("antfly_local_sources").storage_db_relational_predicate_implication;
+    _ = @import("antfly_local_sources").storage_db_relational_index_predicate;
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

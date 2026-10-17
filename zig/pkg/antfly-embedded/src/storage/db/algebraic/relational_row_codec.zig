@@ -1203,6 +1203,19 @@ pub const OrdinalRowView = struct {
         return self.layout.ordinalForName(self.table_schema.relational_columns, name);
     }
 
+    /// SQL NULL is absence or an explicit null bit, never a JSON null datum.
+    /// The view constructor authenticates this metadata before exposing it.
+    /// This probes no value payload and does not certify unread payload bytes;
+    /// decoding, whole-row validation and restore keep their existing checks.
+    pub fn isSqlNull(self: OrdinalRowView, ordinal: usize) !bool {
+        if (ordinal >= self.table_schema.relational_columns.len) return error.RelationalRowSchemaMismatch;
+        if (self.parsed.capabilities & capability_sparse_slots != 0) {
+            const entry = sparseEntryIndex(self.parsed, ordinal) orelse return true;
+            return sparseEntryIsNull(self.parsed, entry);
+        }
+        return !bitmapBit(self.parsed.present, ordinal) or bitmapBit(self.parsed.nulls, ordinal);
+    }
+
     pub fn findCell(self: OrdinalRowView, ordinal: usize) !?Cell {
         if (ordinal >= self.table_schema.relational_columns.len) return null;
         if (self.checksum_groups) |groups| {
@@ -2763,6 +2776,55 @@ test "ordinal checksum groups skip unrelated fixed slots but verify distant offs
     @memcpy(corrupted, raw);
     corrupted[fixed_start + layout.fixed_len] ^= 1;
     try std.testing.expectError(error.RelationalRowChecksumMismatch, ordinalRowViewSelective(corrupted, table, &layout));
+}
+
+test "relational nullness probes authenticate metadata without reading dense or sparse payloads" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 5, 128 }) |width| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const columns = try owned.alloc(runtime_schema.RelationalColumn, width);
+        for (columns, 0..) |*column, i| {
+            const name = try std.fmt.allocPrint(owned, "c{d}", .{i});
+            column.* = .{ .name = name, .path = name, .column_type = .string, .allows_null = true };
+        }
+        columns[0].column_type = .boolean;
+        columns[1].column_type = .json;
+        columns[1].is_json = true;
+        const table = runtime_schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = columns };
+        var layout = try PhysicalLayout.init(a, table);
+        defer layout.deinit();
+        const payload = try owned.alloc(u8, 256 * 1024);
+        @memset(payload, 'x');
+        const cells = [_]Cell{
+            .{ .ordinal = 0, .path = "c0", .value_type = .bool_val, .value = .{ .bool_val = false } },
+            .{ .ordinal = 1, .path = "c1", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "null" } },
+            .{ .ordinal = 2, .path = "c2", .value_type = .bytes_val, .is_null = true, .value = .{ .bytes_val = "" } },
+            .{ .ordinal = 4, .path = "c4", .value_type = .bytes_val, .value = .{ .bytes_val = payload } },
+        };
+        const encoded = try serializeOrdinal(a, 1, columns, &cells, @splat(0));
+        defer a.free(encoded);
+        const row = try ordinalRowViewSelective(encoded, table, &layout);
+        try std.testing.expectEqual(width == 128, row.parsed.capabilities & capability_sparse_slots != 0);
+        try std.testing.expect(!(try row.isSqlNull(0)));
+        try std.testing.expect(!(try row.isSqlNull(1))); // JSON null is a datum.
+        try std.testing.expect(try row.isSqlNull(2));
+        try std.testing.expect(try row.isSqlNull(3)); // Absent.
+        try std.testing.expect(!(try row.isSqlNull(4)));
+        try std.testing.expectError(error.RelationalRowSchemaMismatch, row.isSqlNull(width));
+        try std.testing.expect(row.checksum_groups != null);
+        const body = (try row.findCell(4)).?.value.bytes_val;
+        encoded[@intFromPtr(body.ptr) - @intFromPtr(encoded.ptr) + body.len - 1] ^= 1;
+        const selective = try ordinalRowViewSelective(encoded, table, &layout);
+        // Nullness observes only the authenticated metadata. Reading the value
+        // or the complete row must still detect the damaged, unread body.
+        try std.testing.expect(!(try selective.isSqlNull(4)));
+        try std.testing.expectError(error.RelationalRowChecksumMismatch, selective.findCell(4));
+        try std.testing.expectError(error.RelationalRowChecksumMismatch, validateOrdinalWithLayout(encoded, table, &layout));
+        encoded[ordinal_write_timestamp_offset] ^= 1;
+        try std.testing.expectError(error.RelationalRowChecksumMismatch, ordinalRowViewSelective(encoded, table, &layout));
+    }
 }
 
 test "ordinal rows bind layout support projection checksum and canonical bytes" {

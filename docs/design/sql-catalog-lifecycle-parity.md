@@ -10896,3 +10896,63 @@ That final retry passes all seven mounted nullability/default lifecycle and
 strict acknowledgement/admission companions, including the shifted-clock
 regression, with zero skips or leaks and 80/80 build steps
 (`/private/tmp/antfly-sql-nullability-cow-clock-retry-debug.log`).
+
+### Projected typed-row null validation
+
+`storage/db/relational_nullability.zig` now provides the read-side constraint
+projection. Its plan owns only requested column names; each retained physical
+layout binds them to its own ordinals. A historical absence is SQL NULL,
+whereas present JSON null, zero and false remain nonnull datums. A binding
+rejects a different layout/column identity even if schema version numbers
+coincide. Compilation is bounded, unwinds allocation failures and accepts an
+owner execution checkpoint without introducing API/runtime ABI dependencies
+into the portable decoder. Row checks allocate nothing and checkpoint wide
+projections. The caller still owns the immutable schema pin.
+
+The shared AROW view exposes a presence/null-metadata probe: O(1) for dense
+rows and one sparse-directory search for sparse rows. Native IS NULL/IS NOT
+NULL predicates now use it instead of constructing an ordered comparison key
+for the complete value. The regression uses a 2 MiB worst-case escaped string
+and a one-byte allocator, asserting zero comparison-scratch allocation.
+Metadata checksum failures remain fatal before probing; value reads and strict
+restore/canonical verification retain their payload checks. A metadata-only
+probe explicitly does not authenticate or certify unread payload bytes.
+
+The four focused Debug tests pass, including allocation-failure, cancellation,
+historical-layout, dense/sparse and integrity-boundary coverage
+(`/private/tmp/antfly-sql-nullability-projection-focused-debug.log`). The broader
+codec regression passes 66 Debug tests with no skips or leaks
+(`/private/tmp/antfly-sql-nullability-codec-named-debug.log`). An initial codec
+selector matched no declarations and failed the selection audit; it was
+corrected to declared test names without weakening the empty-selection gate.
+These are correctness/work-allocation tests, not latency benchmarks.
+
+This component is not a durable owner task, scan-completion certificate or
+schema-publication authority. The bounded owner scan, durable fence/drain and
+all-owner publication/recovery protocol remain to be integrated. Neither the
+safe full-rewrite fallback nor this projected check satisfies the original
+validation-only contract by itself. No disposition is reclassified.
+Owner coverage must not be inferred from a user/RLS-filtered query. The worker
+must bind the full owned range and its TTL/tombstone visibility contract (or
+validate every physical row), never silently skip rows that could later become
+visible. Source cuts and resumable progress still need durable owner authority.
+The candidate/install path also needs a distinct compatible-schema transition:
+`tables.applySchemaRecord` currently retains the predecessor read declaration
+and calls `upsertVersionedFullTextIndex` for every changed schema; the FK plan
+verifier independently requires that derived catalog delta. Reusing that
+constructor unchanged would still create a successor full-text incarnation,
+contrary to preserving unchanged indexes for nullability-only publication.
+The new path must prove the exact compatible delta, preserve index identities,
+retain decoding for old row layouts without a background full-row rewrite,
+and independently verify those properties at installation. Widening the
+existing FK replay/shape contract is not a substitute for that proof.
+
+The final complete Debug SQL gate passes 896 portable and 234 native tests
+(1,130 passed, only four existing opt-in benchmarks skipped), with 21/21 build
+steps in `/private/tmp/antfly-sql-nullability-projection-final-debug.log`.
+The selected suite explicitly retains ordinary comparison, partial-index
+membership and exhaustive implication contracts alongside the new probes.
+Formatting, generated control catalog, Apache/license and inventory checks
+pass. GC previewed only (`/private/tmp/antfly-sql-nullability-projection-gc-preview.log`)
+and deleted nothing in this checkpoint. Totals remain 531 implemented /
+132 rejected / 113 superseded / 810 unresolved.

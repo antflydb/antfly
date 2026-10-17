@@ -476,6 +476,7 @@ pub const storage_db_relational_integrity_retirement_contract = @import("storage
 pub const storage_db_relational_integrity_topology = @import("storage/db/relational_integrity_topology.zig");
 pub const storage_db_relational_integrity_topology_contract = @import("storage/db/relational_integrity_topology_contract.zig");
 pub const storage_db_relational_predicate = @import("storage/db/relational_predicate.zig");
+pub const storage_db_relational_nullability = @import("storage/db/relational_nullability.zig");
 pub const storage_db_relational_predicate_implication = @import("storage/db/relational_predicate_implication.zig");
 pub const storage_db_relational_rewrite_contract = @import("storage/db/relational_rewrite_contract.zig");
 pub const storage_db_relational_rewrite_manifest = @import("storage/db/relational_rewrite_manifest.zig");
