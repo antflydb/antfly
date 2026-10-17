@@ -209,9 +209,11 @@ input. Each attempt consumes the request budget. Valid partial results survive
 terminal failures and incomplete searches exit 2.
 
 `--batch-size` defaults to 8 (maximum 128). Cache keys include endpoint/model,
-backend, authorization scope, question, and rendered input. Cached files contain
-scores, not source text or tokens. Use `--no-cache`, `--cache-dir`, or `cache clear`.
-Clear the cache after replacing a model behind an unchanged model identifier.
+backend, authorization scope, question, and rendered input. Decision records
+contain scores, not source bodies or tokens. The separate private source-preparation
+cache contains line offsets, declaration/call names and ranges. Use `--no-cache`,
+`--cache-dir`, or `cache clear`. Pin `--model-revision ID`, or clear the cache after
+replacing a model behind an unchanged identifier.
 
 `--max-requests` and `--max-output-bytes` bound work. In `--ask` mode,
 `--max-regions` and `--max-source-bytes` are evaluation/input budgets; in `ask`
@@ -342,7 +344,8 @@ variable. Provider runs are opt-in; ordinary tests contact only local fixtures.
 Decision score caches expire after 24 hours by default; `--cache-ttl SECONDS`
 sets their lifetime and zero bypasses them. Cache keys include complete inputs,
 questions, policies, model, endpoint and credential scope. Malformed, expired or
-incomplete cache records are misses; writes use atomic replacement.
+incomplete cache records are misses. Batch records use atomic replacement; the
+fixed-size score table validates checksummed records and rejects torn writes.
 
 Ordinary parallel searches flush completed files so a slow file does not hold
 back earlier results. Explicit `--block-buffered` retains block buffering; ranked
@@ -731,8 +734,10 @@ intersected with any user filter. Every alternative must supply a substring of
 at least three bytes; otherwise the entire query falls back to an exact scan.
 All returned content is verified with the shared matcher. Missing certificates
 use the exact-scan fallback. Queries needing nonmatching files, inverted selection,
-passthrough, zero counts, full JSON/statistics, or decision evaluation bypass
-candidate filtering. Unprovable case-insensitive, short, advanced-PCRE and
+passthrough, zero counts, or full JSON/statistics bypass candidate filtering.
+Decision searches can use a proven explicit lexical prefilter; unrestricted
+natural-language searches and jevgrep preview/reading-lead searches retain the
+full scan. Unprovable case-insensitive, short, advanced-PCRE and
 oversized pattern sets fall back too. Existing tables without
 `candidate_index` keep the original exact scan. Approximate semantic retrieval is
 not substituted for an exact grep query.
@@ -1080,3 +1085,117 @@ caches were warm and unrelated builds were active. Full upstream PCRE2/ripgrep
 parity, independent-host cold-cache performance and live-provider quality remain
 outside this qualification. Source and executable identities are recorded in
 [`stream-review-validation.json`](bench/results/stream-review-validation.json).
+
+
+### Cached-only execution and incremental preparation
+
+```sh
+# Warm evidence with a stable model generation, then prohibit inference.
+antfly-grep --ask 'retry enforcement' --model MODEL --model-revision REV src/
+antfly-grep --ask 'retry enforcement' --model MODEL --model-revision REV \
+  --cached-only --max-requests=0 src/
+```
+
+`--cached-only` reads existing evidence without provider HTTP calls or native
+inference startup. Missing, evicted or expired scores produce `DecisionCacheMiss`,
+preserve completed evidence, and exit 2 with `complete: false` (quiet mode
+retains ripgrep-style successful-match precedence). It never converts
+missing evidence into a negative result or falls back to a paid provider. It
+rejects table reads, preprocessors, hostname commands, `--no-cache` and zero cache
+TTL. It operates on local files or stdin; operating-system access to mounted
+filesystems remains outside the CLI's network policy. Existing endpoint/model,
+credential and policy identities must still match the records being read.
+
+Native local inference now has a shared lazy owner. Creating search or decision
+workers does not open a library or model. The first uncached invocation starts
+the runtime under a mutex; subsequent calls use the concurrent native ABI, and
+all workers finish before that owner is destroyed. Entirely cached parallel waves
+also bypass worker dispatch. A regression removes the library after warming
+scores and verifies that both normal and cached-only searches still succeed.
+
+Decision batch cache v7 records each score's original creation time. Re-batching,
+legacy migration and partial-cache repairs cannot rejuvenate old evidence. V6
+batches and scoped v5 scalar files remain readable with their original file age;
+new records use a separate versioned filename. A second-level direct-mapped table
+holds 65,536 checksummed 64-byte records, for at most 4 MiB. It retains individual
+input identities when batch shapes change. Collisions are evictions and cause
+misses, never score substitution; concurrent torn writes also cause misses. The
+exact-batch tier keeps the ordinary one-record warm-hit path. Pinning
+`--model-revision` prevents reuse after a model generation changes.
+
+Source preparation is independent of questions. An artifact stores line offsets,
+declarations and calls for exact content, path/language, delimiter/CRLF settings,
+and authorization/revision scope. Its identity includes the projection source,
+Zig version and every pinned parser/grammar source byte; parser updates invalidate
+artifacts automatically. The private, atomically replaced artifacts occupy at
+most 1,024 slots of 1 MiB each. Full digest and checksum validation precedes reuse;
+collisions, oversized preparations or invalid records fall back to parsing. Source
+cache entries contain identifier names and ranges and are created with mode 0600.
+`stats.source_cache_hits` exposes actual reuse. All source bytes are still read
+and hashed; there is no unsafe mtime-only shortcut. `--no-cache` bypasses both
+preparation and decision caches, and `cache clear` removes both.
+
+Indexed scans recheck authorization before using cached preparation or evidence.
+Their identity includes endpoint, table credential, table/document ID, URI,
+revision, permission data and configured principals. A new retained snapshot alone
+does not invalidate otherwise identical evidence; changed revisions or permission
+scope do. Content hashes independently validate prepared source data.
+
+Indexed `--files` requests only identity, permission and timestamp fields when no
+content-size restriction or JSON/statistics contract requires content. Ordinary
+lexical text output also omits unused metadata and region arrays. Decision and
+JSON/statistics scans preserve the full document projection. These projections
+are verified against the real native server, including nested document fields,
+large documents and denied readers. Certified trigram pushdown can now precede
+explicit lexical decision prefilters; uncertified documents remain candidates.
+
+Dense regex preflight now compresses repeated span lengths/strides into at most
+64 run records. Both JSON and color rendering can consume the verified runs
+without matching again. Irregular rows that exceed the run budget retain bounded
+memory and replay from source. This preserves preflight failure semantics and
+individual JSON occurrences without introducing unbounded match storage.
+
+These changes can eliminate inference calls for warm evidence; they cannot
+eliminate CPU, source reads, storage or output cost. Cached-only mode has zero
+provider requests even when evidence is absent. Normal cache use may reevaluate
+expired or evicted records. Local inference has no remote API bill but still
+uses local compute. Fixture wire-byte and question-count reductions are not
+measurements of billed tokens or live relevance.
+
+
+Qualification against previous PR head `d5d13ece2d`:
+
+| Workload | Before | After | Scope |
+|---|---:|---:|---|
+| Dense regex color, macOS | 21.46 ms | 18.12 ms | rg 30.02 ms |
+| Dense regex color, Linux VM / two CPUs | 20.49 ms | 15.11 ms | rg 29.06 ms |
+| Dense JSON, macOS | 31.92 ms | 30.72 ms | rg 62.40 ms |
+| Dense match-only, macOS | 15.08 ms | 18.14 ms | rg 16.86 ms |
+| Dense match-only, Linux VM / two CPUs | 9.38 ms | 10.71 ms | rg 16.36 ms |
+| Warm Python auth-test source | 11.56 ms | 9.46 ms | Alternating paired runs; zero provider requests |
+| Warm decisions, 2,048 lines / four workers | 20.82 ms | 20.28 ms | Zero provider requests |
+
+The re-batching fixture sends 0 requests / 0 questions instead of 11 requests /
+32 questions, with identical output. A one-line edit evaluates 1 question instead
+of 8. Narrow indexed listing returns the same path using 261 response bytes
+instead of 4,981,035 bytes. These are fixture counts and wire sizes, not provider
+billing measurements. Raw source hashes and paired trials are retained in
+`bench/results/incremental-review-*.json`.
+
+The dense-regex speedup does not establish that every path is faster: match-only
+regresses on both final runs, and discovery/color results are mixed. All runs use
+warm filesystem caches on a shared host with unrelated builds active. Linux uses
+a two-CPU ARM64 VM on that same Mac. CPU, first-byte latency and peak RSS appear
+beside elapsed trials; independent hardware and cold-cache results remain open.
+The current JIT helps existing literal capture chains; repeat and control-flow
+profiles do not justify another emission path in this pass. The verified compact
+span representation improves rendering without altering regex execution.
+
+Final validation: 154 CLI tests on macOS (two skips) and ARM64 Linux (one skip),
+all native grep unit/hardening/tooling targets on macOS, six real-server indexed
+scenarios, 1,000 generated oracle comparisons and the 392-case output-option grid
+with no differences, plus five labeled relevance fixtures. These fixtures retain
+expected results but do not measure real model relevance. License headers,
+the Apache boundary and all 35 boundary-checker tests pass. Exact source and
+executable identities are in
+[`incremental-review-validation.json`](bench/results/incremental-review-validation.json).

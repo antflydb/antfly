@@ -57,7 +57,7 @@
       "evidence": [
         "tests/test_cli.py"
       ],
-      "limits": "Provider checks use HTTP/native fixtures. POSIX interrupt cancellation is cooperative; Windows signal behavior is not runtime-verified."
+      "limits": "Provider checks use HTTP/native fixtures. POSIX interrupt cancellation is cooperative; Windows signal behavior is not runtime-verified. Cached-only mode makes no provider calls and returns partial evidence on misses; rejects remote tables and external commands. Lazy shared local runtime, versioned per-score ages, bounded score table, parser-fingerprinted preparation cache and revision/permission scopes are fixture tested. Cache collisions are misses."
     },
     {
       "area": "Antfly indexed tables",
@@ -68,7 +68,7 @@
         "tests/test_cli.py",
         "../../e2e/antfly/test_grep_indexed.py"
       ],
-      "limits": "Explicit ID ordering from page one; native-server pagination, concurrent writes, actual cursor expiry, large region lists, API-key revocation and opt-in certified-trigram candidates with legacy fallback. Snapshot-bound cursors and request/document/source/output budgets remain required. No connector ingestion or direct remote-file downloads. Proven regex substrings and bounded literal unions support conservative candidate pushdown. Transient per-table statuses inside HTTP 200 envelopes retry the same snapshot/cursor. Optional bounded prefetch overlaps one page with processing, preserves connection reuse across tables, and cancels on terminal budgets; quiet and finite match limits remain sequential."
+      "limits": "Explicit ID ordering from page one; native-server pagination, concurrent writes, actual cursor expiry, large region lists, API-key revocation and opt-in certified-trigram candidates with legacy fallback. Snapshot-bound cursors and request/document/source/output budgets remain required. No connector ingestion or direct remote-file downloads. Proven regex substrings and bounded literal unions support conservative candidate pushdown. Transient per-table statuses inside HTTP 200 envelopes retry the same snapshot/cursor. Optional bounded prefetch overlaps one page with processing, preserves connection reuse across tables, and cancels on terminal budgets; quiet and finite match limits remain sequential. Native-server tests verify narrow metadata listing and lexical projections. Explicit lexical decision prefilters can use certified trigrams; unrestricted natural-language and reading-lead searches retain exact fallback. All finite decision request budgets keep foreground order."
     },
     {
       "area": "Unified local/indexed results",
