@@ -805,5 +805,14 @@
     "required": [
       "Maintained Antfly Zig port; see PORTING.md and SOURCE_NOTICES.md."
     ]
+  },
+  "zig/pkg/inference/src/ops/cuda/video_headers/dynlink_cuda.h": {
+    "file": "LICENSES/third-party/NV-Codec-CUDA-MIT.txt"
+  },
+  "zig/pkg/inference/src/ops/cuda/video_headers/dynlink_cuviddec.h": {
+    "file": "LICENSES/third-party/NV-Codec-NVIDIA-MIT.txt"
+  },
+  "zig/pkg/inference/src/ops/cuda/video_headers/dynlink_nvcuvid.h": {
+    "file": "LICENSES/third-party/NV-Codec-NVIDIA-MIT.txt"
   }
 }

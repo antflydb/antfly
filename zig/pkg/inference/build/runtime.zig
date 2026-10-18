@@ -782,6 +782,12 @@ pub fn configureRuntimeLinks(
         configureSystemBlas(b, module, target, backend.blas_root);
     }
     configureMetal(b, module, target, backend.enable_metal, paths);
+    configureCudaVideo(b, module, target, backend.enable_cuda, paths);
+}
+
+pub fn configureCudaVideo(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, enabled: bool, paths: Paths) void {
+    if (!enabled or target.result.os.tag != .linux) return;
+    module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/ops/cuda/video_decode.c")), .flags = &.{"-std=c11"} });
 }
 
 pub fn configureSystemBlas(

@@ -86,6 +86,11 @@ pub const CudaContext = struct {
     ctx: CUcontext,
     stream: CUstream,
     info: DeviceInfo,
+    // Lazy NVDEC session shares this context. Its parser is request-scoped;
+    // the decoder survives successful clips with compatible geometry.
+    video_decoder_cache: ?*anyopaque = null,
+    video_decoder_release: ?*const fn (*anyopaque) callconv(.c) void = null,
+    video_cache_budget: @import("video_cache_budget.zig").CacheBudget = .{},
     stats: RuntimeStats = .{},
     device_allocations: @import("allocation_budget.zig").Budget = .{},
     debug_graph_capture_active: bool = false,
@@ -133,9 +138,39 @@ pub const CudaContext = struct {
         };
     }
 
+    /// Called under the session execution lock. Keep cache admission attached
+    /// to its original controller until the physical decoder has been evicted.
+    pub fn configureVideoAdmission(self: *CudaContext, admission: ?@import("video_cache_budget.zig").Admission) !void {
+        if (!std.meta.eql(self.video_cache_budget.admission, admission)) {
+            _ = try self.evictVideoDecoder();
+            self.video_cache_budget.admission = admission;
+        }
+    }
+
+    pub fn evictVideoDecoder(self: *CudaContext) !usize {
+        const decoder = self.video_decoder_cache orelse return 0;
+        try self.makeCurrent();
+        try self.synchronize();
+        const bytes = self.video_cache_budget.bytes;
+        self.video_decoder_release.?(decoder);
+        self.video_decoder_cache = null;
+        return bytes;
+    }
+
     pub fn deinit(self: *CudaContext) void {
+        self.releaseResources();
+        self.driver.deinit();
+    }
+
+    /// Leave driver entry points loaded for host-only cleanup after a lost
+    /// context has relinquished all in-flight device references.
+    pub fn releaseResources(self: *CudaContext) void {
         if (self.ctx != null) {
             _ = self.driver.fns.cuCtxSetCurrent(self.ctx);
+        }
+        if (self.video_decoder_cache) |decoder| {
+            self.video_decoder_release.?(decoder);
+            self.video_decoder_cache = null;
         }
         if (self.stream != null) {
             _ = self.driver.fns.cuStreamDestroy(self.stream);
@@ -146,7 +181,6 @@ pub const CudaContext = struct {
             _ = self.driver.fns.cuDevicePrimaryCtxRelease(self.device);
             self.ctx = null;
         }
-        self.driver.deinit();
     }
 
     pub fn makeCurrent(self: *CudaContext) driver_mod.Error!void {
