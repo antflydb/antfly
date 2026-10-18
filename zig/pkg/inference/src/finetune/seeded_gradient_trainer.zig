@@ -427,6 +427,12 @@ pub const Trainer = struct {
     /// Atomically persist parameters, moments, presence, and an unfinished
     /// accumulation window through the existing durable checkpoint owner.
     pub fn save(self: *Trainer, path: []const u8, run: [32]u8, control: ?Control) !void {
+        return self.saveWithExtensions(path, run, &.{}, control);
+    }
+
+    /// Task-owned extension tensors are committed atomically with optimizer
+    /// state. Callers validate their own extension payload when restoring.
+    pub fn saveWithExtensions(self: *Trainer, path: []const u8, run: [32]u8, extensions: []const checkpoint.NamedTensor, control: ?Control) !void {
         try check(control);
         if (self.active_binding) return error.TrainingTapeStillLive;
         try self.ensureHostState(control);
@@ -435,6 +441,10 @@ pub const Trainer = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         var tensors = std.ArrayListUnmanaged(checkpoint.NamedTensor).empty;
+        for (extensions) |extension| {
+            if (!std.mem.startsWith(u8, extension.name, "__extension.") or std.mem.startsWith(u8, extension.name, "__extension.seeded.")) return error.InvalidTrainingCheckpointExtension;
+            try tensors.append(scratch, extension);
+        }
         const counters = [_]f32{ 1, @floatFromInt(self.owner.accum_count), @floatFromInt(self.owner.config.grad_accum_steps) };
         try tensors.append(scratch, .{ .name = "__extension.seeded.counters", .data = &counters, .shape = &.{3} });
         const presence = try scratch.alloc(f32, self.present.len);

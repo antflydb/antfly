@@ -39193,16 +39193,27 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             if (lhs_buf.view_strides == null and rhs_buf.view_strides == null and rhs_buf.source_tensor == null) {
                 const lhs_data = getData(lhs);
                 const rhs_dense = getData(rhs);
-                // General 2D dot: C[i,j] = sum_k A[..] * B[..]
-                for (0..m) |i| {
-                    for (0..n) |j| {
-                        var acc: f64 = 0.0;
-                        for (0..k) |ki| {
-                            const a_idx = if (lc == 1) i * k + ki else ki * m + i;
-                            const b_idx = if (rc == 0) ki * n + j else j * k + ki;
-                            acc += @as(f64, lhs_data[a_idx]) * @as(f64, rhs_dense[b_idx]);
+                // Dense training VJPs use all three ordinary GEMM layouts.
+                // Preserve strided/source-backed handling below; sending these
+                // contiguous operands through scalar contraction loops makes a
+                // final GLiNER span projection slower than its whole encoder.
+                if (lhs_data.len != (std.math.mul(usize, m, k) catch return error.ShapeMismatch) or
+                    rhs_dense.len != (std.math.mul(usize, k, n) catch return error.ShapeMismatch) or
+                    try positiveShapeDim(rhs_effective_shape, rc) != k) return error.ShapeMismatch;
+                if (lc == 1 and rc == 0) {
+                    native.sgemmSync(m, n, k, 1, lhs_data, rhs_dense, 0, output);
+                } else if (lc == 1 and rc == 1) {
+                    native.sgemmTransBSync(m, n, k, 1, lhs_data, rhs_dense, 0, output);
+                } else if (lc == 0 and rc == 0) {
+                    native.sgemmTransA(m, n, k, 1, lhs_data, rhs_dense, 0, output);
+                } else {
+                    // Both operands transposed remains the scalar reference.
+                    for (0..m) |i| {
+                        for (0..n) |j| {
+                            var acc: f64 = 0;
+                            for (0..k) |ki| acc += @as(f64, lhs_data[ki * m + i]) * @as(f64, rhs_dense[j * k + ki]);
+                            output[i * n + j] = @floatCast(acc);
                         }
-                        output[i * n + j] = @floatCast(acc);
                     }
                 }
                 const result = try self.makeBuf(output, true);

@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const gliner_span_head = @import("gliner_span/head.zig");
+pub const gliner_span_job = @import("gliner_span/job.zig");
+pub const gliner_span_eval = @import("gliner_span/evaluate.zig");
 pub const lora = @import("lora.zig");
 pub const laya_job = @import("laya/job.zig");
 pub const laya_evaluate = @import("laya/evaluate.zig");

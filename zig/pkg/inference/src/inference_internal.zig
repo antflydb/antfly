@@ -56,6 +56,9 @@ pub const pipelines = struct {
     pub const gliner_boundary_pipeline = @import("pipelines/gliner_boundary_pipeline.zig");
 };
 pub const finetune = struct {
+    pub const gliner_span_eval = @import("finetune/gliner_span/evaluate.zig");
+    pub const gliner_span_job = @import("finetune/gliner_span/job.zig");
+    pub const gliner_span_head = @import("finetune/gliner_span/head.zig");
     pub const laya_job = @import("finetune/laya/job.zig");
     pub const laya_evaluate = @import("finetune/laya/evaluate.zig");
     pub const gliner_boundary_training_source = @import("finetune/gliner/boundary_training_source.zig");

@@ -16,6 +16,7 @@
 // Ordinary finetuning tests share one source and dependency ownership boundary.
 // Inference-owned compatibility targets remain registered in build/finetune/tests.zig.
 test {
+    _ = @import("finetune/test/test_gliner_span_training.zig");
     _ = @import("finetune/test/test_layoutlmv3_finetune.zig");
     _ = @import("finetune/test/test_colqwen2_finetune.zig");
     _ = @import("finetune/test/test_gliner2_data.zig");
