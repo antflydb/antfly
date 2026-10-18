@@ -1532,14 +1532,27 @@ downstream COUNT/MIN/MAX reduction makes their interleaving unobservable. Counts
 are combined without changing bag multiplicity; representation-sensitive binding
 keys keep integer/float distinctions, including inside containers. Pagination,
 ordering, correlated calls and order-sensitive reductions block this regrouping.
+SUM can also consolidate under a runtime certificate: a private, unpublished
+attempt verifies that every non-null contribution is a nonnegative integer.
+Successful attempts publish owned rows and exact weights. Mixed signs, floating
+point or checked arithmetic failures retry ordinary execution with cumulative
+work accounting; intermediate overflow and floating-point order stay observable.
 Weighted MATCH fuses row-local stages into their actual finite window or
 reduction, carrying parent multiplicities through the fold. Small unordered
 windows retain demand-driven traversal across subsequent MATCH stages: each
 prefix binding runs its continuation before the producer advances, and consumer
-completion unwinds the enclosing producers. Filters and OPTIONAL null extension
-remain in their own MATCH scopes; no prefix is truncated before its continuation
-qualifies. Returning CALL bodies inherit proven
-row goals through unfiltered projections, capped by their own existing limits;
+completion unwinds the enclosing producers. Pure returning CALL bodies with
+row-local projections participate in the same continuation, merging their
+returned scope into each parent before resuming the outer consumer. Empty child
+bags resume the producer rather than truncating its prefix. Child reducers,
+DISTINCT, ordering and windows retain their own stage barriers. Filters and
+OPTIONAL null extension remain in their own MATCH scopes; no prefix is truncated
+before its continuation qualifies. After 64 unsuccessful routes, an endpoint-local filtered window can
+try a proved endpoint-DP emptiness certificate. A declined proof or a possible
+result resumes ordinary route order; speculative predicate errors cannot become
+observable. First successful rows retain the original lazy traversal.
+Returning CALL bodies inherit proven row goals through unfiltered projections,
+capped by their own existing limits;
 child SKIP and aggregate/sort barriers remain inside the child scope. An outer
 filter, DISTINCT, sort, aggregation or expanding stage prevents this propagation.
 Pure returning CALL stages memoize child bags by captured bindings and the
@@ -1552,9 +1565,14 @@ only captured outer bindings stay live. Unobserved path aliases therefore do
 not force route production merely because a later expression contains a pattern.
 SIZE over a pure pattern comprehension requests cardinality directly and evaluates
 its projection once per complete binding, preserving NULL entries and eager
-projection errors without constructing a list of repeated elements. Writes
-and procedure calls remain execution barriers. Expression evaluation isolates
-nested profiling buffers and weighted continuations from retained execution state.
+projection errors without constructing a list of repeated elements. Pure
+pattern comprehensions, SIZE comprehensions and EXISTS expressions share a
+bounded statement-local memo keyed by expression identity and captured bindings.
+It owns cached payloads independently of route scratch, keeps representation and
+lexical scope observable, and declines admission without failing the query.
+Statement-wide field liveness includes locally bound comprehension entities.
+Writes and procedure calls remain execution barriers. Expression evaluation
+isolates nested profiling buffers and weighted continuations from retained execution state.
 Each subsequent match negotiates a seed-aware weighted child producer. Binding
 liveness follows WITH scopes, including wildcard observation, match constraints
 and eager expression dependencies. Endpoint-only children retain compressed

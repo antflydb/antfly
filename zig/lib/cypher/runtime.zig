@@ -825,6 +825,7 @@ pub const NodeCursor = struct {
         if (self.weighted_seeds) |*seeds| if (seeds.arena) |*arena| arena.deinit();
         self.adjacency_cache.deinit();
         self.engine.regex.deinit();
+        if (self.engine.expression_memo) |*memo| memo.deinit();
         self.arena.deinit();
         allocator.destroy(budget);
         allocator.destroy(self);
@@ -838,6 +839,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     defer engine.regex.deinit();
+    defer if (engine.expression_memo) |*memo| memo.deinit();
     for (compiled.parameters) |name| {
         _ = lookup(parameters, name) orelse return error.MissingCypherParameter;
     }
@@ -952,6 +954,11 @@ const Engine = struct {
     collect_match_paths: bool = false,
     shortest_fast: bool = false,
     stream_fold: ?*StreamFold = null,
+    expression_memo: ?CallMemo = null,
+    probe_predicate_failed: ?*bool = null,
+    route_probe: ?struct { rejected: *usize, fold: *StreamFold } = null,
+    numeric_consolidation: bool = false,
+    numeric_attempted: bool = false,
     stream_predicate: ?*const ast.Expr = null,
     shortest_count: ?*u64 = null,
     count_endpoints: bool = false,
@@ -1091,6 +1098,10 @@ const Engine = struct {
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
+                // Regrouping SUM is licensed only after every observed input
+                // has certified the nonnegative integer domain. The speculative
+                // executor publishes nothing until this certificate completes.
+                if (engine.numeric_consolidation and (value != .integer or value.integer < 0)) return error.CypherNumericRegroupingDeclined;
                 if (value != .integer and value != .number) return error.CypherTypeMismatch;
                 if ((value == .integer and value.integer == 0) or (value == .number and value.number == 0)) {
                     self.sum = try engine.binary(.add, self.sum, value);
@@ -1272,7 +1283,7 @@ const Engine = struct {
         weight: Count = Count.one,
         active_calls: ?[]const bool = null,
         record_rows: bool = true,
-        continuation: ?struct { parent: *StreamFold, index: usize } = null,
+        continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             fold.had_match = true;
@@ -1321,6 +1332,43 @@ const Engine = struct {
                         // operator; no row has been emitted on a decline.
                         for (try engine.match(&.{row}, operation)) |child| try fold.expand(engine, child, index + 1);
                     },
+                    .subquery => |inner| {
+                        engine.recursion += 1;
+                        defer engine.recursion -= 1;
+                        if (engine.recursion > engine.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
+                        const columns = engine.columns;
+                        const stages = engine.stages.items.len;
+                        defer engine.columns = columns;
+                        defer engine.stages.shrinkRetainingCapacity(stages);
+                        if (streamableCall(inner)) {
+                            var input = row;
+                            var start: usize = 0;
+                            while (start + 1 < inner.len and inner[start].operation == .project) : (start += 1) {
+                                const projected = try engine.projectUnordered(&.{input}, inner[start].operation.project.value, false);
+                                if (projected.len == 0) return;
+                                input = projected[0];
+                            }
+                            if (start + 1 < inner.len and inner[start].operation == .match) {
+                                const last = inner[inner.len - 1].operation.project.value;
+                                if (try engine.streamMatchProjectionInto(&.{input}, &.{fold.weight}, inner[start].operation.match, last, inner[start + 1 .. inner.len - 1], inner[start].span, inner[inner.len - 1].span, .{ .parent = fold, .index = index + 1, .apply = row })) |_| return;
+                            }
+                        }
+                        // Non-streamable child shapes keep their scoped windows
+                        // and reducers; apply never truncates a selective tail.
+                        const scope = PatternScope.enter(engine);
+                        const children = blk: {
+                            defer scope.leave(engine);
+                            break :blk try engine.runWeightedRows(inner, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
+                        };
+                        const prior = fold.weight;
+                        defer fold.weight = prior;
+                        for (children.rows, children.weights) |child, weight| {
+                            var merged = row;
+                            for (child) |entry| merged = (try engine.bind(merged, entry.name, entry.value)) orelse return error.CypherVariableConflict;
+                            fold.weight = try prior.multiply(engine.a, weight);
+                            try fold.expand(engine, merged, index + 1);
+                        }
+                    },
                     .project => |step| {
                         const projected = try engine.projectUnordered(&.{row}, step.value, false);
                         if (projected.len == 0) return;
@@ -1340,7 +1388,14 @@ const Engine = struct {
                 next.parent.weight = fold.weight;
                 defer next.parent.weight = weight;
                 if (next.parent.record_rows) next.parent.stage_counts[next.index] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
-                return next.parent.expand(engine, row, next.index);
+                var output = row;
+                if (next.apply) |parent| {
+                    const projected = try engine.projectUnordered(&.{row}, fold.projection, false);
+                    if (projected.len == 0) return;
+                    output = parent;
+                    for (projected[0]) |entry| output = (try engine.bind(output, entry.name, entry.value)) orelse return error.CypherVariableConflict;
+                }
+                return next.parent.expand(engine, output, next.index);
             }
             try engine.state();
             if (fold.record_rows) fold.matched.* +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
@@ -1761,6 +1816,58 @@ const Engine = struct {
     fn streamMatchProjectionWeighted(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         return self.streamMatchProjectionInto(input, input_weights, operation, projection, original_middle, match_span, projection_span, null);
     }
+    fn streamShape(self: *Engine, initial: Row, clause: ast.Clause) anyerror!Row {
+        var shape = initial;
+        switch (clause.operation) {
+            .match => |operation| for (operation.paths) |pattern| {
+                for (pattern.nodes) |node| if (node.alias) |name| {
+                    shape = try self.replace(shape, name, .null);
+                };
+                for (pattern.edges) |edge| if (edge.alias) |name| {
+                    shape = try self.replace(shape, name, .null);
+                };
+                if (pattern.alias) |name| shape = try self.replace(shape, name, .null);
+            },
+            .unwind => |u| shape = try self.replace(shape, u.alias, .null),
+            .project => |p| {
+                if (!p.value.wildcard) shape = &.{};
+                for (p.value.items) |item| shape = try self.replace(shape, item.alias orelse try self.expressionName(item.expression), .null);
+            },
+            .subquery => |inner| {
+                var child = initial;
+                for (inner) |step| child = try self.streamShape(child, step);
+                for (child) |entry| shape = try self.replace(shape, entry.name, .null);
+            },
+            else => unreachable,
+        }
+        return shape;
+    }
+    fn pureReturningCall(inner: []const ast.Clause) bool {
+        if (inner.len == 0 or !weightedExpression(inner)) return false;
+        const last = inner[inner.len - 1].operation;
+        return last == .project and last.project.final;
+    }
+    fn hasStreamableCall(clauses: []const ast.Clause) bool {
+        for (clauses) |clause| if (clause.operation == .subquery and pureReturningCall(clause.operation.subquery)) return true;
+        return false;
+    }
+    fn streamableCall(inner: []const ast.Clause) bool {
+        if (inner.len == 0 or !weightedExpression(inner)) return false;
+        const last = inner[inner.len - 1].operation;
+        if (last != .project or !last.project.final) return false;
+        for (inner) |clause| switch (clause.operation) {
+            .match, .unwind => {},
+            .subquery => |child| if (!streamableCall(child)) return false,
+            .project => |step| {
+                const p = step.value;
+                if (p.distinct or p.order.len != 0 or p.skip != null or p.limit != null) return false;
+                for (p.items) |item| if (aggregates(item.expression) or @import("expressions.zig").containsPattern(item.expression)) return false;
+                if (p.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return false;
+            },
+            else => return false,
+        };
+        return true;
+    }
     fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation")) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
@@ -1786,7 +1893,7 @@ const Engine = struct {
         for (projection.order) |order| if (@import("expressions.zig").containsPattern(order.expression)) return null;
         if (projection.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
         const has_match = for (middle) |clause| {
-            if (clause.operation == .match) break true;
+            if (clause.operation == .match or clause.operation == .subquery) break true;
         } else false;
         // Global reducers/order remain stage barriers. This continuation path
         // is for finite unordered demand; it never enumerates a large count
@@ -1795,6 +1902,10 @@ const Engine = struct {
         if (has_match and self.windowGoal(projection).? > self.limits.intermediate_states -| self.stats.intermediate_states) return null;
         for (middle) |clause| {
             if (clause.operation == .match) continue;
+            if (clause.operation == .subquery) {
+                if (!pureReturningCall(clause.operation.subquery)) return null;
+                continue;
+            }
             if (clause.operation == .unwind) {
                 if (@import("expressions.zig").containsPattern(clause.operation.unwind.expression)) return null;
                 continue;
@@ -1842,7 +1953,7 @@ const Engine = struct {
         };
         const small_window = if (self.windowGoal(projection)) |goal| goal <= self.limits.intermediate_states -| self.stats.intermediate_states else false;
         const weighted_top = !grouped and (self.match_weight_demand != null or (projection.limit != null and (projection.order.len != 0 or (self.retain_windows and !small_window) or self.prefixWindow(projection))));
-        const count_endpoints = !count_shortest and operation.paths.len == 1 and path.selector == .all and (grouped or weighted_top) and blk: {
+        const endpoint_local = !count_shortest and operation.paths.len == 1 and path.selector == .all and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
             if (grouped and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
@@ -1859,6 +1970,8 @@ const Engine = struct {
             }
             break :blk true;
         };
+        const count_endpoints = endpoint_local and (grouped or weighted_top);
+        const adaptive_probe = endpoint_local and !count_endpoints and self.read_only and small_window and middle.len == 0 and operation.predicate != null and weightedExpression(operation.predicate) and !operation.optional;
         if (self.component_proof and !count_endpoints and !count_shortest) return null;
         var shape: std.ArrayList(v.Entry) = .empty;
         if (input.len != 0) try shape.appendSlice(self.a, input[0]);
@@ -1872,29 +1985,9 @@ const Engine = struct {
         shape = .empty;
         try shape.appendSlice(self.a, unique_shape);
         for (middle) |clause| {
-            if (clause.operation == .unwind) {
-                const next = try self.replace(shape.items, clause.operation.unwind.alias, .null);
-                shape = .empty;
-                try shape.appendSlice(self.a, next);
-                continue;
-            }
-            if (clause.operation == .match) {
-                for (clause.operation.match.paths) |pattern| {
-                    for (pattern.nodes) |node| if (node.alias) |name| {
-                        shape.items = @constCast(try self.replace(shape.items, name, .null));
-                    };
-                    for (pattern.edges) |edge| if (edge.alias) |name| {
-                        shape.items = @constCast(try self.replace(shape.items, name, .null));
-                    };
-                    if (pattern.alias) |name| shape.items = @constCast(try self.replace(shape.items, name, .null));
-                }
-                continue;
-            }
-            const p = clause.operation.project.value;
-            var next_shape: std.ArrayList(v.Entry) = .empty;
-            if (p.wildcard) try next_shape.appendSlice(self.a, shape.items);
-            for (p.items) |item| try next_shape.append(self.a, .{ .name = item.alias orelse try self.expressionName(item.expression), .value = .null });
-            shape = next_shape;
+            const next = try self.streamShape(shape.items, clause);
+            shape = .empty;
+            try shape.appendSlice(self.a, next);
         }
         var top: ?TopK = if (grouped) null else try TopK.init(self, projection, shape.items);
         defer if (top) |*value| value.deinit();
@@ -1986,8 +2079,23 @@ const Engine = struct {
                 const saved_batch = self.anchor_batch;
                 self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(planned_path, row, planned, pass.projection, middle)) &batch else null;
                 defer self.anchor_batch = saved_batch;
+                const previous_probe = self.route_probe;
+                var rejected: usize = 0;
+                self.route_probe = if (adaptive_probe) .{ .rejected = &rejected, .fold = &fold } else null;
+                defer self.route_probe = previous_probe;
                 self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |err| switch (err) {
                     error.CypherStreamComplete => if (continuation != null) return err else break :produce,
+                    error.CypherProbeEndpoints => {
+                        self.route_probe = null;
+                        if (try self.proveEmptyEndpoints(row, planned)) continue :produce;
+                        // No output was observed before the probe. A declined
+                        // proof restarts the ordinary producer, preserving its
+                        // route order and first observable expression error.
+                        self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |restart_error| switch (restart_error) {
+                            error.CypherStreamComplete => if (continuation != null) return restart_error else break :produce,
+                            else => return restart_error,
+                        };
+                    },
                     else => return err,
                 };
                 batch.flush(self, &ignored) catch |err| switch (err) {
@@ -2022,6 +2130,30 @@ const Engine = struct {
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
         try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = if (self.pending_window) |weighted| weighted.count() else rows.len });
         return rows;
+    }
+    /// After a bounded amount of unsuccessful route exploration, try an
+    /// endpoint-DP emptiness certificate. It is useful only on a proved path
+    /// quotient: cyclic/trail-sensitive shapes decline without enumeration.
+    /// Successful rows still come from the original demand-driven DFS.
+    fn proveEmptyEndpoints(self: *Engine, row: Row, operation: ast.Match) anyerror!bool {
+        const scope = PatternScope.enter(self);
+        defer scope.leave(self);
+        const previous = self.component_proof;
+        self.component_proof = true;
+        defer self.component_proof = previous;
+        const previous_failure = self.probe_predicate_failed;
+        var failed = false;
+        self.probe_predicate_failed = &failed;
+        defer self.probe_predicate_failed = previous_failure;
+        const one: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = 1 } } };
+        const count_value: ast.Expr = .{ .span = .{}, .value = .{ .call = .{ .name = "count", .args = &.{&one}, .distinct = true } } };
+        const projection: ast.Projection = .{ .items = &.{.{ .expression = &count_value }} };
+        const result = self.streamMatchProjection(&.{row}, operation, projection, &.{}, .{}, .{}) catch |err| switch (err) {
+            error.CypherComponentDeclined, error.CypherNumericOverflow, error.CypherTypeMismatch, error.UnboundCypherVariable, error.MissingCypherParameter, error.CypherInvalidArgument, error.CypherDivisionByZero => return false,
+            else => return err,
+        };
+        const rows = result orelse return false;
+        return !failed and rows.len == 1 and rows[0][0].value == .integer and rows[0][0].value.integer == 0;
     }
     // EXISTS consumes one result row. Keep aggregation, DISTINCT, ordering and
     // pagination barriers intact; ordinary terminal projections can carry the
@@ -2447,7 +2579,7 @@ const Engine = struct {
                 if (calls.items.len == 0) continue;
                 for (calls.items) |expression| {
                     const name = expression.value.call.name;
-                    if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max")) return null;
+                    if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max") and !(self.numeric_consolidation and std.ascii.eqlIgnoreCase(name, "sum"))) return null;
                 }
                 return try self.matchDemand(clauses);
             },
@@ -2575,7 +2707,81 @@ const Engine = struct {
             memo.entries.appendAssumeCapacity(.{ .key = owned_key, .goal = goal, .children = .{ .rows = rows, .weights = weights } });
         }
     };
+    fn hasConsolidatableSum(self: *Engine, clauses: []const ast.Clause) !bool {
+        for (clauses) |clause| switch (clause.operation) {
+            .match, .unwind => {},
+            .project => |p| {
+                if (p.value.order.len != 0 or p.value.skip != null or p.value.limit != null) return false;
+                var calls: std.ArrayList(*const ast.Expr) = .empty;
+                for (p.value.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return false;
+                if (calls.items.len == 0) continue;
+                var sum = false;
+                for (calls.items) |expression| {
+                    const name = expression.value.call.name;
+                    if (std.ascii.eqlIgnoreCase(name, "sum")) sum = true else if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max")) return false;
+                }
+                return sum;
+            },
+            else => return false,
+        };
+        return false;
+    }
     fn runWeightedRows(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool, retain_final: bool) anyerror!WeightedRows {
+        if (!self.numeric_attempted and self.read_only and self.stream_fold == null and self.weighted_sink == null and weightedExpression(clauses) and try self.hasConsolidatableSum(clauses)) {
+            // A successful integer-only, one-sign reduction is independent of
+            // contribution order, including its overflow outcome. Use a private
+            // arena and publish only after all groups certify. Mixed signs,
+            // floating point and semantic errors retry the ordinary executor;
+            // budgets/cancellation retain their charged work and propagate.
+            self.numeric_attempted = true;
+            defer self.numeric_attempted = false;
+            if (try self.tryNumericConsolidation(clauses, initial, preserve_rows, retain_final)) |result| return result;
+        }
+        return self.runWeightedRowsImpl(clauses, initial, preserve_rows, retain_final);
+    }
+    fn tryNumericConsolidation(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool, retain_final: bool) anyerror!?WeightedRows {
+        var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer arena.deinit();
+        const scope = EvalScope.enter(self, arena.allocator());
+        var scope_active = true;
+        defer if (scope_active) scope.leave(self);
+        const columns = self.columns;
+        const stages = self.stages;
+        const pending = self.pending_window;
+        self.stages = .empty;
+        self.pending_window = null;
+        self.numeric_consolidation = true;
+        defer self.numeric_consolidation = false;
+        var published = false;
+        defer if (!published) {
+            self.columns = columns;
+            self.stages = stages;
+            self.pending_window = pending;
+        };
+        const result = self.runWeightedRowsImpl(clauses, initial, preserve_rows, retain_final) catch |err| switch (err) {
+            error.CypherNumericRegroupingDeclined, error.CypherNumericOverflow, error.CypherTypeMismatch, error.UnboundCypherVariable, error.MissingCypherParameter, error.CypherInvalidArgument, error.CypherDivisionByZero => return null,
+            else => return err,
+        };
+        const result_columns = self.columns;
+        const result_stages = self.stages.items;
+        scope.leave(self);
+        scope_active = false;
+        self.stages = stages;
+        self.pending_window = pending;
+        const rows = try self.a.alloc(Row, result.rows.len);
+        const weights = try self.a.alloc(Count, rows.len);
+        for (rows, weights, result.rows, result.weights) |*row, *weight, source, count_value| {
+            row.* = (try (v.Value{ .map = source }).clone(self.a)).map;
+            weight.* = try count_value.clone(self.a);
+        }
+        const owned_columns = try self.a.alloc([]const u8, result_columns.len);
+        for (owned_columns, result_columns) |*name, old| name.* = try self.a.dupe(u8, old);
+        self.columns = owned_columns;
+        try self.stages.appendSlice(self.a, result_stages);
+        published = true;
+        return .{ .rows = rows, .weights = weights };
+    }
+    fn runWeightedRowsImpl(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool, retain_final: bool) anyerror!WeightedRows {
         var bags = initial;
         const saved_retention = self.retain_windows;
         defer self.retain_windows = saved_retention;
@@ -2594,7 +2800,7 @@ const Engine = struct {
                     // can stop before capturing an otherwise unbounded closure.
                     var fused = false;
                     for (clauses[clause_index + 1 ..], clause_index + 1..) |following, index| {
-                        if (following.operation == .unwind or following.operation == .match) continue;
+                        if (following.operation == .unwind or following.operation == .match or (following.operation == .subquery and pureReturningCall(following.operation.subquery))) continue;
                         if (following.operation != .project) break;
                         const projection = following.operation.project.value;
                         var reduction = false;
@@ -2792,7 +2998,7 @@ const Engine = struct {
         self.recursion += 1;
         defer self.recursion -= 1;
         if (self.recursion > self.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
-        if (!explain and self.weightedTail(clauses) and ((clauses[0].operation != .match and hasCorrelatedBoundary(clauses)) or separatedMatches(clauses))) {
+        if (!explain and self.weightedTail(clauses) and ((clauses[0].operation != .match and hasCorrelatedBoundary(clauses)) or separatedMatches(clauses) or hasStreamableCall(clauses))) {
             const weights = try self.a.alloc(Count, input.len);
             @memset(weights, Count.one);
             return self.runWeighted(clauses, .{ .rows = input, .weights = weights }, preserve_rows);
@@ -4965,6 +5171,10 @@ const Engine = struct {
                 return;
             }
             if (self.stream_fold) |fold| {
+                if (self.route_probe) |probe| if (probe.fold == fold and !fold.had_match) {
+                    probe.rejected.* += 1;
+                    if (probe.rejected.* == 64) return error.CypherProbeEndpoints;
+                };
                 if (!try self.constraintsMatch(input.constraints, row, false)) return;
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) return;
                 return fold.add(self, row);
@@ -5173,7 +5383,27 @@ const Engine = struct {
         return self.eval(expression, row, null);
     }
     fn eval(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
-        const result = try self.evalInner(expression, row, group);
+        const memoizable = self.read_only and self.projection_overrides == null and self.aggregate_overrides == null and !self.numeric_consolidation and (expression.value == .pattern_comprehension or expression.value == .exists or (expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "size") and expression.value.call.args.len == 1 and expression.value.call.args[0].value == .pattern_comprehension)) and weightedExpression(expression);
+        var key: Row = &.{};
+        if (memoizable) {
+            if (self.expression_memo == null) self.expression_memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+            var references: Names = .empty;
+            try self.retainReferences(&references, row, expression);
+            var captured: std.ArrayList(v.Entry) = .empty;
+            for (row) |entry| if (references.contains(entry.name)) try captured.append(self.a, entry);
+            key = captured.items;
+            if (try self.expression_memo.?.find(self, key, @intFromPtr(expression))) |cached| return cached.rows[0][0].value;
+        }
+        const result = self.evalInner(expression, row, group) catch |err| {
+            if (self.probe_predicate_failed) |failed| if (expression == self.stream_predicate) {
+                // An emptiness proof cannot expose an error from a route
+                // the demand-driven producer might never have observed.
+                failed.* = true;
+                return .{ .boolean = false };
+            };
+            return err;
+        };
+        if (memoizable) try self.expression_memo.?.put(self, key, @intFromPtr(expression), .{ .rows = &.{&.{.{ .name = "value", .value = result }}}, .weights = &.{Count.one} });
         _ = try self.values.info(result);
         return result;
     }

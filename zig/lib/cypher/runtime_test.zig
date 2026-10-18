@@ -2558,3 +2558,42 @@ test "MATCH continuations preserve rejected prefixes optional rows distinct and 
     try check("UNWIND [1,2,1] AS k CALL { WITH k RETURN k AS n } RETURN collect(n)", "[[[1,2,1]]]");
     try check("MATCH (a:Document) CALL { MATCH (a)-[:CITES]->(b) RETURN count(*) AS n } RETURN sum(n)", "[[4]]");
 }
+
+test "pattern memo captures lexical values and read fields include local entities" {
+    try check("MATCH (a:Document {id:'a'}) RETURN [x IN ['missing','b','missing'] | size([(a)-[:CITES]->(b) WHERE b.id=x | b.id])]", "[[[0,2,0]]]");
+    for ([_][]const u8{
+        "MATCH (a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b) | b.title]",
+        "MATCH (a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b) | b]",
+    }, 0..) |text, index| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const fields = try @import("read_fields.zig").required(arena.allocator(), compiled.query, graph);
+        if (index == 0) {
+            var found = false;
+            for (fields.?) |field| if (std.mem.eql(u8, field, "title")) {
+                found = true;
+            };
+            try std.testing.expect(found);
+        } else try std.testing.expect(fields == null);
+    }
+}
+
+test "certified numeric consolidation releases unpublished rows on allocation failure" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "UNWIND [1,2,1] AS x MATCH (a:Document {id:'a'}) WITH x,a MATCH (a)-[:CITES]->(b) RETURN sum(x)", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 8), result.rows[0][0].integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

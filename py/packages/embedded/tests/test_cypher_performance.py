@@ -2049,6 +2049,53 @@ def test_weighted_chains_goals_and_promoted_producers(graph_db):
         )["rows"]
         assert [cell["value"] for cell in rows[0][0]["value"]] == ["0", 0.5, "0"]
 
+    # A rejected endpoint-local window must not enumerate billions of routes.
+    rejected = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (s:D {id:'start'})-[:R*32..32]->(b:D) WHERE b.score+0<0 RETURN b.score LIMIT 1",
+            "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+        },
+    )
+    assert rejected["rows"] == []
+    assert rejected["stats"]["explored_edges"] < 1000
+
+    # Returning apply is a continuation, including the observable prefix path.
+    call = prefix + "CALL { WITH b MATCH (b)-[:R*32..32]->(c:D) RETURN c } RETURN length(p),c.score LIMIT 1"
+    result = db.cypher_json("g", {"query": call, "limits": {"intermediate_states": 10000, "explored_edges": 150}})
+    assert [cell["value"] for cell in result["rows"][0]] == ["32", "64"]
+    assert result["stats"]["explored_edges"] < 150
+
+    # Child windows/reducers remain scoped barriers without forcing all prefix
+    # routes to materialize. The outer consumer can stop after one child bag.
+    for child, expected_value in (
+        ("RETURN count(*) AS n", 2**32),
+        ("RETURN DISTINCT c.score AS n", 64),
+        ("RETURN c.score AS n ORDER BY n SKIP 1 LIMIT 2", 64),
+    ):
+        query = prefix + "CALL { WITH b MATCH (b)-[:R*32..32]->(c:D) " + child + " } RETURN length(p),n LIMIT 1"
+        result = db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 10000, "explored_edges": 1000}})
+        assert [cell["value"] for cell in result["rows"][0]] == ["32", str(expected_value)]
+
+    # Nonnegative integer SUM certifies regrouping before publishing results.
+    chain = "MATCH (s:D {id:'start'})-[:R*4..4]->(b:D) "
+    chain += "WITH b MATCH (b)-[:R*4..4]->(c:D) WITH c AS b " * 13
+    for expression, expected_sum in (("0", 0), ("b.score", 56 * 2**56)):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": chain + f"RETURN sum({expression})",
+                "limits": {"intermediate_states": 20000, "explored_edges": 1000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected_sum)}]]
+
+    # Pattern scalars share work only on their captured bindings, preserving i.
+    query = "UNWIND range(1,100) AS i MATCH (s:D {id:'start'}) RETURN i,size([(s)-[:R*32..32]->(b:D)|b.score]) AS n"
+    result = db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 15000, "explored_edges": 1000}})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [[str(i), str(2**32)] for i in range(1, 101)]
+    assert result["stats"]["explored_edges"] == 126
+
     # Promoted counts survive SQL projections, unions, materialized replay,
     # both join orientations and finite windows without route enumeration.
     path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(65)) + "-[r65 IS R]->(b IS D)"
@@ -2521,3 +2568,37 @@ def test_materialized_graph_ctes_share_exact_weighted_replay(graph_db):
         "SELECT q.e FROM GRAPH_TABLE(g MATCH (a IS D)-[r IS R]->(b IS D) COLUMNS(b.score AS e)) q ORDER BY q.e DESC"
     )
     assert db.sql(f"WITH paths AS MATERIALIZED({ordered}) SELECT e FROM paths LIMIT 7")["rows"] == [["17"]] * 7
+
+
+def test_certified_reductions_and_pattern_cache_scope(graph_db):
+    db = graph_db
+    db.cypher_json("g", {"query": "CREATE (s:D {id:'one',score:1})-[:R]->(b:D {id:'two',score:2})"})
+    prefix = "UNWIND [1,1.0,1] AS x WITH x MATCH (s:D {id:'one'}) "
+    result = db.cypher_json("g", {"query": prefix + "RETURN sum(x/2)"})
+    assert result["rows"] == [[{"type": "number", "value": 0.5}]]
+    prefix = "UNWIND [9223372036854775807,1,-1] AS x WITH x MATCH (s:D {id:'one'}) "
+    with pytest.raises(af.GraphError, match="CypherNumericOverflow"):
+        db.cypher_json("g", {"query": prefix + "RETURN sum(x)"})
+    query = "MATCH (s:D {id:'one'}) RETURN [x IN [1,2,1] | size([(s)-[:R]->(b:D) WHERE b.score=x | b])] AS sizes"
+    result = db.cypher_json("g", {"query": query})
+    assert [cell["value"] for cell in result["rows"][0][0]["value"]] == ["0", "1", "0"]
+    query = (
+        "UNWIND [1,2,1] AS x MATCH (s:D {id:'one'}) "
+        "RETURN x, EXISTS { WITH s,x MATCH (s)-[:R]->(b:D) WHERE b.score=x RETURN b }"
+    )
+    result = db.cypher_json("g", {"query": query})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [["1", False], ["2", True], ["1", False]]
+    # Empty children must resume the upstream apply producer.
+    query = (
+        "UNWIND ['two','one'] AS id MATCH (s:D {id:id}) "
+        "CALL { WITH s MATCH (s)-[:R]->(b:D) RETURN b } RETURN s.id,b.id LIMIT 1"
+    )
+    result = db.cypher_json("g", {"query": query})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [["one", "two"]]
+    # A cached expression cannot cross a write/read cut within the statement.
+    query = (
+        "UNWIND [1,2] AS x MATCH (s:D {id:'one'}) SET s.score=x "
+        "RETURN size([(s)-[:R]->(b:D) WHERE b.score=s.score | b])"
+    )
+    result = db.cypher_json("g", {"query": query})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [["1"], ["1"]]

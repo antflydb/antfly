@@ -108,6 +108,18 @@ const Plan = struct {
         }
         if (T == ast.Expr) {
             switch (value.value) {
+                .pattern_comprehension => |pattern| {
+                    // The comprehension introduces entity bindings which are
+                    // invisible to the enclosing projection. Their predicates
+                    // and values still contribute storage field requirements.
+                    const outer = try self.entities.clone(self.a);
+                    try self.names(pattern.path);
+                    try self.walk(pattern.path);
+                    try self.walk(pattern.predicate);
+                    try self.walk(pattern.projection.*);
+                    self.entities = outer;
+                    return;
+                },
                 .exists => |inner| {
                     const outer = try self.entities.clone(self.a);
                     try self.clauses(inner);
