@@ -8444,13 +8444,23 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
+    pub fn applyCommittedRaftIndexRelease(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedRelease, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.intent.installed.position != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
+    pub fn applyCommittedRaftIndexReleaseGc(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedReleaseGc, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.command.record.position != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
     fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         const PreparedType = @typeInfo(@TypeOf(prepared)).pointer.child;
-        const command = if (comptime @hasField(PreparedType, "command")) prepared.command else if (comptime @hasField(PreparedType, "batch")) prepared.batch.command else prepared.page.command;
+        const command = if (comptime @hasField(PreparedType, "command")) prepared.command else if (comptime @hasField(PreparedType, "batch")) prepared.batch.command else if (comptime @hasField(PreparedType, "page")) prepared.page.command else prepared.intent;
         try command.validate();
-        const binding = if (comptime @hasField(@TypeOf(command), "binding")) command.binding else command.validation.command.binding;
+        const binding = if (comptime @hasField(@TypeOf(command), "binding")) command.binding else if (comptime @hasField(@TypeOf(command), "validation")) command.validation.command.binding else if (comptime @hasField(@TypeOf(command), "installed")) command.installed.command.validation.command.binding else command.record.intent.installed.command.validation.command.binding;
         if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
         if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         // Until the ordered standby envelope carries this control, fail closed
@@ -9147,6 +9157,9 @@ pub const DB = struct {
             }) orelse return null;
         };
         defer page.deinit();
+        // Replicated companion retirement must be proposed by its leader and
+        // applied at a real Raft cut, never through this native-clock worker.
+        if (page.command.record.position != .native) return null;
         var prepared: native_index_control.PreparedReleaseGc = .{ .alloc = alloc, .command = page.command };
         defer prepared.deinit();
         return self.applyPreparedNativeOwnerEffect(&prepared, null) catch |err| {

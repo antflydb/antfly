@@ -123,6 +123,11 @@ pub fn requireCuts(txn: anytype, binding: jobs.Binding) !void {
     } else if (reserved != null) return error.InvalidControlReceiptPosition;
 }
 
+pub fn stageRetireCuts(txn: anytype, binding: jobs.Binding) !void {
+    try requireCuts(txn, binding);
+    for ([_]Effect{ .admitted, .fenced, .reserved }) |effect| try txn.delete(&key(effect));
+}
+
 fn currentState(txn: anytype, binding: jobs.Binding) !jobs.Binding {
     try requireAuthority(txn, binding);
     const current = (try jobs.load(txn)) orelse return error.PrivateIndexJobRequired;

@@ -46,6 +46,15 @@ pub const Position = union(enum) {
         if (self == .native and !self.native.namespace.eql(expected)) return error.IdentityNamespaceMismatch;
     }
 
+    pub fn strictlyAfter(self: Position, previous: Position) bool {
+        self.validate() catch return false;
+        previous.validate() catch return false;
+        return switch (self) {
+            .native => |cut| previous == .native and cut.namespace.eql(previous.native.namespace) and cut.sequence > previous.native.sequence,
+            .raft => |cut| previous == .raft and cut.index > previous.raft.index and cut.term >= previous.raft.term,
+        };
+    }
+
     pub fn encode(self: Position) ![encoded_len]u8 {
         try self.validate();
         var result: [encoded_len]u8 = @splat(0);

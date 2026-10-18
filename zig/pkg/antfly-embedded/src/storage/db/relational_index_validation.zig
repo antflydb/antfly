@@ -52,10 +52,7 @@ fn nonzero(value: Digest) bool {
     return !std.mem.allEqual(u8, &value, 0);
 }
 fn cutAfter(value: Position, previous: Position) bool {
-    return switch (value) {
-        .native => |cut| previous == .native and cut.namespace.eql(previous.native.namespace) and cut.sequence > previous.native.sequence,
-        .raft => |cut| previous == .raft and cut.index > previous.raft.index and cut.term >= previous.raft.term,
-    };
+    return value.strictlyAfter(previous);
 }
 fn optional(txn: anytype, key_: []const u8) !?[]const u8 {
     return txn.get(key_) catch |err| switch (err) {

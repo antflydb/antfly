@@ -2530,7 +2530,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         const receipt = try installed.command.receiptAt(installed.position);
         try std.testing.expectEqual(.installed, receipt.action);
         try std.testing.expectEqual(.raft, receipt.owner.authority);
-        try std.testing.expectError(error.InvalidControlReceiptPosition, (@import("relational_index_release.zig").Intent{ .installed = installed, .metadata_decision = @splat(10) }).validate());
+        try (@import("relational_index_release.zig").Intent{ .installed = installed, .metadata_decision = @splat(10) }).validate();
     }
     var recovered_installation = try owner_control.PreparedInstall.initIntent(alloc, db.core, installation_intent, .{});
     defer recovered_installation.deinit();
@@ -2538,6 +2538,109 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     const schema_generation = db.core.table_catalog.generation;
     try db.applyCommittedRaftIndexInstallation(&recovered_installation, 11, .{ .term = 16, .index = install_entry.index + 2 });
     try std.testing.expectEqual(schema_generation, db.core.table_catalog.generation);
+    const released = @import("relational_index_release.zig");
+    const release_intent: released.Intent = intent: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :intent .{ .installed = (try physical.Installed.load(alloc, &read, reserved_binding)).?, .metadata_decision = @splat(10) };
+    };
+    var release_prepared = try owner_control.PreparedRelease.init(alloc, db.core, release_intent, .{});
+    defer release_prepared.deinit();
+    try std.testing.expectError(error.InvalidControlReceiptPosition, release_prepared.preparePayload());
+    try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .release = release_intent }).validate());
+    const release_entry: receipts.OrderedApplyReceipt = .{ .term = 17, .index = install_entry.index + 3 };
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try release_prepared.stageRaft(db.core, &txn, 11, release_entry);
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try released.Record.load(alloc, &read, release_intent) == null);
+        try std.testing.expect((try @import("relational_integrity_topology.zig").current(&read)).?.eql(reserved_binding.fence));
+        try std.testing.expectEqual(.installed, (try jobs.load(&read)).?.phase);
+    }
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexRelease(&release_prepared, 99, release_entry));
+    try db.applyCommittedRaftIndexRelease(&release_prepared, 11, release_entry);
+    try db.applyCommittedRaftIndexRelease(&release_prepared, 11, release_entry);
+    try db.applyCommittedRaftIndexRelease(&release_prepared, 11, .{ .term = 18, .index = release_entry.index + 1 });
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    const live_claim_key = target.batch.entries[0].address.claimKey();
+    const live_claim_bytes = (try db.core.getStoreValue(alloc, &live_claim_key)).?;
+    defer alloc.free(live_claim_bytes);
+    try std.testing.expect(try db.collectReleasedNativeIndexCompanionsStep() == null);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const terminal = (try released.Record.load(alloc, &read, release_intent)).?;
+        try std.testing.expectEqual(release_entry.index, terminal.position.raft.index);
+        try std.testing.expectEqual(release_entry.term, terminal.position.raft.term);
+        try std.testing.expect(try @import("relational_integrity_topology.zig").current(&read) == null);
+        try std.testing.expect((try @import("relational_integrity_topology.zig").completed(&read)).?.eql(reserved_binding.fence));
+        try std.testing.expect(try jobs.load(&read) == null);
+        try std.testing.expectError(error.NotFound, read.get(physical.Installed.key));
+        try std.testing.expectError(error.GenerationRetirementPending, released.Record.requireRetirementClear(&read));
+        try std.testing.expectEqualSlices(u8, "AIIR\x02\x00\x00\x00", (try read.get(released.Record.key))[0..8]);
+        try std.testing.expectEqual(.released, (try terminal.intent.receiptAt(terminal.position)).action);
+        try std.testing.expectError(error.PrivateIndexJobRequired, raft.receipt(&read, reserved_binding, .reserved));
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(raft.prefix)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.key, raft.prefix));
+    }
+    var gc_pages: usize = 0;
+    var gc_index = release_entry.index + 1;
+    while (true) {
+        var page = prepared: {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            break :prepared (try released.Gc.Page.prepare(alloc, db.backend_runtime.io(), &read)) orelse break;
+        };
+        defer page.deinit();
+        gc_pages += 1;
+        try std.testing.expect(gc_pages <= 8);
+        // Exercise partial progress even though this small fixture fits a page.
+        page.command.entries = page.command.entries[0..@min(1, page.command.entries.len)];
+        var gc_prepared: owner_control.PreparedReleaseGc = .{ .alloc = alloc, .command = page.command };
+        defer gc_prepared.deinit();
+        try std.testing.expectError(error.InvalidControlReceiptPosition, gc_prepared.preparePayload());
+        const entry: receipts.OrderedApplyReceipt = .{ .term = 18, .index = gc_index + 1 };
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            defer txn.abort();
+            try gc_prepared.stageRaft(db.core, &txn, 11, entry);
+        }
+        try std.testing.expectEqual(gc_index, (try db.orderedApplyReceipt()).?.index);
+        try db.applyCommittedRaftIndexReleaseGc(&gc_prepared, 11, entry);
+        try db.applyCommittedRaftIndexReleaseGc(&gc_prepared, 11, entry);
+        gc_index = entry.index;
+        if (gc_pages == 1) {
+            db.close();
+            db_live = false;
+            db = try db_mod.DB.open(alloc, directory.path(), options);
+            db_live = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), gc_pages);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try released.Record.requireRetirementClear(&read);
+        try std.testing.expectEqualSlices(u8, live_claim_bytes, try read.get(&live_claim_key));
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+    }
+    var retained_release = try owner_control.PreparedRelease.init(alloc, db.core, release_intent, .{});
+    defer retained_release.deinit();
+    try db.applyCommittedRaftIndexRelease(&retained_release, 11, .{ .term = 19, .index = gc_index + 1 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try released.Record.requireRetirementClear(&read);
+        try std.testing.expectEqual(release_entry.index, (try released.Record.load(alloc, &read, release_intent)).?.position.raft.index);
+    }
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 
@@ -3896,7 +3999,9 @@ fn testNativeIndexRelease(source: *db_mod.DB, installed: @import("relational_ind
         try std.testing.expectError(error.NotFound, read.get(@import("relational_index_inputs.zig").key));
         try std.testing.expectError(error.NotFound, read.get(@import("relational_index_validation.zig").Installed.key));
         try release_mod.Record.verifyRecovery(alloc, &read);
-        try std.testing.expectEqual(pending.position, (try release_mod.Record.load(alloc, &read, intent)).?.position);
+        const retained = (try release_mod.Record.load(alloc, &read, intent)).?;
+        try std.testing.expect(retained.position == .native);
+        try std.testing.expectEqual(pending.position, retained.position.native);
         const dirty = try @import("receipt_position.zig").Position.decode(try read.get(release_mod.Record.retirement_pending_key));
         try std.testing.expectEqual(pending.position, dirty.native);
     }
@@ -4076,7 +4181,7 @@ fn testReleasedIndexCompanionGc(source: *db_mod.DB, live_address: @import("relat
     {
         var txn = try primary.core.store.beginWriteTxn();
         defer txn.abort();
-        var wrong_cut = terminal.position;
+        var wrong_cut = terminal.position.native;
         wrong_cut.sequence += 1;
         try txn.put(release_mod.Record.retirement_pending_key, &try (@import("receipt_position.zig").Position{ .native = wrong_cut }).encode());
         try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, release_mod.Record.verifyRecovery(alloc, &txn));
@@ -4197,7 +4302,7 @@ fn testReleasedIndexCompanionGc(source: *db_mod.DB, live_address: @import("relat
     defer retry.deinit();
     const outcome = try primary.applyPreparedNativeIndexOwnerRelease(&retry, null);
     try std.testing.expect(outcome.duplicate);
-    try std.testing.expectEqualDeep(try terminal.intent.receipt(terminal.position), outcome.receipt.?);
+    try std.testing.expectEqualDeep(try terminal.intent.receiptAt(terminal.position), outcome.receipt.?);
     var scheduled_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-release-gc-scheduled");
     defer scheduled_dir.cleanup();
     var scheduled = try db_mod.DB.open(alloc, scheduled_dir.path(), options);
@@ -4765,7 +4870,8 @@ test "relational index build pages identity dispatch caches immutable candidates
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             const retained = (try Validation.load(alloc, &read, binding)).?;
-            try std.testing.expectEqual(position, retained.position);
+            try std.testing.expect(retained.position == .native);
+            try std.testing.expectEqual(position, retained.position.native);
             try std.testing.expectEqualDeep(page.command.next, retained.fields);
             prior_rows = retained.fields.rows;
         }
@@ -5853,7 +5959,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                         const installed_retry = try installed_db.applyPreparedNativeIndexOwnerInstallation(&duplicate_install, null);
                         try installed_retry.validate();
                         try std.testing.expect(installed_retry.duplicate);
-                        try std.testing.expectEqualDeep(try install_command.receipt(committed.position), installed_retry.receipt.?);
+                        try std.testing.expectEqualDeep(try install_command.receiptAt(committed.position), installed_retry.receipt.?);
                     }
                     const catalog_generation = installed_db.core.table_catalog.generation;
                     install_record.lsn = 6;
@@ -5865,9 +5971,9 @@ test "relational index build pages identity dispatch caches immutable candidates
                     {
                         var duplicate_read = try installed_db.core.store.beginReadTxn();
                         defer duplicate_read.abort();
-                        try std.testing.expectEqual(committed.position.sequence, (try authority.load(&duplicate_read)).?.sequence);
+                        try std.testing.expectEqual(committed.position.native.sequence, (try authority.load(&duplicate_read)).?.sequence);
                     }
-                    var wrong_position = committed.position;
+                    var wrong_position = committed.position.native;
                     wrong_position.sequence += 1;
                     install_record.lsn = 7;
                     install_record.previous_lsn = 6;

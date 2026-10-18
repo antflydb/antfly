@@ -317,7 +317,7 @@ pub const Effect = union(enum) {
             .install => |value| value.validation.command.binding.fence.namespace,
             .release => |value| value.installed.command.validation.command.binding.fence.namespace,
             .cancel_release => |value| value.canceled.position.namespace,
-            .release_gc => |value| value.record.position.namespace,
+            .release_gc => |value| value.record.intent.installed.command.validation.command.binding.fence.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup, .cancel_complete => |value| value.fence.namespace,
@@ -351,9 +351,15 @@ pub const Effect = union(enum) {
                 try value.validate();
                 if (value.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
             },
-            .release => |value| try value.validate(),
+            .release => |value| {
+                try value.validate();
+                if (value.installed.position != .native) return error.InvalidControlReceiptPosition;
+            },
             .cancel_release => |value| try value.validate(),
-            .release_gc => |value| try value.validate(),
+            .release_gc => |value| {
+                try value.validate();
+                if (value.record.position != .native) return error.InvalidControlReceiptPosition;
+            },
             .build => |value| {
                 try value.validate();
                 if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
@@ -1295,18 +1301,28 @@ pub const PreparedRelease = struct {
     pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !ReleaseOutcome {
         try self.validate();
         const result = try release.Record.stage(self.alloc, txn, self.intent, position);
-        return .{ .intent = self.intent, .position = result.record.position, .duplicate = result.duplicate };
+        return .{ .intent = self.intent, .position = result.record.position.native, .duplicate = result.duplicate };
+    }
+    pub fn stageRaft(self: *@This(), _: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        const binding = self.intent.installed.command.validation.command.binding;
+        if (binding.authority != .raft or owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try release.Record.stageAt(self.alloc, txn, self.intent, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return true;
     }
     pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ReleaseOutcome) !void {
         const record = (try release.Record.load(self.alloc, txn, self.intent)) orelse return error.InvalidPrivateIndexNativeReceipt;
-        if (!std.meta.eql(record.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        if (record.position != .native or !std.meta.eql(record.position.native, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
         try release.Record.verifyRecovery(self.alloc, txn);
-        outcome.receipt = try self.intent.receipt(record.position);
+        outcome.receipt = try self.intent.receipt(record.position.native);
     }
     pub fn preparePayload(self: *@This()) !void {
+        if (self.intent.installed.position != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "release", self.intent, release.Record.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
@@ -1392,24 +1408,34 @@ pub const PreparedReleaseGc = struct {
         try self.command.validate();
     }
     pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
-        return self.command.record.position.namespace;
+        return self.command.record.intent.installed.command.validation.command.binding.fence.namespace;
     }
     pub fn validateReplay(self: *const @This(), position: Native) !void {
         try (Frame{ .effect = .{ .release_gc = self.command }, .position = position }).validate();
-        if (position.sequence <= self.command.record.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        if (position.sequence <= self.command.record.position.native.sequence) return error.InvalidPrivateIndexNativeReceipt;
     }
     pub fn replayDuplicateOutcome(self: *const @This(), position: Native) ApplyOutcome {
-        return .{ .released = self.command.record.position, .position = position, .duplicate = true };
+        return .{ .released = self.command.record.position.native, .position = position, .duplicate = true };
     }
     pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !ApplyOutcome {
         try self.validate();
         return self.command.stage(self.alloc, txn, position);
+    }
+    pub fn stageRaft(self: *@This(), _: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        const binding = self.command.record.intent.installed.command.validation.command.binding;
+        if (binding.authority != .raft or owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try self.command.stageAt(self.alloc, txn, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return false;
     }
     pub fn populateReceipt(_: *const @This(), _: anytype, _: *ApplyOutcome) !void {}
     pub fn preparePayload(self: *@This()) !void {
+        if (self.command.record.position != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "release_gc", self.command, release.Gc.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {

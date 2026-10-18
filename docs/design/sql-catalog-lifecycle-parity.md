@@ -69,8 +69,16 @@ nothing. Native and Raft installed records share AIIS v2 with tagged positions.
 Exact and later-entry retries retain the original install cut without repeating
 schema publication. Cold recovery verifies the real successor and its retained
 predecessor; the write fence stays held until the separately authorized release.
+Replicated release now lifts that fence, retains the original terminal cut and
+records bounded companion retirement in the same transaction as its apply marker.
+GC pages also apply at real Raft cuts: cold recovery resumes the exact retained
+release, and cleanup never deletes live UNIQUE claims. New build admission stays
+closed until companion retirement completes. The standalone worker leaves Raft
+retirement to ordered proposals. Terminal records use one tagged AIIR v2 format.
 This does not yet wire replicated claim delivery, validation seals,
 installation, cancellation or publication release through the public receiver.
+Raft cancellation and failed-build convergence also remain required before
+public activation; none of these storage primitives grants metadata authority.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
 passes 291 storage tests and one server test, with no skips or leaks. The Raft
@@ -89,6 +97,12 @@ foreign groups, retained retry cuts, cold recovery and checksummed future cuts.
 Installation controls cover preparation allocation failures, abort after marker
 staging, pinned old schema views, atomic durable/runtime publication, same-entry
 and later-entry retries, cold installed recovery and unchanged fence ownership.
+Release controls cover abort/replay, immutable terminal cuts, removed private
+control slots, fence completion, cold partial-GC resume, retained retries after
+cleanup, unchanged live claims and exclusion from the native-clock worker.
+`zig build antfly-relational-index-pages-test -Doptimize=Debug -j1` also passes
+all 12 standalone lifecycle tests, including standby replay and bounded released
+companion retirement. This gate is distinct from the publication-only suite.
 
 ## Document conflict delivery (2026-10-17)
 
