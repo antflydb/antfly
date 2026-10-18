@@ -1508,7 +1508,8 @@ one null-extended row; downstream filtering never creates a replacement row.
 This match marker is independent of saturated multiplicities and aggregate passes.
 Wildcard DISTINCT includes every binding in its dependency proof; observing
 an interior node or route retains exact production. Read-only intermediate
-ordering can be omitted before direct COUNT/MIN/MAX reductions when all affected
+ordering can be omitted before COUNT/MIN/MAX reductions, including scalar
+expressions composed from their completed states, when all affected
 projections, predicates and sort keys are provably total and no pagination
 observes their order. Ordered finite windows retain compressed endpoint bags in
 a weighted TopK heap: excess multiplicities are trimmed at the worst key, SKIP
@@ -1522,7 +1523,15 @@ preserving their own aggregate scopes. Read-only CALL subqueries use weighted
 correlated apply: returned child weights multiply the parent contribution,
 empty returning bodies suppress the parent, and unit bodies preserve it once.
 Nested calls isolate projection metadata, aggregate demand and profiling buffers;
-variable conflicts and recursion limits follow ordinary subquery semantics. Writes
+variable conflicts and recursion limits follow ordinary subquery semantics.
+Pure CALL queries enter this pipeline from a weighted unit input, so an initial
+CALL does not need an earlier MATCH or finite window to retain child bags.
+Pattern dependency analysis follows query WITH scopes and lexical shadowing;
+only captured outer bindings stay live. Unobserved path aliases therefore do
+not force route production merely because a later expression contains a pattern.
+SIZE over a pure pattern comprehension requests cardinality directly and evaluates
+its projection once per complete binding, preserving NULL entries and eager
+projection errors without constructing a list of repeated elements. Writes
 and procedure calls remain execution barriers. Expression evaluation isolates
 nested profiling buffers and weighted continuations from retained execution state.
 Each subsequent match negotiates a seed-aware weighted child producer. Binding
@@ -1537,12 +1546,21 @@ and non-DISTINCT SUM/AVG/COLLECT need exact multiplicity. Proof-only constant
 folding accepts bound parameters and constant arithmetic in finite row goals
 without moving invalid-goal errors ahead of their projection. Native path counts
 saturate at maxInt(u64), strictly above every legal signed SKIP+LIMIT sum, so even
-large-offset ordered windows retain sufficient prefix counts. Exact consumers
-reject that sentinel; finite consumers clip it to their requested window. Trail scope and optional null extension remain
-clause-local. Expansion is
-reserved for external rows and consumers such as non-DISTINCT collect that need
-individual elements. Saturated path
-counts remain sufficient for a finite window. Other ordering, aggregation,
+large-offset windows retain sufficient prefix counts. Unordered finite windows
+request prefix counts when their proven row goal exceeds remaining route-work
+capacity; small goals keep demand-driven first-route production. Exact consumers
+reject that producer sentinel; finite consumers clip it to their requested window.
+Native continuation products remain inline u64 when possible and promote to
+immutable, arena-owned arbitrary-precision counts on overflow. Unbounded
+projections retain those counts and SKIP subtracts exactly; finite windows clip
+before any row expansion. COUNT and integer SUM check their result ranges,
+including zero sums over promoted counts. Floating SUM uses a wide intermediate,
+and AVG normalizes count magnitudes before computing weight ratios, so even
+products beyond binary128's exponent range do not create spurious numeric errors.
+SQL weighted cursors retain their existing u64 count protocol. Trail scope and
+optional null extension remain clause-local. Expansion is reserved for external
+rows and consumers such as non-DISTINCT collect that need individual elements.
+Saturated path counts remain sufficient for a finite window. Other ordering, aggregation,
 writes and non-repeatable expressions remain pipeline barriers.
 Endpoint-only RETURN DISTINCT also reduces the path product states directly,
 including saturated counts, while preserving the existing uniqueness proofs and

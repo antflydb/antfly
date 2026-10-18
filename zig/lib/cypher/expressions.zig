@@ -310,7 +310,7 @@ fn visitFreeScoped(expression: *const ast.Expr, context: anytype, locals: ?*cons
             while (local) |binding| : (local = binding.parent) if (std.mem.eql(u8, binding.name, name)) return;
             try context.reference(name);
         },
-        .exists, .pattern_comprehension => try context.pattern(),
+        .exists, .pattern_comprehension => try context.pattern(expression, locals),
         .comprehension => |c| {
             try visitFreeScoped(c.input, context, locals);
             const local: Local = .{ .name = c.alias, .parent = locals };

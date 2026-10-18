@@ -2171,6 +2171,79 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
         with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
             db.cypher_json("g", {"query": window + tail})
 
+    for query, expected in (
+        (window + "MATCH (b)<-[:R*48..48]-(c:D) RETURN avg(c.score),sum(0),count(c.missing)", [16.0, "0", "0"]),
+        (window + "MATCH (b)<-[:R*48..48]-(c:D) WITH c RETURN avg(c.score)", [16.0]),
+        (window + "CALL { WITH b MATCH (b)<-[:R*48..48]-(c:D) RETURN c } RETURN avg(c.score)", [16.0]),
+        (
+            window + "MATCH (b)<-[:R*48..48]-(c:D) RETURN sum(1e-300)",
+            [pytest.approx(5000000 * 2**48 * 1e-300, rel=1e-12, abs=0)],
+        ),
+        (
+            base
+            + "WITH b LIMIT 2 MATCH (b)<-[:R*64..64]-(c:D) WITH c SKIP 9223372036854775807 WITH c LIMIT 3 RETURN count(*)",
+            ["3"],
+        ),
+        ("CALL { " + base + "RETURN b } RETURN count(DISTINCT b)", ["2"]),
+        ("WITH 1 AS k CALL { " + base + "RETURN b ORDER BY b.score LIMIT 5000000 } RETURN count(*)", ["5000000"]),
+        ("CALL { " + base + "RETURN b ORDER BY b.score LIMIT 5000000 } RETURN count(*)", ["5000000"]),
+        ("CALL { " + base + " } RETURN count(*)", ["1"]),
+        (base.replace("MATCH ", "MATCH p=", 1) + "WHERE EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(*)", ["0"]),
+        (
+            base.replace("MATCH ", "MATCH p=", 1) + "WITH b WHERE EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(*)",
+            ["0"],
+        ),
+        (base.replace("MATCH ", "MATCH p=", 1) + "RETURN min(size([p=(b)-[:R]->(c:D) | length(p)]))", ["0"]),
+        (
+            base.replace("MATCH ", "MATCH p=", 1)
+            + "RETURN min(CASE WHEN EXISTS { WITH 1 AS p RETURN p } THEN 1 ELSE 0 END)",
+            ["1"],
+        ),
+        ("MATCH (s:D {id:'start'}) RETURN size([(s)-[:R*24..24]->(c:D) | c.score])", ["16777216"]),
+        ("MATCH (s:D {id:'start'}) RETURN size([(s)-[:R*24..24]->(c:D) | NULL])", ["16777216"]),
+        ("MATCH (s:D {id:'start'}) RETURN size([(s)<-[:R*24..24]-(c:D) | 1/0])", ["0"]),
+        (base + "WITH b ORDER BY b.score RETURN min(b.score)+max(b.score)", ["128"]),
+        (base + "WITH b ORDER BY b.score RETURN count(DISTINCT b)+1", ["3"]),
+    ):
+        result = db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 10000, "explored_edges": 1000}})
+        assert [cell["value"] for cell in result["rows"][0]] == expected, query
+    enormous = (
+        window
+        + "MATCH (b)<-[:R*48..48]-(c:D) MATCH (c)-[:R*48..48]->(d:D) MATCH (d)<-[:R*48..48]-(e:D) RETURN avg(e.score),sum(0)"
+    )
+    result = db.cypher_json("g", {"query": enormous, "limits": {"intermediate_states": 50000, "explored_edges": 4000}})
+    assert [cell["value"] for cell in result["rows"][0]] == [16.0, "0"]
+    small_goal = db.cypher_json(
+        "g",
+        {
+            "query": base + "RETURN b.score SKIP 1 LIMIT 1",
+            "limits": {"intermediate_states": 2000, "explored_edges": 150},
+        },
+    )
+    assert small_goal["rows"] == [[{"type": "integer", "value": "64"}]]
+    for order in ("", "ORDER BY b.score"):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": base + f"RETURN b.score {order} SKIP 9223372036854775807 LIMIT 3",
+                "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "64"}]] * 3
+    for query, code in (
+        (window + "MATCH (b)<-[:R*48..48]-(c:D) RETURN sum(1)", "CypherNumericOverflow"),
+        (window + "MATCH (b)<-[:R*48..48]-(c:D) RETURN collect(0)", "CypherStateBudgetExceeded"),
+        ("MATCH (s:D {id:'start'}) RETURN size([(s)-[:R*24..24]->(c:D) | 1/0])", "CypherDivisionByZero"),
+        (
+            base.replace("*64..64", "*4..4") + "WITH b ORDER BY 1/0 RETURN min(b.score)+max(b.score)",
+            "CypherDivisionByZero",
+        ),
+    ):
+        with pytest.raises(af.GraphError) as failed:
+            db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 10000, "explored_edges": 1000}})
+
+        assert code in str(failed.value), query
+
     empty_binding = db.cypher_json(
         "g",
         {"query": "MATCH (:D {id:'start'})-[:R*64..64]->(:D) WITH * LIMIT 5000000 WITH DISTINCT * RETURN count(*)"},

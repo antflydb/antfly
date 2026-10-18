@@ -23,6 +23,7 @@ const numbers = @import("numbers.zig");
 const Budget = @import("budget.zig");
 const value_work = @import("value_work.zig");
 const A = std.mem.Allocator;
+const Count = @import("multiplicity.zig").Count;
 pub const Row = []const v.Entry;
 pub const max_response_bytes: usize = 32 << 20;
 pub const Limits = struct { memory_bytes: usize = 64 << 20, scanned_anchors: usize = 1_000_000, explored_edges: usize = 1_000_000, intermediate_states: usize = 1_000_000, path_depth: usize = 1024, recursion_depth: usize = 64 };
@@ -977,10 +978,10 @@ const Engine = struct {
     strings: @import("string_work.zig").Runtime = undefined,
     const WeightedRows = struct {
         rows: []const Row,
-        weights: []const u64,
+        weights: []const Count,
         fn count(self: @This()) usize {
             var total: usize = 0;
-            for (self.weights) |weight| total +|= std.math.cast(usize, weight) orelse std.math.maxInt(usize);
+            for (self.weights) |weight| total +|= @as(usize, @intCast(weight.cap(std.math.maxInt(usize))));
             return total;
         }
     };
@@ -1039,12 +1040,15 @@ const Engine = struct {
         sum: v.Value = .{ .integer = 0 },
         mean: f64 = 0,
         mean_weight: f64 = 0,
+        // Only promoted AVG counts need this state; ordinary aggregate groups
+        // retain the inline u64/f64 path and avoid a binary128-sized field.
+        mean_scaled: ?*Count.Scaled = null,
         best: v.Value = .null,
         collected: std.ArrayList(v.Value) = .empty,
         fn add(self: *StreamingAggregate, engine: *Engine, row: Row) !void {
-            return self.addWeighted(engine, row, 1);
+            return self.addWeighted(engine, row, Count.one);
         }
-        fn addWeighted(self: *StreamingAggregate, engine: *Engine, row: Row, multiplicity: u64) !void {
+        fn addWeighted(self: *StreamingAggregate, engine: *Engine, row: Row, multiplicity: Count) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
             if (value == .null) return;
             // MIN/MAX are duplicate insensitive and need no distinct set.
@@ -1063,35 +1067,39 @@ const Engine = struct {
                 try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
                 try self.distinct_values.append(retained, owned);
             }
-            const weight = if (self.function.distinct or std.ascii.eqlIgnoreCase(self.function.name, "min") or std.ascii.eqlIgnoreCase(self.function.name, "max")) 1 else multiplicity;
+            const weight = if (self.function.distinct or std.ascii.eqlIgnoreCase(self.function.name, "min") or std.ascii.eqlIgnoreCase(self.function.name, "max")) Count.one else multiplicity;
             const prior_count = self.count;
-            self.count +|= weight;
+            self.count +|= weight.cap(std.math.maxInt(u64));
             if (std.ascii.eqlIgnoreCase(self.function.name, "count")) {
-                self.count = try addPathCount(prior_count, weight);
+                self.count = try addPathCount(prior_count, weight.cap(std.math.maxInt(u64)));
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
                 const retained = self.arena.allocator();
                 const owned = if (self.function.distinct) self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
-                try Engine.chargeWork(engine, std.math.cast(usize, weight) orelse return error.CypherStateBudgetExceeded);
-                try self.collected.ensureUnusedCapacity(retained, @intCast(weight));
-                for (0..@intCast(weight)) |_| self.collected.appendAssumeCapacity(owned);
+                try Engine.chargeWork(engine, std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded);
+                try self.collected.ensureUnusedCapacity(retained, @intCast(weight.exact().?));
+                for (0..@intCast(weight.exact().?)) |_| self.collected.appendAssumeCapacity(owned);
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
                 if (value != .integer and value != .number) return error.CypherTypeMismatch;
+                if ((value == .integer and value.integer == 0) or (value == .number and value.number == 0)) {
+                    self.sum = try engine.binary(.add, self.sum, value);
+                    return;
+                }
                 if (self.sum == .integer and value == .integer) {
                     // A wide intermediate avoids a spurious product overflow
                     // when the current sum offsets a repeated value.
-                    const sum = @as(i128, self.sum.integer) + @as(i128, value.integer) * @as(i128, weight);
+                    const sum = @as(i128, self.sum.integer) + @as(i128, value.integer) * @as(i128, weight.exact() orelse return error.CypherNumericOverflow);
                     self.sum = .{ .integer = std.math.cast(i64, sum) orelse return error.CypherNumericOverflow };
                 } else {
-                    if (weight == 1) {
+                    if (weight.isOne()) {
                         self.sum = try engine.binary(.add, self.sum, value);
                     } else {
                         // A finite current sum can offset an overflowing f64
                         // product. Wider arithmetic keeps that cancellation.
-                        const combined = @as(f128, try self.sum.numeric()) + @as(f128, try value.numeric()) * @as(f128, @floatFromInt(weight));
+                        const combined = @as(f128, try self.sum.numeric()) + @as(f128, try value.numeric()) * weight.wideNumber();
                         const number: f64 = @floatCast(combined);
                         if (!std.math.isFinite(number)) return error.CypherNumericOverflow;
                         self.sum = .{ .number = number };
@@ -1101,9 +1109,22 @@ const Engine = struct {
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "avg")) {
                 const number = try value.numeric();
-                const added: f64 = @floatFromInt(weight);
+                if (weight.big != null or self.mean_scaled != null) {
+                    const added = weight.scaled();
+                    const current = if (self.mean_scaled) |scaled| scaled.* else Count.Scaled.from(self.mean_weight);
+                    const total = if (prior_count == 0) added else current.plus(added);
+                    if (prior_count == 0) self.mean = number else {
+                        const fraction = added.ratio(total);
+                        self.mean = @floatCast(@as(f128, self.mean) * (1 - fraction) + @as(f128, number) * fraction);
+                    }
+                    if (self.mean_scaled == null) self.mean_scaled = try self.arena.allocator().create(Count.Scaled);
+                    self.mean_scaled.?.* = total;
+                    if (!std.math.isFinite(self.mean)) return error.CypherNumericOverflow;
+                    return;
+                }
+                const added: f64 = @floatFromInt(weight.small);
                 const total = self.mean_weight + added;
-                if (prior_count == 0) self.mean = number else if (weight == 1 and total < @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
+                if (prior_count == 0) self.mean = number else if (weight.isOne() and total < @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
                     self.mean = numbers.nextAverage(self.mean, number, @intFromFloat(total));
                 } else {
                     const fraction = added / total;
@@ -1240,11 +1261,11 @@ const Engine = struct {
         distinct: []DistinctRows,
         distinct_goal: ?usize = null,
         had_match: bool = false,
-        weight: u64 = 1,
+        weight: Count = Count.one,
         active_calls: ?[]const bool = null,
         record_rows: bool = true,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
-            const weight = std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
+            const weight = @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             fold.had_match = true;
             if (fold.record_rows) fold.stage_counts[0] +|= weight;
             return fold.expand(engine, initial, 0);
@@ -1264,7 +1285,7 @@ const Engine = struct {
                             const scope = EvalScope.enter(engine, arena.allocator());
                             defer scope.leave(engine);
                             try engine.state();
-                            if (fold.record_rows) fold.stage_counts[index + 1] +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
+                            if (fold.record_rows) fold.stage_counts[index + 1] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
                             try fold.expand(engine, try engine.replace(row, unwind.alias, item), index + 1);
                         }
                     },
@@ -1274,8 +1295,8 @@ const Engine = struct {
                         if (step.value.distinct and !try fold.distinct[index].accept(engine, fold.retained, projected[0])) return;
                         const prior_weight = fold.weight;
                         defer fold.weight = prior_weight;
-                        if (step.value.distinct) fold.weight = 1;
-                        if (fold.record_rows) fold.stage_counts[index + 1] +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
+                        if (step.value.distinct) fold.weight = Count.one;
+                        if (fold.record_rows) fold.stage_counts[index + 1] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
                         try fold.expand(engine, projected[0], index + 1);
                     },
                     else => unreachable,
@@ -1283,7 +1304,7 @@ const Engine = struct {
                 return;
             }
             try engine.state();
-            if (fold.record_rows) fold.matched.* +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
+            if (fold.record_rows) fold.matched.* +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
                 if (fold.projection.limit != null and fold.projection.order.len == 0 and top.total == top.capacity) return error.CypherStreamComplete;
@@ -1418,11 +1439,64 @@ const Engine = struct {
                 try chargeWork(visitor.engine, 1);
                 try visitor.names.put(visitor.engine.a, name, {});
             }
-            pub fn pattern(visitor: @This()) !void {
-                for (visitor.candidates) |entry| try visitor.reference(entry.name);
+            pub fn pattern(visitor: @This(), expression_value: *const ast.Expr, locals: ?*const @import("expressions.zig").Local) anyerror!void {
+                try visitor.engine.retainPattern(visitor.names, visitor.candidates, expression_value, locals);
             }
         };
         try @import("expressions.zig").visitFree(expression, Visitor{ .engine = self, .names = names, .candidates = candidates });
+    }
+    fn retainPattern(self: *Engine, names: *Names, candidates: Row, expression: *const ast.Expr, locals: ?*const @import("expressions.zig").Local) anyerror!void {
+        var visible: std.ArrayList(v.Entry) = .empty;
+        for (candidates) |entry| {
+            var local = locals;
+            const shadowed = while (local) |binding| : (local = binding.parent) {
+                if (std.mem.eql(u8, entry.name, binding.name)) break true;
+            } else false;
+            if (!shadowed) try visible.append(self.a, entry);
+        }
+        if (expression.value == .exists) return self.retainQueryReferences(names, visible.items, expression.value.exists);
+        const comprehension = expression.value.pattern_comprehension;
+        if (comprehension.path.alias) |alias| {
+            var index: usize = 0;
+            while (index < visible.items.len) {
+                if (std.mem.eql(u8, visible.items[index].name, alias)) {
+                    _ = visible.orderedRemove(index);
+                } else index += 1;
+            }
+        }
+        var references: Names = .empty;
+        try self.matchReferences(&references, visible.items, ast.Match{ .paths = &.{comprehension.path}, .predicate = comprehension.predicate });
+        try self.retainReferences(&references, visible.items, comprehension.projection);
+        for (visible.items) |entry| if (references.contains(entry.name)) try names.put(self.a, entry.name, {});
+    }
+    fn scopeAfter(self: *Engine, active: Row, clause: ast.Clause) !Row {
+        switch (clause.operation) {
+            .project => |p| {
+                var next: std.ArrayList(v.Entry) = .empty;
+                if (p.value.wildcard) for (active) |entry| {
+                    const shadowed = for (p.value.items) |item| {
+                        if (std.mem.eql(u8, entry.name, item.alias orelse try self.expressionName(item.expression))) break true;
+                    } else false;
+                    if (!shadowed) try next.append(self.a, entry);
+                };
+                return next.items;
+            },
+            .unwind => |u| {
+                var next: std.ArrayList(v.Entry) = .empty;
+                for (active) |entry| if (!std.mem.eql(u8, entry.name, u.alias)) try next.append(self.a, entry);
+                return next.items;
+            },
+            else => return active,
+        }
+    }
+    fn retainQueryReferences(self: *Engine, names: *Names, candidates: Row, clauses: []const ast.Clause) anyerror!void {
+        var active = candidates;
+        for (clauses) |clause| {
+            var references: Names = .empty;
+            try self.matchReferences(&references, active, clause);
+            for (active) |entry| if (references.contains(entry.name)) try names.put(self.a, entry.name, {});
+            active = try self.scopeAfter(active, clause);
+        }
     }
     fn discardable(expression: *const ast.Expr, node_shape: Row) bool {
         return switch (expression.value) {
@@ -1442,10 +1516,14 @@ const Engine = struct {
             if (clause.operation == .project and clause.operation.project.value.order.len != 0) break true;
         } else false;
         if (!ordered or projection.items.len == 0 or !self.read_only) return middle;
+        var calls: std.ArrayList(*const ast.Expr) = .empty;
         for (projection.items) |item| {
-            if (item.expression.value != .call) return middle;
-            const aggregate_call = item.expression.value.call;
-            if (!std.ascii.eqlIgnoreCase(aggregate_call.name, "count") and !std.ascii.eqlIgnoreCase(aggregate_call.name, "min") and !std.ascii.eqlIgnoreCase(aggregate_call.name, "max")) return middle;
+            if (!aggregates(item.expression) or !try self.collectStreamingAggregates(item.expression, &calls)) return middle;
+        }
+        if (calls.items.len == 0) return middle;
+        for (calls.items) |expression| {
+            const name = expression.value.call.name;
+            if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max")) return middle;
         }
         var shape: Row = &.{};
         if (input.len != 0) for (input[0]) |entry| {
@@ -1479,7 +1557,7 @@ const Engine = struct {
             for (step.order) |order| if (!self.totalExpression(order.expression, scope)) return middle;
             shape = next;
         }
-        for (projection.items) |item| for (item.expression.value.call.args) |arg| if (!self.totalExpression(arg, shape)) return middle;
+        for (calls.items) |expression| for (expression.value.call.args) |arg| if (!self.totalExpression(arg, shape)) return middle;
         const output = try self.a.dupe(ast.Clause, middle);
         for (output) |*clause| clause.operation.project.value.order = &.{};
         return output;
@@ -1619,6 +1697,18 @@ const Engine = struct {
         for (passes, items, active) |*pass, group, mask| pass.* = .{ .projection = .{ .items = group.items }, .active_calls = mask };
         return passes;
     }
+    fn prefixWindow(self: *Engine, projection: ast.Projection) bool {
+        const skip_expression = projection.skip orelse return false;
+        const limit_expression = projection.limit orelse return false;
+        const skip = self.constant(skip_expression, &.{}) orelse return false;
+        const limit = self.constant(limit_expression, &.{}) orelse return false;
+        if (skip != .integer or limit != .integer or skip.integer <= 0 or limit.integer <= 0) return false;
+        // Route streaming cannot satisfy a prefix larger than its remaining
+        // work quota: every candidate charges a state. Smaller goals keep
+        // demand-driven traversal rather than discovering the whole closure.
+        const goal = @as(u64, @intCast(skip.integer)) + @as(u64, @intCast(limit.integer));
+        return goal > self.limits.intermediate_states -| self.stats.intermediate_states;
+    }
     fn streamMatchProjection(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
@@ -1689,7 +1779,7 @@ const Engine = struct {
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
-        const weighted_top = !grouped and (self.match_weight_demand != null or (projection.limit != null and (projection.order.len != 0 or self.retain_windows)));
+        const weighted_top = !grouped and (self.match_weight_demand != null or (projection.limit != null and (projection.order.len != 0 or self.retain_windows or self.prefixWindow(projection))));
         const count_endpoints = !count_shortest and operation.paths.len == 1 and path.selector == .all and (grouped or weighted_top) and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
@@ -2096,6 +2186,7 @@ const Engine = struct {
         return true;
     }
     fn matchReferences(self: *Engine, names: *Names, shape: Row, value: anytype) anyerror!void {
+        if (@TypeOf(value) == ast.Clause) if (value.operation == .subquery) return self.retainQueryReferences(names, shape, value.operation.subquery);
         if (@TypeOf(value) == ast.Projection) {
             if (value.wildcard) for (shape) |entry| try names.put(self.a, entry.name, {});
         }
@@ -2164,11 +2255,13 @@ const Engine = struct {
             producer.predicate = null;
             producer.optional = false;
             const dependencies = try self.a.alloc(ast.Clause, tail.len + 1);
-            dependencies[0] = .{ .span = .{}, .operation = .{ .project = .{ .value = .{ .items = &.{}, .wildcard = true, .predicate = predicate }, .final = false } } };
+            // Analysis-only stage: retain predicate dependencies without a
+            // wildcard making unused path and interior identities observable.
+            dependencies[0] = .{ .span = .{}, .operation = .{ .match = .{ .paths = &.{}, .predicate = predicate } } };
             @memcpy(dependencies[1..], tail);
             const candidates = try self.weightedMatch(input, producer, dependencies);
             var rows: std.ArrayList(Row) = .empty;
-            var weights: std.ArrayList(u64) = .empty;
+            var weights: std.ArrayList(Count) = .empty;
             for (candidates.rows, candidates.weights) |row, weight| {
                 const accepted = blk: {
                     var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
@@ -2196,7 +2289,7 @@ const Engine = struct {
                     };
                 }
                 try rows.append(self.a, extended);
-                try weights.append(self.a, 1);
+                try weights.append(self.a, Count.one);
             }
             return .{ .rows = rows.items, .weights = weights.items };
         };
@@ -2213,32 +2306,7 @@ const Engine = struct {
             }
         }
         var names: Names = .empty;
-        // Track which original bindings survive each scope boundary. A later
-        // wildcard observes that scope, not discarded path/interior aliases.
-        var active = shape;
-        for (tail) |clause| {
-            var references: Names = .empty;
-            try self.matchReferences(&references, active, clause);
-            for (active) |entry| if (references.contains(entry.name)) try names.put(self.a, entry.name, {});
-            switch (clause.operation) {
-                .project => |p| {
-                    var next: std.ArrayList(v.Entry) = .empty;
-                    if (p.value.wildcard) for (active) |entry| {
-                        const shadowed = for (p.value.items) |item| {
-                            if (std.mem.eql(u8, entry.name, item.alias orelse try self.expressionName(item.expression))) break true;
-                        } else false;
-                        if (!shadowed) try next.append(self.a, entry);
-                    };
-                    active = next.items;
-                },
-                .unwind => |u| {
-                    var next: std.ArrayList(v.Entry) = .empty;
-                    for (active) |entry| if (!std.mem.eql(u8, entry.name, u.alias)) try next.append(self.a, entry);
-                    active = next.items;
-                },
-                else => {},
-            }
-        }
+        try self.retainQueryReferences(&names, shape, tail);
         var items: std.ArrayList(ast.Item) = .empty;
         for (shape) |entry| if (names.contains(entry.name)) {
             const expression = try self.a.create(ast.Expr);
@@ -2263,8 +2331,8 @@ const Engine = struct {
         self.match_weight_demand = null;
         self.retain_windows = false;
         const rows = try self.match(&.{input}, operation);
-        const weights = try self.a.alloc(u64, rows.len);
-        @memset(weights, 1);
+        const weights = try self.a.alloc(Count, rows.len);
+        @memset(weights, Count.one);
         return .{ .rows = rows, .weights = weights };
     }
     fn runNext(self: *Engine, clauses: []const ast.Clause, rows: []const Row, preserve_rows: bool) anyerror![]const Row {
@@ -2288,16 +2356,16 @@ const Engine = struct {
             switch (clause.operation) {
                 .match => |operation| {
                     var rows: std.ArrayList(Row) = .empty;
-                    var weights: std.ArrayList(u64) = .empty;
+                    var weights: std.ArrayList(Count) = .empty;
                     const demand = try self.matchDemand(clauses[clause_index + 1 ..]);
                     for (bags.rows, bags.weights) |input, weight| {
                         const children = try self.weightedMatch(input, operation, clauses[clause_index + 1 ..]);
                         for (children.rows, children.weights) |output, child_weight| {
                             try rows.append(self.a, output);
                             const combined = switch (demand) {
-                                .presence => @as(u64, 1),
-                                .capped => multiplyPathWays(weight, child_weight),
-                                .exact => std.math.mul(u64, weight, child_weight) catch return error.CypherNumericOverflow,
+                                .presence => Count.one,
+                                .capped => Count.init(multiplyPathWays(weight.cap(std.math.maxInt(u64)), child_weight.cap(std.math.maxInt(u64)))),
+                                .exact => try weight.multiply(self.a, child_weight),
                             };
                             try weights.append(self.a, combined);
                         }
@@ -2306,7 +2374,7 @@ const Engine = struct {
                 },
                 .unwind => |u| {
                     var rows: std.ArrayList(Row) = .empty;
-                    var weights: std.ArrayList(u64) = .empty;
+                    var weights: std.ArrayList(Count) = .empty;
                     for (bags.rows, bags.weights) |row, weight| {
                         const value = try self.eval(u.expression, row, null);
                         if (value == .null) continue;
@@ -2371,8 +2439,8 @@ const Engine = struct {
                         self.pending_window = null;
                         bags = weighted;
                     } else {
-                        const weights = try self.a.alloc(u64, rows.len);
-                        @memset(weights, 1);
+                        const weights = try self.a.alloc(Count, rows.len);
+                        @memset(weights, Count.one);
                         bags = .{ .rows = rows, .weights = weights };
                     }
                 },
@@ -2381,7 +2449,7 @@ const Engine = struct {
                     defer self.recursion -= 1;
                     if (self.recursion > self.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
                     var rows: std.ArrayList(Row) = .empty;
-                    var weights: std.ArrayList(u64) = .empty;
+                    var weights: std.ArrayList(Count) = .empty;
                     const last = inner[inner.len - 1].operation;
                     const unit = last != .project or !last.project.final;
                     const demand = try self.matchDemand(clauses[clause_index + 1 ..]);
@@ -2390,7 +2458,7 @@ const Engine = struct {
                         const children = blk: {
                             defer scope.leave(self);
                             self.terminal_weight_demand = if (unit) .presence else demand;
-                            break :blk try self.runWeightedRows(inner, .{ .rows = &.{row}, .weights = &.{1} }, true, true);
+                            break :blk try self.runWeightedRows(inner, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
                         };
                         if (unit) {
                             try rows.append(self.a, row);
@@ -2402,9 +2470,9 @@ const Engine = struct {
                             for (child) |entry| merged = (try self.bind(merged, entry.name, entry.value)) orelse return error.CypherVariableConflict;
                             try rows.append(self.a, merged);
                             try weights.append(self.a, switch (demand) {
-                                .presence => 1,
-                                .capped => multiplyPathWays(weight, child_weight),
-                                .exact => std.math.mul(u64, weight, child_weight) catch return error.CypherNumericOverflow,
+                                .presence => Count.one,
+                                .capped => Count.init(multiplyPathWays(weight.cap(std.math.maxInt(u64)), child_weight.cap(std.math.maxInt(u64)))),
+                                .exact => try weight.multiply(self.a, child_weight),
                             });
                         }
                     }
@@ -2436,6 +2504,11 @@ const Engine = struct {
         self.recursion += 1;
         defer self.recursion -= 1;
         if (self.recursion > self.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
+        if (!explain and self.weightedTail(clauses) and clauses[0].operation != .match and hasCorrelatedBoundary(clauses)) {
+            const weights = try self.a.alloc(Count, input.len);
+            @memset(weights, Count.one);
+            return self.runWeighted(clauses, .{ .rows = input, .weights = weights }, preserve_rows);
+        }
         if (!explain and input.len == 1 and input[0].len == 0 and clauses.len >= 2 and clauses[0].operation == .match and clauses[0].operation.match.paths.len == 1) {
             for (clauses[1..], 1..) |clause, index| {
                 if (clause.operation == .unwind) continue;
@@ -2468,7 +2541,7 @@ const Engine = struct {
                     // Lower the producer before evaluating pure correlated
                     // expressions, once per binding with its bag weight.
                     var rows_out: std.ArrayList(Row) = .empty;
-                    var weights: std.ArrayList(u64) = .empty;
+                    var weights: std.ArrayList(Count) = .empty;
                     for (rows) |row| {
                         const children = try self.weightedMatch(row, clause.operation.match, tail);
                         try rows_out.appendSlice(self.a, children.rows);
@@ -3537,7 +3610,7 @@ const Engine = struct {
                 }
                 const fold = self.stream_fold.?;
                 const previous_weight = fold.weight;
-                fold.weight = if (self.match_weight_demand == .presence) 1 else ways;
+                fold.weight = Count.init(if (self.match_weight_demand == .presence) 1 else ways);
                 defer fold.weight = previous_weight;
                 try fold.add(self, row);
             }
@@ -4992,7 +5065,9 @@ const Engine = struct {
                 }
                 break :blk .{ .map = try output.toOwnedSlice(self.a) };
             },
-            .call => |c| if (aggregateName(c.name)) try self.aggregate(c, group orelse return error.CypherAggregateScope) else try self.function(c.name, c.args, row, group),
+            .call => |c| if (std.ascii.eqlIgnoreCase(c.name, "size") and c.args.len == 1 and c.args[0].value == .pattern_comprehension and weightedExpression(c.args[0]))
+                try self.comprehensionSize(c.args[0], row)
+            else if (aggregateName(c.name)) try self.aggregate(c, group orelse return error.CypherAggregateScope) else try self.function(c.name, c.args, row, group),
             .case_when => |c| blk: {
                 const operand = if (c.operand) |x| try self.eval(x, row, group) else null;
                 for (c.branches) |branch| {
@@ -5011,6 +5086,35 @@ const Engine = struct {
                 break :blk .{ .boolean = candidates.len > 0 };
             },
         };
+    }
+    fn comprehensionSize(self: *Engine, expression: *const ast.Expr, row: Row) anyerror!v.Value {
+        const scope = PatternScope.enter(self);
+        defer scope.leave(self);
+        const comprehension = expression.value.pattern_comprehension;
+        var input = row;
+        if (comprehension.path.alias) |alias| {
+            var local: std.ArrayList(v.Entry) = .empty;
+            for (row) |entry| if (!std.mem.eql(u8, entry.name, alias)) try local.append(self.a, entry);
+            input = local.items;
+        }
+        const count_expression: ast.Expr = .{ .span = expression.span, .value = .{ .call = .{ .name = "count", .args = &.{}, .star = true } } };
+        const dependencies = [_]ast.Clause{
+            .{ .span = expression.span, .operation = .{ .project = .{ .value = .{ .items = &.{.{ .expression = comprehension.projection, .alias = "_comprehension_value" }} }, .final = false } } },
+            .{ .span = expression.span, .operation = .{ .project = .{ .value = .{ .items = &.{.{ .expression = &count_expression }} }, .final = true } } },
+        };
+        const matched = try self.weightedMatch(input, .{ .paths = &.{comprehension.path}, .predicate = comprehension.predicate }, &dependencies);
+        var count_value: u64 = 0;
+        for (matched.rows, matched.weights) |binding, weight| {
+            // SIZE observes cardinality, but constructing the comprehension
+            // would still evaluate its projection, including NULLs and errors.
+            var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+            defer scratch.deinit();
+            const evaluation = EvalScope.enter(self, scratch.allocator());
+            defer evaluation.leave(self);
+            _ = try self.eval(comprehension.projection, binding, null);
+            count_value = try addPathCount(count_value, weight.cap(std.math.maxInt(u64)));
+        }
+        return .{ .integer = @intCast(count_value) };
     }
     fn entries(self: *Engine, items: []const ast.Entry, row: Row) ![]const v.Entry {
         const output = try self.a.alloc(v.Entry, items.len);
@@ -5354,7 +5458,7 @@ const Engine = struct {
             else => std.fmt.allocPrint(self.a, "expression@{}", .{expression.span.start}),
         };
     }
-    const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, sequence: usize = 0, weight: usize = 1 };
+    const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, sequence: usize = 0, weight: usize = 1, multiplicity: ?Count = null };
     const PatternScope = struct {
         columns: @FieldType(Engine, "columns"),
         stages: @FieldType(Engine, "stages"),
@@ -5440,7 +5544,7 @@ const Engine = struct {
         const a = arena.allocator();
         const row = (try (v.Value{ .map = candidate.row }).clone(a)).map;
         const keys = (try (v.Value{ .list = candidate.keys }).clone(a)).list;
-        return .{ .arena = arena, .value = .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence, .weight = candidate.weight } };
+        return .{ .arena = arena, .value = .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence, .weight = candidate.weight, .multiplicity = candidate.multiplicity } };
     }
     const TopK = struct {
         engine: *Engine,
@@ -5466,9 +5570,9 @@ const Engine = struct {
             for (self.picks.items) |*pick| pick.arena.deinit();
         }
         fn add(self: *TopK, source: Row) !void {
-            return self.addWeighted(source, 1);
+            return self.addWeighted(source, Count.one);
         }
-        fn addWeighted(self: *TopK, source: Row, weight: u64) !void {
+        fn addWeighted(self: *TopK, source: Row, weight: Count) !void {
             const engine = self.engine;
             defer self.sequence += 1;
             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
@@ -5485,8 +5589,8 @@ const Engine = struct {
             if (self.projection.predicate) |predicate| if ((try (try engine.eval(predicate, context, null)).truth()) != true) return;
             const keys = try engine.a.alloc(v.Value, self.projection.order.len);
             for (self.projection.order, keys) |order, *key| key.* = try engine.eval(order.expression, context, null);
-            const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence, .weight = @intCast(@min(@as(u128, weight), self.capacity)) };
-            if (self.capacity == 0 or weight == 0) return;
+            const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };
+            if (self.capacity == 0 or weight.cap(1) == 0) return;
             if (self.projection.limit != null and self.total == self.capacity and try engine.compareProjected(candidate, self.picks.items[0].value, self.projection.order) != .lt) return;
             var pick = try engine.clonePick(candidate);
             var owned = true;
@@ -5523,7 +5627,7 @@ const Engine = struct {
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;
             const projected = try engine.a.alloc(Projected, self.picks.items.len);
-            for (self.picks.items, projected) |pick, *item| item.* = .{ .row = (try (v.Value{ .map = pick.value.row }).clone(engine.a)).map, .source = &.{}, .group = null, .keys = (try (v.Value{ .list = pick.value.keys }).clone(engine.a)).list, .sequence = pick.value.sequence, .weight = pick.value.weight };
+            for (self.picks.items, projected) |pick, *item| item.* = .{ .row = (try (v.Value{ .map = pick.value.row }).clone(engine.a)).map, .source = &.{}, .group = null, .keys = (try (v.Value{ .list = pick.value.keys }).clone(engine.a)).list, .sequence = pick.value.sequence, .weight = pick.value.weight, .multiplicity = pick.value.multiplicity };
             // Sort only the retained window, using input sequence for stable ties.
             if (self.projection.order.len == 0 and self.projection.limit != null) std.mem.sort(Projected, projected, {}, struct {
                 fn less(_: void, left: Projected, right: Projected) bool {
@@ -5533,13 +5637,13 @@ const Engine = struct {
             var skip = @min(self.skip, self.total);
             if (engine.retain_windows) {
                 var rows: std.ArrayList(Row) = .empty;
-                var weights: std.ArrayList(u64) = .empty;
+                var weights: std.ArrayList(Count) = .empty;
                 for (projected) |item| {
                     const discarded = @min(skip, item.weight);
                     skip -= discarded;
                     if (item.weight == discarded) continue;
                     try rows.append(engine.a, item.row);
-                    try weights.append(engine.a, item.weight - discarded);
+                    try weights.append(engine.a, try (item.multiplicity orelse Count.init(item.weight)).subtract(engine.a, discarded));
                 }
                 engine.pending_window = .{ .rows = rows.items, .weights = weights.items };
                 if (final) engine.columns = try self.columns.toOwnedSlice(engine.a);
@@ -5993,21 +6097,33 @@ test "weighted numeric reductions keep finite cancellation and checked integer b
     defer reduction.arena.deinit();
     defer reduction.distinct_arena.deinit();
     reduction.sum = .{ .number = -1e308 };
-    try reduction.addWeighted(&engine, &.{}, 2);
+    try reduction.addWeighted(&engine, &.{}, Count.init(2));
     try std.testing.expectEqual(@as(f64, 1e308), reduction.result().number);
     operand.value = .{ .literal = .{ .integer = std.math.maxInt(i64) } };
     reduction.sum = .{ .integer = -std.math.maxInt(i64) };
-    try reduction.addWeighted(&engine, &.{}, 2);
+    try reduction.addWeighted(&engine, &.{}, Count.init(2));
     try std.testing.expectEqual(std.math.maxInt(i64), reduction.result().integer);
     reduction.sum = .{ .integer = 0 };
-    try std.testing.expectError(error.CypherNumericOverflow, reduction.addWeighted(&engine, &.{}, 2));
+    try std.testing.expectError(error.CypherNumericOverflow, reduction.addWeighted(&engine, &.{}, Count.init(2)));
     operand.value = .{ .literal = .{ .number = 1e308 } };
     reduction.function.name = "avg";
     reduction.count = 1;
     reduction.mean = -1e308;
     reduction.mean_weight = 1;
-    try reduction.addWeighted(&engine, &.{}, 2);
+    try reduction.addWeighted(&engine, &.{}, Count.init(2));
     try std.testing.expectApproxEqRel(@as(f64, 1e308 / 3.0), reduction.result().number, 1e-14);
+    var counts = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer counts.deinit();
+    const promoted = try Count.init(@as(u64, 1) << 63).multiply(counts.allocator(), Count.init(2));
+    reduction.count = 0;
+    reduction.mean_weight = 0;
+    operand.value = .{ .literal = .{ .number = 9 } };
+    try reduction.addWeighted(&engine, &.{}, promoted);
+    operand.value = .{ .literal = .{ .number = 3 } };
+    try reduction.addWeighted(&engine, &.{}, promoted);
+    try std.testing.expectEqual(@as(f64, 6), reduction.result().number);
+    try reduction.addWeighted(&engine, &.{}, Count.one);
+    try std.testing.expectApproxEqRel(@as(f64, 6), reduction.result().number, 1e-14);
 }
 
 test "branch subset counting agrees with explicit distinct edge assignments" {
