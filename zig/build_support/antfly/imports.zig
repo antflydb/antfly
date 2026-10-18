@@ -327,6 +327,7 @@ pub const AntflyRootImports = struct {
     };
     const api_imports = .{
         "inference_api",
+        "extraction_openapi",
         "exa_api",
         "tavily_api",
         "websearch_openapi",

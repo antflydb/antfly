@@ -7772,6 +7772,8 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
     defer arena.deinit();
     const curation = @import("../storage/db/resolver_curation.zig");
     const request = std.json.parseFromSliceLeaky(curation.NamespaceRequest, arena.allocator(), request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver namespace request");
+    if (request.key_map != null and request.aliases != null) return capi.mapErrorContext(error.InvalidArgument, "explicit aliases require reset_merges:true");
+    if (request.reset_merges == (request.key_map != null)) return capi.mapErrorContext(error.InvalidArgument, "choose reset_merges:true or an explicit key_map, exclusively");
     const configs = handle.database().core.index_manager.listResolverIdentities(handle.alloc) catch |err| return capi.mapError(err);
     defer {
         for (configs) |*cfg| cfg.deinit(handle.alloc);
