@@ -47,6 +47,26 @@ def producer(commit="1" * 40):
 
 
 class EmbeddedPublishTests(unittest.TestCase):
+    def test_automatic_workflow_preserves_credential_separation(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/embedded-release-publish.yml"
+        ).read_text()
+        self.assertIn('workflows: ["Release build"]', workflow)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
+        self.assertIn('echo "publish=false"', workflow)
+        prepare = workflow.split("  prepare-cargo:")[1].split("  publish-cargo:")[0]
+        publish = workflow.split("  publish-cargo:")[1].split("  publish-pypi:")[0]
+        self.assertNotIn("id-token: write", prepare)
+        self.assertIn("embedded_cargo.py build", prepare)
+        self.assertIn("github_environment.py check", prepare)
+        self.assertIn("environment: crates-io", publish)
+        self.assertIn("id-token: write", publish)
+        self.assertIn("embedded_cargo.py publish", publish)
+        self.assertNotIn("embedded_cargo.py build", publish)
+        self.assertNotIn("rust-toolchain@", publish)
+        self.assertNotIn("--stage", publish)
+
     def test_display_name_does_not_authenticate_the_producer(self):
         run = producer()
         run.update(
@@ -131,6 +151,7 @@ class EmbeddedPublishTests(unittest.TestCase):
                     "version": "0.3.0",
                     "python_version": "0.3.0",
                     "npm_tag": "latest",
+                    "tag": "v0.3.0",
                 },
             )
             combined = copy.deepcopy(document)
@@ -153,6 +174,44 @@ class EmbeddedPublishTests(unittest.TestCase):
                     changed[field] = value
                     with self.assertRaises((ValueError, SystemExit)):
                         verify(changed)
+
+            # Automatic execution derives its immutable tag from the authenticated
+            # controller artifact, including prerelease registry versions.
+            git("tag", "v0.3.0-rc.1", source)
+            rc = build_release_spec(
+                "v0.3.0-rc.1",
+                "next",
+                source,
+                controller,
+                release_line="0.3",
+                source_ref="refs/heads/main",
+                source_ref_head=source,
+                build_contract_schema=5,
+            ).document()
+            request.write_text(json.dumps(rc))
+            outputs = verify_identity(
+                producer(controller),
+                WORKFLOW,
+                REPOSITORY,
+                "main",
+                request,
+                None,
+                root,
+            )
+            self.assertEqual(outputs["tag"], "v0.3.0-rc.1")
+            self.assertEqual(outputs["version"], "0.3.0-rc.1")
+            self.assertEqual(outputs["python_version"], "0.3.0rc1")
+            self.assertEqual(outputs["npm_tag"], "next")
+            with self.assertRaises((ValueError, SystemExit)):
+                verify_identity(
+                    producer(controller),
+                    WORKFLOW,
+                    REPOSITORY,
+                    "main",
+                    request,
+                    "v0.3.0",
+                    root,
+                )
 
             git("checkout", "-q", "--orphan", "untrusted")
             git("commit", "-q", "--allow-empty", "-m", "untrusted source")

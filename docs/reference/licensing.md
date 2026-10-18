@@ -83,15 +83,18 @@ archive and rejects server executables and ELv2 license files. Both package
 formats carry the package roots, additional-file map, and asset manifest in
 `LICENSES/source-map`; verification compares those files with the archive. The immutable
 package snapshot is produced by `.github/workflows/embedded-package.yml` as part
-of the release build. After a successful tagged release build, dispatch
-`.github/workflows/embedded-release-publish.yml` on `main` with that tag and build
-run ID. It authenticates the successful release-controller workflow on `main`,
+of the release build. A successful stable or RC build automatically starts
+`.github/workflows/embedded-release-publish.yml` on `main`; nightlies do not
+publish registry versions. Manual dispatch with the tag and build run ID retries
+an existing release. It authenticates the successful release-controller workflow on `main`,
 then checks its commit-bound release request against the immutable tag and the
 protected release-source history. It verifies package hashes and archive equivalence
 before publishing `antfly-embedded` wheels to PyPI and the
-`@antfly/embedded` platform and selector packages to npm. The PyPI project and
-each npm package must have trusted publishing configured for this workflow in
-their registry settings.
+`@antfly/embedded` platform and selector packages to npm. It also packages and
+verifies the Rust bindings from that exact source commit and publishes
+`antfly-embedded-sys` before `antfly-embedded` to crates.io. Rust versions match
+the native release, including RC suffixes. All three registries require trusted
+publishing configured for this workflow in their registry settings.
 
 Before the first release, the PyPI account owner must configure a pending
 trusted publisher for project `antfly-embedded`, repository
@@ -108,7 +111,7 @@ Crates.io organization ownership uses the existing GitHub team
 `github:antflydb:engineering`, not a separate crates.io organization. All four
 crates were verified with both that team and `ajroetker` as owners. Keep a
 personal owner for ownership administration; team owners can publish and yank.
-See [registry claims](../../registry-claims/README.md) for verification commands.
+See [registry publishing setup](registry-publishing.md) for verification commands.
 
 The four npm packages (`@antfly/embedded` and its Darwin ARM64, Linux ARM64,
 and Linux x64 platform packages) were established with nonfunctional `0.0.0`

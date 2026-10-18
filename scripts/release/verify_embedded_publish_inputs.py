@@ -65,10 +65,14 @@ def verify_identity(
     repository: str,
     branch: str,
     request: Path,
-    tag: str,
+    tag: str | None,
     root: Path,
 ) -> dict[str, str]:
     controller = verify_producer(run, workflow, repository, branch)
+    if tag is None:
+        tag = json.loads(request.read_text()).get("tag")
+    if not isinstance(tag, str):
+        raise ValueError("embedded identity requires a release tag")
     line = resolve_tag(tag, allow_closed=True)
     git(root, "fetch", "--no-tags", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
     commit = git(root, "rev-parse", f"{tag}^{{commit}}")
@@ -103,6 +107,7 @@ def verify_identity(
         "version": document["version"],
         "python_version": document["registry_versions"]["python"],
         "npm_tag": channel["npm_tag"],
+        "tag": tag,
     }
 
 
@@ -127,8 +132,8 @@ def main() -> int:
     if args.command == "producer":
         verify_producer(run, workflow, args.repository, args.default_branch)
     else:
-        if args.request is None or args.tag is None:
-            parser.error("identity requires --request and --tag")
+        if args.request is None:
+            parser.error("identity requires --request")
         outputs = verify_identity(
             run,
             workflow,

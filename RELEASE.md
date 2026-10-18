@@ -53,10 +53,17 @@ packaging-script contract. Binding checks use the staged native library and the
 workflow copies their TypeScript build into the staged wrapper before packing.
 The Homebrew C smoke test checks the installed library against
 `ANTFLY_ABI_VERSION` and the open-options layout in its installed header.
-Dispatch `.github/workflows/embedded-release-publish.yml` with the immutable tag
-and successful build run to verify and publish that snapshot. Go and Rust link
+`.github/workflows/embedded-release-publish.yml` automatically publishes embedded
+packages to npm, PyPI, and crates.io after a successful stable or RC build.
+Nightlies retain artifacts without registry publication. Manual dispatch with
+the immutable tag and successful build run is the retry path. Rust crates are
+packaged from that source commit, stamped with the release version, verified,
+and published sys-first with an exact dependency. Existing versions must match
+the sealed package checksums before they can be skipped on retry. Go and Rust link
 `libantfly` from an embedded archive or local build. See
 [licensing maintenance](docs/reference/licensing.md) for trusted publisher setup.
+Registry ownership and all three trusted-publisher configurations are described
+in [registry publishing setup](docs/reference/registry-publishing.md).
 
 Linux has an explicit two-ABI contract:
 
@@ -247,7 +254,8 @@ The deployment environments follow the versioned contract in
 `scripts/release/github-environments.json`. `release-promotion` accepts only the
 default `main` branch and protects release preflight plus retention approval;
 `container-publish` accepts only the legacy release and operator tag patterns.
-Both copy the required-reviewer set from the `npm` environment and prevent
+`crates-io` accepts only `main` for embedded Rust publication.
+All three copy the required-reviewer set from the `npm` environment and prevent
 self-review. Release preflight and retention planning audit the live GitHub
 configuration before any mutable or destructive operation. An administrator
 applies intentional contract changes with:
