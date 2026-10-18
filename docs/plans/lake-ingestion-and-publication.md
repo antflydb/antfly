@@ -1943,3 +1943,15 @@ parameter values or request callbacks. Each batch binds its current views and
 parameters, preserving selection/null/overflow fallback semantics. Coefficient
 precision limits use a constant lookup table and are bound once per decimal
 input; no row loop recomputes powers of ten.
+
+The commit protocol admits at most 64 MiB of encoded file-chunk metadata per
+snapshot, in addition to the per-chunk and decoded-residency limits. This is
+validated before any chunk I/O and also bounds creation-time schema inference
+and private planning when shared caches are disabled. Reader protocol 52 fences
+publications predating the durable table-bound public identity epoch.
+
+Real-file qualification covers committed-head refresh, schema inference,
+unchanged-chunk sharing, and cold search/SQL count with an old file chunk
+unavailable. It also covers saved public IDs through first index publication,
+index removal and restart, for both plain and dictionary Parquet DOUBLE values
+exposed as SQL REAL. All 61 Parquet/Iceberg cases passed on the final executable.

@@ -557,7 +557,12 @@ test "external lake native publication builds scoped text artifacts and fences e
         var statistics_arena = std.heap.ArenaAllocator.init(a);
         defer statistics_arena.deinit();
         const navigation_root = try @import("lake_source_navigation.zig").load(statistics_arena.allocator(), artifact_store, publication.source_navigation.?, .none, null);
-        try std.testing.expectEqual(@as(u8, 4), navigation_root.version);
+        // A pre-epoch binding remains legacy through publication. Version 3
+        // carries costing without switching its public row identity to v2.
+        try std.testing.expectEqual(@as(u8, 3), navigation_root.version);
+        try std.testing.expectEqual(@as(u8, 1), binding.binding.row_identity_version);
+        try std.testing.expectEqual(binding.binding.row_identity_version, source.inventory.row_identity_version);
+        try std.testing.expectEqual(binding.binding.row_identity_version, navigation_root.public_identity_version);
         try std.testing.expectEqual(@as(usize, 1), navigation_root.costing.len);
         try std.testing.expectEqualStrings("body", navigation_root.costing[0].name);
         try std.testing.expectEqual(@as(?u64, 2), navigation_root.costing[0].statistics.population_rows);

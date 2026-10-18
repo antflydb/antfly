@@ -1151,6 +1151,7 @@ test "lake SQL cursor scans real Parquet with residual filtering before page lim
     };
     const table: catalog.Table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .columns = &.{.{ .name = "amount", .path = "amount", .type = .integer }}, .external_base_source = binding };
     var source: serving.ServingSource = .{ .alloc = alloc, .store = undefined, .inventory = inventory, .scanner = serving.PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client) };
+    defer source.clearLocalPlan();
     const cursor = try openPinned(alloc, table, .{ .fields = &.{"amount"}, .conditions = &.{.{ .column = "amount", .op = .gt, .value = .{ .integer = 2 } }}, .limit = 2 }, .{}, &source);
     defer cursor.close(cursor.ptr);
     const first = try cursor.next(cursor.ptr, alloc, 2);
@@ -1242,6 +1243,7 @@ const TestLake = struct {
         self.source = .{ .alloc = alloc, .store = .{ .alloc = alloc, .client = client, .owns_client = false, .bucket = @constCast("bucket"), .prefix = @constCast("events") }, .inventory = self.inventory, .scanner = serving.PinnedExternalObjectStorageLakeRowsScanner.init(self.inventory, self.meter.client()) };
     }
     fn deinit(self: *TestLake, alloc: Allocator) void {
+        self.source.clearLocalPlan();
         if (self.source.delete_qualification_owned) if (self.source.delete_qualification) |qualification| qualification.destroy();
         if (self.source.delete_lease) |lease| lease.release() else if (self.source.prepared_deletes) |prepared| prepared.destroy(alloc);
         if (self.source.scanner.shared_reader) |reader| alloc.destroy(reader);

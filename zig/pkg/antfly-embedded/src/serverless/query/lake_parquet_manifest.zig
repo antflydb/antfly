@@ -55,6 +55,7 @@ fn parse(a: A, source: []const u8, bytes: []const u8) !std.json.Parsed(Head) {
     const head = result.value;
     if (head.version != 1 or !std.mem.eql(u8, head.source_id, source) or head.chunks.len > 4096 or head.file_count > 1_000_000) return error.InvalidExternalSourceSnapshot;
     var total: u64 = 0;
+    var metadata_bytes: u64 = 0;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
     for (head.chunks) |chunk| {
@@ -62,6 +63,10 @@ fn parse(a: A, source: []const u8, bytes: []const u8) !std.json.Parsed(Head) {
         for (chunk.sha256) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return error.InvalidExternalSourceSnapshot;
         if ((try seen.getOrPut(a, chunk.uri)).found_existing) return error.InvalidExternalSourceSnapshot;
         total += chunk.file_count;
+        metadata_bytes += chunk.byte_len;
+        // Private inference/planning must have the same bounded shape even
+        // when there is no shared decoded-cache allocator to enforce it.
+        if (metadata_bytes > 64 * 1024 * 1024) return error.ExternalSourceSnapshotTooLarge;
     }
     if (total != head.file_count) return error.InvalidExternalSourceSnapshot;
     return result;
@@ -262,16 +267,64 @@ test "external lake metadata navigation Parquet commits check chunks reuse catal
     defer first.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), first.inventory.files.len);
     try std.testing.expectEqual(@as(usize, 1), first.catalog.?.count());
+    const CensusHash = struct {
+        calls: usize = 0,
+        fn get(raw: *anyopaque, id: []const u8) ![32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return @import("lake_file_census.zig").key(id);
+        }
+    };
+    var hasher: CensusHash = .{};
+    const fingerprint: @import("lake_file_census.zig").Fingerprint = .{ .ptr = &hasher, .get = CensusHash.get };
+    const initial = try first.catalog.?.prepareCensus(@splat(1), &.{first.catalog.?.find("part").?.*}, fingerprint, .{});
+    defer initial.release();
+    try std.testing.expectEqual(@as(usize, 1), hasher.calls);
+    hasher.calls = 0;
     var second = try plan(a, request, bytes);
     defer second.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), second.catalog.?.new_files);
+    const unchanged = try second.catalog.?.prepareCensus(@splat(1), &.{second.catalog.?.find("part").?.*}, fingerprint, .{});
+    defer unchanged.release();
+    try std.testing.expectEqual(@as(usize, 0), hasher.calls);
+    const next_data = "[{\"file_id\":\"part2\",\"object_uri\":\"object://antfly/part2.parquet\",\"byte_len\":200,\"row_count\":4,\"etag\":\"e2\"}]";
+    put = try client.putObject("antfly", "chunk2.json", next_data, .{});
+    put.deinit(a);
+    const next_chunk: Chunk = .{ .uri = "object://antfly/chunk2.json", .sha256 = &std.fmt.bytesToHex(checksum(next_data), .lower), .byte_len = next_data.len, .file_count = 1 };
+    const next_bytes = try std.json.Stringify.valueAlloc(a, Head{ .version = 1, .source_id = "s", .chunks = &.{ chunk, next_chunk }, .file_count = 2 }, .{});
+    defer a.free(next_bytes);
+    var refreshed = try plan(a, request, next_bytes);
+    defer refreshed.deinit(a);
+    const changed = try refreshed.catalog.?.prepareCensus(@splat(1), &.{ refreshed.catalog.?.find("part").?.*, refreshed.catalog.?.find("part2").?.* }, fingerprint, .{});
+    defer changed.release();
+    try std.testing.expectEqual(@as(usize, 1), hasher.calls);
+    try std.testing.expectEqual(@as(u64, 2), changed.summary().?.count);
+    try std.testing.expectEqual(@as(u64, 1), initial.summary().?.count);
     request.catalogs = null;
     var full = try plan(a, request, bytes);
     defer full.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), full.inventory.files.len);
     try std.testing.expectEqualStrings("part", full.inventory.files[0].file_id);
     request.chunks = null;
+    const Failure = struct {
+        fn run(alloc: A, req: Request, head_bytes: []const u8) !void {
+            var snapshot = try plan(alloc, req, head_bytes);
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.inventory.files.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ request, bytes });
     put = try client.putObject("antfly", "chunk.json", "corrupt", .{});
     put.deinit(a);
     try std.testing.expectError(error.IcebergManifestLengthMismatch, plan(a, request, bytes));
+}
+
+test "external lake Parquet commit admission bounds aggregate private metadata before I/O" {
+    const a = std.testing.allocator;
+    var chunks: [9]Chunk = undefined;
+    const checksum_text: [64]u8 = @splat('0');
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" }, &chunks) |uri, *chunk| chunk.* = .{ .uri = uri, .sha256 = &checksum_text, .byte_len = 8 * 1024 * 1024, .file_count = 1 };
+    const bytes = try std.json.Stringify.valueAlloc(a, Head{ .version = 1, .source_id = "s", .chunks = &chunks, .file_count = chunks.len }, .{});
+    defer a.free(bytes);
+    try std.testing.expectError(error.ExternalSourceSnapshotTooLarge, header(a, "s", "head.parquet-manifest.json", "schema", bytes));
 }

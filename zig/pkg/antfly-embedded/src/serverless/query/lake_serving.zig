@@ -472,7 +472,7 @@ pub const ServingSource = struct {
         if (self.inventory_owned) self.inventory.deinit(self.alloc);
         if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
         if (self.attachment_uri) |uri| self.alloc.free(uri);
-        if (self.local_plan_owned) if (self.local_plan) |*plan| plan.deinit(self.alloc);
+        self.clearLocalPlan();
         if (self.private_snapshot_owned) if (self.private_snapshot) |snapshot| {
             snapshot.deinit(self.alloc);
             self.alloc.destroy(snapshot);
@@ -872,6 +872,13 @@ pub const ServingSource = struct {
         // The flat descriptor vector is necessary for existing scan cursors,
         // while payloads remain borrowed from individually bounded chunks.
     }
+    /// Borrowers that keep the store and inventory elsewhere still release
+    /// request-owned preparation through the same lifecycle as full sources.
+    pub fn clearLocalPlan(self: *ServingSource) void {
+        if (self.local_plan_owned) if (self.local_plan) |*plan| plan.deinit(self.alloc);
+        self.local_plan = null;
+        self.local_plan_owned = true;
+    }
     pub fn ensureCanonicalPlan(self: *ServingSource, context: @import("lake_read_context.zig").Context) !void {
         if (self.catalog()) |index| {
             _ = index.ensureOrderingVersion(self.inventory.source_id, self.inventory.snapshot_id, self.inventory.row_identity_version, context) catch |err| switch (err) {
@@ -886,7 +893,7 @@ pub const ServingSource = struct {
         const plan = PreparedPlan.init(self.alloc, self.inventory) catch |err| switch (err) {
             error.OutOfMemory => return,
         };
-        if (self.local_plan_owned) if (self.local_plan) |*old| old.deinit(self.alloc);
+        self.clearLocalPlan();
         self.local_plan = plan;
         self.local_plan_owned = true;
     }
@@ -1155,7 +1162,7 @@ pub const ServingSource = struct {
         if (self.partition_rules) |*rules| rules.deinit();
         if (self.iceberg_schema) |*value| value.deinit();
         self.clearVersions();
-        if (self.local_plan_owned) if (self.local_plan) |*plan| plan.deinit(self.alloc);
+        self.clearLocalPlan();
         if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
         self.freeCatalogFiles();
         if (self.inventory_owned) self.inventory.deinit(self.alloc);

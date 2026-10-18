@@ -6104,7 +6104,8 @@ def test_parquet_snapshot_manifest_refresh_and_cold_native_navigation(tmp_path):
                 server, method, path, body, retry_ddl=True
             )
             assert response.ok, response.text + server.debug_logs()
-            return response.json() if response.content else None
+            value = response.json() if response.content else None
+            return value.get("responses", [value])[0] if value is not None else None
 
         def sql(statement):
             return call("POST", "/sql", {"statement": statement})["rows"]
@@ -6153,6 +6154,7 @@ def test_parquet_snapshot_manifest_refresh_and_cold_native_navigation(tmp_path):
             "/tables/committed/query",
             {"full_text_search": {"match": "quasar", "field": "body"}, "limit": 5},
         )["hits"]["hits"]
+        assert len(expected) == 5
         first_path.rename(held)
         server.restart()
         actual = call(

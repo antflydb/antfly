@@ -5840,3 +5840,18 @@ Flat builder arrays, inventory serialization and the canonical coverage hash
 remain linear in file count. Raw uncommitted prefixes still require complete
 listing for freshness. These residual costs and live-provider/archive-scale
 qualification are not hidden by the new preparation caches.
+
+Qualification of the committed-Parquet and proof-census refinement passed
+1,031 SQL checks (three opt-in benchmarks skipped), lake groups of 472 and 151,
+and the shared API group of 222, without leaks. The server API sweep passed
+301 cases; its lone outdated publication assertion expected an index build to
+upgrade a legacy source identity. The corrected assertion explicitly preserves
+version 1 across binding, source and navigation, and passed its focused rerun.
+All 61 real Parquet/Iceberg E2Es passed in 358.89 seconds against the same final
+executable, including the new plain/dictionary REAL joins, saved IDs through
+publication/removal/restart, and cold committed-Parquet navigation while an old
+file chunk is unavailable. Runtime I/O ABI, all 13 packaging checks, generated
+SDK/frontend builds, source/error catalogs, formatting, Python lint, whitespace,
+licenses and the Apache boundary passed. The branch includes origin/main
+through 0f85c7907f (merge b4958dd66b). Archive-scale latency/RSS and live cloud
+retention qualification remain deferred.
