@@ -7929,7 +7929,7 @@ test "HTTPS client uploads large immutable packs without truncation" {
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
     const script =
-        \\import socket, ssl, sys
+        \\import os, socket, ssl, sys
         \\context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         \\context.load_cert_chain('cert.pem', 'key.pem')
         \\listener = socket.socket()
@@ -7938,14 +7938,15 @@ test "HTTPS client uploads large immutable packs without truncation" {
         \\versions = [ssl.TLSVersion.TLSv1_2]
         \\if ssl.HAS_TLSv1_3:
         \\    versions.append(ssl.TLSVersion.TLSv1_3)
-        \\with open('versions.txt', 'w') as ready:
+        \\with open('versions.tmp', 'w') as ready:
         \\    ready.write(str(len(versions)))
+        \\os.replace('versions.tmp', 'versions.txt')
         \\for version in versions:
         \\    context.minimum_version = version
         \\    context.maximum_version = version
         \\    raw, _ = listener.accept()
         \\    with context.wrap_socket(raw, server_side=True) as connection:
-        \\        connection.settimeout(3)
+        \\        connection.settimeout(30)
         \\        for _ in range(4):
         \\            data = b''
         \\            while b'\r\n\r\n' not in data:
@@ -7955,12 +7956,14 @@ test "HTTPS client uploads large immutable packs without truncation" {
         \\                data += chunk
         \\            headers, body = data.split(b'\r\n\r\n', 1)
         \\            length = int(next(line.split(b':', 1)[1] for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')))
-        \\            while len(body) < length:
-        \\                chunk = connection.recv(min(65536, length-len(body)))
+        \\            received = len(body)
+        \\            assert received <= length and body == b'*' * received
+        \\            while received < length:
+        \\                chunk = connection.recv(min(65536, length-received))
         \\                if not chunk:
         \\                    raise RuntimeError('Truncated request body')
-        \\                body += chunk
-        \\            assert body == b'*' * length
+        \\                assert chunk == b'*' * len(chunk)
+        \\                received += len(chunk)
         \\            connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok')
         \\listener.close()
     ;
@@ -7975,10 +7978,19 @@ test "HTTPS client uploads large immutable packs without truncation" {
         .stderr = .inherit,
     });
     defer child.kill(io);
-    try io.sleep(Io.Duration.fromMilliseconds(1000), .awake);
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
-    const version_bytes = try tmp.dir.readFileAlloc(io, "versions.txt", allocator, .limited(8));
+    const ready_deadline = common.milliTimestamp(io) + 30_000;
+    const version_bytes = while (true) {
+        break tmp.dir.readFileAlloc(io, "versions.txt", allocator, .limited(8)) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (common.milliTimestamp(io) >= ready_deadline) return error.TlsFixtureStartupTimeout;
+                try io.sleep(Io.Duration.fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    };
     defer allocator.free(version_bytes);
     const version_count = try std.fmt.parseInt(usize, version_bytes, 10);
     try std.testing.expect(version_count >= 1 and version_count <= 2);
@@ -7987,10 +7999,14 @@ test "HTTPS client uploads large immutable packs without truncation" {
             .keep_alive = true,
             .verify_ssl = false,
             .retry_policy = .{ .max_retries = 0 },
-            .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
+            // This is a multi-MiB integrity campaign, including Debug crypto
+            // and allocator instrumentation. Short deadline/cancellation
+            // behavior is covered by the dedicated watchdog regressions.
+            .timeouts = .{ .request_ms = 30_000, .read_ms = 30_000, .write_ms = 30_000 },
         });
         defer client.deinit();
         for ([_]usize{ 24 * 1024, 1024 * 1024, 8 * 1024 * 1024 }) |size| {
+            errdefer std.debug.print("TLS upload failed size={d}\n", .{size});
             const body = try allocator.alloc(u8, size);
             defer allocator.free(body);
             @memset(body, '*');

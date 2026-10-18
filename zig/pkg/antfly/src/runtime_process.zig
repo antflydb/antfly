@@ -46,7 +46,13 @@ pub fn runtimeEntry(
     const command = context.command.slice();
 
     run(process.processInit(), command, &args) catch |err| {
-        if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+        // Credential validation already emits an actionable operator diagnostic.
+        // Symbolizing an expected rejection can take seconds in a large Debug
+        // image and obscures the normal, successfully unwound startup failure.
+        switch (err) {
+            error.BootstrapAdminPasswordRequired, error.InvalidBootstrapAdminPassword => {},
+            else => if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace),
+        }
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
