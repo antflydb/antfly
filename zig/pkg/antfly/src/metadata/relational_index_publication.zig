@@ -933,6 +933,7 @@ pub const NativeCancellationReleaseGrant = struct {
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
         try owner.validate();
         const receipt = try self.canceled.receipt();
+        if (self.canceled.position != .native or self.cleanup_proof.authority != .native) return error.InvalidCatalogRecord;
         const signed: SignedReceipt = .{ .receipt = receipt, .proof = self.cleanup_proof };
         signed.verifySignature() catch return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, &self.cleanup_proof.identity.metadata_incarnation, &incarnation) or !std.meta.eql(receipt.owner, owner.owner) or

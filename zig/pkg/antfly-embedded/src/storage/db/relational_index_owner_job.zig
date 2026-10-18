@@ -402,9 +402,9 @@ pub const CancellationState = struct {
         if (self.completed) |record| {
             try record.validate();
             if (!self.artifacts_retired or !self.claims_retired or self.binding == null or self.intent == null or
-                !std.meta.eql(record.binding, self.binding.?) or !std.meta.eql(record.intent_position, self.intent.?.position.native) or
+                !std.meta.eql(record.binding, self.binding.?) or !std.meta.eql(record.intent_position, self.intent.?.position) or
                 record.cleanup.position != .native or !std.meta.eql(record.cleanup.position.native, self.cleanup.?) or record.cleanup.claim_allocation != self.claim_allocation.? or
-                record.position.sequence > self.source.sequence) return error.InvalidPrivateIndexCancellation;
+                record.position != .native or record.position.native.sequence > self.source.sequence) return error.InvalidPrivateIndexCancellation;
         }
     }
 };
@@ -1001,42 +1001,39 @@ pub const Canceled = struct {
     pub const encoded_len = 1216;
     binding: Binding,
     cleanup: CancellationCleanupRecord,
-    intent_position: positions.Native,
-    position: positions.Native,
+    intent_position: positions.Position,
+    position: positions.Position,
 
     pub fn validate(self: @This()) !void {
         _ = try self.binding.encode();
         _ = try self.cleanup.encode();
-        try self.intent_position.validate();
-        try self.position.validate();
-        if (self.binding.authority != .native or self.binding.phase != .reserved or
+        try self.intent_position.requireNamespace(self.binding.fence.namespace);
+        try self.position.requireNamespace(self.binding.fence.namespace);
+        if ((self.position == .native) != (self.binding.authority == .native) or self.binding.phase != .reserved or
             !self.cleanup.intent.eql(cancellation.Intent.fromBinding(self.binding)) or
-            !self.intent_position.namespace.eql(self.binding.fence.namespace) or
-            !self.position.namespace.eql(self.binding.fence.namespace) or
-            self.cleanup.position != .native or self.cleanup.position.native.sequence <= self.intent_position.sequence or
-            self.position.sequence <= self.cleanup.position.native.sequence) return error.InvalidPrivateIndexCancellation;
+            !self.cleanup.position.strictlyAfter(self.intent_position) or
+            !self.position.strictlyAfter(self.cleanup.position)) return error.InvalidPrivateIndexCancellation;
     }
 
     pub fn encode(self: @This()) ![encoded_len]u8 {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
-        @memcpy(bytes[0..8], "AICC\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], "AICC\x02\x00\x00\x00");
         @memcpy(bytes[8..696], &try self.binding.encode());
         @memcpy(bytes[696..1112], &try self.cleanup.encode());
-        @memcpy(bytes[1112..1145], &try (positions.Position{ .native = self.intent_position }).encode());
-        @memcpy(bytes[1145..1178], &try (positions.Position{ .native = self.position }).encode());
+        @memcpy(bytes[1112..1145], &try self.intent_position.encode());
+        @memcpy(bytes[1145..1178], &try self.position.encode());
         @memcpy(bytes[1184..1216], &digest(bytes[0..1184]));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !@This() {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICC\x01\x00\x00\x00") or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICC\x02\x00\x00\x00") or
             !std.mem.allEqual(u8, bytes[1178..1184], 0) or
             !std.mem.eql(u8, bytes[1184..1216], &digest(bytes[0..1184]))) return error.InvalidPrivateIndexCancellation;
         const intent_position = try positions.Position.decode(bytes[1112..1145]);
         const position = try positions.Position.decode(bytes[1145..1178]);
-        if (intent_position != .native or position != .native) return error.InvalidPrivateIndexCancellation;
-        const result: @This() = .{ .binding = try Binding.decode(bytes[8..696]), .cleanup = try CancellationCleanupRecord.decode(bytes[696..1112]), .intent_position = intent_position.native, .position = position.native };
+        const result: @This() = .{ .binding = try Binding.decode(bytes[8..696]), .cleanup = try CancellationCleanupRecord.decode(bytes[696..1112]), .intent_position = intent_position, .position = position };
         try result.validate();
         return result;
     }
@@ -1049,9 +1046,9 @@ pub const Canceled = struct {
         var evidence: Digest = undefined;
         hash.final(&evidence);
         const result: publication.Receipt = .{
-            .owner = .{ .plan_id = self.binding.id, .plan_digest = self.binding.plan_digest, .ordinal = self.binding.ordinal, .group_id = self.binding.fence.owner_group_id, .namespace = self.binding.fence.namespace, .fence_digest = self.binding.owner_digest, .authority = .native },
+            .owner = .{ .plan_id = self.binding.id, .plan_digest = self.binding.plan_digest, .ordinal = self.binding.ordinal, .group_id = self.binding.fence.owner_group_id, .namespace = self.binding.fence.namespace, .fence_digest = self.binding.owner_digest, .authority = self.binding.authority },
             .action = .canceled,
-            .position = .{ .native = self.position },
+            .position = self.position,
             .candidate_digest = self.binding.integrity_candidate,
             .reservation_digest = self.binding.integrity_reserved,
             .evidence_digest = evidence,
@@ -1062,8 +1059,7 @@ pub const Canceled = struct {
 
     pub fn load(txn: anytype) !?@This() {
         const record = try decode((try optional(txn, Canceled.key)) orelse return null);
-        const source = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.position.namespace));
-        if (record.position.sequence > source.sequence) return error.InvalidPrivateIndexCancellation;
+        try cancellation.requireCommitted(txn, record.binding.fence.namespace, record.position);
         return record;
     }
 
@@ -1073,18 +1069,30 @@ pub const Canceled = struct {
         try private_claims.requireRetired(txn, self.binding);
         const actual = (try loadCancellationCleanup(txn, self.binding)) orelse return error.PrivateIndexCancellationRequired;
         const intent = (try cancellation.load(txn)) orelse return error.PrivateIndexCancellationRequired;
-        if (intent.position != .native or !std.meta.eql(actual, self.cleanup) or !std.meta.eql(intent.position.native, self.intent_position)) return error.PrivateIndexOwnerJobChanged;
+        if (!std.meta.eql(actual, self.cleanup) or !std.meta.eql(intent.position, self.intent_position)) return error.PrivateIndexOwnerJobChanged;
     }
 
-    /// The caller stages the native replay marker and durable outbox in this
+    /// The caller stages its replay marker and durable transport record in this
     /// same transaction. Even after every local artifact is gone, this never
     /// lifts a fence or retires the active job before metadata's cohort barrier.
-    pub fn stage(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !struct { record: Canceled, duplicate: bool } {
+    pub const Stage = struct { record: Canceled, duplicate: bool };
+
+    pub fn stage(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !Stage {
+        if (binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return stageAt(txn, manager, binding, if (replay) |cut| .{ .native = cut } else null);
+    }
+
+    pub fn stageAt(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Position) !Stage {
         _ = try binding.encode();
+        if (replay) |cut| {
+            try cut.requireNamespace(binding.fence.namespace);
+            if ((cut == .native) != (binding.authority == .native)) return error.InvalidControlReceiptPosition;
+        } else if (binding.authority == .raft) return error.InvalidControlReceiptPosition;
         if (try Canceled.load(txn)) |previous| {
             if (std.meta.eql(previous.binding, binding)) {
                 try previous.requireCurrent(txn);
-                if (replay) |cut| if (!std.meta.eql(cut, previous.position)) return error.InvalidControlReceiptPosition;
+                if (replay) |cut| if (!std.meta.eql(cut, previous.position) and
+                    (binding.authority == .native or !cut.strictlyAfter(previous.position))) return error.InvalidControlReceiptPosition;
                 return .{ .record = previous, .duplicate = true };
             }
             const completed = (try topology.completed(txn)) orelse return error.PrivateIndexCancellationPending;
@@ -1097,12 +1105,19 @@ pub const Canceled = struct {
         try topology.requireDrained(txn, manager, binding.fence);
         const intent = (try cancellation.load(txn)) orelse return error.PrivateIndexCancellationRequired;
         const cleanup = (try loadCancellationCleanup(txn, binding)) orelse return error.PrivateIndexCancellationRequired;
-        const source = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        if (intent.position != .native) return error.InvalidControlReceiptPosition;
-        const record: Canceled = .{ .binding = binding, .cleanup = cleanup, .intent_position = intent.position.native, .position = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition } };
+        const source = try source_authority.require(txn, if (binding.authority == .native) .native else .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        const position: positions.Position = if (binding.authority == .native)
+            .{ .native = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition } }
+        else blk: {
+            const prior = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+            const cut = replay.?;
+            if (!cut.strictlyAfter(.{ .raft = .{ .term = prior.term, .index = prior.index } })) return error.InvalidControlReceiptPosition;
+            break :blk cut;
+        };
+        const record: Canceled = .{ .binding = binding, .cleanup = cleanup, .intent_position = intent.position, .position = position };
         const encoded = try record.encode();
         if (replay) |cut| if (!std.meta.eql(cut, record.position)) return error.InvalidControlReceiptPosition;
-        _ = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |cut| cut.sequence else null);
+        if (position == .native) _ = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), position.native.sequence);
         try txn.put(Canceled.key, &encoded);
         return .{ .record = record, .duplicate = false };
     }

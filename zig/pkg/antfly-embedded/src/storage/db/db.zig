@@ -8471,6 +8471,16 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
+    pub fn applyCommittedRaftIndexCancellationCompletion(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellationCompletion, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
+    pub fn applyCommittedRaftIndexCancellationRelease(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellationRelease, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.intent.canceled.position != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
     fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
         return self.applyCommittedRaftIndexEffectMode(prepared, owner_group, entry, false);
     }
@@ -8480,7 +8490,7 @@ pub const DB = struct {
         const PreparedType = @typeInfo(@TypeOf(prepared)).pointer.child;
         const command = if (comptime @hasField(PreparedType, "command")) prepared.command else if (comptime @hasField(PreparedType, "batch")) prepared.batch.command else if (comptime @hasField(PreparedType, "page")) prepared.page.command else if (comptime @hasField(PreparedType, "intent")) prepared.intent else prepared.binding;
         if (comptime @hasDecl(@TypeOf(command), "validate")) try command.validate() else _ = try command.encode();
-        const fence = if (comptime @hasField(@TypeOf(command), "fence")) command.fence else if (comptime @hasField(@TypeOf(command), "binding")) command.binding.fence else if (comptime @hasField(@TypeOf(command), "validation")) command.validation.command.binding.fence else if (comptime @hasField(@TypeOf(command), "installed")) command.installed.command.validation.command.binding.fence else command.record.intent.installed.command.validation.command.binding.fence;
+        const fence = if (comptime @hasField(@TypeOf(command), "fence")) command.fence else if (comptime @hasField(@TypeOf(command), "binding")) command.binding.fence else if (comptime @hasField(@TypeOf(command), "validation")) command.validation.command.binding.fence else if (comptime @hasField(@TypeOf(command), "installed")) command.installed.command.validation.command.binding.fence else if (comptime @hasField(@TypeOf(command), "canceled")) command.canceled.binding.fence else command.record.intent.installed.command.validation.command.binding.fence;
         if (owner_group == 0 or owner_group != fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
         if (!fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         // Until the ordered standby envelope carries this control, fail closed

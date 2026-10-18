@@ -1732,16 +1732,29 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             try self.write();
             try self.child.delete(name);
         }
-        fn probe(database: *db_mod.DB, prepared: *raft.Prepared, entry: receipts.OrderedApplyReceipt) !void {
+        fn fingerprint(txn: anytype, name: []const u8) !?[32]u8 {
+            const bytes = txn.get(name) catch |err| {
+                if (err == error.NotFound) return null;
+                return err;
+            };
+            return @import("relational_index_inputs.zig").digest(bytes);
+        }
+        fn probe(database: *db_mod.DB, prepared: anytype, entry: receipts.OrderedApplyReceipt) !void {
+            const topology = @import("relational_integrity_topology.zig");
+            const watched = [_][]const u8{ topology.fence_key, topology.receipt_key, jobs.Canceled.key, @import("relational_index_release.zig").CancellationRecord.key };
+            var saved_fixed: [watched.len]?[32]u8 = undefined;
             var saved_job: ?jobs.Binding = null;
             var saved_marker: ?receipts.OrderedApplyReceipt = null;
             var saved_catalog: [32]u8 = undefined;
+            var saved_candidate_blob: ?[32]u8 = null;
             {
                 var read = try database.core.store.beginReadTxn();
                 defer read.abort();
                 saved_job = try jobs.load(&read);
                 saved_marker = try receipts.readOrderedApplyReceiptTxn(&read);
                 saved_catalog = @import("relational_index_inputs.zig").digest(try read.get(catalog.key));
+                for (watched, &saved_fixed) |name, *value| value.* = try fingerprint(&read, name);
+                if (saved_job) |job| saved_candidate_blob = try fingerprint(&read, &@import("relational_index_catalog.zig").blobKey(job.physical_candidate.blob_digest));
             }
             var completed = false;
             for (1..64) |at| {
@@ -1749,11 +1762,18 @@ test "relational index system Raft owner controls commit authentic phase cuts at
                     var txn = try database.core.store.beginWriteTxn();
                     defer txn.abort();
                     var fault: @This() = .{ .child = &txn, .at = at };
-                    const outcome = prepared.stage(database.core, &fault, 11, entry) catch |err| {
-                        try std.testing.expectEqual(error.InjectedPhaseWriteFailure, err);
-                        break :attempt false;
-                    };
-                    try std.testing.expect(!outcome.duplicate);
+                    if (comptime @hasDecl(@typeInfo(@TypeOf(prepared)).pointer.child, "stageRaft")) {
+                        prepared.stageRaft(database.core, &fault, 11, entry) catch |err| {
+                            try std.testing.expectEqual(error.InjectedPhaseWriteFailure, err);
+                            break :attempt false;
+                        };
+                    } else {
+                        const outcome = prepared.stage(database.core, &fault, 11, entry) catch |err| {
+                            try std.testing.expectEqual(error.InjectedPhaseWriteFailure, err);
+                            break :attempt false;
+                        };
+                        try std.testing.expect(!outcome.duplicate);
+                    }
                     var bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
                     const marker_write = receipts.orderedApplyReceiptWrite(entry, &bytes);
                     fault.put(marker_write.key, marker_write.value) catch |err| {
@@ -1768,8 +1788,10 @@ test "relational index system Raft owner controls commit authentic phase cuts at
                     try std.testing.expectEqualDeep(saved_job, try jobs.load(&read));
                     try std.testing.expectEqualDeep(saved_marker, try receipts.readOrderedApplyReceiptTxn(&read));
                     try std.testing.expectEqual(saved_catalog, @import("relational_index_inputs.zig").digest(try read.get(catalog.key)));
+                    for (watched, saved_fixed) |name, value| try std.testing.expectEqualDeep(value, try fingerprint(&read, name));
                     if (saved_job) |job| {
                         try raft.requireCuts(&read, job);
+                        try std.testing.expectEqualDeep(saved_candidate_blob, try fingerprint(&read, &@import("relational_index_catalog.zig").blobKey(job.physical_candidate.blob_digest)));
                         try @import("relational_index_inputs.zig").require(&read, job.inputs_digest);
                     } else {
                         try std.testing.expect(try @import("relational_integrity_topology.zig").current(&read) == null);
@@ -2380,6 +2402,10 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         var cancel = try owner_control.PreparedCancellation.init(alloc, cancellation.Intent.fromBinding(reserved_binding));
         defer cancel.deinit();
         try canceled_db.applyCommittedRaftIndexCancellation(&cancel, 11, .{ .term = 10, .index = 120 });
+        var completion: owner_control.PreparedCancellationCompletion = .{ .alloc = alloc, .binding = reserved_binding };
+        defer completion.deinit();
+        try std.testing.expectError(error.InvalidControlReceiptPosition, completion.preparePayload());
+        try std.testing.expectError(error.PrivateIndexCancellationRequired, canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, .{ .term = 10, .index = 121 }));
         var cleanup = try owner_control.PreparedCleanup.init(alloc, reserved_binding);
         defer cleanup.deinit();
         try std.testing.expectError(error.InvalidControlReceiptPosition, cleanup.preparePayload());
@@ -2440,6 +2466,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             defer read.abort();
             try jobs.requireCancellationArtifactsRetired(&read, reserved_binding);
         }
+        try std.testing.expectError(error.PrivateIndexCancellationPending, canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, .{ .term = 11, .index = cut }));
         var claim_page = blk: {
             var read = try canceled_db.core.store.beginReadTxn();
             defer read.abort();
@@ -2464,21 +2491,101 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         canceled_live = false;
         canceled_db = try db_mod.DB.open(alloc, canceled_directory.path(), options);
         canceled_live = true;
-        var read = try canceled_db.core.store.beginReadTxn();
-        defer read.abort();
-        try jobs.requireCancellationArtifactsRetired(&read, reserved_binding);
-        try claim_store.requireRetired(&read, reserved_binding);
-        try std.testing.expect(try claim_store.GcPage.prepare(alloc, null, &read, reserved_binding) == null);
-        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
-        try std.testing.expectEqual(cut, (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
-        try std.testing.expectEqualDeep(reserved_binding, (try jobs.load(&read)).?);
-        try std.testing.expect((try @import("relational_integrity_topology.zig").current(&read)).?.eql(reserved_binding.fence));
-        try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
-        try std.testing.expectError(error.PrivateIndexPublicationCanceled, jobs.requireReserved(&read, reserved_binding));
-        for (claim_page.entries) |entry| {
-            try std.testing.expectError(error.NotFound, read.get(&entry.address.claimKey()));
-            try std.testing.expectError(error.NotFound, read.get(&claim_store.inventoryKey(entry.address)));
+        {
+            var read = try canceled_db.core.store.beginReadTxn();
+            defer read.abort();
+            try jobs.requireCancellationArtifactsRetired(&read, reserved_binding);
+            try claim_store.requireRetired(&read, reserved_binding);
+            try std.testing.expect(try claim_store.GcPage.prepare(alloc, null, &read, reserved_binding) == null);
+            try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+            try std.testing.expectEqual(cut, (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+            try std.testing.expectEqualDeep(reserved_binding, (try jobs.load(&read)).?);
+            try std.testing.expect((try @import("relational_integrity_topology.zig").current(&read)).?.eql(reserved_binding.fence));
+            try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+            try std.testing.expectError(error.PrivateIndexPublicationCanceled, jobs.requireReserved(&read, reserved_binding));
+            for (claim_page.entries) |entry| {
+                try std.testing.expectError(error.NotFound, read.get(&entry.address.claimKey()));
+                try std.testing.expectError(error.NotFound, read.get(&claim_store.inventoryKey(entry.address)));
+            }
         }
+        const completion_entry: receipts.OrderedApplyReceipt = .{ .term = 12, .index = cut + 1 };
+        try Fault.probe(&canceled_db, &completion, completion_entry);
+        completion.context = .{ .deadline_ns = 0 };
+        try std.testing.expectError(error.DeadlineExceeded, canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, completion_entry));
+        completion.context = .{};
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 99, completion_entry));
+        try canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, completion_entry);
+        try canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, completion_entry);
+        canceled_db.close();
+        canceled_live = false;
+        canceled_db = try db_mod.DB.open(alloc, canceled_directory.path(), options);
+        canceled_live = true;
+        try canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, .{ .term = 13, .index = cut + 2 });
+        const completed_cancel = blk: {
+            var read = try canceled_db.core.store.beginReadTxn();
+            defer read.abort();
+            const record = (try jobs.Canceled.load(&read)).?;
+            try std.testing.expectEqual(completion_entry.index, record.position.raft.index);
+            try std.testing.expectEqual(completion_entry.term, record.position.raft.term);
+            const receipt = try record.receipt();
+            try std.testing.expectEqual(.raft, receipt.owner.authority);
+            try std.testing.expectEqual(.canceled, receipt.action);
+            try record.requireCurrent(&read);
+            try std.testing.expect((try @import("relational_integrity_topology.zig").current(&read)).?.eql(reserved_binding.fence));
+            var future = record;
+            future.position.raft.index += 1000;
+            var txn = try canceled_db.core.store.beginWriteTxn();
+            defer txn.abort();
+            try txn.put(jobs.Canceled.key, &try future.encode());
+            try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.Canceled.load(&txn));
+            break :blk record;
+        };
+        const release = @import("relational_index_release.zig");
+        const cancellation_release_intent: release.CancellationIntent = .{ .canceled = completed_cancel, .metadata_decision = @splat(12) };
+        // This trusted storage fixture supplies a decision identity, not a
+        // signed metadata grant or evidence of mounted public dispatch.
+        var release_control = try owner_control.PreparedCancellationRelease.init(alloc, canceled_db.core, cancellation_release_intent, .{});
+        defer release_control.deinit();
+        try std.testing.expectError(error.InvalidControlReceiptPosition, release_control.preparePayload());
+        const cancellation_release_entry: receipts.OrderedApplyReceipt = .{ .term = 14, .index = cut + 3 };
+        try Fault.probe(&canceled_db, &release_control, cancellation_release_entry);
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 99, cancellation_release_entry));
+        try canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 11, cancellation_release_entry);
+        try canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 11, cancellation_release_entry);
+        canceled_db.close();
+        canceled_live = false;
+        canceled_db = try db_mod.DB.open(alloc, canceled_directory.path(), options);
+        canceled_live = true;
+        try canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 11, .{ .term = 15, .index = cut + 4 });
+        {
+            var read = try canceled_db.core.store.beginReadTxn();
+            defer read.abort();
+            try release.CancellationRecord.verifyRecovery(&read);
+            const terminal = (try release.CancellationRecord.load(&read, cancellation_release_intent)).?;
+            try std.testing.expectEqual(cancellation_release_entry.index, terminal.position.raft.index);
+            try std.testing.expectEqual(cancellation_release_entry.term, terminal.position.raft.term);
+            try std.testing.expectEqual(.cancel_released, (try terminal.intent.receiptAt(terminal.position)).action);
+            const topology = @import("relational_integrity_topology.zig");
+            try topology.requireUnfenced(&read);
+            try std.testing.expect(try jobs.load(&read) == null);
+            try std.testing.expect((try topology.completed(&read)).?.eql(reserved_binding.fence));
+            try std.testing.expect(try cancellation.pending(&read) == null);
+            try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+            try std.testing.expectError(error.NotFound, read.get(@import("relational_index_inputs.zig").key));
+            try std.testing.expectError(error.NotFound, read.get(&@import("relational_index_catalog.zig").blobKey(reserved_binding.physical_candidate.blob_digest)));
+            _ = try read.get(&@import("relational_index_catalog.zig").blobKey(reserved_binding.physical_reserved.blob_digest));
+            try std.testing.expect(try raft.retainedPosition(&read, reserved_binding, .reserved) == null);
+        }
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, canceled_db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 16, .index = cut + 5 }));
+        try canceled_db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "after-cancel-release", .value = "{\"id\":2,\"email\":\"a@example.org\"}" }} }, .{ .term = 16, .index = cut + 5 }, false);
+        const written = (try canceled_db.get(alloc, "after-cancel-release")).?;
+        defer alloc.free(written);
+        try std.testing.expectEqualStrings("{\"id\":2,\"email\":\"a@example.org\"}", written);
+        try std.testing.expectEqual(@as(u64, 0), blk: {
+            var read = try canceled_db.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk (try @import("../source_authority.zig").load(&read)).?.sequence;
+        });
     }
     const Validation = claim_store.InventoryValidation;
     const expected = expected: {
@@ -3922,7 +4029,7 @@ fn testNativeCancellationCompletion(source: *db_mod.DB, binding: @import("relati
     std.crypto.hash.Blake3.hash(corrupt[0..1184], corrupt[1184..1216], .{});
     try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.Canceled.decode(&corrupt));
     var invalid = pending.record.?;
-    invalid.position = invalid.cleanup.position.native;
+    invalid.position = invalid.cleanup.position;
     try std.testing.expectError(error.InvalidPrivateIndexCancellation, invalid.encode());
     publisher.fail = false;
     primary.close();
@@ -3998,7 +4105,7 @@ fn testNativeCancellationRelease(primary: *db_mod.DB, standby: *db_mod.DB, cance
         _ = try release.CancellationRecord.stage(&counter, &manager, intent, null);
         break :count counter.writes;
     };
-    try std.testing.expectEqual(@as(usize, 11), writes);
+    try std.testing.expectEqual(@as(usize, 12), writes);
     for (1..writes + 1) |fail_at| for ([_]bool{ false, true }) |after| {
         {
             var txn = try primary.core.store.beginWriteTxn();
@@ -4012,7 +4119,8 @@ fn testNativeCancellationRelease(primary: *db_mod.DB, standby: *db_mod.DB, cance
         defer read.abort();
         try intent.requireCurrent(&read);
         try std.testing.expect(try release.CancellationRecord.load(&read, intent) == null);
-        try std.testing.expectEqual(canceled.position.sequence, (try authority.load(&read)).?.sequence);
+        try std.testing.expect(canceled.position == .native);
+        try std.testing.expectEqual(canceled.position.native.sequence, (try authority.load(&read)).?.sequence);
     };
     {
         var txn = try primary.core.store.beginWriteTxn();
@@ -4033,8 +4141,8 @@ fn testNativeCancellationRelease(primary: *db_mod.DB, standby: *db_mod.DB, cance
     const pending = try primary.applyPreparedNativeIndexOwnerCancellationRelease(&prepared, null);
     try pending.validate();
     try std.testing.expect(pending.replication_pending and pending.receipt == null and !pending.duplicate);
-    try std.testing.expectEqual(canceled.position.sequence + 1, pending.position.sequence);
-    const encoded = try (release.CancellationRecord{ .intent = intent, .position = pending.position }).encode();
+    try std.testing.expectEqual(canceled.position.native.sequence + 1, pending.position.sequence);
+    const encoded = try (release.CancellationRecord{ .intent = intent, .position = .{ .native = pending.position } }).encode();
     for (0..encoded.len) |len| try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, release.CancellationRecord.decode(encoded[0..len]));
     var corrupt = encoded;
     corrupt[1289] = 1;
@@ -4067,7 +4175,11 @@ fn testNativeCancellationRelease(primary: *db_mod.DB, standby: *db_mod.DB, cance
         try std.testing.expect(try jobs.load(&read) == null);
         try std.testing.expect(try topology.current(&read) == null);
         try std.testing.expect((try topology.completed(&read)).?.eql(canceled.binding.fence));
-        try std.testing.expectEqual(pending.position, (try release.CancellationRecord.load(&read, intent)).?.position);
+        try std.testing.expectError(error.NotFound, read.get(&@import("relational_index_catalog.zig").blobKey(canceled.binding.physical_candidate.blob_digest)));
+        _ = try read.get(&@import("relational_index_catalog.zig").blobKey(canceled.binding.physical_reserved.blob_digest));
+        const terminal = (try release.CancellationRecord.load(&read, intent)).?;
+        try std.testing.expect(terminal.position == .native);
+        try std.testing.expectEqual(pending.position, terminal.position.native);
         try topology.requireUnfenced(&read);
     }
     {

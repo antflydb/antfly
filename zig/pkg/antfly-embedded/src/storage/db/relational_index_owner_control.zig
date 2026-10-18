@@ -316,7 +316,7 @@ pub const Effect = union(enum) {
             .validation_seal => |value| value.binding.fence.namespace,
             .install => |value| value.validation.command.binding.fence.namespace,
             .release => |value| value.installed.command.validation.command.binding.fence.namespace,
-            .cancel_release => |value| value.canceled.position.namespace,
+            .cancel_release => |value| value.canceled.binding.fence.namespace,
             .release_gc => |value| value.record.intent.installed.command.validation.command.binding.fence.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
@@ -355,7 +355,10 @@ pub const Effect = union(enum) {
                 try value.validate();
                 if (value.installed.position != .native) return error.InvalidControlReceiptPosition;
             },
-            .cancel_release => |value| try value.validate(),
+            .cancel_release => |value| {
+                try value.validate();
+                if (value.canceled.position != .native) return error.InvalidControlReceiptPosition;
+            },
             .release_gc => |value| {
                 try value.validate();
                 if (value.record.position != .native) return error.InvalidControlReceiptPosition;
@@ -1200,10 +1203,10 @@ pub const CancellationCompletionOutcome = struct {
     pub fn validate(self: @This()) !void {
         _ = try self.binding.encode();
         try self.position.validate();
-        if (!self.position.namespace.eql(self.binding.fence.namespace) or (self.replication_pending and self.error_name == null)) return error.InvalidPrivateIndexCancellation;
+        if (self.binding.authority != .native or !self.position.namespace.eql(self.binding.fence.namespace) or (self.replication_pending and self.error_name == null)) return error.InvalidPrivateIndexCancellation;
         if (self.record) |record| {
             try record.validate();
-            if (!std.meta.eql(record.binding, self.binding) or !std.meta.eql(record.position, self.position)) return error.InvalidPrivateIndexCancellation;
+            if (record.position != .native or !std.meta.eql(record.binding, self.binding) or !std.meta.eql(record.position.native, self.position)) return error.InvalidPrivateIndexCancellation;
         }
         if (self.receipt) |receipt| {
             const record = self.record orelse return error.InvalidPrivateIndexCancellation;
@@ -1228,7 +1231,8 @@ pub const PreparedCancellationCompletion = struct {
     }
     pub fn validate(self: *const @This()) !void {
         try self.context.ensureActive();
-        try (Effect{ .cancel_complete = self.binding }).validate();
+        _ = try self.binding.encode();
+        if (self.binding.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
     }
     pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
         return self.binding.fence.namespace;
@@ -1244,19 +1248,30 @@ pub const PreparedCancellationCompletion = struct {
         var manager = try core.initTxnManager();
         defer manager.deinit();
         const result = try jobs.Canceled.stage(txn, &manager, self.binding, replay);
-        return .{ .binding = self.binding, .position = result.record.position, .record = result.record, .duplicate = result.duplicate };
+        return .{ .binding = self.binding, .position = result.record.position.native, .record = result.record, .duplicate = result.duplicate };
+    }
+    pub fn stageRaft(self: *@This(), core: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        if (self.binding.authority != .raft or owner_group == 0 or owner_group != self.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        _ = try jobs.Canceled.stageAt(txn, &manager, self.binding, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return true;
     }
     pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ApplyOutcome) !void {
         const record = (try jobs.Canceled.load(txn)) orelse return error.InvalidPrivateIndexCancellation;
-        if (!std.meta.eql(record.binding, self.binding) or !std.meta.eql(record.position, outcome.position)) return error.PrivateIndexOwnerJobChanged;
+        if (record.position != .native or !std.meta.eql(record.binding, self.binding) or !std.meta.eql(record.position.native, outcome.position)) return error.PrivateIndexOwnerJobChanged;
         try record.requireCurrent(txn);
         outcome.record = record;
         outcome.receipt = try record.receipt();
     }
     pub fn preparePayload(self: *@This()) !void {
+        if (self.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "cancel_complete", self.binding, max_cancellation_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
@@ -1357,7 +1372,7 @@ pub const PreparedCancellationRelease = struct {
         try self.intent.validate();
     }
     pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
-        return self.intent.canceled.position.namespace;
+        return self.intent.canceled.binding.fence.namespace;
     }
     pub fn validateReplay(self: *const @This(), position: Native) !void {
         try (Frame{ .effect = .{ .cancel_release = self.intent }, .position = position }).validate();
@@ -1371,18 +1386,30 @@ pub const PreparedCancellationRelease = struct {
         var manager = try core.initTxnManager();
         defer manager.deinit();
         const result = try release.CancellationRecord.stage(txn, &manager, self.intent, replay);
-        return .{ .intent = self.intent, .position = result.record.position, .duplicate = result.duplicate };
+        return .{ .intent = self.intent, .position = result.record.position.native, .duplicate = result.duplicate };
+    }
+    pub fn stageRaft(self: *@This(), core: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        const binding = self.intent.canceled.binding;
+        if (binding.authority != .raft or owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        _ = try release.CancellationRecord.stageAt(txn, &manager, self.intent, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return true;
     }
     pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ApplyOutcome) !void {
         const record = (try release.CancellationRecord.load(txn, self.intent)) orelse return error.InvalidPrivateIndexNativeReceipt;
-        if (!std.meta.eql(record.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        if (record.position != .native or !std.meta.eql(record.position.native, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
         try release.CancellationRecord.verifyRecovery(txn);
-        outcome.receipt = try self.intent.receipt(record.position);
+        outcome.receipt = try self.intent.receipt(record.position.native);
     }
     pub fn preparePayload(self: *@This()) !void {
+        if (self.intent.canceled.position != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "cancel_release", self.intent, max_cancellation_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {

@@ -87,11 +87,22 @@ Claim provenance checks both the real committed watermark and the actual intent
 cut; cancellation before the allocation burn correctly permits only an empty
 inventory. Native and Raft intent/cleanup records each use one tagged format
 (AICI v2 and AICG v2); native transport adapters still reject Raft positions.
-Cancellation completion, cohort-authorized release and public dispatch remain
-required before activation. The borrowed GC selections are local apply inputs,
-not serialized receiver commands: replicated dispatch must carry the same bounded
-selection to followers without rerunning a timed scan. None of these storage
-primitives grants metadata authority or closes an original SQL case.
+Cancellation completion now also retains its real Raft cut and checks that
+physical artifacts, source companions and claim pairs have retired. It leaves
+the job and fence held. A separately authorized cancellation release uses the
+same topology barrier, removes the job, immutable inputs, phase cuts, claim
+registration and unpublished definition blob, and atomically records its
+terminal cut with the apply watermark. The live reserved blob remains intact;
+failed builds must not accumulate one orphan definition blob per attempt.
+Cold retries preserve both original cuts. Both authorities share AICC v2 and
+AICR v2; native envelopes and native metadata grants still reject Raft records.
+The catalogs keep their burned allocations rather than reverting counters;
+ordinary Raft mutations can resume without activating the canceled UNIQUE index.
+Public authorization/dispatch remains required before activation. The borrowed
+GC selections are local apply inputs, not serialized receiver commands:
+replicated dispatch must carry the same bounded selection to followers without
+rerunning a timed scan. The storage test supplies a decision identity, not a
+signed metadata grant. None of these primitives closes an original SQL case.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
 passes 291 storage tests and one server test, with no skips or leaks. The Raft
@@ -117,6 +128,10 @@ Cancellation controls cover first-entry intent, pre-visit drain/burn, delayed
 normal-work rejection, aborted admission/deletions, exact and later-entry retry,
 cold cleanup resumption, 48-byte Raft claim companions, actual cancellation-cut
 bounds and the fence remaining held after physical and claim retirement.
+Terminal controls reuse the write-failure injector for every completion/release
+write and the apply marker. They cover expired preparation, foreign groups,
+checksummed future cuts, cold retained-cut retry, delayed old admission, and a
+real ordinary Raft write after release, with the native clock unchanged.
 `zig build antfly-relational-index-pages-test -Doptimize=Debug -j1` also passes
 all 12 standalone lifecycle tests, including standby replay and bounded released
 companion retirement. This gate is distinct from the publication-only suite.

@@ -302,16 +302,21 @@ pub const CancellationIntent = struct {
     }
 
     pub fn receipt(self: @This(), position: positions.Native) !publication.Receipt {
+        if (self.canceled.position != .native) return error.InvalidControlReceiptPosition;
+        return self.receiptAt(.{ .native = position });
+    }
+
+    pub fn receiptAt(self: @This(), position: positions.Position) !publication.Receipt {
         try self.validate();
-        try position.validate();
-        if (!position.namespace.eql(self.canceled.position.namespace) or position.sequence <= self.canceled.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        try position.requireNamespace(self.canceled.binding.fence.namespace);
+        if (!position.strictlyAfter(self.canceled.position)) return error.InvalidPrivateIndexNativeReceipt;
         var state = std.crypto.hash.Blake3.init(.{});
         state.update("antfly/private-index-cancellation-release-intent/v1");
         state.update(&try self.canceled.encode());
         state.update(&self.metadata_decision);
         var result = try self.canceled.receipt();
         result.action = .cancel_released;
-        result.position = .{ .native = position };
+        result.position = position;
         state.final(&result.evidence_digest);
         _ = try result.digest();
         return result;
@@ -331,26 +336,25 @@ pub const CancellationRecord = struct {
     pub const key = owner.key ++ ":cancel-released";
     pub const encoded_len = 1328;
     intent: CancellationIntent,
-    position: positions.Native,
+    position: positions.Position,
 
     pub fn encode(self: @This()) ![encoded_len]u8 {
-        _ = try self.intent.receipt(self.position);
+        _ = try self.intent.receiptAt(self.position);
         var bytes: [encoded_len]u8 = @splat(0);
-        @memcpy(bytes[0..8], "AICR\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], "AICR\x02\x00\x00\x00");
         @memcpy(bytes[8..1224], &try self.intent.canceled.encode());
         @memcpy(bytes[1224..1256], &self.intent.metadata_decision);
-        @memcpy(bytes[1256..1289], &try (positions.Position{ .native = self.position }).encode());
+        @memcpy(bytes[1256..1289], &try self.position.encode());
         @memcpy(bytes[1296..1328], &hash(bytes[0..1296]));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !@This() {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICR\x01\x00\x00\x00") or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICR\x02\x00\x00\x00") or
             !std.mem.allEqual(u8, bytes[1289..1296], 0) or !std.mem.eql(u8, bytes[1296..1328], &hash(bytes[0..1296]))) return error.InvalidPrivateIndexNativeReceipt;
         const cut = try positions.Position.decode(bytes[1256..1289]);
-        if (cut != .native) return error.InvalidPrivateIndexNativeReceipt;
-        const record: @This() = .{ .intent = .{ .canceled = try owner.Canceled.decode(bytes[8..1224]), .metadata_decision = bytes[1224..1256].* }, .position = cut.native };
-        _ = try record.intent.receipt(record.position);
+        const record: @This() = .{ .intent = .{ .canceled = try owner.Canceled.decode(bytes[8..1224]), .metadata_decision = bytes[1224..1256].* }, .position = cut };
+        _ = try record.intent.receiptAt(record.position);
         return record;
     }
 
@@ -360,8 +364,7 @@ pub const CancellationRecord = struct {
             else => return err,
         };
         const record = try decode(bytes);
-        const source = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.position.namespace));
-        if (source.sequence < record.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        try requireCommitted(txn, record.intent.canceled.binding, record.position);
         return record;
     }
 
@@ -382,11 +385,19 @@ pub const CancellationRecord = struct {
         if (try topology.current(txn)) |current| if (current.admission_epoch <= fence.admission_epoch) return error.IntegrityTopologyChanged;
     }
 
-    pub fn stage(txn: anytype, manager: *@import("../transactions.zig").TxnManager, intent: CancellationIntent, replay: ?positions.Native) !struct { record: CancellationRecord, duplicate: bool } {
+    pub const Stage = struct { record: CancellationRecord, duplicate: bool };
+
+    pub fn stage(txn: anytype, manager: *@import("../transactions.zig").TxnManager, intent: CancellationIntent, replay: ?positions.Native) !Stage {
+        if (intent.canceled.position != .native) return error.InvalidControlReceiptPosition;
+        return stageAt(txn, manager, intent, if (replay) |cut| .{ .native = cut } else null);
+    }
+
+    pub fn stageAt(txn: anytype, manager: *@import("../transactions.zig").TxnManager, intent: CancellationIntent, replay: ?positions.Position) !Stage {
         try intent.validate();
-        if (replay) |cut| _ = try intent.receipt(cut);
+        if (replay) |cut| _ = try intent.receiptAt(cut);
         if (try load(txn, intent)) |previous| {
-            if (replay) |cut| if (!std.meta.eql(cut, previous.position)) return error.InvalidPrivateIndexNativeReceipt;
+            if (replay) |cut| if (!std.meta.eql(cut, previous.position) and
+                (previous.position == .native or !cut.strictlyAfter(previous.position))) return error.InvalidPrivateIndexNativeReceipt;
             try verifyRecovery(txn);
             return .{ .record = previous, .duplicate = true };
         }
@@ -394,13 +405,11 @@ pub const CancellationRecord = struct {
         const binding = intent.canceled.binding;
         const claims = @import("relational_index_private_claims.zig");
         const allocation = try claims.requireRegistered(txn, binding);
-        const source = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition };
-        if (replay) |cut| if (!std.meta.eql(cut, position)) return error.InvalidPrivateIndexNativeReceipt;
+        const position = try preparePosition(txn, binding, replay);
         const record: @This() = .{ .intent = intent, .position = position };
         const encoded = try record.encode();
         try @import("relational_integrity_topology.zig").stageCanceledIndexRelease(txn, manager, intent.canceled);
-        _ = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |cut| cut.sequence else null);
+        if (position == .native) _ = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), position.native.sequence);
         try txn.put(key, &encoded);
         // Both terminal slots are bounded. The predecessor's companion GC was
         // an admission barrier, so it cannot be forgotten while still dirty.
@@ -408,8 +417,15 @@ pub const CancellationRecord = struct {
         try txn.delete(Record.key);
         try txn.delete(owner.key);
         try txn.delete(@import("relational_index_inputs.zig").key);
-        for ([_]owner.NativeEffect{ .admitted, .fenced, .reserved }) |effect| try txn.delete(&owner.nativeEffectKey(effect));
+        if (binding.authority == .native) {
+            for ([_]owner.NativeEffect{ .admitted, .fenced, .reserved }) |effect| try txn.delete(&owner.nativeEffectKey(effect));
+        } else try @import("relational_index_raft_control.zig").stageRetireCuts(txn, binding);
         try txn.delete(&claims.registrationKey(allocation.generation));
+        // This definition was never published. Keeping one immutable blob per
+        // canceled build would turn repeated failures into unbounded storage.
+        // The burned reservation is still the live head and must survive.
+        if (!std.mem.eql(u8, &binding.physical_candidate.blob_digest, &binding.physical_reserved.blob_digest))
+            try txn.delete(&@import("relational_index_catalog.zig").blobKey(binding.physical_candidate.blob_digest));
         return .{ .record = record, .duplicate = false };
     }
 };
