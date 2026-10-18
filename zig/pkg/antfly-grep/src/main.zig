@@ -18,6 +18,7 @@ const grep = @import("antfly-grep");
 const help =
     \\Usage: antfly-grep [OPTIONS] PATTERN [PATH ...]
     \\       antfly-grep --ask QUESTION --model MODEL [OPTIONS] [PATH ...]
+    \\       antfly-grep workspace serve [DISCOVERY OPTIONS] [PATH ...]
     \\
     \\Native local-file grep and decision-based source search. No index required.
     \\With no paths, search piped stdin, otherwise recursively search '.'.
@@ -66,6 +67,8 @@ const help =
     \\      --max-index-documents N  Exact scan document budget (default 100000)
     \\      --decision-batch-wait-ms N  Cross-file gather window (default 1ms; 0 disables)
     \\      --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)
+    \\      --workspace-memory-limit SIZE  Retained snapshot cap (default 256M)
+    \\      --workspace-max-files N  Snapshot entry cap (default 100000)
     \\      --max-pending-output N  Ranked output memory cap (default 64MiB)
     \\      --dictionary-format FORMAT  auto/raw/brotli/brotli-google
     \\      --max-dictionary-size SIZE  Dictionary payload cap (default 64M)
@@ -128,6 +131,12 @@ fn run(init: std.process.Init) !u8 {
     while (args_it.next()) |arg| try args.append(a, arg);
     const persistent = init.arena.allocator();
     const setup = grep.setup;
+    const workspace_service = args.items.len >= 2 and std.mem.eql(u8, args.items[0], "workspace") and std.mem.eql(u8, args.items[1], "serve");
+    if (workspace_service) {
+        _ = args.orderedRemove(0);
+        _ = args.orderedRemove(0);
+        try args.insert(a, 0, "--files");
+    }
     if (args.items.len > 0 and std.mem.eql(u8, args.items[0], "auth")) {
         try setup.auth(persistent, init.io, init.environ_map, args.items[1..]);
         return 0;
@@ -287,6 +296,7 @@ fn run(init: std.process.Init) !u8 {
         var glob = try grep.discovery.glob(a, if (std.mem.startsWith(u8, raw, "!")) raw[1..] else raw);
         glob.deinit();
     }
+    if (workspace_service) return grep.workspace.serve(grep.Search, a, init.io, &o);
     var search = try grep.Search.init(a, init.io, &o);
     defer search.deinit();
     const interrupt = grep.interrupt.Guard.init(&search.limits.cancel);

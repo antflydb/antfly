@@ -1,5 +1,6 @@
-complete -c antfly-grep -n '__fish_use_subcommand' -a 'ask files auth doctor skill cache'
+complete -c antfly-grep -n '__fish_use_subcommand' -a 'ask files auth doctor skill cache workspace'
 complete -c antfly-grep -n '__fish_seen_subcommand_from cache' -a clear
+complete -c antfly-grep -n '__fish_seen_subcommand_from workspace; and not __fish_seen_subcommand_from serve' -a serve
 complete -c antfly-grep -l after-context -r
 complete -c antfly-grep -l agent -r -f -a 'codex claude-code opencode'
 complete -c antfly-grep -l ask -r
@@ -184,4 +185,6 @@ complete -c antfly-grep -l version
 complete -c antfly-grep -l vimgrep
 complete -c antfly-grep -l with-filename
 complete -c antfly-grep -l word-regexp
+complete -c antfly-grep -l workspace-max-files -r
+complete -c antfly-grep -l workspace-memory-limit -r
 complete -c antfly-grep -l yes

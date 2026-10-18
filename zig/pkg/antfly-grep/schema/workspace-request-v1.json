@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "antfly-grep private workspace request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "id", "op"],
+  "properties": {
+    "version": {"const": 1},
+    "id": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "op": {"enum": ["search", "invalidate", "refresh", "close"]},
+    "revision": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "args": {"type": "array", "items": {"type": "string"}}
+  },
+  "allOf": [
+    {"if": {"properties": {"op": {"const": "search"}}},
+     "then": {"required": ["revision"], "properties": {"revision": {"type": "string"}}}}
+  ],
+  "$comment": "Each UTF-8 JSON request occupies at most 65535 bytes before LF. Requests execute serially. Search revision must equal the current non-invalidated workspace_ready revision. Refresh is transactional and a failed refresh leaves the session invalidated."
+}

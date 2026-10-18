@@ -1,4 +1,5 @@
 #compdef antfly-grep
+if [[ ${words[2]} == workspace && CURRENT == 3 ]]; then compadd serve; return; fi
 _arguments -s \
  '--after-context[after-context]:value:' \
  '--agent[agent]:value:(codex claude-code opencode)' \
@@ -184,5 +185,7 @@ _arguments -s \
  '--vimgrep[vimgrep]' \
  '--with-filename[with-filename]' \
  '--word-regexp[word-regexp]' \
+ '--workspace-max-files[workspace-max-files]:value:' \
+ '--workspace-memory-limit[workspace-memory-limit]:value:' \
  '--yes[yes]' \
- '1:command or pattern:(ask files auth doctor skill cache)' '*:path:_files'
+ '1:command or pattern:(ask files auth doctor skill cache workspace)' '*:path:_files'

@@ -17,6 +17,7 @@
 """Black-box CLI contracts, including an actual HTTP decision round trip."""
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -428,7 +429,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
                     row["answers"][0]["probability"] = 0.1
         if self.server.mode == "exploration":
             for row in data:
-                if body["inputs"][row["input_index"]]["id"] in (
+                if body["inputs"][row["input_index"]]["id"].split("@")[0] in (
                     "directory",
                     "file-preview",
                 ):
@@ -5009,11 +5010,11 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(matches(batched), matches(warm))
         self.assertEqual(len(self.server.requests), 0)
-        # Finite request budgets retain existing, uncombined admission.
+        # Finite budgets count merged provider attempts, never queued jobs.
         result = self.raw_cli(*args, "--no-cache", "--max-requests=1", code=2)
         self.assertLessEqual(len(self.server.requests), 1)
         if self.server.requests:
-            self.assertEqual(len(self.server.requests[0][2]["inputs"]), 1)
+            self.assertLessEqual(len(self.server.requests[0][2]["inputs"]), 8)
         self.assertFalse(
             json.loads(result.stdout.splitlines()[-1])["stats"]["complete"]
         )
@@ -5155,7 +5156,9 @@ class CliTests(unittest.TestCase):
                 for _, _, body in self.server.requests
                 for item in body.get("inputs", [])
             ]
-            self.assertEqual(ids.count("file-path"), expected)
+            self.assertEqual(
+                sum(id.split("@")[0] == "file-path" for id in ids), expected
+            )
             self.assertEqual(
                 json.loads(result.stdout.splitlines()[-1])["stats"]["files"], 6
             )
@@ -5316,7 +5319,14 @@ class CliTests(unittest.TestCase):
         self.write("a", "STOP LOW\n")
         self.write("b", "STOP HIGH\n")
         r = self.raw_cli(
-            *self.decision_args(), "--unit", "line", "--no-cache", "-j2", "a", "b"
+            *self.decision_args(),
+            "--unit",
+            "line",
+            "--no-cache",
+            "-j2",
+            "--decision-batch-wait-ms=0",
+            "a",
+            "b",
         )
         self.assertGreaterEqual(self.server.peak, 2)
         self.assertTrue(r.stdout.startswith(b"b:"), r.stdout)
@@ -5754,6 +5764,358 @@ class CliTests(unittest.TestCase):
             self.assertTrue(rows[-1]["stats"]["complete"])
         self.assertEqual(signatures[0], signatures[1])
         self.assertLess(counts[1], counts[0])
+
+    def test_default_budget_and_file_previews_share_batches(self):
+        for i in range(32):
+            self.write(f"src/f{i:03}.py", "def retry():\n    STOP()\n")
+        self.server.mode = "exploration"
+        self.server.delay = 0.01
+        args = [
+            "ask",
+            "retry",
+            "--model=fixture",
+            f"--endpoint=http://127.0.0.1:{self.server.server_port}/decisions",
+            "--json",
+            "--no-cache",
+            "--no-refine",
+            "--max-files=0",
+            "--threads=8",
+            "--decision-concurrency=2",
+            "src",
+        ]
+        signatures = []
+        counts = []
+        for wait in (0, 30):
+            self.server.requests.clear()
+            result = self.raw_cli(*args, f"--decision-batch-wait-ms={wait}")
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            signatures.append(
+                sorted(
+                    (
+                        json.dumps(row["data"]["path"], sort_keys=True),
+                        row["line_number"],
+                        row["probability"],
+                    )
+                    for row in rows
+                    if row["type"] == "match"
+                )
+            )
+            counts.append(len(self.server.requests))
+            self.assertTrue(rows[-1]["stats"]["complete"])
+            self.assertEqual(rows[-1]["requests"], counts[-1])
+        self.assertEqual(signatures[0], signatures[1])
+        self.assertLess(counts[1], counts[0])
+        self.assertTrue(
+            any(
+                len(body["inputs"]) > 1
+                and all(
+                    item["id"].startswith("file-preview") for item in body["inputs"]
+                )
+                for _, _, body in self.server.requests
+            )
+        )
+
+    def test_merged_single_request_budget_and_retry_accounting(self):
+        for i in range(8):
+            self.write(f"src/f{i}.txt", "STOP\n")
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--no-cache",
+            "--no-refine",
+            "--no-rank",
+            "--threads=8",
+            "--max-files=0",
+            "--batch-size=8",
+            "--decision-batch-wait-ms=200",
+            "--max-requests=1",
+            "src",
+        ]
+        result = self.raw_cli(*args)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(rows[-1]["request_inputs"], 8)
+        self.assertEqual(rows[-1]["stats"]["matches"], 8)
+        self.assertTrue(rows[-1]["stats"]["complete"])
+        self.server.requests.clear()
+        self.server.mode = "transient"
+        result = self.raw_cli(*args, "--retries=2", code=2)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(rows[-1]["requests"], 1)
+        self.assertFalse(rows[-1]["stats"]["complete"])
+
+    @contextmanager
+    def workspace(self, *args):
+        proc = subprocess.Popen(
+            [BINARY, "workspace", "serve", *args],
+            cwd=self.root,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+
+        def read():
+            if not select.select([proc.stdout], [], [], 15)[0]:
+                self.fail("workspace response timed out")
+            line = proc.stdout.readline()
+            if not line:
+                self.fail(proc.stderr.read().decode(errors="replace"))
+            return json.loads(line)
+
+        def request(op, **fields):
+            proc.stdin.write(
+                json.dumps({"version": 1, "id": 1, "op": op, **fields}).encode() + b"\n"
+            )
+            rows = []
+            begun = False
+            while True:
+                row = read()
+                rows.append(row)
+                begun = begun or row["type"] == "workspace_begin"
+                if row["type"] == "workspace_error" and begun:
+                    continue
+                if row["type"] in (
+                    "workspace_end",
+                    "workspace_error",
+                    "workspace_ready",
+                    "workspace_invalidated",
+                    "workspace_closed",
+                ):
+                    return rows
+
+        try:
+            ready = read()
+            self.assertEqual(ready["type"], "workspace_ready")
+            yield ready, request
+        finally:
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            stderr = proc.stderr.read()
+            proc.stderr.close()
+            self.assertNotIn(b"leaked", stderr)
+            self.assertNotIn(b"panic", stderr)
+
+    def test_workspace_pins_bytes_and_invalidates_before_transactional_refresh(self):
+        path = self.write("src/a.txt", "STOP old\n")
+        with self.workspace("src") as (ready, request):
+            revision = ready["revision"]
+            path.write_text("new content\n")
+            rows = request("search", revision=revision, args=["STOP"])
+            self.assertEqual(rows[-1]["exit_code"], 0)
+            match = next(row for row in rows if row["type"] == "match")
+            self.assertEqual(match["source"]["snapshot"], revision)
+            self.assertEqual(match["source"]["freshness"], "snapshot")
+            self.assertEqual(
+                request("search", revision="wrong", args=["STOP"])[0]["message"],
+                "WorkspaceRevisionMismatch",
+            )
+            request("invalidate")
+            self.assertEqual(
+                request("search", revision=revision, args=["STOP"])[0]["message"],
+                "WorkspaceInvalidated",
+            )
+            next_ready = request("refresh")[0]
+            self.assertNotEqual(next_ready["revision"], revision)
+            self.assertEqual(
+                request("search", revision=next_ready["revision"], args=["STOP"])[-1][
+                    "exit_code"
+                ],
+                1,
+            )
+            shutil.rmtree(self.root / "src")
+            self.assertEqual(
+                request("search", revision=next_ready["revision"], args=["new"])[-1][
+                    "exit_code"
+                ],
+                0,
+            )
+            self.assertEqual(request("refresh")[0]["type"], "workspace_error")
+            self.assertEqual(
+                request("search", revision=next_ready["revision"], args=["new"])[0][
+                    "message"
+                ],
+                "WorkspaceInvalidated",
+            )
+
+    def test_workspace_reuses_preparations_and_rejects_live_input_options(self):
+        self.write("src/a.py", "def retry():\n    STOP()\n")
+        with self.workspace("src") as (ready, request):
+            args = [*self.decision_args(), "--no-refine", "--no-rank", "--threads=2"]
+            refreshed = request("refresh")[0]
+            self.assertEqual(refreshed["preparations_reused"], 1)
+            shutil.rmtree(self.root / "src")
+            for _ in range(2):
+                rows = request("search", revision=ready["revision"], args=args)
+                self.assertEqual(rows[-1]["exit_code"], 0)
+                summary = next(row for row in rows if row["type"] == "summary")
+                self.assertEqual(summary["stats"]["source_parses"], 0)
+                self.assertEqual(summary["stats"]["source_cache_hits"], 1)
+            for flags in (
+                ["STOP", "src"],
+                ["--pre=cat", "STOP"],
+                ["--table-config=x", "STOP"],
+                ["--glob=*.py", "STOP"],
+            ):
+                rows = request("search", revision=ready["revision"], args=flags)
+                self.assertEqual(rows[-1]["exit_code"], 2)
+                self.assertTrue(any(row["type"] == "workspace_error" for row in rows))
+            request("close")
+
+    def test_workspace_protocol_errors_are_bounded_and_recoverable(self):
+        self.write("src/a.txt", "STOP\n")
+        result = self.raw_cli(
+            "workspace",
+            "serve",
+            "src",
+            input=b'invalid\n{}\n{"version":2,"id":1,"op":"refresh"}\n{"version":1,"id":2,"op":"refresh"}\n{"version":1,"id":3,"op":"close"}\n',
+        )
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(sum(row["type"] == "workspace_error" for row in rows), 3)
+        self.assertEqual(sum(row["type"] == "workspace_ready" for row in rows), 2)
+        self.assertEqual(rows[-1]["type"], "workspace_closed")
+        result = self.raw_cli(
+            "workspace", "serve", "src", input=b"x" * 100000 + b"\n", code=2
+        )
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertIn(b"StreamTooLong", result.stderr)
+
+    def test_workspace_explicit_dot_preserves_ordinary_decision_identity(self):
+        self.write("src/a.py", "def retry():\n    STOP()\n")
+        args = [*self.decision_args(), "--json", "--no-refine", "--threads=1"]
+        ordinary = [
+            json.loads(line) for line in self.raw_cli(*args, ".").stdout.splitlines()
+        ]
+        calls = len(self.server.requests)
+        with self.workspace(".") as (ready, request):
+            rows = request(
+                "search",
+                revision=ready["revision"],
+                args=[*args, "--cached-only", "--max-requests=0"],
+            )
+            self.assertEqual(rows[-1]["exit_code"], 0)
+
+            def paths(events):
+                return [row["data"]["path"] for row in events if row["type"] == "match"]
+
+            self.assertEqual(paths(rows), paths(ordinary))
+            self.assertEqual(len(self.server.requests), calls)
+            summary = next(row for row in rows if row["type"] == "summary")
+            self.assertEqual(summary["requests"], 0)
+            self.assertTrue(summary["stats"]["complete"])
+
+    def test_workspace_inherits_saved_provider_tuning_and_query_overrides(self):
+        self.write("src/a.txt", "STOP\n" * 4)
+        self.write(
+            "config/antfly-grep/credentials.json",
+            json.dumps(
+                {
+                    "provider": "antfly",
+                    "model": "fixture",
+                    "endpoint": f"http://127.0.0.1:{self.server.server_port}/decisions",
+                    "batch_size": 1,
+                    "decision_batch_wait_ms": 0,
+                    "decision_concurrency": 1,
+                }
+            ),
+        )
+        with self.workspace("--no-cache", "src") as (ready, request):
+            for extra, expected in (([], 4), (["--batch-size=2"], 2)):
+                self.server.requests.clear()
+                rows = request(
+                    "search",
+                    revision=ready["revision"],
+                    args=[
+                        "--ask=retry",
+                        "--no-refine",
+                        "--unit=line",
+                        "--threads=1",
+                        *extra,
+                    ],
+                )
+                self.assertEqual(rows[-1]["exit_code"], 0)
+                self.assertEqual(len(self.server.requests), expected)
+                summary = next(row for row in rows if row["type"] == "summary")
+                self.assertEqual(summary["requests"], expected)
+
+    def test_workspace_explicit_binary_file_uses_native_input_semantics(self):
+        self.write("binary.txt", b"STOP\0tail\n")
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--no-cache",
+            "--no-refine",
+            "--threads=1",
+        ]
+        ordinary = [
+            json.loads(line)
+            for line in self.raw_cli(*args, "binary.txt").stdout.splitlines()
+        ]
+        with self.workspace("binary.txt") as (ready, request):
+            rows = request("search", revision=ready["revision"], args=args)
+            self.assertEqual(rows[-1]["exit_code"], 0)
+
+            def matches(events):
+                return [
+                    (row["data"], row["probability"])
+                    for row in events
+                    if row["type"] == "match"
+                ]
+
+            self.assertEqual(matches(rows), matches(ordinary))
+            summary = next(row for row in rows if row["type"] == "summary")
+            self.assertEqual(
+                summary["stats"]["matches"], ordinary[-1]["stats"]["matches"]
+            )
+
+    def test_workspace_encoding_and_anchor_replacements_match_native_files(self):
+        cases = [
+            (b"foo\nfoo\n", ["-P", "--replace=bar", r"\Afoo"]),
+            (b"foo\nfoo\n", ["-P", "--multiline", "--replace=bar", r"\Afoo"]),
+            (b"foo\r\nfoo\r\n", ["--crlf", "foo"]),
+            ("foo\nfoo\n".encode("utf-16"), ["foo"]),
+        ]
+        for data, flags in cases:
+            with self.subTest(flags=flags, data=data):
+                self.write("a.txt", data)
+                ordinary = [
+                    json.loads(line)
+                    for line in self.raw_cli(
+                        "--json", *flags, "a.txt"
+                    ).stdout.splitlines()
+                ]
+                with self.workspace("a.txt") as (ready, request):
+                    rows = request("search", revision=ready["revision"], args=flags)
+                    self.assertEqual(rows[-1]["exit_code"], 0)
+
+                    def matches(events):
+                        return [
+                            (row["data"], row["line_number"], row["text"])
+                            for row in events
+                            if row["type"] == "match"
+                        ]
+
+                    self.assertEqual(matches(rows), matches(ordinary))
+
+    def test_workspace_capture_limits_and_ignore_contract(self):
+        self.write("src/.ignore", "ignored.txt\n")
+        self.write("src/ignored.txt", "STOP\n")
+        self.write("src/keep.txt", "STOP\n")
+        with self.workspace("src") as (ready, request):
+            self.assertEqual(ready["files"], 1)
+            refreshed = request("refresh")[0]
+            self.assertEqual(refreshed["revision"], ready["revision"])
+            self.assertEqual(refreshed["preparations_built"], 0)
+            self.assertEqual(refreshed["preparations_reused"], 1)
+        self.raw_cli("workspace", "serve", "--workspace-max-files=0", "src", code=2)
+        self.raw_cli("workspace", "serve", "--workspace-memory-limit=1K", "src", code=2)
 
     def test_provider_concurrency_is_independent_and_reports_transport_cost(self):
         self.server.delay = 0.02

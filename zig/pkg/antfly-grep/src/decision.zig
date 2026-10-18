@@ -626,8 +626,11 @@ pub const Client = struct {
     fn request(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
         if (self.coalescer) |coalescer| {
             if (inputs.len > 0 and inputs.len < self.options.batch_size and self.options.decision_batch_wait_ms > 0 and
-                self.options.max_requests == std.math.maxInt(usize) and self.options.max_regions == std.math.maxInt(usize) and
-                (self.stage == .region or self.stage == .line or self.stage == .target)) return coalescer.submit(self, inputs, probabilities);
+                // The shared request counter reserves one slot per actual
+                // provider attempt, after merging and before dispatch. Never
+                // merge independently budgeted clients without that counter.
+                (self.limits != null or self.options.max_requests == std.math.maxInt(usize)) and
+                (self.stage == .file or self.stage == .region or self.stage == .line or self.stage == .target)) return coalescer.submit(self, inputs, probabilities);
         }
         return self.requestDirect(inputs, probabilities);
     }

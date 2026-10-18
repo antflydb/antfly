@@ -18,6 +18,7 @@ pub const interrupt = @import("interrupt.zig");
 pub const concurrency = @import("concurrency.zig");
 pub const setup = @import("setup.zig");
 pub const tooling = @import("tooling.zig");
+pub const workspace = @import("workspace.zig");
 pub const Options = @import("options.zig").Options;
 pub const Matcher = @import("matcher.zig").Matcher;
 pub const discovery = @import("discovery.zig");
@@ -47,7 +48,7 @@ pub const Line = @import("source_cache.zig").Line;
 const Limits = @import("budget.zig").Limits;
 const Spill = @import("spill.zig").Store;
 const Temp = @import("temporary.zig").File;
-const Task = struct { prepared: bool = false, path: []const u8, display: []const u8, filename: bool, explicit_file: bool = false, timestamp: i96 = 0, ordinal: usize = 0, result: ?[]u8 = null, score: f64 = 0 };
+const Task = struct { workspace_entry: ?*const @import("workspace_store.zig").Entry = null, prepared: bool = false, path: []const u8, display: []const u8, filename: bool, explicit_file: bool = false, timestamp: i96 = 0, ordinal: usize = 0, result: ?[]u8 = null, score: f64 = 0 };
 const EvidenceRow = struct { line: usize, byte_offset: usize, text: []const u8, p: ?f64, region_p: ?f64, matched: bool };
 const EvidenceView = struct {
     rows: []EvidenceRow,
@@ -125,6 +126,8 @@ fn retainedClone(comptime T: type, a: Allocator, value: T, depth: usize) error{ 
 const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
+    workspace_generation: ?*const @import("workspace_store.zig").Generation = null,
+    workspace_entry: ?*const @import("workspace_store.zig").Entry = null,
     coalescer: decision.Coalescer = .{},
     spill: ?*Spill = null,
     owns_spill: bool = false,
@@ -210,6 +213,7 @@ pub const Search = struct {
         const matcher = try root.matcher.clone(root.a);
         var result: Search = .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
         result.local_cwd = root.local_cwd;
+        result.workspace_generation = root.workspace_generation;
         result.decider.shareCache(&root.decider);
         result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
@@ -303,7 +307,7 @@ pub const Search = struct {
             self.ranking = ranking;
             self.owns_ranking = true;
         }
-        const single_regular_file = self.options.paths.items.len == 1 and !self.hasStdinPath() and
+        const single_regular_file = if (self.workspace_generation) |generation| generation.entries.items.len == 1 else self.options.paths.items.len == 1 and !self.hasStdinPath() and
             (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
         self.single_source = single_regular_file and self.options.table_config == null;
         if (self.ranking == null and self.options.ask != null and self.options.ranked and self.options.sort == null and
@@ -317,7 +321,10 @@ pub const Search = struct {
             self.spill = spill;
             self.owns_spill = true;
         }
-        self.discovery_stream = self.ranking != null or self.spill != null;
+        self.discovery_stream = self.ranking != null or self.spill != null or
+            (self.options.ask != null and !self.options.ranked and !self.options.jev_mode and
+                (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none")) and
+                !self.options.quiet and !self.options.inventory and !self.hasStdinPath());
         if (self.discovery_stream and (self.single_source or self.options.triage or self.options.max_files == std.math.maxInt(usize))) {
             self.file_path_triage = self.options.triage or (self.single_source and 1 > self.options.max_files);
             self.pipeline = try Pipeline.start(self);
@@ -337,24 +344,35 @@ pub const Search = struct {
             self.pipeline = null;
         };
 
-        if (self.options.table_config != null) @import("indexed.zig").run(self) catch |err| {
-            try self.reportError("<antfly>", err);
-        };
-        if (self.options.paths.items.len == 0 and self.options.table_config != null) {
-            // A table-only invocation never consumes ambient stdin.
-        } else if (self.options.paths.items.len == 0) {
-            if (!self.options.files and !try std.Io.File.stdin().isTty(self.io)) self.stdin() catch |err| {
-                try self.reportError("<stdin>", err);
-            } else self.searchPath(".") catch |err| {
-                try self.reportError(".", err);
+        if (self.workspace_generation) |generation| {
+            for (generation.entries.items) |*entry| {
+                if (self.stopped()) break;
+                self.workspace_entry = entry;
+                self.explicit_file = entry.explicit_file;
+                self.render_filename = true;
+                self.file(entry.path, entry.path) catch |err| try self.reportError(entry.path, err);
+            }
+            self.workspace_entry = null;
+        } else {
+            if (self.options.table_config != null) @import("indexed.zig").run(self) catch |err| {
+                try self.reportError("<antfly>", err);
             };
-        } else for (self.options.paths.items) |path| {
-            if (self.stopped()) break;
-            if (std.mem.eql(u8, path, "-")) self.stdin() catch |err| {
-                try self.reportError("<stdin>", err);
-            } else self.searchPath(path) catch |err| {
-                try self.reportError(path, err);
-            };
+            if (self.options.paths.items.len == 0 and self.options.table_config != null) {
+                // A table-only invocation never consumes ambient stdin.
+            } else if (self.options.paths.items.len == 0) {
+                if (!self.options.files and !try std.Io.File.stdin().isTty(self.io)) self.stdin() catch |err| {
+                    try self.reportError("<stdin>", err);
+                } else self.searchPath(".") catch |err| {
+                    try self.reportError(".", err);
+                };
+            } else for (self.options.paths.items) |path| {
+                if (self.stopped()) break;
+                if (std.mem.eql(u8, path, "-")) self.stdin() catch |err| {
+                    try self.reportError("<stdin>", err);
+                } else self.searchPath(path) catch |err| {
+                    try self.reportError(path, err);
+                };
+            }
         }
         if (self.inventory_file != null and !self.stopped()) try self.startInventory(false);
         if (self.pipeline) |pool| {
@@ -540,6 +558,7 @@ pub const Search = struct {
                 if (self.stopped()) break;
                 self.render_filename = task.filename;
                 self.explicit_file = task.explicit_file;
+                self.workspace_entry = task.workspace_entry;
                 self.file(task.path, task.display) catch |err| try self.reportError(task.display, err);
             }
             return;
@@ -807,6 +826,7 @@ pub const Search = struct {
                 local.sink = if (ranked) &output.writer else &streaming.writer;
                 local.render_filename = task.filename;
                 local.explicit_file = task.explicit_file;
+                local.workspace_entry = task.workspace_entry;
                 local.best_probability = 0;
                 if (root.spill != null) local.output_bytes = 0;
                 local.result_ordinal = task.ordinal;
@@ -988,7 +1008,7 @@ pub const Search = struct {
                     timestamp = if (std.mem.eql(u8, sort, "modified")) stat.mtime.nanoseconds else if (std.mem.eql(u8, sort, "accessed")) (stat.atime orelse std.Io.Timestamp.zero).nanoseconds else (try @import("filesystem.zig").info(self.a, self.io, path_name)).created orelse return error.CreationTimeUnavailable;
                 }
             }
-            const task: Task = .{ .ordinal = self.next_ordinal, .path = path, .display = shown, .filename = self.render_filename, .timestamp = timestamp, .explicit_file = self.explicit_file };
+            const task: Task = .{ .workspace_entry = self.workspace_entry, .ordinal = self.next_ordinal, .path = path, .display = shown, .filename = self.render_filename, .timestamp = timestamp, .explicit_file = self.explicit_file };
             self.next_ordinal += 1;
             if (self.pipeline) |pool| {
                 if (!try pool.submit(task)) {
@@ -1016,6 +1036,12 @@ pub const Search = struct {
         const previous_source = self.provenance;
         defer self.provenance = previous_source;
         self.provenance = .{ .uri = local_uri, .observed_at = if (self.options.json) std.Io.Clock.real.now(self.io).toSeconds() else null };
+        if (self.workspace_entry) |entry| {
+            self.provenance.revision = &entry.revision;
+            self.provenance.snapshot = &self.workspace_generation.?.revision;
+            self.provenance.observed_at = self.workspace_generation.?.captured_at;
+            self.provenance.freshness = .snapshot;
+        }
         const before = self.summary;
         self.file_elapsed_ns = null;
         self.file_before = before;
@@ -1183,6 +1209,14 @@ pub const Search = struct {
         try self.tasks.append(self.a, .{ .path = path, .display = display, .filename = true, .prepared = true, .result = result, .score = local.best_probability, .timestamp = timestamp });
     }
     fn readFile(self: *Search, path_name: []const u8, display: []const u8) !void {
+        if (self.workspace_entry) |entry| {
+            if (entry.bytes.len > self.options.max_file_bytes) {
+                if (self.options.skip_oversize) return;
+                return error.StreamTooLong;
+            }
+            self.replacement_file_context = @import("builtin").os.tag == .linux and (self.options.mmap or (self.options.mmap_auto and self.options.ask == null));
+            return self.processBytes(display, entry.bytes);
+        }
         if (self.options.skip_oversize) {
             const info = try std.Io.Dir.cwd().statFile(self.io, path_name, .{});
             if (info.size > self.options.max_file_bytes) return;
@@ -1855,7 +1889,13 @@ pub const Search = struct {
         var prepared: ?@import("source_cache.zig").Prepared = null;
         const lines = if (self.options.ask != null) blk: {
             var hit = false;
-            prepared = try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
+            prepared = if (self.workspace_entry) |entry| blk2: {
+                if (!self.options.crlf and !self.options.null_data and bytes.ptr == entry.bytes.ptr and bytes.len == entry.bytes.len and entry.prepared != null) {
+                    hit = true;
+                    break :blk2 entry.prepared.?;
+                }
+                break :blk2 try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
+            } else try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
             self.summary.source_cache_hits += @intFromBool(hit);
             self.summary.source_parses += @intFromBool(!hit);
             break :blk prepared.?.lines;
@@ -3167,6 +3207,7 @@ test "line offsets preserve CRLF and unterminated final lines" {
 test {
     _ = @import("evidence.zig");
     _ = @import("source_views.zig");
+    _ = @import("workspace_store.zig");
     _ = @import("spill.zig");
     _ = @import("ranked.zig");
     _ = @import("batch_store.zig");

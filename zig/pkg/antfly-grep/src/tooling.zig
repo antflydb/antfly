@@ -119,19 +119,19 @@ pub fn generate(a: std.mem.Allocator, kind: []const u8, help: []const u8) ![]u8 
             if (words.len > 0) try output.writer.print("COMPREPLY=( $(compgen -W '{s}' -- \"$cur\") )", .{words}) else if (value != null and value.?.directory) try output.writer.writeAll("while IFS= read -r candidate; do COMPREPLY+=(\"$candidate\"); done < <(compgen -d -- \"$cur\")") else if (value != null and value.?.path) try output.writer.writeAll("while IFS= read -r candidate; do COMPREPLY+=(\"$candidate\"); done < <(compgen -f -- \"$cur\")") else try output.writer.writeAll("COMPREPLY=()");
             try output.writer.writeAll("; if [[ -n $prefix ]]; then COMPREPLY=( \"${COMPREPLY[@]/#/$prefix}\" ); fi; return;;\n");
         };
-        try output.writer.writeAll(" esac\n case ${COMP_WORDS[1]} in cache) COMPREPLY=( $(compgen -W 'clear' -- \"$cur\") ); return;; esac\n local opts='");
+        try output.writer.writeAll(" esac\n case ${COMP_WORDS[1]} in workspace) if [[ $COMP_CWORD == 2 ]]; then COMPREPLY=( $(compgen -W 'serve' -- \"$cur\") ); return; fi;; cache) COMPREPLY=( $(compgen -W 'clear' -- \"$cur\") ); return;; esac\n local opts='");
         for (names.items) |name| try output.writer.print("{s} ", .{name});
-        try output.writer.writeAll("ask files auth doctor skill cache'\n if [[ $cur == -* || $COMP_CWORD == 1 ]]; then COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") ); fi\n if [[ ${#COMPREPLY[@]} == 0 && $cur != -* ]]; then while IFS= read -r candidate; do COMPREPLY+=(\"$candidate\"); done < <(compgen -f -- \"$cur\"); fi\n}\ncomplete -o filenames -F _antfly_grep antfly-grep\n");
+        try output.writer.writeAll("ask files auth doctor skill cache workspace'\n if [[ $cur == -* || $COMP_CWORD == 1 ]]; then COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") ); fi\n if [[ ${#COMPREPLY[@]} == 0 && $cur != -* ]]; then while IFS= read -r candidate; do COMPREPLY+=(\"$candidate\"); done < <(compgen -f -- \"$cur\"); fi\n}\ncomplete -o filenames -F _antfly_grep antfly-grep\n");
     } else if (std.mem.eql(u8, kind, "complete-zsh")) {
-        try output.writer.writeAll("#compdef antfly-grep\n_arguments -s \\\n");
+        try output.writer.writeAll("#compdef antfly-grep\nif [[ ${words[2]} == workspace && CURRENT == 3 ]]; then compadd serve; return; fi\n_arguments -s \\\n");
         for (names.items) |name| {
             const words = try choices(a, name);
             defer a.free(words);
             if (!takesValue(name)) try output.writer.print(" '{s}[{s}]' \\\n", .{ name, name[2..] }) else if (words.len > 0) try output.writer.print(" '{s}[{s}]:value:({s})' \\\n", .{ name, name[2..], words }) else if (spec(name)) |value| try output.writer.print(" '{s}[{s}]:value:{s}' \\\n", .{ name, name[2..], if (value.directory) "_files -/" else if (value.path) "_files" else "" }) else try output.writer.print(" '{s}[{s}]:value:' \\\n", .{ name, name[2..] });
         }
-        try output.writer.writeAll(" '1:command or pattern:(ask files auth doctor skill cache)' '*:path:_files'\n");
+        try output.writer.writeAll(" '1:command or pattern:(ask files auth doctor skill cache workspace)' '*:path:_files'\n");
     } else if (std.mem.eql(u8, kind, "complete-fish")) {
-        try output.writer.writeAll("complete -c antfly-grep -n '__fish_use_subcommand' -a 'ask files auth doctor skill cache'\ncomplete -c antfly-grep -n '__fish_seen_subcommand_from cache' -a clear\n");
+        try output.writer.writeAll("complete -c antfly-grep -n '__fish_use_subcommand' -a 'ask files auth doctor skill cache workspace'\ncomplete -c antfly-grep -n '__fish_seen_subcommand_from cache' -a clear\ncomplete -c antfly-grep -n '__fish_seen_subcommand_from workspace; and not __fish_seen_subcommand_from serve' -a serve\n");
         for (names.items) |name| {
             try output.writer.print("complete -c antfly-grep -l {s}", .{name[2..]});
             if (takesValue(name)) {
@@ -145,7 +145,7 @@ pub fn generate(a: std.mem.Allocator, kind: []const u8, help: []const u8) ![]u8 
             try output.writer.writeByte('\n');
         }
     } else if (std.mem.eql(u8, kind, "complete-powershell")) {
-        try output.writer.writeAll("Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param($wordToComplete, $commandAst, $cursorPosition)\n $elements=@($commandAst.CommandElements | Where-Object { $_.Extent.EndOffset -le $cursorPosition }); $previousIndex=$elements.Count-1; if($wordToComplete -ne ''){$previousIndex--}; $prev=if($previousIndex -ge 1){$elements[$previousIndex].Extent.Text}else{''}; $prefix=''\n if($wordToComplete -match '^(--[^=]+)=(.*)$'){$prev=$Matches[1];$prefix=$prev+'=';$wordToComplete=$Matches[2]}\n $choices=switch($prev){\n");
+        try output.writer.writeAll("Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param($wordToComplete, $commandAst, $cursorPosition)\n $elements=@($commandAst.CommandElements | Where-Object { $_.Extent.EndOffset -le $cursorPosition }); $previousIndex=$elements.Count-1; if($wordToComplete -ne ''){$previousIndex--}; $prev=if($previousIndex -ge 1){$elements[$previousIndex].Extent.Text}else{''}; $prefix=''\n if($wordToComplete -match '^(--[^=]+)=(.*)$'){$prev=$Matches[1];$prefix=$prev+'=';$wordToComplete=$Matches[2]}\n $choices=switch($prev){\n 'workspace' { 'serve'; break }\n");
         for (names.items) |name| if (takesValue(name)) {
             const words = try choices(a, name);
             defer a.free(words);
@@ -153,7 +153,7 @@ pub fn generate(a: std.mem.Allocator, kind: []const u8, help: []const u8) ![]u8 
         };
         try output.writer.writeAll(" default { @(");
         for (names.items) |name| try output.writer.print("'{s}',", .{name});
-        try output.writer.writeAll("'ask','files','auth','doctor','skill','cache') }\n }\n $choices | Where-Object { $_.StartsWith($wordToComplete,[System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { [System.Management.Automation.CompletionResult]::new($prefix+$_,$_, 'ParameterValue',$_) }\n}\n");
+        try output.writer.writeAll("'ask','files','auth','doctor','skill','cache','workspace') }\n }\n $choices | Where-Object { $_.StartsWith($wordToComplete,[System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { [System.Management.Automation.CompletionResult]::new($prefix+$_,$_, 'ParameterValue',$_) }\n}\n");
     } else return error.UnknownGenerationKind;
     return output.toOwnedSlice();
 }

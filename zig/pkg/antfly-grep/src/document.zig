@@ -24,7 +24,7 @@ pub const Provenance = struct {
     indexed_at: ?i64 = null,
     observed_at: ?i64 = null,
     snapshot: ?[]const u8 = null,
-    freshness: enum { live, indexed } = .live,
+    freshness: enum { live, indexed, snapshot } = .live,
     metadata: ?std.json.Value = null,
     source_regions: ?std.json.Value = null,
 };

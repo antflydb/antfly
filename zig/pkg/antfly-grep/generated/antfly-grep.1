@@ -5,6 +5,7 @@ antfly-grep \- native exact and decision source search
 .nf
 Usage: antfly-grep [OPTIONS] PATTERN [PATH ...]
        antfly-grep --ask QUESTION --model MODEL [OPTIONS] [PATH ...]
+       antfly-grep workspace serve [DISCOVERY OPTIONS] [PATH ...]
 
 Native local-file grep and decision-based source search. No index required.
 With no paths, search piped stdin, otherwise recursively search '.'.
@@ -53,6 +54,8 @@ Use '-' for stdin; '--' ends option parsing.
       --max-index-documents N  Exact scan document budget (default 100000)
       --decision-batch-wait-ms N  Cross-file gather window (default 1ms; 0 disables)
       --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)
+      --workspace-memory-limit SIZE  Retained snapshot cap (default 256M)
+      --workspace-max-files N  Snapshot entry cap (default 100000)
       --max-pending-output N  Ranked output memory cap (default 64MiB)
       --dictionary-format FORMAT  auto/raw/brotli/brotli-google
       --max-dictionary-size SIZE  Dictionary payload cap (default 64M)
@@ -650,6 +653,12 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --word-regexp
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --workspace-max-files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --workspace-memory-limit
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --yes

@@ -28,7 +28,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from compare import measure
+from compare import first_result, measure, timing_quality
 
 
 def main():
@@ -41,6 +41,9 @@ def main():
     parser.add_argument("--provider-lanes", type=int, default=2)
     parser.add_argument("--candidate-concurrency", type=int, default=0)
     parser.add_argument("--delay-ms", type=int, default=20)
+    parser.add_argument("--request-budget", default="1000")
+    parser.add_argument("--file-previews", action="store_true")
+    parser.add_argument("--unranked", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     if (
@@ -73,6 +76,9 @@ def main():
         "provider_lanes": args.provider_lanes,
         "candidate_concurrency": args.candidate_concurrency,
         "fixture_delay_ms": args.delay_ms,
+        "request_budget": args.request_budget,
+        "file_previews": args.file_previews,
+        "unranked": args.unranked,
         "host": {"platform": platform.platform(), "cpu_count": os.cpu_count()},
         "fixture_source_sha256": hashlib.sha256(tests.read_bytes()).hexdigest(),
         "limitations": "Synthetic constant-score fixture with bounded provider lanes; warm filesystem, no cache, no model relevance or billed-token savings established",
@@ -90,11 +96,16 @@ def main():
             "--no-cache",
             "--no-refine",
             "--max-files=0",
-            "--max-requests=unlimited",
+            f"--max-requests={args.request_budget}",
             "--batch-size=8",
             f"--threads={args.threads}",
             "src",
         ]
+        if args.file_previews:
+            flags = ["ask", "retry enforcement", *flags[2:], "--broad"]
+        if args.unranked:
+            flags.append("--no-rank")
+        expected_inputs = args.files * (2 if args.file_previews else 1)
         commands = {
             name: [
                 binary,
@@ -133,6 +144,7 @@ def main():
                 for row in rows
                 if row["type"] == "match"
             ]
+            signature.sort(key=lambda row: json.dumps(row, sort_keys=True))
             if expected is not None and expected != signature:
                 raise RuntimeError("non-equivalent evidence")
             expected = signature
@@ -149,10 +161,20 @@ def main():
                 sample["inputs"] = sum(
                     len(body["inputs"]) for _, _, body in case.server.requests
                 )
-                if sample["inputs"] != args.files:
+                if sample["inputs"] != expected_inputs:
                     raise RuntimeError("lost or duplicated targets")
                 report["cases"][name]["runs"].append(sample)
-        for entry in report["cases"].values():
+        for name, entry in report["cases"].items():
+            entry["first_output_runs"] = [
+                first_result(commands[name], case.root, case.env)
+                for _ in range(args.rounds)
+            ]
+            entry["median_first_output_seconds"] = statistics.median(
+                entry["first_output_runs"]
+            )
+            entry["timing_quality"] = timing_quality(
+                [sample["seconds"] for sample in entry["runs"]]
+            )
             entry["median_seconds"] = statistics.median(
                 r["seconds"] for r in entry["runs"]
             )

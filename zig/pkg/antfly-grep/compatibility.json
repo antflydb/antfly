@@ -58,7 +58,7 @@
       "evidence": [
         "tests/test_cli.py"
       ],
-      "limits": "Provider checks use HTTP/native fixtures. POSIX interrupt cancellation is cooperative; Windows signal behavior is not runtime-verified. Cached-only mode makes no provider calls and returns partial evidence on misses; rejects remote tables and external commands. Lazy shared local runtime, versioned per-score ages, bounded score table, parser-fingerprinted preparation cache and revision/permission scopes are fixture tested. Cache collisions are misses."
+      "limits": "Provider checks use HTTP/native fixtures. POSIX interrupt cancellation is cooperative; Windows signal behavior is not runtime-verified. Cached-only mode makes no provider calls and returns partial evidence on misses; rejects remote tables and external commands. Lazy shared local runtime, versioned per-score ages, bounded score table, parser-fingerprinted preparation cache and revision/permission scopes are fixture tested. Cache collisions are misses. Cross-file file/region/line batching supports finite budgets: one shared reservation per actual provider attempt, including retry/split attempts. Unranked unsorted discovery uses bounded queues and threshold-dependent inventory spill."
     },
     {
       "area": "Antfly indexed tables",
@@ -130,6 +130,23 @@
         "bench/results/review-readiness-validation.json"
       ],
       "limits": "ReleaseSafe regex, Python/Go/Rust/JS/TS parser and dictionary targets have allocation/input/work bounds and leak checks; VM/JIT comparisons include spans, captures, marks, errors and steps. Finite campaigns are evidence, not a proof of safety for arbitrary input."
+    },
+    {
+      "area": "Pinned workspace sessions",
+      "status": "native bounded stdio snapshots; fixture tested",
+      "evidence": [
+        "src/workspace.zig",
+        "src/workspace_store.zig",
+        "schema/workspace-request-v1.json",
+        "tests/test_cli.py",
+        "bench/workspace.py",
+        "bench/results/workspace-session-macos.json",
+        "bench/results/workspace-sdk-macos.json",
+        "bench/results/workspace-previews-macos.json",
+        "bench/results/workspace-unranked-macos.json",
+        "bench/results/workspace-validation.json"
+      ],
+      "limits": "Explicit revision-pinned captures reuse source bytes and newline-mode preparations across queries. Refresh rereads sources and reuses unchanged preparations. Invalidation and failed refresh block queries until successful recapture; no automatic OS watcher or live-filesystem freshness claim. Per-file consistency checks do not establish a globally atomic filesystem snapshot. Captures default to 256 MiB allocator memory and 100000 files; transactional refresh temporarily retains two generations. Explicit-dot paths and explicit-file input semantics preserve native cache/output identities. Saved provider tuning is inherited and query flags override it. Query options exclude filesystem discovery/transform inputs and explicit sorting. Resident source/index allocation is additional to ordinary process/model/query memory; the SDK sample reports an 80.1M physical footprint."
     }
   ]
 }

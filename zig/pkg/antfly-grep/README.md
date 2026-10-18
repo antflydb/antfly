@@ -1740,3 +1740,145 @@ Evidence: [one-worker search](bench/results/dense-topk-macos.json),
 [generated comparisons](bench/results/dense-differential.json),
 [oracle build differences](bench/results/dense-oracle-variants.json), and
 [validation and hashes](bench/results/dense-validation.json).
+
+### Budgeted batching and pinned workspace sessions
+
+Cross-file gathering now applies with the default finite request budget and
+includes file-path triage and file previews. One shared atomic reservation is
+charged per actual provider attempt after gathering, including retries and
+oversize splits. Queued targets do not consume request slots. Use
+`--max-regions` to limit evaluated targets independently. Exhaustion still
+returns exit 2 and retains confirmed partial evidence; batching can evaluate
+more targets within the same request budget. Directory pruning remains ahead
+of traversal and is not gathered with file evaluations. A zero gather window
+retains individual requests for latency-sensitive or differential controls.
+
+Unranked, unsorted decision searches use the existing bounded discovery queue.
+Unlimited-file or explicit-triage searches overlap discovery and evaluation.
+When automatic path triage depends on exceeding `--max-files`, the initial
+inventory spills to bounded scratch until the threshold or EOF determines the
+same triage policy. Explicit sorting and jevgrep overview presentation retain
+their inventory requirements. Source/output/spill/request budgets and
+cancellation remain shared across workers.
+
+For editors and agents issuing repeated searches, start a private stdio session:
+
+```sh
+antfly-grep workspace serve --glob '*.go' ./repository
+```
+
+The service emits `workspace_ready` with protocol `version: 1`, a SHA-256
+`revision`, file/byte counts, retained allocation, and preparation build/reuse
+counts. Send one JSON object per line, with a numeric request ID:
+
+```json
+{"version":1,"id":1,"op":"search","revision":"COPY_READY_REVISION","args":["retry","--fixed-strings"]}
+{"version":1,"id":2,"op":"invalidate"}
+{"version":1,"id":3,"op":"refresh"}
+{"version":1,"id":4,"op":"close"}
+```
+
+Search emits `workspace_begin`, ordinary grep JSON events, and `workspace_end`
+with the request ID, snapshot revision, and ordinary 0/1/2 exit code. Validation
+errors after begin still have an end envelope. Decision arguments such as
+`--ask`, `--model`, `--no-rank`, budgets, thresholds and provider concurrency use
+the ordinary search engine. Provider defaults/credentials are inherited from
+normal configuration and environment. Sources are captured using ordinary
+ignore/glob/type filtering at startup; discovery filters and filesystem input
+transforms cannot be changed by a query. Snapshot queries currently reject
+explicit sorting, file listings, table inputs, preprocessors, compressed-file decoding,
+pattern files, path arguments and directory triage. Capture rejects the recursive `--follow` option; explicit file paths keep
+their ordinary native input behavior. Configure discovery when starting the session.
+
+Each result records its content revision and workspace snapshot with
+`freshness: "snapshot"`. Queries search owned, immutable captured bytes, even
+when the original files change or disappear. They perform no source-file
+opens or source-content digest/preparation-cache validation; UTF-8 declaration
+and call indexes are reused for ordinary newline mode. Decoding, CRLF and NUL
+modes retain their ordinary preparation paths. Query execution and JSON output
+still have CPU and memory costs, and score-cache accesses can still do I/O.
+
+This is an explicit snapshot contract, not an automatically fresh filesystem
+view. A capture reads each file consistently with before/after metadata checks;
+it is not an atomic filesystem-wide snapshot. Integrations can report any
+change, watcher overflow, disconnect or lost event using `invalidate`; searches
+then fail closed until a successful full `refresh`. No OS watcher is installed
+by this command. Refresh rereads discovery rules and source bytes, verifies
+content identities, and reuses preparations for unchanged path/content pairs.
+It publishes only a complete generation. Failed refresh preserves the old
+allocation but leaves it invalidated; it never silently searches stale data.
+Content revisions remain deterministic for unchanged captures. No chain of old
+generations is retained.
+
+Requests execute serially and borrow the generation until all query workers
+join. SIGINT cancels an active search using the existing cancellation path;
+EOF/close releases the session. Frames are limited to 64 KiB; malformed JSON
+gets a protocol error, and an oversized frame terminates the stream. There is
+no network listener or persisted source copy. The default capture limits are
+100,000 files and 256 MiB of allocator-accounted source/index/capture memory,
+configurable with `--workspace-max-files` and `--workspace-memory-limit`.
+Transactional refresh can temporarily retain two bounded generations, plus
+per-query/provider/runtime memory governed by their existing limits.
+
+`bench/workspace.py` checks evidence against ordinary invocations, measures
+capture/refresh separately from warm queries, and can sample the exact tested
+macOS process. `bench/decision_microbatch.py --file-previews` and `--unranked`
+cover default-budget request gathering against a supplied baseline. Reports
+retain binary/fixture hashes and per-run results. These fixtures establish
+orchestration and evidence routing, not live-model relevance or billing.
+
+Final qualification of the budgeted batching/workspace implementation: **194
+CLI tests on macOS and ARM64 Linux** (two skips each), native unit/hardening and
+tooling checks, 1,000 generated ripgrep 15.2 / PCRE2 10.45 comparisons without
+mismatches/timeouts, Windows x86-64 cross-compilation, package asset checks,
+Apache/license boundaries and formatting. Regressions include finite merged
+request budgets/retries, previews, explicit-dot cache identity, saved provider
+tuning and overrides, explicit binary input, CRLF/UTF-16 and anchor replacements,
+invalidated/failed refreshes, parser-index ownership, capture quotas and framing.
+
+Final warm measurements on this shared macOS host:
+
+| Workload | Median elapsed, ordinary/baseline → optimized | Provider calls |
+|---|---:|---:|
+| Default-budget file previews / 64 files | 1,152.62 → 321.07 ms | 128 → 16 |
+| Default-budget unranked search / 64 files | 666.71 → 201.74 ms | 64 → 8 |
+| Repeated top-15 query / 1,024 synthetic Python files | 35.68 → 6.36 ms | 0 in both warm paths |
+| Repeated query / actual Go SDK, 75 files / 5.9 MB | 80.52 → 26.63 ms | 0 in both warm paths |
+
+HTTP fixtures use eight file workers, two fixture provider lanes and 10 ms
+service delay; the candidate explicitly caps provider concurrency at two while
+the baseline follows its file workers. Both use the default 1,000-request
+budget. File-preview first-output medians change 1,122.37 → 300.15 ms; unranked
+first output changes 33.81 → 36.35 ms. Gathering therefore still has a latency
+tradeoff despite reducing total work. No HTTP throughput case crosses the adapter's
+20% relative-MAD high-variance threshold.
+
+Snapshot times compare ordinary warm invocations of the same final binary with
+pinned in-process queries, including consumer JSON decoding. Initial capture
+is measured separately: 60.73 ms / 117.85 ms for synthetic/SDK sources;
+unchanged refresh takes 19.08 ms / 6.16 ms and reparses zero sources. Retained
+source/preparation allocations are 5.52 MiB / 14.09 MiB. They exclude process,
+allocator, model and per-query memory; the SDK process sample reports an 80.1M
+physical footprint. Persistent snapshots trade resident memory for repeated
+query latency, and are opt-in. Both warm paths use the same selected evidence
+and scan statistics. The SDK fixture is a successful negative search, not a
+model relevance evaluation.
+
+Local controls against 03917b05bf retain broadly similar performance: repository
+search 7.05 → 6.77 ms, discovery 6.12 → 6.51 ms, capture/reset counting
+91.38 → 93.63 ms, repeat counting 29.50 → 29.67 ms, and 64 MiB literal misses
+10.35 → 10.40 ms. These measurements do not establish an additional general
+lexical/regex speedup. The same final-binary repository/large-file controls and
+SDK process sample are retained; no new JIT coverage was added. Independent
+Linux hardware/cold-storage performance, Windows runtime, automatic OS watcher
+integration, live-model relevance and billed cost remain unqualified.
+
+Evidence: [default-budget previews](bench/results/workspace-previews-macos.json),
+[unranked decisions](bench/results/workspace-unranked-macos.json),
+[synthetic sessions](bench/results/workspace-session-macos.json),
+[SDK sessions](bench/results/workspace-sdk-macos.json),
+[exact production-binary sample](bench/results/workspace-sdk-profile.sample.txt),
+[local controls](bench/results/workspace-local-macos.json),
+[generated comparisons](bench/results/workspace-differential.json),
+[release archives](bench/results/workspace-archives.json), and
+[validation/source hashes](bench/results/workspace-validation.json).
