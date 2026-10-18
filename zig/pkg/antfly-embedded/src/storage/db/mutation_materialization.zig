@@ -1059,11 +1059,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn acquireSnapshotReplayAsyncContext(ctx: *const AsyncContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
-            const admission = ctx.snapshot_replay_admission orelse return null;
-            if (ctx.io) |io| {
-                return try admission.acquireMutationIo(io, @as(?types.CancellationToken, null));
-            }
-            return admission.acquireMutation();
+            return execution_resources.acquireSnapshotReplay(ctx.snapshot_replay_admission, ctx.io);
         }
 
         pub fn addHbcWriteProfileDelta(total: *BatchProfile, before: hbc_mod.WriteProfile, after: hbc_mod.WriteProfile) void {

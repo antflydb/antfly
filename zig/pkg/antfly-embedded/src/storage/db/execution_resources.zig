@@ -2262,6 +2262,52 @@ pub const DurableReplicationOutbox = durable_outbox.DurableReplicationOutbox;
 
 pub const MutationBarrier = replication_mutation_barrier_mod.MutationBarrier;
 
+/// Every configured replication mirror shares one barrier. Return it, if any
+/// mirror has one. `mirrors` is a tuple of optional mirrors.
+pub fn sharedMutationBarrier(mirrors: anytype) ?*MutationBarrier {
+    var barrier: ?*MutationBarrier = null;
+    inline for (mirrors) |maybe_mirror| {
+        if (maybe_mirror) |mirror| {
+            if (mirror.mutation_barrier) |candidate| {
+                if (barrier) |configured| {
+                    std.debug.assert(configured == candidate);
+                } else {
+                    barrier = candidate;
+                }
+            }
+        }
+    }
+    return barrier;
+}
+
+/// Take a snapshot replay mutation lease, waiting through `io` when one is available.
+pub fn acquireSnapshotReplay(
+    admission: ?*snapshot_admission_mod.SnapshotAdmission,
+    io: ?std.Io,
+) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const configured = admission orelse return null;
+    if (io) |value| return try configured.acquireMutationIo(value, @as(?types.CancellationToken, null));
+    return configured.acquireMutation();
+}
+
+/// Lock the apply mutex with the portable-runtime gate checked before and
+/// after, so an activation that starts while this caller waits is still seen.
+pub fn lockApplyGated(
+    mutex: *apply_rw_lock_mod.ApplyRwLock,
+    pending: ?*const std.atomic.Value(bool),
+    comptime mode: enum { exclusive, shared },
+) !void {
+    try enforcePortableRuntimeGate(pending);
+    if (mode == .exclusive) mutex.lockExclusive() else mutex.lockShared();
+    errdefer if (mode == .exclusive) mutex.unlockExclusive() else mutex.unlockShared();
+    try enforcePortableRuntimeGate(pending);
+}
+
+fn enforcePortableRuntimeGate(pending: ?*const std.atomic.Value(bool)) !void {
+    const configured = pending orelse return;
+    if (configured.load(.acquire)) return error.PortableRuntimeActivationPending;
+}
+
 pub const ReplicationDeferredCommitGate = replication_commit.ReplicationDeferredCommitGate;
 
 pub const ReplicationDeferredCommitGates = replication_commit.ReplicationDeferredCommitGates;

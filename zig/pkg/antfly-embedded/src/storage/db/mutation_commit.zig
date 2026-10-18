@@ -3575,24 +3575,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn replicationMutationBarrier(self: anytype) ?*MutationBarrier {
-            var barrier: ?*MutationBarrier = null;
-            const mirrors = .{
-                S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
-                S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
-                S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
-            };
-            inline for (mirrors) |maybe_mirror| {
-                if (maybe_mirror) |mirror| {
-                    if (mirror.mutation_barrier) |candidate| {
-                        if (barrier) |configured| {
-                            std.debug.assert(configured == candidate);
-                        } else {
-                            barrier = candidate;
-                        }
-                    }
-                }
-            }
-            return barrier;
+            const local = S.ownerField(self, "local_execution");
+            return execution_resources.sharedMutationBarrier(.{
+                local.*.replication_async_effect_mirror,
+                local.*.replication_async_batch_mirror,
+                local.*.replication_async_metadata_mirror,
+            });
         }
 
         pub fn resolveTransactionIntentsInternal(
