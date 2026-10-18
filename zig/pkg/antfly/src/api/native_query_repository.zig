@@ -22,6 +22,7 @@ const cut = local.storage_db_native_query_cut;
 const port = local.storage_db_native_query_cut_repository;
 const objectstore = @import("objectstore");
 const Store = @import("lake_index_store.zig").Store;
+const linked_gc = @import("native_query_link_gc.zig");
 const artifacts = @import("../serverless/artifacts/store.zig");
 const fs = @import("antfly_runtime_fs").fs_paths;
 const A = std.mem.Allocator;
@@ -76,8 +77,31 @@ pub const Repository = struct {
     a: A,
     store: Store,
     limits: cut.Limits = .{},
+    owned_collection: CollectionState,
     owned_config: ?local.common_config.Config = null,
     owned_base_dir: ?[]u8 = null,
+    /// The maintenance owner retains this across short-lived provider adapters.
+    /// At most one namespace iterator and one tree reaper are open at a time.
+    pub const CollectionState = struct {
+        a: A,
+        io: ?std.Io = null,
+        mutex: std.atomic.Mutex = .unlocked,
+        collector: ?linked_gc.Collector = null,
+        namespace: ?Namespace = null,
+        pending: std.atomic.Value(bool) = .init(false),
+        pub fn init(a: A, io: std.Io) CollectionState {
+            return .{ .a = a, .io = io };
+        }
+        pub fn deinit(self: *CollectionState) void {
+            if (self.collector) |*value| value.deinit();
+            self.collector = null;
+            self.namespace = null;
+            self.pending.store(false, .release);
+        }
+        pub fn hasPending(self: *const CollectionState) bool {
+            return self.pending.load(.acquire);
+        }
+    };
     const Setup = struct { config_json: []const u8, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8 = null };
     pub fn setupJsonAlloc(a: A, config: ?*const local.common_config.Config, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -136,9 +160,10 @@ pub const Repository = struct {
         return repository;
     }
     pub fn init(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8) !Repository {
-        return .{ .a = a, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
+        return .{ .a = a, .owned_collection = .{ .a = a }, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
     }
     pub fn deinit(self: *Repository) void {
+        self.owned_collection.deinit();
         self.store.deinit();
         if (self.owned_config) |*value| value.deinit();
         if (self.owned_base_dir) |value| self.a.free(value);
@@ -340,29 +365,32 @@ pub const Repository = struct {
         const manifest = try std.json.parseFromSliceLeaky(cut.Manifest, a, bytes, .{});
         return manifest.sequence == sequence;
     }
-    fn collectLinked(self: *Repository, namespace: Namespace, now: u64, budget: usize, cancellation: Cancellation) !void {
-        if (self.store.opened.fs_client == null or budget == 0) return;
-        var arena = std.heap.ArenaAllocator.init(self.a);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const io = self.store.opened.fs_client.?.io;
-        const parent = try self.linkedNamespace(a, namespace);
-        var guard = try linkedLock(a, io, parent, cancellation);
-        defer guard.deinit();
-        var dir = try std.Io.Dir.cwd().openDir(io, parent, .{ .iterate = true });
-        defer dir.close(io);
-        var it = dir.iterate();
-        var count: usize = 0;
-        while (try it.next(io)) |entry| {
-            try cancellation.check();
-            if (entry.kind != .directory) continue;
-            const expires = std.fmt.parseInt(u64, entry.name, 10) catch continue;
-            if (expires +| 30_000 >= now) continue;
-            try dir.deleteTree(io, entry.name);
-            try fs.syncDirPortable(io, parent);
-            count += 1;
-            if (count >= budget) break;
+    fn collectLinked(self: *Repository, state: *CollectionState, namespace: Namespace, now: u64, budget: usize, cancellation: Cancellation) !linked_gc.Page {
+        if (self.store.opened.fs_client == null) return .{ .complete = true };
+        try cancellation.check();
+        const parent = try self.linkedNamespace(state.a, namespace);
+        defer state.a.free(parent);
+        if (state.collector) |value| if (!state.namespace.?.eql(namespace) or !std.mem.eql(u8, value.root, parent)) state.deinit();
+        errdefer state.deinit();
+        if (state.collector == null) {
+            const io = state.io orelse self.store.opened.fs_client.?.io;
+            try fs.createDirPathPortable(io, parent);
+            state.collector = try linked_gc.Collector.init(state.a, io, parent);
+            if (state.collector == null) return .{ .complete = true }; // Another collector owns this namespace.
+            state.namespace = namespace;
         }
+        const page = state.collector.?.step(now, budget, cancellation) catch |err| switch (err) {
+            // Another collector may have advanced the durable trash between
+            // our pages. Reopen discovery; no private cursor is authority.
+            error.FileNotFound => {
+                state.deinit();
+                state.pending.store(true, .release);
+                return .{ .complete = false };
+            },
+            else => return err,
+        };
+        state.pending.store(!page.complete or page.visited == budget, .release);
+        return page;
     }
     fn from(raw: *anyopaque) *Repository {
         return @ptrCast(@alignCast(raw));
@@ -428,11 +456,19 @@ pub const Repository = struct {
         }
     }
     pub fn collect(self: *Repository, namespace: Namespace, now: u64, cancellation: Cancellation) !void {
-        return self.collectBounded(namespace, now, 128, cancellation);
+        _ = try self.collectBounded(&self.owned_collection, namespace, now, 128, cancellation);
     }
-    fn collectBounded(self: *Repository, namespace: Namespace, now: u64, budget: usize, cancellation: Cancellation) !void {
-        if (budget == 0) return;
-        try self.collectLinked(namespace, now, budget, cancellation);
+    fn collectBounded(self: *Repository, state: *CollectionState, namespace: Namespace, now: u64, budget: usize, cancellation: Cancellation) !bool {
+        if (!state.mutex.tryLock()) return false;
+        defer state.mutex.unlock();
+        if (budget == 0) {
+            state.deinit();
+            return true;
+        }
+        const links = try self.collectLinked(state, namespace, now, budget, cancellation);
+        if (!links.complete or links.visited == budget) return false;
+        defer state.deinit();
+        const remaining_budget = budget - links.visited;
         const Visitor = struct {
             store: *artifacts.ArtifactStore,
             deleted: usize = 0,
@@ -444,15 +480,15 @@ pub const Repository = struct {
         };
         var store = self.store.artifactStore();
         const cut_identity = try @import("native_retained_cut.zig").storeIdentity(self.a, self.store.locator);
-        const descriptors = try @import("native_retained_cut.zig").collectBounded(&store, namespace.table_id, cut_identity, now, budget, cancellation);
-        if (descriptors == budget) return;
+        const descriptors = try @import("native_retained_cut.zig").collectBounded(&store, namespace.table_id, cut_identity, now, remaining_budget, cancellation);
+        if (descriptors == remaining_budget) return true;
         var visitor: Visitor = .{ .store = &store, .deleted = descriptors };
-        store.visitScopedUploads(try self.domain(self.a, namespace), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = budget - descriptors }, cancellation) catch |err| switch (err) {
+        store.visitScopedUploads(try self.domain(self.a, namespace), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = remaining_budget - descriptors }, cancellation) catch |err| switch (err) {
             error.ArtifactEnumerationPaused => {},
             else => return err,
         };
-        if (visitor.deleted >= budget) return;
-        const remaining = budget - visitor.deleted;
+        if (visitor.deleted >= remaining_budget) return true;
+        const remaining = remaining_budget - visitor.deleted;
         const prefix = try std.fmt.allocPrint(self.a, "{s}{s}native-query-generations/{d}/{d}/{d}/", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/", namespace.table_id, namespace.shard_id, namespace.range_id });
         defer self.a.free(prefix);
         const bridge: TokenBridge = .{ .token = cancellation };
@@ -476,6 +512,7 @@ pub const Repository = struct {
             };
         }
         try cancellation.check();
+        return true;
     }
     fn ownerPrefix(self: *Repository, a: A) ![]u8 {
         return std.fmt.allocPrint(a, "{s}{s}native-query-owners/", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/" });
@@ -485,7 +522,14 @@ pub const Repository = struct {
     }
     /// One namespace per supervised pass. The caller owns the returned cursor;
     /// registry witnesses survive failed upload, owner loss and table drop.
+    pub fn collectNextWithState(self: *Repository, a: A, state: *CollectionState, after: ?[]const u8, now: u64, budget: usize, cancellation: Cancellation) !?[]u8 {
+        std.debug.assert(state.io != null); // Borrowed state outlives this adapter's executor.
+        return self.collectNextImpl(a, state, after, now, budget, cancellation);
+    }
     pub fn collectNext(self: *Repository, a: A, after: ?[]const u8, now: u64, budget: usize, cancellation: Cancellation) !?[]u8 {
+        return self.collectNextImpl(a, &self.owned_collection, after, now, budget, cancellation);
+    }
+    fn collectNextImpl(self: *Repository, a: A, state: *CollectionState, after: ?[]const u8, now: u64, budget: usize, cancellation: Cancellation) !?[]u8 {
         const prefix = try self.ownerPrefix(a);
         defer a.free(prefix);
         const bridge: TokenBridge = .{ .token = cancellation };
@@ -494,7 +538,13 @@ pub const Repository = struct {
             return err;
         };
         defer page.deinit(self.store.opened.client.allocator);
-        if (page.entries.len == 0) return null;
+        if (page.entries.len == 0) {
+            if (state.mutex.tryLock()) {
+                defer state.mutex.unlock();
+                state.deinit();
+            }
+            return null;
+        }
         const key_bytes = page.entries[0].key;
         if (!std.mem.startsWith(u8, key_bytes, prefix) or !std.mem.endsWith(u8, key_bytes, ".json")) return error.CatalogGenerationChanged;
         var parts = std.mem.splitScalar(u8, key_bytes[prefix.len .. key_bytes.len - 5], '/');
@@ -502,7 +552,8 @@ pub const Repository = struct {
         const shard = std.fmt.parseInt(u64, parts.next() orelse return error.CatalogGenerationChanged, 10) catch return error.CatalogGenerationChanged;
         const range = std.fmt.parseInt(u64, parts.next() orelse return error.CatalogGenerationChanged, 10) catch return error.CatalogGenerationChanged;
         if (parts.next() != null or table == 0) return error.CatalogGenerationChanged;
-        try self.collectBounded(.{ .table_id = table, .shard_id = shard, .range_id = range }, now, budget, cancellation);
+        if (!try self.collectBounded(state, .{ .table_id = table, .shard_id = shard, .range_id = range }, now, budget, cancellation))
+            return if (after) |previous| try a.dupe(u8, previous) else null;
         try cancellation.check();
         return if (page.next_continuation_token != null) try a.dupe(u8, key_bytes) else null;
     }
@@ -1583,7 +1634,10 @@ test "external lake native filesystem publication links a 24 GiB generation and 
     var tail: [3]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), try file.readPositionalAll(io, &tail, logical_size - 3));
     try std.testing.expectEqualStrings("end", &tail);
-    try repository.collectLinked(namespace, request.expires_ms + 30_001, 1, .none);
+    var gc_turns: usize = 0;
+    while (!(try repository.collectLinked(&repository.owned_collection, namespace, request.expires_ms + 30_001, 1, .none)).complete) : (gc_turns += 1) {
+        try std.testing.expect(gc_turns < 1000);
+    }
     try std.testing.expectError(error.CatalogGenerationChanged, cut.validate(a, io, retained, request, namespace, .none));
     try cut.validate(a, io, recovered, request, namespace, .none);
 }
@@ -1656,4 +1710,104 @@ test "external lake native filesystem falls back to chunks across devices and ca
     const bytes = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(scratch, &.{ copied, "data.tbl" }), 64);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("original", bytes);
+}
+
+test "external lake native linked recovery replaces partial caches only without active readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-linked-partial-cache");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    runtime.ptr().query_cut_repository = repository.capability();
+    const root = try std.fs.path.join(a, &.{ directory.path(), "db" });
+    defer a.free(root);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1}" }}, .sync_level = .write });
+    const id: [64]u8 = @splat('a');
+    var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
+    var reader = try db.openQueryCut(request, .none);
+    var reader_open = true;
+    defer if (reader_open) reader.close();
+    request.create = false;
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2}" }}, .sync_level = .write });
+    const pinned = try cut.pathAlloc(a, root, &id);
+    defer a.free(pinned);
+    const manifest_path = try std.fs.path.join(a, &.{ pinned, "query-cut.json" });
+    defer a.free(manifest_path);
+    try std.Io.Dir.cwd().deleteFile(io, manifest_path);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, db.openQueryCut(request, .none));
+    const still_readable = (try reader.get(a, "doc")).?;
+    defer a.free(still_readable);
+    try std.testing.expectEqualStrings("{\"amount\":1}", still_readable);
+    reader.close();
+    reader_open = false;
+    for (0..3) |loss| {
+        if (loss == 1) _ = try local.storage_db_native_backup.writeFileDurable(io, manifest_path, "{invalid");
+        if (loss == 2) {
+            const bytes = try local.storage_db_native_backup.readFileAlloc(a, io, manifest_path, max_manifest_bytes);
+            defer a.free(bytes);
+            var manifest = try std.json.parseFromSlice(cut.Manifest, a, bytes, .{});
+            defer manifest.deinit();
+            const file = try std.fs.path.join(a, &.{ pinned, manifest.value.files[0].path });
+            defer a.free(file);
+            try std.Io.Dir.cwd().deleteFile(io, file);
+        }
+        var recovered = try db.openQueryCut(request, .none);
+        defer recovered.close();
+        const original = (try recovered.get(a, "doc")).?;
+        defer a.free(original);
+        try std.testing.expectEqualStrings("{\"amount\":1}", original);
+        try cut.validate(a, io, pinned, request, namespace, .none);
+    }
+    const retained = try repository.linkedRoot(a, request, namespace);
+    defer a.free(retained);
+    try std.Io.Dir.cwd().deleteTree(io, retained);
+    try std.Io.Dir.cwd().deleteFile(io, manifest_path);
+    try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(request, .none));
+    try std.Io.Dir.accessAbsolute(io, pinned, .{});
+}
+
+test "external lake native linked collection resumes across short lived repository adapters" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("linked-gc-adapters");
+    defer directory.cleanup();
+    const source = try std.fs.path.join(a, &.{ directory.path(), "source" });
+    defer a.free(source);
+    try fs.createDirPathPortable(io, source);
+    const payload = try std.fs.path.join(a, &.{ source, "file" });
+    defer a.free(payload);
+    _ = try local.storage_db_native_backup.writeFileDurable(io, payload, "immutable");
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const id: [64]u8 = @splat('a');
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
+    try cut.finish(a, io, source, request, namespace, 1, .none);
+    {
+        var repository = try Repository.init(a, null, null, .standalone, directory.path());
+        defer repository.deinit();
+        try repository.capability().publish(io, source, request, namespace, .none);
+    }
+    var state: Repository.CollectionState = .init(a, io);
+    defer state.deinit();
+    var turns: usize = 0;
+    while (true) : (turns += 1) {
+        try std.testing.expect(turns < 1000);
+        var repository = try Repository.init(a, null, null, .standalone, directory.path());
+        defer repository.deinit();
+        const next = try repository.collectNextWithState(a, &state, null, request.expires_ms + 30001, 1, .none);
+        defer if (next) |value| a.free(value);
+        if (!state.hasPending()) {
+            const retained = try repository.linkedRoot(a, request, namespace);
+            defer a.free(retained);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, retained, .{}));
+            break;
+        }
+    }
+    try std.testing.expect(turns > 7);
+    try cut.validate(a, io, source, request, namespace, .none);
 }

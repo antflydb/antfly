@@ -157,6 +157,17 @@ pub const InferenceExecutionControl = struct {
         return .{ .context = self, .check_fn = Adapter.check };
     }
 
+    /// Replace a checkpoint in this compilation unit while retaining the
+    /// request's IO, watchdog, deadline and progress capabilities. A callback
+    /// and its error-domain dispatcher must always change together.
+    pub fn withCheckpoint(self: InferenceExecutionControl, ptr: ?*anyopaque, callback: *const fn (?*anyopaque) anyerror!void) InferenceExecutionControl {
+        var result = self;
+        result.ptr = ptr;
+        result.check_fn = callback;
+        result.check_dispatch = CheckBoundary.local_dispatch;
+        return result;
+    }
+
     pub fn check(self: InferenceExecutionControl) !void {
         if (self.check_fn) |check_fn| try CheckBoundary.call("check_fn", self.check_dispatch, check_fn, .{self.ptr});
         if (self.cancellation) |token| {
@@ -297,4 +308,24 @@ test "native call policy is scoped to the execution control" {
         }
     }.check };
     try std.testing.expectError(error.Cancelled, cancelled.check());
+}
+
+test "execution control checkpoint replacement preserves carrier and resets foreign dispatch" {
+    const abi = @import("antfly_runtime_abi");
+    const Foreign = struct {
+        fn dispatch(_: *const abi.native_abi.CallContract, _: *const anyopaque, _: *const anyopaque, _: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return abi.error_abi.statusFromError(error.DeadlineExceeded);
+        }
+        fn stop(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const original: InferenceExecutionControl = .{ .io = std.testing.io, .check_fn = Foreign.stop, .check_dispatch = Foreign.dispatch, .deadline_ns = std.math.maxInt(u64), .native_call_policy = .in_process, .cancellation_grace_ns = 99 };
+    try std.testing.expectError(error.DeadlineExceeded, original.check());
+    const rebound = original.withCheckpoint(null, Foreign.stop);
+    try std.testing.expectError(error.Cancelled, rebound.check());
+    try std.testing.expectEqual(original.io.?.userdata, rebound.io.?.userdata);
+    try std.testing.expectEqual(original.deadline_ns, rebound.deadline_ns);
+    try std.testing.expectEqual(original.native_call_policy, rebound.native_call_policy);
+    try std.testing.expectEqual(original.cancellation_grace_ns, rebound.cancellation_grace_ns);
 }

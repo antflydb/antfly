@@ -19936,6 +19936,7 @@ pub const DB = struct {
             break :validated true;
         } else false;
         if (!local_usable) if (self.backend_runtime.query_cut_repository) |repository| {
+            // The read lease retains the caller's token beyond this stack frame.
             if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
                 var lease = opened;
                 errdefer lease.deinit();
@@ -19956,9 +19957,10 @@ pub const DB = struct {
                 readonly.retained_remote_query_lease = lease;
                 return readonly;
             }
-            // Legacy repositories may materialize missing generations, but
-            // must not overwrite an invalid cache with active local readers.
-            if (local_exists) return error.CatalogGenerationChanged;
+            // Retained files are authority; local files are a disposable cache.
+            // Admission alone cannot detect a missing sealed file behind a valid
+            // manifest. Protect active readers before replacing any invalid root.
+            if (local_exists) try cut.discardInvalidCache(self.alloc, io, std.fs.path.dirname(path).?, cache_id, path);
             try self.admitQueryCut(io, cache_id, control.token());
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};

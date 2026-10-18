@@ -170,9 +170,7 @@ const CombinedControl = struct {
             if (result.hard_cancellation == null) result.hard_cancellation = original.hard_cancellation;
             if (original.deadline_ns) |deadline| result.deadline_ns = if (result.deadline_ns) |other| @min(deadline, other) else deadline;
         }
-        result.ptr = self;
-        result.check_fn = apply;
-        return result;
+        return result.withCheckpoint(self, apply);
     }
 };
 fn localProgramBytes(value: program.Admission) !usize {

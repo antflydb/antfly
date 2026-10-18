@@ -208,3 +208,30 @@ test "executor archive boundary checkpoints retain deadline lease and connection
     const status = runtime_io_abi_test_consume_checkpoint(&local_token);
     try std.testing.expectEqual(error.ConnectionRefused, @import("antfly_runtime_abi").error_abi.errorFromStatus(status));
 }
+
+const InferenceControl = @import("inference_checkpoint_control").InferenceExecutionControl;
+extern fn runtime_io_abi_test_inference_control(output: *InferenceControl, failure: u8) callconv(.c) void;
+extern fn runtime_io_abi_test_consume_inference_control(control: *const InferenceControl) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+test "executor archive boundary composes inference checkpoints in both error domains" {
+    const abi = @import("antfly_runtime_abi");
+    const Combined = struct {
+        parent: InferenceControl,
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try self.parent.check();
+            return error.ConnectionRefused;
+        }
+    };
+    for ([_]anyerror{ error.DeadlineExceeded, error.SessionLeaseLost, error.ConnectionRefused, error.Canceled, error.ConnectionRefused }, 0..) |expected, i| {
+        var parent: InferenceControl = undefined;
+        runtime_io_abi_test_inference_control(&parent, @intCast(i));
+        var combined: Combined = .{ .parent = parent };
+        const rebound = parent.withCheckpoint(&combined, Combined.check);
+        try std.testing.expectError(expected, rebound.check());
+        const status = runtime_io_abi_test_consume_inference_control(&rebound);
+        try std.testing.expectEqual(expected, abi.error_abi.errorFromStatus(status));
+        try std.testing.expectEqual(@as(usize, 2), combined.calls);
+    }
+}
