@@ -9355,7 +9355,17 @@ pub const ApiHttpServer = struct {
         // External lake sorts are validated against their pinned native column
         // source. A local shard's full-text index is neither the owner nor
         // evidence of those columns, and may intentionally be unconstructed.
-        const can_observe_physical_coverage = parsed_schema.external_base_source == null and if (self.table_reads) |source|
+        const external_source = if (std.mem.eql(u8, schema_json, table.schema_json))
+            parsed_schema.external_base_source != null
+        else external: {
+            // A pinned read schema describes columns, not current physical
+            // ownership. Reuse the parsed view when possible, and inspect the
+            // current table definition only when those views differ.
+            var binding = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+            defer if (binding) |*value| value.deinit(self.alloc);
+            break :external binding != null;
+        };
+        const can_observe_physical_coverage = !external_source and if (self.table_reads) |source|
             source.supportsObservedDynamicFieldCapabilitySets()
         else
             false;
@@ -32494,7 +32504,11 @@ test "api http public sort capability gate uses external lake coverage without l
     for ([_]u32{ 10, 0 }) |limit| {
         try server.validateQuerySortWithResolver("docs", .{ .limit = limit, .order_by = &.{.{ .field = "amount" }} }, &resolver);
     }
+    // A historical read view can omit the physical external-source binding.
+    resolver.definitions.getPtr("docs").?.read_schema_json = local_schema;
+    try server.validateQuerySortWithResolver("docs", .{ .order_by = &.{.{ .field = "amount" }} }, &resolver);
     resolver.definitions.getPtr("docs").?.schema_json = local_schema;
+    resolver.definitions.getPtr("docs").?.read_schema_json = external_schema;
     try std.testing.expectError(error.IndexNotFound, server.validateQuerySortWithResolver("docs", .{ .order_by = &.{.{ .field = "amount" }} }, &resolver));
 }
 
