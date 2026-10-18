@@ -73,6 +73,11 @@ pub const Budget = struct {
         self.remaining -= amount;
     }
 
+    /// Force the shared cancellation check independently of charged work.
+    pub fn poll(self: *Budget) !void {
+        if (self.shared) |context| try context.poll();
+    }
+
     pub fn orderBytes(self: *Budget, left: []const u8, right: []const u8) !Order {
         const count = @min(left.len, right.len);
         var offset: usize = 0;

@@ -239,7 +239,7 @@ pub const ResultBuilder = union(enum) {
                 const length = @min(64, begin + count - at);
                 // Emission below charges these cells once; metadata scans
                 // retain bounded cancellation without a second work charge.
-                try work.consume(0);
+                if ((at - begin) % 4096 == 0) try work.poll();
                 present += length - @popCount(nullBits(view.*, at, length));
                 at += length;
             }
@@ -322,6 +322,7 @@ pub const ResultBuilder = union(enum) {
         while (at < view.count) {
             const count = @min(@as(usize, view.count) - at, 64 - state.index % 64);
             // Preserve scalar cast + emission work, including skipped NULLs.
+            if (accounting == .prepaid) try work.poll();
             try work.consume(count * @backingInt(accounting));
             const bits = nullBits(view, at, count);
             const mask = if (count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
@@ -347,12 +348,19 @@ pub const ResultBuilder = union(enum) {
         }
     }
 
-    fn copyBytes(destination: []u8, source: []const u8, work: *arrays.Budget, payload_work: bool) !void {
+    const CopyWork = enum { scheduled, payload, prepaid };
+    fn copyBytes(destination: []u8, source: []const u8, work: *arrays.Budget, accounting: CopyWork) !void {
         if (destination.len != source.len) return error.InvalidSqlArrayShape;
         var at: usize = 0;
         while (at < source.len) {
             const end = at + @min(4096, source.len - at);
-            try work.consume(if (payload_work) end - at else 0);
+            switch (accounting) {
+                .payload => try work.consume(end - at),
+                .prepaid => try work.poll(),
+                // Native blocks already charge at most 64 cells before each
+                // short copy, preserving the owner's normal polling cadence.
+                .scheduled => try work.consume(0),
+            }
             @memcpy(destination[at..end], source[at..end]);
             at = end;
         }
@@ -398,6 +406,15 @@ pub const ResultBuilder = union(enum) {
             if (last - first > state.bytes.len - state.payload - state.payload_at) return error.InvalidSqlArrayShape;
         }
         const width = layout.width(view.kind);
+        // Fully present dense spans need neither bitmap writes nor rank
+        // checkpoints. Copy payload in bounded chunks under the same work owner.
+        if (!text and !view.compact and !state.compact and present == range_length) {
+            try work.consume(range_length);
+            try copyBytes(state.bytes[state.values + state.index * width ..][0 .. range_length * width], view.bytes[view.payload_start + begin * width ..][0 .. range_length * width], work, .prepaid);
+            state.index += range_length;
+            state.non_null += present;
+            return;
+        }
         var source_index: usize = begin;
         var source_physical: usize = if (view.compact) std.mem.readInt(u32, view.bytes[view.slots_start + begin / 64 * 4 ..][0..4], .little) + begin % 64 - @popCount(nullBits(view, begin / 64 * 64, begin % 64)) else begin;
         while (source_index < begin + range_length) {
@@ -414,12 +431,12 @@ pub const ResultBuilder = union(enum) {
                     std.mem.writeInt(u32, state.bytes[state.slots + (state.index + i) * 4 ..][0..4], @intCast(state.payload_at + offset - base), .little);
                 }
                 const length = end - base;
-                try copyBytes(state.bytes[state.payload + state.payload_at ..][0..length], view.bytes[view.payload_start + base ..][0..length], work, true);
+                try copyBytes(state.bytes[state.payload + state.payload_at ..][0..length], view.bytes[view.payload_start + base ..][0..length], work, .payload);
                 state.payload_at += length;
             } else if (view.compact == state.compact) {
                 const slots = if (view.compact) non_null else count;
                 const destination = if (state.compact) state.non_null else state.index;
-                try copyBytes(state.bytes[state.values + destination * width ..][0 .. slots * width], view.bytes[view.payload_start + source_physical * width ..][0 .. slots * width], work, false);
+                try copyBytes(state.bytes[state.values + destination * width ..][0 .. slots * width], view.bytes[view.payload_start + source_physical * width ..][0 .. slots * width], work, .scheduled);
             } else {
                 // Consecutive present runs permit memcpy even when one side
                 // has NULL slots and the other stores only present values.
@@ -435,7 +452,7 @@ pub const ResultBuilder = union(enum) {
                     const length = (i - run_begin) * width;
                     const destination = if (state.compact) state.non_null + packed_at else state.index + run_begin;
                     const source = source_physical + if (view.compact) packed_at else run_begin;
-                    try copyBytes(state.bytes[state.values + destination * width ..][0..length], view.bytes[view.payload_start + source * width ..][0..length], work, false);
+                    try copyBytes(state.bytes[state.values + destination * width ..][0..length], view.bytes[view.payload_start + source * width ..][0..length], work, .scheduled);
                     packed_at += i - run_begin;
                 }
             }
@@ -1160,4 +1177,54 @@ test "SQL native block conversion and ranges unwind faults and retain shared can
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL native dense bulk spans preserve partial NULL bytes work and cancellation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const region = arena.allocator();
+    var source_builder = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var source_work: arrays.Budget = .{};
+    for (0..8192) |i| try source_builder.append(.json(.{ .integer = @intCast(i) }), &source_work);
+    const source = try source_builder.finish(region, .{}, &source_work);
+    var fast = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 129, .lower = -7 }}, 129, 128, .{});
+    var slow = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 129, .lower = -7 }}, 129, 128, .{});
+    var fast_work: arrays.Budget = .{};
+    var slow_work: arrays.Budget = .{};
+    try fast.append(.{}, &fast_work);
+    try slow.append(.{}, &slow_work);
+    try fast.appendRange(source, 7, 93, &fast_work);
+    for (7..100) |i| try slow.append(.json(.{ .integer = @intCast(i) }), &slow_work);
+    for (0..35) |_| {
+        try fast.append(.json(.{ .integer = -1 }), &fast_work);
+        try slow.append(.json(.{ .integer = -1 }), &slow_work);
+    }
+    const actual = try fast.finish(region, .{}, &fast_work);
+    const expected = try slow.finish(region, .{}, &slow_work);
+    try std.testing.expectEqual(slow_work.remaining, fast_work.remaining);
+    try std.testing.expect(actual.flatCell(0).sql_null);
+    for (1..94) |i| try std.testing.expectEqual(@as(i64, @intCast(i + 6)), actual.flatCell(i).value.integer);
+    for (94..129) |i| try std.testing.expectEqual(@as(i64, -1), actual.flatCell(i).value.integer);
+    try std.testing.expectEqualSlices(u8, expected.stored.?.bytes, actual.stored.?.bytes);
+    _ = try layout.View.open(.int64, actual.stored.?.bytes, .{});
+    var denied_output = try ResultBuilder.initKnown(region, .int64, source.dimensions, 8192, 8192, .{});
+    var denied: arrays.Budget = .{ .remaining = 8191 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, denied_output.appendValue(source, &denied));
+    try std.testing.expectEqual(@as(usize, 0), denied_output.fixed.builder.state.index);
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return error.Canceled;
+        }
+    };
+    var cancel: Cancel = .{};
+    var context: @import("numeric_value.zig").Context = .{ .alloc = region, .checkpoint = Cancel.check, .ptr = &cancel };
+    var work: arrays.Budget = .{ .shared = &context };
+    var output = try ResultBuilder.initKnown(region, .int64, source.dimensions, 8192, 8192, .{});
+    try std.testing.expectError(error.Canceled, output.appendValue(source, &work));
+    try std.testing.expectEqual(@as(usize, 3), cancel.calls);
+    try std.testing.expectError(error.Canceled, work.consume(0));
 }

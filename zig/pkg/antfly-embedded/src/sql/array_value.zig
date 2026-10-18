@@ -65,6 +65,18 @@ pub const ConcatLayout = struct {
         @memcpy(result.axes[0..result.rank], value.dimensions);
         return result;
     }
+    pub fn appended(self: ConcatLayout, limits: Limits) !ConcatLayout {
+        if (self.rank > 1) return error.SqlArrayAppendDimensions;
+        var result = self;
+        result.count = std.math.add(usize, self.count, 1) catch return error.SqlProgramLimitExceeded;
+        const lower_bound: i32 = if (self.rank == 0) 1 else self.axes[0].lower;
+        const count = std.math.cast(i64, result.count) orelse return error.SqlProgramLimitExceeded;
+        if (@as(i64, lower_bound) + count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        result.rank = 1;
+        result.axes[0] = .{ .length = std.math.cast(u32, result.count) orelse return error.SqlProgramLimitExceeded, .lower = lower_bound };
+        _ = try validateShape(result.axes[0..1], result.count, limits);
+        return result;
+    }
     pub fn combine(left: ConcatLayout, right: ConcatLayout) !ConcatLayout {
         if (left.count == 0) return right;
         if (right.count == 0) return left;
@@ -472,12 +484,11 @@ pub const Value = struct {
     pub fn append(self: Value, alloc: Allocator, element: Element, prepend: bool, limits: Limits, work: *Budget) !Value {
         if (self.dimensions.len > 1) return error.SqlArrayAppendDimensions;
         try validateElement(self.element_type, element, work);
-        const count = self.cardinality() + 1;
-        const lower_bound: i32 = if (self.dimensions.len == 0) 1 else self.dimensions[0].lower;
-        if (@as(i64, lower_bound) + @as(i64, @intCast(count)) > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        const shape = try (try ConcatLayout.from(self)).appended(limits);
+        const count = shape.count;
         const non_null = if (try self.knownNonNullCount()) |present| present + @intFromBool(!element.sql_null) else null;
         const text_bytes = if (try self.knownTextBytes()) |bytes| std.math.add(usize, bytes, if (element.sql_null) 0 else element.value.string.len) catch return error.SqlProgramLimitExceeded else null;
-        var output = try @import("array_compact.zig").ResultBuilder.initPlanned(alloc, self.element_type, &.{.{ .length = @intCast(count), .lower = lower_bound }}, count, non_null, text_bytes, limits);
+        var output = try @import("array_compact.zig").ResultBuilder.initPlanned(alloc, self.element_type, shape.axes[0..shape.rank], count, non_null, text_bytes, limits);
         if (prepend) try output.append(element, work);
         try output.appendValue(self, work);
         if (!prepend) try output.append(element, work);
