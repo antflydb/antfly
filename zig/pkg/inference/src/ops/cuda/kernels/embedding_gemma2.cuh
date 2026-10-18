@@ -1410,15 +1410,18 @@ extern "C" __global__ void termite_gemma4_audio_depthwise_causal_conv1d_f32(
     out[i] = sum;
 }
 
-extern "C" __global__ void antfly_audio_frontend_f32(const float *input, const float *aux, float *out, unsigned mode, unsigned rows, unsigned width, unsigned hop, float floor) {
+extern "C" __global__ void antfly_audio_frontend_f32(const float *input, const float *aux, float *out, unsigned mode, unsigned rows, unsigned width, unsigned hop, float floor, unsigned batch) {
     unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
-    unsigned long long total=(unsigned long long)rows*width*(mode==4 ? hop : 1);
+    unsigned long long total=(unsigned long long)rows*width*(mode==4 ? hop : 1)*batch;
     if ((unsigned long long)i >= total) return;
     if (mode == 0) out[i]=__fmul_rn(input[(i/width)*hop+i%width],aux[i%width]);
     else if (mode == 1) { float re=input[2*i], im=input[2*i+1]; out[i]=sqrtf(__fadd_rn(__fmul_rn(re,re),__fmul_rn(im,im))); }
     else if (mode == 2) out[i]=__fmul_rn(logf(__fadd_rn(input[i],floor)),aux[i/width]);
     else if (mode == 3) {
-        if (i>=rows) return;
+        if (i>=(unsigned long long)rows*batch) return;
+        unsigned b=i/rows, pos=i%rows;
+        input += (size_t)b*rows*width; out += (size_t)b*rows*width;
+        i=pos;
         float mean=0.f;
         for (unsigned c=0;c<width;c++) mean=__fadd_rn(mean,input[c*rows+i]);
         mean=__fdiv_rn(mean,(float)width);
@@ -1427,5 +1430,45 @@ extern "C" __global__ void antfly_audio_frontend_f32(const float *input, const f
         var=__fdiv_rn(var,(float)width);
         float scale=__fdiv_rn(1.f,sqrtf(__fadd_rn(var,floor)));
         for (unsigned c=0;c<width;c++) out[c*rows+i]=fmaxf(0.f,__fmul_rn(__fmul_rn(__fsub_rn(input[c*rows+i],mean),scale),aux[c]));
-    } else out[i]=input[((i%hop)*rows+i/(width*hop))*width+(i/hop)%width];
+    } else {
+        unsigned per=rows*width*hop, b=i/per, j=i%per;
+        out[i]=input[(size_t)b*per+((j%hop)*rows+j/(width*hop))*width+(j/hop)%width];
+    }
+}
+
+// One 512-point transform per CTA, fixed shared scratch and immutable twiddles.
+extern "C" __global__ void antfly_audio_fft512_f32(const float *input, const float *tw, float *out) {
+    __shared__ float2 values[512];
+    unsigned t=threadIdx.x, frame=blockIdx.x;
+    for (unsigned i=t;i<512;i+=256) values[__brev(i)>>23]=make_float2(i<320 ? input[(size_t)frame*320+i] : 0.f,0.f);
+    __syncthreads();
+    for (unsigned len=2;len<=512;len*=2) {
+        unsigned half=len/2, j=t%half, a=(t/half)*len+j, b=a+half, w=j*(512/len);
+        float2 x=values[a], y=values[b];
+        float re=__fsub_rn(__fmul_rn(y.x,tw[2*w]),__fmul_rn(y.y,tw[2*w+1]));
+        float im=__fadd_rn(__fmul_rn(y.x,tw[2*w+1]),__fmul_rn(y.y,tw[2*w]));
+        values[a]=make_float2(__fadd_rn(x.x,re),__fadd_rn(x.y,im));
+        values[b]=make_float2(__fsub_rn(x.x,re),__fsub_rn(x.y,im));
+        __syncthreads();
+    }
+    for (unsigned i=t;i<257;i+=256) { float2 x=values[i]; out[(size_t)frame*257+i]=sqrtf(__fadd_rn(__fmul_rn(x.x,x.x),__fmul_rn(x.y,x.y))); }
+}
+
+// Implicit im2col: each tile shares 16 output channels and 16 positions.
+// No expanded image matrix is allocated; reduction order remains IC/KY/KX.
+extern "C" __global__ void antfly_audio_conv_tiled_f32(float *out,const float *input,const float *weight,const float *bias,unsigned ic,unsigned oc,unsigned h,unsigned w,unsigned oh,unsigned ow) {
+    __shared__ float a[16][16], b[16][16];
+    unsigned x=threadIdx.x,y=threadIdx.y, channel=blockIdx.y*16+y,pos=blockIdx.x*16+x, batch=blockIdx.z;
+    float acc=channel<oc ? bias[channel] : 0.f;
+    for(unsigned base=0;base<ic*9;base+=16) {
+        unsigned ak=base+x, bk=base+y;
+        a[y][x]=(channel<oc && ak<ic*9) ? weight[(size_t)channel*ic*9+ak] : 0.f;
+        int iy=(int)((pos/ow)*2+bk/3%3)-1, ix=(int)((pos%ow)*2+bk%3)-1;
+        b[y][x]=(pos<oh*ow && bk<ic*9 && iy>=0 && iy<(int)h && ix>=0 && ix<(int)w) ? input[((size_t)batch*ic+bk/9)*h*w+(unsigned)iy*w+(unsigned)ix] : 0.f;
+        __syncthreads();
+        #pragma unroll
+        for(unsigned k=0;k<16;k++) acc=fmaf(a[y][k],b[k][x],acc);
+        __syncthreads();
+    }
+    if(channel<oc && pos<oh*ow) out[((size_t)batch*oc+channel)*oh*ow+pos]=acc;
 }

@@ -385,3 +385,28 @@ extern "C" __global__ void termite_embedding_gemma2_spatial_pool_f32(
     if (bias) value = __fmul_rn(__fsub_rn(value, bias[channel]), scale[channel]);
     output[i] = value;
 }
+
+// Qualified BF16 alternative: round activations explicitly, accumulate in F32.
+extern "C" __global__ void antfly_audio_conv_bf16_wmma(float *out,const float *input,const float *weight,const float *bias,unsigned ic,unsigned oc,unsigned h,unsigned w,unsigned oh,unsigned ow) {
+#if __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    __shared__ __align__(32) __nv_bfloat16 a[256], b[256];
+    __shared__ __align__(32) float c[256];
+    unsigned lane=threadIdx.x, channel0=blockIdx.y*16,pos0=blockIdx.x*16,batch=blockIdx.z;
+    wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::row_major> af;
+    wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::row_major> bf;
+    wmma::fragment<wmma::accumulator,16,16,16,float> cf;
+    wmma::fill_fragment(cf,0.f);
+    for(unsigned base=0;base<ic*9;base+=16) {
+        for(unsigned i=lane;i<256;i+=32) {
+            unsigned row=i/16,col=i%16, ak=base+col,bk=base+row,pos=pos0+col;
+            a[i]=__float2bfloat16_rn(channel0+row<oc && ak<ic*9 ? weight[(size_t)(channel0+row)*ic*9+ak] : 0.f);
+            int iy=(int)((pos/ow)*2+bk/3%3)-1,ix=(int)((pos%ow)*2+bk%3)-1;
+            b[i]=__float2bfloat16_rn(pos<oh*ow && bk<ic*9 && iy>=0 && iy<(int)h && ix>=0 && ix<(int)w ? input[((size_t)batch*ic+bk/9)*h*w+(unsigned)iy*w+(unsigned)ix] : 0.f);
+        }
+        __syncwarp(); wmma::load_matrix_sync(af,a,16); wmma::load_matrix_sync(bf,b,16); wmma::mma_sync(cf,af,bf,cf); __syncwarp();
+    }
+    wmma::store_matrix_sync(c,cf,16,wmma::mem_row_major); __syncwarp();
+    for(unsigned i=lane;i<256;i+=32) { unsigned ch=channel0+i/16,pos=pos0+i%16; if(ch<oc && pos<oh*ow) out[((size_t)batch*oc+ch)*oh*ow+pos]=c[i]+bias[ch]; }
+#endif
+}

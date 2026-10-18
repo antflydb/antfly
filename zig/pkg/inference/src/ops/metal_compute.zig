@@ -15659,9 +15659,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.data.scalar_bounds.access(self.data.allocator, key, value);
     }
 
+    fn audioChannelNormBatchOp(ctx: *anyopaque, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) anyerror!?CT {
+        return audioFrontendOp(ctx, input, weight, .{ .mode = 3, .batch = std.math.cast(u32, batch) orelse return error.InvalidTensorShape, .rows = std.math.cast(u32, positions) orelse return error.InvalidTensorShape, .width = std.math.cast(u32, channels) orelse return error.InvalidTensorShape, .floor = eps });
+    }
+    fn audioFlattenBatchOp(ctx: *anyopaque, input: CT, batch: usize, time: usize, freq: usize, channels: usize) anyerror!?CT {
+        return audioFrontendOp(ctx, input, null, .{ .mode = 4, .batch = std.math.cast(u32, batch) orelse return error.InvalidTensorShape, .rows = std.math.cast(u32, time) orelse return error.InvalidTensorShape, .width = std.math.cast(u32, freq) orelse return error.InvalidTensorShape, .hop = std.math.cast(u32, channels) orelse return error.InvalidTensorShape });
+    }
+    fn audioFft512Op(ctx: *anyopaque, input: CT, tw: CT, frames: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer x.deinit();
+        var plan = (try self.gemma4AudioDeviceOperand(tw)) orelse return null;
+        defer plan.deinit();
+        if (x.elemCount() != frames * 320 or plan.elemCount() != 512) return error.InvalidTensorShape;
+        const out = (try metal_runtime.decoderRuntimeAudioFft512(self.provider_impl, x, plan, frames)) orelse return null;
+        return self.ctFromOwnedMetalTensor(out);
+    }
     fn audioFrontendOp(ctx: *anyopaque, input: CT, auxiliary: ?CT, params: ops.AudioFrontendParams) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (disableRuntimeElementwise() or params.mode > 2) return null;
+        if (disableRuntimeElementwise()) return null;
         const n = try params.counts();
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
         defer x.deinit();
@@ -33335,6 +33351,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.clampSilu = clampSiluOp;
         vt.spatialPoolPrepare = spatialPoolPrepareOp;
         vt.audioFrontend = audioFrontendOp;
+        vt.audioFft512 = audioFft512Op;
+        vt.channelLayerNormReluBatch = audioChannelNormBatchOp;
+        vt.flattenChannelsTimeFreqBatch = audioFlattenBatchOp;
         vt.layerNorm = layerNormOp;
         // The inherited NativeCompute op would read a MetalCompute tensor as
         // its own; the interpreter falls back to layerNorm without it.

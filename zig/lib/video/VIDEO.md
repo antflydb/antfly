@@ -623,6 +623,12 @@ cache stores clip data, and unusual frontend configurations retain private plans
 Accelerator audio preparation uploads PCM once and windows on device, with
 fused magnitude and log/mask operations. Equal-length audio clips batch through
 subsampling without temporal padding; masks and output order remain clip-local.
+CUDA/Metal normalization and final flatten index batched NCHW storage directly,
+removing five full transposes. The fixed 512 FFT uses shared immutable twiddles,
+Zig SIMD across CPU frames and cooperative accelerator blocks. BLAS builds choose from
+completed FFT/BLAS log-mel timings in a bounded eight-geometry policy; a forced
+DFT reference remains available. CUDA implicit-GEMM convolution and FFT are
+separately identified opt-in candidates pending NVIDIA qualification.
 CUDA clamp metadata uses immutable scalar lookups before packed projection.
 CUDA graph retention shares the existing memory ceiling across reuse-aware
 vision/backbone descriptors and fences only evicted storage by completion event.

@@ -199,6 +199,9 @@ tmp_sm89="$tmp_root/kernels.sm89.cubin"
 trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"; rmdir "$tmp_root"' EXIT
 
 required_symbols=(
+  antfly_audio_fft512_f32
+  antfly_audio_conv_tiled_f32
+  antfly_audio_conv_bf16_wmma
   antfly_audio_frontend_f32
   termite_embedding_gemma2_split_columns_bf16
   termite_embedding_gemma2_vision_rope_pack_bf16

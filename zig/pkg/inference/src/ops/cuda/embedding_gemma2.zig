@@ -39,6 +39,10 @@ pub const Attention = struct {
 
 pub const Stats = struct {
     launches: u64 = 0,
+    audio_fft_launches: u64 = 0,
+    audio_conv_tiled_launches: u64 = 0,
+    audio_conv_bf16_launches: u64 = 0,
+    audio_batch_layout_launches: u64 = 0,
     cublaslt_matmuls: u64 = 0,
     cublas_f32_matmuls: u64 = 0,
     attention_launches: u64 = 0,
@@ -82,6 +86,9 @@ pub const Module = struct {
     audio_clamp: driver.CUfunction,
     audio_glu_rows: driver.CUfunction,
     audio_frontend: driver.CUfunction,
+    audio_fft512: driver.CUfunction,
+    audio_conv_tiled: driver.CUfunction,
+    audio_conv_bf16: driver.CUfunction,
     audio_depthwise_conv: driver.CUfunction,
     pillow_horizontal: driver.CUfunction,
     pillow_vertical_patches: driver.CUfunction,
@@ -152,6 +159,9 @@ pub const Module = struct {
             .audio_clamp = try function(ctx, m, "termite_gemma4_audio_clamp_f32"),
             .audio_glu_rows = try function(ctx, m, "termite_gemma4_audio_glu_rows_f32"),
             .audio_frontend = try function(ctx, m, "antfly_audio_frontend_f32"),
+            .audio_fft512 = try function(ctx, m, "antfly_audio_fft512_f32"),
+            .audio_conv_tiled = try function(ctx, m, "antfly_audio_conv_tiled_f32"),
+            .audio_conv_bf16 = try function(ctx, m, "antfly_audio_conv_bf16_wmma"),
             .audio_depthwise_conv = try function(ctx, m, "termite_gemma4_audio_depthwise_causal_conv1d_f32"),
             .pillow_horizontal = try function(ctx, m, "termite_embedding_gemma2_pillow_horizontal_rgb8"),
             .pillow_vertical_patches = try function(ctx, m, "termite_embedding_gemma2_pillow_vertical_patches_f32"),
@@ -352,6 +362,47 @@ pub const Module = struct {
         try self.launch1d(ctx, self.audio_clamp, &args, count);
     }
 
+    pub fn launchAudioFft512(self: *Module, ctx: *Context, out: Buffer, input: Buffer, tw: Buffer, frames: usize) !void {
+        if (frames == 0 or frames > std.math.maxInt(u32) / 320) return error.InvalidEmbeddingGemma2Shape;
+        try require(out, frames * 257 * 4);
+        try require(input, frames * 320 * 4);
+        try require(tw, 512 * 4);
+        var ip = input.ptr;
+        var tp = tw.ptr;
+        var op = out.ptr;
+        var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&tp), @ptrCast(&op) };
+        try ctx.makeCurrent();
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.audio_fft512, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        self.stats_.audio_fft_launches += 1;
+        self.stats_.launches += 1;
+    }
+    pub fn launchAudioConv(self: *Module, ctx: *Context, out: Buffer, input: Buffer, weight: Buffer, bias: Buffer, batch: usize, ic: usize, oc: usize, h: usize, w: usize, bf16: bool) !void {
+        const oh = h / 2 + h % 2;
+        const ow = w / 2 + w % 2;
+        if (batch == 0 or batch > 65535 or ic == 0 or oc == 0 or h == 0 or w == 0 or oh * ow > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
+        if (ic > std.math.maxInt(u32) / 9 or oc > 65535 * 16 or h > std.math.maxInt(i32) - 2 or w > std.math.maxInt(i32) - 2) return error.InvalidEmbeddingGemma2Shape;
+        const count = try std.math.mul(usize, try std.math.mul(usize, batch, oc), try std.math.mul(usize, oh, ow));
+        if (count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
+        try require(out, count * 4);
+        try require(input, batch * ic * h * w * 4);
+        try require(weight, oc * ic * 9 * 4);
+        try require(bias, oc * 4);
+        var op = out.ptr;
+        var ip = input.ptr;
+        var wp = weight.ptr;
+        var bp = bias.ptr;
+        var ci: u32 = @intCast(ic);
+        var co: u32 = @intCast(oc);
+        var hh: u32 = @intCast(h);
+        var ww: u32 = @intCast(w);
+        var ho: u32 = @intCast(oh);
+        var wo: u32 = @intCast(ow);
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&bp), @ptrCast(&ci), @ptrCast(&co), @ptrCast(&hh), @ptrCast(&ww), @ptrCast(&ho), @ptrCast(&wo) };
+        try ctx.makeCurrent();
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(if (bf16) self.audio_conv_bf16 else self.audio_conv_tiled, @intCast((oh * ow + 15) / 16), @intCast((oc + 15) / 16), @intCast(batch), if (bf16) 32 else 16, if (bf16) 1 else 16, 1, 0, ctx.stream, &args, null));
+        self.stats_.launches += 1;
+        if (bf16) self.stats_.audio_conv_bf16_launches += 1 else self.stats_.audio_conv_tiled_launches += 1;
+    }
     pub fn launchAudioFrontend(self: *Module, ctx: *Context, out: Buffer, input: Buffer, auxiliary: Buffer, params: @import("../ops.zig").AudioFrontendParams) !void {
         const n = try params.counts();
         try require(out, n.output * 4);
@@ -365,8 +416,10 @@ pub const Module = struct {
         var width = params.width;
         var hop = params.hop;
         var floor = params.floor;
-        var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&ap), @ptrCast(&op), @ptrCast(&mode), @ptrCast(&rows), @ptrCast(&width), @ptrCast(&hop), @ptrCast(&floor) };
-        try self.launch1d(ctx, self.audio_frontend, &args, if (params.mode == 3) params.rows else n.output);
+        var batch = params.batch;
+        var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&ap), @ptrCast(&op), @ptrCast(&mode), @ptrCast(&rows), @ptrCast(&width), @ptrCast(&hop), @ptrCast(&floor), @ptrCast(&batch) };
+        try self.launch1d(ctx, self.audio_frontend, &args, if (params.mode == 3) @as(usize, params.rows) * params.batch else n.output);
+        if (params.batch > 1 and (params.mode == 3 or params.mode == 4)) self.stats_.audio_batch_layout_launches += 1;
     }
     pub fn launchAudioGluRows(self: *Module, ctx: *Context, out: Buffer, input: Buffer, rows: u32, dim: u32) !void {
         if (rows == 0 or dim == 0) return error.InvalidEmbeddingGemma2Shape;

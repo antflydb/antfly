@@ -276,9 +276,10 @@ pub const AudioFrontendParams = extern struct {
     width: u32,
     hop: u32 = 0,
     floor: f32 = 0,
+    batch: u32 = 1,
     pub fn counts(p: @This()) !struct { input: usize, auxiliary: usize, output: usize } {
-        if (p.mode > 4 or p.rows == 0 or p.width == 0 or ((p.mode == 0 or p.mode == 4) and p.hop == 0) or ((p.mode == 2 or p.mode == 3) and (!std.math.isFinite(p.floor) or p.floor <= 0))) return error.InvalidTensorShape;
-        const n = try std.math.mul(usize, try std.math.mul(usize, p.rows, p.width), if (p.mode == 4) p.hop else 1);
+        if (p.batch == 0 or (p.batch != 1 and p.mode < 3) or p.mode > 4 or p.rows == 0 or p.width == 0 or ((p.mode == 0 or p.mode == 4) and p.hop == 0) or ((p.mode == 2 or p.mode == 3) and (!std.math.isFinite(p.floor) or p.floor <= 0))) return error.InvalidTensorShape;
+        const n = try std.math.mul(usize, try std.math.mul(usize, try std.math.mul(usize, p.rows, p.width), if (p.mode == 4) p.hop else 1), p.batch);
         if (n > std.math.maxInt(u32) or (p.mode == 1 and n > std.math.maxInt(u32) / 2)) return error.InvalidTensorShape;
         const input = switch (p.mode) {
             0 => try std.math.add(usize, try std.math.mul(usize, p.rows - 1, p.hop), p.width),
@@ -2053,6 +2054,10 @@ pub const ComputeBackend = struct {
         /// position bias; see `Gemma4AudioLocalAttentionParams`.
         /// Starts has one exact F32 clip start index per row; no cross-clip taps.
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+        audioFft512Enabled: ?*const fn (ctx: *anyopaque) bool = null,
+        audioFft512: ?*const fn (ctx: *anyopaque, input: CT, twiddles: CT, frames: usize) anyerror!?CT = null,
+        channelLayerNormReluBatch: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) anyerror!?CT = null,
+        flattenChannelsTimeFreqBatch: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, time: usize, freq: usize, channels: usize) anyerror!?CT = null,
         audioFrontend: ?*const fn (ctx: *anyopaque, input: CT, auxiliary: ?CT, params: AudioFrontendParams) anyerror!?CT = null,
         supportsLinearPackedNamed: ?*const fn (ctx: *anyopaque) bool = null,
         gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
@@ -4751,6 +4756,35 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, weight, channels, positions, eps);
     }
 
+    pub fn supportsAudioFft512(self: *const ComputeBackend) bool {
+        if (self.vtable.audioFft512 == null) return false;
+        return if (self.vtable.audioFft512Enabled) |op| op(self.ptr) else true;
+    }
+    pub fn audioFft512(self: *const ComputeBackend, input: CT, twiddles: CT, frames: usize) !?CT {
+        if (frames == 0 or frames > std.math.maxInt(u32) / 320) return error.InvalidTensorShape;
+        try self.checkExecutionControl();
+        const op = self.vtable.audioFft512 orelse return null;
+        const result = try op(self.ptr, input, twiddles, frames);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn channelLayerNormReluBatch(self: *const ComputeBackend, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) !?CT {
+        const op = self.vtable.channelLayerNormReluBatch orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, weight, batch, channels, positions, eps);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn flattenChannelsTimeFreqBatch(self: *const ComputeBackend, input: CT, batch: usize, time: usize, freq: usize, channels: usize) !?CT {
+        const op = self.vtable.flattenChannelsTimeFreqBatch orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, batch, time, freq, channels);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
     pub fn audioFrontend(self: *const ComputeBackend, input: CT, auxiliary: ?CT, params: AudioFrontendParams) !?CT {
         _ = try params.counts();
         try self.checkExecutionControl();
@@ -6238,7 +6272,7 @@ test "packed boundary QKV releases all outputs and cancels its owned scope on re
 }
 
 test "embeddinggemma2 audio frontend bounds every kernel index and ABI" {
-    try std.testing.expectEqual(@as(usize, 20), @sizeOf(AudioFrontendParams));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(AudioFrontendParams));
     try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 0, .rows = 2, .width = 4, .hop = std.math.maxInt(u32) }).counts());
     try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 4, .rows = 2, .width = 4 }).counts());
     try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 3, .rows = 2, .width = 4, .floor = std.math.nan(f32) }).counts());

@@ -2785,7 +2785,7 @@ pub const CudaCompute = struct {
                     after.short_cudnn_attention_launches,
                 },
             );
-            std.log.info("embedding_gemma2_prep_stats audio_constant_hits_total={} model_constant_hits_total={} model_constant_live_bytes={} patch_rows_written_total={}", .{ self.embedding_gemma2_audio_constant_hits, self.embedding_gemma2_constant_hits, self.embedding_gemma2_constant_bytes, self.embedding_gemma2_patch_rows_written });
+            std.log.info("embedding_gemma2_prep_stats audio_constant_hits_total={} model_constant_hits_total={} model_constant_live_bytes={} patch_rows_written_total={} audio_fft_launches_total={} audio_conv_tiled_launches_total={} audio_conv_bf16_launches_total={} audio_batch_layout_launches_total={}", .{ self.embedding_gemma2_audio_constant_hits, self.embedding_gemma2_constant_hits, self.embedding_gemma2_constant_bytes, self.embedding_gemma2_patch_rows_written, after.audio_fft_launches, after.audio_conv_tiled_launches, after.audio_conv_bf16_launches, after.audio_batch_layout_launches });
         };
         var owned = std.ArrayListUnmanaged(buffer_mod.DeviceBuffer).empty;
         defer {
@@ -12176,8 +12176,34 @@ fn supportsLinearPackedNamedOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.packed_projections;
 }
+fn audioFft512EnabledOp(ctx: *anyopaque) bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.audio_fft;
+}
+fn audioFft512Op(ctx: *anyopaque, input: CT, tw: CT, frames: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_fft) return null;
+    const x = tensorFromCt(input);
+    const plan = tensorFromCt(tw);
+    try ensureF32(x);
+    try ensureF32(plan);
+    if (frames == 0 or frames > std.math.maxInt(u32) / 320 or x.elem_count != frames * 320 or plan.elem_count != 512) return error.InvalidTensorShape;
+    const out = try self.createEmbeddingGemma2Tensor(&.{ @intCast(frames), 257 }, .f32);
+    errdefer freeTensor(self, out);
+    try (try self.embeddingGemma2Module()).launchAudioFft512(&self.ctx, tensorFromCt(out).buffer, x.buffer, plan.buffer, frames);
+    return out;
+}
+fn audioChannelNormBatchOp(ctx: *anyopaque, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) anyerror!?CT {
+    return audioChannelNormInternal(ctx, input, weight, batch, channels, positions, eps);
+}
+fn audioFlattenBatchOp(ctx: *anyopaque, input: CT, batch: usize, time: usize, freq: usize, channels: usize) anyerror!?CT {
+    return audioFrontendOp(ctx, input, null, .{ .mode = 4, .batch = std.math.cast(u32, batch) orelse return error.InvalidShape, .rows = std.math.cast(u32, time) orelse return error.InvalidShape, .width = std.math.cast(u32, freq) orelse return error.InvalidShape, .hop = std.math.cast(u32, channels) orelse return error.InvalidShape });
+}
 fn audioChannelNormOp(ctx: *anyopaque, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) anyerror!?CT {
-    const result = (try audioFrontendOp(ctx, input, weight, .{ .mode = 3, .rows = std.math.cast(u32, positions) orelse return error.InvalidShape, .width = std.math.cast(u32, channels) orelse return error.InvalidShape, .floor = eps })) orelse return null;
+    return audioChannelNormInternal(ctx, input, weight, 1, channels, positions, eps);
+}
+fn audioChannelNormInternal(ctx: *anyopaque, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) !?CT {
+    const result = (try audioFrontendOp(ctx, input, weight, .{ .mode = 3, .batch = std.math.cast(u32, batch) orelse return error.InvalidShape, .rows = std.math.cast(u32, positions) orelse return error.InvalidShape, .width = std.math.cast(u32, channels) orelse return error.InvalidShape, .floor = eps })) orelse return null;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     errdefer freeTensor(ctx, result);
     const shape = try self.allocator.dupe(i64, tensorFromCt(input).shape);
@@ -12198,7 +12224,7 @@ fn audioFrontendOp(ctx: *anyopaque, input: CT, auxiliary: ?CT, params: ops.Audio
     const aux = if (auxiliary) |ct| tensorFromCt(ct) else null;
     if (x.elem_count < n.input or (n.auxiliary != 0 and (aux == null or aux.?.elem_count != n.auxiliary))) return error.InvalidTensorShape;
     if (aux) |t| try ensureF32(t);
-    const shape = try allocShape2(self.allocator, if (params.mode == 3) params.width else params.rows, if (params.mode == 3) params.rows else if (params.mode == 4) @as(usize, params.width) * params.hop else params.width);
+    const shape = try allocShape2(self.allocator, if (params.mode == 3) params.width else @as(usize, params.rows) * params.batch, if (params.mode == 3) params.rows else if (params.mode == 4) @as(usize, params.width) * params.hop else params.width);
     errdefer self.allocator.free(shape);
     var output = try allocDeviceBuffer(self, n.output * 4);
     errdefer releaseDeviceBuffer(self, &output);
@@ -22908,7 +22934,10 @@ fn conv2d(
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchConv2dF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, batch, in_channels, out_channels, height, width, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, groups, out_h, out_w);
+    if (self.capability_profile == .embedding_gemma2 and (self.embedding_gemma2_policy.audio_conv_gemm or self.embedding_gemma2_policy.audio_conv_bf16) and groups == 1 and kernel_h == 3 and kernel_w == 3 and stride_h == 2 and stride_w == 2 and padding_h == 1 and padding_w == 1 and batch <= 65535) {
+        const bf16 = self.embedding_gemma2_policy.audio_conv_bf16 and cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor);
+        try (try self.embeddingGemma2Module()).launchAudioConv(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, batch, in_channels, out_channels, height, width, bf16);
+    } else try self.kernels.launchConv2dF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, batch, in_channels, out_channels, height, width, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, groups, out_h, out_w);
     return createTensor(self, device, shape, out_count);
 }
 fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
@@ -25616,6 +25645,10 @@ const vtable = ops.ComputeBackend.VTable{
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
     .audioFrontend = &audioFrontendOp,
+    .audioFft512 = &audioFft512Op,
+    .audioFft512Enabled = &audioFft512EnabledOp,
+    .channelLayerNormReluBatch = &audioChannelNormBatchOp,
+    .flattenChannelsTimeFreqBatch = &audioFlattenBatchOp,
     .channelLayerNormRelu = &audioChannelNormOp,
     .flattenChannelsTimeFreq = &audioFlattenOp,
     .supportsLinearPackedNamed = &supportsLinearPackedNamedOp,

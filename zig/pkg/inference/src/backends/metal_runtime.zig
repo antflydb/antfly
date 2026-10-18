@@ -10328,10 +10328,20 @@ pub fn decoderRuntimeRmsNormResidual(self: anytype, input: MetalTensor, residual
 
 pub extern fn termite_metal_decode_runtime_norm_residual_device(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, output: ?*anyopaque, output_offset: usize) c_int;
 
+pub fn decoderRuntimeAudioFft512(self: anytype, input: MetalTensor, tw: MetalTensor, frames: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (frames == 0 or frames > std.math.maxInt(u32) / 320 or input.elemCount() != frames * 320 or tw.elemCount() != 512) return error.InvalidTensorShape;
+    var out = try MetalTensor.deviceAllocate(runtime, frames * 257 * 4, .private, &.{ @intCast(frames), 257 });
+    errdefer out.deinit();
+    const rc = antfly_metal_audio_fft512(runtime, input.deviceHandle(), input.deviceByteOffset(), tw.deviceHandle(), tw.deviceByteOffset(), frames, out.deviceHandle(), out.deviceByteOffset());
+    return finishDeviceOutput(&out, rc);
+}
+extern fn antfly_metal_audio_fft512(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, tw: ?*anyopaque, tw_offset: usize, frames: usize, output: ?*anyopaque, output_offset: usize) c_int;
+
 pub fn decoderRuntimeAudioFrontend(self: anytype, input: MetalTensor, auxiliary: ?MetalTensor, params: @import("../ops/ops.zig").AudioFrontendParams) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     const n = try params.counts();
-    var output = try MetalTensor.deviceAllocate(runtime, n.output * 4, .private, &.{ @intCast(params.rows), @intCast(params.width) });
+    var output = try MetalTensor.deviceAllocate(runtime, n.output * 4, .private, if (params.mode == 3) input.shape() else &.{ @intCast(@as(usize, params.rows) * params.batch), @intCast(if (params.mode == 4) @as(usize, params.width) * params.hop else params.width) });
     errdefer output.deinit();
     const rc = antfly_metal_audio_frontend(runtime, input.deviceHandle(), input.deviceByteOffset(), if (auxiliary) |t| t.deviceHandle() else input.deviceHandle(), if (auxiliary) |t| t.deviceByteOffset() else input.deviceByteOffset(), &params, output.deviceHandle(), output.deviceByteOffset());
     return finishDeviceOutput(&output, rc);

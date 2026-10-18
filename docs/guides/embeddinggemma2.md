@@ -1166,7 +1166,10 @@ CUDA audio caches immutable relative-position/query-scale/RMS/frontend constants
 within an independently admitted 8 MiB / 128-entry budget. Warm query-scale
 preparation avoids all twelve per-layer weight readbacks. Borrowers retain their
 snapshots and admission across cache eviction. The fixed audio frontend recipe
-also reuses thread-safe process tables; CPU BLAS retains its established layout.
+also reuses thread-safe process tables. BLAS-enabled CPU preparation measures completed
+FFT and BLAS preparations per frame count in a bounded cache, excludes cold
+calls, and retains BLAS unless FFT wins by at least 5%. Optimized BLAS remains
+competitive on large batches.
 
 CUDA image cohorts write patches directly into one bounded batch destination
 before a single projection GEMM. This versions the `IMAGE_BATCH` and `MEDIA_BATCH`
@@ -1178,8 +1181,31 @@ existing 128 MiB graph arena, without raising the cache ceiling.
 
 Audio acceleration also batches compatible subsampling lengths and keeps window,
 magnitude, log/mask, channel normalization and flatten preparation on device.
+Batched normalization and flattening read NCHW directly, avoiding five full
+transposes. A planned 512 FFT fuses magnitude on Metal and CUDA; the CPU FFT
+uses Zig SIMD across eight frames. Set `ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT=1`
+to force reference preparation. CUDA FFT and tiled F32/BF16 implicit-GEMM audio
+convolutions remain opt-in with distinct identities; see CUDA_TUNING.md for
+flags and route gates. No full im2col buffer is required.
 CUDA QKV packing reuses immutable clamp metadata. The CUDA frontend recipe is
 now version 2; existing CUDA qualification pins must be regenerated. Graph
 retention uses completion-event eviction under the unchanged total memory cap.
 These routes require NVIDIA vector/ranking parity and completed-device timing
 before performance promotion.
+
+The optional `ANTFLY_EMBEDDINGGEMMA2_BENCH_FFT=1` test named `completed
+spectrum benchmark` compares warm, completed spectrum preparation. On an Apple
+M4 Max (Debug host harness, three warmups and five timed iterations), the precise
+Metal route gave:
+
+| Audio frames | DFT GPU µs | FFT GPU µs | DFT completed wall µs | FFT completed wall µs |
+|---|---:|---:|---:|---:|
+| 40 | 66.3 | 23.7 | 1204.8 | 455.6 |
+| 200 | 95.8 | 42.6 | 1063.6 | 276.4 |
+| 1000 | 261.4 | 152.3 | 1366.2 | 498.6 |
+
+These are spectrum microbenchmarks against Antfly's DFT route, excluding mel
+projection and model execution. They do not establish end-to-end or PyTorch
+speed. The independent ReleaseFast CPU spectrum benchmark found Accelerate
+faster at 200/1000 frames, supporting measured CPU selection rather than a
+universal FFT default.

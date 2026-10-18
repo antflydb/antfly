@@ -24,6 +24,8 @@ const gguf_metadata = @import("../gguf/metadata.zig");
 const gguf_format = @import("../gguf/format.zig");
 const hf_weights = @import("gemma4_hf_weights.zig");
 const embedding_gemma2_resample = @import("embedding_gemma2_resample.zig");
+const fft512 = @import("audio_fft512.zig");
+const spectrum_policy = @import("audio_spectrum_policy.zig");
 const gemma4_mel_sparse = @import("gemma4_mel_sparse.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
@@ -1448,12 +1450,23 @@ const AudioFrontendRecipe = struct {
     ready: bool = false,
     basis_ready: bool = false,
     cpu_basis_ready: bool = false,
+    fft_ready: bool = false,
+    fft_twiddles: [512]f32 = undefined,
     builds: usize = 0,
     basis_builds: usize = 0,
     window: [320]f32 = undefined,
     filters: [128 * 257]f32 = undefined,
     basis: [514 * 320]f32 = undefined,
     cpu_basis: [320 * 514]f32 = undefined,
+    fn fft(self: *@This()) []const f32 {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.fft_ready) {
+            fft512.fillTwiddles(&self.fft_twiddles);
+            self.fft_ready = true;
+        }
+        return &self.fft_twiddles;
+    }
     fn cpuBasis(self: *@This(), frame_length: usize, fft_length: usize) ?[]const f32 {
         if (frame_length != 320 or fft_length != 512) return null;
         platform.sync.lockYielding(&self.mutex);
@@ -1768,22 +1781,12 @@ fn gemma4LogMelPacked(cb: *const ComputeBackend, allocator: std.mem.Allocator, p
 }
 fn gemma4LogMelInput(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, basis: []const f32, frames: usize, frame_length: usize, fft_length: usize, filters: []const f32, mel_bins: usize, floor: f32, mask: []const bool) !CT {
     const bins = fft_length / 2 + 1;
-    const basis_ct = try audioFrontendConstant(cb, allocator, "basis", basis, &.{ @intCast(2 * bins), @intCast(frame_length) }, fft_length, frame_length, mel_bins);
-    defer cb.free(basis_ct);
-    const spectrum = try cb.primDotGeneral(input, basis_ct, &.{ @intCast(frames), @intCast(frame_length) }, &.{ @intCast(2 * bins), @intCast(frame_length) }, &.{1}, &.{1}, &.{}, &.{});
-    defer cb.free(spectrum);
-    const rows = (try cb.audioFrontend(spectrum, null, .{ .mode = 1, .rows = @intCast(frames), .width = @intCast(bins) })) orelse legacy: {
-        const squared = try cb.multiply(spectrum, spectrum);
-        defer cb.free(squared);
-        const shape = [_]i64{ @intCast(frames), @intCast(bins), 2 };
-        const pairs = try cb.primReshape(squared, &shape);
-        defer cb.free(pairs);
-        const power = try cb.primReduceSum(pairs, &.{2}, &shape);
-        defer cb.free(power);
-        const magnitude = try cb.primSqrt(power);
-        defer cb.free(magnitude);
-        break :legacy try cb.primReshape(magnitude, &.{ @intCast(frames), @intCast(bins) });
-    };
+    const rows = if (frame_length == 320 and fft_length == 512 and cb.supportsAudioFft512() and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT")) fast: {
+        const twiddles = try audioFrontendConstant(cb, allocator, "fft512_twiddles", audio_frontend_recipe.fft(), &.{512}, 512, 320, mel_bins);
+        defer cb.free(twiddles);
+        if (try cb.audioFft512(input, twiddles, frames)) |magnitudes| break :fast magnitudes;
+        break :fast try gemma4SpectrumDft(cb, allocator, input, basis, frames, frame_length, bins, mel_bins);
+    } else try gemma4SpectrumDft(cb, allocator, input, basis, frames, frame_length, bins, mel_bins);
     defer cb.free(rows);
     const filter_ct = try audioFrontendConstant(cb, allocator, "filters", filters, &.{ @intCast(mel_bins), @intCast(bins) }, fft_length, frame_length, mel_bins);
     defer cb.free(filter_ct);
@@ -1815,6 +1818,25 @@ fn gemma4LogMelInput(cb: *const ComputeBackend, allocator: std.mem.Allocator, in
     return cb.multiply(logged, expanded);
 }
 
+fn gemma4SpectrumDft(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, basis: []const f32, frames: usize, frame_length: usize, bins: usize, mel_bins: usize) !CT {
+    const basis_ct = try audioFrontendConstant(cb, allocator, "basis", basis, &.{ @intCast(2 * bins), @intCast(frame_length) }, (bins - 1) * 2, frame_length, mel_bins);
+    defer cb.free(basis_ct);
+    const spectrum = try cb.primDotGeneral(input, basis_ct, &.{ @intCast(frames), @intCast(frame_length) }, &.{ @intCast(2 * bins), @intCast(frame_length) }, &.{1}, &.{1}, &.{}, &.{});
+    defer cb.free(spectrum);
+    return (try cb.audioFrontend(spectrum, null, .{ .mode = 1, .rows = @intCast(frames), .width = @intCast(bins) })) orelse legacy: {
+        const squared = try cb.multiply(spectrum, spectrum);
+        defer cb.free(squared);
+        const shape = [_]i64{ @intCast(frames), @intCast(bins), 2 };
+        const pairs = try cb.primReshape(squared, &shape);
+        defer cb.free(pairs);
+        const power = try cb.primReduceSum(pairs, &.{2}, &shape);
+        defer cb.free(power);
+        const magnitude = try cb.primSqrt(power);
+        defer cb.free(magnitude);
+        break :legacy try cb.primReshape(magnitude, &.{ @intCast(frames), @intCast(bins) });
+    };
+}
+
 fn supportsGemma4LogMel(cb: *const ComputeBackend) bool {
     return (cb.kind() == .metal or cb.kind() == .cuda) and cb.vtable.dotGeneralOp != null and cb.vtable.reshapeOp != null and cb.vtable.reduceSumOp != null and cb.vtable.sqrtOp != null and cb.vtable.logOp != null and cb.vtable.broadcastInDimOp != null;
 }
@@ -1825,6 +1847,56 @@ fn supportsGemma4LogMel(cb: *const ComputeBackend) bool {
 /// each frame takes the radix FFT. Both give the same rows within float
 /// rounding. Masked-out frames are written as zero.
 fn gemma4LogMelFrames(
+    allocator: std.mem.Allocator,
+    samples: []const f32,
+    frames: usize,
+    hop_length: usize,
+    frame_length: usize,
+    fft_length: usize,
+    window: []const f32,
+    filters: []const f32,
+    mel_bins: usize,
+    mel_floor: f32,
+    mask: []const bool,
+    out: []f32,
+    use_blas: bool,
+) !void {
+    if (use_blas and audio.blas_available and frames > 0 and frames <= std.math.maxInt(c_int) and frame_length == 320 and fft_length == 512 and mel_bins == 128 and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT")) {
+        const ticket = spectrum_policy.cpu.choose(frames);
+        const started = platform.time.monotonicNs();
+        if (ticket.fft) try gemma4LogMelFramesFft(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out) else try gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out, true);
+        spectrum_policy.cpu.completed(ticket, platform.time.monotonicNs() - started);
+        return;
+    }
+    return gemma4LogMelFramesReference(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out, use_blas);
+}
+fn gemma4LogMelFramesFft(
+    allocator: std.mem.Allocator,
+    samples: []const f32,
+    frames: usize,
+    hop_length: usize,
+    frame_length: usize,
+    fft_length: usize,
+    window: []const f32,
+    filters: []const f32,
+    mel_bins: usize,
+    mel_floor: f32,
+    mask: []const bool,
+    out: []f32,
+) !void {
+    _ = frame_length;
+    _ = fft_length;
+    const mag = try allocator.alloc(f32, try std.math.mul(usize, frames, 257));
+    defer allocator.free(mag);
+    try fft512.magnitudes(samples, frames, hop_length, window, audio_frontend_recipe.fft(), mag);
+    const mel = try allocator.alloc(f32, try std.math.mul(usize, frames, mel_bins));
+    defer allocator.free(mel);
+    if (filters.len != 257 * mel_bins or out.len != frames * mel_bins or mask.len != frames) return error.InvalidTensorShape;
+    audio.blas.cblas_sgemm(audio.blas.row_major, audio.blas.no_trans, audio.blas.trans, @intCast(frames), @intCast(mel_bins), 257, 1, mag.ptr, 257, filters.ptr, 257, 0, mel.ptr, @intCast(mel_bins));
+    for (mel, out, 0..) |x, *y, i| y.* = if (mask[i / mel_bins]) @log(x + mel_floor) else 0;
+}
+
+fn gemma4LogMelFramesReference(
     allocator: std.mem.Allocator,
     samples: []const f32,
     frames: usize,
@@ -2080,20 +2152,22 @@ fn audioSubsampleBatch(cb: *const ComputeBackend, a: std.mem.Allocator, store: *
         height = (height + 1) / 2;
         width = (width + 1) / 2;
         channels = out_channels;
-        // [B,C,T,F] -> [C,B,T,F], treating B*T*F as independent
-        // channel-normalization positions. No statistics cross clip boundaries.
-        const transposed = try cb.primTranspose(hidden, &.{ 1, 0, 2, 3 }, &.{ @intCast(batch), @intCast(channels), @intCast(height), @intCast(width) });
-        defer cb.free(transposed);
         const norm = try projectorVectorWeightCt(cb, a, store, try fmt(&buf, "a.conv1d.{d}.norm.weight", .{layer}), channels);
-        const normalized = (try cb.channelLayerNormRelu(transposed, norm, channels, batch * height * width, cfg.layer_norm_eps)) orelse return error.UnsupportedResidentGemma4Audio;
-        defer cb.free(normalized);
-        const next = try cb.primTranspose(normalized, &.{ 1, 0, 2, 3 }, &.{ @intCast(channels), @intCast(batch), @intCast(height), @intCast(width) });
+        const normalized = (try cb.channelLayerNormReluBatch(hidden, norm, batch, channels, height * width, cfg.layer_norm_eps)) orelse legacy: {
+            const transposed = try cb.primTranspose(hidden, &.{ 1, 0, 2, 3 }, &.{ @intCast(batch), @intCast(channels), @intCast(height), @intCast(width) });
+            defer cb.free(transposed);
+            const value = (try cb.channelLayerNormRelu(transposed, norm, channels, batch * height * width, cfg.layer_norm_eps)) orelse return error.UnsupportedResidentGemma4Audio;
+            defer cb.free(value);
+            break :legacy try cb.primTranspose(value, &.{ 1, 0, 2, 3 }, &.{ @intCast(channels), @intCast(batch), @intCast(height), @intCast(width) });
+        };
         cb.free(hidden);
-        hidden = next;
+        hidden = normalized;
     }
-    const nhwc = try cb.primTranspose(hidden, &.{ 0, 2, 3, 1 }, &.{ @intCast(batch), @intCast(channels), @intCast(height), @intCast(width) });
-    defer cb.free(nhwc);
-    const flat = try cb.primReshape(nhwc, &.{ @intCast(batch * height), @intCast(width * channels) });
+    const flat = (try cb.flattenChannelsTimeFreqBatch(hidden, batch, height, width, channels)) orelse legacy: {
+        const nhwc = try cb.primTranspose(hidden, &.{ 0, 2, 3, 1 }, &.{ @intCast(batch), @intCast(channels), @intCast(height), @intCast(width) });
+        defer cb.free(nhwc);
+        break :legacy try cb.primReshape(nhwc, &.{ @intCast(batch * height), @intCast(width * channels) });
+    };
     defer cb.free(flat);
     const projected = try linearNoBiasMaybeClipped(cb, a, store, flat, "a.input_projection", batch * height, width * channels, cfg.audio_hidden);
     cb.free(hidden);
@@ -7728,4 +7802,173 @@ test "embeddinggemma2 audio subsample batch capacity bounds retained convolution
     try std.testing.expectEqual(@as(usize, 4), subsampleBatchCapacity(cfg, 200, 4));
     try std.testing.expectEqual(@as(usize, 1), subsampleBatchCapacity(cfg, 32768, 4));
     try std.testing.expectEqual(@as(usize, 1), subsampleBatchCapacity(cfg, std.math.maxInt(usize), 4));
+}
+
+fn checkPlannedFft(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    if (comptime @import("build_options").enable_cuda) if (cb.kind() == .cuda) {
+        const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        compute.capability_profile = .embedding_gemma2;
+        compute.embedding_gemma2_policy.audio_fft = true;
+    };
+    const frames = 11;
+    var samples: [(frames - 1) * 160 + 320]f32 = undefined;
+    var window: [320]f32 = undefined;
+    for (&samples, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.137) * 0.4;
+    fillAudioWindow(&window);
+    var rows: [frames * 320]f32 = undefined;
+    for (0..frames) |r| for (0..320) |col| {
+        rows[r * 320 + col] = samples[r * 160 + col] * window[col];
+    };
+    const input = try deviceResidentFromFloat32(&cb, &rows, &.{ frames, 320 });
+    defer cb.free(input);
+    const tw = try deviceResidentFromFloat32(&cb, audio_frontend_recipe.fft(), &.{512});
+    defer cb.free(tw);
+    const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const result = (try cb.audioFft512(input, tw, frames)).?;
+    defer cb.free(result);
+    try before.expectUnchanged(cb);
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    var expected: [frames * 257]f32 = undefined;
+    try fft512.magnitudes(&samples, frames, 160, &window, audio_frontend_recipe.fft(), &expected);
+    for (actual, expected) |x, y| try std.testing.expectApproxEqAbs(y, x, 0.00004);
+    try std.testing.expectError(error.InvalidTensorShape, cb.audioFft512(input, tw, frames + 1));
+}
+test "embeddinggemma2 Metal planned FFT512 preserves SIMD reference and frame tails" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkPlannedFft);
+}
+test "embeddinggemma2 CUDA planned FFT512 preserves SIMD reference and frame tails" {
+    try @import("../ops/media_residency_test.zig").onCuda(@import("../ops/media_residency_test.zig").noWeights, checkPlannedFft);
+}
+
+// Force failure on any transpose: batching must consume NCHW directly.
+fn rejectSubsampleTranspose(_: *anyopaque, _: CT, _: []const u8, _: []const i64) anyerror!CT {
+    return error.UnexpectedSubsampleTranspose;
+}
+fn checkDirectSubsample(cb: ComputeBackend, reference: ComputeBackend) !void {
+    var table = cb.vtable.*;
+    table.transposeOp = rejectSubsampleTranspose;
+    var direct = cb;
+    direct.vtable = &table;
+    try checkSubsampleBatch(direct, reference);
+}
+test "embeddinggemma2 Metal audio subsample uses direct batched layouts without transpose" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateAudioCohortWeights, checkDirectSubsample);
+}
+test "embeddinggemma2 CUDA audio subsample uses direct batched layouts without transpose" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateAudioCohortWeights, checkDirectSubsample);
+}
+
+fn checkTiledConvolution(cb: ComputeBackend, _: ComputeBackend) !void {
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.capability_profile = .embedding_gemma2;
+    const a = std.testing.allocator;
+    // Official IC/OC layouts plus odd spatial tails and nonzero biases.
+    for ([_]usize{ 1, 128 }) |ic| {
+        const oc: usize = if (ic == 1) 128 else 32;
+        const h = 9;
+        const w = 7;
+        const batch = 2;
+        const values = try a.alloc(f32, batch * ic * h * w);
+        defer a.free(values);
+        const weights = try a.alloc(f32, oc * ic * 9);
+        defer a.free(weights);
+        const bias = try a.alloc(f32, oc);
+        defer a.free(bias);
+        for (values, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.139) * 0.2;
+        for (weights, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.173) * 0.01;
+        for (bias, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.01;
+        const input = try deviceResidentFromFloat32(&cb, values, &.{ batch, @intCast(ic), h, w });
+        defer cb.free(input);
+        const weight = try deviceResidentFromFloat32(&cb, weights, &.{ @intCast(oc), @intCast(ic), 3, 3 });
+        defer cb.free(weight);
+        const bias_ct = try deviceResidentFromFloat32(&cb, bias, &.{@intCast(oc)});
+        defer cb.free(bias_ct);
+        compute.embedding_gemma2_policy.audio_conv_gemm = false;
+        compute.embedding_gemma2_policy.audio_conv_bf16 = false;
+        const scalar = try cb.conv2d(input, weight, bias_ct, batch, ic, oc, h, w, 3, 3, 2, 2, 1, 1, 1);
+        defer cb.free(scalar);
+        const expected = try cb.toFloat32(scalar, a);
+        defer a.free(expected);
+        compute.embedding_gemma2_policy.audio_conv_gemm = true;
+        const before = cb.trainingRuntimeStats().d2h_bytes;
+        const tiled = try cb.conv2d(input, weight, bias_ct, batch, ic, oc, h, w, 3, 3, 2, 2, 1, 1, 1);
+        defer cb.free(tiled);
+        try std.testing.expectEqual(before, cb.trainingRuntimeStats().d2h_bytes);
+        const actual = try cb.toFloat32(tiled, a);
+        defer a.free(actual);
+        for (actual, expected) |x, y| try std.testing.expectApproxEqAbs(y, x, 0.00001);
+        compute.embedding_gemma2_policy.audio_conv_bf16 = true;
+        const tensorcore = try cb.conv2d(input, weight, bias_ct, batch, ic, oc, h, w, 3, 3, 2, 2, 1, 1, 1);
+        defer cb.free(tensorcore);
+        const tc = try cb.toFloat32(tensorcore, a);
+        defer a.free(tc);
+        // BF16 is a distinct qualified recipe; guard output drift here too.
+        for (tc, expected) |x, y| try std.testing.expectApproxEqAbs(y, x, 0.002);
+    }
+}
+test "embeddinggemma2 CUDA implicit convolution and BF16 tiles match direct convolution" {
+    try @import("../ops/media_residency_test.zig").onCuda(@import("../ops/media_residency_test.zig").noWeights, checkTiledConvolution);
+}
+
+fn measureSpectrum(cb: ComputeBackend, _: ComputeBackend) !void {
+    if (!platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_FFT")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    if (comptime @import("build_options").enable_metal) {
+        const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        compute.require_f32_linears = true;
+    }
+    for ([_]usize{ 40, 200, 1000 }) |frames| {
+        const samples = try a.alloc(f32, (frames - 1) * 160 + 320);
+        defer a.free(samples);
+        for (samples, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.137) * 0.4;
+        var window: [320]f32 = undefined;
+        fillAudioWindow(&window);
+        const filters = audio_frontend_recipe.get(128, true).?.filters;
+        const mask = try a.alloc(bool, frames);
+        defer a.free(mask);
+        @memset(mask, true);
+        const host = try a.alloc(f32, frames * 128);
+        defer a.free(host);
+        for (0..2) |route| {
+            var elapsed: u64 = 0;
+            for (0..8) |iteration| {
+                const started = platform.time.monotonicNs();
+                if (route == 0) try gemma4LogMelFramesReference(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host, true) else try gemma4LogMelFramesFft(a, samples, frames, 160, 320, 512, &window, filters, 128, 1e-3, mask, host);
+                if (iteration >= 3) elapsed += platform.time.monotonicNs() - started;
+            }
+            std.debug.print("spectrum_cpu frames={} fft={} completed_ns={}\n", .{ frames, route == 1, elapsed / 5 });
+        }
+        const packed_frames = try a.alloc(f32, frames * 320);
+        defer a.free(packed_frames);
+        for (0..frames) |r| for (0..320) |col| {
+            packed_frames[r * 320 + col] = samples[r * 160 + col] * window[col];
+        };
+        const input = try deviceResidentFromFloat32(&cb, packed_frames, &.{ @intCast(frames), 320 });
+        defer cb.free(input);
+        const tw = try deviceResidentFromFloat32(&cb, audio_frontend_recipe.fft(), &.{512});
+        defer cb.free(tw);
+        const basis = audio_frontend_recipe.get(128, true).?.basis;
+        for (0..2) |route| {
+            var elapsed: u64 = 0;
+            var gpu: u128 = 0;
+            for (0..8) |iteration| {
+                const before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+                const started = platform.time.monotonicNs();
+                const active = try cb.decoderRuntimeBeginFrame();
+                const result = if (route == 0) try gemma4SpectrumDft(&cb, a, input, basis, frames, 320, 257, 128) else (try cb.audioFft512(input, tw, frames)).?;
+                defer cb.free(result);
+                if (active) try cb.decoderRuntimeSubmitAndWaitFrame() else return error.BenchmarkNeedsOwnedFrame;
+                if (iteration >= 3) {
+                    elapsed += platform.time.monotonicNs() - started;
+                    gpu += cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos - before;
+                }
+            }
+            std.debug.print("spectrum_metal frames={} fft={} completed_ns={} gpu_ns={}\n", .{ frames, route == 1, elapsed / 5, gpu / 5 });
+        }
+    }
+}
+test "embeddinggemma2 completed spectrum benchmark compares planned FFT and DFT" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, measureSpectrum);
 }

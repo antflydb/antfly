@@ -608,6 +608,10 @@ def native(args, suite, result):
 
 
 CUDA_ROUTES = {
+    "audio_fft": "audio_fft_launches_total",
+    "audio_conv_tiled": "audio_conv_tiled_launches_total",
+    "audio_conv_bf16": "audio_conv_bf16_launches_total",
+    "audio_batch_layout": "audio_batch_layout_launches_total",
     "extended_flash": "extended_flash_launches_total",
     "fused_vision": "fused_vision_launches_total",
     "packed_projections": "packed_projection_launches_total",

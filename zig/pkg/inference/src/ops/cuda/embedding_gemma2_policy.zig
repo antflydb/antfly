@@ -27,12 +27,18 @@ pub const Policy = struct {
     fused_backbone: bool = false,
     tuned_gemm: bool = false,
     spatial_pool: bool = false,
+    audio_conv_gemm: bool = false,
+    audio_conv_bf16: bool = false,
+    audio_fft: bool = false,
     pub fn arithmeticBits(self: Policy) u16 {
-        return @as(u16, @intFromBool(self.extended_flash)) | (@as(u16, @intFromBool(self.fused_vision)) << 1) | (@as(u16, @intFromBool(self.packed_projections)) << 2) | (@as(u16, @intFromBool(self.graph_replay)) << 3) | (@as(u16, @intFromBool(self.image_batch)) << 4) | (@as(u16, @intFromBool(self.native_vision)) << 5) | (@as(u16, @intFromBool(self.media_batch)) << 6) | (@as(u16, @intFromBool(self.fused_backbone)) << 7) | (@as(u16, @intFromBool(self.tuned_gemm)) << 8) | (@as(u16, @intFromBool(self.spatial_pool)) << 9);
+        return @as(u16, @intFromBool(self.extended_flash)) | (@as(u16, @intFromBool(self.fused_vision)) << 1) | (@as(u16, @intFromBool(self.packed_projections)) << 2) | (@as(u16, @intFromBool(self.graph_replay)) << 3) | (@as(u16, @intFromBool(self.image_batch)) << 4) | (@as(u16, @intFromBool(self.native_vision)) << 5) | (@as(u16, @intFromBool(self.media_batch)) << 6) | (@as(u16, @intFromBool(self.fused_backbone)) << 7) | (@as(u16, @intFromBool(self.tuned_gemm)) << 8) | (@as(u16, @intFromBool(self.spatial_pool)) << 9) | (@as(u16, @intFromBool(self.audio_conv_gemm)) << 10) | (@as(u16, @intFromBool(self.audio_conv_bf16)) << 11) | (@as(u16, @intFromBool(self.audio_fft)) << 12);
     }
 };
 pub fn configured() Policy {
     return .{
+        .audio_conv_gemm = env.getenvBool("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_CONV_GEMM"),
+        .audio_conv_bf16 = env.getenvBool("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_CONV_BF16"),
+        .audio_fft = env.getenvBool("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_FFT"),
         .spatial_pool = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_SPATIAL_POOL", false),
         .tuned_gemm = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TUNED_GEMM", false),
         .fused_backbone = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE", false),
@@ -48,7 +54,7 @@ pub fn configured() Policy {
 
 test "embeddinggemma2 CUDA arithmetic profiles are disjoint including graph padding and image cohorts" {
     const std = @import("std");
-    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true }, .{ .tuned_gemm = true }, .{ .spatial_pool = true }, .{ .tuned_gemm = true, .packed_projections = true }, .{ .tuned_gemm = true, .fused_backbone = true, .graph_replay = true } };
+    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true }, .{ .tuned_gemm = true }, .{ .spatial_pool = true }, .{ .audio_conv_gemm = true }, .{ .audio_conv_bf16 = true }, .{ .audio_fft = true }, .{ .tuned_gemm = true, .packed_projections = true }, .{ .tuned_gemm = true, .fused_backbone = true, .graph_replay = true } };
     for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(left.arithmeticBits() != right.arithmeticBits());
 }
 

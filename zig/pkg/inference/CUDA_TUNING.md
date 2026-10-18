@@ -1392,7 +1392,7 @@ process-owned storage for its window, filterbank and CPU/GPU DFT layouts. It
 contains no clip/model data, has no dynamically growing key space, and initializes
 once under a mutex. Prepared clips borrow immutable tables; unusual configurations
 retain request-owned preparation. CPU BLAS keeps its previous matrix layout and
-arithmetic. GPU basis/filter copies use the bounded model-constant cache. Existing
+arithmetic as a measured candidate. GPU basis/filter copies use the bounded model-constant cache. Existing
 request estimates conservatively include the borrowed tables.
 
 Deferred CUDA image batches resize/pack into disjoint row spans of one admitted
@@ -1424,6 +1424,35 @@ channel statistics, cancellation and caller ordering remain
 unchanged. The CUDA recipe is `embeddinggemma2-cuda-bf16-mean-v2-audio-frontend`;
 reload qualification pins before serving it. `MEDIA_BATCH` additionally versions
 the subsampling GEMM geometry with `audio-subsample-batch-v2`.
+
+The fixed 512-point frontend also has planned radix-2 FFT kernels: eight
+independent frames per Zig SIMD block on CPU and one 256-thread cooperative
+block per frame on Metal/CUDA. Twiddles are immutable and shared; magnitude is
+written directly, without a complex-spectrum tensor. Metal uses its precise
+library. `ANTFLY_EMBEDDINGGEMMA2_AUDIO_DFT=1` forces the reference route. CPU
+selection times actual completed log-mel preparations in eight bounded frame-count
+entries, excludes each route's cold call, and requires a 5% warm win before
+selecting FFT. It periodically probes the alternate route; concurrent requests
+never duplicate preparation to benchmark it. Optimized BLAS can outperform FFT,
+so FFT is not a universal CPU default.
+
+Batched channel normalization reads NCHW directly and the final flatten writes
+ordered `[batch*time, frequency*channels]` rows directly. This removes five
+whole-tensor transposes from compatible two-convolution cohorts on CUDA/Metal.
+Unsupported backends retain the existing transpose path and conservative
+128 MiB batch envelope.
+
+CUDA 3×3 stride-two audio convolution has a shared-memory 16×16 implicit-GEMM
+kernel, avoiding a full im2col allocation. An optional SM80+ BF16 WMMA kernel
+uses F32 accumulators; portable PTX retains the tiled F32 route. The default
+reference convolution remains available. Enable individual candidates with
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_CONV_GEMM=1`,
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_CONV_BF16=1`,
+and `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_FFT=1`. Each flag carries a
+distinct arithmetic identity and requires fresh vector/ranking and completed-time
+qualification on NVIDIA hardware. The harness routes `audio_conv_tiled`,
+`audio_conv_bf16`, `audio_fft` and `audio_batch_layout` require actual launch
+counters. Compilation and CPU/Metal tests do not qualify these CUDA candidates.
 
 Graph retention has eight lightweight descriptors under the prior aggregate
 512 MiB arena ceiling; each arena remains limited to 128 MiB. Hits refresh
