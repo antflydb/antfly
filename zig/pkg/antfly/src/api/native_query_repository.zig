@@ -145,7 +145,7 @@ pub const Repository = struct {
     }
     pub fn capability(self: *Repository) port.Port {
         if (self.store.opened.fs_client == null) return self.chunkedCapability();
-        const vtable: port.VTable = .{ .publish = publishLinked, .recover = recoverLinked, .can_evict = canEvictLinked };
+        const vtable: port.VTable = .{ .publish = publishLinked, .recover = recoverLinked, .open_read = openReadLinked, .warm = warmLinked, .reference = reference, .publish_with_proof = publishLinkedWithProof, .warm_with_proof = warmLinkedWithProof, .reuse = reuse, .can_evict = canEvictLinked };
         return .{ .limits = self.limits, .ptr = self, .vtable = &vtable };
     }
     fn chunkedCapability(self: *Repository) port.Port {
@@ -233,6 +233,23 @@ pub const Repository = struct {
         try fs.syncDirPortable(io, std.fs.path.dirname(target).?);
     }
     fn publishLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        _ = try publishLinkedLimited(raw, executor, root, request, namespace, cancellation, std.math.maxInt(u64), null);
+    }
+    fn publishLinkedWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.ReuseProof {
+        var proof: ?port.ReuseProof = null;
+        _ = try publishLinkedLimited(raw, executor, root, request, namespace, cancellation, std.math.maxInt(u64), &proof);
+        return proof;
+    }
+    fn warmLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+        return (try warmLinkedWithProof(raw, executor, root, request, namespace, cancellation, max_bytes)).complete;
+    }
+    fn warmLinkedWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !port.WarmResult {
+        if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
+        var proof: ?port.ReuseProof = null;
+        const complete = try publishLinkedLimited(raw, executor, root, request, namespace, cancellation, max_bytes, &proof);
+        return .{ .complete = complete, .proof = proof };
+    }
+    fn publishLinkedLimited(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64, proof: ?*?port.ReuseProof) !bool {
         var receiver = try executor.receive();
         const io = receiver.io();
         const self = from(raw);
@@ -242,7 +259,8 @@ pub const Repository = struct {
         try cut.validate(a, io, root, request, namespace, cancellation);
         const parent = try self.linkedNamespace(a, namespace);
         var guard = try linkedLock(a, io, parent, cancellation);
-        defer guard.deinit();
+        var guarded = true;
+        defer if (guarded) guard.deinit();
         try self.register(a, namespace, cancellation);
         const target = try self.linkedRoot(a, request, namespace);
         var durable: objectstore.durable_directory.Cache = .{};
@@ -253,16 +271,38 @@ pub const Repository = struct {
                 linkGeneration(a, io, root, target, request, namespace, cancellation, false) catch |link_err| switch (link_err) {
                     // A separately mounted filesystem artifact root retains
                     // the chunked transport rather than failing valid queries.
-                    error.CrossDevice, error.OperationUnsupported, error.LinkQuotaExceeded => return publish(raw, executor, root, request, namespace, cancellation),
+                    error.CrossDevice, error.OperationUnsupported, error.LinkQuotaExceeded => {
+                        // Chunk publication has its own immutable commit. Do
+                        // not serialize unrelated cursors behind payload I/O.
+                        guard.deinit();
+                        guarded = false;
+                        return publishLimitedImpl(raw, io, root, request, namespace, cancellation, max_bytes, proof);
+                    },
                     else => return link_err,
                 };
-                return;
+                return true;
             },
             else => return err,
         };
         const source_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ root, "query-cut.json" }), max_manifest_bytes);
         const retained_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fs.path.join(a, &.{ target, "query-cut.json" }), max_manifest_bytes);
         if (!std.mem.eql(u8, source_manifest, retained_manifest)) return error.CatalogGenerationChanged;
+        return true;
+    }
+    // A linked generation is opened through its local inode cache. Chunked
+    // generations (including rc.1 cursors) retain authenticated lazy reads.
+    fn openReadLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.StorageLease {
+        var receiver = try executor.receive();
+        const self = from(raw);
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const source = try self.linkedRoot(a, request, namespace);
+        cut.validate(a, receiver.io(), source, request, namespace, cancellation) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return openRead(raw, executor, root, request, namespace, cancellation),
+            else => return err,
+        };
+        return null;
     }
     fn recoverLinked(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
         var receiver = try executor.receive();
@@ -272,10 +312,15 @@ pub const Repository = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var guard = try linkedLock(a, io, try self.linkedNamespace(a, namespace), cancellation);
-        defer guard.deinit();
+        var guarded = true;
+        defer if (guarded) guard.deinit();
         const source = try self.linkedRoot(a, request, namespace);
         cut.validate(a, io, source, request, namespace, cancellation) catch |err| switch (err) {
-            error.CatalogGenerationChanged => return recover(raw, executor, root, request, namespace, cancellation),
+            error.CatalogGenerationChanged => {
+                guard.deinit();
+                guarded = false;
+                return recover(raw, executor, root, request, namespace, cancellation);
+            },
             else => return err,
         };
         try linkGeneration(a, io, source, root, request, namespace, cancellation, true);
@@ -836,7 +881,7 @@ pub const Repository = struct {
         };
         return expected_domain;
     }
-    fn openRead(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
+    fn openRead(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.StorageLease {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -1511,7 +1556,10 @@ test "external lake native filesystem publication links a 24 GiB generation and 
     const id: [64]u8 = @splat('a');
     const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
     try cut.finish(a, io, source, request, namespace, 42, .none);
-    try repository.capability().publish(io, source, request, namespace, .none);
+    const warmed = try repository.capability().warmReusable(io, source, request, namespace, .none, chunk_bytes);
+    try std.testing.expect(warmed.complete);
+    try std.testing.expect(warmed.proof == null);
+    try std.testing.expect(try repository.capability().openRead(io, source, request, namespace, .none) == null);
     try repository.capability().publish(io, source, request, namespace, .none);
     try cut.finish(a, io, source, request, namespace, 43, .none);
     try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().publish(io, source, request, namespace, .none));
@@ -1561,11 +1609,42 @@ test "external lake native filesystem falls back to chunks across devices and ca
     const source = try std.fs.path.join(scratch, &.{ directory.path(), "source" });
     try fs.createDirPathPortable(io, source);
     _ = try local.storage_db_native_backup.writeFileDurable(io, try std.fs.path.join(scratch, &.{ source, "data.tbl" }), "original");
+    const large_path = try std.fs.path.join(scratch, &.{ source, "large.tbl" });
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, large_path, .{});
+        defer file.close(io);
+        const block = try a.alloc(u8, chunk_bytes);
+        defer a.free(block);
+        for (0..3) |i| {
+            @memset(block, @intCast(i));
+            try file.writePositionalAll(io, block, i * chunk_bytes);
+        }
+        try file.sync(io);
+    }
     const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
     const id: [64]u8 = @splat('a');
     const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
-    try cut.finish(a, io, source, request, namespace, 42, .none);
-    try repository.capability().publish(cross_device_io, source, request, namespace, .none);
+    try cut.finishWithReuseDigest(a, io, source, request, namespace, 42, @splat(7), .none);
+    const capability = repository.capability();
+    var warmed = try capability.warmReusable(cross_device_io, source, request, namespace, .none, chunk_bytes);
+    try std.testing.expect(!warmed.complete);
+    var turns: usize = 1;
+    while (!warmed.complete and turns < 10) : (turns += 1) {
+        warmed = try capability.warmReusable(cross_device_io, source, request, namespace, .none, chunk_bytes);
+    }
+    try std.testing.expect(warmed.complete);
+    try std.testing.expect(warmed.proof != null);
+    const alias_id: [64]u8 = @splat('b');
+    var alias = request;
+    alias.id = &alias_id;
+    try std.testing.expect(try capability.reuse(io, request, alias, namespace, warmed.proof.?, .none) != null);
+    const virtual = try std.fs.path.join(scratch, &.{ directory.path(), "not-materialized" });
+    var lazy = (try capability.openRead(io, virtual, request, namespace, .none)).?;
+    defer lazy.deinit();
+    const lazy_bytes = try lazy.view.readFileAlloc(a, try std.fs.path.join(scratch, &.{ virtual, "data.tbl" }), 64);
+    defer a.free(lazy_bytes);
+    try std.testing.expectEqualStrings("original", lazy_bytes);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, virtual, .{}));
     const restored = try std.fs.path.join(scratch, &.{ directory.path(), "chunk-restored" });
     try repository.capability().recover(io, restored, request, namespace, .none);
     try cut.validate(a, io, restored, request, namespace, .none);

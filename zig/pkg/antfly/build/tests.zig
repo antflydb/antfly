@@ -6260,6 +6260,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_local_maintenance_tests = addCuratedTestRunArtifact(b, local_maintenance_tests, local_maintenance_tests.filters);
     b.step("antfly-local-maintenance-test", "Run local maintenance requirement and recovery contract regressions").dependOn(&run_local_maintenance_tests.step);
 
+    const large_table_recovery_tests = b.addTest(.{
+        .name = "large-table-recovery-tests",
+        .root_module = db_test_mod,
+        .filters = &.{ "db ordered artifact inventory producer", "ordered artifact inventory producer definition", "ordered artifact inventory producer template", "ordered artifact inventory completion", "producer scheduler coverage", "text backfill isolates merge", "force text compaction supersedes", "text merge task carries concurrent deletes" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-large-table-recovery-test", "Verify productive coverage cadence and index-scoped backfill merge admission").dependOn(&addCuratedTestRunArtifact(b, large_table_recovery_tests, large_table_recovery_tests.filters).step);
+
     const producer_maintenance_tests = b.addTest(.{
         .name = "producer-maintenance-tests",
         .root_module = db_test_mod,

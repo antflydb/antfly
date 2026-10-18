@@ -31821,7 +31821,9 @@ pub const DB = struct {
                 var ordered = (try @import("artifact_inventory.zig").load(scratch, &read)) orelse return error.ArtifactCatalogDrift;
                 defer ordered.deinit();
                 if (ordered.value.command.binding.effect_protocol >= 15) return error.ArtifactCatalogCorrupt;
-                return false;
+                const pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
+                self.artifact_producer_scheduler.completeReadinessPage(self.alloc, pending, readiness_progress, self.independentMaintenanceNowNs());
+                return readiness_progress;
             };
             try state.requireAuthority(authority);
             if (state.sealed_attempt != null) return false;
@@ -31909,12 +31911,8 @@ pub const DB = struct {
             processed += 1;
         }
         const readiness_pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
-        more_dispatch = more_dispatch or readiness_pending;
-        self.artifact_producer_scheduler.completePage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, self.independentMaintenanceNowNs());
-        if (readiness_pending and !readiness_progress and processed == page.items.len and page.at_end) {
-            self.artifact_producer_scheduler.retry_after_ns.store(self.independentMaintenanceNowNs() +| @import("artifact_producer_scheduler.zig").Scheduler.poll_interval_ns, .release);
-        }
-        return processed != 0;
+        self.artifact_producer_scheduler.completeWorkPage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, .{ .pending = readiness_pending, .progressed = readiness_progress }, self.independentMaintenanceNowNs());
+        return processed != 0 or readiness_progress;
     }
 
     /// Persist scoped jobs and their document wakeup atomically. The thin
@@ -134300,6 +134298,53 @@ test "db ordered artifact inventory chunk replacement rolls back and reopens as 
     try std.testing.expectEqualStrings("new zero", try read.get(zero));
     try std.testing.expectError(error.NotFound, read.get(one));
     try std.testing.expectError(error.EnrichmentSourceChanged, prepared.requireCurrent(&read));
+}
+
+test "db ordered artifact inventory producer coverage pages do not idle between productive turns" {
+    const alloc = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    var tmp = try TestDirectory.init("producer-coverage-cadence");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    try db.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
+    for (0..140) |i| {
+        const name = try std.fmt.allocPrint(alloc, "doc-{d:0>4}", .{i});
+        defer alloc.free(name);
+        const key = try internal_keys.documentKeyAlloc(alloc, name);
+        defer alloc.free(key);
+        try db.core.store.put(key, "{\"body\":\"one\"}");
+    }
+    var ordered = try db.artifactInventoryCommand(alloc);
+    defer ordered.catalogs.deinit(alloc);
+    ordered.binding.effect_protocol = 14;
+    var namespace: publication.Namespace = undefined;
+    doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const catalogs = try @import("artifact_inventory.zig").catalogs(&txn);
+        try @import("artifact_inventory.zig").stageOrdered(alloc, &txn, ordered, 1);
+        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = catalogs.digest(), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
+    }
+    // No protocol-15 work registry and no clock advancement. Both pages must
+    // run immediately; otherwise a large census advances at 64 rows / 5 s.
+    try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+    try std.testing.expectEqual(@as(u64, 0), db.artifact_producer_scheduler.retry_after_ns.load(.acquire));
+    try std.testing.expect(try db.advanceArtifactProducerWorkPage());
+    try std.testing.expectEqual(@as(u64, 0), db.artifact_producer_scheduler.retry_after_ns.load(.acquire));
+    var turns: usize = 0;
+    while (db.artifact_producer_scheduler.retry_after_ns.load(.acquire) == 0 and turns < 1000) : (turns += 1) {
+        _ = try db.advanceArtifactProducerWorkPage();
+    }
+    // Protocol-14 rows cannot fabricate protocol-15 receipts. The census can
+    // finish, but an unresolved witness sweep must remain pending and back off.
+    try std.testing.expect(turns < 1000);
+    try std.testing.expect(db.artifact_producer_scheduler.pending.load(.acquire));
+    try std.testing.expect(db.artifact_producer_scheduler.retry_after_ns.load(.acquire) > db.independentMaintenanceNowNs());
+    try std.testing.expect(!try db.advanceArtifactProducerWorkPage());
 }
 
 test "db ordered artifact inventory producer dispatch is durable and never completes work" {
