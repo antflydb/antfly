@@ -68,3 +68,11 @@ test "external lake NUMERIC predicates preserve exact conditions and native cell
     const before = try comparisonDatum(a, scalar.Datum.json(.{ .integer = 9007199254740992 }), column);
     try std.testing.expectEqual(std.math.Order.gt, try scalar.compareDatums(integer, before));
 }
+
+/// Normalize stored cells at their declared SQL width. Comparison operands keep
+/// their own domain; narrowing a float8 literal would change mixed comparisons.
+pub fn storedComparisonDatum(a: std.mem.Allocator, raw: @import("scalar.zig").Datum, column: @import("catalog.zig").Column) !@import("scalar.zig").Datum {
+    if (column.type == .number and column.element_type != null and @import("builtin_cast.zig").floating(column.element_type.?))
+        return @import("describe.zig").coerceDatum(a, raw, column.type, column.element_type);
+    return comparisonDatum(a, raw, column);
+}

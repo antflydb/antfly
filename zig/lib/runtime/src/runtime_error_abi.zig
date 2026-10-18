@@ -776,8 +776,9 @@ pub const Detail = enum(c_int) {
     read_snapshot_fork_unsupported,
     file_busy,
     would_block,
-    inference_worker_executable_not_configured,
-    inference_worker_unavailable,
+    // Keep released main identities; append branch-only details below them.
+    inference_worker_executable_not_configured = 674,
+    inference_worker_unavailable = 675,
     model_chunk_audio_too_large,
     model_chunk_chunk_output_too_large,
     model_chunk_chunk_request_failed,
@@ -831,6 +832,7 @@ pub const Detail = enum(c_int) {
     model_chunk_invalid_limits,
     model_chunk_streaming_profile,
     model_chunk_incomplete_audio_stream,
+    decision_limit_exceeded,
     // Append-only Cypher details preserve graph errors across owner callbacks.
     cypher_aggregate_scope,
     cypher_aggregate_wildcard,
@@ -1481,6 +1483,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.DecisionLimitExceeded => status(.invalid_argument, .decision_limit_exceeded),
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
         error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
@@ -2388,6 +2391,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .temporary_name_server_failure => "TemporaryNameServerFailure",
         .name_server_failure => "NameServerFailure",
         .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
+        .decision_limit_exceeded => "DecisionLimitExceeded",
         .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
         .query_embedding_overloaded => "QueryEmbeddingOverloaded",
         .embed_rate_limited => "EmbedRateLimited",
@@ -2916,6 +2920,13 @@ test "Cypher errors retain stable callback details" {
     }
 }
 
+test "external lake evaluation limits retain their exact boundary identity" {
+    const value = statusFromError(error.DecisionLimitExceeded);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
+    try std.testing.expect(errorHasStableDetail(error.DecisionLimitExceeded));
+    try std.testing.expectEqual(error.DecisionLimitExceeded, errorFromStatus(value));
+}
+
 test "inference command and lifecycle errors retain their identities across engine calls" {
     inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
@@ -2977,7 +2988,10 @@ test "inference worker setup and transport failures retain distinct boundary sem
     }
 }
 
-test "main media detail values precede newly appended graph details" {
-    try std.testing.expectEqual(@as(c_int, 728), @backingInt(Detail.model_chunk_incomplete_audio_stream));
-    try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.cypher_aggregate_scope));
+test "merged runtime error details preserve main wire identifiers" {
+    try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
+    try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
+    try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
+    try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 730), @backingInt(Detail.cypher_aggregate_scope));
 }

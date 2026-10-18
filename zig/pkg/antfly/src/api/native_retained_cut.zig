@@ -95,17 +95,16 @@ pub fn saveWithCover(a: A, store: *stores.ArtifactStore, identity: Digest, io: s
     const scope = try stores.UploadScope.forPublication(domain(table.table_id, identity), descriptor.expires_ms, io);
     var metadata = try store.putScoped(scope, bytes, cancellation);
     defer metadata.deinit(store.allocator);
-    return std.fmt.allocPrint(a, "{s}{s}:{d}", .{ prefix, metadata.artifact_id, metadata.byte_len });
+    return @import("lake_generation_envelope.zig").encode(a, prefix, metadata);
 }
 pub fn load(a: A, store: *stores.ArtifactStore, identity: Digest, token: []const u8, table: anytype, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
     if (!std.mem.startsWith(u8, token, prefix)) return error.InvalidQueryRequest;
-    const split = std.mem.lastIndexOfScalar(u8, token, ':') orelse return error.InvalidQueryRequest;
-    const artifact = token[prefix.len..split];
+    const envelope = try @import("lake_generation_envelope.zig").decode(a, prefix, token, 4 * 1024 * 1024);
+    defer if (envelope.generation) |value| a.free(value);
+    const artifact = envelope.id;
     const scope = (stores.uploadScopeFromArtifactId(artifact) catch return error.InvalidQueryRequest) orelse return error.InvalidQueryRequest;
     if (scope.fencingToken() <= now or !std.mem.eql(u8, &scope.domain, &domain(table.table_id, identity))) return error.CatalogGenerationChanged;
-    const length = std.fmt.parseInt(usize, token[split + 1 ..], 10) catch return error.InvalidQueryRequest;
-    if (length == 0 or length > 4 * 1024 * 1024) return error.InvalidQueryRequest;
-    const bytes = store.getVerifiedAllocWithCancellation(artifact, length, try stores.sha256ChecksumFromArtifactId(artifact), cancellation) catch |err| switch (err) {
+    const bytes = @import("lake_generation_envelope.zig").read(store, envelope, cancellation) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => return error.CatalogGenerationChanged,
         else => return err,
     };

@@ -974,6 +974,19 @@ pub const RoaringBitmap = struct {
                 oi += 1;
             } else {
                 andContainers(self.alloc, &self.containers.items[si], &other.containers.items[oi]);
+                const nonempty = switch (self.containers.items[si]) {
+                    .array => |array| array.items.len != 0,
+                    .bitmap => |words| present: {
+                        for (words) |word| if (word != 0) break :present true;
+                        break :present false;
+                    },
+                };
+                if (!nonempty) {
+                    self.containers.items[si].deinit(self.alloc);
+                    si += 1;
+                    oi += 1;
+                    continue;
+                }
                 if (wi != si) {
                     self.keys.items[wi] = sk;
                     self.containers.items[wi] = self.containers.items[si];
@@ -2471,4 +2484,32 @@ test "absent array ranges jump contiguous deletions and clipped seeks" {
     ranges = bitmap.absentRanges(0, 4096);
     ranges.seekForward(4094);
     try std.testing.expectEqual(@as(u32, 4095), ranges.next().?.start);
+}
+
+test "external lake bounded WAL roaring intersections canonicalize empty array and dense containers" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |dense| {
+        var left = RoaringBitmap.init(a);
+        defer left.deinit();
+        var right = RoaringBitmap.init(a);
+        defer right.deinit();
+        try left.addRange(0, if (dense) 10000 else 3);
+        try right.addRange(20000, if (dense) 30000 else 20003);
+        // Keep one later container to exercise compaction over a removed one.
+        try left.add(70000);
+        try right.add(70000);
+        try left.prepareRead();
+        left.andWith(&right);
+        try std.testing.expectEqual(@as(usize, 1), left.keys.items.len);
+        try std.testing.expectEqual(@as(usize, 1), left.cardinality());
+        try std.testing.expect(left.contains(70000));
+        var empty = RoaringBitmap.init(a);
+        defer empty.deinit();
+        try empty.add(70001);
+        left.andWith(&empty);
+        try std.testing.expect(left.isEmpty());
+        try std.testing.expectEqual(@as(usize, 0), left.cardinality());
+        try left.prepareRead();
+        try std.testing.expectEqual(@as(?u32, null), left.read_rank.?.select(0));
+    }
 }

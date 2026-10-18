@@ -211,7 +211,9 @@ pub const SynonymReader = struct {
         while (true) {
             const entry = it.current() orelse break;
             if (@as(u32, @intCast(entry.val)) == group_id) {
-                try terms.append(alloc, try alloc.dupe(u8, entry.key));
+                const copy = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(copy);
+                try terms.append(alloc, copy);
             }
             _ = try it.nextEntry();
         }

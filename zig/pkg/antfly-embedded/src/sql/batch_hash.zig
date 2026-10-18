@@ -20,23 +20,39 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
 pub fn encodedColumns(a: A, values: []const @import("execution_batch.zig").Batch, count: usize, grouped: bool) ![]?u64 {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const physical = try scratch.allocator().alloc(?@import("execution_batch.zig").PhysicalColumn, values.len);
+    for (values, physical) |column, *view| {
+        view.* = try column.physicalColumn(scratch.allocator(), 0);
+        if (view.*) |native| try native.validate();
+    }
+    return encodedColumnsWithPhysical(a, values, physical, count, grouped);
+}
+pub fn encodedColumnsWithPhysical(a: A, values: []const @import("execution_batch.zig").Batch, physical: []const ?@import("execution_batch.zig").PhysicalColumn, count: usize, grouped: bool) ![]?u64 {
+    if (physical.len != values.len) return error.InvalidSqlBackendResponse;
     const states = try a.alloc(std.hash.Wyhash, count);
     defer a.free(states);
     for (states) |*state| state.* = .init(0);
     const result = try a.alloc(?u64, count);
     errdefer a.free(result);
     @memset(result, 0);
-    for (values) |column| {
+    for (values, physical) |column, native| {
         if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
         var memo: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         defer memo.deinit(a);
         var text: std.StringHashMapUnmanaged(u64) = .empty;
         defer text.deinit(a);
+        var numeric_scratch = std.heap.ArenaAllocator.init(a);
+        defer numeric_scratch.deinit();
+        const decimal = try column.decimalColumnSelected(numeric_scratch.allocator(), 0, null);
         for (states, result, 0..) |*state, *valid, index| {
-            const cell = try column.cell(a, index, 0);
+            var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
+            var number: @import("numeric_value.zig").Value = undefined;
+            const cell = if (native) |view| try view.cell(index) else if (decimal) |view| try view.cell(index, &fixed, &number) else try column.cell(a, index, 0);
             if (!grouped and cell.sql_null) valid.* = null;
             if (valid.* == null) continue;
-            const semantic = if (cell.sql_null) 0 else if (try column.dictionaryIdentity(index, 0)) |id| blk: {
+            const semantic = if (cell.sql_null) 0 else if (if (native) |view| view.dictionaryIdentity(index) else try column.dictionaryIdentity(index, 0)) |id| blk: {
                 if (memo.get(id)) |hash| break :blk hash;
                 const hash = try scalar.semanticHashDatum(cell);
                 if (memo.count() < 4096) try memo.put(a, id, hash);

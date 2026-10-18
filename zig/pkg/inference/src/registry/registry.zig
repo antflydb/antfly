@@ -517,7 +517,8 @@ pub const ModelRegistry = struct {
     }
 
     /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
-    /// on the calling thread.
+    /// on the calling thread. Companion pulls recurse through this boundary,
+    /// so its error set must be explicit.
     pub fn pullWithProgress(
         self: *ModelRegistry,
         io: std.Io,

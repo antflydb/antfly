@@ -45,6 +45,7 @@ pub const LevenshteinAutomaton = struct {
     dfa_match: std.ArrayListUnmanaged(bool) = .empty,
     /// We need a persistent allocator for the DFA cache
     alloc: ?std.mem.Allocator = null,
+    allocation_failed: bool = false,
 
     /// Get an fst.Automaton interface for FST traversal.
     pub fn automaton(self: *LevenshteinAutomaton) fst.Automaton {
@@ -109,7 +110,14 @@ pub const LevenshteinAutomaton = struct {
         }
         const idx = self.dfa_states.items.len;
         const alloc = self.alloc orelse return dead_state;
-        self.dfa_states.append(alloc, set) catch return dead_state;
+        self.dfa_states.ensureUnusedCapacity(alloc, 1) catch {
+            self.allocation_failed = true;
+            return dead_state;
+        };
+        self.dfa_match.ensureUnusedCapacity(alloc, 1) catch {
+            self.allocation_failed = true;
+            return dead_state;
+        };
         // Check if any NFA state in this set is a match
         const d: usize = @as(usize, self.max_distance) + 1;
         var is_match = false;
@@ -123,7 +131,8 @@ pub const LevenshteinAutomaton = struct {
                 break;
             }
         }
-        self.dfa_match.append(alloc, is_match) catch return dead_state;
+        self.dfa_states.appendAssumeCapacity(set);
+        self.dfa_match.appendAssumeCapacity(is_match);
         return idx;
     }
 

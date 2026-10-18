@@ -44,6 +44,8 @@ pub const ColumnChunk = struct {
     offset_index_length: ?u32 = null,
     column_index_offset: ?u64 = null,
     column_index_length: ?u32 = null,
+    stats_null_count: ?u64 = null,
+    stats_distinct_count: ?u64 = null,
     stats_min_i64: ?i64 = null,
     stats_max_i64: ?i64 = null,
     stats_min_bytes: ?[]u8 = null,
@@ -65,7 +67,8 @@ pub const ColumnChunk = struct {
         self.* = undefined;
     }
 
-    pub fn validate(self: ColumnChunk, file_len: u64) !void {
+    /// Physical framing can be checked before schema annotations are decoded.
+    pub fn validateRanges(self: ColumnChunk, file_len: u64) !void {
         for ([_]struct { offset: ?u64, len: ?u32 }{
             .{ .offset = self.offset_index_offset, .len = self.offset_index_length },
             .{ .offset = self.column_index_offset, .len = self.column_index_length },
@@ -84,11 +87,17 @@ pub const ColumnChunk = struct {
         if (self.field_id) |id| {
             if (id < 0) return error.InvalidExternalSourceInventory;
         }
+    }
+    pub fn validate(self: ColumnChunk, file_len: u64) !void {
+        try self.validateRanges(file_len);
+        if ((self.stats_null_count orelse 0) > std.math.maxInt(i64) or (self.stats_distinct_count orelse 0) > std.math.maxInt(i64)) return error.InvalidExternalSourceInventory;
         if (self.stats_min_i64 != null and self.stats_max_i64 != null and self.stats_min_i64.? > self.stats_max_i64.?) return error.InvalidExternalSourceInventory;
         if ((self.stats_min_bytes == null) != (self.stats_max_bytes == null)) return error.InvalidExternalSourceInventory;
         if (self.stats_min_bytes) |min| {
             const max = self.stats_max_bytes.?;
-            if (std.mem.order(u8, min, max) == .gt) return error.InvalidExternalSourceInventory;
+            if (std.mem.eql(u8, self.logical_type, "decimal")) {
+                @import("../../common/decimal128.zig").validateBounds(min, max, self.decimal_precision, self.decimal_scale) catch return error.InvalidExternalSourceInventory;
+            } else if (std.mem.order(u8, min, max) == .gt) return error.InvalidExternalSourceInventory;
         }
         if ((self.stats_min_bool == null) != (self.stats_max_bool == null)) return error.InvalidExternalSourceInventory;
         if (self.stats_min_bool == true and self.stats_max_bool == false) return error.InvalidExternalSourceInventory;
@@ -113,17 +122,21 @@ pub const RowGroup = struct {
         self.* = undefined;
     }
 
-    pub fn validate(self: RowGroup, file_len: u64) !void {
+    pub fn validateRanges(self: RowGroup, file_len: u64) !void {
         if (self.total_byte_len != 0) {
             if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
             if (self.total_byte_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
         }
         for (self.column_chunks, 0..) |chunk, idx| {
-            try chunk.validate(file_len);
+            try chunk.validateRanges(file_len);
             for (self.column_chunks[0..idx]) |previous| {
                 if (std.mem.eql(u8, previous.column_id, chunk.column_id)) return error.InvalidExternalSourceInventory;
             }
         }
+    }
+    pub fn validate(self: RowGroup, file_len: u64) !void {
+        try self.validateRanges(file_len);
+        for (self.column_chunks) |chunk| try chunk.validate(file_len);
     }
 };
 
@@ -258,6 +271,7 @@ pub const DeletedRowGroup = struct {
 };
 
 pub const Inventory = struct {
+    row_identity_version: u8 = 1,
     format: Format,
     source_id: []u8,
     source_uri: []u8,
@@ -286,6 +300,7 @@ pub const Inventory = struct {
         if (self.source_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.source_uri.len == 0) return error.InvalidExternalSourceInventory;
         if (self.snapshot_id.len == 0) return error.InvalidExternalSourceInventory;
+        if (self.row_identity_version != 1 and self.row_identity_version != 2) return error.InvalidExternalSourceInventory;
         if (self.schema_fingerprint.len == 0) return error.InvalidExternalSourceInventory;
 
         var file_ids = std.StringHashMapUnmanaged(void).empty;
@@ -445,3 +460,16 @@ test "external source inventory rejects duplicate file ids with allocator-backed
 
     try std.testing.expectError(error.InvalidExternalSourceInventory, inventory.validateAlloc(alloc));
 }
+
+pub const ColumnStatistics = struct {
+    pub const Frequency = struct { hash: u64, rows: u64 };
+    name: []const u8,
+    distinct_count: ?u64 = null,
+    population_rows: ?u64 = null,
+    average_bytes: ?u32 = null,
+    non_null_rows: ?u64 = null,
+    unique: bool = false,
+    min_integer: ?i64 = null,
+    max_integer: ?i64 = null,
+    frequencies: []const Frequency = &.{},
+};

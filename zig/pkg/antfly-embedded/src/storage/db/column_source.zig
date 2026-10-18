@@ -96,6 +96,15 @@ pub const Page = struct {
             for (selection, nulls) |index, *flag| flag.* = @intFromBool(column.nulls.isNull(index));
             out.nulls = .{ .bytes = nulls };
             out.values = switch (column.values) {
+                .encoded => return error.UnsupportedSqlExecution,
+                .decimal128 => |values| blk: {
+                    var result = values;
+                    const gathered = try pa.alloc(i128, selection.len);
+                    for (selection, gathered, nulls) |index, *value, flag| value.* = if (flag != 0) 0 else values.values[index];
+                    result.values = gathered;
+                    break :blk .{ .decimal128 = result };
+                },
+
                 inline .i64, .f64, .bool => |values, tag| blk: {
                     const gathered = try pa.alloc(@TypeOf(values[0]), selection.len);
                     for (selection, gathered) |index, *value| value.* = values[index];
@@ -280,6 +289,7 @@ pub const Row = struct {
     fn cell(self: Row, a: A, column: rows.ColumnVector) !std.json.Value {
         if (column.nulls.isNull(self.index)) return .null;
         return switch (column.values) {
+            .decimal128, .encoded => try column.values.jsonAt(a, self.index),
             .i64 => |values| .{ .integer = values[self.index] },
             .dictionary_i64 => |values| .{ .integer = values.at(self.index) },
             .f64 => |values| .{ .float = values[self.index] },
@@ -347,11 +357,11 @@ pub const Row = struct {
                 for (options.fields, 0..) |field, ordinal| for (self.page.columns) |column| {
                     if (!std.mem.eql(u8, field, "*") and !std.mem.eql(u8, field, column.name)) continue;
                     if (firstInclude(options.fields, column.name) != ordinal or excluded(options.fields, column.name) or internal(column.name)) continue;
-                    try fields.append(a, .{ .name = column.name, .value = try Prepared.Value.prepare(a, try self.cell(sa, column), column.values != .json) });
+                    try fields.append(a, .{ .name = column.name, .value = try Prepared.Value.prepare(a, try self.cell(sa, column), column.values != .json and column.values != .decimal128 and column.values != .encoded) });
                 };
             } else if (options.fields.len != 0 or options.include_all_fields) for (self.page.columns) |column| {
                 if (internal(column.name) or excluded(options.fields, column.name)) continue;
-                try fields.append(a, .{ .name = column.name, .value = try Prepared.Value.prepare(a, try self.cell(sa, column), column.values != .json) });
+                try fields.append(a, .{ .name = column.name, .value = try Prepared.Value.prepare(a, try self.cell(sa, column), column.values != .json and column.values != .decimal128 and column.values != .encoded) });
             };
         }
         return Prepared.init(fields.items);

@@ -48,6 +48,7 @@ pub fn publishWithContributions(a: A, store: *stores.ArtifactStore, declarations
         var page_store = store.*;
         page_store.allocator = ca;
         const uploaded = try page_store.putWithCancellation(encoded, cancellation);
+        defer if (uploaded.provider_version) |version| page_store.allocator.free(version);
         try pages.append(ca, .{ .kind = .external_base_source, .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len });
         offset = end;
     }
@@ -57,6 +58,7 @@ pub fn publishWithContributions(a: A, store: *stores.ArtifactStore, declarations
     var upload = store.*;
     upload.allocator = a;
     const artifact = try upload.putWithCancellation(bytes, cancellation);
+    defer if (artifact.provider_version) |version| upload.allocator.free(version);
     return .{ .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .count = @intCast(declarations.len) };
 }
 /// The publication must already have fresh source/store/authorization proof.
@@ -153,5 +155,6 @@ pub fn publishIndexed(a: A, store: *stores.ArtifactStore, declarations: []const 
     var upload = store.*;
     upload.allocator = a;
     const artifact = try upload.putWithCancellation(bytes, cancellation);
+    defer if (artifact.provider_version) |version| upload.allocator.free(version);
     return .{ .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .count = @intCast(declarations.len) };
 }

@@ -198,7 +198,68 @@ pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u6
     return store.watermark(a);
 }
 
-pub const Pending = struct { lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
+pub const KeyIdentity = enum { legacy_json, canonical };
+pub fn rowId(a: A, keys: []const []const u8, row: V, encoding: KeyIdentity) ![]u8 {
+    const encoded = if (encoding == .canonical)
+        try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, &.{})
+    else legacy: {
+        const values = try a.alloc(V, keys.len);
+        defer a.free(values);
+        for (keys, values) |key, *value| value.* = row.object.get(key) orelse return error.InvalidWal;
+        break :legacy try std.json.Stringify.valueAlloc(a, values, .{});
+    };
+    defer a.free(encoded);
+    return std.fmt.allocPrint(a, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(encoded)});
+}
+pub const Pending = struct {
+    key_identity: KeyIdentity = .legacy_json,
+    block_digests: []const [32]u8 = &.{},
+    cut_identity: ?[32]u8 = null,
+    base_lsn: u64 = 0,
+    lsn: u64,
+    key_fields: []const []const u8,
+    changes: []const Batch.Change = &.{},
+    change_blocks: []const []const Batch.Change = &.{},
+    pub fn count(self: @This()) usize {
+        var n = self.changes.len;
+        for (self.change_blocks) |block| n += block.len;
+        return n;
+    }
+    pub fn materialized(self: @This(), a: A) !Pending {
+        if (self.change_blocks.len == 0) return self;
+        var result = self;
+        const changes = try a.alloc(Batch.Change, self.count());
+        @memcpy(changes[0..self.changes.len], self.changes);
+        var n = self.changes.len;
+        for (self.change_blocks) |block| {
+            @memcpy(changes[n..][0..block.len], block);
+            n += block.len;
+        }
+        result.changes = changes;
+        result.change_blocks = &.{};
+        result.block_digests = &.{};
+        return result;
+    }
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        try stream.objectField("key_identity");
+        try stream.write(self.key_identity);
+        try stream.objectField("cut_identity");
+        try stream.write(self.cut_identity);
+        try stream.objectField("base_lsn");
+        try stream.write(self.base_lsn);
+        try stream.objectField("lsn");
+        try stream.write(self.lsn);
+        try stream.objectField("key_fields");
+        try stream.write(self.key_fields);
+        try stream.objectField("changes");
+        try stream.beginArray();
+        for (self.changes) |change| try stream.write(change);
+        for (self.change_blocks) |block| for (block) |change| try stream.write(change);
+        try stream.endArray();
+        try stream.endObject();
+    }
+};
 /// Caller arena owns the immutable WAL cut and its normalized final images.
 pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {
     var opened = try openQueue(a, binding, options);
@@ -206,15 +267,26 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
     const base = try prefix(a, opened.prefix, binding, options);
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
     const suffix = try store.range(a, cut);
+    return normalizePending(a, cut, suffix.lsn, suffix.records);
+}
+pub fn normalizePending(a: A, cut: u64, lsn: u64, records: []const wal.Record) !Pending {
+    return normalizePendingWithBase(a, cut, lsn, null, records);
+}
+/// Final images may borrow an immutable prior cut. Its owner must outlive this
+/// result; new records are parsed only once and replace earlier key images.
+pub fn normalizePendingWithBase(a: A, cut: u64, lsn: u64, base: ?Pending, records: []const wal.Record) !Pending {
     var changes: std.ArrayList(Batch.Change) = .empty;
     var latest: std.StringHashMapUnmanaged(usize) = .empty;
-    var keys: []const []const u8 = &.{};
-    for (suffix.records) |record| {
+    var keys: []const []const u8 = if (base) |previous| previous.key_fields else &.{};
+    if (base) |previous| for (previous.changes) |change| {
+        const identity = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, change.row, &.{});
+        try latest.put(a, identity, changes.items.len);
+        try changes.append(a, change);
+    };
+    for (records) |record| {
         const batch = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
         if (keys.len == 0) keys = batch.key_fields else if (!keyFieldsEqual(keys, batch.key_fields)) return error.LakeSourceConflict;
         for (batch.changes) |change| {
-            var values: std.ArrayList(V) = .empty;
-            for (keys) |field| try values.append(a, change.row.object.get(field) orelse return error.InvalidWal);
             const identity = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, change.row, &.{});
             const entry = try latest.getOrPut(a, identity);
             if (entry.found_existing) changes.items[entry.value_ptr.*] = change else {
@@ -224,7 +296,7 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
             }
         }
     }
-    return .{ .lsn = suffix.lsn, .key_fields = keys, .changes = changes.items };
+    return .{ .base_lsn = cut, .lsn = lsn, .key_fields = keys, .changes = changes.items };
 }
 
 test "external lake filesystem maintenance reads ingestion artifacts in the same namespace" {

@@ -45,7 +45,7 @@ pub const Plan = struct {
         for (join.left_keys, join.right_keys) |left, right| {
             if (left.instructions.len != 1 or right.instructions.len != 1 or left.instructions[0].operation != .column or right.instructions[0].operation != .column) return null;
         }
-        if (!equijoin(condition, condition.root, join.left_keys, join.right_keys, join.left.columns.len, 0)) return null;
+        if (!equijoin(condition, condition.root, join.left_keys, join.right_keys, join.left.columns.len, join.output_order, 0)) return null;
         for (recipe.inputs) |input| {
             if (input.spec.distinct) return null;
             switch (input.spec.kind) {
@@ -65,10 +65,11 @@ pub const Plan = struct {
         errdefer a.free(outputs);
         const width = join.left.columns.len;
         for (recipe.keys, outputs) |key, *output| {
-            const column = findColumn(node, key.path) orelse {
+            const logical = findColumn(node, key.path) orelse {
                 a.free(outputs);
                 return null;
             };
+            const column = if (join.output_order) |order| order[logical] else logical;
             const side: u1 = @intFromBool(column >= width);
             const ordinal: u32 = @intCast(if (side == 0) column else column - width);
             const index = std.mem.indexOfScalar(u32, keys[side].items, ordinal) orelse append: {
@@ -82,11 +83,12 @@ pub const Plan = struct {
         for (recipe.inputs, inputs) |input, *out| {
             out.* = null;
             if (input.column) |key| {
-                const column = findColumn(node, key.path) orelse {
+                const logical = findColumn(node, key.path) orelse {
                     a.free(outputs);
                     a.free(inputs);
                     return null;
                 };
+                const column = if (join.output_order) |order| order[logical] else logical;
                 out.* = .{ .side = @intFromBool(column >= width), .column = @intCast(if (column < width) column else column - width) };
             }
         }
@@ -105,20 +107,22 @@ pub const Plan = struct {
         }
         return false;
     }
-    fn equijoin(program: scalar.Program, index: u32, left: []const scalar.Program, right: []const scalar.Program, width: usize, depth: usize) bool {
+    fn equijoin(program: scalar.Program, index: u32, left: []const scalar.Program, right: []const scalar.Program, width: usize, output_order: ?[]const usize, depth: usize) bool {
         if (depth >= 128 or index >= program.instructions.len) return false;
         const operation = program.instructions[index].operation;
         if (operation != .binary) return false;
         const binary = operation.binary;
-        if (binary.op == .@"and") return equijoin(program, binary.left, left, right, width, depth + 1) and equijoin(program, binary.right, left, right, width, depth + 1);
+        if (binary.op == .@"and") return equijoin(program, binary.left, left, right, width, output_order, depth + 1) and equijoin(program, binary.right, left, right, width, output_order, depth + 1);
         if (binary.op != .eq or binary.left >= program.instructions.len or binary.right >= program.instructions.len) return false;
         const l = program.instructions[binary.left].operation;
         const r = program.instructions[binary.right].operation;
         if (l != .column or r != .column) return false;
+        const logical_left = if (output_order) |order| order[l.column] else l.column;
+        const logical_right = if (output_order) |order| order[r.column] else r.column;
         for (left, right) |lk, rk| {
             const lc = lk.instructions[0].operation.column;
             const rc = width + rk.instructions[0].operation.column;
-            if ((l.column == lc and r.column == rc) or (r.column == lc and l.column == rc)) return true;
+            if ((logical_left == lc and logical_right == rc) or (logical_right == lc and logical_left == rc)) return true;
         }
         return false;
     }

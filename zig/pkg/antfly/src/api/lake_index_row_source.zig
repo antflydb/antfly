@@ -27,6 +27,9 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const Provider = struct {
     source: *serving.ServingSource,
+    /// Borrowed authenticated prior inventory, shared by all native builders.
+    previous_inventory: ?local.serverless_external_source_types.Inventory = null,
+    native_delta: ?@import("lake_source_navigation.zig").Delta = null,
     enrichment_columns: bool = false,
     vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
     progress: ?BuildProgress = null,
@@ -36,8 +39,18 @@ pub const Provider = struct {
     expected_delete_objects: ?[32]u8 = null,
     only_file: ?usize = null,
     only_files: ?[]const bool = null,
+    only_plan: ?*const @import("lake_index_native_state.zig").Plan = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,
+    replay_recommended: bool = false,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
+    statistics: ?Statistics = null,
+    pub const Statistics = struct {
+        ptr: *anyopaque,
+        columns: []const []const u8,
+        files: *const local.serverless_query_lake_inventory_catalog.Positions,
+        needed: *const fn (*anyopaque, usize) bool,
+        save: *const fn (*anyopaque, usize, []const local.sql_catalog.StatisticsSketch) anyerror!void,
+    };
     pub const BuildProgress = struct {
         ptr: *anyopaque,
         save: *const fn (*anyopaque, local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void,
@@ -79,10 +92,10 @@ pub const Provider = struct {
             !std.mem.eql(u8, binding.source_id, inventory.source_id) or
             !std.mem.eql(u8, binding.snapshot_id, inventory.snapshot_id) or
             !std.mem.eql(u8, binding.schema_fingerprint, inventory.schema_fingerprint)) return error.SidecarSourceBindingMismatch;
-        if (self.only_files) |selected| {
-            if (selected.len != inventory.files.len or self.only_file != null) return error.InvalidNativeLakeFileState;
+        if (self.only_files != null or self.only_plan != null) {
+            if ((self.only_files != null and self.only_files.?.len != inventory.files.len) or (self.only_plan != null and self.only_plan.?.count() != inventory.files.len) or self.only_file != null) return error.InvalidNativeLakeFileState;
             const cursor = try a.create(FileCursor);
-            cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation };
+            cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation, .planned = if (self.only_plan) |plan| plan.iterator(true) else null };
             return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit };
         }
         if (!self.enrichment_columns) if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
@@ -105,6 +118,24 @@ pub const Provider = struct {
         errdefer a.destroy(state);
         state.* = .{ .stream = try stream_api.Stream.init(a, self.source, columns, &.{}, self.context, self.limits), .source_columns = columns, .expected_delete_objects = self.expected_delete_objects, .scratch = .init(a), .cancellation = cancellation };
         errdefer state.stream.deinit();
+        if (self.statistics) |statistics| {
+            const needed = if (self.only_file) |file| statistics.needed(statistics.ptr, file) else true;
+            const covered = for (statistics.columns) |name| {
+                const found = for (columns) |column| {
+                    if (std.mem.eql(u8, name, column)) break true;
+                } else false;
+                if (!found) break false;
+            } else true;
+            if (needed and covered and statistics.columns.len != 0 and statistics.columns.len <= 64) {
+                state.statistics = try a.create(StatisticsCapture);
+                state.statistics.?.* = .{ .a = a, .callback = statistics, .contract = if (self.source.iceberg_schema) |schema| schema.columns else self.schema_contract };
+                if (self.only_file) |file| {
+                    state.statistics.?.file = file;
+                    state.statistics.?.enabled = true;
+                }
+            }
+        }
+        errdefer if (state.statistics) |statistics| a.destroy(statistics);
         if (self.only_file) |index| try state.stream.restrictFile(index);
         state.stream.schema_contract = if (self.source.iceberg_schema) |selected| selected.columns else self.schema_contract;
         return .{ .kind = kind, .ctx = state, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
@@ -116,6 +147,7 @@ const FileCursor = struct {
     binding: bindings.Binding,
     cancellation: Cancellation,
     file: usize = 0,
+    planned: ?@import("lake_index_native_state.zig").Plan.Iterator = null,
     active: ?rows.Source = null,
     fn next(raw: *anyopaque, a: A) !?rows.ColumnBatch {
         const self: *FileCursor = @ptrCast(@alignCast(raw));
@@ -127,12 +159,20 @@ const FileCursor = struct {
                 source.deinit(a);
                 self.active = null;
             }
-            while (self.file < self.provider.only_files.?.len and !self.provider.only_files.?[self.file]) self.file += 1;
-            if (self.file == self.provider.only_files.?.len) return null;
+            const ordinal = if (self.planned) |*planned| blk: {
+                break :blk ((try planned.next()) orelse return null).ordinal;
+            } else blk: {
+                const mask = self.provider.only_files.?;
+                while (self.file < mask.len and !mask[self.file]) self.file += 1;
+                if (self.file == mask.len) return null;
+                const index = self.file;
+                self.file += 1;
+                break :blk index;
+            };
             var input = self.provider;
             input.only_files = null;
-            input.only_file = self.file;
-            self.file += 1;
+            input.only_plan = null;
+            input.only_file = ordinal;
             self.active = try Provider.openCanceled(&input, a, self.binding, self.cancellation);
         }
     }
@@ -142,7 +182,77 @@ const FileCursor = struct {
         a.destroy(self);
     }
 };
+const StatisticsCapture = struct {
+    a: A,
+    callback: Provider.Statistics,
+    file: ?usize = null,
+    enabled: bool = false,
+    contract: []const local.serverless_query_lake_schema.Column,
+    sketches: [64]local.sql_catalog.StatisticsSketch = @splat(.{}),
+    complete: bool = false,
+    fn add(self: *@This(), batch: rows.ColumnBatch) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        var begin: usize = 0;
+        while (begin < batch.rowCount()) {
+            const reference = switch (batch.rowRef(begin)) {
+                .external => |ref| ref,
+                else => return error.SidecarSourceBindingMismatch,
+            };
+            const file = self.callback.files.get(reference.file_id) orelse return error.InvalidNativeLakeFileState;
+            var end = begin + 1;
+            while (end < batch.rowCount()) : (end += 1) {
+                const next = switch (batch.rowRef(end)) {
+                    .external => |ref| ref,
+                    else => return error.SidecarSourceBindingMismatch,
+                };
+                if (!std.mem.eql(u8, next.file_id, reference.file_id)) break;
+            }
+            // Stream owns files in contiguous order. A complete file is
+            // committed only at the next file boundary or terminal EOF.
+            if (self.file == null or self.file.? != file) {
+                try self.finish();
+                self.file = file;
+                self.complete = false;
+                self.enabled = self.callback.needed(self.callback.ptr, file);
+                @memset(&self.sketches, .{});
+            }
+            if (self.enabled) for (self.callback.columns, self.sketches[0..self.callback.columns.len]) |name, *sketch| {
+                const column = batch.findColumn(name) orelse return error.RowSourceColumnKindMismatch;
+                const numeric = for (self.contract) |definition| {
+                    if (std.mem.eql(u8, definition.name, name)) break std.mem.eql(u8, definition.kind, "numeric") or std.mem.eql(u8, definition.kind, "number");
+                } else false;
+                for (begin..end) |lane| {
+                    _ = scratch.reset(.retain_capacity);
+                    var fixed: local.sql_numeric_value.ScaledInteger = undefined;
+                    var number: local.sql_numeric_value.Value = undefined;
+                    const value: local.sql_scalar.Datum = if (column.nulls.isNull(lane)) .{} else if (numeric and column.values == .decimal128) decimal: {
+                        const decimal = column.values.decimal128;
+                        if (decimal.scale < 0 or decimal.scale > 38) return error.InvalidNativeLakeFileState;
+                        fixed = try local.sql_numeric_value.ScaledInteger.init(decimal.values[lane], @intCast(decimal.scale));
+                        number = fixed.view();
+                        break :decimal local.sql_scalar.Datum.typedNumeric(&number);
+                    } else local.sql_scalar.Datum.fromJson(try column.values.jsonAt(scratch.allocator(), lane));
+                    const width: usize = if (value.numeric != null) 16 else switch (value.value) {
+                        .integer, .float => 8,
+                        .bool => 1,
+                        .string => |text| 16 + text.len,
+                        else => 0,
+                    };
+                    try sketch.add(value, width);
+                }
+            };
+            begin = end;
+        }
+    }
+    fn finish(self: *@This()) !void {
+        if (self.complete or self.file == null or !self.enabled) return;
+        try self.callback.save(self.callback.ptr, self.file.?, self.sketches[0..self.callback.columns.len]);
+        self.complete = true;
+    }
+};
 const Cursor = struct {
+    statistics: ?*StatisticsCapture = null,
     stream: stream_api.Stream,
     source_columns: []const []const u8,
     scratch: std.heap.ArenaAllocator,
@@ -164,7 +274,9 @@ const Cursor = struct {
                     while (self.position < self.keep.len and self.keep[self.position]) self.position += 1;
                     // Descriptors are reusable; their values continue borrowing
                     // the current Parquet page until its final live run drains.
-                    return try slice(self.columns, batch, begin, self.position);
+                    const selected = try slice(self.columns, batch, begin, self.position);
+                    if (self.statistics) |statistics| try statistics.add(selected);
+                    return selected;
                 }
             }
             self.batch = null;
@@ -172,7 +284,10 @@ const Cursor = struct {
             self.position = 0;
             self.columns = &.{};
             if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
-            const physical = try self.stream.next() orelse return null;
+            const physical = try self.stream.next() orelse {
+                if (self.statistics) |statistics| try statistics.finish();
+                return null;
+            };
             const batch = try nullableColumns(self.scratch.allocator(), physical, self.source_columns, self.stream.schema_contract);
             if (self.expected_delete_objects) |expected| {
                 if (self.stream.source.prepared_deletes) |prepared| {
@@ -191,6 +306,7 @@ const Cursor = struct {
     }
     fn deinit(raw: *anyopaque, a: A) void {
         const self: *Cursor = @ptrCast(@alignCast(raw));
+        if (self.statistics) |statistics| a.destroy(statistics);
         self.stream.deinit();
         self.scratch.deinit();
         a.free(self.source_columns);
@@ -240,13 +356,15 @@ fn slice(columns: []rows.ColumnVector, batch: rows.ColumnBatch, begin: usize, en
     if (columns.len != batch.columns.len) return error.RowSourceColumnLengthMismatch;
     for (columns, batch.columns) |*column, original| {
         column.* = original;
-        if (original.nulls.bytes.len != 0) column.nulls.bytes = original.nulls.bytes[begin..end];
+        column.nulls = original.nulls.slice(begin, end - begin);
         column.values = switch (original.values) {
+            .decimal128 => |values| .{ .decimal128 = values.slice(begin, end - begin) },
+            .encoded => return error.UnsupportedSqlExecution,
             inline .dictionary_bytes, .dictionary_i64, .dictionary_f64 => |dictionary, tag| @unionInit(rows.ColumnValues, @tagName(tag), .{ .values = dictionary.values, .indices = dictionary.indices[begin..end] }),
             inline else => |values, tag| @unionInit(rows.ColumnValues, @tagName(tag), values[begin..end]),
         };
     }
-    return .{ .snapshot = batch.snapshot, .row_refs = batch.row_refs[begin..end], .columns = columns };
+    return batch.identitySlice(begin, end, columns);
 }
 
 test "external lake native index input preserves dictionary ids and nulls across filtered runs" {

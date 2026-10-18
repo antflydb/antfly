@@ -22,6 +22,7 @@ test {
     _ = @import("api/tables.zig");
     _ = @import("api/table_contract.zig");
     _ = @import("serverless/build/lake_sidecar_text.zig");
+    _ = @import("serverless/build/lake_replay.zig");
     _ = @import("api/lake_sql_cursor.zig");
     _ = @import("api/lake_sql_overlay.zig");
     _ = @import("api/lake_maintenance_scheduler.zig");

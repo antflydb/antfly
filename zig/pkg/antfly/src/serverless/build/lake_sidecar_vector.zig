@@ -197,19 +197,19 @@ fn appendBatchVectors(
         .vector_f32 => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                try appendVectorEntry(alloc, entries, dims, batch.row_refs[row], value);
+                try appendVectorEntry(alloc, entries, dims, batch.rowRef(row), value);
             }
         },
         .bytes => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                try appendJsonVectorEntry(alloc, entries, dims, batch.row_refs[row], value, embedding_name);
+                try appendJsonVectorEntry(alloc, entries, dims, batch.rowRef(row), value, embedding_name);
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                try appendJsonVectorEntry(alloc, entries, dims, batch.row_refs[row], value, embedding_name);
+                try appendJsonVectorEntry(alloc, entries, dims, batch.rowRef(row), value, embedding_name);
             }
         },
         else => return error.UnsupportedLakeSidecarVectorColumn,

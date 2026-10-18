@@ -37,7 +37,7 @@ fn optionalWord(hash: *Hash, value: ?u64) void {
     hash.update(&.{@intFromBool(value != null)});
     if (value) |number| word(hash, number);
 }
-fn versionIsStrong(etag: []const u8, version: []const u8) bool {
+pub fn versionIsStrong(etag: []const u8, version: []const u8) bool {
     return etag.len != 0 or (version.len != 0 and !std.mem.startsWith(u8, version, "object-stat:v1:") and !std.mem.startsWith(u8, version, "iceberg:"));
 }
 fn jsonPart(a: A, hash: *Hash, value: anytype) !void {
@@ -60,7 +60,7 @@ const ObjectStat = struct {
         return worker_client.statObject(location.bucket, location.key);
     }
 };
-pub const Coverage = struct { source: [32]u8, delete_objects: [32]u8 };
+pub const Coverage = struct { source: [32]u8, delete_objects: [32]u8, data: [32]u8 };
 pub fn pin(source: *Source, context: Context) !Coverage {
     return pinWithInventory(source, context, null);
 }
@@ -78,6 +78,26 @@ pub fn pinWithFileMap(source: *Source, context: Context, previous: ?local.server
 // delete-object evidence remains fresh for every selection.
 pub const DataProof = Hash;
 pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
+    return pinDataMode(source, context, previous, verified_files, true);
+}
+pub fn pinDataLegacy(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
+    return pinDataMode(source, context, previous, verified_files, false);
+}
+fn merkleData(source: *Source, digest: [32]u8, count: usize) !Hash {
+    var hash = Hash.init(.{});
+    hash.update("native-lake-source-data-merkle-v2");
+    try jsonPart(source.alloc, &hash, .{ .format = source.inventory.format, .source_id = source.inventory.source_id, .source_uri = source.inventory.source_uri, .snapshot_id = source.inventory.snapshot_id, .schema = source.inventory.schema_fingerprint });
+    word(&hash, count);
+    hash.update(&digest);
+    try jsonPart(source.alloc, &hash, source.inventory.deleted_row_groups);
+    return hash;
+}
+fn pinDataMode(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap, merkle: bool) !DataProof {
+    try context.ensureActive();
+    if (merkle and source.immutable_objects and !source.lazy_versions and source.verified_files == null) if (source.catalog()) |index| {
+        if (index.allStrong()) return merkleData(source, index.coverageDigest(), index.count());
+    };
+    try source.ensureInventory(context);
     try source.ownInventory();
     const a = source.alloc;
     if (source.immutable_objects) if (previous) |inventory| {
@@ -164,17 +184,29 @@ pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_ex
     var hash = Hash.init(.{});
     hash.update("native-lake-source-coverage-v1");
     try jsonPart(a, &hash, .{ .format = source.inventory.format, .source_id = source.inventory.source_id, .source_uri = source.inventory.source_uri, .snapshot_id = source.inventory.snapshot_id, .schema = source.inventory.schema_fingerprint });
-    const order = try a.alloc(usize, source.inventory.files.len);
+    const files = source.inventory.files;
+    const sorted = for (files, 0..) |file, i| {
+        if (i != 0 and std.mem.order(u8, files[i - 1].file_id, file.file_id) != .lt) break false;
+    } else true;
+    const order: []usize = if (sorted) &.{} else try a.alloc(usize, files.len);
     defer a.free(order);
     for (order, 0..) |*index, i| index.* = i;
-    std.mem.sort(usize, order, source.inventory, struct {
+    if (!sorted) std.mem.sort(usize, order, source.inventory, struct {
         fn less(inventory: local.serverless_external_source_types.Inventory, left: usize, right: usize) bool {
             return std.mem.order(u8, inventory.files[left].file_id, inventory.files[right].file_id) == .lt;
         }
     }.less);
-    word(&hash, order.len);
-    for (order) |index| {
-        const file = source.inventory.files[index];
+    if (merkle) {
+        var builder: local.serverless_query_lake_inventory_catalog.CoverageBuilder = .{};
+        for (0..files.len) |position| {
+            try context.ensureActive();
+            try builder.add(files[if (sorted) position else order[position]]);
+        }
+        return merkleData(source, builder.finish(), files.len);
+    }
+    word(&hash, files.len);
+    for (0..files.len) |position| {
+        const file = files[if (sorted) position else order[position]];
         part(&hash, file.file_id);
         part(&hash, file.object_uri);
         part(&hash, file.etag);
@@ -195,9 +227,52 @@ pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_ex
     try jsonPart(a, &hash, source.inventory.deleted_row_groups);
     return hash;
 }
+pub fn dataDigest(data: DataProof) [32]u8 {
+    var copy = data;
+    return copy.finalResult();
+}
+/// Protocol 47 persists the data census digest independently of fresh delete
+/// evidence. No compiler-specific hash state becomes durable wire metadata.
 pub fn finish(source: *Source, context: Context, data: DataProof) !Coverage {
+    return finishDigest(source, context, dataDigest(data));
+}
+pub fn finishDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
+    var hash = Hash.init(.{});
+    part(&hash, "native-lake-source-coverage-v2");
+    hash.update(&data);
+    return finishHash(source, context, hash, data);
+}
+/// A serving statement pins delete evidence once, before admitting native
+/// coverage, and shares that exact evidence with selected hydration views.
+/// Build/publication verification continues to use finish()/finishDigest(),
+/// which deliberately re-stat objects before and after construction.
+pub fn finishReadDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
+    const qualified = (try source.qualifiedDeletes(context)) orelse return finishDigest(source, context, data);
+    if (qualified.proof) |proof| {
+        if (!std.mem.eql(u8, &proof.data, &data)) return error.InvalidExternalLakeIndexCoverage;
+        try context.ensureActive();
+        return .{ .source = proof.source, .delete_objects = qualified.digest, .data = data };
+    }
+    var hash = Hash.init(.{});
+    part(&hash, "native-lake-source-coverage-v2");
+    hash.update(&data);
+    const plan = source.scanner.iceberg_delete_plan.?;
+    if (plan.files.len != qualified.versions.len) return error.InvalidExternalLakeIndexCoverage;
+    for (plan.files, qualified.versions) |file, version| {
+        try context.ensureActive();
+        if (!versionIsStrong(version.etag, version.version)) return error.InvalidExternalLakeIndexCoverage;
+        try jsonPart(source.alloc, &hash, file);
+        part(&hash, version.etag);
+        part(&hash, version.version);
+    }
+    return .{ .source = hash.finalResult(), .delete_objects = qualified.digest, .data = data };
+}
+pub fn finishLegacy(source: *Source, context: Context, data: DataProof) !Coverage {
+    return finishHash(source, context, data, dataDigest(data));
+}
+fn finishHash(source: *Source, context: Context, input: Hash, digest: [32]u8) !Coverage {
     const a = source.alloc;
-    var hash = data;
+    var hash = input;
     var client = source.scanner.object_reader.client;
     client.allocator = a;
     const Work = ObjectStat;
@@ -243,7 +318,7 @@ pub fn finish(source: *Source, context: Context, data: DataProof) !Coverage {
         }
     }
     try context.ensureActive();
-    return .{ .source = hash.finalResult(), .delete_objects = delete_versions.finalResult() };
+    return .{ .source = hash.finalResult(), .delete_objects = delete_versions.finalResult(), .data = digest };
 }
 
 test "external lake native index coverage rejects synthetic provider identities" {
@@ -339,4 +414,57 @@ test "external lake immutable object contract avoids data HEAD while mutable cov
     const serial = try pin(&source, .{});
     try std.testing.expectEqual(parallel, serial);
     try std.testing.expectEqual(@as(usize, 4), spy.heads.load(.acquire));
+    const read_data = dataDigest(try pinData(&source, .{}, null, null));
+    const pinned_read = try finishReadDigest(&source, .{ .io = std.testing.io }, read_data);
+    try std.testing.expectEqual(serial, pinned_read);
+    try std.testing.expectEqual(@as(usize, 6), spy.heads.load(.acquire));
+    try std.testing.expectEqual(pinned_read, try finishReadDigest(&source, .{}, read_data));
+    try std.testing.expectEqual(@as(usize, 6), spy.heads.load(.acquire));
+    // Publication still freshly checks objects even after serving qualification.
+    try std.testing.expectEqual(serial, try finishDigest(&source, .{}, read_data));
+    try std.testing.expectEqual(@as(usize, 8), spy.heads.load(.acquire));
+}
+
+test "external lake metadata navigation Merkle coverage matches private plans without flattening strong immutable catalogs" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("merkle-data-coverage");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const payload = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "n", .values = &.{1} }});
+    defer a.free(payload);
+    var put = try client.putObject("antfly", "part.parquet", payload, .{});
+    put.deinit(a);
+    var metadata = try client.statObject("antfly", "part.parquet");
+    defer metadata.deinit(a);
+    const manifests = local.serverless_query_lake_parquet_manifest;
+    const chunk = try std.json.Stringify.valueAlloc(a, &[_]manifests.File{.{ .file_id = "p", .object_uri = "object://antfly/part.parquet", .byte_len = payload.len, .row_count = 1, .etag = metadata.etag.? }}, .{});
+    defer a.free(chunk);
+    put = try client.putObject("antfly", "chunk.json", chunk, .{});
+    put.deinit(a);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(chunk, &digest, .{});
+    const head = try std.json.Stringify.valueAlloc(a, manifests.Head{ .version = 1, .source_id = "s", .chunks = &.{.{ .uri = "object://antfly/chunk.json", .byte_len = chunk.len, .file_count = 1, .sha256 = &std.fmt.bytesToHex(digest, .lower) }}, .file_count = 1 }, .{});
+    defer a.free(head);
+    put = try client.putObject("antfly", "head.parquet-manifest.json", head, .{});
+    put.deinit(a);
+    const schema = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"s\",\"format\":\"parquet\",\"uri\":\"file://{s}/head.parquet-manifest.json\",\"schema_fingerprint\":\"schema\",\"object_mutability\":\"immutable\"}}}}", .{directory.path()});
+    defer a.free(schema);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    var lazy = try Source.openLazyCached(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{}, .{}, &cache);
+    defer lazy.deinit();
+    try std.testing.expect(lazy.catalog() != null);
+    try std.testing.expectEqual(@as(usize, 0), lazy.inventory.files.len);
+    const cached = dataDigest(try pinData(&lazy, .{}, null, null));
+    try std.testing.expectEqual(@as(usize, 0), lazy.inventory.files.len);
+    var private = try Source.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer private.deinit();
+    try std.testing.expectEqual(@as(usize, 1), private.inventory.files.len);
+    const full = dataDigest(try pinData(&private, .{}, null, null));
+    try std.testing.expectEqualDeep(full, cached);
 }

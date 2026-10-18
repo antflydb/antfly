@@ -386,7 +386,10 @@ pub const ExternalLakeTableSource = struct {
     kind: []const u8,
     table_id: []const u8,
     format: []const u8,
+    /// Parquet prefix, Iceberg table, or an explicit Parquet snapshot head ending in .parquet-manifest.json. Snapshot heads name immutable checksummed file-list chunks; each query revalidates the head without listing the data prefix.
     uri: []const u8,
+    /// Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
+    row_identity_version: ?i64 = null,
     schema_fingerprint: ?[]const u8 = null,
     /// iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
     write_policy: ?[]const u8 = null,
@@ -402,6 +405,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "table_id", "table_id", false },
         .{ "format", "format", false },
         .{ "uri", "uri", false },
+        .{ "row_identity_version", "row_identity_version", true },
         .{ "schema_fingerprint", "schema_fingerprint", true },
         .{ "write_policy", "write_policy", true },
         .{ "object_mutability", "object_mutability", true },
@@ -428,6 +432,10 @@ pub const ExternalLakeTableSource = struct {
         try jw.write(self.format);
         try jw.objectField("uri");
         try jw.write(self.uri);
+        if (self.row_identity_version) |value| {
+            try jw.objectField("row_identity_version");
+            try jw.write(value);
+        }
         if (self.schema_fingerprint) |value| {
             try jw.objectField("schema_fingerprint");
             try jw.write(value);

@@ -142,3 +142,38 @@ test "manifest artifact kinds include lake-native artifacts" {
     try @import("std").testing.expectEqual(@as(u8, 11), @backingInt(ArtifactKind.algebraic_segment));
     try @import("std").testing.expectEqual(@as(u8, 13), @backingInt(ArtifactKind.graph_metric_segment));
 }
+
+/// Provider-qualified map edges are separate from legacy content identities.
+/// Parents authenticate the generation as well as the payload digest.
+pub const ProviderGenerationRef = struct {
+    artifact_id: []const u8,
+    checksum: []const u8,
+    byte_len: u64,
+    generation: []const u8,
+    retention_until_ms: u64 = 0,
+    pub fn validate(self: @This()) !void {
+        if (self.artifact_id.len != 175 or self.checksum.len != 64 or self.byte_len == 0 or self.byte_len > 1024 * 1024 or self.generation.len == 0 or self.generation.len > max_provider_generation_bytes) return error.InvalidCloudGenerationMap;
+        const std = @import("std");
+        if (!std.mem.eql(u8, self.artifact_id[0..7], "sha256:") or !std.mem.eql(u8, self.artifact_id[7..71], self.checksum) or std.mem.eql(u8, self.generation, "null")) return error.InvalidCloudGenerationMap;
+    }
+};
+
+/// Shared producer/admission bound for retained capabilities with exact versions.
+pub const max_provider_generation_bytes = 4096;
+pub const max_retained_generation_token_bytes = 8 + 175 + 3 + @import("std").base64.url_safe_no_pad.Encoder.calcSize(max_provider_generation_bytes) + 1 + 20;
+pub fn retainedGenerationToken(token: []const u8) bool {
+    const prefix: usize = if (@import("std").mem.startsWith(u8, token, "lake2:")) 6 else if (@import("std").mem.startsWith(u8, token, "native2:")) 8 else return false;
+    if (token.len > max_retained_generation_token_bytes or token.len <= prefix + 178) return false;
+    if (!@import("std").mem.eql(u8, token[prefix + 175 ..][0..3], ":g:")) return false;
+    const end = @import("std").mem.lastIndexOfScalar(u8, token, ':') orelse return false;
+    if (end <= prefix + 178 or token.len - end - 1 > 20) return false;
+    const size = @import("std").fmt.parseUnsigned(u64, token[end + 1 ..], 10) catch return false;
+    if (size == 0) return false;
+    const encoded = token[prefix + 178 .. end];
+    const decoder = @import("std").base64.url_safe_no_pad.Decoder;
+    const length = decoder.calcSizeForSlice(encoded) catch return false;
+    if (length == 0 or length > max_provider_generation_bytes) return false;
+    var buffer: [max_provider_generation_bytes]u8 = undefined;
+    decoder.decode(buffer[0..length], encoded) catch return false;
+    return !@import("std").mem.eql(u8, buffer[0..length], "null");
+}

@@ -102,5 +102,6 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 test {
     _ = @import("antfly_local_sources").serverless_query_lake_serving;
+    _ = @import("antfly_local_sources").serverless_query_lake_stream;
     _ = @import("antfly_local_sources").serverless_external_source_schema_binding;
 }

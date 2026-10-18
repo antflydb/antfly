@@ -147,6 +147,7 @@ pub const TransportResponse = struct {
     version_id: ?[]u8 = null,
     checksum: ?types.ObjectChecksum = null,
     last_modified: ?[]u8 = null,
+    server_date: ?[]u8 = null,
 
     pub fn deinit(self: *TransportResponse, alloc: Allocator) void {
         alloc.free(self.body);
@@ -155,6 +156,7 @@ pub const TransportResponse = struct {
         if (self.version_id) |value| alloc.free(value);
         if (self.checksum) |*value| value.deinit(alloc);
         if (self.last_modified) |value| alloc.free(value);
+        if (self.server_date) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -353,6 +355,7 @@ fn httpxRequest(
     if (response.headers.get("x-amz-version-id")) |value| result.version_id = try alloc.dupe(u8, value);
     result.checksum = try checksumFromHeaders(alloc, &response.headers);
     if (response.headers.get("Last-Modified")) |value| result.last_modified = try alloc.dupe(u8, value);
+    if (response.headers.get("Date")) |value| result.server_date = try alloc.dupe(u8, value);
     return result;
 }
 
@@ -803,8 +806,10 @@ pub const Client = struct {
             404 => return error.FileNotFound,
             else => return unexpectedStatusError(response.status),
         }
+        const etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null;
+        errdefer if (etag) |value| alloc.free(value);
         return .{
-            .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
+            .etag = etag,
             .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
         };
     }
@@ -964,6 +969,7 @@ pub const Client = struct {
             defer alloc.free(value);
             break :blk try alloc.dupe(u8, stripQuotes(value));
         } else null;
+        errdefer if (result_etag) |value| alloc.free(value);
         return .{
             .etag = result_etag,
             .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
@@ -1017,6 +1023,9 @@ pub const Client = struct {
             };
         } else try self.statObjectVersion(alloc, bucket, key, opts.version_id, opts.cancellation);
         errdefer meta.deinit(alloc);
+        if (opts.version_id) |expected| if (meta.version_id) |actual| {
+            if (!std.mem.eql(u8, actual, expected)) return error.PreconditionFailed;
+        };
         // Keep an ordinary current-object read on the ordinary GetObject
         // permission path. Supplying a probed version ID would require
         // s3:GetObjectVersion even though the caller did not request one.
@@ -1076,9 +1085,18 @@ pub const Client = struct {
             meta.content_type = next;
         }
         if (response.version_id) |value| {
+            if (opts.version_id) |expected| if (!std.mem.eql(u8, value, expected)) return error.PreconditionFailed;
             const next = try alloc.dupe(u8, value);
             if (meta.version_id) |current| alloc.free(current);
             meta.version_id = next;
+        } else if (opts.version_id) |expected| {
+            if (meta.version_id) |actual| {
+                if (!std.mem.eql(u8, actual, expected)) return error.PreconditionFailed;
+            } else {
+                // An explicitly qualified URL retains its selector even when
+                // the endpoint omits the response version header.
+                meta.version_id = try alloc.dupe(u8, expected);
+            }
         }
         try replaceChecksum(alloc, &meta.checksum, response.checksum);
         if (response.checksum != null) {
@@ -1128,7 +1146,7 @@ pub const Client = struct {
     }
 
     fn statObjectWithOptions(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
-        return self.statObjectVersion(alloc, bucket, key, null, opts.cancellation);
+        return self.statObjectVersion(alloc, bucket, key, opts.version_id, opts.cancellation);
     }
 
     fn statObjectVersion(
@@ -1157,7 +1175,7 @@ pub const Client = struct {
             .bucket = try alloc.dupe(u8, bucket),
             .key = try alloc.dupe(u8, key),
             .etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null,
-            .version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null,
+            .version_id = if (response.version_id orelse version_id) |value| try alloc.dupe(u8, value) else null,
             .checksum = if (response.checksum) |value| try value.clone(alloc) else null,
             .content_length = response.content_length orelse 0,
             .content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null,
@@ -1222,19 +1240,38 @@ pub const Client = struct {
         }
     }
 
+    fn supportsObjectVersions(raw: *anyopaque, a: Allocator, bucket: []const u8, token: ?types.CancellationToken) !bool {
+        const self: *Client = @ptrCast(@alignCast(raw));
+        // R2's API is explicitly unversioned. Other compatible endpoints must
+        // prove support; HTTP failures cannot silently discard historical versions.
+        if (std.mem.endsWith(u8, self.cfg.credentials.endpoint, ".r2.cloudflarestorage.com")) return false;
+        var page = self.listObjectVersions(a, bucket, .{ .max_keys = 1, .cancellation = token }) catch |err| switch (err) {
+            error.ObjectVersionListingUnsupported => return false,
+            else => return err,
+        };
+        defer page.deinit(a);
+        return true;
+    }
+
     fn listObjectVersions(self: *Client, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        if (opts.continuation_token != null) return error.InvalidVersionPagination;
         const query = try buildListObjectVersionsQueryAlloc(alloc, opts);
         defer freeQueryPairs(alloc, query);
         var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
         defer target.deinit(alloc);
 
-        var response = try self.performAlloc(alloc, .GET, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, target, &.{}, null, null, 8 * 1024 * 1024, opts.cancellation);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => return try parseListObjectVersionsResponse(alloc, response.body),
             404 => return .{
                 .entries = try alloc.alloc(types.ObjectVersionEntry, 0),
                 .is_truncated = false,
+            },
+            501 => return error.ObjectVersionListingUnsupported,
+            400 => {
+                if (std.mem.indexOf(u8, response.body, "<Code>NotImplemented</Code>") != null or std.mem.indexOf(u8, response.body, "<Code>UnsupportedOperation</Code>") != null) return error.ObjectVersionListingUnsupported;
+                return unexpectedStatusError(response.status);
             },
             else => return unexpectedStatusError(response.status),
         }
@@ -1351,7 +1388,39 @@ pub const Client = struct {
         );
     }
 
+    fn versionRetention(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, version: []const u8, cancellation: ?types.CancellationToken) !?types.VersionRetention {
+        const query = [_]QueryPair{ .{ .name = @constCast("retention"), .value = @constCast("") }, .{ .name = @constCast("versionId"), .value = @constCast(version) } };
+        var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, &query);
+        defer target.deinit(alloc);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, target, &.{}, null, null, 64 * 1024, cancellation);
+        defer response.deinit(alloc);
+        if (response.status != 200) return null;
+        // Some compatible endpoints omit this response header. Supplying an
+        // explicit version remains mandatory; a contradictory header fails.
+        if (response.version_id) |actual| if (!std.mem.eql(u8, actual, version)) return null;
+        return parseVersionRetention(response.body, response.server_date);
+    }
+    fn providerTime(self: *Client, alloc: Allocator, bucket: []const u8, cancellation: ?types.CancellationToken) !?u64 {
+        var target = try bucketTargetAlloc(alloc, self.cfg, bucket);
+        defer target.deinit(alloc);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .HEAD, target, &.{}, null, null, 64 * 1024, cancellation);
+        defer response.deinit(alloc);
+        if (response.status != 200) return null;
+        return @import("retention_time.zig").providerDateUpperBound(response.server_date orelse return null);
+    }
+    fn erasedVersionRetention(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, version: []const u8, token: ?types.CancellationToken) !?types.VersionRetention {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.versionRetention(alloc, bucket, key, version, token);
+    }
+    fn erasedProviderTime(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, token: ?types.CancellationToken) !?u64 {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.providerTime(alloc, bucket, token);
+    }
+
     const vtable: client_mod.Client.VTable = .{
+        .supports_object_versions = supportsObjectVersions,
+        .version_retention = erasedVersionRetention,
+        .provider_time = erasedProviderTime,
         .deinit = erasedDeinit,
         .bucket_exists = erasedBucketExists,
         .make_bucket = erasedMakeBucket,
@@ -1426,6 +1495,27 @@ pub const Client = struct {
         return try self.listObjectVersions(alloc, bucket, opts);
     }
 };
+
+fn parseVersionRetention(xml: []const u8, date: ?[]const u8) ?types.VersionRetention {
+    const time = @import("retention_time.zig");
+    const observed = time.providerDateUpperBound(date orelse return null) orelse return null;
+    // AWS includes the XML namespace on this root; accept only the documented
+    // namespace (or the plain root used by compatible endpoints).
+    const plain = "<Retention>";
+    const namespaced = "<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
+    const start = if (std.mem.indexOf(u8, xml, namespaced)) |offset| offset + namespaced.len else if (std.mem.indexOf(u8, xml, plain)) |offset| offset + plain.len else return null;
+    const end = std.mem.indexOfPos(u8, xml, start, "</Retention>") orelse return null;
+    const root = xml[start..end];
+    const mode = findBlock(root, "Mode", 0) orelse return null;
+    if (findBlock(root, "Mode", mode.end) != null) return null;
+    // Governance and legal holds can be revoked; only compliance is durable.
+    if (!std.mem.eql(u8, mode.inner, "COMPLIANCE")) return null;
+    const expiry = findBlock(root, "RetainUntilDate", 0) orelse return null;
+    if (findBlock(root, "RetainUntilDate", expiry.end) != null) return null;
+    const until = time.rfc3339(expiry.inner) orelse return null;
+    if (until <= observed) return null;
+    return .{ .observed_ms = observed, .until_ms = until };
+}
 
 const QueryPair = struct {
     name: []u8,
@@ -2213,6 +2303,7 @@ fn parseListResponse(alloc: Allocator, xml: []const u8) !types.ListResult {
 }
 
 fn parseListObjectVersionsResponse(alloc: Allocator, xml: []const u8) !types.ListObjectVersionsResult {
+    if (std.mem.indexOf(u8, xml, "<ListVersionsResult") == null or std.mem.indexOf(u8, xml, "</ListVersionsResult>") == null) return error.InvalidListVersionsResponse;
     var entries = std.ArrayListUnmanaged(types.ObjectVersionEntry).empty;
     errdefer {
         for (entries.items) |*entry| entry.deinit(alloc);
@@ -2822,7 +2913,7 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_checksum_mode = true, .expect_max_response_size = 4 },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-head", .checksum_type = .full_object, .expect_checksum_mode = true },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
-        .{ .method = .GET, .url_contains = "versions=", .status = 200, .body = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>docs/a.txt</Key><VersionId>v1</VersionId></Version></ListVersionsResult>" },
+        .{ .method = .GET, .url_contains = "versions=", .status = 200, .expect_max_response_size = 8 * 1024 * 1024, .body = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>docs/a.txt</Key><VersionId>v1</VersionId></Version></ListVersionsResult>" },
         .{ .method = .DELETE, .url_contains = "versionId=v1", .status = 204 },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };
@@ -3401,4 +3492,105 @@ test "s3 operation response ownership follows caller allocator across checksum f
     var put = try client.putObject("archive", "hn/file", "data", .{});
     defer put.deinit(operation_alloc);
     try std.testing.expect(state.calls >= 5);
+}
+
+test "s3 exact version retention requires compliance and provider time" {
+    const date = "Sun, 11 Oct 2026 12:34:56 GMT";
+    const locked = "<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>COMPLIANCE</Mode><RetainUntilDate>2026-10-12T12:34:56Z</RetainUntilDate></Retention>";
+    const proof = parseVersionRetention(locked, date).?;
+    try std.testing.expect(proof.protectsThrough(proof.observed_ms));
+    try std.testing.expect(!proof.protectsThrough(proof.until_ms));
+    try std.testing.expect(parseVersionRetention(locked, null) == null);
+    try std.testing.expect(parseVersionRetention(locked, "Mon, 12 Oct 2026 12:34:56 GMT") == null);
+    try std.testing.expect(parseVersionRetention("<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>", date) == null);
+    try std.testing.expect(parseVersionRetention("<Retention><Mode>COMPLIANCE</Mode><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>", date) == null);
+    const State = struct {
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, a: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, limit: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(?usize, 64 * 1024), limit);
+            if (method == .HEAD) {
+                try std.testing.expect(std.mem.endsWith(u8, url, "/bucket"));
+                return .{ .status = 200, .body = try a.alloc(u8, 0), .server_date = try a.dupe(u8, "Sun, 11 Oct 2026 12:34:56 GMT") };
+            }
+            try std.testing.expectEqual(HttpMethod.GET, method);
+            try std.testing.expect(std.mem.endsWith(u8, url, "/bucket/folder/key?retention=&versionId=v%2B1"));
+            return .{ .status = 200, .body = try a.dupe(u8, "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2026-10-12T12:34:56Z</RetainUntilDate></Retention>"), .server_date = try a.dupe(u8, "Sun, 11 Oct 2026 12:34:56 GMT"), .version_id = try a.dupe(u8, "v+1") };
+        }
+    };
+    const a = std.testing.allocator;
+    const cfg: Config = .{ .credentials = .{ .endpoint = try a.dupe(u8, "example.com"), .use_ssl = true, .access_key_id = try a.dupe(u8, "key"), .secret_access_key = try a.dupe(u8, "secret"), .region = try a.dupe(u8, "us-east-1") }, .addressing_style = .path };
+    var state: State = .{};
+    var provider = Client.initWithRequestFn(a, cfg, &state, State.request);
+    var client = provider.client();
+    defer client.deinit();
+    try std.testing.expect((try client.versionRetention("bucket", "folder/key", "null", null)) == null);
+    try std.testing.expect((try client.versionRetention("bucket", "folder/key", "", null)) == null);
+    const remote = (try client.versionRetention("bucket", "folder/key", "v+1", null)).?;
+    try std.testing.expectEqual(proof.until_ms, remote.until_ms);
+    try std.testing.expect(remote.observed_ms > proof.observed_ms);
+    try std.testing.expect((try client.providerTime("bucket", null)).? > proof.observed_ms);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expect((try client.immutablePrefixUntil("bucket", "folder/", null)) == null);
+}
+
+test "s3 exact reads reject contradictory response versions and retain qualified selectors" {
+    const a = std.testing.allocator;
+    const State = struct {
+        response_version: ?[]const u8 = "v2",
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(std.mem.indexOf(u8, url, "versionId=v1") != null);
+            const body = try alloc.dupe(u8, if (method == .HEAD) "" else "x");
+            errdefer alloc.free(body);
+            return .{ .status = 200, .body = body, .content_length = 1, .version_id = if (method == .HEAD) null else if (self.response_version) |version| try alloc.dupe(u8, version) else null };
+        }
+    };
+    const cfg: Config = .{ .credentials = .{ .endpoint = try a.dupe(u8, "example.com"), .use_ssl = true, .access_key_id = try a.dupe(u8, "key"), .secret_access_key = try a.dupe(u8, "secret"), .region = try a.dupe(u8, "us-east-1") }, .addressing_style = .path };
+    var state: State = .{};
+    var provider = Client.initWithRequestFn(a, cfg, &state, State.request);
+    var client = provider.client();
+    defer client.deinit();
+    for ([_]bool{ false, true }) |skip| {
+        state.response_version = "v2";
+        try std.testing.expectError(error.PreconditionFailed, client.getObject("bucket", "key", .{ .version_id = "v1", .skip_metadata_probe = skip, .max_response_bytes = 1 }));
+        state.response_version = null;
+        var result = try client.getObject("bucket", "key", .{ .version_id = "v1", .skip_metadata_probe = skip, .max_response_bytes = 1 });
+        defer result.deinit(a);
+        try std.testing.expectEqualStrings("v1", result.metadata.version_id.?);
+        try std.testing.expectEqualStrings("x", result.body);
+    }
+}
+
+test "s3 version capabilities preserve unversioned compatible endpoints and permission failures" {
+    const a = std.testing.allocator;
+    const State = struct {
+        status: u16 = 200,
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, _: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expect(std.mem.indexOf(u8, url, "versions=") != null);
+            return .{ .status = self.status, .body = try alloc.dupe(u8, "<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>") };
+        }
+    };
+    var state: State = .{};
+    for ([_][]const u8{ "example.com", "account.r2.cloudflarestorage.com" }, 0..) |endpoint, index| {
+        const cfg: Config = .{ .credentials = .{ .endpoint = try a.dupe(u8, endpoint), .use_ssl = true, .access_key_id = try a.dupe(u8, "key"), .secret_access_key = try a.dupe(u8, "secret"), .region = try a.dupe(u8, "us-east-1") }, .addressing_style = .path };
+        var provider = Client.initWithRequestFn(a, cfg, &state, State.request);
+        var client = provider.client();
+        defer client.deinit();
+        if (index == 1) {
+            const before = state.calls;
+            try std.testing.expect(!try client.supportsObjectVersions("bucket", null));
+            try std.testing.expectEqual(before, state.calls);
+        } else {
+            try std.testing.expect(try client.supportsObjectVersions("bucket", null));
+            state.status = 501;
+            try std.testing.expect(!try client.supportsObjectVersions("bucket", null));
+            state.status = 403;
+            try std.testing.expectError(error.AccessDenied, client.supportsObjectVersions("bucket", null));
+        }
+    }
 }

@@ -49,7 +49,16 @@ pub fn httpDate(text: []const u8) ?u64 {
         month = index;
         break;
     };
-    return utc(digits(text[12..16]) orelse return null, month orelse return null, digits(text[5..7]) orelse return null, digits(text[17..19]) orelse return null, digits(text[20..22]) orelse return null, digits(text[23..25]) orelse return null);
+    const value = utc(digits(text[12..16]) orelse return null, month orelse return null, digits(text[5..7]) orelse return null, digits(text[17..19]) orelse return null, digits(text[20..22]) orelse return null, digits(text[23..25]) orelse return null) orelse return null;
+    const names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    if (!std.mem.eql(u8, text[0..3], names[(value / std.time.ms_per_day + 4) % 7])) return null;
+    return value;
+}
+/// HTTP Date has whole-second precision. Treat the entire stated second as
+/// elapsed before comparing expiry; a fractional expiry must never gain 999ms
+/// of unsupported protection. Callers also account for transport elapsed time.
+pub fn providerDateUpperBound(text: []const u8) ?u64 {
+    return std.math.add(u64, httpDate(text) orelse return null, 999) catch null;
 }
 test "provider retention timestamps reject malformed dates and truncate expiry conservatively" {
     try std.testing.expectEqual(@as(?u64, 0), rfc3339("1970-01-01T00:00:00Z"));
@@ -58,4 +67,6 @@ test "provider retention timestamps reject malformed dates and truncate expiry c
     try std.testing.expect(rfc3339("2025-02-29T00:00:00Z") == null);
     try std.testing.expect(rfc3339("2024-02-29T00:00:00.Z") == null);
     try std.testing.expect(httpDate("Sun, 11 Oct 2026 12:34:56 UTC") == null);
+    try std.testing.expect(httpDate("Mon, 11 Oct 2026 12:34:56 GMT") == null);
+    try std.testing.expectEqual(@as(?u64, 999), providerDateUpperBound("Thu, 01 Jan 1970 00:00:00 GMT"));
 }

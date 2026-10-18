@@ -250,6 +250,26 @@ pub fn appendEqualityColumnPart(alloc: Allocator, out: *std.ArrayListUnmanaged(u
         return;
     }
     switch (column.values) {
+        .decimal128 => |values| {
+            const text = try values.text(alloc, row);
+            defer alloc.free(text);
+            try appendBytesEqualityKeyPart(alloc, out, text);
+        },
+        .encoded => |values| switch (try values.at(row)) {
+            .integer => |value| {
+                try out.append(alloc, 2);
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(i64, &bytes, value, .little);
+                try out.appendSlice(alloc, &bytes);
+            },
+            .float => |value| try appendF64EqualityKeyPart(alloc, out, value),
+            .string => |value| try appendBytesEqualityKeyPart(alloc, out, value),
+            .bool => |value| {
+                try out.append(alloc, 4);
+                try out.append(alloc, @intFromBool(value));
+            },
+            else => return error.UnsupportedIcebergEqualityDeleteColumn,
+        },
         .bytes => |values| try appendBytesEqualityKeyPart(alloc, out, values[row]),
         .dictionary_bytes => |values| try appendBytesEqualityKeyPart(alloc, out, values.at(row)),
         .json, .vector_f32 => return error.UnsupportedIcebergEqualityDeleteColumn,

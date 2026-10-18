@@ -15,7 +15,7 @@
 
 //! Grace hash join: sequentially partition both relations, then retain one
 //! build partition. Oversized partitions repartition on remaining hash bits;
-//! indistinguishable/skewed keys keep the bounded disk-chain fallback.
+//! indistinguishable/skewed keys use bounded typed block nested loops.
 const std = @import("std");
 const operators = @import("operators.zig");
 const spill = @import("spill.zig");
@@ -31,6 +31,7 @@ pub const Join = struct {
         left_width: usize,
         right_width: usize,
         flipped: bool = false,
+        output_order: ?[]const usize = null,
     };
 
     // Exact summary of admitted build hashes. A split decision never needs a
@@ -80,6 +81,10 @@ pub const Join = struct {
     probe_input: ?spill.Sequential.InputBlock = null,
     probe_input_index: usize = 0,
     hash: ?*operators.HashJoin = null,
+    skew: ?*@import("skew_join.zig").Join = null,
+    skew_blocks_read: usize = 0,
+    vector_residual_batches: usize = 0,
+    scalar_residual_rows: usize = 0,
     probe: ?operators.HashJoin.Probe = null,
     left: ?[]const Datum = null,
     matched: bool = false,
@@ -390,6 +395,8 @@ pub const Join = struct {
         if (self.probe_input) |*block| block.deinit();
         self.probe_input = null;
         self.probe_input_index = 0;
+        if (self.skew) |skew| skew.close();
+        self.skew = null;
         if (self.hash) |hash| hash.deinit();
         self.hash = null;
         self.probe = null;
@@ -451,6 +458,7 @@ pub const Join = struct {
     }
     pub fn accept(self: *Join, index: usize) !void {
         if (self.active_join) |child| return child.accept(index);
+        if (self.skew) |skew| return skew.accept(index);
         self.matched = true;
         if (self.outer_right) try self.hash.?.markMatched(index);
     }
@@ -463,7 +471,7 @@ pub const Join = struct {
         const parent = &self.active.?;
         const available = differences & ~parent.used_bits;
         // Identical key hashes cannot be separated. Cap depth and file count
-        // independently of relation size; those cases retain disk probing.
+        // independently of relation size; those cases use block nested loops.
         if (available == 0 or parent.depth == self.pending.len) return false;
         const bit = @as(u64, 1) << @as(u6, @intCast(@ctz(available)));
         var children = [_]Task{
@@ -518,8 +526,28 @@ pub const Join = struct {
         self.repartitions += 1;
         return true;
     }
+    fn compactSkewInput(self: *Join, source: *spill.Sequential) !void {
+        var compact = try spill.Sequential.init(self.manager, @max(512, @min(32 * 1024, self.limits.bytes / 16)));
+        errdefer compact.close();
+        compact.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 64));
+        source.rewind();
+        var offset: u64 = 0;
+        while (offset < source.size) {
+            var input = try source.readInputBlockBorrowed(offset);
+            defer input.deinit();
+            const block = input.view();
+            for (0..block.count()) |row| {
+                _ = self.scratch.reset(.retain_capacity);
+                _ = try compact.append(try block.row(self.scratch.allocator(), row), spill.none);
+            }
+            offset += block.count();
+        }
+        try compact.seal();
+        source.close();
+        source.* = compact;
+    }
     fn prepare(self: *Join) anyerror!bool {
-        while (self.hash == null) {
+        while (self.hash == null and self.skew == null) {
             try self.manager.check();
             if (self.active == null) {
                 if (self.pending_count != 0) {
@@ -544,7 +572,6 @@ pub const Join = struct {
             var repartitioned = false;
             if (self.active.?.build) |*file| {
                 var offset: u64 = 0;
-                var skew_fallback = false;
                 while (offset < file.size) {
                     var input = try file.readInputBlock(offset);
                     defer input.deinit();
@@ -559,13 +586,7 @@ pub const Join = struct {
                         for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
                         key.* = row;
                     }
-                    if (skew_fallback) {
-                        try self.hash.?.addBatch(self.a, values, keys[0..block.count()]);
-                        offset += block.count();
-                        continue;
-                    }
                     const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
-                    const following = offset + block.count();
                     offset += consumed;
                     if (consumed == block.count()) continue;
                     // Exact ingestion summaries include unread blocks. Do
@@ -576,16 +597,22 @@ pub const Join = struct {
                         repartitioned = true;
                         break;
                     }
-                    skew_fallback = true;
-                    // The current compact input still owns the declined
-                    // suffix. Transfer it directly and keep the forward cursor.
-                    const positions = try a.alloc(usize, block.count() - consumed);
-                    for (positions, consumed..) |*position, index| position.* = index;
-                    try self.hash.?.addBatch(self.a, try values.select(a, positions), keys[consumed..block.count()]);
-                    offset = following;
+                    // No useful hash split remains. Keep the typed partition
+                    // and replay it per probe block, not per probe row.
+                    self.hash.?.deinit();
+                    self.hash = null;
+                    try self.compactSkewInput(file);
+                    if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
+                    self.skew = try @import("skew_join.zig").Join.create(self.manager, self.outer_left, self.outer_right);
+                    file.rewind();
+                    break;
                 }
             }
             if (repartitioned) continue;
+            if (self.skew != null) {
+                self.partitions_loaded += 1;
+                return true;
+            }
             if (self.active.?.build) |*file| file.close();
             self.active.?.build = null;
             self.partitions_loaded += 1;
@@ -630,6 +657,20 @@ pub const Join = struct {
                 .values => null,
             };
         }
+        fn same(self: NativeRow, other: NativeRow) bool {
+            return switch (self.source) {
+                .probe => |block| other.source == .probe and block == other.source.probe,
+                .build => |store| other.source == .build and store == other.source.build,
+                else => false,
+            };
+        }
+        fn batch(self: NativeRow, a: A) !?Batch {
+            return switch (self.source) {
+                .probe => |block| try @constCast(block).batch(a, false),
+                .build => |store| .{ .retained = .{ .store = store, .begin = 0, .count = store.len } },
+                else => null,
+            };
+        }
         fn row(self: NativeRow, a: A) ![]const Datum {
             const values = try a.alloc(Datum, self.width);
             for (values, 0..) |*value, column| value.* = try self.cell(a, column);
@@ -650,7 +691,7 @@ pub const Join = struct {
                 return .{ .source = .{ .probe = block }, .index = self.source.disk.row, .width = self.width };
             }
             // Disk-chain matches borrow the decoder until the next candidate.
-            // Copy only accepted fallback rows, including nested payloads.
+            // Retain staged fallback rows, including nested payloads.
             if (self.source == .values) {
                 const values = try a.alloc(Datum, self.source.values.len);
                 for (values, self.source.values) |*dest, value| dest.* = try operators.cloneDatum(a, value);
@@ -700,28 +741,62 @@ pub const Join = struct {
             const location = try self.locate(row, column);
             return if (location.source) |source| source.frozen(location.column) else null;
         }
+        fn selectedSource(self: *@This(), a: A, column: usize, selected: ?[]const usize) !?struct { batch: Batch, column: usize, rows: []usize } {
+            const count = if (selected) |indices| indices.len else self.rows.len;
+            if (count == 0) return null;
+            const first = try self.locate(if (selected) |indices| indices[0] else 0, column);
+            const source = first.source orelse return null;
+            const batch_ = (try source.batch(a)) orelse return null;
+            const rows = try a.alloc(usize, count);
+            var retained = false;
+            defer if (!retained) a.free(rows);
+            for (rows, 0..) |*row, lane| {
+                const current = try self.locate(if (selected) |indices| indices[lane] else lane, column);
+                const value = current.source orelse return null;
+                if (current.column != first.column or !source.same(value)) return null;
+                row.* = value.index;
+            }
+            retained = true;
+            return .{ .batch = batch_, .column = first.column, .rows = rows };
+        }
+        fn physical(raw: *anyopaque, a: A, column: usize, selected: ?[]const usize) !?@import("execution_batch.zig").PhysicalColumn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const source = (try self.selectedSource(a, column, selected)) orelse return null;
+            return source.batch.physicalColumnSelected(a, source.column, source.rows);
+        }
+        fn decimal(raw: *anyopaque, a: A, column: usize, selected: ?[]const usize) !?@import("execution_batch.zig").DecimalColumn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const source = (try self.selectedSource(a, column, selected)) orelse return null;
+            return source.batch.decimalColumnSelected(a, source.column, source.rows);
+        }
         fn batch(self: *@This()) Batch {
-            return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .count = self.rows.len, .width = self.evaluation.left_width + self.evaluation.right_width } };
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_physical_selected = physical, .read_decimal_selected = decimal, .count = self.rows.len, .width = self.evaluation.left_width + self.evaluation.right_width } };
         }
     };
     fn nativeProbe(self: *Join) NativeRow {
         return .{ .source = .{ .probe = self.probe_input.?.view() }, .index = self.probe_input_index - 1, .width = self.probe_input.?.view().width() };
     }
-    fn acceptNative(self: *Join, a: A, view: *NativeRows, match: ?usize) !bool {
-        if (match) |index| {
-            if (view.evaluation.condition) |program| {
-                const cells = try self.scalar_row.prepare(self.a, view.evaluation.left_width + view.evaluation.right_width);
-                for (program.required_columns) |logical| {
-                    if (logical >= cells.len) return error.InvalidSqlBackendResponse;
-                    const physical = if (!view.evaluation.flipped) logical else if (logical < view.evaluation.right_width) view.evaluation.left_width + logical else logical - view.evaluation.right_width;
-                    cells[logical] = try NativeRows.cell(view, a, 0, physical);
-                }
-                const accepted = try program.evaluate(a, cells, view.evaluation.parameters, view.evaluation.limits);
-                if (accepted.sql_null) return false;
-                if (accepted.value != .bool) return error.SqlTypeMismatch;
-                if (!accepted.value.bool) return false;
+    fn vectorResidualAllowed(limits: @import("scalar.zig").EvalLimits) bool {
+        const defaults: @import("scalar.zig").EvalLimits = .{};
+        // Native kernels retain the ordinary expression budgets. Custom scalar
+        // budgets and decision execution must use the evaluator that owns them.
+        return limits.steps == defaults.steps and limits.input_bytes == defaults.input_bytes and
+            limits.output_bytes == defaults.output_bytes and limits.depth == defaults.depth and
+            limits.decision_values == null and limits.decision_demand == null;
+    }
+    fn evaluateNative(self: *Join, a: A, view: *NativeRows) !bool {
+        if (view.evaluation.condition) |program| {
+            const cells = try self.scalar_row.prepare(self.a, view.evaluation.left_width + view.evaluation.right_width);
+            for (program.required_columns) |logical| {
+                if (logical >= cells.len) return error.InvalidSqlBackendResponse;
+                const original = if (view.evaluation.output_order) |order| order[logical] else logical;
+                const physical = if (!view.evaluation.flipped) original else if (original < view.evaluation.right_width) view.evaluation.left_width + original else original - view.evaluation.right_width;
+                cells[logical] = try NativeRows.cell(view, a, 0, physical);
             }
-            try self.accept(index);
+            const accepted = try program.evaluate(a, cells, view.evaluation.parameters, view.evaluation.limits);
+            if (accepted.sql_null) return false;
+            if (accepted.value != .bool) return error.SqlTypeMismatch;
+            if (!accepted.value.bool) return false;
         }
         return true;
     }
@@ -755,53 +830,124 @@ pub const Join = struct {
             child.close();
             self.active_join = null;
         };
-        var rows: std.ArrayList(NativePair) = .empty;
-        var bytes: usize = 0;
-        while (rows.items.len < maximum) {
-            const pair = (self.nextNativePair(rows.items.len == 0) catch |err| {
-                if (failure) |out| {
-                    out.* = err;
+        while (true) {
+            _ = self.candidate.reset(.{ .retain_with_limit = @min(64 * 1024, self.limits.bytes / 16) });
+            const work = self.candidate.allocator();
+            var candidates: std.ArrayList(NativePair) = .empty;
+            var candidate_bytes: usize = 0;
+            var upstream: ?anyerror = null;
+            while (candidates.items.len < maximum) {
+                const pair = (self.nextNativePair(candidates.items.len == 0) catch |err| {
+                    upstream = err;
                     break;
+                }) orelse break;
+                pair.append(work, &candidates, self) catch |err| {
+                    upstream = err;
+                    break;
+                };
+                candidate_bytes +|= @sizeOf(NativePair);
+                for ([_]?NativeRow{ pair.left, pair.right }) |side| if (side) |value| {
+                    if (value.source == .values) {
+                        for (value.source.values) |cell_| candidate_bytes +|= try @import("typed_store.zig").retainedCellBytes(cell_);
+                    }
+                };
+                var retained_bytes = candidate_bytes;
+                for (self.native_disk_leases.items) |block| retained_bytes +|= block.retainedBytes();
+                if (candidates.items.len * @sizeOf(NativePair) >= self.limits.bytes / 64 or retained_bytes >= @max(4096, self.limits.bytes / 8)) break;
+            }
+            if (candidates.items.len == 0) {
+                if (upstream) |err| {
+                    if (failure) |out| out.* = err else return err;
                 }
-                return err;
-            }) orelse break;
-            _ = self.scratch.reset(.retain_capacity);
-            const scratch = self.scratch.allocator();
-            var candidate: NativeRows = .{ .rows = &.{pair}, .evaluation = self.evaluation.? };
-            const accepted = self.acceptNative(scratch, &candidate, pair.match) catch |err| {
+                return .{ .rows = &.{} };
+            }
+            var candidate: NativeRows = .{ .rows = candidates.items, .evaluation = self.evaluation.? };
+            var inner: std.ArrayList(usize) = .empty;
+            for (candidates.items, 0..) |pair, row| if (pair.match != null) try inner.append(work, row);
+            var decisions: ?Batch = null;
+            if (self.evaluation.?.condition) |program| if (inner.items.len >= 2 and vectorResidualAllowed(self.evaluation.?.limits)) {
+                if (self.evaluation.?.limits.checkpoint) |check| try check(self.evaluation.?.limits.checkpoint_context);
+                const source_batch = try work.create(Batch);
+                source_batch.* = candidate.batch();
+                const physical = try work.create(Batch);
+                physical.* = try source_batch.select(work, inner.items);
+                const width = physical.width();
+                const ordinals = try work.alloc(usize, width);
+                const types = try work.alloc(@import("scalar.zig").Type, width);
+                const definitions = try work.alloc(@import("scalar.zig").Column, width);
+                const names = try work.alloc([]const u8, width);
+                const selection = try work.alloc(usize, inner.items.len);
+                for (selection, 0..) |*row, i| row.* = i;
+                for (ordinals, types, definitions, names, 0..) |*ordinal, *type_, *definition, *name, logical| {
+                    const original = if (self.evaluation.?.output_order) |order| order[logical] else logical;
+                    ordinal.* = if (!self.evaluation.?.flipped) original else if (original < self.evaluation.?.right_width) self.evaluation.?.left_width + original else original - self.evaluation.?.right_width;
+                    type_.* = .{ .kind = .json };
+                    for (program.instructions) |instruction| if (instruction.operation == .column and instruction.operation.column == logical) {
+                        type_.* = instruction.type;
+                        break;
+                    };
+                    name.* = try std.fmt.allocPrint(work, "c{d}", .{logical});
+                    definition.* = .{ .name = name.*, .type = type_.kind orelse .json, .element_type = type_.element_type };
+                }
+                const logical_batch = try work.create(Batch);
+                logical_batch.* = .{ .mapped = .{ .source = physical, .ordinals = ordinals, .types = types, .selection = selection } };
+                const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = logical_batch, .names = names }, .selection = selection };
+                const outputs = @import("vector_eval.zig").evaluateColumnsEncodedMany(work, &.{program}, page, definitions, self.evaluation.?.parameters, null) catch |err| blk: {
+                    if (!@import("errors.zig").isRowEvaluationError(err)) return err;
+                    break :blk null;
+                };
+                if (outputs) |values| if (values[0]) |value| {
+                    decisions = value;
+                    self.vector_residual_batches += 1;
+                };
+            };
+            var rows: std.ArrayList(NativePair) = .empty;
+            var lane: usize = 0;
+            for (candidates.items) |pair| {
+                if (pair.match) |index| {
+                    var accepted = true;
+                    if (decisions) |values| {
+                        const value = try values.cell(work, lane, 0);
+                        if (!value.sql_null and value.value != .bool) return error.SqlTypeMismatch;
+                        accepted = !value.sql_null and value.value.bool;
+                    } else if (self.evaluation.?.condition != null) {
+                        self.scalar_residual_rows += 1;
+                        var one: NativeRows = .{ .rows = &.{pair}, .evaluation = self.evaluation.? };
+                        // Scalar fallback preserves the first demanded error and prefix.
+                        accepted = self.evaluateNative(work, &one) catch |err| {
+                            upstream = err;
+                            break;
+                        };
+                    }
+                    lane += 1;
+                    if (!accepted) continue;
+                    if (self.skew) |skew| try skew.acceptAt(index, pair.left.?.index) else try self.accept(index);
+                }
+                rows.append(a, pair) catch |err| {
+                    upstream = err;
+                    break;
+                };
+            }
+            if (upstream) |err| {
+                if (failure) |out| out.* = err else return err;
+            }
+            if (rows.items.len == 0 and upstream == null) {
+                self.releaseNativeDiskLeases();
+                continue;
+            }
+            if (rows.items.len == 0) return .{ .rows = &.{} };
+            const view = a.create(NativeRows) catch |err| {
                 if (failure) |out| {
                     out.* = err;
-                    break;
+                    return .{ .rows = &.{} };
                 }
                 return err;
             };
-            if (!accepted) continue;
-            const batch = candidate.batch();
-            var cost: usize = @sizeOf(NativePair);
-            const copied = if (pair.right) |right| right.source == .values or right.source == .disk else false;
-            for (0..if (copied) batch.width() else 0) |column| cost +|= batch.cellBytes(scratch, 0, column) catch |err| {
-                if (failure) |out| {
-                    out.* = err;
-                    break;
-                }
-                return err;
-            };
-            if (failure) |out| if (out.* != null) break;
-            pair.append(a, &rows, self) catch |err| {
-                if (failure) |out| {
-                    out.* = err;
-                    break;
-                }
-                return err;
-            };
-            bytes +|= cost;
-            if (bytes >= self.limits.bytes / 32) break;
+            view.* = .{ .rows = rows.items, .evaluation = self.evaluation.? };
+            return view.batch();
         }
-        if (rows.items.len == 0) return .{ .rows = &.{} };
-        const view = try a.create(NativeRows);
-        view.* = .{ .rows = rows.items, .evaluation = self.evaluation.? };
-        return view.batch();
     }
+
     pub fn next(self: *Join) anyerror!?Pair {
         self.releaseNativeDiskLeases();
         try self.finishInputs();
@@ -812,11 +958,26 @@ pub const Join = struct {
         return .{ .left = if (pair.left) |left| try left.row(a) else null, .right = if (pair.right) |right| try right.row(a) else null, .match = pair.match };
     }
     fn nextNativePair(self: *Join, may_advance: bool) anyerror!?NativePair {
-        if (!may_advance and self.hash == null) return null;
+        if (!may_advance and self.hash == null and self.skew == null) return null;
         while (try self.prepare()) {
             try self.manager.check();
+            if (self.skew) |skew| {
+                if (try skew.nextNative(&self.active.?.build.?, if (self.active.?.probes) |*file| file else null, may_advance)) |pair| return .{
+                    .left = if (pair.left) |row| .{ .source = .{ .probe = row.block }, .index = row.index, .width = row.block.width() } else null,
+                    .right = if (pair.right) |row| .{ .source = .{ .probe = row.block }, .index = row.index, .width = row.block.width() } else null,
+                    .match = pair.match,
+                };
+                if (!may_advance) return null;
+                self.skew_blocks_read += skew.blocks_read;
+                skew.close();
+                self.skew = null;
+                self.active.?.close();
+                self.active = null;
+                continue;
+            }
             if (self.probe) |*probe| {
                 if (try probe.next()) |match| return .{ .left = self.nativeProbe(), .right = NativeRow.build(match), .match = match.index };
+                if (!may_advance) return null;
                 self.probe = null;
                 if (!self.matched and self.outer_left) return .{ .left = self.nativeProbe(), .right = null };
             }
@@ -1224,6 +1385,103 @@ test "SQL compact probe blocks retain rows through duplicate matches and early c
     }
 }
 
+test "SQL partitioned join block skew fallback preserves residual outer matches and bounded replay" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const join = try Join.create(a, &manager, 32 * 1024, 2000, 0, true, true);
+    defer join.close();
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..1200) |i| try join.add(true, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    for (0..40) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    var accepted: usize = 0;
+    var left_only: usize = 0;
+    var right_only: usize = 0;
+    while (try join.next()) |pair| {
+        if (pair.match) |match| {
+            if (pair.left.?[0].value.integer == pair.right.?[0].value.integer and pair.left.?[0].value.integer < 20) {
+                try join.accept(match);
+                accepted += 1;
+            }
+        } else if (pair.left != null) left_only += 1 else right_only += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 20), accepted);
+    try std.testing.expectEqual(@as(usize, 20), left_only);
+    try std.testing.expectEqual(@as(usize, 1180), right_only);
+    try std.testing.expect(join.skew_blocks_read != 0);
+    try std.testing.expect(join.skew_blocks_read < 1200 * 4);
+    std.debug.print("SQL skew join: candidates=48000 typed_build_block_decodes={d}\n", .{join.skew_blocks_read});
+}
+
+fn skewEarlyClose(a: A) !void {
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var build = try spill.Sequential.init(&manager, 1024);
+    defer build.close();
+    var probes = try spill.Sequential.init(&manager, 1024);
+    defer probes.close();
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..3) |i| _ = try build.append(.{ .values = &.{Datum.json(.{ .integer = @intCast(i) })}, .keys = &.{key}, .ordinal = i }, spill.none);
+    _ = try probes.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = 0 }, spill.none);
+    try build.seal();
+    try probes.seal();
+    const skew = try @import("skew_join.zig").Join.create(&manager, true, true);
+    defer skew.close();
+    const first = (try skew.next(&build, &probes)) orelse return error.TestUnexpectedResult;
+    try skew.accept(first.match orelse return error.TestUnexpectedResult);
+}
+
+test "SQL partitioned join block skew releases typed inputs and match state on early close and allocation faults" {
+    try skewEarlyClose(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, skewEarlyClose, .{});
+}
+
+test "SQL parallel partition residuals use logical output permutations" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |flipped| {
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        defer manager.deinit();
+        var compiled = try @import("compiler.zig").compileScalar(a, if (flipped) "rk=lk AND rv-lv = -10000" else "rk=lk AND rv-lv = 10000", .{});
+        defer compiled.deinit();
+        var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "rk", .type = .integer }, .{ .name = "rv", .type = .integer }, .{ .name = "lk", .type = .integer }, .{ .name = "lv", .type = .integer } }, &.{}, .{});
+        defer condition.deinit();
+        const join = try Join.create(a, &manager, 512 * 1024, 10000, 200000, false, false);
+        defer join.close();
+        join.evaluation = .{ .condition = &condition, .left_width = 2, .right_width = 2, .flipped = flipped, .output_order = &.{ 2, 3, 0, 1 } };
+        for (0..512) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(true, &.{ key, Datum.json(.{ .integer = @intCast(i + 20000) }) }, &.{key}, i);
+        }
+        for (0..512) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(false, &.{ key, Datum.json(.{ .integer = @intCast(i + 10000) }) }, &.{key}, i);
+        }
+        var count: usize = 0;
+        while (try join.nextTypedBatch(137)) |view| {
+            defer view.deinit();
+            for (0..view.count) |row| {
+                const values = view.values();
+                const left = (try values.cell(a, row, 1)).value.integer;
+                const right = (try values.cell(a, row, 3)).value.integer;
+                try std.testing.expectEqual(@as(i64, 10000), right - left);
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 512), count);
+        try std.testing.expect(join.parallel_partitions_completed > 1);
+    }
+}
+
 const NativeJoinFixture = struct {
     text: []const u8 = "{\"x\":9007199254740993,\"items\":[1,2,3]}",
     frozen: ?@import("execution_batch.zig").FrozenJson = null,
@@ -1574,7 +1832,7 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
             join.parallel_builds = false;
             join.evaluation = .{ .left_width = 1, .right_width = 2 };
             const key = Datum.json(.{ .integer = 7 });
-            // Distinct large strings force the bounded disk-chain fallback.
+            // Distinct large strings force the bounded block-skew fallback.
             var text: [2048]u8 = @splat('x');
             for (0..32) |i| {
                 text[0] = @as(u8, @intCast(i)) + 'A';
@@ -1588,7 +1846,7 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
                 try std.testing.expectEqual(@as(usize, 0), batch.len());
                 try std.testing.expect(failure != null);
                 try std.testing.expectEqual(error.OutOfMemory, failure.?);
-                try std.testing.expect(join.hash.?.disk != null);
+                try std.testing.expect(join.skew != null or (join.hash != null and join.hash.?.disk != null));
                 return;
             }
             var page = std.heap.ArenaAllocator.init(a);
@@ -1600,6 +1858,7 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
                 _ = page.reset(.free_all);
                 const batch = try join.nextBatch(page.allocator(), 91, null);
                 if (join.hash) |hash| saw_disk = saw_disk or hash.disk != null;
+                saw_disk = saw_disk or join.skew != null;
                 if (batch.len() == 0) break;
                 // Read only after the entire delivery page has been staged.
                 // This catches mutable probe selections and transient disks.
@@ -1622,4 +1881,45 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
     for ([_]bool{ false, true }) |disk| try Fixture.run(std.testing.allocator, disk, false);
     try Fixture.run(std.testing.allocator, true, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ false, false });
+}
+
+test "SQL partitioned vector residual batches preserve skew outer matches" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "l = r", .{});
+    defer compiled.deinit();
+    var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{}, .{});
+    defer condition.deinit();
+    const join = try Join.create(a, &manager, 32 * 1024, 2000, 0, true, true);
+    defer join.close();
+    join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 1 };
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..1200) |i| try join.add(true, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    for (0..40) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    var accepted: usize = 0;
+    var unmatched: usize = 0;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    while (true) {
+        _ = arena.reset(.free_all);
+        const batch = try join.nextBatch(arena.allocator(), 64, null);
+        if (batch.len() == 0) break;
+        for (0..batch.len()) |row| {
+            const left = try batch.cell(arena.allocator(), row, 0);
+            const right = try batch.cell(arena.allocator(), row, 1);
+            if (left.sql_null or right.sql_null) unmatched += 1 else {
+                try std.testing.expectEqual(left.value.integer, right.value.integer);
+                accepted += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 40), accepted);
+    try std.testing.expectEqual(@as(usize, 1160), unmatched);
+    try std.testing.expect(join.skew_blocks_read > 0);
+    try std.testing.expect(join.vector_residual_batches > 0);
+    try std.testing.expect(join.scalar_residual_rows < 1200 * 40 / 2);
 }

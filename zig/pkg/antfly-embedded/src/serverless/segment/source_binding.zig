@@ -196,7 +196,12 @@ pub fn validateBatchSnapshotAgainstBinding(binding: Binding, batch: rowsource.Co
     if (!std.mem.eql(u8, binding.snapshot_id, batch.snapshot.snapshot_id)) {
         return error.SidecarSourceBindingMismatch;
     }
-    for (batch.row_refs) |row_ref| {
+    if (batch.external_span) |span| {
+        try validateRowRefAgainstBinding(binding, .{ .external = span.first });
+        return;
+    }
+    for (0..batch.rowCount()) |row_index| {
+        const row_ref = batch.rowRef(row_index);
         try validateRowRefAgainstBinding(binding, row_ref);
     }
 }

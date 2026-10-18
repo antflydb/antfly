@@ -108,6 +108,8 @@ pub const WritePolicy = enum(u8) {
 pub const ObjectMutability = enum { mutable, immutable };
 
 pub const Binding = struct {
+    /// Durable source epoch, independent of derived index availability.
+    row_identity_version: u8 = 1,
     table_id: []const u8,
     format: external_source.Format,
     source_uri: []const u8,
@@ -119,6 +121,7 @@ pub const Binding = struct {
     catalog: ?@import("lake_catalog/types.zig").Config = null,
 
     pub fn validate(self: Binding) !void {
+        if (self.row_identity_version != 1 and self.row_identity_version != 2) return error.InvalidExternalTableBinding;
         if (self.table_id.len == 0) return error.InvalidExternalTableBinding;
         if (self.source_uri.len == 0) return error.InvalidExternalTableBinding;
         if (self.schema_fingerprint.len == 0) return error.InvalidExternalTableBinding;

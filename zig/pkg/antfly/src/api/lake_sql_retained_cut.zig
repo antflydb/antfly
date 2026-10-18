@@ -54,7 +54,7 @@ pub fn save(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io,
     const scope = try artifacts.UploadScope.forPublication(domain(descriptor.table_id, identity), descriptor.expires_ms, io);
     var object = try store.putScoped(scope, bytes, cancellation);
     defer object.deinit(store.allocator);
-    return std.fmt.allocPrint(a, "{s}{s}:{d}", .{ prefix, object.artifact_id, object.byte_len });
+    return @import("lake_generation_envelope.zig").encode(a, prefix, object);
 }
 pub fn load(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table: catalog.Table, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
     const value = try loadDescriptor(a, store, identity, token, table.id, now, cancellation);
@@ -63,13 +63,12 @@ pub fn load(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []co
 }
 pub fn loadDescriptor(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table_id: u64, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
     if (!std.mem.startsWith(u8, token, prefix)) return error.CatalogGenerationChanged;
-    const at = std.mem.lastIndexOfScalar(u8, token, ':') orelse return error.CatalogGenerationChanged;
-    const id = token[prefix.len..at];
+    const envelope = try @import("lake_generation_envelope.zig").decode(a, prefix, token, max_bytes);
+    defer if (envelope.generation) |generation| a.free(generation);
+    const id = envelope.id;
     const scope = (try artifacts.uploadScopeFromArtifactId(id)) orelse return error.CatalogGenerationChanged;
     if (!std.mem.eql(u8, &scope.domain, &domain(table_id, identity))) return error.CatalogGenerationChanged;
-    const size = std.fmt.parseInt(u64, token[at + 1 ..], 10) catch return error.CatalogGenerationChanged;
-    if (size > max_bytes or size == 0) return error.QueryCandidateBudgetExceeded;
-    const bytes = try store.getVerifiedAllocWithCancellation(id, size, try artifacts.sha256ChecksumFromArtifactId(id), cancellation);
+    const bytes = try @import("lake_generation_envelope.zig").read(store, envelope, cancellation);
     defer store.allocator.free(bytes);
     const value = try std.json.parseFromSliceLeaky(Descriptor, a, bytes, .{ .allocate = .alloc_always });
     if (value.version != 1 or value.table_id != table_id or value.expires_ms <= now or value.expires_ms != scope.fencingToken()) return error.CatalogGenerationChanged;

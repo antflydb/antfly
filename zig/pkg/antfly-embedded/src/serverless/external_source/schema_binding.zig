@@ -138,6 +138,11 @@ pub fn externalBindingFromSchemaJsonAlloc(
     const catalog_owned = if (source.get("catalog")) |value| try std.json.parseFromValue(@import("lake_catalog/types.zig").Config, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (catalog_owned) |value| value.deinit();
     const binding = external_binding.Binding{
+        .row_identity_version = if (source.get("row_identity_version")) |v| switch (v) {
+            .integer => |n| std.math.cast(u8, n) orelse return error.InvalidExternalTableBinding,
+            .number_string => |n| std.fmt.parseInt(u8, n, 10) catch return error.InvalidExternalTableBinding,
+            else => return error.InvalidExternalTableBinding,
+        } else 1,
         .table_id = table_id,
         .format = format,
         .source_uri = source_uri,

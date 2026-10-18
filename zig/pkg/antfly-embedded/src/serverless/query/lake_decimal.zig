@@ -16,42 +16,25 @@
 //! Exact decimal128 decoding and fixed-scale formatting. No floating-point
 //! conversion occurs between the Parquet payload and the SQL string contract.
 const std = @import("std");
+const decimal = @import("../../common/decimal128.zig");
+fn mapError(err: anyerror) anyerror {
+    return switch (err) {
+        error.UnsupportedDecimal128 => error.UnsupportedParquetPage,
+        error.InvalidDecimal128 => error.InvalidParquetPage,
+        else => err,
+    };
+}
 pub fn validate(precision: i32, scale: i32) !void {
-    if (precision < 1 or precision > 38 or scale < 0 or scale > precision) return error.UnsupportedParquetPage;
+    decimal.validate(precision, scale) catch |err| return mapError(err);
+}
+pub fn validateCoefficient(value: i128, precision: i32, scale: i32) !void {
+    decimal.validateCoefficient(value, precision, scale) catch |err| return mapError(err);
+}
+pub fn formatAlloc(a: std.mem.Allocator, value: i128, precision: i32, scale: i32) ![]u8 {
+    return decimal.formatAlloc(a, value, precision, scale) catch |err| return mapError(err);
 }
 pub fn signedBigEndian(bytes: []const u8) !i128 {
-    if (bytes.len == 0 or bytes.len > 16) return error.UnsupportedParquetPage;
-    var raw: u128 = if (bytes[0] & 0x80 != 0) std.math.maxInt(u128) else 0;
-    for (bytes) |byte| raw = (raw << 8) | byte;
-    return @bitCast(raw);
-}
-pub fn formatAlloc(a: std.mem.Allocator, unscaled: i128, precision: i32, scale: i32) ![]u8 {
-    try validate(precision, scale);
-    var buffer: [39]u8 = undefined;
-    const digits = try std.fmt.bufPrint(&buffer, "{d}", .{@abs(unscaled)});
-    if (digits.len > @as(usize, @intCast(precision))) return error.InvalidParquetPage;
-    const fractional: usize = @intCast(scale);
-    const negative: usize = @intFromBool(unscaled < 0);
-    const integral = if (digits.len > fractional) digits.len - fractional else 1;
-    const result = try a.alloc(u8, negative + integral + (if (fractional == 0) @as(usize, 0) else fractional + 1));
-    var position: usize = 0;
-    if (negative != 0) {
-        result[0] = '-';
-        position = 1;
-    }
-    if (fractional == 0) {
-        @memcpy(result[position..], digits);
-    } else if (digits.len > fractional) {
-        @memcpy(result[position..][0..integral], digits[0..integral]);
-        result[position + integral] = '.';
-        @memcpy(result[position + integral + 1 ..], digits[integral..]);
-    } else {
-        result[position] = '0';
-        result[position + 1] = '.';
-        @memset(result[position + 2 ..][0 .. fractional - digits.len], '0');
-        @memcpy(result[result.len - digits.len ..], digits);
-    }
-    return result;
+    return decimal.signedBigEndian(bytes) catch |err| return mapError(err);
 }
 test "external lake exact decimal128 preserves precision scale sign and validates values" {
     const a = std.testing.allocator;

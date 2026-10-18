@@ -217,7 +217,7 @@ const ReplacementSource = struct {
                 .bytes, .json => |values| values[row],
                 else => return error.UnsupportedLakeSidecarGraphColumn,
             };
-            self.node = try source_binding.rowRefKeyAlloc(self.alloc, batch.row_refs[row]);
+            self.node = try source_binding.rowRefKeyAlloc(self.alloc, batch.rowRef(row));
             self.parsed = try parseGraphEdgesAlloc(self.alloc, value);
             self.edges = try self.alloc.alloc(graph_segment.page_keys.Edge, self.parsed.len);
             for (self.edges, self.parsed) |*out, edge| out.* = .{ .source = self.node.?, .target = edge.target, .kind = edge.edge_type, .weight = edge.weight, .table = edge.target_table };
@@ -254,14 +254,14 @@ fn appendBatchGraph(
         .bytes => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, builder, batch.row_refs[row], value)) catch
+                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, builder, batch.rowRef(row), value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, builder, batch.row_refs[row], value)) catch
+                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, builder, batch.rowRef(row), value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },

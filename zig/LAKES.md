@@ -55,20 +55,55 @@ lake cursors overlap up to four version-pinned projected range reads in a
 32 MiB lookahead batch through the existing I/O runtime. Cancellation reaches
 provider tokens; workers join before source metadata is released.
 
+SQL residual predicates can evaluate supported PLAIN/dictionary Parquet pages
+without allocating complete value vectors. Primitive page kernels dispatch by
+operator/type, compare dense numeric runs with SIMD, and memoize referenced
+dictionary values. NULLs, deletes and scalar coercion errors retain their existing
+semantics; unsupported layouts use the established decoder. Projected values are
+materialized only for surviving rows. Non-nullable pages use implicit positions.
+
 Blocking sorts, mergeable grouped aggregates (including DISTINCT), and hash-join
 build rows can spill through statement-owned temporary storage. Bounded merge
-runs support sorting and per-key state reduction; joins use a bounded bucket
-directory and persistent match markers for outer joins. The shared statement
+runs support sorting and per-key state reduction. SQL joins partition both
+relations into typed sequential blocks, recursively splitting oversized build
+partitions. Inseparable/skewed partitions replay build blocks once per probe
+block, with disk-backed accepted-match flags for right/full joins. Residual ON
+predicates mark matches only after acceptance. The shared statement
 spill quota defaults to 1 GiB and 64 open files. Private files are immediately
 unlinked and close on success/error/cancellation. Small inputs keep the existing
 in-memory paths. The exact datum codec preserves integers and SQL/JSON nulls.
 
-Native SQL and public typed lake scans decode decimal columns as lossless,
-fixed-scale strings through precision 38. INT32/INT64 and binary/fixed binary
-(up to 16 bytes), nullable pages and cached dictionaries share exact integer
-formatting. The older row-scanner numeric contract remains an explicit decoding
-mode. Timestamp predicates normalize wire strings and numeric operands to exact
+Native page scans retain decimal columns as signed i128 coefficient vectors
+with column precision/scale through precision 38. Declared SQL NUMERIC reads
+convert coefficients directly into exact numeric state without formatting or
+parsing text. Raw string columns and public result boundaries retain lossless,
+fixed-scale strings. INT32/INT64 and binary/fixed binary (up to 16 bytes), nullable
+pages and cached dictionaries share this contract. The older row-scanner numeric
+contract remains an explicit decoding mode. Timestamp predicates normalize wire
+strings and numeric operands to exact
 signed epoch nanoseconds; canonical SQL projections preserve pre-1970 values.
+
+Exact decimal comparisons, hashes and mergeable aggregate updates borrow stack
+NUMERIC views instead of allocating a numeric value for every lane. Common
+comparison literals lower once to the column's coefficient scale; fractional,
+large and special literals retain exact comparison. SUM/AVG use wide state and
+can exceed i128. String declarations and explicit NUMERIC modifiers retain their
+existing coercion boundary.
+
+Dictionary predicates retain validated Parquet RLE/bit-packed ID runs when that
+uses less memory than an expanded ID vector. Repeated runs can reject a dense
+mask interval at once; packed IDs use bounded byte reads. Projected survivor
+cohorts keep the existing dictionary interfaces.
+
+After capturing a statement snapshot, eligible inner joins with three to eight
+inputs can use filter-aware estimates to choose a cheaper connected join order.
+Build-side selection preserves a negotiated native exact-index probe when only
+one side offers it; scan row estimates do not account for covering-index seeks.
+Planning uses bounded memory and only already-owned pruning/candidate evidence;
+it does not fetch Parquet footers to improve estimates. Logical column order is
+preserved across projection, aggregation and parallel spill workers. Unsupported
+or effectful shapes keep their original plan. Estimates remain advisory and use
+heuristics when precise cardinality statistics are unavailable.
 
 Table creation can infer and persist columns/fingerprints from every Parquet
 footer or the selected Iceberg schema. Inference preserves requiredness and
@@ -102,7 +137,10 @@ so decoder reads reuse the versioned cache entries.
 The active page set retains the 32 MiB input/decoded budgets; oversized individual
 pages/dictionaries still fail. Iceberg file pruning uses spec/source field IDs
 and inclusive identity, bucket, truncate and temporal projections. Unknown
-transforms or values remain residual.
+transforms or values remain residual. Typed floating bounds respect REAL
+normalization and PostgreSQL NaN ordering; Bloom probes require identical physical
+equality bytes. Optional OffsetIndex decode-cache admission exhaustion falls back
+to sequential page scanning within the original statement budget.
 
 Window partition rows, peer/group directories and frame trees now share the
 statement spill quota, with small tracked caches. Separate cell records store
@@ -122,7 +160,12 @@ input. Floating-point, DISTINCT and pattern reductions retain ordered execution.
 Shared scheduling bounds all workers and releases
 speculative warming admission on completion. Sequential sort/join/group spills
 use typed, checksummed column blocks where multiple rows fit, compact records
-for wide rows, and optional Snappy compression.
+for wide rows, and optional Snappy compression. Spilled join residuals evaluate
+bounded pinned candidate cohorts through physical/decimal column views, updating
+outer matches before advancing probes. Exact decimal column comparisons retain
+per-lane scales and NULLs. Census-backed native producers borrow immutable source
+state and mutate sparse overlays; dense/sparse v3 file-state directories path-copy
+changed files and retain document chunks through both GC walkers (protocol 54).
 
 Borrowed operator batches preserve physical scan vectors and selection masks
 through simple filters, projections and join admission. Probe payloads are

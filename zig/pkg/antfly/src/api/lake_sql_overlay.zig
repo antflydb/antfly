@@ -40,16 +40,21 @@ pub const Cut = struct {
         };
         // Native Iceberg WAL timestamps are microseconds; SQL exposes the
         // same canonical UTC representation as the committed Parquet reader.
-        for (pending.changes) |change| for (table.columns) |column| {
+        var normalized = try pending.materialized(a);
+        const owned_changes = try a.dupe(ingestion.Batch.Change, normalized.changes);
+        for (owned_changes) |*change| change.row.object = try change.row.object.clone(a);
+        normalized.changes = owned_changes;
+        for (normalized.changes) |change| for (table.columns) |column| {
             if (column.type == .datetime) if (change.row.object.getPtr(column.name)) |value| {
                 if (value.* != .null) value.* = try stable_key.normalize(a, value.*, .timestamp);
             };
         };
-        return initKinds(a, pending, kinds);
+        return initKinds(a, normalized, kinds);
     }
     fn initKinds(a: A, pending: ingestion.Pending, kinds: []const stable_key.Kind) !Cut {
-        var result: Cut = .{ .pending = pending, .kinds = kinds };
-        for (pending.changes) |change| try result.changed.put(a, try identity(a, pending.key_fields, change.row, kinds), {});
+        const normalized = try pending.materialized(a);
+        var result: Cut = .{ .pending = normalized, .kinds = kinds };
+        for (normalized.changes) |change| try result.changed.put(a, try identity(a, pending.key_fields, change.row, kinds), {});
         return result;
     }
 };

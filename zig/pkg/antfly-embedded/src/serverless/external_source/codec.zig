@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("types.zig");
 
 const magic = "AFXS";
-const version: u32 = 18;
+const version: u32 = 20;
 
 pub const DecodeLimits = struct {
     max_artifact_bytes: usize = 256 * 1024 * 1024,
@@ -70,6 +70,7 @@ fn encodeVersion(alloc: Allocator, inventory: external_source.Inventory, format_
     try appendBytes(alloc, &out, inventory.source_uri);
     try appendBytes(alloc, &out, inventory.snapshot_id);
     try appendBytes(alloc, &out, inventory.schema_fingerprint);
+    if (format_version >= 20) try out.append(alloc, inventory.row_identity_version);
     try appendU32(alloc, &out, @intCast(inventory.files.len));
 
     for (inventory.files) |file| {
@@ -137,6 +138,10 @@ fn encodeVersion(alloc: Allocator, inventory: external_source.Inventory, format_
                     try appendOptionalI64(alloc, &out, if (chunk.column_index_offset) |v| @intCast(v) else null);
                     try appendOptionalI64(alloc, &out, if (chunk.column_index_length) |v| v else null);
                 }
+                if (format_version >= 19) {
+                    try appendOptionalI64(alloc, &out, if (chunk.stats_null_count) |v| @intCast(v) else null);
+                    try appendOptionalI64(alloc, &out, if (chunk.stats_distinct_count) |v| @intCast(v) else null);
+                }
             }
         }
     }
@@ -170,7 +175,7 @@ pub fn decodeAllocWithLimits(
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidExternalSourceInventoryMagic;
     cursor += magic.len;
     const got_version = try readU32(bytes, &cursor);
-    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != 11 and got_version != 12 and got_version != 13 and got_version != 14 and got_version != 15 and got_version != 16 and got_version != 17 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
+    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != 11 and got_version != 12 and got_version != 13 and got_version != 14 and got_version != 15 and got_version != 16 and got_version != 17 and got_version != 18 and got_version != 19 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
     if (cursor >= bytes.len) return error.InvalidExternalSourceInventory;
     const format = try decodeFormat(bytes[cursor]);
     cursor += 1;
@@ -183,6 +188,12 @@ pub fn decodeAllocWithLimits(
     errdefer alloc.free(snapshot_id);
     const schema_fingerprint = try readBytesAlloc(alloc, bytes, &cursor);
     errdefer alloc.free(schema_fingerprint);
+    const row_identity_version: u8 = if (got_version >= 20) blk: {
+        if (cursor >= bytes.len) return error.InvalidExternalSourceInventory;
+        const value = bytes[cursor];
+        cursor += 1;
+        break :blk value;
+    } else 1;
     const raw_file_count = try readU32(bytes, &cursor);
     const file_count = try budget.admitCount(external_source.FileEntry, bytes, cursor, raw_file_count);
 
@@ -299,6 +310,9 @@ pub fn decodeAllocWithLimits(
                 if (got_version >= 17) for (&index_fields) |*field| {
                     if (try readOptionalI64(bytes, &cursor)) |value| field.* = std.math.cast(u64, value) orelse return error.InvalidExternalSourceInventory;
                 };
+                const stats_null_count = if (got_version >= 19) try readOptionalI64(bytes, &cursor) else null;
+                const stats_distinct_count = if (got_version >= 19) try readOptionalI64(bytes, &cursor) else null;
+                if ((stats_null_count orelse 0) < 0 or (stats_distinct_count orelse 0) < 0) return error.InvalidExternalSourceInventory;
                 chunk.* = .{
                     .column_id = column_id,
                     .file_offset = chunk_file_offset,
@@ -311,6 +325,8 @@ pub fn decodeAllocWithLimits(
                     .logical_type = logical_type,
                     .decimal_precision = decimal_precision,
                     .decimal_scale = decimal_scale,
+                    .stats_null_count = if (stats_null_count) |v| @intCast(v) else null,
+                    .stats_distinct_count = if (stats_distinct_count) |v| @intCast(v) else null,
                     .stats_min_i64 = stats_min_i64,
                     .stats_max_i64 = stats_max_i64,
                     .stats_min_bytes = stats_min_bytes,
@@ -391,6 +407,7 @@ pub fn decodeAllocWithLimits(
 
     var inventory = external_source.Inventory{
         .format = format,
+        .row_identity_version = row_identity_version,
         .source_id = source_id,
         .source_uri = source_uri,
         .snapshot_id = snapshot_id,
@@ -602,6 +619,7 @@ test "external source inventory codec round-trips file inventory" {
         .source_id = try alloc.dupe(u8, "events"),
         .source_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events"),
         .snapshot_id = try alloc.dupe(u8, "iceberg-123"),
+        .row_identity_version = 2,
         .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
         .files = try alloc.alloc(external_source.FileEntry, 1),
         .deleted_row_groups = try alloc.alloc(external_source.DeletedRowGroup, 1),
@@ -648,6 +666,8 @@ test "external source inventory codec round-trips file inventory" {
                     .column_index_length = 40,
                     .bloom_filter_offset = 880,
                     .bloom_filter_length = 64,
+                    .stats_null_count = 1,
+                    .stats_distinct_count = 2,
                     .stats_min_i64 = 10,
                     .stats_max_i64 = 20,
                     .stats_min_bytes = try alloc.dupe(u8, "acct:a"),
@@ -707,6 +727,20 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqual(@as(?u64, 880), decoded.files[0].row_groups[0].column_chunks[0].bloom_filter_offset);
     try std.testing.expectEqual(@as(?u32, 64), decoded.files[0].row_groups[0].column_chunks[0].bloom_filter_length);
     try std.testing.expectEqual(@as(?i64, 10), decoded.files[0].row_groups[0].column_chunks[0].stats_min_i64);
+    try std.testing.expectEqual(@as(?u64, 1), decoded.files[0].row_groups[0].column_chunks[0].stats_null_count);
+    try std.testing.expectEqual(@as(?u64, 2), decoded.files[0].row_groups[0].column_chunks[0].stats_distinct_count);
+    try std.testing.expectEqual(@as(u8, 2), decoded.row_identity_version);
+    const prior_bytes = try encodeVersion(alloc, inventory, 19);
+    defer alloc.free(prior_bytes);
+    var prior = try decodeAlloc(alloc, prior_bytes);
+    defer prior.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 1), prior.row_identity_version);
+    const old_bytes = try encodeVersion(alloc, inventory, 18);
+    defer alloc.free(old_bytes);
+    var old = try decodeAlloc(alloc, old_bytes);
+    defer old.deinit(alloc);
+    try std.testing.expect(old.files[0].row_groups[0].column_chunks[0].stats_null_count == null);
+
     try std.testing.expectEqual(@as(?i64, 20), decoded.files[0].row_groups[0].column_chunks[0].stats_max_i64);
     try std.testing.expectEqualStrings("acct:a", decoded.files[0].row_groups[0].column_chunks[0].stats_min_bytes.?);
     try std.testing.expectEqualStrings("acct:z", decoded.files[0].row_groups[0].column_chunks[0].stats_max_bytes.?);

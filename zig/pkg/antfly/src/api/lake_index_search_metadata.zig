@@ -57,7 +57,11 @@ pub const Cache = struct {
         _ = entry.references.fetchAdd(1, .monotonic);
         return entry;
     }
-    pub fn acquire(self: *Cache, key: [32]u8, provider: *@import("lake_index_row_source.zig").Provider) !*Entry {
+    pub fn acquire(self: *Cache, publication_key: [32]u8, provider: *@import("lake_index_row_source.zig").Provider) !*Entry {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&publication_key);
+        hash.update(&.{provider.source.inventory.row_identity_version});
+        const key = hash.finalResult();
         return self.acquireInner(key, provider) catch |err| {
             if (err != error.OutOfMemory) return err;
             self.evictIdle();
@@ -97,7 +101,7 @@ pub const Cache = struct {
         const a = entry.arena.allocator();
         for (provider.source.inventory.files) |file| {
             const owned_id = try a.dupe(u8, file.file_id);
-            const public = try a.dupe(u8, &std.fmt.bytesToHex(local.storage_rowsource_identity.fileDigest(provider.source.inventory.source_id, provider.source.inventory.snapshot_id, file.file_id), .lower));
+            const public = try local.storage_rowsource_identity.publicFileAlloc(a, provider.source.inventory.row_identity_version, provider.source.inventory.source_id, provider.source.inventory.snapshot_id, file.file_id);
             const private = try a.dupe(u8, &std.fmt.bytesToHex(try state.identity(a, provider, file), .lower));
             try entry.files.put(a, public, owned_id);
             try entry.private_files.put(a, private, owned_id);

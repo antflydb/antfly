@@ -159,6 +159,7 @@ pub fn estimateBatchBytes(batch: rowsource.ColumnBatch) usize {
     total = addOrMax(total, batch.snapshot.snapshot_id.len);
     total = addOrMax(total, std.math.mul(usize, batch.row_refs.len, @sizeOf(rowsource.RowRef)) catch return std.math.maxInt(usize));
     total = addOrMax(total, std.math.mul(usize, batch.columns.len, @sizeOf(rowsource.ColumnVector)) catch return std.math.maxInt(usize));
+    if (batch.external_span) |span| total = addOrMax(total, span.first.file_id.len);
     for (batch.row_refs) |row_ref| {
         const ref_bytes = switch (row_ref) {
             .relational_key => |key| key.len,
@@ -168,8 +169,10 @@ pub fn estimateBatchBytes(batch: rowsource.ColumnBatch) usize {
         total = addOrMax(total, ref_bytes);
     }
     for (batch.columns) |column| {
-        total = addOrMax(total, addOrMax(column.name.len, column.nulls.bytes.len));
+        total = addOrMax(total, addOrMax(column.name.len, if (column.nulls.bits != null) column.rowCount() else column.nulls.bytes.len));
         const value_bytes = switch (column.values) {
+            .decimal128 => |values| std.math.mul(usize, values.values.len, @sizeOf(i128)) catch std.math.maxInt(usize),
+            .encoded => std.math.maxInt(usize),
             inline .dictionary_i64, .dictionary_f64 => |values| addOrMax(std.math.mul(usize, values.indices.len, @sizeOf(u32)) catch std.math.maxInt(usize), std.math.mul(usize, values.values.len, 8) catch std.math.maxInt(usize)),
             .dictionary_bytes => |values| blk: {
                 var bytes = std.math.mul(usize, values.indices.len, @sizeOf(u32)) catch break :blk std.math.maxInt(usize);

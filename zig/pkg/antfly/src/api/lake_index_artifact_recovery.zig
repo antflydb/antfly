@@ -30,6 +30,12 @@ pub const Reads = struct {
     }
     pub fn init(backend: stores.ArtifactStore) Reads {
         const vtable: stores.ArtifactStore.VTable = .{
+            .object_store = if (backend.vtable.object_store != null) object_store else null,
+            .retention_witness = if (backend.vtable.retention_witness != null) retention_witness else null,
+            .retained_closure = if (backend.vtable.retained_closure != null) retained_closure else null,
+            .remember_closure = if (backend.vtable.remember_closure != null) remember_closure else null,
+            .inherit_closure = if (backend.vtable.inherit_closure != null) inherit_closure else null,
+            .seal_closures = if (backend.vtable.seal_closures != null) seal_closures else null,
             .deinit = deinit,
             .put = put,
             .put_with_cancellation = if (backend.vtable.put_with_cancellation != null) put_with_cancellation else null,
@@ -44,6 +50,7 @@ pub const Reads = struct {
             .stat_with_cancellation = if (backend.vtable.stat_with_cancellation != null) stat_with_cancellation else null,
             .verify_content = if (backend.vtable.verify_content != null) verify_content else null,
             .delete = delete,
+            .delete_with_cancellation = if (backend.vtable.delete_with_cancellation != null) delete_with_cancellation else null,
             .put_scoped = if (backend.vtable.put_scoped != null) put_scoped else null,
             .visit_scoped_uploads = if (backend.vtable.visit_scoped_uploads != null) visit_scoped_uploads else null,
             .reclaim_retired_scoped_inventory = if (backend.vtable.reclaim_retired_scoped_inventory != null) reclaim_retired_scoped_inventory else null,
@@ -58,9 +65,37 @@ pub const Reads = struct {
         handle.vtable = &self.vtable;
         return handle;
     }
+    fn object_store(raw: *anyopaque) *@import("../serverless/artifacts/object_store.zig").ObjectStore {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.providerStore().?;
+    }
+    fn retention_witness(raw: *anyopaque, scope: stores.UploadScope, token: Cancellation) !?stores.RetentionWitness {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.retentionWitness(scope, token);
+    }
+    fn retained_closure(raw: *anyopaque, id: []const u8, token: Cancellation) !bool {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.retainedClosure(id, token);
+    }
+    fn remember_closure(raw: *anyopaque, id: []const u8, witnesses: []const stores.RetentionWitness, token: Cancellation) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.rememberClosure(id, witnesses, token);
+    }
+    fn inherit_closure(raw: *anyopaque, id: []const u8, previous: ?[]const u8, scope: stores.UploadScope, token: Cancellation) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.vtable.inherit_closure.?(self.backend.ptr, id, previous, scope, token);
+    }
+    fn seal_closures(raw: *anyopaque, token: Cancellation) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.sealClosures(token);
+    }
+    fn delete_with_cancellation(raw: *anyopaque, id: []const u8, token: Cancellation) !void {
+        const self: *Reads = @ptrCast(@alignCast(raw));
+        return self.backend.deleteWithCancellation(id, token);
+    }
     fn failure(self: *Reads, err: anyerror) anyerror {
         switch (err) {
-            error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => {
+            error.FileNotFound, error.NotFound, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch => {
                 self.cause_code.store(@intFromError(err), .release);
                 return error.LakeIndexArtifactUnavailable;
             },

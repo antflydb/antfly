@@ -155,6 +155,7 @@ pub const RangeRead = struct {
 
 pub const CoalesceOptions = struct {
     max_gap_bytes: u64 = 0,
+    max_range_bytes: u64 = max_physical_range_read_bytes,
 };
 
 pub fn planParquetFooterRead(object: ObjectRef, max_probe_bytes: u64) !RangeRead {
@@ -281,7 +282,7 @@ pub fn coalescePhysicalReadsAlloc(
 
     var current = sorted[0];
     for (sorted[1..]) |next| {
-        if (canCoalesce(current, next, options.max_gap_bytes)) {
+        if (canCoalesce(current, next, options.max_gap_bytes) and @max(current.range.end(), next.range.end()) - current.range.offset <= options.max_range_bytes) {
             const new_end = @max(current.range.end(), next.range.end());
             current.range.len = new_end - current.range.offset;
             if (!std.mem.eql(u8, current.decoded_column_id, next.decoded_column_id)) {
@@ -313,7 +314,7 @@ fn canCoalesce(a: RangeRead, b: RangeRead, max_gap_bytes: u64) bool {
     return new_end - a.range.offset <= max_physical_range_read_bytes;
 }
 
-fn sameObjectVersion(a: ObjectRef, b: ObjectRef) bool {
+pub fn sameObjectVersion(a: ObjectRef, b: ObjectRef) bool {
     return std.mem.eql(u8, a.bucket, b.bucket) and
         std.mem.eql(u8, a.key, b.key) and
         a.byte_len == b.byte_len and

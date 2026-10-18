@@ -222,14 +222,14 @@ fn appendBatchSparse(
         .bytes => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                posting_count = std.math.add(usize, posting_count, try appendSparseDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                posting_count = std.math.add(usize, posting_count, try appendSparseDocument(alloc, docs, term_map, batch.rowRef(row), value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                posting_count = std.math.add(usize, posting_count, try appendSparseDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                posting_count = std.math.add(usize, posting_count, try appendSparseDocument(alloc, docs, term_map, batch.rowRef(row), value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },

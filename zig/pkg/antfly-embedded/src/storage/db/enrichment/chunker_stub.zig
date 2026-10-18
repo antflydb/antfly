@@ -274,3 +274,13 @@ test "chunker stub model-aware input retains validation without byte chunk fallb
         \\{"provider":"mock","embedding":{"model":"model"}}
     , null));
 }
+
+test "chunker stub model input preserves config errors and never flattens binary inputs" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(a, &.{ 0xff, 0 },
+        \\{"provider":"antfly"}
+    , null));
+    try std.testing.expectError(error.UnsupportedPlatform, chunkInputWithConfigJsonAndProvider(a, &.{ 0xff, 0 },
+        \\{"provider":"antfly","embedding":{"model":"fixed"}}
+    , null));
+}

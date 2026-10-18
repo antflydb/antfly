@@ -33,7 +33,7 @@ pub const Column = struct {
             value.* = number.value;
             return Datum.typedNumeric(value);
         }
-        return .{ .value = try @import("describe.zig").coerceAlloc(a, raw.value, self.type), .sql_null = false };
+        return @import("describe.zig").coerceDatum(a, raw, self.type, self.element_type);
     }
 };
 pub const Domain = struct {
@@ -217,45 +217,137 @@ pub const Filter = struct {
         }
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        const columns = try a.alloc([]const Datum, self.columns.len);
-        defer a.free(columns);
-        @memset(columns, &.{});
-        defer for (columns) |column| a.free(column);
-        for (self.columns, columns, self.domains) |definition, *column, domain| {
-            const values = try a.alloc(Datum, batch.rowCount());
-            column.* = values;
-            @memset(values, .{});
-            const physical = batch.findColumn(definition.name);
-            var dictionary: std.AutoHashMapUnmanaged(u32, Datum) = .empty;
-            defer dictionary.deinit(a);
-            for (selected, values, 0..) |*keep, *value, index| {
-                if (!keep.*) continue;
-                const one: @import("catalog.zig").ColumnPage = .{ .batch = batch, .selection = &.{index} };
-                value.* = if (if (physical) |source| try source.dictionaryId(index) else null) |id| blk: {
-                    if (dictionary.get(id)) |cached| break :blk cached;
-                    const raw = try one.cell(scratch.allocator(), 0, definition.name);
-                    const cell = try definition.datum(scratch.allocator(), raw);
-                    try dictionary.put(a, id, cell);
-                    break :blk cell;
-                } else blk: {
-                    const cell = try one.cell(scratch.allocator(), 0, definition.name);
-                    break :blk try definition.datum(scratch.allocator(), cell);
-                };
-                if (value.sql_null or (try scalar.compareDatums(value.*, domain.minimum.?)) == .lt or (try scalar.compareDatums(value.*, domain.maximum.?)) == .gt) keep.* = false;
+        // Keep hash lanes on the stack, independent of scan width/cardinality.
+        // Primitive columns dispatch once; exact/complex coercions reuse one
+        // scalar lane whose temporary payload expires immediately after hashing.
+        var begin: usize = 0;
+        while (begin < selected.len) {
+            const count = @min(128, selected.len - begin);
+            var hashes: [128]std.hash.Wyhash = undefined;
+            for (hashes[0..count]) |*hash| hash.* = .init(0);
+            const keep = selected[begin..][0..count];
+            for (self.columns, self.domains) |definition, domain| {
+                if (batch.findColumn(definition.name)) |vector| {
+                    if (vector.rowCount() != selected.len) return error.InvalidSqlBackendResponse;
+                    vector.nulls.validate(selected.len) catch return error.InvalidSqlBackendResponse;
+                    if (try nativeColumn(vector, definition, domain, begin, keep, hashes[0..count])) continue;
+                }
+                for (keep, hashes[0..count], begin..) |*active, *hash, row| {
+                    if (!active.*) continue;
+                    _ = scratch.reset(.retain_capacity);
+                    const one: @import("catalog.zig").ColumnPage = .{ .batch = batch, .selection = &.{row} };
+                    const value = try definition.datum(scratch.allocator(), try one.typedCell(scratch.allocator(), 0, definition.name, definition.element_type == .numeric));
+                    if (value.sql_null or (try scalar.compareDatums(value, domain.minimum.?)) == .lt or (try scalar.compareDatums(value, domain.maximum.?)) == .gt) {
+                        active.* = false;
+                        continue;
+                    }
+                    var bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &bytes, try scalar.semanticHashDatum(value), .little);
+                    hash.update(&bytes);
+                }
             }
+            for (keep, hashes[0..count]) |*active, *state| {
+                if (!active.*) continue;
+                const hash = state.final();
+                const first = self.mask(hash);
+                const second = self.mask(std.math.rotr(u64, hash, 23));
+                active.* = self.bits[first.index] & first.bit != 0 and self.bits[second.index] & second.bit != 0;
+            }
+            begin += count;
         }
-        const hashes = try @import("batch_hash.zig").columns(a, columns, batch.rowCount(), false);
-        defer a.free(hashes);
-        for (selected, hashes) |*keep, optional| {
-            if (!keep.*) continue;
-            const hash = optional orelse {
-                keep.* = false;
-                continue;
-            };
-            const first = self.mask(hash);
-            const second = self.mask(std.math.rotr(u64, hash, 23));
-            keep.* = self.bits[first.index] & first.bit != 0 and self.bits[second.index] & second.bit != 0;
+    }
+    fn nativeColumn(vector: @import("../storage/rowsource/types.zig").ColumnVector, definition: Column, domain: Domain, begin: usize, keep: []bool, hashes: []std.hash.Wyhash) !bool {
+        if (definition.element_type == .numeric) return false;
+        const lower = domain.minimum orelse return error.InvalidSqlBackendResponse;
+        const upper = domain.maximum orelse return error.InvalidSqlBackendResponse;
+        const supported = switch (vector.values) {
+            .i64, .dictionary_i64 => definition.type == .integer and lower.value == .integer and upper.value == .integer,
+            .f64, .dictionary_f64 => definition.type == .number and lower.value == .float and upper.value == .float,
+            .bytes, .dictionary_bytes => definition.type == .string and lower.value == .string and upper.value == .string,
+            .bool => definition.type == .boolean and lower.value == .bool and upper.value == .bool,
+            else => false,
+        };
+        if (!supported) return false;
+        if (lower.value == .float and (std.math.isNan(lower.value.float) or std.math.isNan(upper.value.float))) return false;
+        // Memoize page-local dictionary identities without allocator pressure.
+        // Only selected nonnull IDs are inspected; malformed excluded lanes
+        // preserve the scalar lazy boundary.
+        var used: [256]u8 = @splat(0);
+        var ids: [256]u32 = undefined;
+        var semantic: [256]u64 = undefined;
+        switch (vector.values) {
+            inline .i64, .dictionary_i64, .f64, .dictionary_f64, .bytes, .dictionary_bytes, .bool => |values, tag| {
+                const dictionary = tag == .dictionary_i64 or tag == .dictionary_f64 or tag == .dictionary_bytes;
+                for (keep, hashes, begin..) |*active, *hash, row| {
+                    if (!active.*) continue;
+                    if (vector.nulls.isNull(row)) {
+                        active.* = false;
+                        continue;
+                    }
+                    const id: u32 = if (dictionary) values.indices[row] else 0;
+                    var slot: usize = (id *% 2654435761) & 255;
+                    if (dictionary) {
+                        if (id >= values.values.len) return error.InvalidSqlBackendResponse;
+                        while (used[slot] != 0 and ids[slot] != id) slot = (slot + 1) & 255;
+                        if (used[slot] != 0) {
+                            active.* = used[slot] == 2;
+                            if (active.*) {
+                                var bytes: [8]u8 = undefined;
+                                std.mem.writeInt(u64, &bytes, semantic[slot], .little);
+                                hash.update(&bytes);
+                            }
+                            continue;
+                        }
+                    }
+                    // Filters consume the declared SQL value, including REAL rounding.
+                    const value = normalized: {
+                        const raw_value = if (dictionary) values.values[id] else values[row];
+                        break :normalized switch (tag) {
+                            .f64, .dictionary_f64 => if (definition.element_type == .float32)
+                                try @import("builtin_cast.zig").floatValue(f32, .{ .float = raw_value })
+                            else
+                                raw_value,
+                            .i64, .dictionary_i64 => if (definition.element_type) |element|
+                                if (@import("builtin_cast.zig").integral(element)) try @import("builtin_cast.zig").checkedInteger(raw_value, element) else raw_value
+                            else
+                                raw_value,
+                            else => raw_value,
+                        };
+                    };
+                    const datum = Datum.json(switch (tag) {
+                        .i64, .dictionary_i64 => .{ .integer = value },
+                        .f64, .dictionary_f64 => .{ .float = value },
+                        .bytes, .dictionary_bytes => .{ .string = value },
+                        .bool => .{ .bool = value },
+                        else => unreachable,
+                    });
+                    const allowed = switch (tag) {
+                        .i64, .dictionary_i64 => value >= lower.value.integer and value <= upper.value.integer,
+                        .f64, .dictionary_f64 => blk: {
+                            if (definition.element_type == null and !std.math.isFinite(value)) return error.SqlTypeMismatch;
+                            break :blk value >= lower.value.float and value <= upper.value.float;
+                        },
+                        .bytes, .dictionary_bytes => std.mem.order(u8, value, lower.value.string) != .lt and std.mem.order(u8, value, upper.value.string) != .gt,
+                        .bool => @intFromBool(value) >= @intFromBool(lower.value.bool) and @intFromBool(value) <= @intFromBool(upper.value.bool),
+                        else => unreachable,
+                    };
+                    active.* = allowed;
+                    const key = if (allowed) try scalar.semanticHashDatum(datum) else 0;
+                    if (dictionary) {
+                        ids[slot] = id;
+                        used[slot] = if (allowed) 2 else 1;
+                        semantic[slot] = key;
+                    }
+                    if (allowed) {
+                        var bytes: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &bytes, key, .little);
+                        hash.update(&bytes);
+                    }
+                }
+            },
+            else => unreachable,
         }
+        return true;
     }
     pub fn contains(self: *const Filter, values: []const Datum) !bool {
         if (self.failed or !self.sealed or values.len != self.columns.len) return error.InvalidSqlBackendResponse;
@@ -372,4 +464,41 @@ test "SQL dynamic exact keys spill complete tuples and abandon resource limited 
     try std.testing.expect(!fallback.hasExact());
     try std.testing.expectEqual(@as(u64, 0), limited.live_bytes);
     for (0..count) |i| try std.testing.expect(try fallback.contains(&.{Datum.json(.{ .integer = @intCast(i) })}));
+}
+
+test "lake SQL native dynamic filter masks use bounded allocation-free primitive lanes" {
+    const a = std.testing.allocator;
+    const filter = try Filter.create(a, &.{ .{ .name = "n", .type = .integer }, .{ .name = "s", .type = .string } }, 256);
+    defer filter.close();
+    try filter.add(&.{ Datum.json(.{ .integer = 7 }), Datum.json(.{ .string = "yes" }) });
+    filter.sealed = true;
+    var integers: [4096]i64 = @splat(7);
+    integers[2048] = 9;
+    var ids: [4096]u32 = @splat(0);
+    ids[2049] = 1;
+    const batch: @import("../storage/rowsource/types.zig").ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .external_span = .{ .first = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = integers.len }, .columns = &.{ .{ .name = "n", .values = .{ .i64 = &integers } }, .{ .name = "s", .values = .{ .dictionary_bytes = .{ .values = &.{ "yes", "no" }, .indices = &ids } } } } };
+    var selected: [4096]bool = @splat(true);
+    try filter.applyBatch(std.testing.failing_allocator, batch, &selected);
+    for (selected, 0..) |keep, i| try std.testing.expectEqual(i != 2048 and i != 2049, keep);
+}
+
+test "lake SQL dynamic filters normalize REAL dictionary and flat values before ranges and hashes" {
+    const a = std.testing.allocator;
+    const filter = try Filter.create(a, &.{.{ .name = "n", .type = .number, .element_type = .float32 }}, 256);
+    defer filter.close();
+    const expected = try @import("builtin_cast.zig").floatValue(f32, .{ .float = 0.1 });
+    try filter.add(&.{Datum.json(.{ .float = expected })});
+    filter.sealed = true;
+    const types = @import("../storage/rowsource/types.zig");
+    for ([_]@FieldType(types.ColumnVector, "values"){
+        .{ .f64 = &.{ 0.1, 0.2, 0.1 } },
+        .{ .dictionary_f64 = .{ .values = &.{ 0.1, 0.2 }, .indices = &.{ 0, 1, 0 } } },
+    }) |values| {
+        const batch: types.ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .external_span = .{ .first = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 3 }, .columns = &.{.{ .name = "n", .values = values }} };
+        var selected = [_]bool{ true, true, true };
+        try filter.applyBatch(std.testing.failing_allocator, batch, &selected);
+        try std.testing.expectEqualSlices(bool, &.{ true, false, true }, &selected);
+    }
+    const normalized = try filter.columns[0].datum(a, Datum.json(.{ .float = 0.1 }));
+    try std.testing.expectEqual(expected, normalized.value.float);
 }
