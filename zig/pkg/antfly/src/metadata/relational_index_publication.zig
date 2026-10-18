@@ -475,16 +475,15 @@ pub const CancellationWitness = struct {
         try self.verifyScope(signed);
     }
     fn verifyScope(self: @This(), signed: SignedReceipt) !void {
-        if (signed.receipt.owner.authority != .native or signed.receipt.action != .canceled or
+        if (signed.receipt.action != .canceled or
             !std.meta.eql(try self.record.receipt(), signed.receipt)) return error.InvalidIndexOwnerReceipt;
     }
 };
 
 fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !void {
-    const is_native = signed.receipt.owner.authority == .native;
     if ((signed.receipt.action == .validated) != (validation != null) or
         (signed.receipt.action == .installed) != (installation != null) or
-        (is_native and signed.receipt.action == .canceled) != (cancellation != null)) return error.InvalidIndexOwnerReceipt;
+        (signed.receipt.action == .canceled) != (cancellation != null)) return error.InvalidIndexOwnerReceipt;
 }
 
 /// One retained stage record, not a second independently committed journal.
@@ -820,7 +819,7 @@ pub fn cancellationReleaseDecisionDigest(group: u64, incarnation: local.metadata
         (head.phase != .cancel_releasing and head.phase != .canceled) or
         head.counts[@backingInt(progress.Action.canceled)] != head.owner_count) return error.InvalidCatalogRecord;
     var state = std.crypto.hash.Blake3.init(.{});
-    state.update("antfly/native-index-cancellation-release-decision/v1");
+    state.update("antfly/index-cancellation-release-decision/v1");
     state.update(&incarnation);
     state.update(&head.plan_id);
     state.update(&head.plan_digest);
@@ -894,7 +893,7 @@ pub fn requireReleaseReceipt(group: u64, incarnation: local.metadata_incarnation
 /// Shared live/recovery binding. Unvisited owners need no invented prior cut;
 /// visited owners cannot adopt a replacement root or another physical job by
 /// presenting a fresh cancellation signature.
-pub fn requireNativeCancellationWitness(group: u64, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, witness: CancellationWitness, signed: SignedReceipt, prior: ?StoredProof.Decoded) !void {
+pub fn requireCancellationWitness(group: u64, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, witness: CancellationWitness, signed: SignedReceipt, prior: ?StoredProof.Decoded) !void {
     if (group == 0) return error.InvalidCatalogRecord;
     try head.validate();
     try owner.validate();
@@ -905,11 +904,11 @@ pub fn requireNativeCancellationWitness(group: u64, head: progress.Head, owner: 
     if (head.phase != .canceling and head.phase != .cancel_releasing and head.phase != .canceled) return error.GenerationPublicationChanged;
     const decision: OwnerDecision = .{ .metadata_group_id = group, .metadata_incarnation = signed.proof.identity.metadata_incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch };
     const binding = witness.record.binding;
-    try decision.requireRetainedNativeBinding(binding);
+    try decision.requireRetainedBinding(binding, owner.owner.authority);
     if (witness.record.cleanup.claim_allocation != dispatch.native_claim_allocation) return error.PrivateIndexOwnerJobChanged;
     if (prior) |accepted| {
         const previous = accepted.signed;
-        if (previous.receipt.position != .native or witness.record.cleanup.position != .native or witness.record.cleanup.position.native.sequence <= previous.receipt.position.native.sequence or
+        if (!witness.record.cleanup.position.strictlyAfter(previous.receipt.position) or
             !std.meta.eql(previous.proof.identity, signed.proof.identity) or !std.meta.eql(previous.proof.authority, signed.proof.authority) or
             previous.proof.root_generation != signed.proof.root_generation or previous.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
         if (accepted.validation) |validation| if (!std.meta.eql(validation.outcome.binding, binding)) return error.PrivateIndexOwnerJobChanged;
@@ -918,7 +917,7 @@ pub fn requireNativeCancellationWitness(group: u64, head: progress.Head, owner: 
 
 /// Metadata's accepted cleanup cut plus the root generation that must be
 /// pinned BEFORE a receiver releases anything. This is not root adoption.
-pub const NativeCancellationReleaseGrant = struct {
+pub const CancellationReleaseGrant = struct {
     canceled: local.storage_db_relational_index_owner_job.Canceled,
     decision_digest: Digest,
     cleanup_proof: RootProof,
@@ -930,7 +929,6 @@ pub const NativeCancellationReleaseGrant = struct {
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
         try owner.validate();
         const receipt = try self.canceled.receipt();
-        if (self.canceled.position != .native or self.cleanup_proof.authority != .native) return error.InvalidCatalogRecord;
         const signed: SignedReceipt = .{ .receipt = receipt, .proof = self.cleanup_proof };
         signed.verifySignature() catch return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, &self.cleanup_proof.identity.metadata_incarnation, &incarnation) or !std.meta.eql(receipt.owner, owner.owner) or
@@ -944,12 +942,11 @@ pub const NativeCancellationReleaseGrant = struct {
 
 /// Reconstruct terminal cancellation from the accepted cleanup checkpoint.
 /// A signed action tag alone is not evidence of the cohort release decision.
-pub fn requireNativeCancellationReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, canceled: StoredProof.Decoded, signed: SignedReceipt) !void {
+pub fn requireCancellationReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, canceled: StoredProof.Decoded, signed: SignedReceipt) !void {
     const witness = canceled.cancellation orelse return error.InvalidCatalogRecord;
-    const grant: NativeCancellationReleaseGrant = .{ .canceled = witness.record, .cleanup_proof = canceled.signed.proof, .decision_digest = try cancellationReleaseDecisionDigest(group, incarnation, head) };
+    const grant: CancellationReleaseGrant = .{ .canceled = witness.record, .cleanup_proof = canceled.signed.proof, .decision_digest = try cancellationReleaseDecisionDigest(group, incarnation, head) };
     try grant.validateFor(group, incarnation, head, owner);
-    if (signed.receipt.position != .native or
-        !std.meta.eql(try grant.intent().receipt(signed.receipt.position.native), signed.receipt) or
+    if (!std.meta.eql(try grant.intent().receiptAt(signed.receipt.position), signed.receipt) or
         !std.meta.eql(canceled.signed.proof.identity, signed.proof.identity) or
         !std.meta.eql(canceled.signed.proof.authority, signed.proof.authority) or
         canceled.signed.proof.root_generation != signed.proof.root_generation or
@@ -975,7 +972,7 @@ pub const OwnerDecision = struct {
     target_expectation: ?local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = null,
     installation: ?InstallGrant = null,
     release: ?ReleaseGrant = null,
-    native_cancel_release: ?NativeCancellationReleaseGrant = null,
+    cancellation_release: ?CancellationReleaseGrant = null,
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
     attestation: ?Attestation = null,
@@ -1010,14 +1007,19 @@ pub const OwnerDecision = struct {
                     grant.installation_proof.authority != .raft or grant.installation_proof.authority.raft != view.replica_id or grant.installation_proof.root_generation != view.root_generation) return error.InvalidCatalogRecord;
             } else return error.InvalidCatalogRecord;
         } else if (self.release != null) return error.InvalidCatalogRecord;
-        if (request.operation == .cancel_release and self.disposition == .execute and self.owner.owner.authority == .native) {
-            const grant = self.native_cancel_release orelse return error.InvalidCatalogRecord;
+        if (request.operation == .cancel_release and self.disposition == .execute) {
+            const grant = self.cancellation_release orelse return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
-            try self.requireRetainedNativeBinding(grant.canceled.binding);
-            const view = self.native_signing orelse return error.InvalidCatalogRecord;
-            if (!std.meta.eql(grant.cleanup_proof.identity, view.identity) or grant.cleanup_proof.reporter_incarnation != view.reporter_incarnation or
-                grant.cleanup_proof.authority != .native or !std.mem.eql(u8, &grant.cleanup_proof.authority.native, &view.binding_digest)) return error.InvalidCatalogRecord;
-        } else if (self.native_cancel_release != null) return error.InvalidCatalogRecord;
+            try self.requireRetainedBinding(grant.canceled.binding, self.owner.owner.authority);
+            if (self.owner.owner.authority == .native) {
+                const view = self.native_signing orelse return error.InvalidCatalogRecord;
+                if (!std.meta.eql(grant.cleanup_proof.identity, view.identity) or grant.cleanup_proof.reporter_incarnation != view.reporter_incarnation or
+                    grant.cleanup_proof.authority != .native or !std.mem.eql(u8, &grant.cleanup_proof.authority.native, &view.binding_digest)) return error.InvalidCatalogRecord;
+            } else if (self.raft_signing) |view| {
+                if (!std.meta.eql(grant.cleanup_proof.identity, view.identity) or grant.cleanup_proof.reporter_incarnation != view.reporter_incarnation or
+                    grant.cleanup_proof.authority != .raft or grant.cleanup_proof.authority.raft != view.replica_id or grant.cleanup_proof.root_generation != view.root_generation) return error.InvalidCatalogRecord;
+            } else return error.InvalidCatalogRecord;
+        } else if (self.cancellation_release != null) return error.InvalidCatalogRecord;
         if (request.claim_groups) |groups| {
             if (self.disposition == .execute) {
                 const routes = self.claim_routes orelse return error.InvalidCatalogRecord;
@@ -1487,12 +1489,18 @@ pub const OwnerDecision = struct {
     /// Cancel a never-visited owner without loading schema-sized inputs. This
     /// is permission to persist intent, not proof of cleanup or a canceled ACK.
     pub fn nativeCancellationIntent(self: OwnerDecision) !native_control.Admission {
-        const identity = try self.nativeExecutionIdentity(.{
+        return self.cancellationIntentFor(.native);
+    }
+    pub fn raftCancellationIntent(self: OwnerDecision) !raft_control.Admission {
+        return self.cancellationIntentFor(.raft);
+    }
+    fn cancellationIntentFor(self: OwnerDecision, authority: progress.Authority) !native_control.Admission {
+        const identity = try self.executionIdentity(.{
             .table_id = self.head.table_id,
             .group_id = self.owner.owner.group_id,
             .id = self.head.plan_id,
             .operation = .cancel,
-        });
+        }, authority);
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         const intent: native_control.Admission = .{
             .id = identity.id,
@@ -1516,6 +1524,46 @@ pub const OwnerDecision = struct {
 
     pub fn nativeCancellationAdmission(self: OwnerDecision) !native_control.Admission {
         return self.admissionImpl(.native, true);
+    }
+
+    pub fn raftCancellationAdmission(self: OwnerDecision) !raft_control.Admission {
+        return self.admissionImpl(.raft, true);
+    }
+
+    pub fn raftCancellationReleaseIntent(self: OwnerDecision, request: OwnerRequest) !@FieldType(native_control.CancellationReleaseOutcome, "intent") {
+        if (request.operation != .cancel_release) return error.InvalidGenerationPublication;
+        _ = try self.raftExecutionIdentity(request);
+        const grant = self.cancellation_release orelse return error.InvalidCatalogRecord;
+        try self.requireRetainedRaftBinding(grant.canceled.binding);
+        return grant.intent();
+    }
+
+    pub fn signRaftCancellation(self: OwnerDecision, request: OwnerRequest, record: local.storage_db_relational_index_owner_job.Canceled, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        if (request.operation != .cancel) return error.InvalidGenerationPublication;
+        _ = try self.raftExecutionIdentity(request);
+        try self.requireRetainedRaftBinding(record.binding);
+        try record.validate();
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (record.cleanup.claim_allocation != dispatch.native_claim_allocation) return error.PrivateIndexOwnerJobChanged;
+        if (record.position != .raft or record.position.raft.term > actual.leader_term or record.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        const receipt = try record.receipt();
+        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) }, .cancellation = .{ .record = record } };
+        try ack.validate();
+        return ack;
+    }
+
+    pub fn signRaftCancellationRelease(self: OwnerDecision, request: OwnerRequest, record: raft_control.Release.CancellationRecord, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        const intent = try self.raftCancellationReleaseIntent(request);
+        if (!std.meta.eql(intent, record.intent)) return error.PrivateIndexOwnerJobChanged;
+        const receipt = try intent.receiptAt(record.position);
+        if (record.position != .raft or record.position.raft.term > actual.leader_term or record.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) } };
+        try ack.validate();
+        return ack;
     }
 
     pub fn raftAdmission(self: OwnerDecision) !raft_control.Admission {
@@ -2493,11 +2541,11 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
             if (retained.cancellation) |witness| {
                 var dispatch = try readDispatch(a, txn, group, owner.owner);
                 defer dispatch.deinit();
-                requireNativeCancellationWitness(group, head, owner, dispatch.value, witness, signed, prior_cleanup) catch return error.InvalidCatalogRecord;
+                requireCancellationWitness(group, head, owner, dispatch.value, witness, signed, prior_cleanup) catch return error.InvalidCatalogRecord;
             }
-            if (action == .cancel_released and owner.owner.authority == .native) {
+            if (action == .cancel_released) {
                 const cleanup = try storedProof(a, (try optionalGet(txn, try proofKey(&buf, group, table, @intCast(i), .canceled))) orelse return error.InvalidCatalogRecord, head, owner, .canceled);
-                requireNativeCancellationReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, cleanup, signed) catch return error.InvalidCatalogRecord;
+                requireCancellationReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, cleanup, signed) catch return error.InvalidCatalogRecord;
             }
             if (action == .released) {
                 requireReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed) catch return error.InvalidCatalogRecord;

@@ -2455,6 +2455,21 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         var cancel = try owner_control.PreparedCancellation.init(alloc, cancellation.Intent.fromBinding(reserved_binding));
         defer cancel.deinit();
         try Wire.apply(&canceled_db, .{ .cancel_intent = cancel.intent }, .{ .term = 10, .index = 120 });
+        {
+            const inspection = try canceled_db.raftIndexOwnerCancellationState(11, identity);
+            try std.testing.expectEqual(@as(u64, 120), inspection.intent.?.position.raft.index);
+            try std.testing.expectEqualDeep(reserved_binding, inspection.binding.?);
+            try std.testing.expect(inspection.cleanup == null and !inspection.artifacts_retired and !inspection.claims_retired);
+            try std.testing.expectEqual(@as(u64, 0), inspection.source.sequence);
+            var future = inspection;
+            future.intent.?.position.raft.index += 1;
+            try std.testing.expectError(error.InvalidPrivateIndexCancellation, future.validate(identity));
+            var wrong_term = inspection;
+            wrong_term.intent.?.position.raft.term -= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexCancellation, wrong_term.validate(identity));
+            try std.testing.expectError(error.OnlineSourceScopeChanged, canceled_db.nativeIndexOwnerCancellationState(identity));
+            try std.testing.expectError(error.PrivateIndexOwnerJobChanged, canceled_db.raftIndexOwnerCancellationState(99, identity));
+        }
         var completion: owner_control.PreparedCancellationCompletion = .{ .alloc = alloc, .binding = reserved_binding };
         defer completion.deinit();
         try std.testing.expectError(error.InvalidControlReceiptPosition, completion.preparePayload());
@@ -2518,6 +2533,11 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             physical_pages += 1;
         }
         try std.testing.expect(physical_pages >= 2);
+        {
+            const inspection = try canceled_db.raftIndexOwnerCancellationState(11, identity);
+            try std.testing.expect(inspection.artifacts_retired and !inspection.claims_retired and inspection.completed == null);
+            try std.testing.expect(inspection.cleanup != null);
+        }
         {
             var read = try canceled_db.core.store.beginReadTxn();
             defer read.abort();
@@ -2584,6 +2604,12 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         canceled_db = try db_mod.DB.open(alloc, canceled_directory.path(), options);
         canceled_live = true;
         try canceled_db.applyCommittedRaftIndexCancellationCompletion(&completion, 11, .{ .term = 13, .index = cut + 2 });
+        {
+            const inspection = try canceled_db.raftIndexOwnerCancellationState(11, identity);
+            try std.testing.expect(inspection.artifacts_retired and inspection.claims_retired);
+            try std.testing.expectEqual(completion_entry.index, inspection.completed.?.position.raft.index);
+            try std.testing.expectEqual(cut + 2, inspection.applied.?.raft.index);
+        }
         const completed_cancel = blk: {
             var read = try canceled_db.core.store.beginReadTxn();
             defer read.abort();
@@ -2620,6 +2646,10 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         canceled_db = try db_mod.DB.open(alloc, canceled_directory.path(), options);
         canceled_live = true;
         try canceled_db.applyCommittedRaftIndexCancellationRelease(&release_control, 11, .{ .term = 15, .index = cut + 4 });
+        {
+            const inspection = try canceled_db.raftIndexOwnerCancellationState(11, identity);
+            try std.testing.expect(inspection.binding == null and inspection.intent == null and inspection.completed == null);
+        }
         {
             var read = try canceled_db.core.store.beginReadTxn();
             defer read.abort();

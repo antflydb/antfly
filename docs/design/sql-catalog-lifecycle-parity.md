@@ -156,6 +156,15 @@ preserving progress when signing fails. The worker recognizes the explicit Raft
 lifecycle response, and release cannot produce an ACK before retirement ends.
 Installed observations verify the actual successor schema, seal and Raft cuts;
 ordinary build/control entry points still reject installed jobs.
+Cancellation metadata now requires the complete canonical cleanup witness for
+either authority and derives release from the exact accepted cleanup cut. Raft
+signing checks the actual completed prefix and preserves the accepted root,
+generation and reporter across release. Cleanup remains possible after reader
+capability loss, while enrollment, namespace, placement and real apply cuts are
+still required. A shared bounded inspection reads the same intent, phase slots,
+retirement objectives and completion record for Native and Raft owners; the
+Native adapter keeps native cuts and the Raft projection keeps tagged cuts,
+validating every cut against the durable Raft watermark rather than a clock.
 This is not complete public activation: the worker's Raft cohort guard,
 cancellation receiver paths and root-adoption recovery
 remain unfinished, and public CREATE remains guarded. No original case is

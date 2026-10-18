@@ -1568,7 +1568,7 @@ pub fn cancelReleaseStep(alloc: std.mem.Allocator, source: anytype, metadata: an
     defer permission.deinit();
     if (permission.value.disposition == .acknowledged) return .acknowledged;
     try requireTable(permission.value, table_name);
-    const grant = permission.value.native_cancel_release orelse return error.InvalidCatalogRecord;
+    const grant = permission.value.cancellation_release orelse return error.InvalidCatalogRecord;
     const view = permission.value.native_signing orelse return error.IndexOwnerReceiptChanged;
     var rooted = try source.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, request.group_id, table_name, grant.intent(), grant.cleanup_proof.root_generation, view.identity.root_incarnation, context);
     errdefer rooted.deinit();

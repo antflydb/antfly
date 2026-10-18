@@ -8777,6 +8777,13 @@ pub const DB = struct {
         return outcome;
     }
 
+    pub fn raftIndexOwnerCancellationState(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !@import("relational_index_owner_job.zig").RaftCancellationState {
+        try self.requireRaftIndexOwnerIdentity(owner_group, expected);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return @import("relational_index_owner_job.zig").inspectRaftCancellation(&txn, expected);
+    }
+
     pub fn nativeIndexOwnerCancellationState(self: *DB, expected: NativeIndexOwnerIdentity) !NativeIndexOwnerCancellationState {
         try expected.validate();
         if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;

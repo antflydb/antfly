@@ -336,10 +336,14 @@ pub fn nativeEffectPosition(txn: anytype, binding: Binding, action: NativeEffect
 /// Bounded local status for a receiver which independently obtains current
 /// metadata permission. Absence is not a cancellation fence or an ACK proof.
 pub fn inspectNative(txn: anytype, expected: anytype) !?Binding {
+    return inspectOwner(txn, expected, .native);
+}
+
+fn inspectOwner(txn: anytype, expected: anytype, comptime kind: source_authority.Kind) !?Binding {
     try expected.validate();
-    _ = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(expected.namespace));
+    _ = try source_authority.require(txn, kind, @import("online_source_contract.zig").namespaceBytes(expected.namespace));
     const binding = (try load(txn)) orelse return null;
-    if (binding.authority != .native or !std.mem.eql(u8, &binding.id, &expected.id) or
+    if ((binding.authority == .native) != (kind == .native) or !std.mem.eql(u8, &binding.id, &expected.id) or
         !std.mem.eql(u8, &binding.plan_digest, &expected.plan_digest) or
         !std.mem.eql(u8, &binding.owner_digest, &expected.owner_digest) or binding.ordinal != expected.ordinal or
         !binding.fence.namespace.eql(expected.namespace) or binding.fence.owner_group_id != expected.owner_group_id)
@@ -417,27 +421,91 @@ fn requireCancellationIdentity(intent: cancellation.Intent, expected: anytype) !
         intent.fence.owner_group_id != expected.owner_group_id) return error.PrivateIndexOwnerJobChanged;
 }
 
+pub const RaftCancellationState = struct {
+    source: source_authority.State,
+    applied: ?positions.Position = null,
+    intent: ?cancellation.Record = null,
+    binding: ?Binding = null,
+    admitted: ?positions.Position = null,
+    fenced: ?positions.Position = null,
+    reserved: ?positions.Position = null,
+    cleanup: ?positions.Position = null,
+    claim_allocation: ?u64 = null,
+    artifacts_retired: bool = false,
+    claims_retired: bool = false,
+    completed: ?Canceled = null,
+
+    fn requireCut(self: @This(), cut: positions.Position) !void {
+        try cut.validate();
+        const applied = self.applied orelse return error.InvalidPrivateIndexCancellation;
+        if (cut != .raft or applied != .raft or cut.raft.index > applied.raft.index or cut.raft.term > applied.raft.term or
+            (cut.raft.index == applied.raft.index and cut.raft.term != applied.raft.term)) return error.InvalidPrivateIndexCancellation;
+    }
+
+    pub fn validate(self: @This(), expected: anytype) !void {
+        try expected.validate();
+        if (self.source.kind != .raft or self.source.sequence != 0 or !std.mem.eql(u8, &self.source.namespace, &@import("online_source_contract.zig").namespaceBytes(expected.namespace))) return error.OnlineSourceScopeChanged;
+        if (self.applied) |cut| try self.requireCut(cut);
+        if (self.intent) |record| {
+            try self.requireCut(record.position);
+            try record.intent.validate();
+            try requireCancellationIdentity(record.intent, expected);
+        }
+        for ([_]?positions.Position{ self.admitted, self.fenced, self.reserved, self.cleanup }) |cut| if (cut) |value| try self.requireCut(value);
+        if (self.binding) |binding| {
+            _ = try binding.encode();
+            if (binding.authority != .raft or self.admitted == null or (binding.phase != .fencing and binding.phase != .reserved)) return error.InvalidPrivateIndexCancellation;
+            try requireCancellationIdentity(cancellation.Intent.fromBinding(binding), expected);
+            if (self.intent) |record| if (!record.intent.eql(cancellation.Intent.fromBinding(binding))) return error.PrivateIndexOwnerJobChanged;
+            if ((binding.phase == .reserved) != (self.reserved != null)) return error.InvalidPrivateIndexCancellation;
+        } else if (self.admitted != null or self.fenced != null or self.reserved != null or self.cleanup != null) return error.InvalidPrivateIndexCancellation;
+        if (self.fenced) |cut| if (!cut.strictlyAfter(self.admitted orelse return error.InvalidPrivateIndexCancellation)) return error.InvalidPrivateIndexCancellation;
+        if (self.reserved) |cut| if (!cut.strictlyAfter(self.fenced orelse return error.InvalidPrivateIndexCancellation)) return error.InvalidPrivateIndexCancellation;
+        if (self.cleanup) |cut| {
+            if (self.intent == null or self.claim_allocation == null or self.claim_allocation.? == 0 or
+                !cut.strictlyAfter(self.intent.?.position) or !cut.strictlyAfter(self.reserved orelse return error.InvalidPrivateIndexCancellation)) return error.InvalidPrivateIndexCancellation;
+        } else if (self.claim_allocation != null or self.artifacts_retired or self.claims_retired) return error.InvalidPrivateIndexCancellation;
+        if (self.completed) |record| {
+            try record.validate();
+            try self.requireCut(record.position);
+            if (!self.artifacts_retired or !self.claims_retired or self.binding == null or self.intent == null or
+                !std.meta.eql(record.binding, self.binding.?) or !std.meta.eql(record.intent_position, self.intent.?.position) or
+                !std.meta.eql(record.cleanup.position, self.cleanup orelse return error.InvalidPrivateIndexCancellation) or record.cleanup.claim_allocation != self.claim_allocation.?) return error.InvalidPrivateIndexCancellation;
+        }
+    }
+};
+
 pub fn inspectCancellation(txn: anytype, expected: anytype) !CancellationState {
-    const binding = try inspectNative(txn, expected);
+    return inspectCancellationAuthority(txn, expected, .native);
+}
+pub fn inspectRaftCancellation(txn: anytype, expected: anytype) !RaftCancellationState {
+    return inspectCancellationAuthority(txn, expected, .raft);
+}
+fn inspectCancellationAuthority(txn: anytype, expected: anytype, comptime kind: source_authority.Kind) !if (kind == .native) CancellationState else RaftCancellationState {
+    const binding = try inspectOwner(txn, expected, kind);
     try cancellation.verifyRecovery(txn, binding);
-    const authority = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(expected.namespace));
-    var result: CancellationState = .{
+    const authority = try source_authority.require(txn, kind, @import("online_source_contract.zig").namespaceBytes(expected.namespace));
+    var result: if (kind == .native) CancellationState else RaftCancellationState = .{
         .source = authority,
         .intent = try cancellation.pending(txn),
         .binding = binding,
     };
+    if (comptime kind == .raft) {
+        const applied = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        result.applied = if (applied) |cut| .{ .raft = .{ .term = cut.term, .index = cut.index } } else null;
+    }
     if (result.intent) |record| {
         try requireCancellationIdentity(record.intent, expected);
     }
     if (binding) |current| {
-        result.admitted = try nativeEffectPosition(txn, current, .admitted);
-        result.fenced = try nativeEffectPosition(txn, current, .fenced);
-        result.reserved = try nativeEffectPosition(txn, current, .reserved);
+        inline for (.{ "admitted", "fenced", "reserved" }) |field| {
+            @field(result, field) = if (comptime kind == .native) try nativeEffectPosition(txn, current, @field(NativeEffect, field)) else try @import("relational_index_raft_control.zig").retainedPosition(txn, current, @field(@import("relational_index_raft_control.zig").Effect, field));
+        }
     }
     if (try loadCancellationCleanup(txn, binding)) |record| {
         const current = binding orelse return error.InvalidPrivateIndexCancellation;
-        if (record.position != .native) return error.InvalidPrivateIndexCancellation;
-        result.cleanup = record.position.native;
+        if ((record.position == .native) != (kind == .native)) return error.InvalidPrivateIndexCancellation;
+        result.cleanup = if (comptime kind == .native) record.position.native else record.position;
         result.claim_allocation = record.claim_allocation;
         if (requireCancellationArtifactsRetired(txn, current)) |_| {
             result.artifacts_retired = true;
