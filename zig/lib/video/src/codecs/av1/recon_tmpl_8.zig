@@ -2839,7 +2839,7 @@ pub fn decode_coefs(t: [*c]Dav1dTaskContext, a: [*c]u8, l: [*c]u8, tx: enum_Rect
                 continue;
             },
             139 => {
-                afz_level_66 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, afz_x_64) * afz_stride_60))))) + afz_y_65;
+                afz_level_66 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, @intCast(afz_x_64)) * afz_stride_60))))) + afz_y_65;
                 afz_pc = 137;
                 continue;
             },
@@ -2907,7 +2907,7 @@ pub fn decode_coefs(t: [*c]Dav1dTaskContext, a: [*c]u8, l: [*c]u8, tx: enum_Rect
                 continue;
             },
             153 => {
-                afz_level_66 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, afz_x_64) * afz_stride_60))))) + afz_y_65;
+                afz_level_66 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, @intCast(afz_x_64)) * afz_stride_60))))) + afz_y_65;
                 afz_pc = 151;
                 continue;
             },
@@ -3195,7 +3195,7 @@ pub fn decode_coefs(t: [*c]Dav1dTaskContext, a: [*c]u8, l: [*c]u8, tx: enum_Rect
                 continue;
             },
             213 => {
-                afz_level_56 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, afz_x_54) * afz_stride_50))))) + afz_y_55;
+                afz_level_56 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, @intCast(afz_x_54)) * afz_stride_50))))) + afz_y_55;
                 afz_pc = 211;
                 continue;
             },
@@ -3263,7 +3263,7 @@ pub fn decode_coefs(t: [*c]Dav1dTaskContext, a: [*c]u8, l: [*c]u8, tx: enum_Rect
                 continue;
             },
             227 => {
-                afz_level_56 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, afz_x_54) * afz_stride_50))))) + afz_y_55;
+                afz_level_56 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, @intCast(afz_x_54)) * afz_stride_50))))) + afz_y_55;
                 afz_pc = 225;
                 continue;
             },
@@ -3551,7 +3551,7 @@ pub fn decode_coefs(t: [*c]Dav1dTaskContext, a: [*c]u8, l: [*c]u8, tx: enum_Rect
                 continue;
             },
             287 => {
-                afz_level_46 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, afz_x_44) * afz_stride_40))))) + afz_y_45;
+                afz_level_46 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, @intCast(afz_x_44)) * afz_stride_40))))) + afz_y_45;
                 afz_pc = 285;
                 continue;
             },
@@ -3619,7 +3619,7 @@ pub fn decode_coefs(t: [*c]Dav1dTaskContext, a: [*c]u8, l: [*c]u8, tx: enum_Rect
                 continue;
             },
             301 => {
-                afz_level_46 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, afz_x_44) * afz_stride_40))))) + afz_y_45;
+                afz_level_46 = (afz_levels_31 + @as(usize, @bitCast(@as(isize, @intCast(@as(ptrdiff_t, @intCast(afz_x_44)) * afz_stride_40))))) + afz_y_45;
                 afz_pc = 299;
                 continue;
             },

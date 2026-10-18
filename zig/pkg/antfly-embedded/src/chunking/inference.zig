@@ -163,7 +163,10 @@ pub fn chunkInputWithProvider(
     if (resolved_endpoint == null and linked_callback_available) if (antfly_provider) |provider| {
         const ptr = provider.ptr orelse return error.InvalidChunkProvider;
         const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
-        const io = execution.io orelse std.Io.Threaded.global_single_threaded.io();
+        const io = execution.io orelse if (builtin.os.tag == .freestanding)
+            return error.BackendRuntimeIoUnavailable
+        else
+            std.Io.Threaded.global_single_threaded.io();
         const request_context = execution.requestContext(io);
         try request_context.check();
         const chunks = if (provider.chunk_input_with_context_callback) |callback| blk: {
@@ -179,6 +182,9 @@ pub fn chunkInputWithProvider(
         return try cloneRemoteChunks(alloc, chunks);
     };
     const endpoint_raw = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
+    // Browser storage uses direct chunking or a host callback. Native HTTP
+    // discovery/sockets are unavailable in a freestanding module.
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     if (cfg.model.len == 0 and cfg.embedding == null) return error.InvalidChunkerConfig;
     // Unlike `managed_embedder.zig`'s embedder/extractor base URLs, a
     // chunker's `api_url` reached this call unnormalized: a bare
