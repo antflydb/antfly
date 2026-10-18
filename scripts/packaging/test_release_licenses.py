@@ -167,6 +167,7 @@ pub fn build(b: *std.Build) void {
                 for entry in policy["platforms"]
                 if entry["archive_os"] == "Darwin"
             )
+            compile_failed = False
             for product, target, steps, license_name in (
                 ("embedded", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("lite", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
@@ -175,6 +176,8 @@ pub fn build(b: *std.Build) void {
                 ("server", darwin_target, ["antfly", "capi", "grep"], "LICENSE"),
                 ("server", "aarch64-linux-musl", ["antfly", "capi", "grep"], "LICENSE"),
             ):
+                if compile_failed:
+                    break  # Later cases require this first provider/cache to exist.
                 with self.subTest(product=product, target=target):
                     built = subprocess.run(
                         [
@@ -204,6 +207,7 @@ pub fn build(b: *std.Build) void {
                         capture_output=True,
                         text=True,
                     )
+                    compile_failed = built.returncode != 0
                     self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                     build_dir = root / (
                         "zig/pkg/inference" if product == "inference" else "zig"

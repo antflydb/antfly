@@ -83,12 +83,13 @@ jobs:
       - name: Test Antfly C ABI packaging
         run: python scripts/packaging/test_cabi_packaging.py
 
-      - name: Build wheels and populate npm packages
+      - name: Populate npm CLI packages
         run: |
           python scripts/packaging/package_cli_release.py \
             --version "${{ steps.version.outputs.version }}" \
             --archive-dir dist/release-archives \
-            --out-dir dist/cli-packages
+            --out-dir dist/cli-packages \
+            --skip-python
 
       - name: Smoke check package wrappers
         run: |
@@ -111,7 +112,6 @@ jobs:
             --version "${{ steps.version.outputs.version }}" \
             --commit "${{ inputs.source_commit }}" \
             --npm-dir dist/cli-packages/npm \
-            --python-dir dist/cli-packages/python \
             --out-dir dist/cli-snapshot
           python scripts/release/verify_cli_snapshot.py \
             --snapshot-dir dist/cli-snapshot \
