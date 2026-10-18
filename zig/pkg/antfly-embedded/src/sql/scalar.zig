@@ -283,6 +283,38 @@ pub const Program = struct {
     constant_memberships: std.AutoHashMapUnmanaged(u32, *arrays.Membership) = .empty,
     constant_pool: ?*ConstantPool = null,
     constant_inputs: std.AutoHashMapUnmanaged(u32, Datum) = .empty,
+    /// Statement-owned traversal edges and eligibility, built after constants.
+    /// Runtime values, shapes, work and depth remain request-owned checks.
+    concat_nodes: []const Evaluator.ConcatMetadata = &.{},
+
+    fn prepareConcatNodes(self: *Program, a: Allocator) !void {
+        const vm: Evaluator = .{ .program = self, .alloc = a, .cells = &.{}, .parameters = &.{}, .limits = .{} };
+        for (self.instructions, 0..) |instruction, index| {
+            const kind = instruction.type.element_type orelse continue;
+            if (vm.concatNode(@intCast(index), kind) != null) break;
+        } else return;
+        const nodes = try a.alloc(Evaluator.ConcatMetadata, self.instructions.len);
+        // Instructions are topological; each structural child is ready once.
+        for (self.instructions, nodes, 0..) |instruction, *entry, index| {
+            entry.* = .{};
+            const kind = instruction.type.element_type orelse continue;
+            const node = vm.concatNode(@intCast(index), kind) orelse continue;
+            entry.node = node;
+            if (node != index) {
+                entry.leaves = nodes[node].leaves;
+                entry.widenings = @min(2, nodes[node].widenings + @intFromBool(instruction.type.element_type != self.instructions[node].type.element_type));
+                entry.height = nodes[node].height + 1;
+            } else {
+                const call = instruction.operation.call;
+                const left = nodes[call.args[@intFromBool(call.function == .array_prepend)]];
+                const right: Evaluator.ConcatMetadata = if (call.function == .array_cat) nodes[call.args[1]] else .{};
+                entry.leaves = @min(65, left.leaves + right.leaves);
+                entry.widenings = @min(2, left.widenings + right.widenings);
+                entry.height = @max(left.height, right.height) + 1;
+            }
+        }
+        self.concat_nodes = nodes;
+    }
 
     fn literalInstruction(self: *const Program, index: u32, earlier: []const bool) bool {
         return switch (self.instructions[index].operation) {
@@ -673,6 +705,7 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     };
     errdefer program.releaseConstants();
     try program.prepareConstantArrays(binder.alloc, limits);
+    try program.prepareConcatNodes(binder.alloc);
     if (limits.invocation) |invocation| try invocation.register(&program);
     program.arena = arena;
     return program;
@@ -3923,11 +3956,12 @@ const Evaluator = struct {
     // Follow only identity and total widening casts. A final primitive writer
     // composes these lossless conversions; fallible/modifier/constant-owner
     // boundaries still execute before later operands in the original tree.
-    fn concatNode(self: *Evaluator, index: u32, kind: arrays.ElementType) ?u32 {
+    fn concatNode(self: *const Evaluator, index: u32, kind: arrays.ElementType) ?u32 {
         const instruction = self.program.instructions[index];
         if (instruction.type.kind != .array or instruction.type.element_type == null) return null;
         const node_kind = instruction.type.element_type.?;
         if (node_kind != kind and !totalArrayWidening(node_kind, kind)) return null;
+        if (self.program.concat_nodes.len != 0) return self.program.concat_nodes[index].node;
         if (self.program.constant_arrays.contains(index) or self.program.constant_inputs.contains(index)) return null;
         switch (instruction.operation) {
             .call => |call| if (call.function == .array_cat or call.function == .array_append or call.function == .array_prepend) return index,
@@ -3940,8 +3974,15 @@ const Evaluator = struct {
         return null;
     }
     const ConcatEligibility = struct { leaves: usize, widenings: usize = 0 };
+    const ConcatMetadata = struct { node: ?u32 = null, height: u32 = 1, leaves: u8 = 1, widenings: u8 = 0 };
     fn concatLeaves(self: *Evaluator, index: u32, kind: arrays.ElementType, remaining: usize) ConcatEligibility {
         if (remaining == 0) return .{ .leaves = 65 };
+        if (self.program.concat_nodes.len != 0) {
+            // Parent widening can only cross the same total, transitive
+            // primitive edges admitted for this instruction's own element kind.
+            const entry = self.program.concat_nodes[index];
+            return if (entry.height > remaining) .{ .leaves = 65 } else .{ .leaves = entry.leaves, .widenings = entry.widenings };
+        }
         const node = self.concatNode(index, kind) orelse return .{ .leaves = 1 };
         if (node != index) {
             var child = self.concatLeaves(node, kind, remaining - 1);
@@ -6703,5 +6744,46 @@ test "SQL fused append widening writes packed scalar and array leaves directly" 
         try std.testing.expect(actual.stored.?.compact);
         try std.testing.expectEqual(@as(i32, -7), actual.dimensions[0].lower);
         try std.testing.expectEqual(@as(usize, 131), actual.cardinality());
+    }
+}
+
+test "SQL prepared fusion metadata preserves fallback depth work and allocation free rows" {
+    const a = std.testing.allocator;
+    const cells: [1]Datum = .{.json(.{ .integer = 7 })};
+    const source = try arrays.Value.init(.int64, &.{.{ .length = 1, .lower = -7 }}, &cells, .{});
+    var alternate = source;
+    alternate.dimensions = &.{.{ .length = 1, .lower = 17 }};
+    alternate.prepared_footprint = null;
+    try std.testing.expect(@sizeOf(Evaluator.ConcatMetadata) <= 16);
+    var compiled = try @import("compiler.zig").compileScalar(a, "NULL::int8[] || a || NULL::int8[] || NULL::int8[] || NULL::int8[]", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int64 }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.concat_nodes.len == program.instructions.len);
+    var fallback = program;
+    fallback.concat_nodes = &.{};
+    for ([_]*const Program{ &fallback, &program }, 0..) |p, mode| {
+        var elapsed: i96 = 0;
+        for (0..5) |_| {
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            for (0..20000) |row| {
+                const input = if (row % 2 == 0) &source else &alternate;
+                const result = try p.evaluate(std.testing.failing_allocator, &.{Datum.typedArray(input)}, &.{}, .{});
+                try std.testing.expect(result.array.? == input);
+            }
+            elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+        }
+        std.debug.print("SQL_PREPARED_FUSION cached={} rows=100000 allocations=0 elapsed_ns={}\n", .{ mode == 1, elapsed });
+    }
+    for (1..20) |depth| {
+        var fast: Evaluator = .{ .program = &program, .alloc = std.testing.failing_allocator, .cells = &.{Datum.typedArray(&source)}, .parameters = &.{}, .limits = .{ .depth = depth } };
+        var slow = fast;
+        slow.program = &fallback;
+        const expected = slow.runDatum(program.root, 0);
+        const actual = fast.runDatum(program.root, 0);
+        if (expected) |value| {
+            try std.testing.expect((try actual).array.? == value.array.?);
+        } else |err| try std.testing.expectError(err, actual);
+        try std.testing.expectEqual(slow.usedSteps(), fast.usedSteps());
     }
 }

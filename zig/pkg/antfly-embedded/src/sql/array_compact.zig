@@ -369,6 +369,13 @@ pub const ResultBuilder = union(enum) {
     /// Internal native-plan primitive: caller bounds count to 64 and the
     /// requested range to the pinned, validated view before reaching here.
     pub fn nullBits(view: layout.View, begin: usize, count: usize) u64 {
+        if (count == 64) {
+            const offset = view.bitmap_start + begin / 8;
+            const word = std.mem.readInt(u64, view.bytes[offset..][0..8], .little);
+            const shift: u6 = @intCast(begin % 8);
+            if (shift == 0) return word;
+            return (word >> shift) | (@as(u64, view.bytes[offset + 8]) << @intCast(64 - @as(usize, shift)));
+        }
         var bits: u64 = 0;
         var at: usize = 0;
         while (at < count) {
@@ -383,6 +390,11 @@ pub const ResultBuilder = union(enum) {
 
     fn writeNulls(state: *Builder, bits: u64, count: usize) void {
         if (state.compact and state.index % 64 == 0) std.mem.writeInt(u32, state.bytes[state.slots + state.index / 64 * 4 ..][0..4], @intCast(state.non_null), .little);
+        if (count == 64 and state.index % 8 == 0) {
+            const destination = state.bytes[state.bitmap + state.index / 8 ..][0..8];
+            std.mem.writeInt(u64, destination, std.mem.readInt(u64, destination, .little) | bits, .little);
+            return;
+        }
         var bit_at: usize = 0;
         while (bit_at < count) {
             const index = state.index + bit_at;
@@ -417,6 +429,24 @@ pub const ResultBuilder = union(enum) {
         }
         var source_index: usize = begin;
         var source_physical: usize = if (view.compact) std.mem.readInt(u32, view.bytes[view.slots_start + begin / 64 * 4 ..][0..4], .little) + begin % 64 - @popCount(nullBits(view, begin / 64 * 64, begin % 64)) else begin;
+        if (!text and view.compact == state.compact) {
+            // Matching physical layouts have one contiguous payload, even
+            // across NULLs. Rebuild only destination validity/checkpoints.
+            try work.consume(range_length);
+            const slots = if (view.compact) present else range_length;
+            const destination = if (state.compact) state.non_null else state.index;
+            try copyBytes(state.bytes[state.values + destination * width ..][0 .. slots * width], view.bytes[view.payload_start + source_physical * width ..][0 .. slots * width], work, .prepaid);
+            while (source_index < begin + range_length) {
+                if ((source_index - begin) % 4096 < 64) try work.poll();
+                const count = @min(begin + range_length - source_index, 64 - state.index % 64);
+                const bits = nullBits(view, source_index, count);
+                writeNulls(state, bits, count);
+                state.index += count;
+                state.non_null += count - @popCount(bits);
+                source_index += count;
+            }
+            return;
+        }
         while (source_index < begin + range_length) {
             const count = @min(begin + range_length - source_index, 64 - state.index % 64);
             try work.consume(count);
@@ -433,10 +463,6 @@ pub const ResultBuilder = union(enum) {
                 const length = end - base;
                 try copyBytes(state.bytes[state.payload + state.payload_at ..][0..length], view.bytes[view.payload_start + base ..][0..length], work, .payload);
                 state.payload_at += length;
-            } else if (view.compact == state.compact) {
-                const slots = if (view.compact) non_null else count;
-                const destination = if (state.compact) state.non_null else state.index;
-                try copyBytes(state.bytes[state.values + destination * width ..][0 .. slots * width], view.bytes[view.payload_start + source_physical * width ..][0 .. slots * width], work, .scheduled);
             } else {
                 // Consecutive present runs permit memcpy even when one side
                 // has NULL slots and the other stores only present values.
@@ -1227,4 +1253,77 @@ test "SQL native dense bulk spans preserve partial NULL bytes work and cancellat
     try std.testing.expectError(error.Canceled, output.appendValue(source, &work));
     try std.testing.expectEqual(@as(usize, 3), cancel.calls);
     try std.testing.expectError(error.Canceled, work.consume(0));
+}
+
+test "SQL native bulk nullable spans preserve unaligned checkpoints and work" {
+    const a = std.testing.allocator;
+    for (0..4) |pattern| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const region = arena.allocator();
+        const cells = try region.alloc(arrays.Element, 257);
+        var present: usize = 0;
+        for (cells, 0..) |*cell, i| {
+            cell.* = if (pattern == 0 or (pattern == 1 and i % 7 != 0) or (pattern == 2 and i == 128)) .{} else .json(.{ .integer = @intCast(i) });
+            present += @intFromBool(!cell.sql_null);
+        }
+        var source_builder = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 257, .lower = -7 }}, 257, present, .{});
+        var initial: arrays.Budget = .{};
+        for (cells) |cell| try source_builder.append(cell, &initial);
+        const source = try source_builder.finish(region, .{}, &initial);
+        for ([_]usize{ 0, 1, 7, 63, 64, 65 }) |begin| for ([_]usize{ 0, 1, 7, 63, 64, 65 }) |prefix| {
+            const count: usize = 129;
+            var range_present: usize = 0;
+            for (cells[begin..][0..count]) |cell| range_present += @intFromBool(!cell.sql_null);
+            const axes = [_]arrays.Dimension{.{ .length = @intCast(prefix + count + 5), .lower = -3 }};
+            var fast = try ResultBuilder.initKnown(region, .int64, &axes, prefix + count + 5, range_present + 5, .{});
+            var slow = try ResultBuilder.initKnown(region, .int64, &axes, prefix + count + 5, range_present + 5, .{});
+            var fw: arrays.Budget = .{};
+            var sw: arrays.Budget = .{};
+            for (0..prefix) |_| {
+                try fast.append(.{}, &fw);
+                try slow.append(.{}, &sw);
+            }
+            try fast.appendRange(source, begin, count, &fw);
+            for (cells[begin..][0..count]) |cell| try slow.append(cell, &sw);
+            for (0..5) |_| {
+                try fast.append(.json(.{ .integer = -1 }), &fw);
+                try slow.append(.json(.{ .integer = -1 }), &sw);
+            }
+            const actual = try fast.finish(region, .{}, &fw);
+            const expected = try slow.finish(region, .{}, &sw);
+            try std.testing.expectEqual(sw.remaining, fw.remaining);
+            try std.testing.expectEqualSlices(u8, expected.stored.?.bytes, actual.stored.?.bytes);
+            _ = try layout.View.open(.int64, actual.stored.?.bytes, .{});
+        };
+    }
+}
+
+test "SQL native nullable span copy measurement" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 16 }) |stride| {
+        var source_arena = std.heap.ArenaAllocator.init(a);
+        defer source_arena.deinit();
+        const region = source_arena.allocator();
+        const count: usize = 16384;
+        const present = if (stride == 1) count - 1 else count / stride;
+        var source_builder = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = count }}, count, present, .{});
+        var initial: arrays.Budget = .{};
+        for (0..count) |i| try source_builder.append(if (if (stride == 1) i == 0 else i % stride != 0) .{} else .json(.{ .integer = @intCast(i) }), &initial);
+        const source = try source_builder.finish(region, .{}, &initial);
+        var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 1024 * 1024 };
+        var elapsed: i96 = 0;
+        for (0..100) |_| {
+            var arena = std.heap.ArenaAllocator.init(counter.allocator());
+            defer arena.deinit();
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            var output = try ResultBuilder.initKnown(arena.allocator(), .int64, &.{.{ .length = count }}, count, present, .{});
+            var work: arrays.Budget = .{};
+            try output.appendValue(source, &work);
+            const result = try output.finish(arena.allocator(), .{}, &work);
+            elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+            try std.testing.expectEqualSlices(u8, source.stored.?.bytes, result.stored.?.bytes);
+        }
+        std.debug.print("SQL_NULLABLE_SPAN compact={} repetitions=100 peak={} elapsed_ns={} canonical_equal=true\n", .{ source.stored.?.compact, counter.peak, elapsed });
+    }
 }

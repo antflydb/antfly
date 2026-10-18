@@ -283,6 +283,18 @@ pub const Value = struct {
         const lower_bound = self.dimensions[0].lower;
         const offset: usize = @intCast(@max(@as(i64, 0), @as(i64, start orelse lower_bound) - lower_bound));
         if (offset >= self.cardinality()) return null;
+        if (self.nativeSearch()) |view| {
+            _ = try self.knownNonNullCount();
+            var physical: usize = if (view.compact) std.mem.readInt(u32, view.bytes[view.slots_start + offset / 64 * 4 ..][0..4], .little) + offset % 64 - @popCount(@import("array_compact.zig").ResultBuilder.nullBits(view, offset / 64 * 64, offset % 64)) else offset;
+            var cursor = offset;
+            while (cursor < view.count) {
+                const block_count = @min(64, view.count - cursor);
+                const bits = try searchNativeBlock(view, cursor, block_count, &physical, needle, work, true);
+                if (bits != 0) return @intCast(@as(i64, lower_bound) + @as(i64, @intCast(cursor + @ctz(bits))));
+                cursor += block_count;
+            }
+            return null;
+        }
         for (offset..self.cardinality()) |i| {
             const element = self.flatCell(i);
             if (try compareElement(self.element_type, element, needle, work) == .eq) return @intCast(@as(i64, lower_bound) + @as(i64, @intCast(i)));
@@ -296,6 +308,33 @@ pub const Value = struct {
     pub fn positions(self: Value, alloc: Allocator, needle: Element, limits: Limits, work: *Budget) !Value {
         if (self.dimensions.len > 1) return error.UnsupportedSqlShape;
         try validateElement(self.element_type, needle, work);
+        var local: [8192]u8 = undefined;
+        if (self.cardinality() <= local.len * 8) if (self.nativeSearch()) |view| {
+            _ = try self.knownNonNullCount();
+            const bitmap = local[0 .. (self.cardinality() + 7) / 8];
+            var physical: usize = 0;
+            var cursor: usize = 0;
+            var count: usize = 0;
+            const before = work.remaining;
+            while (cursor < view.count) {
+                const block_count = @min(64, view.count - cursor);
+                const bits = try searchNativeBlock(view, cursor, block_count, &physical, needle, work, false);
+                for (0..(block_count + 7) / 8) |byte| bitmap[cursor / 8 + byte] = @truncate(bits >> @intCast(byte * 8));
+                count += @popCount(bits);
+                cursor += block_count;
+            }
+            const dimensions: [1]Dimension = .{.{ .length = @intCast(count) }};
+            var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, .int32, dimensions[0..@intFromBool(count != 0)], count, count, limits);
+            // Retain the second logical comparison pass without decoding or
+            // comparing again. Emission keeps its own original work charges.
+            try work.consume(before - work.remaining);
+            cursor = nextBit(bitmap, 0, view.count, true);
+            while (cursor < view.count) {
+                try output.append(Element.json(.{ .integer = @as(i64, self.dimensions[0].lower) + @as(i64, @intCast(cursor)) }), work);
+                cursor = nextBit(bitmap, cursor + 1, view.count, true);
+            }
+            return output.finish(alloc, limits, work);
+        };
         var count: usize = 0;
         for (0..self.cardinality()) |i| if (try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq) {
             count += 1;
@@ -429,17 +468,37 @@ pub const Value = struct {
     // A validated view permits sequential physical addressing. Packed inputs
     // never replay rank checkpoints for each non-NULL candidate; text reads its
     // offset pair directly. Keep the scalar comparator's work and NaN rules.
+    fn nativeSearch(self: Value) ?@import("../common/sql_array_layout.zig").View {
+        const view = self.stored orelse return null;
+        return if (view.validation != null) view.* else null;
+    }
+    fn searchNativeBlock(view: @import("../common/sql_array_layout.zig").View, begin: usize, count: usize, physical: *usize, needle: Element, work: *Budget, comptime first_only: bool) !u64 {
+        const nulls = @import("array_compact.zig").ResultBuilder.nullBits(view, begin, count);
+        if (needle.sql_null) {
+            try work.consume(if (first_only and nulls != 0) @ctz(nulls) + 1 else count);
+            return nulls;
+        }
+        return switch (view.kind) {
+            inline .boolean, .int16, .int32, .int64, .float32, .float64, .text => |kind| matchNativeBlockMode(kind, view, begin, count, nulls, physical, needle, work, first_only),
+            else => error.InvalidSqlArrayShape,
+        };
+    }
     fn matchNativeBlock(comptime kind: ElementType, view: @import("../common/sql_array_layout.zig").View, begin: usize, block_count: usize, nulls: u64, physical: *usize, needle: Element, work: *Budget) !u64 {
-        try work.consume(@popCount(nulls));
+        return matchNativeBlockMode(kind, view, begin, block_count, nulls, physical, needle, work, false);
+    }
+    fn matchNativeBlockMode(comptime kind: ElementType, view: @import("../common/sql_array_layout.zig").View, begin: usize, block_count: usize, nulls: u64, physical: *usize, needle: Element, work: *Budget, comptime first_only: bool) !u64 {
+        if (!first_only) try work.consume(@popCount(nulls));
         const mask = if (block_count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(block_count)) - 1;
         var candidates = ~nulls & mask;
         var packed_cursor = physical.*;
         var matched: u64 = 0;
+        var charged: usize = 0;
         while (candidates != 0) {
             const bit = @ctz(candidates);
             candidates &= candidates - 1;
             const slot = if (view.compact) packed_cursor else begin + bit;
-            try work.consume(1);
+            try work.consume(if (first_only) bit + 1 - charged else 1);
+            charged = bit + 1;
             const equal = switch (kind) {
                 .text => text: {
                     const first = std.mem.readInt(u32, view.bytes[view.slots_start + slot * 4 ..][0..4], .little);
@@ -461,8 +520,12 @@ pub const Value = struct {
                 else => unreachable,
             };
             packed_cursor += 1;
-            if (equal) matched |= @as(u64, 1) << @intCast(bit);
+            if (equal) {
+                matched |= @as(u64, 1) << @intCast(bit);
+                if (first_only) return matched;
+            }
         }
+        if (first_only) try work.consume(block_count - charged);
         physical.* = packed_cursor;
         return matched;
     }
@@ -1336,4 +1399,138 @@ test "SQL identity replacements borrow only admitted representations and retain 
     var owner: @import("numeric_value.zig").Context = .{ .alloc = std.testing.failing_allocator, .checkpoint = Cancel.poll };
     var canceled: Budget = .{ .shared = &owner };
     try std.testing.expectError(error.Canceled, source.transform(std.testing.failing_allocator, .{}, Element{}, .{}, &canceled));
+}
+
+test "SQL native search preserves scalar results bounds and exact work" {
+    const a = std.testing.allocator;
+    for ([_]ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64, .text }) |kind| {
+        for ([_]usize{ 0, 1, 17, 65, 129 }) |count| for (0..3) |pattern| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const region = arena.allocator();
+            const cells = try region.alloc(Element, count);
+            for (cells, 0..) |*cell, i| cell.* = if (pattern == 2 or (pattern == 1 and i % 7 != 0)) .{} else .json(switch (kind) {
+                .boolean => .{ .bool = i % 2 == 0 },
+                .float32, .float64 => .{ .float = if (i == 0) -0.0 else if (i % 11 == 0) std.math.nan(f64) else 42.0 },
+                .text => .{ .string = if (i % 3 == 0) "é☺" else "other" },
+                else => .{ .integer = if (i % 3 == 0) 42 else 7 },
+            });
+            const axes = [_]Dimension{.{ .length = @intCast(count), .lower = -7 }};
+            const prepared = try Value.init(kind, axes[0..@intFromBool(count != 0)], cells, .{});
+            const encoded = try @import("array_storage.zig").encodeAlloc(region, prepared, .{});
+            const native = try @import("array_storage.zig").viewLeaky(region, kind, encoded, .{});
+            var unproven_view = native.stored.?.*;
+            unproven_view.validation = null;
+            var oracle = native;
+            oracle.stored = &unproven_view;
+            for (0..4) |probe| {
+                const needle: Element = if (probe == 0) .{} else .json(switch (kind) {
+                    .boolean => .{ .bool = probe == 1 },
+                    .float32, .float64 => .{ .float = if (probe == 1) -0.0 else if (probe == 2) std.math.nan(f64) else 999.0 },
+                    .text => .{ .string = if (probe == 1) "é☺" else if (probe == 2) "other" else "missing" },
+                    else => .{ .integer = if (probe == 1) 42 else if (probe == 2) 7 else 999 },
+                });
+                for ([_]?i32{ null, -99, -7, -1, 8, 56, 57, 58, 120, 500 }) |start| {
+                    var fast: Budget = .{};
+                    var slow: Budget = .{};
+                    try std.testing.expectEqual(try oracle.position(needle, start, &slow), try native.position(needle, start, &fast));
+                    try std.testing.expectEqual(slow.remaining, fast.remaining);
+                }
+                var fast: Budget = .{};
+                var slow: Budget = .{};
+                const expected = try oracle.positions(region, needle, .{}, &slow);
+                const actual = try native.positions(region, needle, .{}, &fast);
+                try std.testing.expectEqual(slow.remaining, fast.remaining);
+                try std.testing.expectEqualSlices(u8, try @import("array_storage.zig").encodeAlloc(region, expected, .{}), try @import("array_storage.zig").encodeAlloc(region, actual, .{}));
+                const used = (Budget{}).remaining - fast.remaining;
+                if (used != 0) {
+                    var denied: Budget = .{ .remaining = used - 1 };
+                    try std.testing.expectError(error.SqlProgramLimitExceeded, native.positions(region, needle, .{}, &denied));
+                }
+            }
+        };
+    }
+}
+
+test "SQL native search measurements retain canonical output" {
+    const a = std.testing.allocator;
+    for ([_]ElementType{ .int64, .text }) |kind| {
+        var source_arena = std.heap.ArenaAllocator.init(a);
+        defer source_arena.deinit();
+        const region = source_arena.allocator();
+        const count: usize = 16384;
+        var builder = try @import("array_compact.zig").ResultBuilder.initPlanned(region, kind, &.{.{ .length = count, .lower = -7 }}, count, count / 16, if (kind == .text) count / 16 * 5 else null, .{});
+        var initial: Budget = .{};
+        for (0..count) |i| try builder.append(if (i % 16 != 0) .{} else .json(if (kind == .text) .{ .string = "match" } else .{ .integer = 42 }), &initial);
+        const source = try builder.finish(region, .{}, &initial);
+        var unproven_view = source.stored.?.*;
+        unproven_view.validation = null;
+        var unproven = source;
+        unproven.stored = &unproven_view;
+        for (0..2) |mode| {
+            var elapsed: i96 = 0;
+            var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 1024 * 1024 };
+            for (0..20) |_| {
+                var arena = std.heap.ArenaAllocator.init(counter.allocator());
+                defer arena.deinit();
+                const input = if (mode == 0) unproven else source;
+                var work: Budget = .{};
+                const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+                try std.testing.expectEqual(@as(?i32, null), try input.position(.json(if (kind == .text) .{ .string = "missing" } else .{ .integer = 99 }), null, &work));
+                const result = try input.positions(arena.allocator(), .json(if (kind == .text) .{ .string = "match" } else .{ .integer = 42 }), .{}, &work);
+                elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+                try std.testing.expectEqual(count / 16, result.cardinality());
+                for (0..result.cardinality()) |i| try std.testing.expectEqual(@as(i64, @intCast(i * 16)) - 7, result.flatCell(i).value.integer);
+            }
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            std.debug.print("SQL_NATIVE_SEARCH kind={s} native={} repetitions=20 peak={} elapsed_ns={}\n", .{ @tagName(kind), mode == 1, counter.peak, elapsed });
+        }
+    }
+}
+
+test "SQL native search unwinds allocation faults cancellation and oversized scratch fallback" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const region = source_arena.allocator();
+    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region, .int64, &.{.{ .length = 129 }}, 129, 1, .{});
+    var initial: Budget = .{};
+    for (0..129) |i| try builder.append(if (i == 128) .json(.{ .integer = 42 }) else .{}, &initial);
+    const source = try builder.finish(region, .{}, &initial);
+    const Fixture = struct {
+        fn run(backing: Allocator, input: *const Value) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            var work: Budget = .{};
+            const output = try input.positions(arena.allocator(), .json(.{ .integer = 42 }), .{}, &work);
+            try std.testing.expectEqual(@as(i64, 129), output.flatCell(0).value.integer);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{&source});
+    var exact: Budget = .{ .remaining = 2 };
+    try std.testing.expectEqual(@as(?i32, 1), try source.position(.{}, null, &exact));
+    try std.testing.expectEqual(@as(usize, 0), exact.remaining);
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+    };
+    var cancel: Cancel = .{};
+    var context: @import("numeric_value.zig").Context = .{ .alloc = region, .checkpoint = Cancel.check, .ptr = &cancel };
+    var work: Budget = .{ .shared = &context };
+    try std.testing.expectError(error.Canceled, source.positions(region, .{}, .{}, &work));
+    try std.testing.expectError(error.Canceled, work.consume(0));
+    const count: usize = 70000;
+    const limits: Limits = .{ .elements = count };
+    var large_builder = try @import("array_compact.zig").ResultBuilder.initKnown(region, .int64, &.{.{ .length = count, .lower = -7 }}, count, 0, limits);
+    var lw: Budget = .{};
+    for (0..count) |_| try large_builder.append(.{}, &lw);
+    const large = try large_builder.finish(region, limits, &lw);
+    const output = try large.positions(region, .{}, limits, &lw);
+    try std.testing.expectEqual(count, output.cardinality());
+    try std.testing.expectEqual(@as(i64, -7), output.flatCell(0).value.integer);
+    try std.testing.expectEqual(@as(i64, count - 8), output.flatCell(count - 1).value.integer);
 }
