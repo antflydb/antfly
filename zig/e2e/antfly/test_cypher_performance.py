@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 import uuid
-from math import comb
+from math import comb, perm
 from pathlib import Path
 
 import conftest
@@ -529,6 +529,28 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             str(branch_paths),
             str(branch_sum),
         ], branched
+        many_branches = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*3..3]->(m:H),(m)-[:R*3..3]->(b:H)"
+                + "".join(f",(m)-[:R]->(c{i}:H)" for i in range(7))
+                + " RETURN count(*)",
+                "limits": {"explored_edges": 153, "intermediate_states": 30000},
+            },
+        )
+        assert many_branches["rows"] == [
+            [
+                {
+                    "type": "integer",
+                    "value": str(
+                        sum(
+                            comb(m, 3) * comb(17 - m, 3) * perm(16 - m, 7)
+                            for m in range(3, 15)
+                        )
+                    ),
+                }
+            ]
+        ], many_branches
         split_path = (
             "(a IS H)-[r0 IS R]->(u0 IS H)-[r1 IS R]->(u1 IS H)-[r2 IS R]->(m IS H),"
             "(m)-[r3 IS R]->(v0 IS H)-[r4 IS R]->(v1 IS H)-[r5 IS R]->(b IS H)"
@@ -550,6 +572,14 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             (
                 f"SELECT sum(q.score),count(*) FROM {relation} CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) d",
                 [["994500", "63648"]],
+            ),
+            (
+                f"SELECT count(*),sum(q.score) FROM {relation} JOIN (SELECT 16 AS k UNION ALL SELECT 17 AS k) d ON q.score=d.k",
+                [["20384", "338520"]],
+            ),
+            (
+                f"SELECT count(*),sum(q.score),sum(d.k) FROM {relation} LEFT JOIN (SELECT 16 AS k UNION ALL SELECT 17 AS k) d ON q.score=d.k",
+                [["31824", "497250", "338520"]],
             ),
         ):
             compressed_sql = call("/sql", {"statement": statement})
@@ -849,6 +879,34 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
         )
         assert saturated_top["rows"] == [["64"]] * 5, saturated_top
+        presence_relation = (
+            f"GRAPH_TABLE({hops} MATCH {presence_path} "
+            "WHERE a.id='presence_start' COLUMNS(b.score AS score)) q"
+        )
+        for order in ("", "ORDER BY q.score DESC"):
+            window = f"SELECT q.score FROM {presence_relation} {order} LIMIT 5000000 OFFSET 1000"
+            reduced_window = call(
+                "/sql",
+                {"statement": f"SELECT count(*),sum(d.score) FROM ({window}) d"},
+            )
+            assert reduced_window["rows"] == [["5000000", "320000000"]], reduced_window
+            counted_window = call(
+                "/sql", {"statement": f"SELECT count(*) FROM ({window}) d"}
+            )
+            assert counted_window["rows"] == [["5000000"]], counted_window
+        for order in ("", "ORDER BY b.score DESC"):
+            reduced_window = call(
+                f"/graphs/{hops}/query",
+                {
+                    "query": "MATCH (s:H {id:'presence_start'})-[:R*64..64]->(b:H) "
+                    f"WITH b {order} SKIP 1000 LIMIT 5000000 RETURN count(*),sum(b.score)",
+                    "limits": {"intermediate_states": 30000, "explored_edges": 300},
+                },
+            )
+            assert [cell["value"] for cell in reduced_window["rows"][0]] == [
+                "5000000",
+                "320000000",
+            ], reduced_window
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

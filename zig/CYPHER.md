@@ -1371,7 +1371,11 @@ with a proven finite, repeatable side relation (at most 4,096 rows). The normal
 SQL iterator captures that side once under the statement memory budget, including
 its errors and empty inputs. Unobserved side columns permit direct multiplication
 of contribution weights; observed columns use a paged Cartesian product with one
-retained graph page. Each unsupported child retains
+retained graph page. Repeatable conditional inner joins and graph-preserving
+left/right outer joins use the existing typed hash join. Predicate dependencies
+remain live in every producer pass; duplicate keys multiply matches, NULL keys
+retain SQL semantics, and rejected ON residuals still produce the required
+unmatched graph row. Each unsupported child retains
 ordinary production with unit weights, so negotiation never requires advancing a
 producer or rolling back another child's capability. A tree with no weighted
 producer declines negotiation and retains the ordinary columnar execution path.
@@ -1379,7 +1383,7 @@ Positional set coercions,
 NULLs and DISTINCT state stay in the typed SQL machinery. Pure direct
 sort keys can be omitted when no pagination observes their order and the consumer
 has negotiated duplicate/order-insensitive typed reduction. Other joins, set
-operators, materialized relations, windows, ordered/error-producing sort keys and
+operators, materialized relations, analytic windows, ordered/error-producing sort keys and
 cardinality-changing stages retain ordinary production. No aggregate expression
 is algebraically rewritten.
 
@@ -1390,7 +1394,12 @@ Only the final LIMIT window expands into output rows; OFFSET skips whole bags.
 NULL ordering, typed comparisons, expression errors and positional coercions
 remain SQL operations. A separate capped-count capability admits saturated graph
 counts as lower bounds for finite windows, including through UNION ALL and
-bounded side joins. Exact SUM/AVG and COUNT consumers never receive those bounds.
+bounded side joins. Finite ordered and unordered subquery windows clip those
+counts into exact selected multiplicities before downstream consumers see them.
+Nested windows retain compact typed contributions in the statement's bounded
+memory/spill cursor, and all downstream aggregate slots consume the same selected
+bag. Only external row output expands multiplicities. Exact SUM/AVG and COUNT
+consumers never receive saturated lower bounds.
 
 Read phases share a bounded, quota-accounted cache of raw adjacency pages across
 anchors. Cache keys include mapping, direction, identity and continuation; each
@@ -1451,7 +1460,11 @@ negotiation, retaining the original MATCH for ordinary execution. Directed cores
 with unobserved one-edge leaves also admit local factorization: each junction
 counts eligible leaf-edge assignments while excluding its adjacent trunk edge
 under relationship-simple semantics. Cached local choices avoid carrying full
-route histories; parallel edges remain separate identities. The core uniqueness
+route histories; parallel edges remain separate identities. Local assignment
+counting uses at most 2^L subset states for L leaves, rather than enumerating
+edge permutations. Identical candidate sets use falling factorials; repeatable
+leaves multiply independent cardinalities. Factors are cached by pivot and the
+excluded edge's eligibility class. The core uniqueness
 proof must still pass before any contribution is emitted. Node-simple paths,
 observed leaf bindings, mixed directions and unproven cyclic trails retain exact
 execution. Repeatable walks permit reuse explicitly. Leaf matching shares work,
@@ -1484,7 +1497,10 @@ ordering can be omitted before direct COUNT/MIN/MAX reductions when all affected
 projections, predicates and sort keys are provably total and no pagination
 observes their order. Ordered finite windows retain compressed endpoint bags in
 a weighted TopK heap: excess multiplicities are trimmed at the worst key, SKIP
-consumes weights, and only the requested window expands to rows. Saturated path
+consumes weights, and intermediate WITH windows pass the clipped exact bags to
+subsequent projections, filters, UNWIND, DISTINCT and reductions. Expansion is
+reserved for external rows and consumers such as non-DISTINCT collect that need
+individual elements. Saturated path
 counts remain sufficient for a finite window. Other ordering, aggregation,
 writes and non-repeatable expressions remain pipeline barriers.
 Endpoint-only RETURN DISTINCT also reduces the path product states directly,

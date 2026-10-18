@@ -833,6 +833,9 @@ pub const Context = struct {
                 metadata_counted = true;
             }
         }
+        const weighted_count = statement.count_all and !metadata_counted and !predicates.empty and
+            (self.binding.scalars.predicate == null or self.binding.scalars.predicate.?.repeatable()) and
+            try scan_state.weights(self, table_def, scan_request, .exact);
         while (!predicates.empty and !metadata_counted) {
             try self.checkpoint();
             page_count += 1;
@@ -853,7 +856,7 @@ pub const Context = struct {
             request.limit = @intCast(wanted);
             const page = try scan_state.page(self, page_arena.allocator(), table_def, request);
             defer page.deinit();
-            if (page.rows.len > wanted or (weighted_top and (page.multiplicities == null or page.multiplicities.?.len != page.rows.len))) return error.InvalidSqlBackendResponse;
+            if (page.rows.len > wanted or ((weighted_top or weighted_count) and (page.multiplicities == null or page.multiplicities.?.len != page.rows.len))) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
             var first: usize = 0;
             while (first < page.rows.len) {
@@ -902,7 +905,11 @@ pub const Context = struct {
                         if (values[row_index].value != .bool) return error.SqlTypeMismatch;
                         if (!values[row_index].value.bool) continue;
                     }
-                    scanned += 1;
+                    if (weighted_count) {
+                        const weight = std.math.cast(usize, page.multiplicities.?[first + row_index]) orelse return error.SqlNumericOutOfRange;
+                        scanned = std.math.add(usize, scanned, weight) catch return error.SqlNumericOutOfRange;
+                        if (scanned > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+                    } else scanned += 1;
                     if (statement.count_all) continue;
                     if (top_k) |*operator| {
                         const values = try scratch.alloc(Datum, fields.items.len + if (defer_projection) self.binding.scalars.columns.len else @as(usize, 0));

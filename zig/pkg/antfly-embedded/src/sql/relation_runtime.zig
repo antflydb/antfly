@@ -290,6 +290,10 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k UNION ALL SELECT 4 AS k) x", .sum = "1400", .count = "200" },
                 .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k UNION ALL SELECT 4 AS k) x CROSS JOIN docs d", .sum = "400", .count = "200" },
                 .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v DESC LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT 2 AS k UNION ALL SELECT 2 AS k UNION ALL SELECT NULL AS k) x ON d.v=x.k", .sum = "400", .count = "200" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d LEFT JOIN (SELECT 3 AS k) x ON d.v=x.k", .sum = "200", .count = "100" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k) x RIGHT JOIN docs d ON d.v=x.k", .sum = "200", .count = "100" },
             }) |case| {
                 var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
                 defer compiled.deinit();
@@ -297,6 +301,13 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 defer result.deinit();
                 try std.testing.expectEqualStrings(case.sum, result.output.rows[0][0].string);
                 try std.testing.expectEqualStrings(case.count, result.output.rows[0][1].string);
+            }
+            {
+                var compiled = try @import("compiler.zig").compile(a, "SELECT count(*) FROM (SELECT 1/(v-2) AS bad FROM docs LIMIT 1 OFFSET 100) d", .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 100 });
+                defer result.deinit();
+                try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
             }
             self.saturated = true;
             {
@@ -2234,6 +2245,10 @@ fn Engine(comptime Context: type) type {
             cross_page: ?catalog.Page = null,
             cross_row: usize = 0,
             cross_side: usize = 0,
+            join_hash: ?*operators.HashJoin = null,
+            join_probe: ?operators.HashJoin.Probe = null,
+            join_matched: bool = false,
+            window_cursor: ?*@import("result_cursor.zig").Cursor = null,
             singleton_ready: bool = false,
             tagged: bool = false,
             compressed: bool = false,
@@ -2242,6 +2257,22 @@ fn Engine(comptime Context: type) type {
             closed: bool = false,
             slots: []const usize,
 
+            /// Native compressed producers take precedence over a join
+            /// reduction that would consume unit rows. Inspect capability
+            /// metadata only: sampling a join arm would advance its graph
+            /// cursor and make later weight negotiation impossible.
+            fn hasProducer(engine: *Self, plan: Plan) bool {
+                return switch (plan.terminal) {
+                    .ordinary => false,
+                    .scan => blk: {
+                        const cursor = engine.cursors[plan.source.operation.scan.index];
+                        break :blk cursor.enable_weights != null or cursor.enable_aggregate_weights != null;
+                    },
+                    .cross => |join| hasProducer(engine, join.child.*),
+                    .window => |window| hasProducer(engine, window.child.*),
+                    .union_all => |set| hasProducer(engine, set.left.*) or hasProducer(engine, set.right.*),
+                };
+            }
             fn create(engine: *Self, plan: Plan) anyerror!*WeightedReader {
                 const a = engine.context.arena;
                 const self = try a.create(WeightedReader);
@@ -2269,6 +2300,16 @@ fn Engine(comptime Context: type) type {
                         self.right = try create(engine, set.right.*);
                         self.compressed = self.left.?.compressed or self.right.?.compressed;
                     },
+                    .window => |window| {
+                        var context = engine.context;
+                        context.binding = plan.source.operation.query.binding;
+                        if (!try context.hasRowLimit(plan.source.operation.query.statement.limit)) {
+                            self.fallback = true;
+                            return self;
+                        }
+                        self.left = try create(engine, window.child.*);
+                        self.compressed = self.left.?.compressed;
+                    },
                     .cross => |join| {
                         self.left = try create(engine, join.child.*);
                         self.singleton_iterator = try Iterator.create(engine, join.singleton);
@@ -2284,8 +2325,15 @@ fn Engine(comptime Context: type) type {
                 if (self.right) |child| child.deinit();
                 if (self.ordinary) |iterator| iterator.deinit();
                 if (self.singleton_iterator) |iterator| iterator.deinit();
+                if (self.window_cursor) |cursor| cursor.close();
+                if (self.join_hash) |hash| hash.deinit();
                 if (self.cross_page) |*page| page.deinit();
                 if (self.cross_arena) |*arena| arena.deinit();
+            }
+            fn cloneValues(a: Allocator, values: []const Datum) ![]const Datum {
+                const result = try a.alloc(Datum, values.len);
+                for (values, result) |value, *out| out.* = try operators.cloneDatum(a, value);
+                return result;
             }
             fn ownValues(self: *WeightedReader, values: []const Datum) ![]const Datum {
                 const a = self.engine.context.arena;
@@ -2318,6 +2366,83 @@ fn Engine(comptime Context: type) type {
                 }
                 self.done = page.after == null;
                 return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = try a.dupe(usize, slots), .after = if (self.done) null else "weighted" };
+            }
+            fn prepareWindow(self: *WeightedReader) !void {
+                const Cursor = @import("result_cursor.zig").Cursor;
+                const query = self.plan.source.operation.query;
+                var context = self.engine.context;
+                context.binding = query.binding;
+                context.binding.relation = null;
+                const limit = try context.count(query.statement.limit, context.limits.scan_rows);
+                var skip = try context.offsetCount(query.statement.offset);
+                if (limit > context.limits.scan_rows or skip > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                const capacity = std.math.add(usize, skip, limit) catch return error.InvalidSqlLimit;
+                const cursor = if (context.spill) |manager| try Cursor.create(context.alloc, manager, self.plan.source.columns.len + 1) else try Cursor.createMemory(context.alloc, self.plan.source.columns.len + 1, context.limits.retained_bytes / 4);
+                errdefer cursor.close();
+                const Sink = struct {
+                    cursor: *Cursor,
+                    a: Allocator,
+                    fn append(ptr: *anyopaque, values: []const Datum, weight: usize) !void {
+                        const state: *@This() = @ptrCast(@alignCast(ptr));
+                        const stored = try state.a.alloc(Datum, values.len + 1);
+                        defer state.a.free(stored);
+                        @memcpy(stored[0..values.len], values);
+                        stored[values.len] = Datum.json(.{ .integer = @intCast(weight) });
+                        try Cursor.append(state.cursor, stored);
+                    }
+                };
+                var sink: Sink = .{ .cursor = cursor, .a = context.alloc };
+                const orders = try context.arena.alloc(operators.Order, query.binding.order_keys.len);
+                for (query.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
+                var top: ?operators.TopK = if (orders.len != 0) try operators.TopK.initWithSpill(context.alloc, capacity, orders, context.limits.retained_bytes / 4, context.spill) else null;
+                defer if (top) |*operator| operator.deinit();
+                var arena = std.heap.ArenaAllocator.init(context.alloc);
+                defer arena.deinit();
+                var emitted: usize = 0;
+                var ordinal: usize = 0;
+                while (limit != 0) {
+                    _ = arena.reset(.retain_capacity);
+                    const a = arena.allocator();
+                    var page = try self.left.?.next(a, context.limits.executionRows());
+                    defer page.deinit();
+                    for (page.rows, page.multiplicities.?) |input, weight| {
+                        try context.checkpoint();
+                        const cells = try query.binding.scalars.cells(a, input);
+                        if (!try query.binding.scalars.matchesWithLimits(a, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) continue;
+                        var selected_weight: usize = 0;
+                        if (top == null) {
+                            const discarded = @min(skip, weight);
+                            skip -= discarded;
+                            selected_weight = @intCast(@min(weight - discarded, limit - emitted));
+                            // SQL does not evaluate an unordered projection
+                            // for rows discarded by OFFSET or LIMIT.
+                            if (selected_weight == 0) continue;
+                        }
+                        const values = try a.alloc(Datum, query.statement.columns.len);
+                        for (query.statement.columns, query.binding.columns, values, 0..) |column, definition, *value, i| {
+                            const program = if (i < query.binding.scalars.projections.len) query.binding.scalars.projections[i] else null;
+                            const cell = if (program) |p| try context.evaluate(a, p, cells) else try input.cell(column.field);
+                            value.* = try describe.coerceDatum(a, cell, definition.type, definition.element_type);
+                        }
+                        if (top) |*operator| {
+                            const keys = try a.alloc(Datum, orders.len);
+                            for (query.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
+                                .output => |i| values[i],
+                                .column => |column| try describe.coerceDatum(a, try input.cell(column.path), column.type, column.element_type),
+                                .expression => |i| try context.evaluate(a, query.binding.scalars.orders[i].?, cells),
+                            };
+                            try operator.addWeighted(.{ .values = values, .keys = keys, .ordinal = ordinal }, weight);
+                            ordinal += 1;
+                        } else {
+                            try Sink.append(&sink, values, selected_weight);
+                            emitted += selected_weight;
+                            if (emitted == limit) break;
+                        }
+                    }
+                    if (page.after == null or (top == null and emitted == limit)) break;
+                }
+                if (top) |*operator| try operator.drainWeightedBags(context.alloc, skip, limit, false, .{ .ptr = &sink, .append = Sink.append });
+                self.window_cursor = cursor;
             }
             fn raw(self: *WeightedReader, a: Allocator, limit: u32) anyerror!catalog.Page {
                 if (self.done) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
@@ -2374,6 +2499,19 @@ fn Engine(comptime Context: type) type {
                         }
                         return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (self.left.?.done and self.right.?.done) null else "union" };
                     },
+                    .window => {
+                        if (self.window_cursor == null) try self.prepareWindow();
+                        var rows: std.ArrayList(catalog.Row) = .empty;
+                        var weights: std.ArrayList(u64) = .empty;
+                        while (rows.items.len < limit) {
+                            const values = try self.window_cursor.?.next(a) orelse break;
+                            const weight = values[values.len - 1];
+                            if (weight.sql_null or weight.value != .integer or weight.value.integer <= 0) return error.InvalidSqlBackendResponse;
+                            try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values[0 .. values.len - 1])));
+                            try weights.append(a, @intCast(weight.value.integer));
+                        }
+                        return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = self.slots, .after = if (rows.items.len == limit) "window" else null };
+                    },
                     .cross => |join| {
                         if (!self.singleton_ready) {
                             self.singleton_ready = true;
@@ -2384,8 +2522,17 @@ fn Engine(comptime Context: type) type {
                                 try side.append(self.engine.context.arena, try self.ownValues(values));
                             }
                             self.singleton_values = side.items;
+                            if (self.plan.source.operation.join.condition != null) {
+                                self.join_hash = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = 4096, .bytes = self.engine.context.limits.retained_bytes / 16, .spill = self.engine.context.spill });
+                                const programs = if (join.graph_left) self.plan.source.operation.join.right_keys else self.plan.source.operation.join.left_keys;
+                                for (side.items) |values| {
+                                    const keys = try self.engine.context.arena.alloc(Datum, programs.len);
+                                    for (programs, keys) |program, *key| key.* = try self.engine.context.evaluate(self.engine.context.arena, program, values);
+                                    try self.join_hash.?.add(values, keys);
+                                }
+                            }
                         }
-                        if (self.singleton_values.len == 0) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
+                        if (self.singleton_values.len == 0 and self.plan.source.operation.join.kind != .left and self.plan.source.operation.join.kind != .right) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
                         if (self.cross_page == null) {
                             if (self.cross_arena == null) self.cross_arena = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                             _ = self.cross_arena.?.reset(.retain_capacity);
@@ -2399,13 +2546,43 @@ fn Engine(comptime Context: type) type {
                         while (self.cross_row < page.rows.len and rows.items.len < limit) {
                             try self.engine.context.checkpoint();
                             const input = page.rows[self.cross_row];
-                            const single = self.singleton_values[self.cross_side];
+                            const operation = self.plan.source.operation.join;
+                            const outer = operation.kind == .left or operation.kind == .right;
+                            var single: ?[]const Datum = null;
+                            if (self.join_hash) |hash| {
+                                if (self.join_probe == null) {
+                                    const graph_values = try self.cross_arena.?.allocator().alloc(Datum, self.left.?.node().columns.len);
+                                    for (self.left.?.node().columns, graph_values) |column, *value| value.* = try input.cell(column.internal);
+                                    const programs = if (join.graph_left) operation.left_keys else operation.right_keys;
+                                    const keys = try self.cross_arena.?.allocator().alloc(Datum, programs.len);
+                                    for (programs, keys) |program, *key| key.* = try self.engine.context.evaluate(self.cross_arena.?.allocator(), program, graph_values);
+                                    self.join_probe = try hash.probe(keys);
+                                }
+                                if (try self.join_probe.?.next()) |match| single = try match.materializeValues(a);
+                            } else if (self.cross_side < self.singleton_values.len) single = self.singleton_values[self.cross_side];
+                            if (single == null and (!outer or self.join_matched)) {
+                                self.join_probe = null;
+                                self.join_matched = false;
+                                self.cross_side = 0;
+                                self.cross_row += 1;
+                                continue;
+                            }
                             const values = try a.alloc(Datum, self.plan.source.columns.len);
                             for (self.plan.source.columns, values) |column, *value| {
-                                const cell = for (join.singleton.columns, single) |source, item| {
-                                    if (std.mem.eql(u8, source.internal, column.internal)) break item;
+                                const cell = for (join.singleton.columns, 0..) |source, i| {
+                                    if (std.mem.eql(u8, source.internal, column.internal)) break if (single) |items| items[i] else Datum{};
                                 } else try input.cell(column.internal);
                                 value.* = try operators.cloneDatum(a, cell);
+                            }
+                            if (single != null) {
+                                self.cross_side += if (join.factor_only) self.singleton_values.len else @as(usize, 1);
+                                if (operation.condition) |program| {
+                                    const accepted = try self.engine.context.evaluate(a, program, values);
+                                    if (accepted.sql_null) continue;
+                                    if (accepted.value != .bool) return error.SqlTypeMismatch;
+                                    if (!accepted.value.bool) continue;
+                                }
+                                self.join_matched = true;
                             }
                             try rows.append(a, try row(a, self.plan.source.columns, values));
                             const weight = page.multiplicities.?[self.cross_row];
@@ -2414,9 +2591,10 @@ fn Engine(comptime Context: type) type {
                             } else true;
                             const multiplied = if (!join.factor_only) weight else if (capped) @min(@as(u64, std.math.maxInt(i64)) + 1, weight *| self.singleton_values.len) else std.math.mul(u64, weight, self.singleton_values.len) catch return error.SqlNumericOutOfRange;
                             try weights.append(a, multiplied);
-                            self.cross_side += if (join.factor_only) self.singleton_values.len else @as(usize, 1);
-                            if (self.cross_side == self.singleton_values.len) {
+                            if (single == null or (self.join_hash == null and self.cross_side == self.singleton_values.len)) {
+                                self.join_probe = null;
                                 self.cross_side = 0;
+                                self.join_matched = false;
                                 self.cross_row += 1;
                             }
                         }
@@ -2452,6 +2630,10 @@ fn Engine(comptime Context: type) type {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.opened or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
                 const plan = (try @import("join_aggregate.zig").Plan.prove(self.engine.context.arena, self.iterator.node, recipe)) orelse return null;
+                const fields = try self.engine.context.arena.alloc([]const u8, self.iterator.node.columns.len);
+                for (self.iterator.node.columns, fields) |column, *field| field.* = column.internal;
+                if (try @import("weighted_relation.zig").Plan.init(self.engine.context.arena, self.iterator.node, &.{.{ .fields = fields, .multiplicity = .exact }})) |weighted_plan|
+                    if (WeightedReader.hasProducer(self.engine, weighted_plan)) return null;
                 const build_side: u1 = if (self.iterator.flipped_join) 0 else 1;
                 if (!try self.iterator.right.?.sampleReduction(plan.keys[build_side])) return null;
                 const cursor = try @import("join_aggregate.zig").open(a, self.engine, self.iterator, plan);

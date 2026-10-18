@@ -947,6 +947,8 @@ const Engine = struct {
     count_endpoints: bool = false,
     component_proof: bool = false,
     component_leaves: []const ComponentLeaf = &.{},
+    retain_windows: bool = false,
+    pending_window: ?WeightedRows = null,
     weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
     anchor_batch: ?*AnchorBatch = null,
@@ -970,6 +972,15 @@ const Engine = struct {
     postimages: v.EntityMap(v.Value) = .empty,
     values: value_work.Work = undefined,
     strings: @import("string_work.zig").Runtime = undefined,
+    const WeightedRows = struct {
+        rows: []const Row,
+        weights: []const u64,
+        fn count(self: @This()) usize {
+            var total: usize = 0;
+            for (self.weights) |weight| total +|= std.math.cast(usize, weight) orelse std.math.maxInt(usize);
+            return total;
+        }
+    };
     fn chargeValue(ptr: *anyopaque, value: v.Value) !void {
         const self: *Engine = @ptrCast(@alignCast(ptr));
         // Planning validates and encodes properties before the durable decision.
@@ -1059,7 +1070,9 @@ const Engine = struct {
             if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
                 const retained = self.arena.allocator();
                 const owned = if (self.function.distinct) self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
-                try self.collected.append(retained, owned);
+                try Engine.chargeWork(engine, std.math.cast(usize, weight) orelse return error.CypherStateBudgetExceeded);
+                try self.collected.ensureUnusedCapacity(retained, @intCast(weight));
+                for (0..@intCast(weight)) |_| self.collected.appendAssumeCapacity(owned);
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
@@ -1268,7 +1281,7 @@ const Engine = struct {
             if (fold.record_rows) fold.matched.* +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
-                if (fold.projection.order.len == 0 and top.picks.items.len == top.capacity) return error.CypherStreamComplete;
+                if (fold.projection.order.len == 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
             var key: std.ArrayList(v.Value) = .empty;
@@ -1298,7 +1311,7 @@ const Engine = struct {
             if (fold.distinct_goal) |goal| if (fold.groups.items.len >= goal) return error.CypherStreamComplete;
         }
         fn demand(fold: *@This()) usize {
-            if (fold.top.*) |top| if (fold.projection.order.len == 0) return @min(128, top.capacity - top.picks.items.len);
+            if (fold.top.*) |top| if (fold.projection.order.len == 0) return @min(128, top.capacity - top.total);
             if (fold.distinct_goal) |goal| return @min(128, goal -| fold.groups.items.len);
             return 128;
         }
@@ -1671,11 +1684,11 @@ const Engine = struct {
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
-        const weighted_top = !grouped and projection.limit != null and projection.order.len != 0;
+        const weighted_top = !grouped and projection.limit != null and (projection.order.len != 0 or self.retain_windows);
         const count_endpoints = !count_shortest and operation.paths.len == 1 and path.selector == .all and (grouped or weighted_top) and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
-            if (calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
+            if (grouped and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
             // One fixed hop has no shared prefixes to compress. Keep its
             // page-at-a-time fold instead of retaining the whole adjacency.
             if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) break :blk false;
@@ -1807,7 +1820,10 @@ const Engine = struct {
                     error.CypherStreamComplete => break :produce,
                     else => return err,
                 };
-                try batch.flush(self, &ignored);
+                batch.flush(self, &ignored) catch |err| switch (err) {
+                    error.CypherStreamComplete => break :produce,
+                    else => return err,
+                };
                 if (operation.optional and !fold.had_match) {
                     var extended = row;
                     for (self.match_aliases) |alias| if (lookup(extended, alias) == null) {
@@ -1833,7 +1849,7 @@ const Engine = struct {
         const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, calls.items, projection);
         try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = input.len, .output_rows = stage_counts[0] });
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
-        try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = rows.len });
+        try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = if (self.pending_window) |weighted| weighted.count() else rows.len });
         return rows;
     }
     // EXISTS consumes one result row. Keep aggregation, DISTINCT, ordering and
@@ -2007,6 +2023,7 @@ const Engine = struct {
             self.component_leaves = leaves.items;
             defer self.component_proof = previous;
             defer self.component_leaves = previous_leaves;
+            self.retain_windows = self.weightedTail(clauses[index + 1 ..]);
             const result = self.streamMatchProjection(input, operation, projection, clauses[match_count..index], clauses[0].span, clause.span) catch |err| switch (err) {
                 error.CypherComponentDeclined => return null,
                 else => return err,
@@ -2015,7 +2032,102 @@ const Engine = struct {
         }
         return null;
     }
+    fn weightedTail(self: *Engine, clauses: []const ast.Clause) bool {
+        _ = self;
+        if (clauses.len == 0) return false;
+        for (clauses) |clause| switch (clause.operation) {
+            .project => |p| {
+                if (p.value.distinct and p.value.wildcard) return false;
+                for (p.value.items) |item| if (@import("expressions.zig").containsPattern(item.expression)) return false;
+                for (p.value.order) |order| if (@import("expressions.zig").containsPattern(order.expression)) return false;
+                if (p.value.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return false;
+            },
+            .unwind => |u| if (@import("expressions.zig").containsPattern(u.expression)) return false,
+            else => return false,
+        };
+        return true;
+    }
+    fn runNext(self: *Engine, clauses: []const ast.Clause, rows: []const Row, preserve_rows: bool) anyerror![]const Row {
+        if (self.pending_window) |weighted| {
+            self.pending_window = null;
+            if (weighted.rows.ptr != rows.ptr) return error.CypherInvalidBackendResponse;
+            return self.runWeighted(clauses, weighted, preserve_rows);
+        }
+        return self.run(clauses, rows, false, preserve_rows);
+    }
+    fn runWeighted(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool) anyerror![]const Row {
+        var bags = initial;
+        const saved_retention = self.retain_windows;
+        defer self.retain_windows = saved_retention;
+        for (clauses, 0..) |clause, clause_index| {
+            try self.checkpoint();
+            const before = bags.count();
+            switch (clause.operation) {
+                .unwind => |u| {
+                    var rows: std.ArrayList(Row) = .empty;
+                    var weights: std.ArrayList(u64) = .empty;
+                    for (bags.rows, bags.weights) |row, weight| {
+                        const value = try self.eval(u.expression, row, null);
+                        if (value == .null) continue;
+                        const items = if (value == .list) value.list else &.{value};
+                        for (items) |item| {
+                            try self.state();
+                            try rows.append(self.a, try self.replace(row, u.alias, item));
+                            try weights.append(self.a, weight);
+                        }
+                    }
+                    bags = .{ .rows = rows.items, .weights = weights.items };
+                },
+                .project => |p| {
+                    const projection = p.value;
+                    var calls: std.ArrayList(*const ast.Expr) = .empty;
+                    for (projection.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return error.CypherInvalidAggregate;
+                    for (projection.order) |order| if (!try self.collectStreamingAggregates(order.expression, &calls)) return error.CypherInvalidAggregate;
+                    const grouped = projection.distinct or calls.items.len != 0;
+                    if (grouped and projection.wildcard) return error.CypherAggregateWildcard;
+                    var top: ?TopK = if (grouped) null else try TopK.init(self, projection, if (bags.rows.len == 0) &.{} else bags.rows[0]);
+                    defer if (top) |*value| value.deinit();
+                    var groups: std.ArrayList(StreamGroup) = .empty;
+                    var group_index: value_work.Index = .{};
+                    defer for (groups.items) |group| for (group.states) |*state_value| {
+                        state_value.arena.deinit();
+                        state_value.distinct_arena.deinit();
+                    };
+                    var has_keys = false;
+                    for (projection.items) |item| has_keys = has_keys or !aggregates(item.expression);
+                    if (grouped and !has_keys) try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, calls.items));
+                    var matched: usize = 0;
+                    var counts = [_]usize{0};
+                    var fold: StreamFold = .{ .retained = self.a, .middle = &.{}, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = &counts, .matched = &matched, .distinct = &.{} };
+                    for (bags.rows, bags.weights) |row, weight| {
+                        fold.weight = weight;
+                        fold.add(self, row) catch |err| switch (err) {
+                            error.CypherStreamComplete => break,
+                            else => return err,
+                        };
+                    }
+                    self.retain_windows = !p.final and self.weightedTail(clauses[clause_index + 1 ..]);
+                    const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, calls.items, projection);
+                    if (self.pending_window) |weighted| {
+                        self.pending_window = null;
+                        bags = weighted;
+                    } else {
+                        const weights = try self.a.alloc(u64, rows.len);
+                        @memset(weights, 1);
+                        bags = .{ .rows = rows, .weights = weights };
+                    }
+                },
+                else => unreachable,
+            }
+            try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = before, .output_rows = bags.count() });
+        }
+        if (!preserve_rows and clauses[clauses.len - 1].operation != .project) return &.{};
+        return bags.rows;
+    }
     fn run(self: *Engine, clauses: []const ast.Clause, input: []const Row, explain: bool, preserve_rows: bool) anyerror![]const Row {
+        const prior_retention = self.retain_windows;
+        defer self.retain_windows = prior_retention;
+        self.retain_windows = false;
         const prior_lower_graph = self.lower_graph;
         const prior_join = self.join;
         const prior_lookup = self.lookup;
@@ -2036,13 +2148,15 @@ const Engine = struct {
                 var reduction = false;
                 for (projection.items) |item| reduction = reduction or aggregates(item.expression);
                 if (!clause.operation.project.final and !reduction and projection.limit == null) continue;
+                self.retain_windows = self.weightedTail(clauses[index + 1 ..]);
                 if (try self.streamMatchProjection(input, clauses[0].operation.match, projection, clauses[1..index], clauses[0].span, clause.span)) |streamed| {
-                    if (index + 1 < clauses.len) return self.run(clauses[index + 1 ..], streamed, false, preserve_rows);
+                    if (index + 1 < clauses.len) return self.runNext(clauses[index + 1 ..], streamed, preserve_rows);
                     return streamed;
                 }
                 break;
             }
         }
+        self.retain_windows = false;
         var rows = input;
         for (clauses, 0..) |clause, clause_index| {
             try self.checkpoint();
@@ -2053,7 +2167,7 @@ const Engine = struct {
             }
             if (clause.operation == .match) {
                 if (try self.tryComponent(rows, clauses[clause_index..])) |component| {
-                    if (clause_index + component.next < clauses.len) return self.run(clauses[clause_index + component.next ..], component.rows, false, preserve_rows);
+                    if (clause_index + component.next < clauses.len) return self.runNext(clauses[clause_index + component.next ..], component.rows, preserve_rows);
                     return component.rows;
                 }
                 for (clauses[clause_index + 1 ..], clause_index + 1..) |following, index| {
@@ -2063,13 +2177,15 @@ const Engine = struct {
                     var reduction = false;
                     for (projection.items) |item| reduction = reduction or aggregates(item.expression);
                     if (!following.operation.project.final and !reduction and projection.limit == null) continue;
+                    self.retain_windows = self.weightedTail(clauses[index + 1 ..]);
                     if (try self.streamMatchProjection(rows, clause.operation.match, projection, clauses[clause_index + 1 .. index], clause.span, following.span)) |streamed| {
-                        if (index + 1 < clauses.len) return self.run(clauses[index + 1 ..], streamed, false, preserve_rows);
+                        if (index + 1 < clauses.len) return self.runNext(clauses[index + 1 ..], streamed, preserve_rows);
                         return streamed;
                     }
                     break;
                 }
             }
+            self.retain_windows = false;
             rows = switch (clause.operation) {
                 .match => |m| blk: {
                     if (clause_index == 0 and clauses.len == 2 and clauses[1].operation == .project and clauses[1].operation.project.final) {
@@ -3121,13 +3237,15 @@ const Engine = struct {
         for (self.component_leaves) |leaf| leaf_count += @intFromBool(leaf.pivot == pivot);
         if (leaf_count == 0) return 1;
         const key: BranchKey = .{ .node = position, .pivot = pivot };
-        const choices = graph.branch_choices.get(key) orelse blk: {
+        const cached = graph.branch_choices.get(key) orelse blk: {
             const sets = try self.a.alloc([]const *const v.Relationship, leaf_count);
             var slot: usize = 0;
+            var eligibility: v.EntityMap(u16) = .empty;
             const node = graph.nodes.items[position].node;
             for (self.component_leaves) |leaf| {
                 if (leaf.pivot != pivot) continue;
                 var candidates: std.ArrayList(*const v.Relationship) = .empty;
+                var seen: v.EntitySet = .empty;
                 for (self.graph.relationships, 0..) |mapping, mapping_index| {
                     const selected = leaf.edge.types.len == 0 or for (leaf.edge.types) |name| {
                         if (std.mem.eql(u8, name, mapping.name)) break true;
@@ -3144,10 +3262,8 @@ const Engine = struct {
                             const target = (try self.getNode(identity)) orelse continue;
                             if (!try self.graph.admits(target, if (leaf.edge.direction == .out) mapping.target_label else mapping.source_label, &self.values) or !try self.nodeMatches(target, leaf.node) or !boundNodeMatches(target, leaf.node, graph.input.row)) continue;
                             if (!try self.constantProperties(.{ .node = target }, leaf.node.properties, graph.input.row) or !try self.constantProperties(.{ .relationship = relationship }, leaf.edge.properties, graph.input.row)) continue;
-                            const duplicate = for (candidates.items) |other| {
-                                if (sameRelationship(other, relationship)) break true;
-                            } else false;
-                            if (!duplicate) try candidates.append(self.a, relationship);
+                            const entry = try seen.getOrPut(self.a, .{ .relationship = .{ .identity = relationship.identity, .index = relationship.index } });
+                            if (!entry.found_existing) try candidates.append(self.a, relationship);
                         }
                         const next = page.next orelse break;
                         if (after) |previous| if (std.mem.eql(u8, previous, next)) return error.CypherInvalidBackendCursor;
@@ -3155,30 +3271,90 @@ const Engine = struct {
                     }
                 }
                 sets[slot] = candidates.items;
+                for (candidates.items) |candidate| {
+                    const eligible = try eligibility.getOrPut(self.a, .{ .relationship = .{ .identity = candidate.identity, .index = candidate.index } });
+                    if (!eligible.found_existing) eligible.value_ptr.* = 0;
+                    eligible.value_ptr.* |= @as(u16, 1) << @intCast(slot);
+                }
                 slot += 1;
             }
-            try graph.branch_choices.put(self.a, key, sets);
-            break :blk sets;
+            const result: BranchChoices = .{ .sets = sets, .eligibility = eligibility };
+            try graph.branch_choices.put(self.a, key, result);
+            break :blk result;
         };
-        var used: [16]*const v.Relationship = undefined;
-        return self.branchAssignments(choices, 0, &used, if (mode == .repeatable) null else excluded, mode == .repeatable);
-    }
-    fn branchAssignments(self: *Engine, choices: []const []const *const v.Relationship, depth: usize, used: *[16]*const v.Relationship, excluded: ?*const v.Relationship, repeatable: bool) anyerror!u64 {
-        if (depth == choices.len) return 1;
-        var ways: u64 = 0;
-        for (choices[depth]) |relationship| {
-            try self.state();
-            if (excluded) |edge| if (sameRelationship(edge, relationship)) continue;
-            if (!repeatable) {
-                const duplicate = for (used[0..depth]) |edge| {
-                    if (sameRelationship(edge, relationship)) break true;
-                } else false;
-                if (duplicate) continue;
-            }
-            used[depth] = relationship;
-            ways = mergePathWays(ways, try self.branchAssignments(choices, depth + 1, used, excluded, repeatable));
-        }
+        // Excluding two edges with the same leaf eligibility has the same
+        // effect. Cache that equivalence class, not individual trunk histories.
+        const excluded_mask: u16 = if (mode != .repeatable and excluded != null)
+            cached.eligibility.get(.{ .relationship = .{ .identity = excluded.?.identity, .index = excluded.?.index } }) orelse 0
+        else
+            0;
+        const factor_key: BranchFactorKey = .{ .branch = key, .excluded = excluded_mask };
+        if (graph.branch_factors.get(factor_key)) |ways| return ways;
+        const ways = try self.branchAssignments(cached.sets, excluded_mask, mode == .repeatable);
+        try graph.branch_factors.put(self.a, factor_key, ways);
         return ways;
+    }
+    fn branchAssignments(self: *Engine, choices: []const []const *const v.Relationship, excluded_mask: u16, repeatable: bool) anyerror!u64 {
+        if (repeatable) {
+            var ways: u64 = 1;
+            for (choices) |set| ways = multiplyPathWays(ways, set.len);
+            return ways;
+        }
+        // Each physical relationship can fill at most one leaf. Group edges
+        // by eligibility, then count matchings over leaf subsets, never over
+        // permutations of edge identities. Identical leaves have a direct
+        // falling-factorial solution.
+        const full: u16 = @intCast((@as(u32, 1) << @intCast(choices.len)) - 1);
+        var edges: v.EntityMap(usize) = .empty;
+        var masks: std.ArrayList(u16) = .empty;
+        for (choices, 0..) |set, leaf| for (set) |edge| {
+            try self.state();
+            const entry = try edges.getOrPut(self.a, .{ .relationship = .{ .identity = edge.identity, .index = edge.index } });
+            if (!entry.found_existing) {
+                entry.value_ptr.* = masks.items.len;
+                try masks.append(self.a, 0);
+            }
+            const position = entry.value_ptr.*;
+            masks.items[position] |= @as(u16, 1) << @intCast(leaf);
+        };
+        const identical = for (masks.items) |mask| {
+            if (mask != full) break false;
+        } else true;
+        if (identical) {
+            var available = masks.items.len - @intFromBool(excluded_mask != 0);
+            var ways: u64 = 1;
+            for (choices) |_| {
+                if (available == 0) return 0;
+                ways = multiplyPathWays(ways, available);
+                available -= 1;
+            }
+            return ways;
+        }
+        const counts = try self.a.alloc(u64, @as(usize, full) + 1);
+        @memset(counts, 0);
+        counts[0] = 1;
+        var removed = excluded_mask == 0;
+        for (masks.items) |eligible| {
+            try Engine.chargeWork(self, counts.len);
+            if (!removed and eligible == excluded_mask) {
+                removed = true;
+                continue;
+            }
+            var cursor: usize = full;
+            while (cursor != 0) {
+                cursor -= 1;
+                if (counts[cursor] == 0) continue;
+                var available = eligible & ~@as(u16, @intCast(cursor));
+                while (available != 0) {
+                    try self.state();
+                    const bit = available & (0 -% available);
+                    available &= available - 1;
+                    const next = cursor | bit;
+                    counts[next] = mergePathWays(counts[next], counts[cursor]);
+                }
+            }
+        }
+        return counts[full];
     }
     fn advanceLower(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64), source: ?usize) !void {
         return self.advanceLowerTarget(graph, domain, edge, current, next, null, source);
@@ -3489,6 +3665,8 @@ const Engine = struct {
     const LowerRange = struct { first: usize, last: usize };
     const LowerNode = struct { node: *const v.Node, depth: usize, arcs: std.ArrayList(LowerArc) = .empty, loaded: bool = false, domains: std.AutoHashMapUnmanaged(usize, LowerRange) = .empty };
     const BranchKey = struct { node: usize, pivot: usize };
+    const BranchFactorKey = struct { branch: BranchKey, excluded: u16 };
+    const BranchChoices = struct { sets: []const []const *const v.Relationship, eligibility: v.EntityMap(u16) };
     const LowerGraph = struct {
         nodes: std.ArrayList(LowerNode) = .empty,
         positions: std.HashMapUnmanaged(v.Identity, usize, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
@@ -3497,7 +3675,8 @@ const Engine = struct {
         domains: []const ast.Edge = &.{},
         qualified: bool = false,
         mode: ast.PathMode = .relationship_simple,
-        branch_choices: std.AutoHashMapUnmanaged(BranchKey, []const []const *const v.Relationship) = .empty,
+        branch_factors: std.AutoHashMapUnmanaged(BranchFactorKey, u64) = .empty,
+        branch_choices: std.AutoHashMapUnmanaged(BranchKey, BranchChoices) = .empty,
         probing: bool = false,
         probe_matches: bool = false,
         first_only: bool = false,
@@ -5000,6 +5179,20 @@ const Engine = struct {
                 }
             }.less) else if (self.projection.order.len != 0) try engine.sort(projected, self.projection.order);
             var skip = @min(self.skip, self.total);
+            if (engine.retain_windows) {
+                var rows: std.ArrayList(Row) = .empty;
+                var weights: std.ArrayList(u64) = .empty;
+                for (projected) |item| {
+                    const discarded = @min(skip, item.weight);
+                    skip -= discarded;
+                    if (item.weight == discarded) continue;
+                    try rows.append(engine.a, item.row);
+                    try weights.append(engine.a, item.weight - discarded);
+                }
+                engine.pending_window = .{ .rows = rows.items, .weights = weights.items };
+                if (final) engine.columns = try self.columns.toOwnedSlice(engine.a);
+                return rows.items;
+            }
             const output = try engine.a.alloc(Row, self.total - skip);
             var position: usize = 0;
             for (projected) |item| {
@@ -5463,4 +5656,52 @@ test "weighted numeric reductions keep finite cancellation and checked integer b
     reduction.mean_weight = 1;
     try reduction.addWeighted(&engine, &.{}, 2);
     try std.testing.expectApproxEqRel(@as(f64, 1e308 / 3.0), reduction.result().number, 1e-14);
+}
+
+test "branch subset counting agrees with explicit distinct edge assignments" {
+    const Oracle = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn count(sets: []const []const *const v.Relationship, depth: usize, used: *[4]*const v.Relationship, excluded: ?*const v.Relationship, repeatable: bool) u64 {
+            if (depth == sets.len) return 1;
+            var total: u64 = 0;
+            for (sets[depth]) |edge| {
+                if (!repeatable) {
+                    if (excluded == edge) continue;
+                    if (std.mem.indexOfScalar(*const v.Relationship, used[0..depth], edge) != null) continue;
+                }
+                used[depth] = edge;
+                total += count(sets, depth + 1, used, excluded, repeatable);
+            }
+            return total;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dummy: u8 = 0;
+    var engine: Engine = .{ .a = a, .scratch_allocator = a, .regex = undefined, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Oracle.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    var edges: [5]v.Relationship = undefined;
+    for (&edges, 0..) |*edge, index| edge.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "{d}", .{index / 2}) }, .index = if (index % 2 == 0) "a" else "b", .type = "R", .source = .{ .table = "docs", .key = "s" }, .target = .{ .table = "docs", .key = "t" } };
+    var seed: u64 = 42;
+    for (0..96) |case| {
+        const leaves = 1 + case % 4;
+        var sets: [4][]const *const v.Relationship = undefined;
+        for (sets[0..leaves]) |*set| {
+            var items: std.ArrayList(*const v.Relationship) = .empty;
+            for (&edges) |*edge| {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                if (seed >> 63 != 0) try items.append(a, edge);
+            }
+            set.* = items.items;
+        }
+        const excluded: ?*const v.Relationship = if (case % 6 < 5) &edges[case % 6] else null;
+        var mask: u16 = 0;
+        for (sets[0..leaves], 0..) |set, leaf| for (set) |edge| {
+            if (excluded == edge) mask |= @as(u16, 1) << @intCast(leaf);
+        };
+        for ([_]bool{ false, true }) |repeatable| {
+            var used: [4]*const v.Relationship = undefined;
+            try std.testing.expectEqual(Oracle.count(sets[0..leaves], 0, &used, excluded, repeatable), try engine.branchAssignments(sets[0..leaves], if (repeatable) 0 else mask, repeatable));
+        }
+    }
 }

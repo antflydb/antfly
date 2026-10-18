@@ -256,7 +256,9 @@ pub const TopK = struct {
         row.values = values;
         try self.add(row);
     }
-    pub fn drainWeighted(self: *TopK, alloc: Allocator, offset: usize, limit: usize, implicit: bool, sink: anytype) !void {
+    /// Internal windows keep a contribution's clipped multiplicity. Only a
+    /// transport or a consumer requiring individual rows expands that bag.
+    pub fn drainWeightedBags(self: *TopK, alloc: Allocator, offset: usize, limit: usize, implicit: bool, sink: anytype) !void {
         const Window = struct {
             remaining: usize,
             emitted: usize = 0,
@@ -273,14 +275,24 @@ pub const TopK = struct {
                 state.remaining -= skip;
                 weight -= skip;
                 if (state.implicit and weight > state.limit - state.emitted) return error.SqlResultTooLarge;
-                for (0..@min(weight, state.limit - state.emitted)) |_| {
-                    try state.sink.append(state.sink.ptr, values[0 .. values.len - 1]);
-                    state.emitted += 1;
-                }
+                const take = @min(weight, state.limit - state.emitted);
+                if (take != 0) try state.sink.append(state.sink.ptr, values[0 .. values.len - 1], take);
+                state.emitted += take;
             }
         };
         var window: Window = .{ .remaining = offset, .limit = limit, .implicit = implicit, .sink = sink };
         try self.drain(alloc, 0, self.capacity, false, .{ .ptr = &window, .append = Window.append });
+    }
+    pub fn drainWeighted(self: *TopK, alloc: Allocator, offset: usize, limit: usize, implicit: bool, sink: anytype) !void {
+        const Expand = struct {
+            sink: @TypeOf(sink),
+            fn append(raw: *anyopaque, values: []const Datum, weight: usize) anyerror!void {
+                const state: *@This() = @ptrCast(@alignCast(raw));
+                for (0..weight) |_| try state.sink.append(state.sink.ptr, values);
+            }
+        };
+        var expand: Expand = .{ .sink = sink };
+        try self.drainWeightedBags(alloc, offset, limit, implicit, .{ .ptr = &expand, .append = Expand.append });
     }
     pub fn finishWeightedPage(self: *TopK, alloc: Allocator, offset: usize, limit: usize, implicit: bool) ![]const Row {
         const Page = struct {

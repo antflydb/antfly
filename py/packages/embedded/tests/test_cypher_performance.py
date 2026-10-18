@@ -1916,3 +1916,136 @@ def test_sql_weighted_seed_batches_resume_cyclic_routes(graph_db):
         "MATCH (a IS D)-[IS R]->(IS D)-[IS R]->(b IS D) COLUMNS(b.score AS score)) q"
     )
     assert result["rows"] == [[str(size * (size - 1)), str(2 * size)]]
+
+
+def test_conditional_dimension_joins_preserve_graph_bags(graph_db):
+    from math import comb
+
+    db = graph_db
+    size = 18
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(size) for j in range(i + 1, size)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(5)) + "-[r5 IS R]->(b IS D)"
+    relation = f"GRAPH_TABLE(g MATCH {path} COLUMNS(b.score AS score)) q"
+    side = "(SELECT 17 AS k UNION ALL SELECT 17 AS k UNION ALL SELECT 16 AS k UNION ALL SELECT NULL AS k) d"
+    count = 2 * comb(17, 6) + comb(16, 6)
+    total = 34 * comb(17, 6) + 16 * comb(16, 6)
+    for source in (
+        f"{relation} JOIN {side} ON q.score=d.k",
+        f"{side} JOIN {relation} ON d.k=q.score",
+        f"{relation} JOIN {side} ON q.score=d.k AND d.k>15",
+    ):
+        assert db.sql(f"SELECT count(*),sum(q.score),sum(d.k) FROM {source}")["rows"] == [
+            [str(count), str(total), str(total)]
+        ]
+    full_count = comb(18, 7)
+    full_sum = sum(i * comb(i, 6) for i in range(6, 18))
+    for source in (
+        f"{relation} LEFT JOIN {side} ON q.score=d.k",
+        f"{side} RIGHT JOIN {relation} ON d.k=q.score",
+    ):
+        assert db.sql(f"SELECT count(*),sum(q.score),sum(d.k) FROM {source}")["rows"] == [
+            [str(full_count + comb(17, 6)), str(full_sum + 17 * comb(17, 6)), str(total)]
+        ]
+    empty = "(SELECT 1 AS k WHERE false) d"
+    assert db.sql(f"SELECT count(*),sum(q.score),count(d.k) FROM {relation} LEFT JOIN {empty} ON q.score=d.k")[
+        "rows"
+    ] == [[str(full_count), str(full_sum), "0"]]
+    from antfly_embedded._sql import SQLStateError
+
+    with pytest.raises(SQLStateError, match="22012"):
+        db.sql(f"SELECT sum(q.score) FROM {relation} JOIN (SELECT 17 AS k) d ON q.score=d.k AND 1/(q.score-17)>0")
+
+
+def test_sibling_branch_counts_do_not_enumerate_assignments(graph_db):
+    from math import comb, perm
+
+    db = graph_db
+    patterns = [f"(n{i}:D {{score:{i}}})" for i in range(18)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(18) for j in range(i + 1, 18)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    for repeatable in (False, True):
+        mode = "REPEATABLE ELEMENTS " if repeatable else ""
+        for leaves in (4, 7, 16):
+            query = f"MATCH {mode}(a:D)-[:R*3..3]->(m:D),(m)-[:R*3..3]->(b:D)"
+            query += "".join(f",(m)-[:R]->(c{i}:D)" for i in range(leaves))
+            expected = sum(
+                comb(m, 3) * comb(17 - m, 3) * ((17 - m) ** leaves if repeatable else perm(16 - m, leaves))
+                for m in range(3, 15)
+            )
+            # The 16-leaf repeatable result exceeds signed BIGINT.
+            if expected > 2**63 - 1:
+                continue
+            result = db.cypher_json(
+                "g",
+                {"query": query + " RETURN count(*)", "limits": {"intermediate_states": 20000, "explored_edges": 200}},
+            )
+            assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+            assert result["stats"]["intermediate_states"] < 20000
+    # Overlapping, nonidentical candidate sets require subset matching rather
+    # than a product of independent degrees. Two fixed leaves reserve edges.
+    query = "MATCH (a:D)-[:R*3..3]->(m:D),(m)-[:R*3..3]->(b:D)"
+    query += "".join(f",(m)-[:R]->(c{i}:D)" for i in range(5))
+    query += ",(m)-[:R]->(x:D {score:16}),(m)-[:R]->(y:D {score:17}) RETURN count(*)"
+    expected = sum(comb(m, 3) * comb(17 - m, 3) * perm(14 - m, 5) for m in range(3, 15))
+    result = db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 100000, "explored_edges": 200}})
+    assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+
+
+def test_intermediate_windows_preserve_graph_bags(graph_db):
+    import time
+
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    layers = 64
+    patterns = ["(s:D {id:'start',score:0})"] + [
+        f"(v{i}_{j}:D {{score:{i + 1}}})" for i in range(layers) for j in range(2)
+    ]
+    patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+    patterns += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(63)) + "-[r63 IS R]->(b IS D)"
+    relation = f"GRAPH_TABLE(g MATCH {path} WHERE a.id='start' COLUMNS(b.score AS score)) q"
+    for order in ("", "ORDER BY q.score DESC"):
+        started = time.monotonic()
+        window = f"SELECT q.score FROM {relation} {order} LIMIT 5000000 OFFSET 1000"
+        assert db.sql(f"SELECT count(*) FROM ({window}) d")["rows"] == [["5000000"]]
+        assert db.sql(f"SELECT count(*),sum(d.score),min(d.score) FROM ({window}) d")["rows"] == [
+            ["5000000", "320000000", "64"]
+        ]
+        assert db.sql(f"SELECT count(*),sum(e.score) FROM (SELECT d.score FROM ({window}) d LIMIT 123 OFFSET 17) e")[
+            "rows"
+        ] == [["123", "7872"]]
+        assert time.monotonic() - started < 5
+    for order in ("", "ORDER BY b.score DESC"):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) "
+                f"WITH b {order} SKIP 1000 LIMIT 5000000 "
+                "WITH b SKIP 17 LIMIT 123 UNWIND [1,2] AS k RETURN count(*),sum(b.score),sum(k)",
+                "limits": {"intermediate_states": 10000, "explored_edges": 300},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == ["246", "15744", "369"]
+    for tail, expected in (
+        ("RETURN DISTINCT b.score", ["64"]),
+        ("WITH DISTINCT b.score AS score RETURN count(*),sum(score)", ["1", "64"]),
+        ("WITH b.score AS score WHERE score=64 RETURN count(*),sum(score)", ["5000000", "320000000"]),
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) WITH b ORDER BY b.score LIMIT 5000000 " + tail,
+                "limits": {"intermediate_states": 10000, "explored_edges": 300},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == expected
+    collected = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) WITH b ORDER BY b.score LIMIT 7 RETURN collect(b.score)"
+        },
+    )
+    assert collected["rows"] == [[{"type": "list", "value": [{"type": "integer", "value": "64"}] * 7}]]

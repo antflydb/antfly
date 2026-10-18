@@ -28,6 +28,7 @@ pub const Plan = struct {
     pub const Terminal = union(enum) {
         scan,
         ordinary,
+        window: struct { child: *Plan },
         union_all: struct { left: *Plan, right: *Plan },
         cross: struct { child: *Plan, singleton: *const binding.Node, graph_left: bool, factor_only: bool },
     };
@@ -59,6 +60,28 @@ pub const Plan = struct {
         while (node.operation == .query) {
             if (depth + stages.items.len >= 64) return null;
             const query = node.operation.query;
+            if (query.statement.limit != null and query.binding.aggregate == null and query.binding.window == null and
+                !query.statement.count_all and !query.statement.scalar_cardinality_limit and !query.statement.selection_prefix and query.constant_refs.len == 0 and
+                query.statement.columns.len == node.columns.len and query.binding.columns.len == node.columns.len)
+            window: {
+                const bound = query.binding.scalars;
+                if (bound.predicate) |p| if (!p.repeatable()) break :window;
+                for (bound.projections) |p| if (p) |program| if (!program.repeatable()) break :window;
+                for (bound.orders) |p| if (p) |program| if (!program.repeatable()) break :window;
+                var needed: Names = .empty;
+                if (bound.predicate) |p| try programFields(a, &needed, p, bound.columns);
+                for (query.statement.columns, 0..) |column, i| {
+                    if (i < bound.projections.len and bound.projections[i] != null) {
+                        try programFields(a, &needed, bound.projections[i].?, bound.columns);
+                    } else try needed.put(a, column.field, {});
+                }
+                for (bound.orders) |p| if (p) |program| try programFields(a, &needed, program, bound.columns);
+                for (query.binding.order_keys) |key| if (key.source == .column) try needed.put(a, key.source.column.path, {});
+                const input = try a.alloc(catalog.AggregateWeight, 1);
+                input[0] = .{ .fields = try names(a, needed), .multiplicity = .capped };
+                const nested = try child(a, query.source, input, depth + stages.items.len + 1);
+                return .{ .source = node, .terminal = .{ .window = .{ .child = nested } }, .requests = requests, .stages = stages.items, .physical = &.{}, .width = width + node.columns.len + nested.width };
+            }
             if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or
                 !unobservedOrder(query) or query.statement.limit != null or query.statement.offset != null or
                 query.statement.scalar_cardinality_limit or query.constant_refs.len != 0 or
@@ -121,11 +144,14 @@ pub const Plan = struct {
                 break :blk .{ .union_all = .{ .left = left, .right = right } };
             },
             .join => |join| blk: {
-                if ((join.kind != .inner and join.kind != .cross) or join.condition != null or join.correlation or join.membership != null) return null;
+                if (join.correlation or join.membership != null) return null;
+                if (join.condition) |program| if (!program.repeatable()) return null;
                 const graph_left = boundedRepeatable(join.right, 0) != null;
                 const graph = if (graph_left) join.left else if (boundedRepeatable(join.left, 0) != null) join.right else return null;
                 const single = if (graph_left) join.right else join.left;
-                var factor_only = true;
+                if (join.kind != .inner and join.kind != .cross and
+                    !(join.kind == .left and graph_left) and !(join.kind == .right and !graph_left)) return null;
+                var factor_only = join.condition == null and join.kind != .left and join.kind != .right;
                 for (mapped) |request| for (request.fields) |field| if (columnIndex(single, field) != null) {
                     factor_only = false;
                 };
@@ -133,6 +159,11 @@ pub const Plan = struct {
                 for (mapped, input) |request, *out| {
                     var fields: Names = .empty;
                     for (request.fields) |field| if (columnIndex(graph, field) != null) try fields.put(a, field, {});
+                    if (join.condition) |program| for (program.required_columns) |ordinal| {
+                        if (ordinal >= node.columns.len) return error.InvalidSqlBackendResponse;
+                        const name = node.columns[ordinal].internal;
+                        if (columnIndex(graph, name) != null) try fields.put(a, name, {});
+                    };
                     out.* = .{ .fields = try names(a, fields), .multiplicity = request.multiplicity };
                 }
                 const nested = try child(a, graph, input, depth + stages.items.len + 1);
