@@ -24,6 +24,10 @@ pub const packed_limit = 512 * 1024 * 1024;
 pub const arena_limit = 128 * 1024 * 1024;
 pub const graph_rows_limit = 4096;
 pub const Arena = struct {
+    kind: enum { encoder, vision } = .encoder,
+    grid_x: usize = 0,
+    grid_y: usize = 0,
+    geometry_ready: bool = false,
     sequence: usize = 0,
     batch: usize = 0,
     mask_kind: u8 = 0,
@@ -34,6 +38,35 @@ pub const Arena = struct {
     graph: driver.CUgraphExec = null,
     warm: bool = false,
     disabled: bool = false,
+    eager_samples: u8 = 0,
+    replay_samples: u8 = 0,
+    eager_ns: u64 = 0,
+    replay_ns: u64 = 0,
+    timed_uses: u64 = 0,
+    pub fn preferReplay(self: *const Arena) bool {
+        if (self.replay_samples < 2) return true;
+        if (self.eager_samples < 2) return false;
+        const replay_wins = @as(u128, self.replay_ns) * 100 <= @as(u128, self.eager_ns) * 95;
+        // One real request every 64 samples probes the alternate route. No
+        // duplicate inference or synchronous GPU timing is introduced.
+        return if (self.timed_uses % 64 == 0) !replay_wins else replay_wins;
+    }
+    pub fn recordCompleted(self: *Arena, replay: bool, ns: u64) void {
+        if (ns == 0) return;
+        const samples = if (replay) &self.replay_samples else &self.eager_samples;
+        const elapsed = if (replay) &self.replay_ns else &self.eager_ns;
+        elapsed.* = if (samples.* == 0) ns else @intCast((@as(u128, elapsed.*) * 3 + ns) / 4);
+        samples.* +|= 1;
+        self.timed_uses +%= 1;
+    }
+    pub fn resetTiming(self: *Arena) void {
+        self.eager_samples = 0;
+        self.replay_samples = 0;
+        self.eager_ns = 0;
+        self.replay_ns = 0;
+        self.timed_uses = 0;
+    }
+
     pub fn captureFailed(self: *Arena, err: anyerror) void {
         self.warm = false;
         // A request cancellation must not poison later requests' replay.
@@ -118,8 +151,19 @@ pub const Cache = struct {
     }
 
     pub fn arena(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, sizes: [11]usize) !?*Arena {
-        if (batch == 0 or batch > 4 or sequence == 0 or sequence > 8192 or batch > graph_rows_limit / sequence) return null;
-        for (&self.arenas) |*entry| if (entry.sequence == sequence and entry.batch == batch and entry.mask_kind == mask_kind) {
+        return self.arenaFor(ctx, batch, sequence, mask_kind, 0, 0, sizes);
+    }
+
+    pub fn visionArena(self: *Cache, ctx: *Context, batch: usize, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
+        if (grid_x == 0 or grid_y == 0) return null;
+        const sequence = try std.math.mul(usize, grid_x, grid_y);
+        return self.arenaFor(ctx, batch, sequence, 0, grid_x, grid_y, sizes);
+    }
+
+    fn arenaFor(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
+        const kind: @FieldType(Arena, "kind") = if (grid_x == 0) .encoder else .vision;
+        if (batch == 0 or batch > (if (kind == .encoder) @as(usize, 4) else 8) or sequence == 0 or sequence > 8192 or batch > graph_rows_limit / sequence) return null;
+        for (&self.arenas) |*entry| if (entry.kind == kind and entry.grid_x == grid_x and entry.grid_y == grid_y and entry.sequence == sequence and entry.batch == batch and entry.mask_kind == mask_kind) {
             for (entry.buffers, sizes) |buffer, size| if (buffer.len != size) return error.InvalidCudaState;
             return entry;
         };
@@ -131,7 +175,7 @@ pub const Cache = struct {
         entry.deinit(ctx);
         var lease = acquire(ctx, bytes) catch return null;
         errdefer if (lease) |*active| active.release();
-        var candidate = Arena{ .sequence = sequence, .batch = batch, .mask_kind = mask_kind };
+        var candidate = Arena{ .kind = kind, .grid_x = grid_x, .grid_y = grid_y, .sequence = sequence, .batch = batch, .mask_kind = mask_kind };
         errdefer for (&candidate.buffers) |*buffer| buffer.free(ctx);
         for (&candidate.buffers, sizes) |*buffer, size| {
             buffer.* = Buffer.alloc(ctx, size) catch {
@@ -226,6 +270,15 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     try std.testing.expect(large == (try cache.arena(&ctx, 4, 1024, 1, @splat(16))).?);
     const smaller_batch = (try cache.arena(&ctx, 2, 1024, 1, @splat(16))).?;
     try std.testing.expect(large != smaller_batch);
+    const vision = (try cache.visionArena(&ctx, 2, 32, 32, @splat(16))).?;
+    try std.testing.expect(vision != smaller_batch);
+    vision.geometry_ready = true;
+    try std.testing.expect(vision == (try cache.visionArena(&ctx, 2, 32, 32, @splat(16))).?);
+    try std.testing.expect(vision.geometry_ready);
+    const rotated = (try cache.visionArena(&ctx, 2, 64, 16, @splat(16))).?;
+    try std.testing.expect(vision != rotated and !rotated.geometry_ready);
+    try std.testing.expectEqual(@as(usize, 704), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expect((try cache.visionArena(&ctx, 8, 32, 32, @splat(16))) == null);
 }
 
 test "embeddinggemma2 graph cancellation keeps capture retryable" {
@@ -250,4 +303,23 @@ test "embeddinggemma2 execution cache releases admission after a lost context is
     cache.releaseAfterContextDestroyed(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), cache.weights.capacity());
+}
+
+test "embeddinggemma2 graph selection measures completed warm routes with bounded exploration" {
+    var entry = Arena{};
+    try std.testing.expect(entry.preferReplay());
+    entry.recordCompleted(true, 100);
+    entry.recordCompleted(true, 100);
+    try std.testing.expect(!entry.preferReplay());
+    entry.recordCompleted(false, 50);
+    entry.recordCompleted(false, 50);
+    try std.testing.expect(!entry.preferReplay());
+    entry.timed_uses = 64;
+    try std.testing.expect(entry.preferReplay());
+    entry.resetTiming();
+    entry.recordCompleted(true, 40);
+    entry.recordCompleted(true, 40);
+    entry.recordCompleted(false, 100);
+    entry.recordCompleted(false, 100);
+    try std.testing.expect(entry.preferReplay());
 }

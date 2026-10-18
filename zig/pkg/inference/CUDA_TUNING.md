@@ -1214,11 +1214,12 @@ pending NVIDIA hardware qualification.
 | `EXTENDED_FLASH=1` | cuDNN global/local plans when available, otherwise bundled BF16 WMMA tiles across supported sequence lengths and SM80–SM120; masks and scalar tile tails remain explicit. Portable SM75 PTX never enters an empty WMMA body. |
 | `FUSED_VISION=1` | Fused F32 rotary/Q-scaling math directly into BF16 attention inputs, BF16 SDPA output directly into projection; one final widening at the tower boundary. Declined plans retain the existing path. |
 | `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and consume packed rows directly in fused head RMS/rotary and GELU multiply kernels. Also pack immutable PLE projections into groups bounded by 16 MiB, preserving BF16 GEMM/scale/norm boundaries. |
-| `GRAPH_REPLAY=1` | Four retained arenas keyed by batch, padded sequence and mask kind, through four items and 4096 total padded rows. Each arena has a 128-MiB ceiling and retained admission. Fresh typed inputs, masks and prefix lengths are uploaded before replay; compact results are read afterward. |
+| `GRAPH_REPLAY=1` | Four shared encoder/vision arenas keyed by tower kind, batch, geometry and mask kind. Encoder batches support four items, vision batches eight, with 4096 total rows and a 128-MiB per-arena ceiling. Each arena has a 128-MiB ceiling and retained admission. Fresh typed inputs, masks and prefix lengths are uploaded before replay; compact results are read afterward. |
 | `IMAGE_BATCH=1` | Existing image cohort opt-in also permits up to four staged video pictures. cuDNN vision plans carry the full batch dimension. |
 | `NATIVE_VISION=1` | Native batched head-64 tensor-core attention with BF16 inputs/output and online softmax. Fused rotary packing feeds attention and projection without whole-tensor F32 bridges. No score/probability arenas or cuDNN dependency. The typed BF16 implementation carries a new native-vision identity version. |
 | `MEDIA_BATCH=1` | Up to four ordered text/image/audio groups share preparation waves and length-bucketed BF16 backbone calls. CUDA Pillow resize, reference audio resampling and manual placeholder ordering remain explicit. |
 | `FUSED_BACKBONE=1` | Fuse post-attention norm/residual/pre-FFN norm, post-FFN norm/residual, PLE scale/norm, and PLE norm/residual/scalar. Explicit BF16 conversions preserve intermediate boundaries; six launches per encoder layer and three per vision layer are removed. |
+| `SPATIAL_POOL=1` | Merge spatial patches and apply optional per-channel standardization in one F32 kernel, preserving dy/dx addition order and separate arithmetic boundaries; RMS uses the existing backend reduction. |
 | `TUNED_GEMM=1` | Time up to eight validated cuBLASLt BF16-input/BF16-output algorithms (one warmup, three completed-device iterations), cache the fastest admissible plan, and retry ordinary heuristics on tuning decline before the scalar fallback. |
 
 Packed weights retain up to 512 MiB, and each of the four graph arenas has a
@@ -1333,3 +1334,37 @@ fresh inputs. These tests still require NVIDIA execution before qualification.
 `FUSED_BACKBONE` uses `vision-residual-v2`. `TUNED_GEMM` has a separate arithmetic
 bit and `tuned-bf16-output-v1` version. Reload and qualify resulting model pins
 before using them. Defaults, CPU and Metal profiles retain their identities.
+
+The extended attention dispatcher validates official GQA/MQA geometry before
+choosing candidates. Unmasked/right-padded sequences from 16 tokens can try
+cuDNN; sequences from 64 tokens can use bundled tiles, including arbitrary masks
+and scalar tails. Unsupported plans retain exact fallbacks. Hardware qualification
+must include short queries, holes, prefixes, batches and each target architecture;
+`--require-route short_attention` proves short cuDNN execution. `EXTENDED_FLASH`
+now uses the `extended-dispatch-v3` identity and remains opt-in.
+
+Graph mode retains exact sequences below 128 tokens and permits at most 12.5%
+additional rows for larger tiled buckets. Once an encoder graph is warm, two
+completed replay requests and two completed eager requests seed a per-arena
+latency estimate. Cold setup/capture are excluded. Replay requires a 5% measured
+advantage; one real request every 64 samples probes the alternate route. Estimates
+use the existing completed readback boundary, introduce no duplicate inference
+or new device barrier, and reset when graph dependencies change.
+
+Vision uses the same four retained arena slots and aggregate cache ceiling as
+the encoder. Keys include both grid axes even when patch counts match. Position
+tables upload once per retained geometry. BF16 native/cuDNN tower routes warm
+actual packed weights and GEMM/attention plans before capture; generic F32
+attention stays eager because it owns transient tensors. Workspace pointer and
+packed-weight generation changes invalidate graphs. Cancellation remains
+retryable, and synchronized eviction destroys graphs before buffers and releases
+shared admission. `--require-route vision_graph` requires actual graph submission.
+`GRAPH_REPLAY` uses the `media-graphs-v3` identity.
+
+`SPATIAL_POOL` is a separate CUDA arithmetic profile (`spatial-pool-v1`), with
+`--require-route spatial_pool` execution evidence. Metal uses a precise-library
+kernel tested bitwise against the previous gathers/additions, including channel
+tails, multiple frames, merge sizes and standardization. Neither route downloads
+activations or constructs gather indices. The existing RMS reduction follows the
+fused merge/standardization so its numerical contract remains intact; supported
+model constant caches retain the no-scale RMS ones vector under bounded admission.

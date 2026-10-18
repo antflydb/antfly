@@ -266,6 +266,25 @@ pub const DotGeneral2DManyResult = struct {
     outputs: []CT,
 };
 
+/// Spatial merge in row-major dy/dx addition order, followed by optional
+/// per-channel (pooled-bias)*scale. RMS stays on the backend's qualified route.
+pub const SpatialPoolParams = struct {
+    batch: u32,
+    grid_x: u32,
+    grid_y: u32,
+    merge: u32,
+    dim: u32,
+    pub fn validate(p: @This()) !void {
+        if (p.batch == 0 or p.grid_x == 0 or p.grid_y == 0 or p.merge == 0 or p.dim == 0 or p.grid_x % p.merge != 0 or p.grid_y % p.merge != 0) return error.InvalidTensorShape;
+        var count: u64 = p.batch;
+        for ([_]u32{ p.grid_x, p.grid_y, p.dim }) |factor| count = std.math.mul(u64, count, factor) catch return error.InvalidTensorShape;
+        if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+    }
+    pub fn rows(p: @This()) usize {
+        return @as(usize, p.batch) * (p.grid_x / p.merge) * (p.grid_y / p.merge);
+    }
+};
+
 /// Backend-neutral inputs for a device-resident AdamW update.  Bias
 /// correction belongs to each parameter because conditional optimizer
 /// families can advance at different rates.
@@ -2439,6 +2458,9 @@ pub const ComputeBackend = struct {
         scaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         tryScaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        /// Direct spatial merge and optional channel standardization.
+        spatialPoolPrepare: ?*const fn (ctx: *anyopaque, input: CT, bias: ?CT, scale: ?CT, params: SpatialPoolParams) anyerror!?CT = null,
+
         /// Complete official EmbeddingGemma2 HF vision encoder. The input and
         /// output are token-major F32 `[sequence, 768]`. A backend may decline
         /// before queueing work; errors after submission must propagate.
@@ -4390,6 +4412,13 @@ pub const ComputeBackend = struct {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return null;
+    }
+
+    pub fn spatialPoolPrepare(self: *const ComputeBackend, input: CT, bias: ?CT, scale: ?CT, params: SpatialPoolParams) !?CT {
+        try params.validate();
+        if ((bias == null) != (scale == null)) return error.InvalidTensorShape;
+        const op = self.vtable.spatialPoolPrepare orelse return null;
+        return op(self.ptr, input, bias, scale, params);
     }
 
     pub fn runEmbeddingGemma2VisionTower(self: *const ComputeBackend, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize) !?CT {

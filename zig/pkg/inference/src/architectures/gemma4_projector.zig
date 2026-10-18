@@ -2474,11 +2474,9 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
         }
     }
     if (can_group) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
-    const pooled_ct = try averagePoolSpatialBatchTensor(cb, allocator, hidden, cfg, geometry, batch);
-    defer cb.free(pooled_ct);
+    const standardized = try prepareSpatialProjector(cb, allocator, store, hidden, cfg, geometry, batch);
     cb.free(hidden);
     hidden_live = false;
-    const standardized = try standardizeSpatialTensor(cb, allocator, store, pooled_ct, cfg);
     defer cb.free(standardized);
     const normed_pooled = try rmsNormNoScaleCt(cb, allocator, standardized, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed_pooled);
@@ -5005,6 +5003,30 @@ fn averagePoolSpatialTensor(cb: *const ComputeBackend, allocator: std.mem.Alloca
     return averagePoolSpatialBatchTensor(cb, allocator, input, cfg, geometry, 1);
 }
 
+fn prepareSpatialProjector(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, input: CT, cfg: Config, geometry: Geometry, batch: usize) !CT {
+    if (cb.vtable.spatialPoolPrepare != null) {
+        var bias: ?CT = null;
+        var scale: ?CT = null;
+        defer if (bias) |value| cb.free(value);
+        defer if (scale) |value| cb.free(value);
+        if (store.gguf) |gguf| {
+            var b = try loadOptionalTensorF32(gguf, "v.std_bias");
+            defer if (b) |*value| value.deinit();
+            var sc = try loadOptionalTensorF32(gguf, "v.std_scale");
+            defer if (sc) |*value| value.deinit();
+            if (b != null or sc != null) {
+                if (b == null or sc == null or b.?.data.len != cfg.vision_hidden or sc.?.data.len != cfg.vision_hidden) return error.InvalidStandardizationTensorShape;
+                bias = try deviceResidentFromFloat32(cb, b.?.data, &.{@intCast(cfg.vision_hidden)});
+                scale = try deviceResidentFromFloat32(cb, sc.?.data, &.{@intCast(cfg.vision_hidden)});
+            }
+        }
+        if (try cb.spatialPoolPrepare(input, bias, scale, .{ .batch = @intCast(batch), .grid_x = @intCast(geometry.grid_x), .grid_y = @intCast(geometry.grid_y), .merge = @intCast(cfg.spatial_merge_size), .dim = @intCast(cfg.vision_hidden) })) |result| return result;
+    }
+    const pooled = try averagePoolSpatialBatchTensor(cb, allocator, input, cfg, geometry, batch);
+    defer cb.free(pooled);
+    return standardizeSpatialTensor(cb, allocator, store, pooled, cfg);
+}
+
 fn averagePoolSpatialBatchTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, cfg: Config, geometry: Geometry, batch: usize) !CT {
     if (cb.vtable.takeRows == null or cb.vtable.multiplyScalar == null) {
         const data = try cb.toFloat32(input, allocator);
@@ -5106,11 +5128,15 @@ fn rmsNormNoScaleCt(
     eps: f32,
 ) !CT {
     _ = rows;
-    const ones = try allocator.alloc(f32, dim);
-    defer allocator.free(ones);
-    @memset(ones, 1.0);
-    const shape = [_]i32{@intCast(dim)};
-    const weight = try cb.fromFloat32Shape(ones, &shape);
+    var key_buf: [96]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.vision.ones.v1.{d}", .{dim});
+    const weight = (try cb.modelConstant(key, null)) orelse create: {
+        const ones = try allocator.alloc(f32, dim);
+        defer allocator.free(ones);
+        @memset(ones, 1.0);
+        const tensor = try deviceResidentFromFloat32(cb, ones, &.{@intCast(dim)});
+        break :create try publishAudioConstant(cb, key, tensor, true);
+    };
     defer cb.free(weight);
     return cb.rmsNorm(input, weight, dim, eps);
 }
@@ -7102,4 +7128,64 @@ test "embeddinggemma2 Metal segmented audio kernels match isolated clips with fi
 
 test "embeddinggemma2 CUDA segmented audio kernels match isolated clips with finite masks" {
     try @import("../ops/media_residency_test.zig").onCuda(@import("../ops/media_residency_test.zig").noWeights, checkAudioSegmentKernels);
+}
+
+fn checkSpatialPoolPreparation(cb: ComputeBackend, reference: ComputeBackend) !void {
+    _ = reference;
+    if (cb.kind() == .cuda) {
+        const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        compute.capability_profile = .embedding_gemma2;
+        compute.embedding_gemma2_policy.spatial_pool = true;
+    }
+    const a = std.testing.allocator;
+    const fixture = @import("../ops/media_residency_test.zig");
+    for ([_]usize{ 1, 2, 3 }) |merge| for ([_]usize{ 33, 768 }) |dim| {
+        const geometry = Geometry{ .width = 6, .height = 6, .grid_x = 6, .grid_y = 6, .pooled_x = 6 / merge, .pooled_y = 6 / merge };
+        const cfg = Config{ .image_size = 6, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .text_hidden = 4, .vision_hidden = dim, .head_count = 1, .block_count = 1, .intermediate_size = dim * 2, .patch_size = 1, .layer_norm_eps = 1e-6, .rope_theta = 10000, .spatial_merge_size = merge };
+        const values = try a.alloc(f32, 2 * 36 * dim);
+        defer a.free(values);
+        for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.037);
+        const weights = try a.alloc(f32, dim * 2);
+        defer a.free(weights);
+        for (weights, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) / 8;
+        const input = try deviceResidentFromFloat32(&cb, values, &.{ 72, @intCast(dim) });
+        defer cb.free(input);
+        const bias = try deviceResidentFromFloat32(&cb, weights[0..dim], &.{@intCast(dim)});
+        defer cb.free(bias);
+        const scale = try deviceResidentFromFloat32(&cb, weights[dim..], &.{@intCast(dim)});
+        defer cb.free(scale);
+        const baseline = try averagePoolSpatialBatchTensor(&cb, a, input, cfg, geometry, 2);
+        defer cb.free(baseline);
+        const expected_pool = try cb.toFloat32(baseline, a);
+        defer a.free(expected_pool);
+        for ([_]bool{ false, true }) |standardize| {
+            var active = if (cb.kind() == .metal) try cb.decoderRuntimeBeginFrame() else false;
+            defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+            const before = fixture.Transfers.snapshot(cb);
+            const result = (try cb.spatialPoolPrepare(input, if (standardize) bias else null, if (standardize) scale else null, .{ .batch = 2, .grid_x = 6, .grid_y = 6, .merge = @intCast(merge), .dim = @intCast(dim) })).?;
+            defer cb.free(result);
+            if (active) {
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                active = false;
+            }
+            try before.expectUnchanged(cb);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            for (expected_pool, actual, 0..) |pooled, got, i| {
+                const expected = if (standardize) (pooled - weights[i % dim]) * weights[dim + i % dim] else pooled;
+                try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(got)));
+            }
+        }
+        try std.testing.expectError(error.InvalidTensorShape, cb.spatialPoolPrepare(input, null, null, .{ .batch = 2, .grid_x = 6, .grid_y = 5, .merge = 3, .dim = @intCast(dim) }));
+    };
+}
+
+test "embeddinggemma2 Metal spatial projector preparation is bitwise and stays resident in frames" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkSpatialPoolPreparation);
+}
+
+test "embeddinggemma2 CUDA spatial projector preparation is bitwise and stays resident" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(fixture.noWeights, checkSpatialPoolPreparation);
 }

@@ -597,3 +597,14 @@ cache; cache misses decline during graph capture. These profiles remain opt-in,
 carry versioned model identities and require NVIDIA vector/ranking and timing
 qualification. See [CUDA tuning](../../pkg/inference/CUDA_TUNING.md) for controls,
 memory bounds and observed execution gates.
+
+CUDA vision replay shares the encoder's four bounded arena slots. Grid axes and
+batch identify retained position tables; workspace/weight changes invalidate
+captured execution. BF16 towers capture after warming, while transient F32
+attention keeps eager ownership. Short encoder graphs avoid the former 64-row
+minimum and use completed warm latency to choose eager/replay submission.
+
+Spatial projector preparation has direct CUDA/Metal kernels for ordered patch
+merging and channel standardization, without host index tables or intermediate
+gathers. RMS keeps the backend's established reduction. CUDA `SPATIAL_POOL`
+remains a separately identified opt-in profile pending NVIDIA qualification.

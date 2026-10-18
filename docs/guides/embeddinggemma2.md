@@ -1145,3 +1145,19 @@ passes. These opt-in profiles have new identity versions; reload and qualify
 pins with NVIDIA differential tests, pretrained vectors/rankings and completed
 GPU timing before production use. The packed vision rotary consumer applies only
 to existing BF16 attention routes. CPU and Metal profiles are unaffected.
+
+CUDA graph replay now shares four bounded arena slots between encoder and vision
+execution. Vision geometry tables persist per grid/batch; BF16 towers can replay
+once warm. Short encoder queries retain exact row counts, larger buckets add at
+most 12.5% rows, and completed warm measurements choose eager or replay execution.
+The graph profile (`media-graphs-v3`) and extended attention profile
+(`extended-dispatch-v3`) require reloaded, newly qualified model pins.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_SPATIAL_POOL=1` enables direct spatial
+merge/standardization, with a distinct CUDA identity. Metal uses the precise
+resident implementation. RMS normalization retains its existing backend
+reduction. CUDA qualification can require `--require-route spatial_pool`,
+`--require-route vision_graph` and `--require-route short_attention`; use repeated
+images/video frames for vision replay and 16–63-token inputs for short attention.
+These gates attest execution, and still require pinned vector/ranking parity and
+completed timing on NVIDIA hardware before promotion.

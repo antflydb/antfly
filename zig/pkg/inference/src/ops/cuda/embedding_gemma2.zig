@@ -55,6 +55,8 @@ pub const Stats = struct {
     tuned_gemm_calls: u64 = 0,
     gemm_tuning_declines: u64 = 0,
     vision_residual_launches: u64 = 0,
+    spatial_pool_launches: u64 = 0,
+    short_cudnn_attention_launches: u64 = 0,
 };
 
 pub const Contrastive = struct {
@@ -93,6 +95,7 @@ pub const Module = struct {
     split_columns: driver.CUfunction,
     packed_heads: driver.CUfunction,
     packed_gelu: driver.CUfunction,
+    spatial_pool: driver.CUfunction,
     vision_rope_pack: driver.CUfunction,
     native_vision: driver.CUfunction,
     audio_segment_conv: driver.CUfunction,
@@ -160,6 +163,7 @@ pub const Module = struct {
             .training_rope_vjp = try function(ctx, m, "termite_embedding_gemma2_training_rope_vjp_f32"),
             .packed_heads = try function(ctx, m, "termite_embedding_gemma2_packed_heads_bf16"),
             .packed_gelu = try function(ctx, m, "termite_embedding_gemma2_packed_gelu_bf16"),
+            .spatial_pool = try function(ctx, m, "termite_embedding_gemma2_spatial_pool_f32"),
             .split_columns = try function(ctx, m, "termite_embedding_gemma2_split_columns_bf16"),
             .vision_rope_pack = try function(ctx, m, "termite_embedding_gemma2_vision_rope_pack_bf16"),
             .audio_segment_conv = try function(ctx, m, "termite_embedding_gemma2_audio_segment_conv_f32"),
@@ -463,6 +467,36 @@ pub const Module = struct {
         self.stats_.launches += 1;
         self.stats_.packed_head_launches += 1;
     }
+    pub fn noteShortCudnnAttention(self: *Module) void {
+        self.stats_.short_cudnn_attention_launches += 1;
+    }
+    pub fn launchSpatialPool(self: *Module, ctx: *Context, output: Buffer, input: Buffer, bias: Buffer, scale: Buffer, rows: u32, gx: u32, gy: u32, merge: u32, dim: u32, factor: f32) !void {
+        if (gx == 0 or gy == 0 or merge == 0 or dim == 0 or gx % merge != 0 or gy % merge != 0 or !std.math.isFinite(factor)) return error.InvalidEmbeddingGemma2Shape;
+        const frame_rows = try std.math.mul(usize, gx / merge, gy / merge);
+        if (rows == 0 or rows % frame_rows != 0) return error.InvalidEmbeddingGemma2Shape;
+        const params = @import("../ops.zig").SpatialPoolParams{ .batch = @intCast(rows / frame_rows), .grid_x = gx, .grid_y = gy, .merge = merge, .dim = dim };
+        try params.validate();
+        try require(input, @as(usize, params.batch) * gx * gy * dim * 4);
+        try require(output, @as(usize, rows) * dim * 4);
+        if (bias.ptr != 0) {
+            try require(bias, @as(usize, dim) * 4);
+            try require(scale, @as(usize, dim) * 4);
+        }
+        var op = output.ptr;
+        var ip = input.ptr;
+        var bp = bias.ptr;
+        var sp = scale.ptr;
+        var r = rows;
+        var x = gx;
+        var y = gy;
+        var m = merge;
+        var d = dim;
+        var f = factor;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&bp), @ptrCast(&sp), @ptrCast(&r), @ptrCast(&x), @ptrCast(&y), @ptrCast(&m), @ptrCast(&d), @ptrCast(&f) };
+        try self.launch1d(ctx, self.spatial_pool, &args, @as(usize, rows) * dim);
+        self.stats_.spatial_pool_launches += 1;
+    }
+
     pub fn launchPackedGelu(self: *Module, ctx: *Context, output: Buffer, input: Buffer, rows: u32, width: u32) !void {
         if (rows == 0 or width == 0) return error.InvalidEmbeddingGemma2Shape;
         const count = try std.math.mul(usize, rows, width);

@@ -368,3 +368,20 @@ extern "C" __global__ void termite_embedding_gemma2_packed_gelu_bf16(
     g = __bfloat162float(__float2bfloat16_rn(g));
     out[i] = __float2bfloat16_rn(g * __bfloat162float(input[base+width]));
 }
+
+// Direct geometry indexing avoids repeated gather tables and temporary sums.
+extern "C" __global__ void termite_embedding_gemma2_spatial_pool_f32(
+    float* output, const float* input, const float* bias, const float* scale,
+    unsigned rows, unsigned gx, unsigned gy, unsigned merge, unsigned dim, float factor) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * dim) return;
+    unsigned channel = i % dim, row = i / dim, px = gx / merge, py = gy / merge;
+    unsigned batch = row / (px * py), y = (row / px) % py, x = row % px;
+    size_t base = ((size_t)batch * gx * gy + y * merge * gx + x * merge) * dim + channel;
+    float sum = input[base];
+    for (unsigned dy = 0; dy < merge; ++dy) for (unsigned dx = 0; dx < merge; ++dx)
+        if (dy || dx) sum = __fadd_rn(sum, input[base + ((size_t)dy * gx + dx) * dim]);
+    float value = __fmul_rn(sum, factor);
+    if (bias) value = __fmul_rn(__fsub_rn(value, bias[channel]), scale[channel]);
+    output[i] = value;
+}

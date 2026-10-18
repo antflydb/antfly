@@ -1336,6 +1336,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> scale_pipeline;
     id<MTLComputePipelineState> norm_residual_pipeline;
     id<MTLComputePipelineState> gemma4_audio_clamp_silu_pipeline;
+    id<MTLComputePipelineState> spatial_pool_prepare_pipeline;
     id<MTLComputePipelineState> gemma4_audio_clamp_pipeline;
     id<MTLComputePipelineState> gemma4_audio_glu_pipeline;
     id<MTLComputePipelineState> gemma4_audio_dwconv_pipeline;
@@ -10490,6 +10491,19 @@ static NSString *termite_metal_shader_source(void) {
            "    float inv = 1.0f / sqrt(total / float(p.dim) + p.eps);\n"
            "    if ((p.dim & 3u) == 0u) { for (uint v = tid; v < p.dim/4u; v += tpg) { uint c = v*4u, i = base+c; float4 x = float4(input[i],input[i+1u],input[i+2u],input[i+3u]); float4 w = float4(weight[c],weight[c+1u],weight[c+2u],weight[c+3u]); float4 r = float4(residual[i],residual[i+1u],residual[i+2u],residual[i+3u]); float4 y = (r + ((x*inv)*w)*p.norm_scale)*p.output_scale; output[i] = y.x; output[i+1u] = y.y; output[i+2u] = y.z; output[i+3u] = y.w; } }\n"
            "    else { for (uint c = tid; c < p.dim; c += tpg) { float n = (input[base+c] * inv) * weight[c]; output[base+c] = (residual[base+c] + n * p.norm_scale) * p.output_scale; } }\n"
+           "}\n"
+           "struct termite_spatial_pool_params { uint total, gx, gy, merge, dim, flags; float factor; };\n"
+           "kernel void termite_spatial_pool_prepare(device const float *input [[buffer(0)]], device const float *bias [[buffer(1)]], device const float *scale [[buffer(2)]], device float *output [[buffer(3)]], constant termite_spatial_pool_params &p [[buffer(4)]], uint i [[thread_position_in_grid]]) {\n"
+           "#pragma clang fp contract(off)\n"
+           "    if (i >= p.total) return;\n"
+           "    uint channel=i%p.dim, row=i/p.dim, px=p.gx/p.merge, py=p.gy/p.merge;\n"
+           "    uint batch=row/(px*py), y=(row/px)%py, x=row%px;\n"
+           "    uint base=(batch*p.gx*p.gy+y*p.merge*p.gx+x*p.merge)*p.dim+channel;\n"
+           "    float sum=input[base];\n"
+           "    for (uint dy=0; dy<p.merge; ++dy) for (uint dx=0; dx<p.merge; ++dx) if (dy || dx) sum=sum+input[base+(dy*p.gx+dx)*p.dim];\n"
+           "    float value=sum*p.factor;\n"
+           "    if (p.flags) { value=value-bias[channel]; value=value*scale[channel]; }\n"
+           "    output[i]=value;\n"
            "}\n"
            "kernel void termite_clamp_silu(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_clamp_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.total) return; float v = input[gid];\n"
@@ -28826,6 +28840,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_scale_1x");
         runtime->norm_residual_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_norm_residual");
         runtime->gemma4_audio_clamp_silu_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_clamp_silu");
+        runtime->spatial_pool_prepare_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_spatial_pool_prepare");
         runtime->gemma4_audio_clamp_pipeline = termite_metal_make_pipeline(device, library, @"termite_gemma4_audio_clamp");
         runtime->gemma4_audio_glu_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gemma4_audio_glu_rows");
         runtime->gemma4_audio_dwconv_pipeline = termite_metal_make_pipeline(device, library, @"termite_gemma4_audio_dwconv_causal");
@@ -29781,6 +29796,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->scale_pipeline = nil;
     runtime->norm_residual_pipeline = nil;
     runtime->gemma4_audio_clamp_silu_pipeline = nil;
+    runtime->spatial_pool_prepare_pipeline = nil;
     runtime->gemma4_audio_clamp_pipeline = nil;
     runtime->gemma4_audio_glu_pipeline = nil;
     runtime->gemma4_audio_dwconv_pipeline = nil;
@@ -54379,6 +54395,28 @@ int termite_metal_decode_runtime_norm_residual_device(
     if (pipeline == nil || pipeline.threadExecutionWidth != 32) return -2;
     const size_t threads = rows >= 256 && dim <= 512 ? 32 : 128;
     return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, pipeline, bindings, 4, &params, sizeof(params), rows, 1, threads, __func__);
+}
+
+typedef struct { uint32_t total, gx, gy, merge, dim, flags; float factor; } termite_spatial_pool_params;
+int termite_metal_decode_runtime_spatial_pool_prepare_device(
+    termite_metal_decode_runtime *runtime, void *input, size_t input_offset,
+    size_t total, uint32_t gx, uint32_t gy, uint32_t merge, uint32_t dim,
+    void *bias, size_t bias_offset, void *scale, size_t scale_offset,
+    void *output, size_t output_offset
+) {
+    if (runtime == NULL || !runtime->precise_library_safe || total == 0 || total > UINT32_MAX || gx == 0 || gy == 0 || merge == 0 || dim == 0 || gx%merge || gy%merge || (bias == NULL) != (scale == NULL)) return -1;
+    if ((uint64_t)gx*gy > UINT32_MAX/dim) return -1;
+    const size_t per_frame=(size_t)(gx/merge)*(gy/merge)*dim;
+    if (total%per_frame || total/per_frame > UINT32_MAX/((size_t)gx*gy*dim)) return -1;
+    const size_t input_total=(total/per_frame)*gx*gy*dim;
+    const termite_metal_gemma4_audio_binding bindings[4] = {
+        { (__bridge id<MTLBuffer>)input, input_offset, input_total*sizeof(float), false },
+        { (__bridge id<MTLBuffer>)(bias ? bias : input), bias ? bias_offset : input_offset, dim*sizeof(float), false },
+        { (__bridge id<MTLBuffer>)(scale ? scale : input), scale ? scale_offset : input_offset, dim*sizeof(float), false },
+        { (__bridge id<MTLBuffer>)output, output_offset, total*sizeof(float), true },
+    };
+    const termite_spatial_pool_params params = { (uint32_t)total, gx, gy, merge, dim, bias != NULL, sqrtf((float)dim)/(float)((uint64_t)merge*merge) };
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->spatial_pool_prepare_pipeline, bindings, 4, &params, sizeof(params), total, 0, 0, __func__);
 }
 
 int termite_metal_decode_runtime_clamp_silu_device(

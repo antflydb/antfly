@@ -10328,6 +10328,16 @@ pub fn decoderRuntimeRmsNormResidual(self: anytype, input: MetalTensor, residual
 
 pub extern fn termite_metal_decode_runtime_norm_residual_device(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, output: ?*anyopaque, output_offset: usize) c_int;
 
+pub fn decoderRuntimeSpatialPoolPrepare(self: anytype, input: MetalTensor, bias: ?MetalTensor, scale: ?MetalTensor, batch: u32, gx: u32, gy: u32, merge: u32, dim: u32) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    const rows = @as(usize, batch) * (gx / merge) * (gy / merge);
+    var output = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, &.{ @intCast(rows), @intCast(dim) });
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_spatial_pool_prepare_device(runtime, input.deviceHandle(), input.deviceByteOffset(), rows * dim, gx, gy, merge, dim, if (bias) |b| b.deviceHandle() else null, if (bias) |b| b.deviceByteOffset() else 0, if (scale) |s| s.deviceHandle() else null, if (scale) |s| s.deviceByteOffset() else 0, output.deviceHandle(), output.deviceByteOffset());
+    return finishDeviceOutput(&output, rc);
+}
+pub extern fn termite_metal_decode_runtime_spatial_pool_prepare_device(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, total: usize, gx: u32, gy: u32, merge: u32, dim: u32, bias: ?*anyopaque, bias_offset: usize, scale: ?*anyopaque, scale_offset: usize, output: ?*anyopaque, output_offset: usize) c_int;
+
 pub fn decoderRuntimeClampSilu(self: anytype, input: MetalTensor, min_value: ?f32, max_value: ?f32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (!input.isDevice() or input.elemCount() == 0) return null;

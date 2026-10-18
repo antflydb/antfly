@@ -15659,6 +15659,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.data.scalar_bounds.access(self.data.allocator, key, value);
     }
 
+    fn spatialPoolPrepareOp(ctx: *anyopaque, input: CT, bias: ?CT, scale: ?CT, params: ops.SpatialPoolParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        try params.validate();
+        const x = denseDeviceF32(input) orelse return null;
+        if (x.elemCount() != @as(usize, params.batch) * params.grid_x * params.grid_y * params.dim) return error.InvalidTensorShape;
+        const b = if (bias) |value| denseDeviceF32(value) orelse return null else null;
+        const sc = if (scale) |value| denseDeviceF32(value) orelse return null else null;
+        if ((b == null) != (sc == null)) return error.InvalidTensorShape;
+        if (b) |value| if (value.elemCount() != params.dim or sc.?.elemCount() != params.dim) return error.InvalidTensorShape;
+        const result = (try metal_runtime.decoderRuntimeSpatialPoolPrepare(self.provider_impl, x, b, sc, params.batch, params.grid_x, params.grid_y, params.merge, params.dim)) orelse return null;
+        return self.ctFromOwnedMetalTensor(result);
+    }
+
     fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
@@ -33307,6 +33321,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rmsNormResidual = rmsNormResidualOp;
         vt.modelScalarBounds = modelScalarBoundsOp;
         vt.clampSilu = clampSiluOp;
+        vt.spatialPoolPrepare = spatialPoolPrepareOp;
         vt.layerNorm = layerNormOp;
         // The inherited NativeCompute op would read a MetalCompute tensor as
         // its own; the interpreter falls back to layerNorm without it.

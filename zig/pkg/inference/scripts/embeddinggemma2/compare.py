@@ -620,6 +620,9 @@ CUDA_ROUTES = {
     "packed_gelu": "packed_gelu_launches_total",
     "tuned_gemm": "tuned_gemm_calls_total",
     "vision_residual": "vision_residual_launches_total",
+    "vision_graph": "vision_graph_replays_total",
+    "spatial_pool": "spatial_pool_launches_total",
+    "short_attention": "short_cudnn_attention_launches_total",
     "fused_backbone": "fused_backbone_launches_total",
 }
 
