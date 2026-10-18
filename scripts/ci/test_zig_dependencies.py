@@ -155,6 +155,48 @@ class DependencyTests(unittest.TestCase):
                 },
             )
 
+    def test_corrupt_cached_archives_are_removed_before_verified_refetch(self):
+        import gzip
+        import io
+        import tarfile
+
+        manifest = {
+            "mirror": "https://mirror.test",
+            "packages": [
+                {"hash": "expected", "url": "https://upstream.test/archive.tar.gz"}
+            ],
+        }
+        for damaged in (b"not an archive", gzip.compress(b"partial")[:12]):
+            with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as temp:
+                cache = Path(temp)
+                packages = cache / "p"
+                packages.mkdir()
+                cached = packages / "expected.tar.gz"
+                cached.write_bytes(damaged)
+                neighbor = packages / "other.tar.gz"
+                neighbor.write_bytes(b"preserve neighboring packages")
+
+                def fetch(zig, source, identity, target):
+                    self.assertFalse(cached.exists())
+                    self.assertEqual(source, "https://mirror.test/expected.tar.gz")
+                    with tarfile.open(cached, "w:gz") as archive:
+                        data = b".{ .dependencies = .{} }"
+                        member = tarfile.TarInfo("expected/build.zig.zon")
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
+                    return cached
+
+                with patch.object(deps, "fetch_verified", side_effect=fetch) as fetcher:
+                    deps.prepare("zig", manifest, cache)
+                fetcher.assert_called_once()
+                deps.check_remote_declarations(cached, manifest)
+                self.assertEqual(
+                    neighbor.read_bytes(), b"preserve neighboring packages"
+                )
+                with patch.object(deps, "fetch_verified") as fetcher:
+                    deps.prepare("zig", manifest, cache)
+                fetcher.assert_not_called()
+
     @unittest.skipUnless(
         os.environ.get("ANTFLY_TEST_ZIG"), "requires the pinned Zig compiler"
     )
@@ -186,6 +228,25 @@ class DependencyTests(unittest.TestCase):
                 [zig, "fetch", str(source)], env=env, text=True, timeout=600
             ).strip()
             deps.fetch_verified(zig, str(source), identity, global_cache / "p")
+            seed = work / "seed"
+            seed.mkdir()
+            (seed / (identity + ".tar.gz")).write_bytes(source.read_bytes())
+            (global_cache / "p" / (identity + ".tar.gz")).write_bytes(b"truncated")
+            deps.prepare(
+                zig,
+                {
+                    "mirror": "https://offline.invalid",
+                    "packages": [
+                        {
+                            "hash": identity,
+                            "url": "https://offline.invalid/fixture.tar.gz",
+                        }
+                    ],
+                },
+                global_cache,
+                seed=seed,
+                offline=True,
+            )
             (work / "build.zig").write_text("pub fn build() void {}")
             (work / "build.zig.zon").write_text(
                 zon.replace(

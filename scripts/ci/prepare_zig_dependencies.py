@@ -191,8 +191,12 @@ def prepare(
             try:
                 check_remote_declarations(cached, manifest)
                 continue
-            except ValueError:
+            except (ValueError, tarfile.TarError, EOFError, OSError):
                 print(f"Refetching invalid cached package {identity}", flush=True)
+                # Zig may retain an existing global archive during fetch. Remove
+                # the invalid entry so a verified replacement can be installed.
+                if cached.is_file():
+                    cached.unlink()
         local_source = seed / f"{identity}.tar.gz" if seed else None
         sources = [] if offline else [f"{manifest['mirror']}/{identity}.tar.gz"]
         if local_source and local_source.is_file():
