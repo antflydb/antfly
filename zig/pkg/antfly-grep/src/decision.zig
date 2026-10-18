@@ -32,6 +32,26 @@ pub const Input = struct {
     context: []const u8 = "",
     context_hash: ?[32]u8 = null,
     derived_key: ?[64]u8 = null,
+    deferred: ?Deferred = null,
+    pub const Deferred = struct {
+        path: []const u8,
+        bytes: []const u8,
+        lines: []const @import("source_cache.zig").Line,
+        region: @import("regions.zig").Region,
+        context: usize,
+        pub fn render(self: Deferred, a: Allocator) ![]const u8 {
+            var listing: std.Io.Writer.Allocating = .init(a);
+            errdefer listing.deinit();
+            const region = self.region;
+            try listing.writer.print("File: {s}\nTARGET lines {d}-{d}\n", .{ self.path, region.start + 1, region.end });
+            const first = region.start -| self.context;
+            const last = region.end + @min(self.context, self.lines.len - region.end);
+            for (self.lines[first..last], first..) |line, j| try listing.writer.print("{s} {d}: {s}\n", .{ if (j >= region.start and j < region.end) "TARGET" else "CONTEXT", j + 1, self.bytes[line.start..line.end] });
+            if (listing.written().len > 1024 * 1024) return error.DecisionInputTooLarge;
+            if (!std.unicode.utf8ValidateSlice(listing.written())) return error.DecisionInputNotUtf8;
+            return listing.toOwnedSlice();
+        }
+    };
     pub fn jsonStringify(self: Input, json: *std.json.Stringify) !void {
         try json.beginObject();
         try json.objectField("id");
@@ -52,6 +72,8 @@ pub const Input = struct {
 pub const Client = struct {
     a: Allocator,
     http: httpx.Client,
+    shared_http: ?*httpx.Client = null,
+    executor: ?*@import("worker_pool.zig").Pool = null,
     options: *const Options,
     requests: usize = 0,
     io: std.Io,
@@ -103,6 +125,9 @@ pub const Client = struct {
         self.owns_batch_store = true;
     }
     pub fn shareCache(self: *Client, parent: *Client) void {
+        self.shared_http = parent.shared_http;
+        self.executor = parent.executor;
+        self.shared_local = parent.shared_local orelse parent.local;
         if (self.batch_store != null) return;
         self.batch_store = parent.batch_store;
         self.batch_store_failed = parent.batch_store_failed;
@@ -227,6 +252,7 @@ pub const Client = struct {
         a: Allocator,
         io: std.Io,
         options: *const Options,
+        executor: ?*@import("worker_pool.zig").Pool,
         workers: []Worker,
         started: usize = 0,
         generation: usize = 0,
@@ -237,12 +263,12 @@ pub const Client = struct {
         mutex: std.Io.Mutex = .init,
         changed: std.Io.Condition = .init,
         completed: std.Io.Condition = .init,
-        const Worker = struct { pool: *Pool, index: usize, generation: usize, thread: std.Thread = undefined };
+        const Worker = struct { pool: *Pool, index: usize, generation: usize, thread: @import("worker_pool.zig").Handle = undefined };
         fn create(parent: *Client) !*Pool {
             const pool = try parent.a.create(Pool);
             errdefer parent.a.destroy(pool);
             const workers = try parent.a.alloc(Worker, parent.options.providerJobs());
-            pool.* = .{ .a = parent.a, .io = parent.io, .options = parent.options, .workers = workers };
+            pool.* = .{ .a = parent.a, .io = parent.io, .options = parent.options, .executor = parent.executor, .workers = workers };
             return pool;
         }
         fn deinit(self: *Pool) void {
@@ -262,7 +288,10 @@ pub const Client = struct {
             while (self.started < wanted) {
                 const worker = &self.workers[self.started];
                 worker.* = .{ .pool = self, .index = self.started, .generation = self.generation };
-                worker.thread = std.Thread.spawn(.{}, workerMain, .{worker}) catch break;
+                worker.thread = (if (self.executor) |pool| pool.launch(workerMain, worker) else blk: {
+                    const thread = std.Thread.spawn(.{}, workerMain, .{worker}) catch break;
+                    break :blk @import("worker_pool.zig").Handle{ .native = thread };
+                }) catch break;
                 self.started += 1;
             }
             if (self.started == 0) {
@@ -424,7 +453,7 @@ pub const Client = struct {
         split += 1;
         return if (split == text.len) null else split;
     }
-    fn key(self: *Client, input: Input) [64]u8 {
+    pub fn key(self: *Client, input: Input) [64]u8 {
         if (input.derived_key) |value| return value;
         var context_hash = input.context_hash orelse if (input.context.len == 0) empty_context_hash else blk: {
             var digest: [32]u8 = undefined;
@@ -636,6 +665,17 @@ pub const Client = struct {
     }
     fn requestDirect(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
         if (self.options.cached_only) return error.DecisionCacheMiss;
+        for (inputs) |input| if (input.deferred != null) {
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const materialized = try a.dupe(Input, inputs);
+            for (materialized) |*item| if (item.deferred) |value| {
+                item.input = try value.render(a);
+                item.deferred = null;
+            };
+            return self.requestDirect(materialized, probabilities);
+        };
         // Raw input bytes are a lower bound on serialized size. Split
         // guaranteed-oversized batches before allocating/escaping their body.
         // Shared transport counts each context once, just like its encoder.
@@ -754,7 +794,7 @@ pub const Client = struct {
             return;
         }
         self.recordRequest(body.len, inputs.len);
-        var response = try self.http.post(self.options.endpoint, .{
+        var response = try (self.shared_http orelse &self.http).post(self.options.endpoint, .{
             .json = body,
             .headers = headers,
             .timeout_ms = self.options.timeout_ms,

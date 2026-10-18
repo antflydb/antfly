@@ -203,7 +203,7 @@ def main():
                 summary = next(row for row in rows if row["type"] == "summary")
                 if {key: summary["stats"][key] for key in stat_keys} != expected_stats:
                     raise RuntimeError(
-                        "workspace scan statistics differ from ordinary invocation"
+                        f"workspace scan statistics differ: expected={expected_stats!r} actual={summary['stats']!r}"
                     )
                 if summary["requests"] or summary["stats"]["source_parses"]:
                     raise RuntimeError(

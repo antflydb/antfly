@@ -251,9 +251,8 @@ fn run(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, path, "-") and o.paths.items.len == 0) try o.paths.append(a, ".");
     }
-    if (o.backend == .typesafe and std.mem.eql(u8, o.endpoint, "http://127.0.0.1:8090/decisions")) o.endpoint = "https://api.typesafe.ai/v1/systemone";
-    if (o.backend == .typesafe and o.token == null and (std.mem.eql(u8, o.provider_name, "typesafe") or std.mem.eql(u8, o.provider_name, "antfly"))) o.token = init.environ_map.get("TYPESAFE_API_KEY");
-    if (o.ask != null and o.backend != .typesafe and !std.mem.endsWith(u8, o.endpoint, "/decisions")) o.endpoint = try std.fmt.allocPrint(persistent, "{s}/decisions", .{std.mem.trimEnd(u8, o.endpoint, "/")});
+    o.typesafe_api_key = init.environ_map.get("TYPESAFE_API_KEY");
+    try o.finalizeProvider(persistent);
     if (o.generate) |kind| {
         const output = try grep.tooling.generate(a, kind, help);
         defer a.free(output);

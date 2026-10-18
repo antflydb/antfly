@@ -75,7 +75,52 @@ const Shard = struct {
 fn validDirectory(bytes: *const [prefix]u8, class: Class) bool {
     return std.mem.eql(u8, bytes[0..8], magic) and std.mem.readInt(u32, bytes[8..12], .little) == class.bytes() and std.mem.readInt(u32, bytes[12..16], .little) == class.buckets / shards;
 }
+/// Optional workspace-only immutable record cache. TTL/score validation stays
+/// in the caller, on every hit; timestamps are never refreshed by reading.
+pub const Memo = struct {
+    a: A,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    slots: [2048]?struct { key: [32]u8, body: []const u8 } = @splat(null),
+    bytes: usize = 0,
+    clock: usize = 0,
+    pub const limit = 4 * 1024 * 1024;
+    pub fn deinit(self: *Memo) void {
+        for (self.slots) |slot| if (slot) |entry| self.a.free(entry.body);
+    }
+    fn get(self: *Memo, a: A, key: [32]u8) ?[]const u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const slot = std.mem.readInt(u16, key[0..2], .little) % self.slots.len;
+        if (self.slots[slot]) |entry| if (std.mem.eql(u8, &entry.key, &key)) return a.dupe(u8, entry.body) catch null;
+        return null;
+    }
+    fn put(self: *Memo, key: [32]u8, body: []const u8) void {
+        if (body.len > 4096) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const slot = std.mem.readInt(u16, key[0..2], .little) % self.slots.len;
+        const copy = self.a.dupe(u8, body) catch return;
+        if (self.slots[slot]) |entry| {
+            self.bytes -= entry.body.len;
+            self.a.free(entry.body);
+            self.slots[slot] = null;
+        }
+        while (self.bytes + body.len > limit) {
+            const victim = self.clock % self.slots.len;
+            self.clock +%= 1;
+            if (self.slots[victim]) |entry| {
+                self.bytes -= entry.body.len;
+                self.a.free(entry.body);
+                self.slots[victim] = null;
+            }
+        }
+        self.slots[slot] = .{ .key = key, .body = copy };
+        self.bytes += copy.len;
+    }
+};
 pub const Store = struct {
+    memo: ?*Memo = null,
     preparations: bool = false,
     handles: [3][shards]Shard = @splat(@splat(.{})),
     pub const max_handles = 3 * shards;
@@ -84,6 +129,7 @@ pub const Store = struct {
         for (&self.handles) |*group| for (group) |*shard| if (shard.file) |file| file.close(io);
     }
     pub fn load(self: *Store, a: A, io: std.Io, o: *const Options, count: usize, key: [32]u8) ?[]const u8 {
+        if (self.memo) |memo| if (memo.get(a, key)) |body| return body;
         const class = if (self.preparations) Class.preparation() else Class.select(count);
         const bucket = std.mem.readInt(u16, key[0..2], .little) % class.buckets;
         const local = bucket / shards;
@@ -111,11 +157,14 @@ pub const Store = struct {
         if (self.preparations) return class.codec().loadAt(a, io, file, key, offset);
         var page: [32768]u8 = undefined;
         const n = file.readPositionalAll(io, page[0..class.bytes()], offset) catch return null;
-        return class.codec().fixedGet(a, key, page[0..n]);
+        const body = class.codec().fixedGet(a, key, page[0..n]) orelse return null;
+        if (self.memo) |memo| memo.put(key, body);
+        return body;
     }
     pub fn store(self: *Store, a: A, io: std.Io, o: *const Options, count: usize, key: [32]u8, body: []const u8) void {
         const class = if (self.preparations) Class.preparation() else Class.select(count);
         if (body.len > class.slot - 80) return;
+        if (self.memo) |memo| memo.put(key, body);
         const bucket = std.mem.readInt(u16, key[0..2], .little) % class.buckets;
         const local = bucket / shards;
         const shard = &self.handles[class.id][bucket % shards];
@@ -298,4 +347,23 @@ test "prepared shard handles retain eight colliding revisions and bound pages" {
     const broken: [8 * 3000]u8 = @splat('!');
     try file.writePositionalAll(io, &broken, prefix + 8 * 80);
     try std.testing.expect(reader.load(a, io, &o, 0, key) == null);
+}
+
+test "workspace record memo owns bytes and remains bounded under replacement" {
+    const a = std.testing.allocator;
+    var memo: Memo = .{ .a = a, .io = std.testing.io };
+    defer memo.deinit();
+    var key: [32]u8 = @splat(0);
+    var body: [4096]u8 = @splat('a');
+    for (0..3000) |i| {
+        std.mem.writeInt(u32, key[0..4], @intCast(i), .little);
+        memo.put(key, &body);
+        try std.testing.expect(memo.bytes <= Memo.limit);
+    }
+    body[0] = 'b';
+    const read = memo.get(a, key).?;
+    defer a.free(read);
+    try std.testing.expectEqual(@as(u8, 'a'), read[0]);
+    memo.put(key, "replacement");
+    try std.testing.expectEqual(@as(u8, 'a'), read[0]);
 }

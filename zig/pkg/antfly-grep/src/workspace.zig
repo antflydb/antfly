@@ -30,6 +30,8 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     if (base.pre != null or base.search_zip or base.table_config != null or base.pattern_files.items.len != 0 or base.inventory or base.follow) return error.UnsupportedWorkspaceCaptureOptions;
     var generation = try Generation.capture(a, io, base, null);
     defer generation.deinit();
+    var session = @import("session.zig").Session.init(a, io);
+    defer session.deinit();
     var valid = true;
     try ready(a, io, generation, null);
     // A frame cannot grow with repository size. Source bytes are captured by
@@ -71,7 +73,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 continue;
             }
             try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
-            const code = search(Search, a, io, base, generation, request.args) catch |err| blk: {
+            const code = search(Search, a, io, base, generation, &session, request.args) catch |err| blk: {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 break :blk @as(u8, 2);
             };
@@ -84,19 +86,22 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     return 0;
 }
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
-    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.budget.live, .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused });
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused });
 }
-fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, args: []const []const u8) !u8 {
+fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, args: []const []const u8) !u8 {
     var o: Options = .{};
     defer o.deinit(a);
     // Provider identity and credentials remain process-owned. Requests may
     // choose a query/model but never mutate the captured discovery contract.
-    inline for (.{ "endpoint", "model", "token", "backend", "decision_context", "models_dir", "library_path", "provider_name", "cache_dir", "cache_ttl_seconds", "model_revision", "jobs", "jobs_auto", "decision_concurrency", "batch_size", "decision_batch_wait_ms", "no_cache", "retries", "retry_base_ms", "timeout_ms", "home", "global_ignore", "git_config", "temporary_dir", "hostname" }) |name| @field(o, name) = @field(base.*, name);
+    inline for (.{ "typesafe_api_key", "endpoint", "model", "token", "backend", "decision_context", "models_dir", "library_path", "provider_name", "cache_dir", "cache_ttl_seconds", "model_revision", "jobs", "jobs_auto", "decision_concurrency", "batch_size", "decision_batch_wait_ms", "no_cache", "retries", "retry_base_ms", "timeout_ms", "home", "global_ignore", "git_config", "temporary_dir", "hostname" }) |name| @field(o, name) = @field(base.*, name);
     if (base.jobs_auto) {
         o.jobs = 0;
         o.jobs_auto = false;
     }
     try o.parse(a, args);
+    var provider_arena = std.heap.ArenaAllocator.init(a);
+    defer provider_arena.deinit();
+    try o.finalizeProvider(provider_arena.allocator());
     if (o.jobs == 0) {
         o.jobs_auto = true;
         o.jobs = base.jobs;
@@ -117,7 +122,14 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
     try o.paths.append(a, ".");
     var searcher = try Search.init(a, io, &o);
     defer searcher.deinit();
+    try session.configure(&o);
     searcher.workspace_generation = generation;
+    searcher.executor = &session.files;
+    searcher.region_plans = &session.plans;
+    searcher.decider.executor = &session.providers;
+    searcher.decider.shared_http = &session.http.?;
+    searcher.decider.shared_local = session.local;
+    if (!o.no_cache and o.cache_dir != null) searcher.decider.batch_store = &session.batches;
     const interrupt = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
     defer interrupt.deinit();
     return searcher.run();

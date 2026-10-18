@@ -312,6 +312,14 @@ class DecisionHandler(BaseHTTPRequestHandler):
         if "/tables/" in self.path:
             return self.index_query()
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if (
+            getattr(self.server, "strict_decisions", False)
+            and self.path != "/decisions"
+        ):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if getattr(self.server, "stagger_scores", False) and any(
             "STOP(slow)" in item["input"] for item in body.get("inputs", [])
         ):
@@ -1843,6 +1851,7 @@ class CliTests(unittest.TestCase):
         self.server.index_mode = "ok"
         self.server.mode = "ok"
         self.server.peak = 0
+        self.server.strict_decisions = False
         self.server.stagger_scores = False
         self.server.after_decision = None
         self.server.delay = 0
@@ -6044,6 +6053,129 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(len(self.server.requests), expected)
                 summary = next(row for row in rows if row["type"] == "summary")
                 self.assertEqual(summary["requests"], expected)
+
+    def test_workspace_normalizes_startup_and_query_provider_endpoints(self):
+        self.write("a.txt", "STOP\n")
+        self.server.strict_decisions = True
+        endpoint = f"http://127.0.0.1:{self.server.server_port}"
+        common = [
+            "--ask=retry",
+            "--model=fixture",
+            "--no-cache",
+            "--no-refine",
+            "--no-rank",
+            "--threads=1",
+        ]
+        self.raw_cli(*common, "--endpoint", endpoint, "a.txt")
+        for startup in (False, True):
+            with self.workspace(
+                *(["--endpoint", endpoint] if startup else []), "a.txt"
+            ) as (ready, request):
+                rows = request(
+                    "search",
+                    revision=ready["revision"],
+                    args=[*common, *([] if startup else ["--endpoint", endpoint])],
+                )
+                self.assertEqual(rows[-1]["exit_code"], 0)
+        self.assertTrue(all(row[0] == "/decisions" for row in self.server.requests))
+
+    def test_workspace_reuses_http_connections_and_keeps_request_budgets_local(self):
+        self.write("a.txt", "STOP\n")
+        args = [
+            *self.decision_args(),
+            "--no-cache",
+            "--no-refine",
+            "--no-rank",
+            "--threads=1",
+            "--max-requests=1",
+        ]
+        with self.workspace("a.txt") as (ready, request):
+            for _ in range(3):
+                rows = request("search", revision=ready["revision"], args=args)
+                self.assertEqual(rows[-1]["exit_code"], 0)
+                summary = next(row for row in rows if row["type"] == "summary")
+                self.assertEqual(summary["requests"], 1)
+        self.assertEqual(len(self.server.requests), 3)
+        self.assertEqual(len(set(self.server.client_ports)), 1)
+
+    def test_workspace_local_runtime_survives_queries_and_refresh(self):
+        if not NATIVE_LIBRARY:
+            self.skipTest("native inference fixture unavailable")
+        self.write("a.txt", "STOP\n" * 8)
+        library = self.root / Path(NATIVE_LIBRARY).name
+        shutil.copyfile(NATIVE_LIBRARY, library)
+        args = [
+            "--ask=retry",
+            "--model=fixture",
+            "--backend=local",
+            f"--library={library}",
+            "--no-cache",
+            "--no-refine",
+            "--threads=2",
+            "--unit=line",
+            "--batch-size=1",
+        ]
+        with self.workspace("a.txt") as (ready, request):
+            first = request("search", revision=ready["revision"], args=args)
+            if any(
+                row.get("message") == "DynamicInferenceRequiresDynamicLibc"
+                for row in first
+            ):
+                self.skipTest("static musl cannot load fixture")
+            self.assertEqual(first[-1]["exit_code"], 0)
+            library.unlink()
+            ready = request("refresh")[0]
+            for _ in range(3):
+                rows = request("search", revision=ready["revision"], args=args)
+                self.assertEqual(rows[-1]["exit_code"], 0)
+                self.assertEqual(
+                    next(row for row in rows if row["type"] == "summary")["requests"], 8
+                )
+
+    def test_workspace_reuses_file_and_provider_workers_across_queries(self):
+        for i in range(16):
+            self.write(f"src/f{i}.txt", "STOP\n" * 3)
+        args = [
+            *self.decision_args(),
+            "--no-cache",
+            "--no-refine",
+            "--no-rank",
+            "--threads=4",
+            "--batch-size=8",
+            "--max-requests=unlimited",
+        ]
+        with self.workspace("src") as (ready, request):
+            for _ in range(3):
+                self.server.requests.clear()
+                rows = request("search", revision=ready["revision"], args=args)
+                self.assertEqual(rows[-1]["exit_code"], 0, rows)
+                summary = next(row for row in rows if row["type"] == "summary")
+                self.assertTrue(summary["stats"]["complete"])
+                self.assertEqual(summary["stats"]["matches"], 48)
+                self.assertEqual(summary["requests"], len(self.server.requests))
+
+    def test_workspace_plan_keys_preserve_query_policy_and_cache_controls(self):
+        self.write("a.py", "def retry():\n    STOP()\n")
+        args = [*self.decision_args(), "--no-refine", "--threads=1"]
+        with self.workspace("a.py") as (ready, request):
+
+            def run(extra):
+                query_args = args.copy()
+                if extra and extra[0].startswith("--ask="):
+                    query_args[1] = extra[0].split("=", 1)[1]
+                    extra = extra[1:]
+                rows = request(
+                    "search", revision=ready["revision"], args=[*query_args, *extra]
+                )
+                self.assertEqual(rows[-1]["exit_code"], 0, rows)
+                return next(row for row in rows if row["type"] == "summary")
+
+            self.assertGreater(run([])["requests"], 0)
+            self.assertEqual(run([])["requests"], 0)
+            self.assertGreater(run(["--ask=different"])["requests"], 0)
+            self.assertGreater(run(["--only=STOP"])["requests"], 0)
+            self.assertGreater(run(["--no-cache"])["requests"], 0)
+            self.assertEqual(run(["--cached-only"])["requests"], 0)
 
     def test_workspace_explicit_binary_file_uses_native_input_semantics(self):
         self.write("binary.txt", b"STOP\0tail\n")

@@ -1882,3 +1882,93 @@ Evidence: [default-budget previews](bench/results/workspace-previews-macos.json)
 [generated comparisons](bench/results/workspace-differential.json),
 [release archives](bench/results/workspace-archives.json), and
 [validation/source hashes](bench/results/workspace-validation.json).
+
+### Workspace resource reuse
+
+Workspace requests use the same provider finalization as ordinary CLI searches:
+base URLs receive `/decisions`, and Typesafe defaults and environment credentials
+are resolved after request arguments. Full endpoint paths retain ordinary CLI
+semantics.
+
+A session retains separate file and provider worker pools, with at most 32 idle
+threads in each pool. Higher explicitly requested concurrency can use temporary
+threads. Every query joins its leases before releasing request options, buffers,
+cancellation state or the source generation. HTTP connections and the lazily opened
+native inference handle survive compatible queries and refreshes. Changing the
+endpoint, credential, backend, model directory, library, timeout or cache directory
+retires that provider scope after its workers finish. Request budgets, cancellation
+and statistics remain per query; no model/library is opened for a pure cache hit.
+
+Unchanged files share reference-counted source/index blobs across refreshes.
+References point directly to independent blobs, never to previous generations.
+Each generation counts the full allocation of every referenced blob against its
+capture quota; failed capture releases acquired references. Identifiers retain offsets into captured bytes when possible; derived names
+are owned independently and source kinds are interned within each blob. Refresh still rereads and hashes source bytes
+to establish content identity, and still follows the explicit snapshot contract.
+
+A disposable region-plan cache retains at most 32 MiB of allocator-accounted plans,
+including construction and evicted plans still borrowed by active queries. Each
+plan is limited to 4 MiB; allocation failure falls back to ordinary evaluation.
+Plans retain region metadata and compatible decision keys, not copies of formatted
+provider text or source bytes. Listings are materialized from the active generation
+only when needed for a new key or an actual provider request. Raw UTF-8 preparations
+also certify validation, so unchanged input is not rescanned for UTF-8/NUL validation
+in the decision content path. Decoding and CRLF/NUL modes preserve their original paths.
+
+A separate 4 MiB payload cache retains checked batch records within the current
+provider/cache scope. Cache timestamps and scores are validated on every use;
+reading never renews a timestamp. Query/policy/model/document changes invalidate
+derived keys using the ordinary cache identity. `--no-cache`, `--cached-only` and
+zero TTL retain their existing meanings. These caches are resident-memory tradeoffs,
+not additional provider-result guarantees or a zero-cost execution claim.
+
+Qualification of resource reuse compares the saved `6fa6dbfb` binary with the
+candidate using 101 alternating, evidence-equivalent queries per binary and
+workload. Native macOS, a warm filesystem and a constant-score inference fixture
+are used; this is not a live-provider relevance or billing evaluation.
+
+| Pinned workload | Baseline median | Candidate median | CPU per query, baseline → candidate |
+|---|---:|---:|---:|
+| SDK, 75 files / 5.9 MB | 29.28 ms | 20.68 ms | 29.60 → 20.79 ms |
+| Synthetic, 1,024 files | 9.88 ms | 8.00 ms | 8.32 → 5.84 ms |
+
+The median paired speedups are 1.42× / 1.25× for SDK/synthetic sources,
+with relative MAD 2.8% / 3.3% and 9.6% / 11.5%, respectively. Both campaigns
+show approximately 30% less CPU per warm query. CPU is cumulative process time
+sampled using Darwin `ps` (0.01-second resolution) across each entire campaign,
+divided by its query count. Both services stay resident and timed queries alternate.
+Capture/refresh are excluded from those warm-query timings.
+
+SDK samples report physical footprint **79.9M → 97.8M**, with the same reported
+peaks in those samples. Retained source/index bytes, sampled footprint and peak
+footprint are distinct measurements. This implementation retains bounded plans,
+records, threads and provider resources in exchange for less repeated work; it
+does **not** establish lower RSS or a lower startup/capture peak. Source/parser
+arenas use the ordinary search allocator and resource accounting to preserve
+bounded parser behavior. Sequential reports on a heavily contended shared host
+are retained too and are not used as headline speedup evidence. Local lexical
+controls are mixed; no additional general lexical/JIT performance win is claimed.
+
+Reproduce the paired SDK campaign with:
+
+```sh
+python3 pkg/antfly-grep/bench/session_compare.py BASELINE CANDIDATE \
+  --library NATIVE_FIXTURE --repository ../go/pkg/sdk --rounds 101 \
+  --output sdk-paired.json
+```
+
+Evidence: [paired SDK](bench/results/session-sdk-paired-macos.json),
+[paired synthetic](bench/results/session-synthetic-paired-macos.json),
+[baseline sample](bench/results/session-sdk-baseline-profile.sample.txt),
+[candidate sample](bench/results/session-sdk-profile.sample.txt),
+[local controls](bench/results/session-local-macos.json),
+and [generated differential cases](bench/results/session-differential.json).
+
+Final qualification: **199 CLI tests on macOS** (two skips) and **199 on ARM64
+Linux** (one skip), native unit/hardening/tooling checks, 1,000 generated pinned
+ripgrep/PCRE2 comparisons without mismatches/timeouts, Windows x86-64
+cross-compilation, three real target archive/hash checks, packaging, license
+boundaries, generated compatibility and formatting. Linux runtime checks use
+an isolated two-CPU Docker VM; independent hardware performance, Windows runtime
+and live-provider quality remain outside this qualification. The source/binary
+identities and scope limits are in [validation](bench/results/session-validation.json).

@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 
 pub const default_max_requests: usize = 1000;
 pub const Options = struct {
+    typesafe_api_key: ?[]const u8 = null,
     workspace_memory_limit: usize = 256 * 1024 * 1024,
     workspace_max_files: usize = 100000,
     table_config: ?[]const u8 = null,
@@ -209,6 +210,12 @@ pub const Options = struct {
             .files_without => self.files_without_match = true,
             .json => self.json = true,
         }
+    }
+    /// Shared by process startup and each workspace request, after parsing.
+    pub fn finalizeProvider(self: *Options, a: Allocator) !void {
+        if (self.backend == .typesafe and std.mem.eql(u8, self.endpoint, "http://127.0.0.1:8090/decisions")) self.endpoint = "https://api.typesafe.ai/v1/systemone";
+        if (self.backend == .typesafe and self.token == null and (std.mem.eql(u8, self.provider_name, "typesafe") or std.mem.eql(u8, self.provider_name, "antfly"))) self.token = self.typesafe_api_key;
+        if (self.ask != null and self.backend != .typesafe and !std.mem.endsWith(u8, self.endpoint, "/decisions")) self.endpoint = try std.fmt.allocPrint(a, "{s}/decisions", .{std.mem.trimEnd(u8, self.endpoint, "/")});
     }
     pub fn providerJobs(self: *const Options) usize {
         return @max(1, if (self.decision_concurrency == 0) self.jobs else self.decision_concurrency);
@@ -810,4 +817,18 @@ test "preprocessor and compression flags override in command order" {
     defer third.deinit(a);
     try third.parse(a, &.{ "--pre", "cat", "--no-pre", "needle" });
     try std.testing.expect(third.pre == null);
+}
+
+test "provider finalization shares base URL and typesafe defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var options: Options = .{ .ask = "question", .endpoint = "http://localhost:8090/" };
+    try options.finalizeProvider(arena.allocator());
+    try std.testing.expectEqualStrings("http://localhost:8090/decisions", options.endpoint);
+    try options.finalizeProvider(arena.allocator());
+    try std.testing.expectEqualStrings("http://localhost:8090/decisions", options.endpoint);
+    options = .{ .backend = .typesafe, .typesafe_api_key = "environment-token" };
+    try options.finalizeProvider(arena.allocator());
+    try std.testing.expectEqualStrings("https://api.typesafe.ai/v1/systemone", options.endpoint);
+    try std.testing.expectEqualStrings("environment-token", options.token.?);
 }

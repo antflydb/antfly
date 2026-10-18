@@ -126,6 +126,8 @@ fn retainedClone(comptime T: type, a: Allocator, value: T, depth: usize) error{ 
 const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
+    region_plans: ?*@import("region_plan.zig").Cache = null,
+    executor: ?*@import("worker_pool.zig").Pool = null,
     workspace_generation: ?*const @import("workspace_store.zig").Generation = null,
     workspace_entry: ?*const @import("workspace_store.zig").Entry = null,
     coalescer: decision.Coalescer = .{},
@@ -214,6 +216,7 @@ pub const Search = struct {
         var result: Search = .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
         result.local_cwd = root.local_cwd;
         result.workspace_generation = root.workspace_generation;
+        result.region_plans = root.region_plans;
         result.decider.shareCache(&root.decider);
         result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
@@ -565,12 +568,12 @@ pub const Search = struct {
         }
         self.decider.coalescer = if (jobs > 1 and self.options.ask != null) &self.coalescer else null;
         var context = Parallel{ .search = self };
-        const threads = try self.a.alloc(std.Thread, jobs);
+        const threads = try self.a.alloc(@import("worker_pool.zig").Handle, jobs);
         defer self.a.free(threads);
         var started: usize = 0;
         defer for (threads[0..started]) |thread| thread.join();
         for (threads) |*thread| {
-            thread.* = try std.Thread.spawn(.{}, Parallel.worker, .{&context});
+            thread.* = try self.spawnParallel(&context);
             started += 1;
         }
         for (threads[0..started]) |thread| thread.join();
@@ -647,10 +650,14 @@ pub const Search = struct {
             self.writable.broadcast(io);
         }
     };
+    fn spawnParallel(self: *Search, context: *Parallel) !@import("worker_pool.zig").Handle {
+        if (self.executor) |pool| return pool.launch(Parallel.worker, context);
+        return .{ .native = try std.Thread.spawn(.{}, Parallel.worker, .{context}) };
+    }
     const Pipeline = struct {
         context: Parallel,
         queue: Queue,
-        threads: []std.Thread,
+        threads: []@import("worker_pool.zig").Handle,
         started: usize = 0,
         growing: bool = false,
         growth_failed: bool = false,
@@ -661,7 +668,7 @@ pub const Search = struct {
             errdefer root.a.destroy(self);
             const slots = try root.a.alloc(Task, @min(256, jobs *| 4));
             errdefer root.a.free(slots);
-            const threads = try root.a.alloc(std.Thread, jobs);
+            const threads = try root.a.alloc(@import("worker_pool.zig").Handle, jobs);
             errdefer root.a.free(threads);
             self.* = .{ .context = .{ .search = root }, .queue = .{ .slots = slots }, .threads = threads };
             self.context.queue = &self.queue;
@@ -670,7 +677,7 @@ pub const Search = struct {
                 for (threads[0..self.started]) |thread| thread.join();
             }
             for (threads[0..if (root.single_source) 0 else if (root.options.jobs_auto) @min(2, jobs) else jobs]) |*thread| {
-                thread.* = try std.Thread.spawn(.{}, Parallel.worker, .{&self.context});
+                thread.* = try root.spawnParallel(&self.context);
                 self.started += 1;
             }
             return self;
@@ -703,7 +710,7 @@ pub const Search = struct {
             self.queue.readable.signal(root.io);
             self.queue.mutex.unlock(root.io);
             if (grow) {
-                const thread = std.Thread.spawn(.{}, Parallel.worker, .{&self.context}) catch null;
+                const thread = root.spawnParallel(&self.context) catch null;
                 self.queue.mutex.lockUncancelable(root.io);
                 defer self.queue.mutex.unlock(root.io);
                 if (thread) |worker| {
@@ -800,7 +807,7 @@ pub const Search = struct {
             local.shared_limits = &root.limits;
             local.decider.limits = &root.limits;
             local.decider.allow_parallel = root.single_source or root.tasks.items.len == 1;
-            local.decider.shared_local = if (root.decider.local) |provider| provider else null;
+            local.decider.shared_local = root.decider.shared_local orelse root.decider.local;
             while (!root.limits.cancel.load(.monotonic)) {
                 var queued: Task = undefined;
                 const task = if (ctx.queue) |queue| blk: {
@@ -924,7 +931,7 @@ pub const Search = struct {
             const c = try self.a.create(decision.Client);
             c.* = decision.Client.init(self.a, self.io, self.options);
             c.shareCache(&self.decider);
-            c.shared_local = self.decider.local;
+            c.shared_local = self.decider.shared_local orelse self.decider.local;
             c.limits = &self.limits;
             c.stage = .directory;
             self.discovery_decider = c;
@@ -1144,7 +1151,7 @@ pub const Search = struct {
         local.collecting = false;
         local.shared_limits = &self.limits;
         local.decider.limits = &self.limits;
-        local.decider.shared_local = if (self.decider.local) |provider| provider else null;
+        local.decider.shared_local = self.decider.shared_local orelse self.decider.local;
         local.provenance = doc.provenance;
         local.render_filename = self.options.filename orelse true;
         local.explicit_file = true;
@@ -1878,11 +1885,12 @@ pub const Search = struct {
         if (self.shared_limits) |limits| if (!Limits.reserve(&limits.source_bytes, bytes.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
         self.summary.files += 1;
         self.summary.bytes += bytes.len;
-        if (self.options.ask != null and !std.unicode.utf8ValidateSlice(bytes)) {
+        const validated_snapshot = if (self.workspace_entry) |entry| entry.prepared != null and entry.bytes.ptr == bytes.ptr and entry.bytes.len == bytes.len else false;
+        if (self.options.ask != null and !validated_snapshot and !std.unicode.utf8ValidateSlice(bytes)) {
             self.summary.invalid_utf8_files += 1;
             return;
         }
-        if (!self.options.text and !self.options.null_data and std.mem.indexOfScalar(u8, bytes, 0) != null) return;
+        if (!validated_snapshot and !self.options.text and !self.options.null_data and std.mem.indexOfScalar(u8, bytes, 0) != null) return;
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
@@ -2385,7 +2393,14 @@ pub const Search = struct {
     fn evaluate(self: *Search, a: Allocator, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !void {
         var regions: std.ArrayList(Region) = .empty;
         if (self.options.semantic_files_only) return;
-        const built = try @import("regions.zig").buildPrepared(a, bytes, lines, self.options.chunk_lines, self.evidence.?.index);
+        const plan = if (self.region_plans) |cache| if (self.workspace_entry) |entry| blk: {
+            if (self.options.crlf or self.options.null_data or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len or entry.prepared == null) break :blk null;
+            break :blk cache.get(path_name, entry.revision, bytes, lines, self.evidence.?.index, self.options.chunk_lines, self.options.context_lines);
+        } else null else null;
+        defer if (plan) |value| value.release();
+        self.decider.stage = if (self.options.chunk_lines == 1) .line else .region;
+        const planned_keys: ?bool = if (plan != null and self.options.patterns.items.len == 0) (plan.?.prepare(&self.decider, bytes, lines) catch null) else null;
+        const built = if (plan) |value| value.regions else try @import("regions.zig").buildPrepared(a, bytes, lines, self.options.chunk_lines, self.evidence.?.index);
         for (built) |region| {
             var eligible = self.options.patterns.items.len == 0;
             if (!eligible) for (lines[region.start..region.end]) |line| if (try self.matcher.matches(bytes[line.start..line.end])) {
@@ -2409,6 +2424,10 @@ pub const Search = struct {
             const ba = batch_arena.allocator();
             const inputs = try ba.alloc(decision.Input, n);
             for (regions.items[offset..][0..n], 0..) |region, i| {
+                if (planned_keys) |caching| {
+                    inputs[i] = plan.?.input(offset + i, bytes, lines, caching);
+                    continue;
+                }
                 const id = try std.fmt.allocPrint(ba, "region-{d}", .{offset + i});
                 var listing: std.Io.Writer.Allocating = .init(ba);
                 try listing.writer.print("File: {s}\nTARGET lines {d}-{d}\n", .{ path_name, region.start + 1, region.end });
@@ -3208,6 +3227,8 @@ test {
     _ = @import("evidence.zig");
     _ = @import("source_views.zig");
     _ = @import("workspace_store.zig");
+    _ = @import("worker_pool.zig");
+    _ = @import("region_plan.zig");
     _ = @import("spill.zig");
     _ = @import("ranked.zig");
     _ = @import("batch_store.zig");

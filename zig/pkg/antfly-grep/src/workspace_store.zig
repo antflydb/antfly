@@ -21,6 +21,7 @@ const Options = @import("options.zig").Options;
 const source = @import("source_cache.zig");
 const Budget = @import("antfly_regex").Budget;
 pub const Entry = struct {
+    blob: *Blob,
     path: []const u8,
     bytes: []const u8,
     revision: [64]u8,
@@ -38,13 +39,13 @@ pub const Generation = struct {
     preparations_built: usize = 0,
     preparations_reused: usize = 0,
     pub fn capture(a: A, io: std.Io, o: *const Options, previous: ?*const Generation) !*Generation {
+        if (o.workspace_memory_limit < @sizeOf(Generation)) return error.OutOfMemory;
         const self = try a.create(Generation);
-        self.* = .{ .backing = a, .budget = .{ .backing = a, .limit = o.workspace_memory_limit }, .arena = undefined };
+        self.* = .{ .backing = a, .budget = .{ .backing = a, .limit = o.workspace_memory_limit - @sizeOf(Generation) }, .arena = undefined };
         self.arena = .init(self.budget.allocator());
         errdefer self.deinit();
-        var collector = Collector{ .generation = self, .io = io, .options = o };
+        var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous };
         if (o.paths.items.len == 0) try collector.path(".") else for (o.paths.items) |path| try collector.path(path);
-        const alloc = self.arena.allocator();
         std.mem.sort(Entry, self.entries.items, {}, struct {
             fn less(_: void, x: Entry, y: Entry) bool {
                 return std.mem.order(u8, x.path, y.path) == .lt;
@@ -60,25 +61,6 @@ pub const Generation = struct {
             hash.update(entry.path);
             hash.update(&entry.revision);
             hash.update(&.{@intFromBool(entry.explicit_file)});
-            // Retain only preparations for unchanged raw UTF-8. Other input
-            // modes use the ordinary decoder/preparation path during search.
-            if (std.unicode.utf8ValidateSlice(entry.bytes) and std.mem.indexOfScalar(u8, entry.bytes, 0) == null and !@import("antfly_encoding").hasBom(entry.bytes)) {
-                if (if (previous) |old| old.find(entry.path) else null) |old| {
-                    if (std.mem.eql(u8, &old.revision, &entry.revision) and old.prepared != null) {
-                        entry.prepared = try clonePrepared(alloc, old.prepared.?);
-                        self.preparations_reused += 1;
-                        continue;
-                    }
-                }
-                // Parser temporaries must be reclaimed per file rather than
-                // retained in the generation arena. Both use the same quota.
-                var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
-                defer scratch.deinit();
-                const temp = scratch.allocator();
-                const prepared: source.Prepared = .{ .lines = try source.lines(temp, entry.bytes, '\n', false), .index = try @import("source.zig").parse(temp, entry.path, entry.bytes) };
-                entry.prepared = try clonePrepared(alloc, prepared);
-                self.preparations_built += 1;
-            }
         }
         var digest: [32]u8 = undefined;
         hash.final(&digest);
@@ -86,8 +68,15 @@ pub const Generation = struct {
         self.captured_at = std.Io.Clock.real.now(io).toSeconds();
         return self;
     }
+    /// Shared blobs count in full against every generation that retains them.
+    pub fn retainedBytes(self: *const Generation) usize {
+        var bytes = self.budget.live + @sizeOf(Generation);
+        for (self.entries.items) |entry| bytes += entry.blob.budget.live + @sizeOf(Blob);
+        return bytes;
+    }
     pub fn deinit(self: *Generation) void {
         const a = self.backing;
+        for (self.entries.items) |entry| entry.blob.release();
         self.arena.deinit();
         a.destroy(self);
     }
@@ -106,20 +95,47 @@ pub const Generation = struct {
         return null;
     }
 };
-fn clonePrepared(a: A, value: source.Prepared) !source.Prepared {
+/// Independent allocations never borrow a generation allocator. Refresh can
+/// release the old generation immediately, including after arbitrarily many reuses.
+const Blob = struct {
+    backing: A,
+    refs: usize = 1, // capture/publication run serially after query workers join
+    budget: Budget,
+    arena: std.heap.ArenaAllocator,
+    bytes: []const u8 = "",
+    prepared: ?source.Prepared = null,
+    fn release(self: *Blob) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        const a = self.backing;
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
+fn clonePrepared(a: A, temporary: A, bytes: []const u8, value: source.Prepared) !source.Prepared {
     var out = value;
     out.lines = try a.dupe(source.Line, value.lines);
     out.index.declarations = try a.dupe(@import("source.zig").Declaration, value.index.declarations);
     out.index.calls = try a.dupe(@import("source.zig").Call, value.index.calls);
-    // Own names too: old generations and parser scratch may be released
-    // immediately after publication. No generation chain is retained.
-    for (out.index.declarations) |*decl| {
-        decl.name = try a.dupe(u8, decl.name);
-        decl.kind = try a.dupe(u8, decl.kind);
-    }
-    for (out.index.calls) |*call| {
-        call.name = try a.dupe(u8, call.name);
-        call.kind = try a.dupe(u8, call.kind);
+    // Most identifiers are views into the captured bytes. Preserve those
+    // offsets instead of allocating a second copy or a large name hash table.
+    // Parser-synthesized names still need independent ownership.
+    var kinds: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer kinds.deinit(temporary);
+    inline for (.{ "declarations", "calls" }) |field| {
+        for (@field(out.index, field)) |*item| {
+            const start = @intFromPtr(item.name.ptr);
+            const base = @intFromPtr(bytes.ptr);
+            if (start >= base and start - base <= bytes.len and item.name.len <= bytes.len - (start - base)) {
+                item.name = bytes[start - base ..][0..item.name.len];
+            } else item.name = try a.dupe(u8, item.name);
+            const entry = try kinds.getOrPut(temporary, item.kind);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = try a.dupe(u8, item.kind);
+                entry.key_ptr.* = entry.value_ptr.*;
+            }
+            item.kind = entry.value_ptr.*;
+        }
     }
     return out;
 }
@@ -127,6 +143,7 @@ const Collector = struct {
     generation: *Generation,
     io: std.Io,
     options: *const Options,
+    previous: ?*const Generation,
     fn path(self: *Collector, name: []const u8) !void {
         if (std.mem.eql(u8, name, "-")) return error.WorkspaceStdinUnsupported;
         var scratch = std.heap.ArenaAllocator.init(self.generation.budget.allocator());
@@ -160,16 +177,50 @@ const Collector = struct {
         const before = try file_handle.stat(self.io);
         if (before.kind != .file) return error.NotRegularFile;
         if (before.size > self.options.max_file_bytes and self.options.skip_oversize) return;
+        const available = generation.budget.limit -| generation.budget.live;
+        if (available < @sizeOf(Blob)) return error.OutOfMemory;
+        var blob = try generation.backing.create(Blob);
+        // Use the ordinary search allocator for parser/capture arenas so
+        // bounded parser outcomes remain identical across both entry points.
+        blob.* = .{ .backing = generation.backing, .budget = .{ .backing = generation.backing, .limit = available - @sizeOf(Blob) }, .arena = undefined };
+        blob.arena = .init(blob.budget.allocator());
+        errdefer blob.release();
         var buffer: [65536]u8 = undefined;
         var reader = file_handle.reader(self.io, &buffer);
-        const bytes = try reader.interface.allocRemaining(a, .limited(@min(self.options.max_file_bytes, self.options.workspace_memory_limit)));
+        blob.bytes = try reader.interface.allocRemaining(blob.arena.allocator(), .limited(@min(self.options.max_file_bytes, self.options.workspace_memory_limit)));
         const after = try file_handle.stat(self.io);
-        if (before.inode != after.inode or before.size != after.size or after.size != bytes.len or
+        if (before.inode != after.inode or before.size != after.size or after.size != blob.bytes.len or
             before.mtime.nanoseconds != after.mtime.nanoseconds or before.ctime.nanoseconds != after.ctime.nanoseconds) return error.WorkspaceChangedDuringCapture;
         var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        try generation.entries.append(a, .{ .path = try a.dupe(u8, display), .bytes = bytes, .revision = std.fmt.bytesToHex(digest, .lower), .explicit_file = explicit_file });
-        generation.source_bytes += bytes.len;
+        std.crypto.hash.sha2.Sha256.hash(blob.bytes, &digest, .{});
+        const revision = std.fmt.bytesToHex(digest, .lower);
+        var reused = false;
+        if (if (self.previous) |old| old.find(display) else null) |old| {
+            if (std.mem.eql(u8, &old.revision, &revision)) {
+                const retained = old.blob.budget.live + @sizeOf(Blob);
+                if (retained > available) return error.OutOfMemory;
+                blob.release();
+                blob = old.blob;
+                blob.refs += 1;
+                reused = true;
+            }
+        }
+        if (!reused and std.unicode.utf8ValidateSlice(blob.bytes) and std.mem.indexOfScalar(u8, blob.bytes, 0) == null and !@import("antfly_encoding").hasBom(blob.bytes)) {
+            var scratch = std.heap.ArenaAllocator.init(blob.budget.allocator());
+            defer scratch.deinit();
+            const temp = scratch.allocator();
+            const prepared: source.Prepared = .{ .lines = try source.lines(temp, blob.bytes, '\n', false), .index = try @import("source.zig").parse(temp, display, blob.bytes) };
+            blob.prepared = try clonePrepared(blob.arena.allocator(), temp, blob.bytes, prepared);
+        }
+        const charge = blob.budget.live + @sizeOf(Blob);
+        if (charge > available) return error.OutOfMemory;
+        generation.budget.limit -= charge;
+        errdefer generation.budget.limit += charge;
+        try generation.entries.append(a, .{ .blob = blob, .path = try a.dupe(u8, display), .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .prepared = blob.prepared });
+        generation.source_bytes += blob.bytes.len;
+        if (blob.prepared != null) {
+            if (reused) generation.preparations_reused += 1 else generation.preparations_built += 1;
+        }
     }
 };
 
@@ -191,6 +242,8 @@ test "workspace generations own reused indexes and failed captures release their
     try std.testing.expectEqualSlices(u8, &old.?.revision, &next.revision);
     try std.testing.expectEqual(@as(usize, 0), next.preparations_built);
     try std.testing.expectEqual(@as(usize, 1), next.preparations_reused);
+    try std.testing.expect(old.?.entries.items[0].blob == next.entries.items[0].blob);
+    try std.testing.expect(next.retainedBytes() <= o.workspace_memory_limit);
     old.?.deinit();
     old = null;
     try std.testing.expectEqualStrings("retry", next.entries.items[0].prepared.?.index.declarations[0].name);
@@ -200,4 +253,22 @@ test "workspace generations own reused indexes and failed captures release their
     o.workspace_max_files = 10;
     o.workspace_memory_limit = 1;
     try std.testing.expectError(error.OutOfMemory, Generation.capture(a, io, &o, next));
+}
+
+test "preparations preserve source name offsets and own parser synthesized names" {
+    const a = std.testing.allocator;
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    const bytes = try retained.allocator().dupe(u8, "def retry():\n    STOP()\n");
+    var scratch = std.heap.ArenaAllocator.init(a);
+    var scratch_live = true;
+    defer if (scratch_live) scratch.deinit();
+    const temp = scratch.allocator();
+    var calls = [_]@import("source.zig").Call{.{ .name = try temp.dupe(u8, "Receiver.method"), .line = 2, .column = 1, .start_byte = 13, .end_byte = 20 }};
+    var declarations = [_]@import("source.zig").Declaration{.{ .name = bytes[4..9], .kind = "function", .start = 1, .end = 2, .label_line = 1, .start_byte = 0, .end_byte = bytes.len }};
+    const index = try clonePrepared(retained.allocator(), temp, bytes, .{ .lines = try source.lines(temp, bytes, '\n', false), .index = .{ .declarations = &declarations, .calls = &calls, .complete = true } });
+    scratch.deinit();
+    scratch_live = false;
+    try std.testing.expect(index.index.declarations[0].name.ptr == bytes[4..9].ptr);
+    try std.testing.expectEqualStrings("Receiver.method", index.index.calls[0].name);
 }
