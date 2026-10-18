@@ -207,56 +207,59 @@ pub fn decodeFromView(alloc: Allocator, view: @import("../segment_source.zig").V
     return dst;
 }
 
-const RangeInput = struct {
-    view: @import("../segment_source.zig").View,
-    pos: u64 = 0,
-    start: u64 = 0,
-    valid: usize = 0,
-    window_bytes: usize = 8192,
-    bytes: [8192]u8 = undefined,
-    fn decodedSize(self: *@This()) !usize {
-        if (self.view.length == 0) return 0;
-        var prefix: [5]u8 = undefined;
-        var length: usize = 0;
-        while (true) {
-            if (length == prefix.len) return error.CorruptInput;
-            prefix[length] = try self.byte();
-            length += 1;
-            if (prefix[length - 1] & 128 == 0) break;
+const RangeInput = RangeReader(@import("../segment_source.zig").View);
+fn RangeReader(comptime View: type) type {
+    return struct {
+        view: View,
+        pos: u64 = 0,
+        start: u64 = 0,
+        valid: usize = 0,
+        window_bytes: usize = 8192,
+        bytes: [8192]u8 = undefined,
+        fn decodedSize(self: *@This()) !usize {
+            if (self.view.length == 0) return 0;
+            var prefix: [5]u8 = undefined;
+            var length: usize = 0;
+            while (true) {
+                if (length == prefix.len) return error.CorruptInput;
+                prefix[length] = try self.byte();
+                length += 1;
+                if (prefix[length - 1] & 128 == 0) break;
+            }
+            return try decodedLen(prefix[0..length]);
         }
-        return try decodedLen(prefix[0..length]);
-    }
-    fn byte(self: *@This()) !u8 {
-        if (self.pos >= self.view.length) return error.CorruptInput;
-        if (self.valid == 0 or self.pos - self.start >= self.valid) {
-            self.start = self.pos;
-            self.valid = @intCast(@min(self.window_bytes, self.view.length - self.pos));
-            try self.view.readInto(self.pos, self.bytes[0..self.valid]);
+        fn byte(self: *@This()) !u8 {
+            if (self.pos >= self.view.length) return error.CorruptInput;
+            if (self.valid == 0 or self.pos - self.start >= self.valid) {
+                self.start = self.pos;
+                self.valid = @intCast(@min(self.window_bytes, self.view.length - self.pos));
+                try self.view.readInto(self.pos, self.bytes[0..self.valid]);
+            }
+            const value = self.bytes[@intCast(self.pos - self.start)];
+            self.pos += 1;
+            return value;
         }
-        const value = self.bytes[@intCast(self.pos - self.start)];
-        self.pos += 1;
-        return value;
-    }
-    fn integer(self: *@This(), count: usize) !usize {
-        var value: usize = 0;
-        for (0..count) |i| value |= @as(usize, try self.byte()) << @intCast(i * 8);
-        return value;
-    }
-    fn literal(self: *@This(), out: []u8) !void {
-        if (out.len > self.view.length - self.pos) return error.CorruptInput;
-        var copied: usize = 0;
-        while (copied < out.len) {
-            const first = try self.byte();
-            out[copied] = first;
-            copied += 1;
-            const available = self.valid - @as(usize, @intCast(self.pos - self.start));
-            const take = @min(available, out.len - copied);
-            @memcpy(out[copied..][0..take], self.bytes[@intCast(self.pos - self.start)..][0..take]);
-            copied += take;
-            self.pos += take;
+        fn integer(self: *@This(), count: usize) !usize {
+            var value: usize = 0;
+            for (0..count) |i| value |= @as(usize, try self.byte()) << @intCast(i * 8);
+            return value;
         }
-    }
-};
+        fn literal(self: *@This(), out: []u8) !void {
+            if (out.len > self.view.length - self.pos) return error.CorruptInput;
+            var copied: usize = 0;
+            while (copied < out.len) {
+                const first = try self.byte();
+                out[copied] = first;
+                copied += 1;
+                const available = self.valid - @as(usize, @intCast(self.pos - self.start));
+                const take = @min(available, out.len - copied);
+                @memcpy(out[copied..][0..take], self.bytes[@intCast(self.pos - self.start)..][0..take]);
+                copied += take;
+                self.pos += take;
+            }
+        }
+    };
+}
 
 /// Decode into reusable caller-owned output without allocating input or output.
 pub fn decodeFromViewInto(view: @import("../segment_source.zig").View, dst: []u8) !void {
@@ -267,6 +270,67 @@ pub fn decodeFromViewInto(view: @import("../segment_source.zig").View, dst: []u8
     var input = RangeInput{ .view = view };
     if (try input.decodedSize() != dst.len) return error.CorruptInput;
     try decodeRangePayload(&input, dst, dst.len, true);
+}
+
+/// Compare a compressed block with borrowed expected spans. The already
+/// verified prefix supplies COPY history, so neither an output buffer nor a
+/// second encoding is needed. Equality validates the complete block.
+pub fn equalsFromReader(view: anytype, parts: []const []const u8) !bool {
+    const Expected = struct {
+        parts: []const []const u8,
+        fn span(self: @This(), offset: usize) []const u8 {
+            var at = offset;
+            for (self.parts) |part| {
+                if (at < part.len) return part[at..];
+                at -= part.len;
+            }
+            return &.{};
+        }
+    };
+    const expected: Expected = .{ .parts = parts };
+    var size: usize = 0;
+    for (parts) |part| size = std.math.add(usize, size, part.len) catch return error.CorruptInput;
+    var input: RangeReader(@TypeOf(view)) = .{ .view = view };
+    if (try input.decodedSize() != size) return false;
+    var written: usize = 0;
+    var bytes: [4096]u8 = undefined;
+    while (input.pos < input.view.length) {
+        const tag = try input.byte();
+        const kind: u2 = @truncate(tag);
+        var count: usize = @as(usize, tag >> 2) + 1;
+        var offset: usize = 0;
+        switch (kind) {
+            tag_literal => if (count > 60) {
+                count = std.math.add(usize, 1, try input.integer(count - 60)) catch return error.CorruptInput;
+            },
+            tag_copy1 => {
+                count = @as(usize, (tag >> 2) & 7) + 4;
+                offset = (@as(usize, tag & 0xe0) << 3) | try input.byte();
+            },
+            tag_copy2 => offset = try input.integer(2),
+            tag_copy4 => offset = try input.integer(4),
+        }
+        if (count > size - written) return error.CorruptInput;
+        if (kind != tag_literal and (offset == 0 or offset > written)) return error.CorruptInput;
+        var done: usize = 0;
+        while (done < count) {
+            const out = expected.span(written + done);
+            if (kind == tag_literal) {
+                const take = @min(@min(out.len, bytes.len), count - done);
+                try input.literal(bytes[0..take]);
+                if (!std.mem.eql(u8, bytes[0..take], out[0..take])) return false;
+                done += take;
+            } else {
+                const prior = expected.span(written + done - offset);
+                const take = @min(@min(out.len, prior.len), count - done);
+                if (!std.mem.eql(u8, out[0..take], prior[0..take])) return false;
+                done += take;
+            }
+        }
+        written += count;
+    }
+    if (written != size) return error.CorruptInput;
+    return true;
 }
 
 /// Decode only an admission prefix using a small input window. This does not
@@ -674,4 +738,34 @@ test "decode admission checks long literals and repeated copy tags without chang
         defer std.testing.allocator.free(legacy);
         try std.testing.expectEqualSlices(u8, legacy, decoded);
     }
+}
+
+test "SQL bounded native delivery Snappy exact span comparison validates literals copies and cross-span history without output" {
+    const Input = struct {
+        bytes: []const u8,
+        length: u64,
+        pub fn readInto(self: @This(), at: u64, out: []u8) !void {
+            if (at > self.bytes.len or out.len > self.bytes.len - at) return error.EndOfStream;
+            @memcpy(out, self.bytes[@intCast(at)..][0..out.len]);
+        }
+    };
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 100_000);
+    defer a.free(bytes);
+    for (bytes, 0..) |*value, i| value.* = @truncate((i % 1024) *% 37);
+    const compressed = try encode(a, bytes);
+    defer a.free(compressed);
+    const input: Input = .{ .bytes = compressed, .length = compressed.len };
+    for ([_]usize{ 0, 1, 63, 4095, 65536, bytes.len }) |split| {
+        try std.testing.expect(try equalsFromReader(input, &.{ bytes[0..split], &.{}, bytes[split..] }));
+    }
+    // The final byte is covered by copy tags. An equal length/hash hint is
+    // insufficient: the expected history and every literal must agree.
+    bytes[bytes.len - 1] ^= 1;
+    try std.testing.expect(!try equalsFromReader(input, &.{bytes}));
+    bytes[bytes.len - 1] ^= 1;
+    const corrupt = [_]u8{ 4, 1, 0 }; // COPY_1 with zero history/offset.
+    try std.testing.expectError(error.CorruptInput, equalsFromReader(Input{ .bytes = &corrupt, .length = corrupt.len }, &.{"abcd"}));
+    const trailing = [_]u8{ 1, 0, 'a', 0, 'b' };
+    try std.testing.expectError(error.CorruptInput, equalsFromReader(Input{ .bytes = &trailing, .length = trailing.len }, &.{"a"}));
 }

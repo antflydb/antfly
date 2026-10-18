@@ -743,6 +743,14 @@ const OwnedRead = struct {
         // Cell conversion borrows only the page. Retained cursor lifetime
         // belongs to PageOwner and is exercised by the release callback.
         fn pageCell(page: *const Pull.BatchPage, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
+            if (try page.values.frozenJson(row, column)) |value| {
+                if (page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
+                return .{ .frozen_json = value, .sql_null = false };
+            }
+            if (try page.values.encodedJson(row, column)) |bytes| {
+                if (page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
+                return .{ .json_bytes = bytes, .sql_null = false };
+            }
             const value = try page.values.cell(alloc, row, column);
             if (value.array) |array| {
                 const definition = page.columns[column];
@@ -2383,4 +2391,55 @@ test "SQL pgwire guarded cleanup checkpoint preserves independent deadline after
     try std.testing.expectError(error.DeadlineExceeded, GuardedCatalog.checkpoint(&guarded));
     try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
     try std.testing.expectEqual(@as(u64, 17), scheduling.stats().retained_bytes);
+}
+
+test "SQL pgwire native frozen JSON renders exact numbers without scalar delivery" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const sources = @import("antfly_local_sources");
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            for ([_]bool{ false, true }) |parse_numbers| {
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"x\":[9007199254740993,1.25],\"s\":\"a\\nb\"}", .{ .parse_numbers = parse_numbers });
+                const rows = [_]sources.sql_operators.Row{.{ .values = &.{sources.sql_scalar.Datum.json(root)}, .keys = &.{}, .ordinal = 0 }};
+                for ([_]sources.sql_spill.ColumnarVersion{ .v1, .v2 }) |version| {
+                    const bytes = try sources.sql_spill.encodeColumnarBlockVersionAlloc(alloc, &rows, 1 << 20, version);
+                    const block = try sources.sql_spill.decodeColumnarBlockWithCache(alloc, a, bytes, 1 << 20);
+                    defer block.deinit();
+                    const Reader = struct {
+                        value: sources.sql_execution_batch.FrozenJson,
+                        fn cell(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !sources.sql_scalar.Datum {
+                            return error.UnexpectedScalarMaterialization;
+                        }
+                        fn frozen(raw: *anyopaque, _: usize, _: usize) !?sources.sql_execution_batch.FrozenJson {
+                            return @as(*@This(), @ptrCast(@alignCast(raw))).value;
+                        }
+                    };
+                    var reader: Reader = .{ .value = (try block.frozenJson(0, 0, false)).? };
+                    var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+                        .arena = .init(a),
+                        .columns = &.{.{ .name = "j", .type = .json }},
+                        .values = .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 1, .width = 1 } },
+                        .exhausted = true,
+                    } };
+                    defer owner.page.deinit();
+                    var scratch = std.heap.FixedBufferAllocator.init(&.{});
+                    const cell = try OwnedRead.PageOwner.cell(&owner, scratch.allocator(), 0, 0);
+                    try std.testing.expect(!cell.sql_null and cell.value == .null and cell.json_bytes == null and cell.frozen_json != null);
+                    const expected = try std.json.Stringify.valueAlloc(alloc, root, .{});
+                    for ([_]u16{ 0, 1 }) |format| {
+                        var buffer: [256]u8 = undefined;
+                        var output: std.Io.Writer = .fixed(&buffer);
+                        try wire_values.encodeCellInto(scratch.allocator(), &output, .{ .name = "j", .type = .json }, format, cell, buffer.len);
+                        const prefix: usize = @intFromBool(format == 1);
+                        if (prefix != 0) try std.testing.expectEqual(@as(u8, 1), output.buffered()[0]);
+                        try std.testing.expectEqualStrings(expected, output.buffered()[prefix..]);
+                    }
+                }
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

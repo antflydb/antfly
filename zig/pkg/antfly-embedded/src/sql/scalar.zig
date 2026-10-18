@@ -3125,11 +3125,11 @@ const Evaluator = struct {
             .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
             .cast => |cast| blk: {
                 if (cast.type == .array) if (self.program.constant_arrays.get(index)) |prepared| {
-                    try self.charge(@sizeOf(arrays.Value) + prepared.cardinality() * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
+                    try self.charge(try prepared.retainedBytes());
                     break :blk Datum.typedArray(prepared);
                 };
                 if (self.program.constant_inputs.get(index)) |input| {
-                    if (input.array) |array| try self.charge(@sizeOf(arrays.Value) + array.cardinality() * @sizeOf(arrays.Element) + array.dimensions.len * @sizeOf(arrays.Dimension));
+                    if (input.array) |array| try self.charge(try array.retainedBytes());
                     break :blk if (!self.input_validation and cast.numeric_modifier != null) try self.constrainNumeric(input, cast.numeric_modifier.?) else input;
                 }
                 const datum = try self.runDatum(cast.operand, depth + 1);
@@ -3297,7 +3297,9 @@ const Evaluator = struct {
                         const input = if (prepend) right else left;
                         const empty: arrays.Value = .{ .element_type = instruction.type.element_type.?, .dimensions = &.{}, .elements = &.{} };
                         const output = if (call.function == .array_cat) try left.array.?.concatenate(self.alloc, right.array.?.*, limits, &work) else try (input.array orelse &empty).append(self.alloc, if (prepend) left else right, prepend, limits, &work);
-                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.cardinality() * @sizeOf(arrays.Element));
+                        // A region may retain dense capacity after sparse
+                        // finalization when its allocator cannot shrink.
+                        try self.charge(@max(try output.retainedBytes(), try @import("array_compact.zig").ResultBuilder.allocationBytes(output.element_type, output.cardinality(), output.dimensions.len)));
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
                         break :blk Datum.typedArray(owned);
@@ -3321,7 +3323,9 @@ const Evaluator = struct {
                         }
                         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
                         const output = if (call.function == .array_positions) try array.positions(self.alloc, needle, limits, &work) else try array.transform(self.alloc, needle, if (call.function == .array_remove) null else third, limits, &work);
-                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.cardinality() * @sizeOf(arrays.Element));
+                        // A region may retain dense capacity after sparse
+                        // finalization when its allocator cannot shrink.
+                        try self.charge(@max(try output.retainedBytes(), try @import("array_compact.zig").ResultBuilder.allocationBytes(output.element_type, output.cardinality(), output.dimensions.len)));
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
                         break :blk Datum.typedArray(owned);
@@ -3387,24 +3391,27 @@ const Evaluator = struct {
                     .@"$array" => {
                         const kind = instruction.type.element_type orelse return error.InvalidSqlProgram;
                         if (self.program.constant_arrays.get(index)) |prepared| {
-                            try self.charge(@sizeOf(arrays.Value) + prepared.cardinality() * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
+                            try self.charge(try prepared.retainedBytes());
                             break :blk Datum.typedArray(prepared);
                         }
                         for (call.args) |arg| if (self.program.instructions[arg].type.kind == .array) {
                             break :blk try self.nestedArray(call.args, kind, depth + 1);
                         };
-                        const cell_bytes = std.math.mul(usize, call.args.len, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded;
-                        try self.charge(cell_bytes + @sizeOf(arrays.Value) + @sizeOf(arrays.Dimension));
-                        const elements = try self.alloc.alloc(arrays.Element, call.args.len);
-                        for (call.args, elements) |arg, *out| {
-                            const value = try self.runDatum(arg, depth + 1);
-                            if (value.array != null) return error.SqlTypeMismatch;
-                            out.* = if (value.sql_null) .{} else try self.castDatumBuiltin(value, self.program.instructions[arg].type.element_type, kind);
+                        const results = @import("array_compact.zig").ResultBuilder;
+                        const count = call.args.len;
+                        const dimensions: [1]arrays.Dimension = .{.{ .length = std.math.cast(u32, count) orelse return error.SqlProgramLimitExceeded }};
+                        const axes = dimensions[0..@intFromBool(count != 0)];
+                        try self.charge(try results.allocationBytes(kind, count, axes.len));
+                        const limits: arrays.Limits = .{ .bytes = @min((arrays.Limits{}).bytes, self.limits.output_bytes) };
+                        var output = try results.init(self.alloc, kind, axes, count, limits);
+                        var work = self.workBudget();
+                        for (call.args) |arg| {
+                            const child = try self.runDatum(arg, depth + 1);
+                            if (child.array != null) return error.SqlTypeMismatch;
+                            try output.append(if (child.sql_null) .{} else try self.castDatumBuiltin(child, self.program.instructions[arg].type.element_type, kind), &work);
                         }
-                        const dimensions = try self.alloc.alloc(arrays.Dimension, @intFromBool(elements.len != 0));
-                        if (elements.len != 0) dimensions[0] = .{ .length = std.math.cast(u32, elements.len) orelse return error.SqlProgramLimitExceeded };
                         const value = try self.alloc.create(arrays.Value);
-                        value.* = try arrays.Value.init(kind, dimensions, elements, .{});
+                        value.* = try output.finish(self.alloc, limits, &work);
                         break :blk Datum.typedArray(value);
                     },
                     .@"$array_quantified" => {
@@ -3813,7 +3820,7 @@ const Evaluator = struct {
     }
 
     /// Evaluate children once, admit a rectangular layout, then flatten into
-    /// one exact cell allocation. Payloads borrow the enclosing row/program
+    /// a typed result or small cell vector. Payloads borrow the enclosing row/program
     /// region; no JSON reconstruction or repeated evaluation is involved.
     fn nestedArray(self: *Evaluator, args: []const u32, kind: arrays.ElementType, depth: usize) !Datum {
         var local: [16]Datum = undefined;
@@ -3832,23 +3839,21 @@ const Evaluator = struct {
         const stacked = try admitted.finish((arrays.Limits{}).elements);
         const count: usize = stacked.count;
         const rank: usize = stacked.rank;
-        const cell_bytes = std.math.mul(usize, count, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded;
-        try self.charge(cell_bytes + rank * @sizeOf(arrays.Dimension) + @sizeOf(arrays.Value));
-        const cells = try self.alloc.alloc(arrays.Element, count);
-        var at: usize = 0;
+        const results = @import("array_compact.zig").ResultBuilder;
+        const shape = stacked.axes[0..rank];
+        try self.charge(try results.allocationBytes(kind, count, rank));
+        const limits: arrays.Limits = .{ .bytes = @min((arrays.Limits{}).bytes, self.limits.output_bytes) };
+        var output = try results.init(self.alloc, kind, shape, count, limits);
+        var work = self.workBudget();
         for (children) |child| if (child.array) |array| {
             for (0..array.cardinality()) |array_cell_0| {
                 const element = array.flatCell(array_cell_0);
                 try self.workOwner().charge(1);
-                cells[at] = if (element.sql_null) .{} else try self.castDatumBuiltin(element, array.element_type, kind);
-                at += 1;
+                try output.append(if (element.sql_null) .{} else try self.castDatumBuiltin(element, array.element_type, kind), &work);
             }
         };
-        const shape = try self.alloc.alloc(arrays.Dimension, rank);
-        @memcpy(shape, stacked.axes[0..rank]);
         const value = try self.alloc.create(arrays.Value);
-        var work = self.workBudget();
-        value.* = try arrays.Value.initWithBudget(kind, shape, cells, .{}, &work);
+        value.* = try output.finish(self.alloc, limits, &work);
         return Datum.typedArray(value);
     }
 
@@ -3858,16 +3863,18 @@ const Evaluator = struct {
         const source = datum.array orelse return error.UnsupportedSqlShape;
         if (source.element_type == target) return datum;
         if (!builtin_cast.allowed(source.element_type, target)) return error.SqlCannotCoerce;
-        try self.charge(@sizeOf(arrays.Value) + source.cardinality() * @sizeOf(arrays.Element));
-        const cells = try self.alloc.alloc(arrays.Element, source.cardinality());
-        for (0..source.cardinality(), cells) |array_cell_0, *cell| {
+        const results = @import("array_compact.zig").ResultBuilder;
+        try self.charge(try results.allocationBytes(target, source.cardinality(), source.dimensions.len));
+        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes };
+        var output = try results.init(self.alloc, target, source.dimensions, source.cardinality(), limits);
+        var work = self.workBudget();
+        for (0..source.cardinality()) |array_cell_0| {
             const element = source.flatCell(array_cell_0);
             try self.workOwner().charge(1);
-            cell.* = if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else try self.castDatumBuiltin(element, source.element_type, target);
+            try output.append(if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else try self.castDatumBuiltin(element, source.element_type, target), &work);
         }
         const value = try self.alloc.create(arrays.Value);
-        var work = self.workBudget();
-        value.* = try arrays.Value.initWithBudget(target, source.dimensions, cells, .{ .bytes = self.limits.output_bytes }, &work);
+        value.* = try output.finish(self.alloc, limits, &work);
         return Datum.typedArray(value);
     }
 
@@ -5640,4 +5647,64 @@ test "SQL strpos rejects invalid UTF8 and bounds adversarial substring work" {
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = &invalid }, .{ .string = "x" } }, .{}));
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = "x" }, .{ .string = &invalid } }, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(alloc, &.{}, &.{ .{ .string = "aaaaaaaaaaaaab" }, .{ .string = "aaaaab" } }, .{ .pattern_steps = 24 }));
+}
+
+test "SQL computed array scalar producers retain compact results under tight output budgets" {
+    const a = std.testing.allocator;
+    const repeated = try std.mem.join(a, ",", &@as([32][]const u8, @splat("n")));
+    defer a.free(repeated);
+    const flat = try std.fmt.allocPrint(a, "ARRAY[{s}]", .{repeated});
+    defer a.free(flat);
+    const nested = try std.fmt.allocPrint(a, "ARRAY[{s},{s}]", .{ flat, flat });
+    defer a.free(nested);
+    for ([_][]const u8{ flat, nested }) |expression| {
+        var compiled = try @import("compiler.zig").compileScalar(a, expression, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer, .element_type = .int64 }}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{Datum.json(.{ .integer = 7 })}, &.{}, .{ .output_bytes = 2048 });
+        const value = result.array.?;
+        try std.testing.expect(value.stored != null);
+        for (0..value.cardinality()) |i| try std.testing.expectEqual(@as(i64, 7), value.flatCell(i).value.integer);
+    }
+    var cells: [64]Datum = @splat(Datum.json(.{ .integer = 7 }));
+    cells[1] = .{};
+    const source = try arrays.Value.init(.int32, &.{.{ .length = 64, .lower = -7 }}, &cells, .{});
+    for ([_][]const u8{ "a::bigint[]", "array_append(a, 9)", "array_prepend(9, a)", "a || a", "array_remove(a, 999)", "array_replace(a, 7, 9)", "array_positions(a, 7)" }) |expression| {
+        var compiled = try @import("compiler.zig").compileScalar(a, expression, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int32 }}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{Datum.typedArray(&source)}, &.{}, .{ .output_bytes = 2048 });
+        try std.testing.expect(result.array.?.stored != null);
+        _ = try result.array.?.validate(.{});
+    }
+}
+
+test "SQL computed array sparse staging capacity stays inside evaluator admission without resize" {
+    const a = std.testing.allocator;
+    const cells: [64]Datum = @splat(.{});
+    const source = try arrays.Value.init(.int32, &.{.{ .length = 64, .lower = -7 }}, &cells, .{});
+    var compiled = try @import("compiler.zig").compileScalar(a, "array_append(a, NULL) || array_append(a, NULL)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int32 }}, &.{}, .{});
+    defer program.deinit();
+    const results = @import("array_compact.zig").ResultBuilder;
+    const required = 2 * try results.allocationBytes(.int32, 65, 1) + try results.allocationBytes(.int32, 130, 1);
+    for ([_]bool{ false, true }) |admitted| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var nr: @import("../storage/lite/test_allocator.zig").NoResizeAllocator = .{ .backing = arena.allocator() };
+        const result = program.evaluate(nr.allocator(), &.{Datum.typedArray(&source)}, &.{}, .{ .output_bytes = required - @intFromBool(!admitted) });
+        if (admitted) {
+            const value = (try result).array.?;
+            try std.testing.expect(value.stored != null);
+            try std.testing.expectEqual(@as(usize, 130), value.cardinality());
+            try std.testing.expectEqual(@as(i32, -7), value.dimensions[0].lower);
+        } else try std.testing.expectError(error.SqlProgramLimitExceeded, result);
+    }
 }
