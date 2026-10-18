@@ -186,3 +186,25 @@ test "executor archive boundary opens retained immutable sources and preserves t
     try std.testing.expectEqualStrings("cdef", &bytes);
     try std.testing.expectError(error.EndOfStream, source.readInto(7, &bytes));
 }
+
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+extern fn runtime_io_abi_test_checkpoint(*CancellationToken, u8) callconv(.c) void;
+extern fn runtime_io_abi_test_consume_checkpoint(*const CancellationToken) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+
+test "executor archive boundary checkpoints retain deadline lease and connection error identity" {
+    for ([_]anyerror{ error.DeadlineExceeded, error.SessionLeaseLost, error.ConnectionRefused, error.Canceled }, 0..) |expected, i| {
+        var token: CancellationToken = undefined;
+        runtime_io_abi_test_checkpoint(&token, @intCast(i));
+        try std.testing.expectError(expected, token.check());
+        try std.testing.expect(token.isCancelled());
+    }
+    const Local = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.ConnectionRefused;
+        }
+    };
+    var marker: u8 = 0;
+    const local_token: CancellationToken = .{ .ptr = &marker, .check_fn = Local.check };
+    const status = runtime_io_abi_test_consume_checkpoint(&local_token);
+    try std.testing.expectEqual(error.ConnectionRefused, @import("antfly_runtime_abi").error_abi.errorFromStatus(status));
+}

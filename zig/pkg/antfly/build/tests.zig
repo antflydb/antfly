@@ -6066,6 +6066,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
+    const query_capture_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"query capture"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-query-capture-test", "Verify retained query consistency, cancellation and enrichment independence")
+        .dependOn(&addFilteredTestRunArtifact(b, query_capture_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const graph_producer_tests = b.addTest(.{
         .root_module = db_test_mod,

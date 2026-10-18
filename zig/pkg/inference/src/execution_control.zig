@@ -14,6 +14,9 @@
 // limitations under the License.
 
 const std = @import("std");
+const CheckBoundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct {
+    check_fn: *const fn (?*anyopaque) anyerror!void,
+});
 const platform_time = @import("antfly_platform").time;
 
 /// Stable phases shared by API, enrichment, model loading, pipelines, and
@@ -72,12 +75,13 @@ pub const MonitorControl = struct {
     cancellation_grace_ns: ?u64 = null,
     ptr: ?*anyopaque = null,
     check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    check_dispatch: CheckBoundary.Dispatch = CheckBoundary.local_dispatch,
 
     pub fn check(self: MonitorControl) !void {
         if (self.deadline_ns) |deadline_ns| {
             if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         }
-        if (self.check_fn) |check_fn| try check_fn(self.ptr);
+        if (self.check_fn) |check_fn| try CheckBoundary.call("check_fn", self.check_dispatch, check_fn, .{self.ptr});
         if (self.cancellation) |token| {
             if (token.isCancelled()) return error.Cancelled;
         }
@@ -130,6 +134,7 @@ pub const InferenceExecutionControl = struct {
     progress: ?ProgressSink = null,
     ptr: ?*anyopaque = null,
     check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    check_dispatch: CheckBoundary.Dispatch = CheckBoundary.local_dispatch,
     /// Present only inside a worker process whose parent owns restart. It is
     /// deliberately request-scoped; a boolean "running out of process" flag
     /// cannot notice that one particular request was cancelled while blocked
@@ -153,7 +158,7 @@ pub const InferenceExecutionControl = struct {
     }
 
     pub fn check(self: InferenceExecutionControl) !void {
-        if (self.check_fn) |check_fn| try check_fn(self.ptr);
+        if (self.check_fn) |check_fn| try CheckBoundary.call("check_fn", self.check_dispatch, check_fn, .{self.ptr});
         if (self.cancellation) |token| {
             if (token.isCancelled()) return error.Cancelled;
         }
@@ -220,6 +225,7 @@ pub const InferenceExecutionControl = struct {
                 .cancellation_grace_ns = self.cancellation_grace_ns,
                 .ptr = self.ptr,
                 .check_fn = self.check_fn,
+                .check_dispatch = self.check_dispatch,
             }),
         };
     }

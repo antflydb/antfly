@@ -20170,7 +20170,7 @@ pub const DB = struct {
                 .{},
                 cancellation,
                 maintenance_deadline_ns orelse std.math.maxInt(u64),
-                if (query_cut != null) .settled_requests else .successful_requests,
+                if (query_cut != null) .published_requests else .successful_requests,
             ) catch |err| switch (err) {
                 error.Cancelled => return error.Canceled,
                 else => return err,
@@ -31087,7 +31087,7 @@ pub const DB = struct {
         return self.runMaintenanceUntilWithEnrichmentCompletion(sequence, sync_targets, cancellation, deadline_ns, .successful_requests);
     }
 
-    const EnrichmentCompletion = enum { successful_requests, settled_requests };
+    const EnrichmentCompletion = enum { successful_requests, published_requests };
 
     fn runMaintenanceUntilWithEnrichmentCompletion(
         self: *DB,
@@ -31104,14 +31104,16 @@ pub const DB = struct {
         };
         var stable_target = sequence;
         while (true) {
-            const outcome = self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
-            outcome catch |err| {
-                if (completion != .settled_requests or err != error.EnrichmentWorkerFailed) return err;
-            };
-            // A completed watermark alone does not prove owner health. This
-            // also runs when the visibility wait took its already-applied path.
-            if (completion == .settled_requests) if (self.enrichment_runtime) |runtime|
-                try runtime.requireSettledForQueryCapture(stable_target);
+            if (completion == .successful_requests) {
+                try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            } else if (self.enrichment_runtime) |runtime| {
+                // A retained read captures committed primary and generated
+                // publications. It must not run providers or wait for future
+                // request retries before reading already-visible documents.
+                // Replay/apply fences below exclude publication while pinning;
+                // derived indexes still catch up to this exact primary cut.
+                try runtime.requireHealthyForQueryCapture();
+            }
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
@@ -71103,7 +71105,9 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
 
 test "db query capture retains settled terminal repair debt without acknowledging visibility" {
     const Fixture = struct {
-        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+        fn produce(raw: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const calls: *u8 = @ptrCast(@alignCast(raw));
+            calls.* += 1;
             return error.InvalidExtractorResponse;
         }
     };
@@ -71121,6 +71125,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
     var fixture: u8 = 0;
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
@@ -71147,12 +71152,25 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     runtime.worker_failed = false;
     runtime.retrying = true;
     runtime.next_retry_at_ms = runtime.clock.nowRealtimeMs() + 60_000;
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.captureQueryCut(request, .none));
+    try db.batch(.{ .writes = &.{.{ .key = "pending", .value = "{\"body\":\"awaiting extraction\"}" }}, .sync_level = .write });
+    try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
+    const calls_before_capture = fixture;
+    try db.captureQueryCut(request, .none);
+    try std.testing.expectEqual(calls_before_capture, fixture);
+    try std.testing.expect(runtime.stats().retrying);
     runtime.retrying = false;
     runtime.next_retry_at_ms = 0;
 
     var retained = try db.openQueryCut(request, .none);
     defer retained.close();
+    var sorted = try retained.search(alloc, .{ .index_name = "text", .full_text = .{ .match_all = {} }, .order_by = &.{.{ .field = "_id" }}, .limit = 10 });
+    defer sorted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sorted.hits.len);
+    try std.testing.expectEqualStrings("doc", sorted.hits[0].id);
+    try std.testing.expectEqualStrings("pending", sorted.hits[1].id);
+    const pending = (try retained.get(alloc, "pending")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(pending);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "awaiting extraction") != null);
     var document = (try retained.getDocument(alloc, "doc", .{})) orelse return error.TestUnexpectedResult;
     defer document.deinit(alloc);
     try ant_json.testing.expectSubsetJsonText(alloc, "{\"body\":\"broken input\"}", document.json);

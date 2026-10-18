@@ -152,6 +152,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .target = ctx.target,
         .optimize = ctx.optimize,
     });
+    bge_m3_runtime_mod.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
         .build_info_mod = ctx.graph.build_info_mod,
         .identities = ctx.graph.identities,
