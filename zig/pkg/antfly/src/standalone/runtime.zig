@@ -1083,6 +1083,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
+                .supports_sql_views = durable,
                 .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
@@ -2648,7 +2649,7 @@ const LocalStandaloneMetadata = struct {
             try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, context);
             return alloc.dupe(u8, "{}");
         }
-        const shared_catalog_mutation = call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
+        const shared_catalog_mutation = call == .sql_view_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
             call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .relational_index_cancel or call == .store_root_enroll;
         if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
@@ -3194,7 +3195,7 @@ const LocalStandaloneMetadata = struct {
             .resolve_many => |request| {
                 if (request.name_allocation and !self.standaloneRelationPublicationSupported())
                     return self.resolveAllocationNamesLocked(alloc, context, request);
-                if (request.relations.len != 0 or request.expected_relation_epoch != null) {
+                if (request.sql_sources.len != 0 or request.relations.len != 0 or request.expected_relation_epoch != null) {
                     const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
                     const resolved = try store.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, request);
                     defer resolved.deinit(alloc);
@@ -3219,6 +3220,29 @@ const LocalStandaloneMetadata = struct {
                     alloc.free(names);
                 }
                 return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = revision, .tables = tables, .logical_names = names }, .{});
+            },
+            .sql_view_mutate => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try request.mutation.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const command = @import("../system_catalog/views.zig").command(request);
+                const result = try store.prepareSystemCatalogResult(alloc, group_ids.main_metadata_group_id, command);
+                errdefer alloc.free(result);
+                var parsed = try std.json.parseFromSlice(@import("../system_catalog/views.zig").MutationResult, alloc, result, .{});
+                defer parsed.deinit();
+                if (parsed.value.revision == request.expected_revision) return result;
+                const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes });
+                self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const meta = try store.systemCatalogMeta(alloc, group_ids.main_metadata_group_id);
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+                if (meta.revision != parsed.value.revision or !std.mem.eql(u8, &hash, &meta.last_command)) return error.MetadataMutationOutcomeUnknown;
+                return result;
             },
             .relation_schema_mutate => |request| {
                 if (!context.setting_admin) return error.Forbidden;

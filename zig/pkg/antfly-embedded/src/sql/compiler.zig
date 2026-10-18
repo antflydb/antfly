@@ -558,6 +558,11 @@ const Parser = struct {
             self.pos += 1;
             const literal = try self.scalarNode(.{ .literal = try self.value() });
             left = try self.scalarNode(.{ .cast = .{ .operand = literal, .type = .datetime } });
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "current_user")) {
+            self.pos += 1;
+            if (self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "CURRENT_USER does not take parentheses");
+            self.uses_current_setting = true;
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_user", .args = &.{} } });
         } else if (self.keyword(.current_timestamp)) {
             var precision: i64 = 6;
             if (self.take(.lparen)) {
@@ -1317,6 +1322,56 @@ const Parser = struct {
             return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc), .lateral = lateral } });
         }
         const name_value = try self.tableReferenceName();
+        if (name_value.database == null and (name_value.namespace == null or std.mem.eql(u8, name_value.namespace.?, "pg_catalog")) and std.mem.eql(u8, name_value.table, "jsonb_to_record") and self.take(.lparen)) {
+            var input = try self.scalar(0, 0);
+            try self.expect(.rparen);
+            // Only unknown literals acquire the function's JSONB input type.
+            // A typed TEXT/integer argument must not become an implicit cast.
+            if (input.* == .literal and input.literal == .string)
+                input = try self.scalarNode(.{ .cast = .{ .operand = input, .type = .json, .element_type = .jsonb } });
+            const alias = try self.sourceAlias() orelse "jsonb_to_record";
+            try self.expect(.lparen);
+            var output: std.ArrayList(ast.Projection) = .empty;
+            const document = try self.scalarNode(.{ .column = "$record_input\x00$document" });
+            while (true) {
+                if (output.items.len == 1024) return self.fail(error.SqlLimitExceeded, "JSON record has too many columns");
+                const column = try self.identifier();
+                for (output.items) |prior| if (std.mem.eql(u8, prior.alias.?, column)) return self.fail(error.DuplicateSqlColumn, "JSON record column names must be unique");
+                const kind = try self.castType();
+                const hint = try self.scalarNode(.{ .cast = .{ .operand = try self.scalarNode(.{ .literal = .null }), .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
+                const args = try self.alloc.dupe(*const ast.Scalar, &.{ document, try self.scalarNode(.{ .literal = .{ .string = column } }), hint });
+                try output.append(self.alloc, .{ .alias = column, .expression = try self.scalarNode(.{ .call = .{ .name = "$record_field", .args = args } }) });
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
+            const producer = try self.alloc.create(ast.Select);
+            producer.* = .{ .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$document", .expression = input }}) };
+            const query = try self.alloc.create(ast.Select);
+            const valid = try self.scalarNode(.{ .call = .{ .name = "$record_validate", .args = try self.alloc.dupe(*const ast.Scalar, &.{document}) } });
+            const validation = try self.alloc.create(ast.Predicate);
+            validation.* = .{ .scalar = valid };
+            query.* = .{
+                .source = try self.relationNode(.{ .derived = .{ .query = producer, .alias = "$record_input", .lateral = true } }),
+                .columns = try output.toOwnedSlice(self.alloc),
+                // Validate even when the consumer only counts rows. This is
+                // a table function, not a discardable SELECT-list cast.
+                .predicate = validation,
+            };
+            // A table function constructs every declared field, including
+            // invalid fields discarded by COUNT(*) or an outer projection.
+            // Reuse the complete-row materialization boundary so conversion
+            // happens once, not once for validation and again for projection.
+            const materialized = try self.alloc.create(ast.Select);
+            materialized.* = .{
+                .source = try self.relationNode(.{ .table = .{ .name = .{ .table = "$record_output\x00" } } }),
+                .ctes = try self.alloc.dupe(ast.Cte, &.{.{
+                    .name = "$record_output\x00",
+                    .query = query,
+                    .materialization = .materialized,
+                }}),
+            };
+            return self.relationNode(.{ .derived = .{ .query = materialized, .alias = alias, .lateral = true } });
+        }
         if (name_value.database == null and (name_value.namespace == null or std.mem.eql(u8, name_value.namespace.?, "pg_catalog")) and std.mem.eql(u8, name_value.table, "unnest") and self.take(.lparen)) {
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             while (true) {
@@ -1803,7 +1858,7 @@ const Parser = struct {
         // Keep the original PostgreSQL function/CASE label before lowering
         // replaces expressions with internal columns or aggregate slots.
         const label = alias orelse switch (expression.*) {
-            .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$current_user")) "current_user" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
             .case_when => "case",
             else => null,
         };

@@ -152,6 +152,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     if (parameters.len > 1024) return error.InvalidSqlParameters;
     if (backend.setting_capture) |capture| {
         pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
+        try pinned_settings.?.pinSqlUser(capture.sql_user);
         statement_backend.settings_view = &pinned_settings.?;
     }
     const memory = try limits.workingMemory();
@@ -2778,6 +2779,10 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
     try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.typedArray(&integers.value), .json, null));
 }
 
+test {
+    _ = @import("view_lateral_test.zig");
+}
+
 const TestBackend = struct {
     const stored_tag_elements = [_]Datum{ Datum.fromJson(.{ .string = "urgent" }), .{}, Datum.fromJson(.{ .string = "vip" }) };
     stored_arrays: bool = false,
@@ -3268,6 +3273,194 @@ test "SQL grouped aggregation streams pages then applies HAVING ORDER OFFSET and
     try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("12", result.output.rows[0][1].string);
     try std.testing.expectEqualStrings("3", result.output.rows[0][2].string);
+}
+
+test "SQL JSON record projections preserve typed arrays paths and NULLs through lateral relations" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{};
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{
+            .sql = "SELECT r.title,r.metadata->>'plan' AS plan,array_to_string(r.tags,'|','<null>') AS tags,cardinality(r.tags) AS n FROM jsonb_to_record('{\"title\":\"alpha\",\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",null,\"vip\"]}') AS r(title TEXT,metadata JSONB,tags TEXT[])",
+            .expected = "[[\"alpha\",\"pro\",\"urgent|<null>|vip\",\"3\"]]",
+        },
+        .{ .sql = "SELECT cardinality(r.tags),r.extra FROM jsonb_to_record('{\"tags\":[]}') AS r(tags TEXT[],extra BIGINT)", .expected = "[[\"0\",null]]" },
+        .{ .sql = "SELECT r.a,r.b FROM jsonb_to_record(NULL::jsonb) AS r(a JSONB,b TEXT[])", .expected = "[[null,null]]" },
+        .{ .sql = "SELECT r.a,r.b FROM jsonb_to_record('{\"a\":null,\"b\":null}') AS r(a JSONB,b TEXT[])", .expected = "[[null,null]]" },
+        .{ .sql = "SELECT r.n,cardinality(r.tags) FROM (VALUES('{\"n\":1,\"tags\":[\"x\"]}'::jsonb),('{\"n\":2,\"tags\":[]}'::jsonb)) d(body),jsonb_to_record(d.body) AS r(n BIGINT,tags TEXT[]) ORDER BY r.n", .expected = "[[\"1\",\"1\"],[\"2\",\"0\"]]" },
+        .{ .sql = "SELECT t.tag,t.n FROM jsonb_to_record('{\"tags\":[\"urgent\",null,\"vip\"]}') AS r(tags TEXT[]),LATERAL UNNEST(r.tags) WITH ORDINALITY AS t(tag,n) ORDER BY t.n", .expected = "[[\"urgent\",\"1\"],[null,\"2\"],[\"vip\",\"3\"]]" },
+        .{ .sql = "SELECT r.n,r.b FROM pg_catalog.jsonb_to_record('{\"n\":\"9007199254740993\",\"b\":\"yes\"}') AS r(n BIGINT,b BOOLEAN)", .expected = "[[\"9007199254740993\",true]]" },
+        .{ .sql = "SELECT array_ndims(r.a),array_length(r.a,1),array_length(r.a,2),array_to_string(r.a,',','NULL') FROM jsonb_to_record('{\"a\":[[1,2],[3,null]]}') AS r(a BIGINT[])", .expected = "[[\"2\",\"2\",\"2\",\"1,2,3,NULL\"]]" },
+    }) |case| {
+        errdefer std.debug.print("JSON record projection: {s}\n", .{case.sql});
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+        defer a.free(json);
+        try std.testing.expectEqualStrings(case.expected, json);
+    }
+    for ([_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT COUNT(*) FROM jsonb_to_record('[1]') AS r(id BIGINT)", .code = "22023" },
+        .{ .sql = "SELECT COUNT(*) FROM jsonb_to_record('{\"n\":\"bad\"}') AS r(n BIGINT)", .code = "22P02" },
+        .{ .sql = "SELECT 1 FROM jsonb_to_record('{\"n\":\"bad\"}') AS r(n BIGINT)", .code = "22P02" },
+        .{ .sql = "SELECT * FROM jsonb_to_record('null') AS r(id BIGINT)", .code = "22023" },
+        .{ .sql = "SELECT * FROM jsonb_to_record('{\"a\":[[1],[2,3]]}') AS r(a BIGINT[])", .code = "2202E" },
+        .{ .sql = "SELECT * FROM jsonb_to_record(7) AS r(a BIGINT)", .code = "42883" },
+    }) |case| {
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = execute(a, backend.iface(), &compiled, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.code, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        result.deinit();
+        return error.ExpectedJsonRecordFailure;
+    }
+}
+
+test "SQL current_user preserves authenticated SQL identity instead of API key settings scope" {
+    const Settings = @import("setting_catalog.zig");
+    const Owner = struct {
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: Settings.Scope) !Settings.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{} };
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var backend = fixture.iface();
+    backend.setting_capture = .{
+        .owner = .{ .ptr = &fixture, .load = Owner.load },
+        .scope = .{ .principal = "api-key:credential-123", .database = "default" },
+        .sql_user = "alice",
+    };
+    var compiled = try compiler.compile(a, "SELECT CURRENT_USER", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.uses_current_setting);
+    var result = try execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("alice", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("current_user", result.output.columns[0].name);
+    try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(a, "SELECT CURRENT_USER()", .{}));
+}
+
+test "SQL stored views execute derived plans in isolated scopes and preserve security barriers" {
+    const Fixture = struct {
+        rows: TestBackend = .{},
+        query: *const ast.Select,
+        expose_alias: bool = false,
+        row_filter: ?catalog.ViewRowFilter = null,
+        fn iface(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{
+                .resolve_read = read,
+                .resolve = resolve,
+                .scan = scan,
+                .open_statement = open,
+                .mutate = mutate,
+                .checkpoint = checkpoint,
+            } };
+        }
+        fn read(raw: *anyopaque, a: std.mem.Allocator, name: ast.Name) !catalog.ReadRelation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, name.table, "stored")) {
+                var scoped = self.iface();
+                scoped.binding_scope = @intFromPtr(self.query);
+                return .{ .view = .{
+                    .id = 51,
+                    .generation = 1,
+                    .query = self.query,
+                    .backend = scoped,
+                    .security_barrier = true,
+                    .columns = &.{.{ .name = "id", .path = "id", .type = .integer, .element_type = .int64 }},
+                    .exposure = if (self.expose_alias) &.{.{ .ordinal = 0, .name = "frozen" }} else null,
+                    .row_filter = self.row_filter,
+                } };
+            }
+            return .{ .table = try resolve(raw, a, name, .read) };
+        }
+        fn resolve(raw: *anyopaque, a: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, name.table, "things")) return error.TableNotFound;
+            var table = try TestBackend.resolve(&self.rows, a, name, action);
+            table.read_authority = raw;
+            return table;
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Outer equality demand cannot cross a barrier to become an
+            // owner-side source filter without a leakproof-expression proof.
+            try std.testing.expectEqual(@as(usize, 0), request.conditions.len);
+            return TestBackend.scan(&self.rows, a, table, request);
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.Forbidden;
+        }
+        fn open(raw: *anyopaque, a: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (scans) |request| {
+                try std.testing.expectEqual(@as(usize, 0), request.request.conditions.len);
+                try std.testing.expect(request.table.read_authority == raw);
+            }
+            return TestBackend.openStatement(&self.rows, a, scans);
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var body = try compiler.compile(a, "SELECT id FROM things", .{});
+    defer body.deinit();
+    var fixture: Fixture = .{ .query = &body.statement.select };
+    for ([_][]const u8{
+        "SELECT id FROM stored WHERE id = 9007199254740993",
+        "WITH things AS (SELECT 0::BIGINT AS id) SELECT id FROM stored",
+        "SELECT s.id FROM stored s JOIN stored other ON s.id=other.id LIMIT 2",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][0].string);
+    }
+    fixture.expose_alias = true;
+    {
+        var exposed = try compiler.compile(a, "SELECT frozen FROM stored", .{});
+        defer exposed.deinit();
+        var result = try execute(a, fixture.iface(), &exposed, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][0].string);
+    }
+    fixture.expose_alias = false;
+    {
+        const SelectLast = struct {
+            fn matches(raw: *const anyopaque, _: std.mem.Allocator, cells: []const Datum) !bool {
+                const last: *const i64 = @ptrCast(@alignCast(raw));
+                return cells[0].value.integer == last.*;
+            }
+        };
+        var numbered = try compiler.compile(a, "SELECT CAST(_id AS BIGINT) AS id FROM things", .{});
+        defer numbered.deinit();
+        const last: i64 = 8191;
+        fixture.query = &numbered.statement.select;
+        fixture.rows.row_count = 8192;
+        fixture.row_filter = .{ .ptr = &last, .matches = SelectLast.matches };
+        var filtered = try compiler.compile(a, "SELECT id FROM stored LIMIT 1", .{});
+        defer filtered.deinit();
+        var result = try execute(a, fixture.iface(), &filtered, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("8191", result.output.rows[0][0].string);
+        var counted = try compiler.compile(a, "SELECT count(*) FROM stored", .{});
+        defer counted.deinit();
+        var count_result = try execute(a, fixture.iface(), &counted, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 });
+        defer count_result.deinit();
+        try std.testing.expectEqualStrings("1", count_result.output.rows[0][0].string);
+    }
+    fixture.row_filter = null;
+    var recursive = try compiler.compile(a, "SELECT id FROM stored", .{});
+    defer recursive.deinit();
+    fixture.query = &recursive.statement.select;
+    try std.testing.expectError(error.SqlViewCycle, execute(a, fixture.iface(), &recursive, &.{}, .{}));
 }
 
 test "SQL high fanout join bounds candidate allocation churn" {

@@ -18,6 +18,11 @@
 //! changes from forcing code generation for every storage and search test.
 
 const http_server = @import("api/http_server.zig");
+test {
+    _ = @import("api/row_policy_publication_coordinator.zig");
+    _ = @import("api/retained_read_rpc.zig");
+    _ = @import("antfly_local_sources").api_batch;
+}
 const httpx_handler = @import("api/httpx_handler.zig");
 const indexes = @import("api/indexes.zig");
 const kernel_abi = @import("api/kernel_abi.zig");

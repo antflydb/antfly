@@ -22,6 +22,16 @@ const metadata = @import("../metadata/api.zig");
 const http = @import("antfly_local_sources").common_http_http_common;
 const time = @import("antfly_platform").time;
 
+fn unpublishedAdmissionBusy(operation: @FieldType(rpc.Request, "operation"), status: u16, acknowledged: bool, body: []const u8) bool {
+    if (status != 503 or !acknowledged or !std.mem.eql(u8, body, "ReadUnavailable")) return false;
+    return switch (operation) {
+        .admit, .capture, .validate, .snapshot, .open => true,
+        // These operations can run after query evaluation/row delivery. A
+        // negative reply never authorizes replay of an advanced cursor.
+        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel => false,
+    };
+}
+
 /// Owns endpoint and catalog capability bytes. Executor must be a stable
 /// server-owned authenticated transport, never a stack-built hosted adapter.
 pub const Client = struct {
@@ -52,7 +62,7 @@ pub const Client = struct {
         try receiver.io().randomSecure(&nonce);
         const connection = std.mem.readInt(u128, &nonce, .little);
         if (connection == 0) return error.ReadUnavailable;
-        self.* = .{ .alloc = alloc, .executor = executor, .uri = uri, .route = encoded_route, .schema_version = schema_version, .deadline_ns = deadline_ns orelse time.monotonicNs() +| 30 * std.time.ns_per_s, .token = undefined, .connection = connection };
+        self.* = .{ .alloc = alloc, .executor = executor, .uri = uri, .route = encoded_route, .schema_version = schema_version, .deadline_ns = deadline_ns orelse executor.monotonicNs() +| 30 * std.time.ns_per_s, .token = undefined, .connection = connection };
         return self;
     }
 
@@ -89,7 +99,7 @@ pub const Client = struct {
     fn call(self: *Client, request: rpc.Request) !http.HttpResponse {
         const cleanup = request.operation == .close or request.operation == .cancel;
         if (self.poisoned and !cleanup) return error.RetainedReadRestartRequired;
-        const now = time.monotonicNs();
+        const now = self.executor.monotonicNs();
         if (now >= self.deadline_ns and !cleanup) return error.DeadlineExceeded;
         const timeout: u32 = if (cleanup) 100 else @intCast(@max(1, @min(5000, (self.deadline_ns -| now) / std.time.ns_per_ms)));
         const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
@@ -117,6 +127,7 @@ pub const Client = struct {
         }
         if (response.status != 200 or !std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value)) {
             self.poisoned = true;
+            if (unpublishedAdmissionBusy(request.operation, response.status, std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value), response.body)) return error.ReadUnavailable;
             return error.RetainedReadRestartRequired;
         }
         return response;
@@ -264,6 +275,21 @@ fn consumerTests() type {
     const root = @import("antfly_source_root");
     if (@hasDecl(root, "implementation_tests_only") and root.implementation_tests_only) return struct {};
     return struct {
+        test "retained read client admission retries require an exact unpublished owner rejection" {
+            const Operation = @FieldType(rpc.Request, "operation");
+            for (std.meta.tags(Operation)) |operation| {
+                const expected = switch (operation) {
+                    .admit, .capture, .validate, .snapshot, .open => true,
+                    else => false,
+                };
+                try std.testing.expectEqual(expected, unpublishedAdmissionBusy(operation, 503, true, "ReadUnavailable"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, false, "ReadUnavailable"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 409, true, "ReadUnavailable"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, true, "RetainedReadExpired"));
+                try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, true, "ReadUnavailable\n"));
+            }
+        }
+
         test "retained read client never replays an ambiguous page request" {
             const Fixture = struct {
                 calls: usize = 0,

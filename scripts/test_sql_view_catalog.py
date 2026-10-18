@@ -34,6 +34,120 @@ def attributes(db, relation):
 
 
 class ViewCatalogTest(unittest.TestCase):
+    def test_record_table_function_validates_discarded_typed_outputs(self):
+        with postgres() as db:
+            for sql in (
+                """SELECT count(*) FROM jsonb_to_record('{"n":"bad"}') AS r(n BIGINT)""",
+                """SELECT 1 FROM jsonb_to_record('{"n":"bad"}') AS r(n BIGINT)""",
+            ):
+                with self.subTest(sql=sql):
+                    with self.assertRaises(psycopg.Error) as invalid:
+                        db.execute(sql)
+                    self.assertEqual("22P02", invalid.exception.sqlstate)
+
+    def test_document_view_projects_real_paths_and_typed_arrays(self):
+        with postgres() as db:
+            db.execute("CREATE TABLE docs(_id TEXT PRIMARY KEY,body JSONB)")
+            db.execute(
+                """INSERT INTO docs VALUES
+                ('a','{"title":"alpha","metadata":{"plan":"pro","score":12},
+                       "tags":["urgent",null,"vip"]}'),
+                ('b','{"title":"beta","metadata":{"plan":"free","score":4},
+                       "tags":[]}'),
+                ('c','{"title":"gamma","metadata":{},"tags":null}')"""
+            )
+            db.execute(
+                """CREATE VIEW support_view AS
+                SELECT d._id,r.title AS title_text,r.metadata->>'plan' AS plan,
+                       (r.metadata->>'score')::BIGINT AS score,r.tags AS tag_list
+                FROM docs d CROSS JOIN LATERAL
+                jsonb_to_record(d.body) AS r(title TEXT,metadata JSONB,tags TEXT[])"""
+            )
+            self.assertEqual(
+                [
+                    ("a", "pro", 12, ["urgent", None, "vip"]),
+                    ("b", "free", 4, []),
+                    ("c", None, None, None),
+                ],
+                db.execute(
+                    "SELECT _id,plan,score,tag_list FROM support_view ORDER BY _id"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [("a", "urgent"), ("a", None), ("a", "vip")],
+                db.execute(
+                    "SELECT d._id,t.tag FROM support_view d,"
+                    "LATERAL UNNEST(d.tag_list) WITH ORDINALITY AS t(tag,n) "
+                    "ORDER BY d._id,t.n"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                (None, None),
+                db.execute(
+                    "SELECT * FROM jsonb_to_record(NULL::jsonb) AS r(a JSONB,b TEXT[])"
+                ).fetchone(),
+            )
+            self.assertEqual(
+                (None, None),
+                db.execute(
+                    """SELECT * FROM jsonb_to_record('{"a":null,"b":null}')
+                    AS r(a JSONB,b TEXT[])"""
+                ).fetchone(),
+            )
+
+    def test_nested_invoker_view_restores_original_caller_authority(self):
+        with postgres() as db:
+            for role in ("outer_owner", "inner_owner", "view_reader"):
+                db.execute("CREATE ROLE " + role)
+            db.execute("CREATE SCHEMA app")
+            db.execute(
+                "GRANT USAGE,CREATE ON SCHEMA app TO "
+                "outer_owner,inner_owner,view_reader"
+            )
+            db.execute("CREATE TABLE app.rows(id BIGINT)")
+            db.execute("INSERT INTO app.rows VALUES(1)")
+            db.execute("GRANT SELECT ON app.rows TO outer_owner")
+            db.execute("SET ROLE inner_owner")
+            db.execute(
+                "CREATE VIEW app.inner_view WITH(security_invoker=true) AS "
+                "SELECT id FROM app.rows"
+            )
+            db.execute("RESET ROLE")
+            db.execute("GRANT SELECT ON app.inner_view TO outer_owner")
+            db.execute("SET ROLE outer_owner")
+            db.execute("CREATE VIEW app.outer_view AS SELECT id FROM app.inner_view")
+            db.execute("RESET ROLE")
+            db.execute("GRANT SELECT ON app.outer_view TO view_reader")
+            db.execute("SET ROLE view_reader")
+            with self.assertRaises(psycopg.Error) as denied:
+                db.execute("SELECT * FROM app.outer_view")
+            self.assertEqual("42501", denied.exception.sqlstate)
+            db.execute("RESET ROLE")
+            db.execute("GRANT SELECT ON app.rows TO view_reader")
+            db.execute("REVOKE SELECT ON app.rows FROM outer_owner")
+            db.execute("SET ROLE view_reader")
+            self.assertEqual(
+                [(1,)], db.execute("SELECT * FROM app.outer_view").fetchall()
+            )
+
+    def test_cyclic_replacement_is_admitted_but_expansion_is_rejected(self):
+        with postgres() as db:
+            db.execute("CREATE VIEW first_view AS SELECT 1 AS id")
+            db.execute("CREATE VIEW second_view AS SELECT id FROM first_view")
+            db.execute(
+                "CREATE OR REPLACE VIEW first_view AS SELECT id FROM second_view"
+            )
+            with self.assertRaises(psycopg.Error) as recursive:
+                db.execute("SELECT * FROM first_view")
+            self.assertEqual("42P17", recursive.exception.sqlstate)
+            with self.assertRaises(psycopg.Error) as dependent:
+                db.execute("DROP VIEW first_view")
+            self.assertEqual("2BP01", dependent.exception.sqlstate)
+            db.execute("DROP VIEW first_view CASCADE")
+            self.assertEqual(
+                (None,), db.execute("SELECT to_regclass('second_view')").fetchone()
+            )
+
     def test_replacement_retains_owner_and_output_ids_but_resets_omitted_options(self):
         with postgres() as db:
             db.execute("CREATE ROLE view_owner")
@@ -77,7 +191,9 @@ class ViewCatalogTest(unittest.TestCase):
                 ).fetchone(),
             )
 
-    def test_creation_checks_schema_usage_not_select_and_does_not_recheck_source_usage(self):
+    def test_creation_checks_schema_usage_not_select_and_does_not_recheck_source_usage(
+        self,
+    ):
         with postgres() as db:
             db.execute("CREATE ROLE view_creator")
             db.execute("CREATE SCHEMA source")

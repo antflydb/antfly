@@ -112,8 +112,9 @@ pub const Catalog = struct {
         // replayed after a later re-enable at the same generation.
         if ((catalog.row_policy_generation == 0) != (catalog.row_policy_catalog_epoch == 0) or
             (catalog.row_policy_phase != .disabled and catalog.row_policy_generation == 0)) return error.InvalidTableCatalog;
-        if (catalog.row_policy_phase != .disabled and
-            (catalog.storage_mode != .relational or catalog.active_schema_version == 0)) return error.InvalidTableCatalog;
+        // Zero is the initial, durable relational schema epoch, not absence.
+        // Generation/catalog epoch above still fence installed policy state.
+        if (catalog.row_policy_phase != .disabled and catalog.storage_mode != .relational) return error.InvalidTableCatalog;
         if (version == format_version) for (data[49..56]) |reserved| {
             if (reserved != 0) return error.InvalidTableCatalog;
         };
@@ -361,6 +362,16 @@ test "table catalog has a stable canonical representation" {
     const preparing: Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3, .row_policy_phase = .preparing, .row_policy_generation = 11, .row_policy_catalog_epoch = 19 };
     const preparing_bytes = preparing.encode();
     try std.testing.expectEqual(preparing, try Catalog.decode(&preparing_bytes));
+    var initial = preparing;
+    initial.active_schema_version = 0;
+    for ([_]RowPolicyPhase{ .preparing, .active }) |phase| {
+        initial.row_policy_phase = phase;
+        const initial_bytes = initial.encode();
+        try std.testing.expectEqual(initial, try Catalog.decode(&initial_bytes));
+    }
+    initial.storage_mode = .document;
+    const invalid_mode = initial.encode();
+    try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(&invalid_mode));
     var revoked = preparing;
     revoked.row_policy_phase = .disabled;
     revoked.row_policy_generation += 1;

@@ -148,6 +148,18 @@ test "row policy publication Raft codec carries immutable owner-fetched bytes pr
     defer parsed.deinit(alloc);
     try std.testing.expectEqualDeep(request.row_policy_publication.?, parsed.req.row_policy_publication.?);
     try std.testing.expectEqualStrings(request.row_policy_install_bundle, parsed.req.row_policy_install_bundle);
+    var mixed = request;
+    mixed.timestamp_ns = 1;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
+    mixed = request;
+    mixed.schema_version = 0;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
+    mixed = request;
+    mixed.sync_level = .full_text;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
+    mixed = request;
+    mixed.relational_schema_version = 0;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, mixed));
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"inserts\":{},\"deletes\":[],\"_row_policy_publication\":{\"table_id\":7,\"expected_generation\":11,\"expected_catalog_epoch\":13,\"expected_phase\":\"pending_install\"},\"sync_level\":\"write\",\"_schema_version\":1}"));
 }
 
@@ -777,7 +789,11 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
     errdefer if (relational_generation_gc) |*page| page.deinit();
     var row_policy_publication = if (root.get("_row_policy_publication")) |value| publication: {
         if (!allow_internal) return error.InvalidBatchRequest;
-        break :publication @as(?std.json.Parsed(@import("../system_catalog/policies.zig").InstallRequest), try std.json.parseFromValue(@import("../system_catalog/policies.zig").InstallRequest, alloc, value, .{ .allocate = .alloc_always }));
+        const parsed_publication = std.json.parseFromValue(@import("../system_catalog/policies.zig").InstallRequest, alloc, value, .{ .allocate = .alloc_always }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidBatchRequest;
+        };
+        break :publication @as(?std.json.Parsed(@import("../system_catalog/policies.zig").InstallRequest), parsed_publication);
     } else null;
     errdefer if (row_policy_publication) |*publication| publication.deinit();
     const row_policy_install_bundle: ?[]u8 = if (root.get("_row_policy_install_bundle")) |value| bundle: {
@@ -1569,6 +1585,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
             .transaction = transaction,
         },
     };
+    try validateRowPolicyPublicationRequest(result_value.req);
     try @import("../storage/range_protection.zig").validateRequest(result_value.req);
     try @import("../storage/db/relational_index_raft_contract.zig").validateBatchRequest(result_value.req);
     if (!allow_internal) {
@@ -1620,6 +1637,31 @@ fn validateGraphBatchCommand(req: db_mod.types.BatchRequest) !void {
     };
 }
 
+fn validateRowPolicyPublicationRequest(req: db_mod.types.BatchRequest) !void {
+    const publication = req.row_policy_publication orelse {
+        if (req.row_policy_install_bundle.len != 0) return error.InvalidBatchRequest;
+        return;
+    };
+    if (publication.table_id == 0 or publication.expected_generation == 0 or
+        publication.expected_catalog_epoch == 0 or publication.owner_group_id == 0 or
+        req.row_policy_install_bundle.len == 0 or
+        req.row_policy_install_bundle.len > @import("../system_catalog/policies.zig").max_install_snapshot_bytes)
+        return error.InvalidBatchRequest;
+    // Isolated control commands must round-trip before entering Raft. Compare
+    // every other field with its semantic default, including future fields;
+    // accepting an encoder-only field could otherwise poison committed apply.
+    const defaults: db_mod.types.BatchRequest = .{};
+    inline for (comptime std.meta.fieldNames(db_mod.types.BatchRequest)) |name| {
+        if (comptime std.mem.eql(u8, name, "row_policy_publication") or std.mem.eql(u8, name, "row_policy_install_bundle")) continue;
+        const value = @field(req, name);
+        const info = @typeInfo(@TypeOf(value));
+        if (comptime info == .pointer and info.pointer.size == .slice) {
+            if (comptime @field(defaults, name).len != 0) @compileError("review nonempty row-policy control default: " ++ name);
+            if (value.len != 0) return error.InvalidBatchRequest;
+        } else if (!std.meta.eql(value, @field(defaults, name))) return error.InvalidBatchRequest;
+    }
+}
+
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
     return encodeBatchRequestOwned(alloc, req) catch |err| switch (err) {
         // This memory writer can fail only when allocation fails.
@@ -1632,16 +1674,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     try @import("../storage/db/relational_index_raft_contract.zig").validateBatchRequest(req);
     try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
     try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
-    if (req.row_policy_publication) |publication| {
-        if (publication.table_id == 0 or publication.expected_generation == 0 or publication.expected_catalog_epoch == 0 or publication.owner_group_id == 0 or
-            req.row_policy_install_bundle.len == 0 or req.row_policy_install_bundle.len > @import("../system_catalog/policies.zig").max_install_snapshot_bytes or
-            req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
-            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or
-            req.transaction != null or req.relational_topology != null or req.relational_generation_gc != null or
-            req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or
-            req.split_checkpoint != null or req.merge_checkpoint != null or req.online_source != null or req.restore_staging != null)
-            return error.InvalidBatchRequest;
-    } else if (req.row_policy_install_bundle.len != 0) return error.InvalidBatchRequest;
+    try validateRowPolicyPublicationRequest(req);
     if (req.range_guards.len != 0 and (req.range_guards.len > @import("../storage/range_protection.zig").max_proofs or req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(req);

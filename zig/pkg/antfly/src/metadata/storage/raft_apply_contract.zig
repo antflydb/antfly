@@ -245,8 +245,10 @@ pub const SystemCatalogCommand = struct {
     topology: ?TableTopologyMutation = null,
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+    sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view });
         // Keep legacy frames byte-for-byte shaped as before while capability
         // 34 is not activated. Old decoders must not see even a null new field.
         if (self.constraint_name_admission == null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update });

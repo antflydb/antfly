@@ -13020,7 +13020,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -26849,6 +26849,7 @@ const RemoteMetadataSource = struct {
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
                 .supports_query_definitions = true,
+                .supports_sql_views = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .control_snapshot = remoteControlSnapshot,
@@ -42776,6 +42777,23 @@ fn consumerTests() type {
 
         test "raft proposal materializes a default batch timestamp exactly once" {
             const alloc = std.testing.allocator;
+            const policy = DataServer.materializeRaftBatchTimestamp(.{
+                .row_policy_publication = .{
+                    .table_id = 7,
+                    .expected_generation = 1,
+                    .expected_catalog_epoch = 2,
+                    .expected_phase = .pending_install,
+                    .owner_group_id = 9,
+                    .expected_descriptor_digest = @splat(7),
+                },
+                .row_policy_install_bundle = "{}",
+            }, 456);
+            try std.testing.expectEqual(@as(u64, 0), policy.timestamp_ns);
+            const policy_frame = try data_raft_batch.encode(alloc, "rows", policy);
+            defer alloc.free(policy_frame);
+            var policy_decoded = try data_raft_batch.decode(alloc, policy_frame);
+            defer policy_decoded.deinit(alloc);
+            try std.testing.expectEqualDeep(policy.row_policy_publication.?, policy_decoded.batch.req.row_policy_publication.?);
             const materialized = DataServer.materializeRaftBatchTimestamp(.{
                 .writes = &.{.{ .key = "doc:a", .value = "{}" }},
             }, 456);

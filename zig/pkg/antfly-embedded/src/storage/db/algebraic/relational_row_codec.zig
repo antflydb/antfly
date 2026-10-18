@@ -1463,34 +1463,43 @@ pub const OrdinalRowView = struct {
             const slot = if (output) |layout| layout.ordinals.get(self.table_schema.relational_columns[ordinal].name) orelse continue else index;
             const value = &values[slot];
             const present = &presence[slot];
-            const cell = (try self.findCell(ordinal)) orelse {
+            const datum = (try self.sqlDatumAlloc(alloc, ordinal)) orelse {
                 value.* = .{};
                 present.* = false;
                 continue;
             };
             present.* = true;
-            value.* = .{};
-            if (cell.is_null) continue;
-            const column = self.table_schema.relational_columns[ordinal];
-            value.* = switch (column.column_type) {
-                .sql_array => blk: {
-                    const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
-                    array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
-                    break :blk Datum.typedArray(array);
-                },
-                .numeric => blk: {
-                    const numeric = @import("../../../sql/numeric_value.zig");
-                    var context: numeric.Context = .{ .alloc = alloc };
-                    var decoded = try @import("../../../sql/numeric_binary.zig").decodeCanonical(&context, cell.value.bytes_val);
-                    errdefer decoded.deinit();
-                    const number = try alloc.create(numeric.Value);
-                    number.* = decoded.value;
-                    break :blk Datum.typedNumeric(number);
-                },
-                else => Datum.json(try self.materializeCellAlloc(alloc, cell)),
-            };
+            value.* = datum;
         }
         return .{ .values = values, .presence = presence };
+    }
+
+    /// The same selective typed decoder serves projected query pages and RLS.
+    /// Single-cell consumers reuse their existing vector instead of allocating
+    /// an intermediate projection/presence vector for every candidate row.
+    pub fn sqlDatumAlloc(self: OrdinalRowView, alloc: Allocator, ordinal: usize) !?@import("../../../sql/scalar.zig").Datum {
+        const Datum = @import("../../../sql/scalar.zig").Datum;
+        if (ordinal >= self.table_schema.relational_columns.len) return error.RelationalRowSchemaMismatch;
+        const cell = (try self.findCell(ordinal)) orelse return null;
+        if (cell.is_null) return Datum{};
+        const column = self.table_schema.relational_columns[ordinal];
+        return switch (column.column_type) {
+            .sql_array => blk: {
+                const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
+                array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
+                break :blk Datum.typedArray(array);
+            },
+            .numeric => blk: {
+                const numeric = @import("../../../sql/numeric_value.zig");
+                var context: numeric.Context = .{ .alloc = alloc };
+                var decoded = try @import("../../../sql/numeric_binary.zig").decodeCanonical(&context, cell.value.bytes_val);
+                errdefer decoded.deinit();
+                const number = try alloc.create(numeric.Value);
+                number.* = decoded.value;
+                break :blk Datum.typedNumeric(number);
+            },
+            else => Datum.json(try self.materializeCellAlloc(alloc, cell)),
+        };
     }
 
     pub const TypedProjection = struct {

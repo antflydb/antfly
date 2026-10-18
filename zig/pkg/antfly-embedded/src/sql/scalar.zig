@@ -400,10 +400,13 @@ pub const Function = enum {
     now,
     transaction_timestamp,
     @"$current_timestamp",
+    @"$current_user",
+    @"$record_validate",
+    @"$record_field",
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
             .ai_decide, .ai_choice, .ai_score, .ai_probability => .@"volatile",
-            .now, .transaction_timestamp, .@"$current_timestamp", .current_setting, .date_part, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
+            .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_user", .current_setting, .date_part, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
             else => .immutable,
         };
     }
@@ -1921,6 +1924,16 @@ fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.
 fn uuidTextOperand(expression: *const ast.Scalar) bool {
     return expression.* == .literal and expression.literal == .string;
 }
+/// Hash keys must use the same resolved domain as the equality operator.
+/// In particular exact NUMERIC and integer values have different physical
+/// hashes until both operands have passed through their comparison coercion.
+pub fn comparisonDomain(left: Type, right: Type) !Type {
+    var merged = try common(left, right);
+    if (merged.kind == .number and merged.element_type == .float32 and
+        (left.element_type == .numeric or right.element_type == .numeric)) merged.element_type = .float64;
+    return merged;
+}
+
 fn common(left: Type, right: Type) !Type {
     if (left.kind == .array or right.kind == .array) {
         const chosen = if (left.kind == .array) left else right;
@@ -2358,7 +2371,9 @@ fn arity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
-        .now, .transaction_timestamp => count == 0,
+        .now, .transaction_timestamp, .@"$current_user" => count == 0,
+        .@"$record_validate" => count == 1,
+        .@"$record_field" => count == 3,
         .@"$current_timestamp" => count == 1,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
@@ -2573,6 +2588,17 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .@"$record_field" or function == .@"$record_validate") {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != null and input.kind != .json) return error.SqlUndefinedFunction;
+                    if (function == .@"$record_validate") break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = false };
+                    const name = call.args[1];
+                    if (name.* != .literal or name.literal != .string or call.args[2].* != .cast or call.args[2].cast.operand.* != .literal or call.args[2].cast.operand.literal != .null) return error.InvalidSqlProgram;
+                    var result = try self.infer(call.args[2], depth + 1);
+                    if (result.kind == null) return error.InvalidSqlProgram;
+                    result.nullable = true;
+                    break :blk result;
+                }
                 if (clockFunction(function) != null) {
                     if (function == .@"$current_timestamp") {
                         const arg = call.args[0];
@@ -2732,6 +2758,7 @@ const Binder = struct {
                     }, .nullable = true };
                 }
 
+                if (function == .@"$current_user") break :blk .{ .kind = .string, .nullable = false };
                 if (function == .current_setting) {
                     const name = call.args[0];
                     if (name.* != .literal or name.literal != .string) return error.UnsupportedSqlShape;
@@ -3022,11 +3049,9 @@ const Binder = struct {
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
                 const left_type = try self.infer(binary.left, depth + 1);
                 const right_type = try self.infer(binary.right, depth + 1);
-                var merged = try common(left_type, right_type);
+                const merged = try comparisonDomain(left_type, right_type);
                 // PostgreSQL's mixed NUMERIC/real operators use float8;
                 // CASE/COALESCE and array common types still select real.
-                if (merged.kind == .number and merged.element_type == .float32 and
-                    (left_type.element_type == .numeric or right_type.element_type == .numeric)) merged.element_type = .float64;
                 const operand_kind: ?ast.ColumnType = switch (binary.op) {
                     .@"and", .@"or" => .boolean,
                     .concat => merged.kind orelse .string,
@@ -3059,6 +3084,11 @@ const Binder = struct {
                     break :blk .{ .literal = .{ .integer = 1 } };
                 }
                 const function = try functionId(call.name);
+                if (function == .@"$current_user") {
+                    if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
+                    _ = self.settings orelse return error.SettingCatalogUnavailable;
+                    break :blk .{ .call = .{ .function = function, .args = &.{} } };
+                }
                 if (function == .current_setting) {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
                     const view = self.settings orelse return error.SettingCatalogUnavailable;
@@ -3127,6 +3157,8 @@ const Binder = struct {
                 const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
+                        .@"$record_validate" => .json,
+                        .@"$record_field" => if (i == 0) .json else if (i == 1) .string else kind.kind,
                         .@"$like_escape" => if (i == 3) .boolean else .string,
                         .string_to_array => .string,
                         .jsonb_exists => if (i == 0) .json else .string,
@@ -3190,7 +3222,9 @@ const Binder = struct {
                         continue;
                     }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
-                    const element_context: ?arrays.ElementType = if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
+                    const element_context: ?arrays.ElementType = if (function == .@"$record_field" or function == .@"$record_validate")
+                        (if (i == 0) .jsonb else if (i == 1) .text else kind.element_type)
+                    else if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
                         .jsonb_exists_any, .jsonb_exists_all => if (i == 1) .text else null,
                         .jsonb_set => if (i == 1) .text else null,
                         .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
@@ -3703,6 +3737,10 @@ const Evaluator = struct {
                     if (self.limits.decision_demand) |demand| demand.* = .{ .instruction = index, .function = desc.function, .args = args };
                     return error.DecisionNotEvaluated;
                 }
+                if (call.function == .@"$current_user") {
+                    const view = self.program.settings orelse return error.SettingCatalogUnavailable;
+                    break :blk Datum.json(.{ .string = view.sql_user orelse view.scope.principal });
+                }
                 if (call.function == .current_setting) {
                     const view = self.program.settings orelse return error.SettingCatalogUnavailable;
                     const value = try view.resolveDependency(call.setting_identity orelse return error.InvalidSqlProgram);
@@ -3962,6 +4000,17 @@ const Evaluator = struct {
                             try object.put(self.alloc, name, try self.sqlJson(value, self.program.instructions[call.args[i + 1]].type));
                         }
                         break :blk Datum.json(.{ .object = object });
+                    },
+                    .@"$record_validate", .@"$record_field" => {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        if (!input.sql_null and (input.array != null or input.numeric != null or input.value != .object)) return error.InvalidSqlParameters;
+                        if (call.function == .@"$record_validate") break :blk Datum.json(.{ .bool = true });
+                        if (input.sql_null) break :blk .{};
+                        const name = try self.runDatum(call.args[1], depth + 1);
+                        if (name.sql_null or name.value != .string) return error.InvalidSqlProgram;
+                        const value = input.value.object.get(name.value.string) orelse break :blk .{};
+                        const target = self.program.instructions[call.args[2]].type;
+                        break :blk try self.recordField(value, target);
                     },
                     .jsonb_extract_path_text, .jsonb_extract_path => {
                         var value = try self.runDatum(call.args[0], depth + 1);
@@ -4261,6 +4310,45 @@ const Evaluator = struct {
         var work = self.workBudget();
         value.* = try arrays.Value.initWithBudget(kind, shape, cells, .{}, &work);
         return Datum.typedArray(value);
+    }
+
+    fn recordLeaf(raw: *anyopaque, value: Json, target: arrays.ElementType) anyerror!Datum {
+        const self: *Evaluator = @ptrCast(@alignCast(raw));
+        try self.workOwner().charge(1);
+        if (value == .null) return .{};
+        if (target == .jsonb) return Datum.json(value);
+        const text = if (value == .string) value.string else try self.jsonText(value);
+        // Record conversion uses the destination type's text input function,
+        // not SQL JSONB cast rules (which intentionally differ).
+        return self.castDatumBuiltin(Datum.json(.{ .string = text }), .text, target);
+    }
+    fn recordCharge(raw: *anyopaque, bytes: usize) anyerror!void {
+        const self: *Evaluator = @ptrCast(@alignCast(raw));
+        try self.workOwner().charge(1);
+        try self.charge(bytes);
+    }
+    fn recordField(self: *Evaluator, value: Json, target: Type) anyerror!Datum {
+        if (value == .null) return .{};
+        var converted: Datum = undefined;
+        if (target.kind == .array) {
+            const element = target.element_type orelse return error.InvalidSqlProgram;
+            if (value == .string) {
+                const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, element, value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.remainingSteps() }, .context = self.workOwner() });
+                try self.charge(decoded.allocated_bytes + @sizeOf(arrays.Value));
+                const array = try self.alloc.create(arrays.Value);
+                array.* = decoded.value;
+                converted = Datum.typedArray(array);
+            } else {
+                var work = self.workBudget();
+                converted = try @import("json_record_array.zig").decode(self.alloc, value, element, .{ .ptr = self, .convert = recordLeaf, .charge = recordCharge, .work = &work });
+            }
+        } else if (target.kind == .datetime) {
+            const text = if (value == .string) value.string else try self.jsonText(value);
+            converted = Datum.json(try self.convert(.{ .string = text }, .datetime));
+        } else {
+            converted = try recordLeaf(self, value, target.element_type orelse try arrayElementType(target.kind orelse return error.InvalidSqlProgram));
+        }
+        return if (target.numeric_modifier) |modifier| try self.constrainNumeric(converted, modifier) else converted;
     }
 
     fn castArray(self: *Evaluator, datum: Datum, target: arrays.ElementType) !Datum {

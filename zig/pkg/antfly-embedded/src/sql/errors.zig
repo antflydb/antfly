@@ -116,6 +116,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped => .{ .code = "42P16", .message = "The replacement view must preserve existing output column names, order, and types.", .hint = "Keep the existing output prefix unchanged; new columns may be appended.", .retryable = false },
         error.SqlDependentObjectsExist => .{ .code = "2BP01", .message = "A stored view depends on this relation or column.", .hint = "Remove the dependent views explicitly before changing their referenced columns or dropping the relation.", .retryable = false },
         error.InvalidSqlViewRecord => .{ .code = "XX001", .message = "The stored view catalog or its dependency records are inconsistent.", .retryable = false },
+        error.SqlViewCycle => .{ .code = "42P17", .message = "Infinite recursion detected while expanding a stored view.", .hint = "Remove the dependency cycle or use a recursive query within the view.", .retryable = false },
         error.SqlConstraintAlreadyExists => .{ .code = "42710", .message = "The constraint already exists.", .hint = "Inspect the existing table constraint or choose a distinct constraint name.", .retryable = false },
         error.SqlConstraintNotFound => .{ .code = "42704", .message = "The constraint does not exist.", .retryable = false },
         error.ConstraintNotDeferrable => .{ .code = "55000", .message = "The constraint is not deferrable.", .retryable = false },

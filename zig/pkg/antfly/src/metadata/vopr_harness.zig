@@ -6909,6 +6909,7 @@ pub const MetadataAdminVoprSource = struct {
             // publication/coordination protocols. Keep these explicit so a
             // newly added Call remains visible to exhaustive compilation.
             .lake_index_lifecycle_read,
+            .sql_view_mutate,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,
             .relation_replace,

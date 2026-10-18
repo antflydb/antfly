@@ -84,7 +84,7 @@ pub const Definition = struct {
         return result;
     }
 };
-pub const ResolvedSource = struct { table: catalog.Table, schema_digest: [32]u8 };
+pub const ResolvedSource = struct { kind: SourceKind = .table, table: catalog.Table, schema_digest: [32]u8 };
 /// Resolve only referenced names against one authorized metadata snapshot.
 /// This is definition lookup (source-schema USAGE), not runtime source SELECT
 /// admission. PostgreSQL permits creating a view without source-table SELECT.
@@ -183,13 +183,13 @@ const Preparation = struct {
         const resolved = try self.resolver.resolve(self.resolver.ptr, a, name);
         const table = resolved.table;
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
-        if (table.id == 0 or table.physical_name.len == 0 or !nameValid(scope.database) or !nameValid(scope.namespace) or !nameValid(scope.name) or std.mem.allEqual(u8, &resolved.schema_digest, 0)) return error.InvalidSqlBackendResponse;
+        if (table.id == 0 or (resolved.kind == .table and table.physical_name.len == 0) or !nameValid(scope.database) or !nameValid(scope.namespace) or !nameValid(scope.name) or std.mem.allEqual(u8, &resolved.schema_digest, 0)) return error.InvalidSqlBackendResponse;
         if (self.revision) |revision| {
             if (revision != scope.revision) return error.CatalogGenerationChanged;
         } else self.revision = scope.revision;
         // Different lexical qualifications can identify the same source. They
         // retain separate SQL references but cannot capture conflicting cuts.
-        for (self.sources.items) |prior| if (prior.table_id == table.id) {
+        for (self.sources.items) |prior| if (prior.kind == resolved.kind and prior.table_id == table.id) {
             if (prior.schema_version != table.schema_version or
                 !std.mem.eql(u8, &prior.schema_digest, &resolved.schema_digest) or
                 !std.mem.eql(u8, prior.physical_name, table.physical_name) or
@@ -197,9 +197,15 @@ const Preparation = struct {
                 !std.mem.eql(u8, prior.namespace, scope.namespace) or
                 !std.mem.eql(u8, prior.name, scope.name)) return error.InvalidSqlBackendResponse;
         };
-        try self.sources.append(a, .{ .reference = try cloneName(a, name), .database = try a.dupe(u8, scope.database), .namespace = try a.dupe(u8, scope.namespace), .name = try a.dupe(u8, scope.name), .physical_name = try a.dupe(u8, table.physical_name), .table_id = table.id, .schema_version = table.schema_version, .schema_digest = resolved.schema_digest });
-        try self.tables.append(a, table);
-        return table;
+        try self.sources.append(a, .{ .kind = resolved.kind, .reference = try cloneName(a, name), .database = try a.dupe(u8, scope.database), .namespace = try a.dupe(u8, scope.namespace), .name = try a.dupe(u8, scope.name), .physical_name = try a.dupe(u8, table.physical_name), .table_id = table.id, .schema_version = table.schema_version, .schema_digest = resolved.schema_digest });
+        // Physical table IDs and logical view IDs occupy different durable
+        // domains. Use private bind-local IDs, never a high-bit reservation or
+        // a fabricated routing identity, for semantic dependency collection.
+        var shape = table;
+        shape.id = self.sources.items.len;
+        if (resolved.kind == .view) shape.virtual_columns_override = &.{};
+        try self.tables.append(a, shape);
+        return shape;
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *Preparation = @ptrCast(@alignCast(raw));
@@ -276,11 +282,11 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
         out.* = .{ .name = try output.dupe(u8, name), .type = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
     }
     const sources = try output.alloc(Source, preparation.sources.items.len);
-    for (preparation.sources.items, sources) |source, *out| {
+    for (preparation.sources.items, preparation.tables.items, sources) |source, shape, *out| {
         out.* = try cloneSource(output, source);
         var unique: std.StringHashMapUnmanaged(ColumnDependency) = .empty;
         for (relation.column_dependencies) |dependency| {
-            if (dependency.table_id != source.table_id) continue;
+            if (dependency.table_id != shape.id) continue;
             const signature = try dependency.column.identitySignature(a);
             const entry = try unique.getOrPut(a, dependency.column.name);
             if (entry.found_existing) {
@@ -420,6 +426,39 @@ test "SQL view definition binds derived array relations and canonical qualified 
     try std.testing.expectEqualStrings("public", definition.value.sources[1].reference.namespace.?);
     try std.testing.expectEqualStrings("a", definition.value.sources[1].reference.table);
     try std.testing.expectEqual(.int16, definition.value.columns[0].element_type.?);
+}
+
+test "SQL view definition keeps table and view identity domains distinct and excludes row envelopes from views" {
+    const Mixed = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn resolve(_: *anyopaque, _: A, name: ast.Name) !ResolvedSource {
+            const is_view = std.mem.eql(u8, name.table, "stored");
+            return .{
+                .kind = if (is_view) .view else .table,
+                .schema_digest = @splat(if (is_view) 2 else 1),
+                .table = .{
+                    .id = 7,
+                    .physical_name = if (is_view) "" else "rows",
+                    .schema_version = 1,
+                    .scope = .{ .database = "default", .namespace = "public", .name = if (is_view) "stored" else "rows", .revision = 3 },
+                    .columns = &.{
+                        .{ .name = "id", .path = "id", .type = .integer },
+                        .{ .name = "note", .path = "note", .type = .string },
+                    },
+                },
+            };
+        }
+    };
+    var dummy: u8 = 0;
+    const resolver: Resolver = .{ .ptr = &dummy, .resolve = Mixed.resolve, .checkpoint = Mixed.checkpoint };
+    var definition = try prepare(std.testing.allocator, resolver, "SELECT r.id AS row_id,v.note AS view_note FROM rows r JOIN stored v ON r.id=v.id", .{ .owner = .auth_disabled });
+    defer definition.deinit();
+    try std.testing.expectEqual(@as(usize, 2), definition.value.sources.len);
+    for (definition.value.sources) |source| {
+        try std.testing.expectEqual(@as(u64, 7), source.table_id);
+        try std.testing.expectEqual(@as(usize, if (source.kind == .table) 1 else 2), source.columns.len);
+    }
+    try std.testing.expectError(error.UndefinedColumn, prepare(std.testing.allocator, resolver, "SELECT _id FROM stored", .{ .owner = .auth_disabled }));
 }
 
 test "SQL view definition retains semantic column dependencies independently of scan demand" {

@@ -86,6 +86,9 @@ pub const Graph = struct {
 
     fn lineage(self: Graph, node: *const Node, name: []const u8, skip_nullable: ?*const Node, depth: usize) error{ SqlProgramLimitExceeded, InvalidSqlBackendResponse }!?Lineage {
         if (depth >= 128) return error.SqlProgramLimitExceeded;
+        // Without an explicit leakproof-expression proof, no caller predicate
+        // or dynamic join filter may cross a security-barrier view.
+        if (node.security_barrier or node.row_filter != null) return null;
         const ordinal = columnOrdinal(node.columns, name) orelse return null;
         const result: ?Lineage = switch (node.operation) {
             .scan => |scan| .{ .scan = scan.index, .column = scan.source_columns[ordinal] },

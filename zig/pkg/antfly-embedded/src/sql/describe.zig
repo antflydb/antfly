@@ -159,6 +159,10 @@ pub fn describe(allocator: std.mem.Allocator, backend: catalog.Backend, compiled
     if (backend.setting_capture) |capture| {
         const view = try arena.allocator().create(@import("setting_catalog.zig").View);
         view.* = try @import("setting_catalog.zig").View.capture(allocator, capture.owner, capture.scope, capture.overlay);
+        view.pinSqlUser(capture.sql_user) catch |err| {
+            view.deinit();
+            return err;
+        };
         settings = view;
         statement_backend.settings_view = view;
     }
@@ -297,6 +301,24 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     }
     if (explicit_parameter_types.len > compiled.parameter_count) return error.InvalidSqlParameters;
     if (compiled.statement == .select) try @import("window_binding.zig").validatePlacement(compiled.statement.select);
+    if (compiled.statement == .select and compiled.statement.select.source == null and compiled.statement.select.table != null and backend.vtable.resolve_read != null and backend.prepared_read == null and !@import("relation_binding.zig").accepts(compiled.statement.select) and !@import("subquery_lowering.zig").accepts(compiled.statement.select)) {
+        const name = compiled.statement.select.table.?;
+        const resolved = try backend.resolveRead(allocator, name);
+        if (resolved == .view) {
+            var rewritten = compiled.*;
+            const source = try allocator.create(ast.Relation);
+            source.* = .{ .table = .{ .name = name } };
+            rewritten.statement.select.source = source;
+            rewritten.statement.select.table = null;
+            const prepared = try allocator.create(catalog.Backend.PreparedRead);
+            prepared.* = .{ .name = name, .relation = resolved };
+            var pinned = backend;
+            pinned.prepared_read = prepared;
+            return bindInternal(allocator, pinned, &rewritten, explicit_parameter_types);
+        }
+        var adapter: @import("relation_binding.zig").ResolveAdapter = .{ .backend = backend, .table = resolved.table };
+        return bindInternal(allocator, adapter.iface(), compiled, explicit_parameter_types);
+    }
     if (compiled.statement == .select and @import("subquery_lowering.zig").accepts(compiled.statement.select) and !@import("subquery_lowering.zig").needsProjectionDomain(compiled.statement.select)) {
         var lowered = compiled.*;
         lowered.statement = .{ .select = try @import("subquery_lowering.zig").lower(allocator, compiled.statement.select) };

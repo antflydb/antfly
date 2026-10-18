@@ -30,6 +30,13 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_sql_view_record, .err = error.InvalidSqlViewRecord },
+    .{ .status = .sql_view_cycle, .err = error.SqlViewCycle },
+    .{ .status = .sql_view_column_rename, .err = error.SqlViewColumnRename },
+    .{ .status = .sql_view_column_type_changed, .err = error.SqlViewColumnTypeChanged },
+    .{ .status = .sql_view_column_dropped, .err = error.SqlViewColumnDropped },
+    .{ .status = .sql_dependent_objects_exist, .err = error.SqlDependentObjectsExist },
+    .{ .status = .sql_program_limit_exceeded, .err = error.SqlProgramLimitExceeded },
     .{ .status = .invalid_schema_reader_requirements, .err = error.InvalidSchemaReaderRequirements },
     .{ .status = .sql_invalid_power_argument, .err = error.SqlInvalidPowerArgument },
     .{ .status = .immutable_relational_index_definition_conflict, .err = error.ImmutableRelationalIndexDefinitionConflict },

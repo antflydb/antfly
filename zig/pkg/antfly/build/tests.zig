@@ -488,6 +488,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
     const sql_read_admission_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"SQL statement read admission"} });
+    const sql_view_authority_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "SQL read policy proof cache", "SQL owner view legacy filters", "SQL require-index equality uses exact native bounds only inside a guarded statement", "SQL view public resolver", "SQL view filters", "SQL prepared view manifests", "SQL pgwire view", "retained read client admission retries", "retained read client never replays an ambiguous page", "relational statement retries unavailable capture", "SQL policy DDL writes a durable draft", "row policy coordinator", "row policy publication Raft codec", "retained read admission is independent" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_view_authority_run = addFilteredTestRunArtifact(b, sql_view_authority_tests);
+    sql_view_authority_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-view-authority-test", "Verify scoped view proof caching and existing Antfly row-filter/RLS scan integration")
+        .dependOn(&sql_view_authority_run.step);
     b.step("antfly-sql-read-admission-test", "Verify SQL read admission availability without weakening error or mutation semantics")
         .dependOn(&addFilteredTestRunArtifact(b, sql_read_admission_tests).step);
     const sql_index_ddl_run = addFilteredTestRunArtifact(b, sql_index_ddl_tests);
@@ -668,6 +677,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_common_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, common_http_tests, &.{});
     const common_http_test_step = b.step("common-http-test", "Run common HTTP listener and client tests");
     common_http_test_step.dependOn(&run_common_http_tests.step);
+    const retained_http_io = addFilteredTestRunArtifactWithRuntimeFilters(b, common_http_tests, &.{"std http executor exports request Io"});
+    retained_http_io.addArg("--require-no-skips");
+    b.step("common-http-retained-io-test", "Verify the HTTP executor retains its std.Io clock and secure-random capability")
+        .dependOn(&retained_http_io.step);
 
     const api_json_helpers_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/api/json_helpers.zig"),

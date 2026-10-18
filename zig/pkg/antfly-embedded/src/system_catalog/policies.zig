@@ -54,7 +54,18 @@ pub const Predicate = struct {
                         .string => .string,
                         .array, .object => .json,
                     };
-                    if (actual != null and instruction.type.kind != actual) return error.InvalidRowPolicyProgram;
+                    // Literal instructions retain their input image; the
+                    // scalar evaluator applies the resolved output domain.
+                    // Exact NUMERIC comparisons legitimately retain an
+                    // integer literal here, and UUID inputs are canonical text.
+                    const numeric_input = actual == .integer and instruction.type.kind == .number;
+                    const uuid_input = actual == .string and instruction.type.kind == .uuid;
+                    if (uuid_input) {
+                        const uuid = @import("../common/uuid.zig");
+                        const canonical = uuid.format(uuid.parse(value.string) catch return error.InvalidRowPolicyProgram);
+                        if (!std.mem.eql(u8, &canonical, value.string)) return error.InvalidRowPolicyProgram;
+                    }
+                    if (actual != null and instruction.type.kind != actual and !numeric_input and !uuid_input) return error.InvalidRowPolicyProgram;
                 },
                 .column => |ordinal| {
                     if (ordinal >= columns.len or instruction.type.kind != columns[ordinal].type) return error.InvalidRowPolicyProgram;
@@ -106,6 +117,7 @@ pub const Predicate = struct {
                             .trim, .ltrim, .rtrim => count == 1 or count == 2,
                             .coalesce, .greatest, .least => count > 0,
                             .concat => true,
+                            .@"$current_user" => count == 0 and instruction.type.kind == .string,
                             else => false,
                         };
                         if (!valid) return error.InvalidRowPolicyProgram;
@@ -156,7 +168,7 @@ pub const Record = struct {
     with_check: ?Predicate = null,
 
     pub fn validateShape(self: @This()) !void {
-        if (self.id == 0 or self.generation == 0 or self.table_id == 0 or self.schema_version == 0 or
+        if (self.id == 0 or self.generation == 0 or self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or
             self.name.len == 0 or self.name.len > 128 or !self.commands.any() or self.roles.len == 0 or self.roles.len > 256)
             return error.InvalidRowPolicyRecord;
         for (self.name) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_') return error.InvalidRowPolicyRecord;
@@ -237,7 +249,7 @@ pub const OwnerDescriptor = struct {
 
     pub fn digest(self: @This()) ![32]u8 {
         if (self.table_id == 0 or self.group_id == 0 or self.range_id == 0 or
-            self.schema_version == 0 or
+            std.mem.allEqual(u8, &self.schema_digest, 0) or
             self.range_start.len > std.math.maxInt(u32) or self.range_end.len > std.math.maxInt(u32))
             return error.InvalidRowPolicyPublication;
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -297,7 +309,7 @@ pub const InstallSnapshot = struct {
     settings: []const @import("settings.zig").Record,
 
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.policy_generation == 0 or
+        if (self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or self.policy_generation == 0 or
             self.catalog_epoch == 0 or self.records.len > 1024 or self.settings.len > 1024)
             return error.InvalidRowPolicyRecord;
         if (self.phase != .disabled and self.records.len == 0) return error.InvalidRowPolicyRecord;
@@ -360,7 +372,7 @@ pub const Publication = struct {
     disabled_acknowledged_owners: []const OwnerAck = &.{},
 
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.generation == 0 or
+        if (self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or self.generation == 0 or
             self.catalog_epoch == 0 or self.required_owners.len == 0 or self.required_owners.len > 4096 or
             self.acknowledged_owners.len > self.required_owners.len or
             self.serving_acknowledged_owners.len > self.required_owners.len or
@@ -440,7 +452,7 @@ pub const PublicationStamp = struct {
     }
 
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.generation == 0 or self.catalog_epoch == 0) return error.InvalidRowPolicyPublication;
+        if (self.table_id == 0 or self.generation == 0 or self.catalog_epoch == 0) return error.InvalidRowPolicyPublication;
         if (self.serving_generation) |serving| {
             if (serving == 0 or serving >= self.generation or self.serving_catalog_epoch == null or self.serving_catalog_epoch.? == 0 or self.serving_catalog_epoch.? >= self.catalog_epoch or
                 (self.phase != .pending_install and self.phase != .pending_disable and self.phase != .serving_install and self.phase != .serving_disable)) return error.InvalidRowPolicyPublication;
@@ -460,6 +472,23 @@ pub const PublicationStamp = struct {
         };
     }
 };
+
+test "row-policy native zero schema epochs retain explicit identity and digest guards" {
+    // Managed native CREATE starts at zero. Schema version is a required
+    // field, not a presence bit; generation/catalog epoch remain nonzero.
+    const predicate: Predicate = .{ .instructions = &.{.{ .type = .{ .kind = .boolean, .nullable = false }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 };
+    var record: Record = .{ .id = 1, .generation = 1, .table_id = 7, .schema_version = 0, .schema_digest = @splat(2), .name = "visible", .commands = .{ .select = true }, .roles = &.{"PUBLIC"}, .using = predicate };
+    try record.validateShape();
+    const owner: OwnerDescriptor = .{ .table_id = 7, .group_id = 9, .shard_id = 9, .range_id = 9, .schema_version = 0, .schema_digest = @splat(2), .range_start = "", .range_end = "" };
+    const descriptor = try owner.digest();
+    const snapshot: InstallSnapshot = .{ .table_id = 7, .schema_version = 0, .schema_digest = @splat(2), .policy_generation = 1, .catalog_epoch = 2, .phase = .pending_install, .records = &.{record}, .settings = &.{} };
+    try snapshot.validateShape();
+    const publication: Publication = .{ .table_id = 7, .schema_version = 0, .schema_digest = @splat(2), .generation = 1, .catalog_epoch = 2, .phase = .pending_install, .required_owners = &.{.{ .group_id = 9, .descriptor_digest = descriptor }}, .acknowledged_owners = &.{} };
+    try publication.validateShape();
+    try PublicationStamp.fromPublication(publication).validateShape();
+    record.schema_digest = @splat(0);
+    try std.testing.expectError(error.InvalidRowPolicyRecord, record.validateShape());
+}
 
 test "row-policy publication stamp retains prior serving authority only during candidate install" {
     const active: PublicationStamp = .{ .table_id = 7, .schema_version = 1, .generation = 4, .catalog_epoch = 9, .topology_generation = 1, .schema_record_digest = @splat(1), .phase = .active };
@@ -596,6 +625,13 @@ pub const Evaluator = struct {
     /// the metadata policy snapshot itself may never assert them. This keeps
     /// policy definitions and authentication claims under separate authority.
     pub fn initForAuthenticatedRoles(alloc: std.mem.Allocator, view: *const View, settings: *const setting_catalog.View, command: Action, authenticated_roles: []const []const u8) !Evaluator {
+        return initForAuthenticatedPrincipal(alloc, view, settings, command, view.snapshot.principal, authenticated_roles);
+    }
+
+    /// Only owner-verified statement proofs may separate policy selection
+    /// from expression identity. Never rewrite the settings principal to the
+    /// view owner: current_user in USING predicates remains the caller.
+    pub fn initForAuthenticatedPrincipal(alloc: std.mem.Allocator, view: *const View, settings: *const setting_catalog.View, command: Action, policy_principal: []const u8, authenticated_roles: []const []const u8) !Evaluator {
         if (view.snapshot.catalog_epoch > settings.epoch or
             !std.mem.eql(u8, view.snapshot.principal, settings.scope.principal) or
             !std.mem.eql(u8, view.snapshot.database, settings.scope.database) or
@@ -614,7 +650,7 @@ pub const Evaluator = struct {
                 .update_old, .update_new => record.commands.update,
                 .delete => record.commands.delete,
             };
-            if (!applies or !roleMatches(record.roles, view.snapshot.principal, authenticated_roles)) continue;
+            if (!applies or !roleMatches(record.roles, policy_principal, authenticated_roles)) continue;
             const predicate: *const Predicate = switch (command) {
                 .insert, .update_new => if (record.with_check) |*program| program else return error.InvalidRowPolicyRecord,
                 .select, .delete, .update_old => if (record.using) |*program| program else return error.InvalidRowPolicyRecord,
@@ -694,6 +730,41 @@ fn evaluatePredicate(predicate: *const Predicate, settings: *const setting_catal
     if (result.sql_null) return false;
     if (result.value != .bool) return error.InvalidRowPolicyProgram;
     return result.value.bool;
+}
+
+test "row policy typed numeric and array predicates preserve native schema domains" {
+    const Fake = struct {
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{} };
+        }
+    };
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var settings = try setting_catalog.View.capture(a, .{ .ptr = &marker, .load = Fake.load }, .{ .principal = "caller", .database = "default" }, &.{});
+    defer settings.deinit();
+    const columns = [_]sql_catalog.Column{
+        .{ .name = "id", .path = "id", .type = .integer, .element_type = .int64 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .numeric },
+        .{ .name = "tags", .path = "tags", .type = .array, .element_type = .text },
+        .{ .name = "u", .path = "u", .type = .uuid, .element_type = .uuid },
+    };
+    var scalar_columns: [columns.len]scalar.Column = undefined;
+    for (columns, &scalar_columns) |column, *out| out.* = .{
+        .name = column.name,
+        .type = column.type,
+        .element_type = column.element_type,
+        .nullable = column.nullable,
+    };
+    for ([_][]const u8{
+        "id=1 AND amount>10 AND tags IS NOT NULL",
+        "u='A0EEBC999C0B4EF8BB6D6BB9BD380A11'",
+    }) |sql| {
+        var parsed = try @import("../sql/compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        var program = try scalar.bindExpectedWithSettings(a, parsed.expression, &scalar_columns, &.{}, .boolean, .{}, &settings);
+        defer program.deinit();
+        try (Predicate{ .instructions = program.instructions, .root = program.root }).validate(&columns, &settings);
+    }
 }
 
 test "row policy capture fences revocation and rejects client-writable setting dependencies" {
@@ -798,6 +869,11 @@ test "owner policy evaluator combines permissive and restrictive programs with S
     var bob_with_verified_role = try Evaluator.initForAuthenticatedRoles(alloc, &view, &settings, .select, &.{"alice"});
     defer bob_with_verified_role.deinit();
     try std.testing.expect(try bob_with_verified_role.permits(alloc, &.{ scalar.Datum.json(.{ .string = "a" }), scalar.Datum.json(.{ .bool = true }) }));
+    var owner_delegated = try Evaluator.initForAuthenticatedPrincipal(alloc, &view, &settings, .select, "alice", &.{});
+    defer owner_delegated.deinit();
+    try std.testing.expect(try owner_delegated.permits(alloc, &.{ scalar.Datum.json(.{ .string = "a" }), scalar.Datum.json(.{ .bool = true }) }));
+    try std.testing.expectEqualStrings("bob", owner_delegated.settings.scope.principal);
+    try std.testing.expectEqualStrings("bob", view.snapshot.principal);
     view.snapshot.principal = "alice";
     settings.scope.principal = "alice";
     var insert = try Evaluator.init(alloc, &view, &settings, .insert);

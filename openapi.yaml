@@ -4072,19 +4072,29 @@ paths:
       tags:
         - data_operations
       description: >
-        Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
+        Executes supported SQL statements through the current catalog and native
 
-        subset through the current catalog and native row execution contracts.
+        execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
 
-        Parameters are bound separately from statement text. Document, graph,
+        ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
 
-        and lake SQL sources, DDL, and SQL sessions are not yet supported.
+        endpoint. Views retain durable source identities; owner/invoker access
 
-        Reads inherit native owner-local consistency, not a global SQL
+        reuses native row policies and caller/owner filters without changing
 
-        transaction snapshot. Statements requiring a retained multi-page
+        the caller's SQL identity. Document fields can be projected with
 
-        statement snapshot fail when that capability is unavailable.
+        jsonb_to_record and declared SQL types, including typed arrays.
+
+        Parameters are bound separately from statement text. Source, DDL,
+
+        session, and transaction capabilities are checked explicitly; not every
+
+        PostgreSQL statement or cross-source transaction is supported.
+
+        Reads require the native retained statement-snapshot capabilities of
+
+        their sources, not an implied global SQL transaction snapshot.
 
         Unsupported statement shapes fail explicitly; the server never
 

@@ -609,7 +609,7 @@ pub const MutableState = struct {
     }
 };
 
-fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
+pub fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     var r = source;
     r.name = try alloc.dupe(u8, source.name);
     errdefer alloc.free(r.name);
@@ -1063,7 +1063,38 @@ pub const ConstraintNameCheck = struct {
     schema_json: []const u8,
 };
 
+/// SQL distinguishes stored views from physical tables; a logical view must
+/// never be represented by a fabricated table routing identity.
+pub const SqlSourceLookup = union(enum) { name: Target, table_id: u64, view_id: u64 };
+pub const SqlSource = struct {
+    target: Target,
+    value: union(enum) {
+        table: struct { binding: ResolvedTable, column_identities_json: ?[]const u8 = null },
+        view: Resource,
+    },
+
+    pub fn deinit(self: SqlSource, alloc: std.mem.Allocator) void {
+        alloc.free(self.target.database);
+        alloc.free(self.target.namespace);
+        alloc.free(self.target.table);
+        switch (self.value) {
+            .table => |value| {
+                value.binding.deinit(alloc);
+                if (value.column_identities_json) |bytes| alloc.free(bytes);
+            },
+            .view => |value| {
+                alloc.free(value.name);
+                alloc.free(value.storage_name);
+                alloc.free(value.location_json);
+                alloc.free(value.source_json);
+                if (value.placement_policy.placement_role) |bytes| alloc.free(bytes);
+            },
+        }
+    }
+};
+
 pub const ResolveMany = struct {
+    sql_sources: []const SqlSourceLookup = &.{},
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.
     /// Captured with forward bindings in the same immutable catalog read.
@@ -1077,6 +1108,7 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.sql_sources.len != 0) return jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources });
         if (self.relations.len != 0 or self.expected_relation_epoch != null) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else {
@@ -1087,6 +1119,8 @@ pub const ResolveMany = struct {
 };
 
 pub const ResolvedMany = struct {
+    sql_sources: []const ?SqlSource = &.{},
+    sql_sources_resolved: bool = false,
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
@@ -1098,6 +1132,7 @@ pub const ResolvedMany = struct {
     relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.sql_sources_resolved) return jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = true });
         if (self.relation_epoch != null or self.relations.len != 0) {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else {
@@ -1128,6 +1163,8 @@ pub const ResolvedMany = struct {
     }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        for (self.sql_sources) |source| if (source) |value| value.deinit(alloc);
+        alloc.free(self.sql_sources);
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
         for (self.logical_names) |name| if (name) |value| alloc.free(value);

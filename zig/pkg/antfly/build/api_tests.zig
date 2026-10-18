@@ -2166,6 +2166,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation",
             "mounted SQL original nullability validates staged generations and preserves relaxation across restart",
             "mounted SQL original unique indexes enforce exact postimages across owner restart",
+            "mounted SQL original views preserve identity dependencies and postimages across owner restart",
+            "mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart",
             "mounted SQL original expression indexes build maintain partial keys and recover owners",
             "mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart",
             "mounted SQL original nonunique expression indexes preserve keys mutations and cold owners",
@@ -2208,6 +2210,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_index_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-lifecycle-test", "Run exact original index DDL, data-owner enforcement and restart qualification")
         .dependOn(&sql_index_lifecycle_run.step);
+    const sql_view_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original views preserve identity dependencies and postimages across owner restart"});
+    sql_view_lifecycle_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-view-lifecycle-test", "Run original authenticated view DDL, identity dependencies, remote reads and cold data-owner recovery")
+        .dependOn(&sql_view_lifecycle_run.step);
+    const sql_document_view_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart"});
+    sql_document_view_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-document-view-lifecycle-test", "Run exact original document-view queries with raw JSON, typed arrays, remote owners and cold recovery")
+        .dependOn(&sql_document_view_run.step);
     const sql_expression_index_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original expression indexes build maintain partial keys and recover owners"});
     sql_expression_index_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-expression-index-lifecycle-test", "Run original expression/covering/partial indexes through owner builds mutations and cold restart")

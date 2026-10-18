@@ -114,9 +114,10 @@ const std = @import("std");
 /// authorize adoption of a different physical root.
 /// Version 54 adds incarnation/plan-bound SQL cancellation and its explicit
 /// command guard encoding. Earlier private cancellation bytes are not accepted.
-pub const current_version: u16 = 54;
-/// Views join this unreleased SQL catalog cohort, not another draft wire epoch.
-pub const sql_view_catalog_version: u16 = current_version;
+/// Version 55 decodes stored-view lifecycle commands and delegated read proofs
+/// separating caller, policy-selection, and credential-settings principals.
+pub const current_version: u16 = 55;
+pub const sql_view_catalog_version: u16 = 55;
 pub const index_publication_release_version: u16 = 54;
 // One coordinated floor for this unreleased protocol. A cohort capable only
 // of an earlier partial stage must not admit work that it cannot finish.

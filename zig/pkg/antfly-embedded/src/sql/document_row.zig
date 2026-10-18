@@ -89,26 +89,14 @@ pub fn deriveRelationalColumnsLeaky(owned: std.mem.Allocator, temporary: std.mem
         }
     }
     const columns = try owned.alloc(catalog.Column, native.relational_columns.len);
-    for (native.relational_columns, columns) |column, *out| out.* = .{
-        .name = try owned.dupe(u8, column.name),
-        .path = try owned.dupe(u8, column.path),
-        .nullable = !column.required or column.allows_null,
-        .generated = generated.contains(column.name),
-        .defaulted = catalog.hasColumnDefault(parsed, column.name),
-        .element_type = column.sql_element_type,
-        .numeric_modifier = column.numeric_modifier,
-        .type = relationalType(parsed, column.name, switch (column.column_type) {
-            .string => .string,
-            .integer => .integer,
-            .number => .number,
-            .numeric => .number,
-            .boolean => .boolean,
-            .datetime => .datetime,
-            .json => .json,
-            .sql_array => .array,
-            else => return error.UnsupportedSqlExecution,
-        }),
-    };
+    for (native.relational_columns, columns) |column, *out| {
+        out.* = try catalog.Column.fromRelational(column);
+        out.name = try owned.dupe(u8, column.name);
+        out.path = try owned.dupe(u8, column.path);
+        out.generated = generated.contains(column.name);
+        out.defaulted = catalog.hasColumnDefault(parsed, column.name);
+        out.type = relationalType(parsed, column.name, out.type);
+    }
     return columns;
 }
 

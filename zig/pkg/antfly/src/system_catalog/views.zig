@@ -24,6 +24,60 @@ const domain = sources.system_catalog_domain;
 const A = std.mem.Allocator;
 
 pub const max_bytes = domain.max_command_bytes;
+
+pub const Identity = struct { id: u64, generation: u32 };
+/// Private catalog intent. Ingress derives the owner and bound definition;
+/// neither SQL text nor a public request may supply an execution credential.
+pub const Mutation = struct {
+    target: domain.Target,
+    operation: union(enum) {
+        publish: struct { definition: definitions.Definition, replace: bool = false, expected: ?Identity = null },
+        rename: struct { expected: Identity, name: []const u8 },
+        drop: struct { expected: ?Identity = null, if_exists: bool = false, cascade: bool = false },
+    },
+
+    pub fn validate(self: Mutation) !void {
+        try self.target.validate();
+        switch (self.operation) {
+            .publish => |value| {
+                if (!value.replace and value.expected != null) return error.InvalidCatalogMutation;
+                if (value.expected) |identity| try validateIdentity(identity);
+            },
+            .rename => |value| {
+                try validateIdentity(value.expected);
+                var target = self.target;
+                target.table = value.name;
+                try target.validate();
+            },
+            .drop => |value| if (value.expected) |identity| try validateIdentity(identity),
+        }
+    }
+};
+fn validateIdentity(identity: Identity) !void {
+    if (identity.id == 0 or identity.generation == 0) return error.InvalidCatalogMutation;
+}
+pub const MutationResult = struct { revision: u64, identity: ?Identity, removed: usize = 0 };
+pub const Request = struct { expected_revision: u64, mutation: Mutation };
+
+pub fn command(request: Request) @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand {
+    return .{
+        .version = 2,
+        .expected_revision = request.expected_revision,
+        .mutation = .{
+            .kind = .view,
+            .action = switch (request.mutation.operation) {
+                .publish => .create,
+                .rename => .rename,
+                .drop => .drop,
+            },
+            .database = request.mutation.target.database,
+            .namespace = request.mutation.target.namespace,
+            .name = request.mutation.target.table,
+        },
+        .sql_view = request.mutation,
+    };
+}
+
 fn bindingDigest(a: A, definition: definitions.Definition, columns: []const []const u64) ![32]u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .definition = definition, .source_columns = columns }, .{});
     defer a.free(bytes);
@@ -158,7 +212,7 @@ pub const Record = struct {
             references.deinit(a);
         }
         for (definition.sources, self.source_columns) |source, columns| {
-            if (source.table_id == 0 or source.schema_version == 0 or
+            if (source.table_id == 0 or (source.kind == .view and source.schema_version == 0) or
                 std.mem.allEqual(u8, &source.schema_digest, 0) or
                 source.columns.len > identities.max_columns or
                 columns.len != source.columns.len or

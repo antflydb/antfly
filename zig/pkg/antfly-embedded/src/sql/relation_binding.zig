@@ -103,7 +103,7 @@ fn qualifierMatches(column: Column, qualifier: []const u8) bool {
 
 fn physicalScope(table: catalog.Table, name: ast.Name, aliased: bool) ?catalog.Table.Scope {
     if (aliased) return null;
-    return table.scope orelse if (name.namespace) |namespace| .{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
+    return table.binding_scope orelse table.scope orelse if (name.namespace) |namespace| .{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
 }
 
 pub const Node = struct {
@@ -122,6 +122,8 @@ pub const Node = struct {
     };
     columns: []const Column,
     replay_policy: ReplayPolicy = .captured,
+    security_barrier: bool = false,
+    row_filter: ?catalog.ViewRowFilter = null,
     operation: union(enum) {
         singleton,
         recursive_ref: usize,
@@ -224,7 +226,11 @@ pub const ResolveAdapter = struct {
     backend: catalog.Backend,
     table: catalog.Table,
     pub fn iface(self: *ResolveAdapter) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .parameter_invocation = self.backend.parameter_invocation, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        var result = self.backend;
+        result.ptr = self;
+        result.prepared_read = null;
+        result.vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint };
+        return result;
     }
     fn resolve(ptr: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
         if (action != .read) return error.UnsupportedSqlExecution;
@@ -253,25 +259,36 @@ pub const TargetResolveAdapter = struct {
     /// A mutation statement must bind every occurrence of a source against
     /// the same authorized catalog identity, including an optimized rebind.
     cache_sources: bool = false,
-    source_tables: std.StringHashMapUnmanaged(catalog.Table) = .empty,
+    source_tables: std.StringHashMapUnmanaged(catalog.ReadRelation) = .empty,
     pub fn iface(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .supports_search_relations = self.backend.supports_search_relations, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .parameter_invocation = self.backend.parameter_invocation, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        var result = self.backend;
+        result.ptr = self;
+        result.prepared_read = null;
+        result.vtable = &.{ .resolve_read = resolveRead, .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint };
+        return result;
     }
     fn resolve(ptr: *anyopaque, alloc: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         // This adapter is only used while binding the read side of a mutation.
         // Never let a future caller turn the pinned target into an implicit
         // authorization for a second write or an administrative operation.
         if (action != .read) return error.UnsupportedSqlExecution;
+        const resolved = try resolveRead(ptr, alloc, name);
+        return switch (resolved) {
+            .table => |table| table,
+            .view => error.UnsupportedSqlShape,
+        };
+    }
+    fn resolveRead(ptr: *anyopaque, alloc: Allocator, name: ast.Name) !catalog.ReadRelation {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (std.mem.eql(u8, name.table, self.name.table) and std.mem.eql(u8, name.database orelse "", self.name.database orelse "") and std.mem.eql(u8, name.namespace orelse "", self.name.namespace orelse "")) return self.table;
-        if (!self.cache_sources) return self.backend.vtable.resolve(self.backend.ptr, alloc, name, action);
+        if (std.mem.eql(u8, name.table, self.name.table) and std.mem.eql(u8, name.database orelse "", self.name.database orelse "") and std.mem.eql(u8, name.namespace orelse "", self.name.namespace orelse "")) return .{ .table = self.table };
+        if (!self.cache_sources) return self.backend.resolveRead(alloc, name);
         const key = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ name.database orelse "", name.namespace orelse "", name.table });
         if (self.source_tables.get(key)) |cached| {
             alloc.free(key);
             return cached;
         }
         errdefer alloc.free(key);
-        const resolved = try self.backend.vtable.resolve(self.backend.ptr, alloc, name, action);
+        const resolved = try self.backend.resolveRead(alloc, name);
         try self.source_tables.put(alloc, key, resolved);
         return resolved;
     }
@@ -325,6 +342,12 @@ const PhaseEquality = struct {
     }
 };
 
+const MaterializedIdentity = struct {
+    query: *const ast.Select,
+    binding_scope: usize,
+    outer_frame: ?usize,
+};
+
 const Builder = struct {
     alloc: Allocator,
     backend: catalog.Backend,
@@ -337,7 +360,9 @@ const Builder = struct {
     capture_dependencies: bool = false,
     dependency_origins: std.StringHashMapUnmanaged(ColumnDependency) = .empty,
     dependency_references: std.StringHashMapUnmanaged(void) = .empty,
-    identities: std.StringHashMapUnmanaged(catalog.Table) = .empty,
+    identities: std.StringHashMapUnmanaged(catalog.ReadRelation) = .empty,
+    view_path: [64]u64 = undefined,
+    view_depth: usize = 0,
     outer_references: ?*std.StringHashMapUnmanaged(void) = null,
     next_column: usize = 0,
     nodes: usize = 0,
@@ -348,7 +373,10 @@ const Builder = struct {
     shape_columns: std.ArrayList(scalar.Column) = .empty,
     constraints: std.ArrayList(Constraint) = .empty,
     recursive_nodes: std.AutoHashMapUnmanaged(*const ast.Select, *const Node) = .empty,
-    materialized_nodes: std.AutoHashMapUnmanaged(*const ast.Select, *const Node) = .empty,
+    // A stored body is one immutable AST but can be bound at multiple lexical
+    // correlation sites. Share a producer only within its binding authority
+    // and defining outer frame, never by AST address alone.
+    materialized_nodes: std.AutoHashMapUnmanaged(MaterializedIdentity, *const Node) = .empty,
     auto_materialized: std.AutoHashMapUnmanaged(*const ast.Select, void) = .empty,
     recursive_active: ?*const RecursiveFrame = null,
     recursive_next: usize = 0,
@@ -1555,9 +1583,14 @@ const Builder = struct {
                             if (cte.recursive and try @import("recursive_shape.zig").references(cte.query.*, cte.name, 0) != 0)
                                 break :blk try self.recursiveCte(cte, reference.alias orelse cte.name, scope[0..i], depth + 1);
                             if (cte.materialization == .materialized or (cte.materialization == .automatic and self.auto_materialized.contains(cte.query))) {
-                                const materialized = self.materialized_nodes.get(cte.query) orelse source: {
+                                const materialized_identity: MaterializedIdentity = .{
+                                    .query = cte.query,
+                                    .binding_scope = self.backend.binding_scope,
+                                    .outer_frame = if (self.outer_scope) |frame| frame.id else null,
+                                };
+                                const materialized = self.materialized_nodes.get(materialized_identity) orelse source: {
                                     const source = try self.derived(cte.query, cte.name, cte.columns, scope[0..i], depth + 1);
-                                    try self.materialized_nodes.put(self.alloc, cte.query, source);
+                                    try self.materialized_nodes.put(self.alloc, materialized_identity, source);
                                     break :source source;
                                 };
                                 const columns = try self.alloc.dupe(Column, materialized.columns);
@@ -1571,10 +1604,71 @@ const Builder = struct {
                         }
                     }
                 }
-                const identity = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
+                const identity = try std.fmt.allocPrint(self.alloc, "{d}\x00{s}\x00{s}\x00{s}", .{ self.backend.binding_scope, reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
                 const entry = try self.identities.getOrPut(self.alloc, identity);
-                if (!entry.found_existing) entry.value_ptr.* = try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
-                var table = entry.value_ptr.*;
+                if (!entry.found_existing) entry.value_ptr.* = try self.backend.resolveRead(self.alloc, reference.name);
+                const resolved = entry.value_ptr.*;
+                if (resolved == .view) {
+                    if (reference.search != null or reference.mutation_target or reference.prepared_rows) return error.UnsupportedSqlShape;
+                    const view = resolved.view;
+                    if (view.id == 0 or view.generation == 0 or view.backend.binding_scope == 0 or self.view_depth >= self.view_path.len) return error.InvalidSqlBackendResponse;
+                    for (self.view_path[0..self.view_depth]) |id| if (id == view.id) return error.SqlViewCycle;
+                    const previous_backend = self.backend;
+                    const previous_outer = self.outer_scope;
+                    self.view_path[self.view_depth] = view.id;
+                    self.view_depth += 1;
+                    // Change only name-resolution authority. The invocation,
+                    // clock, regex budget and caller settings belong to the
+                    // enclosing statement, not the stored view provider.
+                    self.backend.ptr = view.backend.ptr;
+                    self.backend.vtable = view.backend.vtable;
+                    self.backend.binding_scope = view.backend.binding_scope;
+                    self.backend.settings_view = previous_backend.settings_view orelse view.backend.settings_view;
+                    self.backend.prepared_read = null;
+                    self.outer_scope = null;
+                    defer {
+                        self.backend = previous_backend;
+                        self.outer_scope = previous_outer;
+                        self.view_depth -= 1;
+                    }
+                    const names = try self.alloc.alloc([]const u8, view.columns.len);
+                    for (view.columns, names) |column, *name| name.* = column.name;
+                    // A stored view has its own lexical scope: caller CTEs,
+                    // lateral frames and correlation may never enter its body.
+                    var result = try self.derived(view.query, reference.alias orelse reference.name.table, names, &.{}, depth + 1);
+                    if (result.columns.len != view.columns.len) return error.InvalidSqlBackendResponse;
+                    for (result.columns, view.columns) |actual, expected| {
+                        const column: catalog.Column = .{ .name = actual.name, .path = actual.name, .type = actual.type, .element_type = actual.element_type, .numeric_modifier = actual.numeric_modifier };
+                        if (!std.mem.eql(u8, &try column.identitySignature(self.alloc), &try expected.identitySignature(self.alloc))) return error.CatalogGenerationChanged;
+                    }
+                    // Authorization uses the complete view output before a
+                    // parent's frozen exposure narrows/relabels its columns.
+                    @constCast(result).row_filter = view.row_filter;
+                    if (view.exposure) |exposure| {
+                        if (exposure.len == 0) return error.InvalidSqlBackendResponse;
+                        const projections = try self.alloc.alloc(ast.Projection, exposure.len);
+                        const columns = try self.alloc.alloc(Column, exposure.len);
+                        for (exposure, projections, columns) |item, *projection, *column| {
+                            if (item.ordinal >= result.columns.len) return error.InvalidSqlBackendResponse;
+                            const forwarded = result.columns[item.ordinal];
+                            projection.* = .{ .field = forwarded.internal, .alias = item.name };
+                            column.* = forwarded;
+                            column.name = item.name;
+                            column.internal = try self.internal();
+                        }
+                        const selection: ast.Select = .{ .table = .{ .table = "$view_output" }, .columns = projections };
+                        var adapter: ResolveAdapter = .{ .backend = self.backend, .table = try self.virtualTable(result.columns) };
+                        const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = selection }, .parameter_count = @intCast(self.parameters.len) };
+                        const bound = try describe.bindInternal(self.alloc, adapter.iface(), &compiled, self.parameters);
+                        result = try self.node(columns, .{ .query = .{ .source = result, .statement = selection, .binding = bound } });
+                    }
+                    @constCast(result).security_barrier = view.security_barrier or result.row_filter != null;
+                    if (reference.alias == null) for (@constCast(result.columns)) |*column| {
+                        column.scope = .{ .database = reference.name.database orelse "", .namespace = reference.name.namespace orelse "", .name = reference.name.table, .revision = 0 };
+                    };
+                    break :blk result;
+                }
+                var table = resolved.table;
                 if (reference.search) |search| {
                     if (!self.backend.supports_search_relations) return error.UnsupportedSqlExecution;
                     if (reference.mutation_target) return error.UnsupportedSqlShape;
@@ -1627,7 +1721,6 @@ const Builder = struct {
                     source_columns[table.columns.len + virtual_count + i] = name;
                 }
                 if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable });
-                source_columns[table.columns.len] = "_id";
                 if (reference.prepared_rows) {
                     if (reference.mutation_target or reference.mutation_document or reference.mutation_presence) return error.InvalidSqlBackendResponse;
                     break :blk try self.node(columns, .{ .prepared_rows = source_columns });
@@ -1910,8 +2003,30 @@ const Builder = struct {
         var right_node = binary.right;
         if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) std.mem.swap(*const ast.Scalar, &left_node, &right_node);
         if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) return;
-        try left_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, left_node, try self.scalarColumns(left.columns), self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view));
-        try right_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, right_node, try self.scalarColumns(right.columns), self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view));
+        const left_columns = try self.scalarColumns(left.columns);
+        const right_columns = try self.scalarColumns(right.columns);
+        const left_type = try scalar.inferOutputWithInvocation(self.alloc, left_node, left_columns, self.parameters, self.backend.parameter_invocation);
+        const right_type = try scalar.inferOutputWithInvocation(self.alloc, right_node, right_columns, self.parameters, self.backend.parameter_invocation);
+        const numeric_pair = (left_type.kind == .integer or left_type.kind == .number) and
+            (right_type.kind == .integer or right_type.kind == .number);
+        if (numeric_pair) {
+            const domain = try scalar.comparisonDomain(left_type, right_type);
+            const element = scalar.columnElementType(domain.kind.?, domain.element_type);
+            // Keep identity operands bare: native exact key spooling,
+            // scan-filter lineage and join partials depend on this shape.
+            if (left_type.kind != domain.kind or scalar.columnElementType(left_type.kind.?, left_type.element_type) != element)
+                left_node = try self.scalarNode(.{ .cast = .{ .operand = left_node, .type = domain.kind.?, .element_type = domain.element_type } });
+            if (right_type.kind != domain.kind or scalar.columnElementType(right_type.kind.?, right_type.element_type) != element)
+                right_node = try self.scalarNode(.{ .cast = .{ .operand = right_node, .type = domain.kind.?, .element_type = domain.element_type } });
+        } else if (left_type.kind != right_type.kind or scalar.columnElementType(left_type.kind orelse return, left_type.element_type) !=
+            scalar.columnElementType(right_type.kind orelse return, right_type.element_type))
+        {
+            // A residual equality is always authoritative. Do not install a
+            // false-negative hash prefilter for an unproven mixed domain.
+            return;
+        }
+        try left_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, left_node, left_columns, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view));
+        try right_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, right_node, right_columns, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view));
     }
 };
 /// Expressions whose inputs belong to one side are valid hash keys too.

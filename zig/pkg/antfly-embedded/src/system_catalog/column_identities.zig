@@ -45,7 +45,7 @@ pub const State = struct {
     columns: []const Column,
 
     pub fn validate(self: State, a: A) !void {
-        if (self.format != 1 or self.table_id == 0 or self.epoch.version == 0 or !validDigest(self.epoch.digest) or self.next_id == 0 or self.columns.len > max_columns) return error.InvalidColumnIdentityState;
+        if (self.format != 1 or self.table_id == 0 or !validDigest(self.epoch.digest) or self.next_id == 0 or self.columns.len > max_columns) return error.InvalidColumnIdentityState;
         var names: std.StringHashMapUnmanaged(void) = .empty;
         defer names.deinit(a);
         var prior: u64 = 0;
@@ -103,7 +103,9 @@ pub const Owned = struct {
 /// Publication/dependency guards belong to the caller's catalog transaction.
 /// An absent predecessor is bootstrap, not a read-time allocation capability.
 pub fn prepare(backing: A, table_id: u64, previous: ?State, epoch: Epoch, declarations: []const Declaration, renames: []const Rename) !Owned {
-    if (table_id == 0 or epoch.version == 0 or !validDigest(epoch.digest)) return error.InvalidColumnIdentityState;
+    // Native CREATE TABLE starts at schema version zero. Presence and the
+    // nonzero schema digest distinguish that valid epoch from absent state.
+    if (table_id == 0 or !validDigest(epoch.digest)) return error.InvalidColumnIdentityState;
     if (declarations.len > max_columns or renames.len > max_columns) return error.ColumnIdentityLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(backing);
     errdefer arena.deinit();
@@ -208,6 +210,23 @@ pub fn Store(comptime Txn: type) type {
             try self.txn.put(&try key(.{ .group = self.group_id, .table = value.table_id }), encoded);
         }
     };
+}
+
+test "SQL column identities admit native zero schema epochs without accepting absent or substituted state" {
+    const a = std.testing.allocator;
+    var initial = try prepare(a, 7, null, .{ .version = 0, .digest = @splat(1) }, &.{.{ .name = "id", .signature = @splat(2) }}, &.{});
+    defer initial.deinit();
+    const bytes = try initial.value.encode(a);
+    defer a.free(bytes);
+    var restored = try State.decode(a, bytes);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u32, 0), restored.value.epoch.version);
+    try std.testing.expectEqual(@as(u64, 1), (try restored.value.requireDependency(1, @splat(2))).id);
+    try std.testing.expectError(error.InvalidColumnIdentityState, prepare(a, 7, null, .{ .version = 0, .digest = @splat(0) }, &.{}, &.{}));
+    try std.testing.expectError(error.ColumnIdentityEpochChanged, prepare(a, 7, restored.value, .{ .version = 0, .digest = @splat(3) }, &.{}, &.{}));
+    var next = try prepare(a, 7, restored.value, .{ .version = 1, .digest = @splat(3) }, &.{.{ .name = "id", .signature = @splat(2) }}, &.{});
+    defer next.deinit();
+    try std.testing.expectEqual(@as(u64, 1), next.value.columns[0].id);
 }
 
 test "SQL column identities retain rename and reorder while dropped names never recycle IDs" {

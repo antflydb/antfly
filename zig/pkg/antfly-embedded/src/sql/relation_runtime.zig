@@ -941,6 +941,7 @@ fn Engine(comptime Context: type) type {
             node: *const binding.Node,
             arena: std.heap.ArenaAllocator,
             scratch: std.heap.ArenaAllocator,
+            filter_arena: std.heap.ArenaAllocator,
             left: ?*Iterator = null,
             right: ?*Iterator = null,
             page: ?catalog.Page = null,
@@ -1016,7 +1017,7 @@ fn Engine(comptime Context: type) type {
             fn createContext(engine: *Self, node: *const binding.Node, recursive_id: ?usize, apply_mode: bool) anyerror!*Iterator {
                 const alloc = engine.context.alloc;
                 const self = try alloc.create(Iterator);
-                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
+                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .filter_arena = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
                 errdefer self.deinit();
                 if (recursive_id) |id| if (node.replay_policy != .streaming and !dependsOn(node, id)) {
                     self.cached_reader = try (try engine.prefixRows(node)).openReader();
@@ -1060,7 +1061,10 @@ fn Engine(comptime Context: type) type {
                 if (self.page) |page| page.deinit();
                 if (self.left) |left| left.deinit();
                 if (self.right) |right| right.deinit();
-                if (self.node.operation == .apply) self.engine.clearOuter(self.node.operation.apply.id);
+                // An invariant Apply can itself be a replay consumer. Only
+                // the iterator that installed an active outer row owns its
+                // scope; closing a cached consumer must not retire its producer.
+                if (self.node.operation == .apply and self.left_values != null) self.engine.clearOuter(self.node.operation.apply.id);
                 if (self.values_leaf) |leaf| leaf.deinit();
                 if (self.join_view) |view| view.deinit();
                 if (self.partition_join) |join| join.close();
@@ -1074,9 +1078,11 @@ fn Engine(comptime Context: type) type {
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
+                self.filter_arena.deinit();
                 self.engine.context.alloc.destroy(self);
             }
             pub fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+                if (self.node.row_filter != null) return self.nextRowsBatch(a, maximum, failure);
                 if (self.sampled) |sample| {
                     const count = @min(maximum, sample.len() - self.sampled_index);
                     if (count != 0) {
@@ -1144,6 +1150,9 @@ fn Engine(comptime Context: type) type {
                         return .{ .columns = .{ .page = page, .definitions = definitions } };
                     }
                 }
+                return self.nextRowsBatch(a, maximum, failure);
+            }
+            fn nextRowsBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 var rows: std.ArrayList([]const Datum) = .empty;
                 var retained: usize = 0;
                 while (rows.items.len < maximum) {
@@ -1165,6 +1174,19 @@ fn Engine(comptime Context: type) type {
                 return .{ .rows = rows.items };
             }
             pub fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
+                const filter = self.node.row_filter orelse return self.nextUnfiltered(alloc);
+                while (true) {
+                    try self.engine.checkpoint();
+                    // Rejected rows must not accumulate in the consumer's
+                    // result/batch arena. Accepted cells borrow this region
+                    // until the next pull, like native source-page cells.
+                    if (!self.filter_arena.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
+                    const scratch = self.filter_arena.allocator();
+                    const values = (try self.nextUnfiltered(scratch)) orelse return null;
+                    if (try filter.matches(filter.ptr, scratch, values)) return values;
+                }
+            }
+            fn nextUnfiltered(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
                 if (self.sampled) |sample| {
                     if (self.sampled_index < sample.len()) {

@@ -41,7 +41,7 @@ const SettingLoader = struct {
 
 fn bindPredicate(alloc: std.mem.Allocator, expression: *const ast.Scalar, table: catalog.Table, view: *const settings.View) !scalar.Program {
     const columns = try alloc.alloc(scalar.Column, table.columns.len);
-    for (table.columns, columns) |column, *out| out.* = .{ .name = column.name, .type = column.type, .nullable = column.nullable };
+    for (table.columns, columns) |column, *out| out.* = .{ .name = column.name, .type = column.type, .nullable = column.nullable, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
     return scalar.bindExpectedWithSettings(alloc, expression, columns, &.{}, .boolean, .{}, view);
 }
 
@@ -95,6 +95,15 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const prior: ?policies.Record = for (state.policies) |record| {
         if (record.table_id == physical.table_id and std.ascii.eqlIgnoreCase(record.name, ddl.name)) break record;
     } else null;
+    // The command borrows compiled predicates and setting identities until
+    // the authority has serialized/proposed it. Block-local deinit would
+    // publish dangling instruction slices, hidden by some arena allocators.
+    var predicate_settings: ?settings.View = null;
+    defer if (predicate_settings) |*view| view.deinit();
+    var using_program: ?scalar.Program = null;
+    defer if (using_program) |*program| program.deinit();
+    var check_program: ?scalar.Program = null;
+    defer if (check_program) |*program| program.deinit();
     const change: policies.Command = switch (ddl.action) {
         .enable, .disable => unreachable,
         .drop => blk: {
@@ -110,12 +119,10 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             if (prior) |record| if (record.schema_version != table.schema_version or !std.mem.eql(u8, &record.schema_digest, &schema_digest)) return error.RowPolicyCatalogChanged;
             const principal = if (identity) |authenticated| server_mod.transactionPrincipal(authenticated) orelse authenticated.username else "internal_admin";
             var loader: SettingLoader = .{ .server = server, .context = context };
-            var view = try settings.View.capture(a, .{ .ptr = &loader, .load = SettingLoader.load }, .{ .principal = principal, .database = target.database }, &.{});
-            defer view.deinit();
-            var using_program: ?scalar.Program = if (ddl.using) |expression| try bindPredicate(a, expression, table, &view) else null;
-            defer if (using_program) |*program| program.deinit();
-            var check_program: ?scalar.Program = if (ddl.with_check) |expression| try bindPredicate(a, expression, table, &view) else null;
-            defer if (check_program) |*program| program.deinit();
+            predicate_settings = try settings.View.capture(a, .{ .ptr = &loader, .load = SettingLoader.load }, .{ .principal = principal, .database = target.database }, &.{});
+            const view = &predicate_settings.?;
+            using_program = if (ddl.using) |expression| try bindPredicate(a, expression, table, view) else null;
+            check_program = if (ddl.with_check) |expression| try bindPredicate(a, expression, table, view) else null;
             const commands = if (prior) |record| record.commands else commandScope(ddl.command);
             if (ddl.action == .alter) {
                 if (ddl.using_specified and !commands.select and !commands.update and !commands.delete) return error.InvalidSqlSyntax;
@@ -134,7 +141,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 .using = if (ddl.using_specified or ddl.action == .create) if (using_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else prior.?.using,
                 .with_check = if (ddl.check_specified or ddl.action == .create) if (check_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else prior.?.with_check,
             };
-            try record.validate(table, schema_digest, &view);
+            try record.validate(table, schema_digest, view);
             break :blk .{ .expected_revision = state.revision, .change = .{ .put = record } };
         },
     };
@@ -174,6 +181,12 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
                     try std.testing.expectEqual(@as(u64, 17), command.change.put.table_id);
                     try std.testing.expect(command.change.put.commands.select);
                     try std.testing.expect(command.change.put.using != null);
+                    // Inspect the borrowed bytes at the real consumer edge,
+                    // not just the optional's presence after plan teardown.
+                    var encoded: std.Io.Writer.Allocating = .init(alloc);
+                    defer encoded.deinit();
+                    var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
+                    try @import("antfly_local_sources").storage_db_relational_integrity_json.write(command, &stream);
                     self.mutation_calls += 1;
                     break :blk alloc.dupe(u8, "{\"revision\":8}");
                 },

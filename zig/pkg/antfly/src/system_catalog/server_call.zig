@@ -116,6 +116,7 @@ pub const Call = union(enum) {
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
+    sql_view_mutate: @import("views.zig").Request,
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
@@ -127,7 +128,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin => true,
+            .sql_view_mutate, .relation_replace, .relation_schema_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };

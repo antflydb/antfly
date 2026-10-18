@@ -64,10 +64,9 @@ pub const EvaluationScratch = struct {
         _ = self.arena.reset(.retain_capacity);
         const scratch = self.arena.allocator();
         for (evaluator.required_columns) |ordinal| {
-            const index: usize = @intCast(ordinal);
-            self.cells[index] = .{};
-            const cell = (try row.findCell(index)) orelse continue;
-            self.cells[index] = .{ .value = try row.materializeCellAlloc(scratch, cell), .sql_null = cell.is_null };
+            const value = (try row.sqlDatumAlloc(scratch, ordinal)) orelse scalar.Datum{};
+            const column = try @import("../../sql/catalog.zig").Column.fromRelational(row.table_schema.relational_columns[ordinal]);
+            self.cells[ordinal] = try @import("../../sql/document_row.zig").declaredCell(scratch, column, value);
         }
         return evaluator.permitsWithScratch(scratch, self.cells);
     }
@@ -259,7 +258,7 @@ pub const Gate = struct {
         if (state.row_policy_phase == .disabled or state.row_policy_phase == .active) {
             if (state.row_policy_phase == .active and
                 (state.row_policy_generation == 0 or state.row_policy_catalog_epoch == 0 or
-                    state.active_schema_version == 0 or state.storage_mode != .relational or
+                    state.storage_mode != .relational or
                     state.row_policy_generation < self.generation.load(.acquire))) return error.RowPolicyCatalogChanged;
             if (state.row_policy_phase == .disabled and
                 (state.row_policy_generation < self.generation.load(.acquire) or
@@ -273,6 +272,29 @@ pub const Gate = struct {
         return error.RowPolicyCatalogChanged;
     }
 };
+
+test "row-policy gate publishes native zero schema epochs but retains generation guards" {
+    var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 0 });
+    try gate.beginPreparing(.disabled);
+    try std.testing.expectError(error.RowPolicyCatalogChanged, gate.publishCommitted(.{
+        .mode_initialized = true,
+        .storage_mode = .relational,
+        .active_schema_version = 0,
+        .row_policy_phase = .active,
+        .row_policy_generation = 0,
+        .row_policy_catalog_epoch = 1,
+    }));
+    try gate.publishCommitted(.{
+        .mode_initialized = true,
+        .storage_mode = .relational,
+        .active_schema_version = 0,
+        .row_policy_phase = .active,
+        .row_policy_generation = 1,
+        .row_policy_catalog_epoch = 1,
+    });
+    try std.testing.expectEqual(@as(u32, 0), gate.schema_version.load(.acquire));
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, gate.enterRaw());
+}
 
 test "row-policy gate drains raw leases before publishing a generation" {
     var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3 });

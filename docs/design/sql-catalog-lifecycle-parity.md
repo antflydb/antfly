@@ -9827,7 +9827,7 @@ IDs. Replacement retains ownership and the existing output-name/type prefix;
 appended outputs get new IDs. Omitted security options reset to defaults,
 matching PostgreSQL rather than inheriting the old view options.
 
-Publication checks the existing unreleased SQL cohort floor (54), a verified
+Publication checks the stored-view SQL cohort floor (55), a verified
 occupancy-capable physical namespace root, target identity/generation and source
 epochs before writing. Source-attribute bootstrap, the view resource/name
 index, catalog counters and authoritative reverse dependency edges commit in
@@ -9869,6 +9869,125 @@ removed and the retry passed all 83 build steps and 11 tests in
 /private/tmp/antfly-sql-view-catalog-api-retry-debug.log. Original-case dispositions remain
 559 implemented / 131 rejected / 125 superseded / 771 unresolved.
 
+### Stored-view lifecycle and execution-authority integration checkpoint
+
+The private catalog command now carries a typed view lifecycle intent through
+the existing apply_system_catalog envelope. Read-only preflight and committed
+apply share admission logic; catalog revision/command-hash receipts distinguish
+an admitted result from an ambiguous response. Standalone uses the same command
+under its existing mutation barrier and standby outbox. CREATE/REPLACE, rename,
+RESTRICT and bounded atomic CASCADE operate on namespace-owned resources and
+durable IDs. CASCADE plans the entire closure before writing, verifies both
+directions of every traversed dependency, and rejects corrupt edges rather
+than repairing them. Its explicit limits are 256 views, 16384 dependency edges,
+and 3 MiB of retained definition bytes. Cyclic view replacement is admitted,
+matching PostgreSQL; expansion reports 42P17 and CASCADE remains finite.
+
+Qualified SQL source reads now return tagged table/view results, including
+current attribute registries when requested. Names and IDs are resolved in one
+catalog cut; older responses without the tagged-resolution capability cannot
+prove a missing view. View mutations include source-attribute changes in the
+existing metadata snapshot projection mask. No additional restore system is
+introduced.
+
+The relational binder has a request-owned view resolver boundary. Expansion
+uses the existing derived-query operators, preserves captured output exposure,
+isolates caller CTE/correlation scopes, bounds recursion, and retains the
+enclosing invocation, clock, regex budget and SQL settings. Binding-cache keys
+include the private resolver scope. Security-barrier nodes stop caller predicate
+and dynamic join-filter lineage without preventing optimization of the view's
+own producer predicates.
+
+Read authority is separate from the adapter's original caller identity. Policy
+proof cache keys include the source schema/catalog epoch and private authority,
+not just table ID. Scoped scan, lake rejection and staged-overlay paths reuse
+Antfly's existing row-policy proofs and row-filter machinery. Legacy caller and
+owner filters are conjunctive and resolve their auth placeholders against their
+respective identities. Delegated read tokens select owner policies/roles while
+retaining caller expression/settings identity; they cannot authorize writes.
+The user manager rechecks caller credentials, owner/caller incarnations and
+intermediate view grants under its role-capture lock. CURRENT_USER is a stable
+native expression distinct from an API-key-scoped durable settings/session
+principal, and installed owner-side policy evaluation preserves that identity.
+Invoker views restore the original caller, including the credential's narrower
+base-table grants. Installed policy compilation and read capture share the
+native schema-to-SQL domain mapping, including NUMERIC and typed arrays.
+
+Quorum admission uses an explicit topology/read-index callback rather than an
+unauthenticated primary-key lookup. Admission cannot read rows or bypass RLS;
+the subsequently opened cursor still requires its signed row-policy authority.
+Only explicitly unpublished read-unavailable responses retry whole-cohort
+capture, with bounded backoff and complete cleanup. Individual pages and
+ambiguous cursor operations are never replayed.
+
+The public SQL producer now prepares definitions through a definition-only
+source-schema loader and submits the typed catalog intent. It derives durable
+owners from authenticated user incarnations, never from client definition JSON.
+The read adapter resolves stored bodies through ID-bound sources and immutable
+request-owned authority contexts. Prepared manifests distinguish tables from
+views and fence generation/definition changes. Both the old and new logical
+resources require current admin authority for rename. View-resource row filters
+run after the complete view projection and before outer predicates, LIMIT and
+aggregation, using the existing compiled filter grammar. Their reusable bounded
+scratch region does not retain rejected rows.
+
+Production metadata, remote-data and durable-standalone providers advertise the
+resolver capability; incomplete/non-durable providers remain closed. The mounted
+HTTP/Raft campaign now qualifies the original eight view DDL statements, name
+reuse, dependent reads, owner/invoker RLS, legacy caller/owner filter
+intersection, native NUMERIC/array policies and owner restart. Pgwire uses the
+same producer and read authority: qualification covers protocol execution,
+prepared rename/name reuse, definition replacement, and live/detached cursor
+revocation, output-filter changes and drop/recreate generation fences.
+
+The document campaign creates an actual document table through the public API
+and persists a SQL support_view using jsonb_to_record. Its 38 unchanged original
+queries compare PostgreSQL-derived column identities, typed arrays, complete
+rows, ordering and SQL NULL flags before and after owner restart. The measured
+Debug query cohorts took 939 ms and 1076 ms respectively; this is not a
+production throughput or genuinely cold object-store benchmark.
+
+Materialization identity includes the defining authority and outer frame, not
+just the immutable AST pointer. Repeated expansions of a stored view cannot
+reuse another expansion's correlated producer. jsonb_to_record uses existing
+complete-row materialization to convert every declared field once, including
+fields discarded by COUNT(*) or outer projections. Strict PostgreSQL errors,
+early close and exhaustive allocation-failure cleanup have native regressions.
+Schema epoch zero is admitted consistently in policy metadata, installation,
+capture and durable table-catalog decoding; it is a valid initial schema, not
+missing state.
+
+All 17 API authority/admission contracts and 20 native catalog contracts pass.
+The catalog fault campaign delivers committed commands to three independent
+stores, loses replies, repeats stale intents, restarts an owner and catches up a
+lagging store from a verified snapshot. This qualifies state-machine delivery
+and recovery, not a simulated consensus election. Twelve isolated PostgreSQL
+18.6 lifecycle/security/record contracts and the 38-query golden reproducibility
+check pass. PostgreSQL witnesses define semantics; mounted Antfly tests provide
+the implementation evidence.
+
+The bounded 2048-key hash workload measured about 90 ms for integer keys and
+120 ms for mixed NUMERIC keys in Debug, with peaks of 7,477,926 and 7,552,122
+bytes under an 8 MiB statement budget. Hash keys use a common comparison domain
+without identity casts that would obscure native column lineage.
+
+The executable ledger gate sql-original-views-native-debug qualifies 46 original
+cases: 39 implemented and seven PostgreSQL supersessions. The running inventory
+is 598 implemented / 131 rejected / 132 superseded / 725 unresolved. Search
+extensions and the remaining private index-mapping cases are not included in
+this credit. The gate reuses the existing SQL routes; no separate view query,
+RLS, restore, or policy-evaluation API is introduced.
+
+Final Debug qualification passed all 109 combined lifecycle/authority/catalog
+build steps. Three additional independent mounted lifecycle/restart soak rounds
+passed with zero skips, failures or leaks. The complete SQL gate passed 951 core
+tests and 234 extracted tests; its four skips are existing opt-in benchmarks.
+The zero-epoch catalog round-trip regression passes independently. The inventory
+validator's 20 tests, the 2314-file Apache boundary audit, formatting and generated
+OpenAPI checks pass. The public SQL description and generated client docs now
+describe stored views and document projections instead of the obsolete
+relational-only limitation; request/response shapes and routes are unchanged.
+
 ### Captured Apply prefix replay
 
 Invariant captured inputs under Apply now retain one suspended iterator instead
@@ -9877,6 +9996,8 @@ one new row, appends an owned replay image and advances. Other readers consume
 that image without reopening physical storage or repeating producer effects.
 EOF closes the producer once; a producer error is sticky at its frontier.
 Abandonment closes suspended iterators before destroying their cached inputs.
+Only the Apply iterator that installed an active outer row can retire its
+correlation scope; cached consumers cannot destroy a producer's live readers.
 
 The replay owner retains a reusable producer scratch arena. Growing memory
 replay can promote to one typed sequential spill run while readers remain live.

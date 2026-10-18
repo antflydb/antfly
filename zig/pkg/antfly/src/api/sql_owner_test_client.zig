@@ -20,6 +20,30 @@ const fixture = @import("sql_owner_test_fixture.zig");
 const http = @import("../raft/transport/http_common.zig");
 
 pub const Retry = enum { never, read, write_admission };
+/// Real scoped credentials for long Debug HTTP campaigns. Keep password
+/// hashing unchanged and reserve Basic verification for authentication tests.
+pub const ApiKeyHeaders = struct {
+    authorization: [2][192]u8 = undefined,
+    admin: [1]http.RequestHeader = undefined,
+    reader: [1]http.RequestHeader = undefined,
+
+    pub fn activate(self: *@This(), ctx: *fixture.Context) !void {
+        const users = @import("../usermgr/mod.zig");
+        const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+        const manager = api.cfg.user_manager orelse return error.MissingUserManager;
+        for ([_][]const u8{ "pk-rewriter", "pk-reader" }, 0..) |username, i| {
+            var permission = try users.Permission.initOwned(ctx.alloc, .table, "*", if (i == 0) .admin else .read);
+            defer permission.deinit(ctx.alloc);
+            var key = try manager.createApiKey(username, "sql-owner-campaign", &.{permission}, &.{}, null);
+            defer key.deinit(manager.alloc);
+            const authorization = try std.fmt.bufPrint(&self.authorization[i], "ApiKey {s}", .{key.encoded});
+            const header: http.RequestHeader = .{ .name = "authorization", .value = authorization };
+            if (i == 0) self.admin[0] = header else self.reader[0] = header;
+        }
+        ctx.admin_headers = &self.admin;
+        ctx.reader_headers = &self.reader;
+    }
+};
 const Diagnostic = struct {
     code: []const u8,
     message: []const u8,

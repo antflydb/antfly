@@ -31,6 +31,29 @@ pub const Column = struct {
     /// Native row preparation fills absent DEFAULT cells after SQL evaluation.
     defaulted: bool = false,
 
+    /// Borrow one immutable native layout's complete SQL domain. Shared by
+    /// query binding and installed RLS: unrelated array/numeric columns must
+    /// neither block activation nor lose their widths/modifiers in policies.
+    pub fn fromRelational(column: anytype) !Column {
+        return .{
+            .name = column.name,
+            .path = column.path,
+            .nullable = !column.required or column.allows_null,
+            .element_type = column.sql_element_type,
+            .numeric_modifier = column.numeric_modifier,
+            .type = switch (column.column_type) {
+                .string => if (column.sql_element_type == .uuid) .uuid else .string,
+                .integer => .integer,
+                .number, .numeric => .number,
+                .boolean => .boolean,
+                .datetime => .datetime,
+                .json => .json,
+                .sql_array => .array,
+                else => return error.UnsupportedSqlExecution,
+            },
+        };
+    }
+
     /// A view dependency binds a logical SQL domain, not the spelling of its
     /// name/path, nullability, generation expression, or DEFAULT clause.
     pub fn identitySignature(self: Column, a: std.mem.Allocator) ![32]u8 {
@@ -345,6 +368,15 @@ pub const Table = struct {
     /// Request-owned logical authority. Never use a mutable adapter's last
     /// resolved name to validate an earlier table in a join or subquery.
     scope: ?Scope = null,
+    /// Stored SQL keeps creation-time lexical names independently of the
+    /// current logical scope used for catalog and authorization checks.
+    binding_scope: ?Scope = null,
+    /// Request-owned read authority. Never serialized, cached in a plan, or
+    /// inferred from a SQL identifier; native owners receive signed proofs.
+    read_authority: ?*const anyopaque = null,
+    /// Definition-only logical shapes can suppress physical row-envelope
+    /// columns. Executable stored views use ReadRelation, never table routing.
+    virtual_columns_override: ?[]const Column = null,
 
     /// Hidden SQL columns owned by the row envelope, not the user schema.
     /// Binders enumerate these explicitly so SELECT * keeps its stored shape.
@@ -352,6 +384,7 @@ pub const Table = struct {
     const document_virtual_columns = identity_virtual_columns ++ [_]Column{.{ .name = "_doc", .path = "_doc", .type = .json, .element_type = .jsonb, .nullable = false }};
 
     pub fn virtualColumns(self: Table) []const Column {
+        if (self.virtual_columns_override) |columns| return columns;
         return if (self.storage_mode == .document) &document_virtual_columns else &identity_virtual_columns;
     }
 
@@ -958,7 +991,34 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Clock = @import("statement_clock.zig");
+pub const ViewExposure = struct { ordinal: usize, name: []const u8 };
+/// Statement-owned authorization predicate over complete typed view outputs.
+/// Providers reuse their existing filter compiler; SQL never invents a second
+/// public policy grammar or serializes a row to invoke it.
+pub const ViewRowFilter = struct {
+    ptr: *const anyopaque,
+    matches: *const fn (*const anyopaque, std.mem.Allocator, []const @import("scalar.zig").Datum) anyerror!bool,
+};
+pub const ReadRelation = union(enum) {
+    table: Table,
+    view: struct {
+        id: u64,
+        generation: u32,
+        query: *const ast.Select,
+        columns: []const Column,
+        exposure: ?[]const ViewExposure = null,
+        backend: Backend,
+        security_barrier: bool,
+        row_filter: ?ViewRowFilter = null,
+    },
+};
+
 pub const Backend = struct {
+    pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
+    /// Private resolver namespace. Distinct delegated view contexts must not
+    /// share name bindings even when their SQL references have the same text.
+    binding_scope: usize = 0,
+    prepared_read: ?*const PreparedRead = null,
     /// Trusted execution source and authorized durable transaction start.
     /// Neither is populated from SQL parameters, request JSON or cached plans.
     clock_source: ?Clock.Source = null,
@@ -988,6 +1048,7 @@ pub const Backend = struct {
     setting_capture: ?struct {
         owner: @import("setting_catalog.zig").Owner,
         scope: @import("setting_catalog.zig").Scope,
+        sql_user: ?[]const u8 = null,
         overlay: []const @import("setting_catalog.zig").OverlayEntry = &.{},
     } = null,
     /// Authorized, immutable settings captured for this exact statement.
@@ -1049,6 +1110,7 @@ pub const Backend = struct {
     }
 
     pub const VTable = struct {
+        resolve_read: ?*const fn (*anyopaque, std.mem.Allocator, ast.Name) anyerror!ReadRelation = null,
         /// Native opaque identity, generated once before mutation admission.
         /// Providers without this capability require an explicit _id.
         generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
@@ -1090,6 +1152,17 @@ pub const Backend = struct {
         /// publication. SQL must never emulate DDL with read-then-write.
         ddl: ?*const fn (*anyopaque, DdlAllocators, Ddl) anyerror!DdlOutcome = null,
     };
+
+    pub fn resolveRead(self: Backend, a: std.mem.Allocator, name: ast.Name) !ReadRelation {
+        if (self.prepared_read) |prepared| {
+            if (std.mem.eql(u8, prepared.name.table, name.table) and
+                std.mem.eql(u8, prepared.name.namespace orelse "", name.namespace orelse "") and
+                std.mem.eql(u8, prepared.name.database orelse "", name.database orelse ""))
+                return prepared.relation;
+        }
+        if (self.vtable.resolve_read) |resolve| return resolve(self.ptr, a, name);
+        return .{ .table = try self.vtable.resolve(self.ptr, a, name, .read) };
+    }
 };
 
 test "SQL row cells distinguish absent SQL NULL and JSON null and reject invalid flags" {

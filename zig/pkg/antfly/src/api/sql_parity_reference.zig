@@ -86,7 +86,7 @@ fn postgresTypeMatches(kind: wire.SQLColumnType, oid: u32) bool {
     };
 }
 
-fn postgresColumnMatches(column: wire.SQLColumn, oid: u32) bool {
+pub fn postgresColumnMatches(column: wire.SQLColumn, oid: u32) bool {
     if (oid == 1700) return column.type == .number and column.element_type == .numeric;
     if (column.type != .array) return postgresTypeMatches(column.type, oid);
     const element = column.element_type orelse return false;
@@ -150,7 +150,7 @@ fn rowMatches(alloc: std.mem.Allocator, columns: []const wire.SQLColumn, actual:
     return rowMatchesWithNulls(alloc, columns, actual, nulls, expected, null);
 }
 
-fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn, actual: []const Json, nulls: ?[]const bool, expected: []const Json, expected_nulls: ?[]const bool) !bool {
+pub fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn, actual: []const Json, nulls: ?[]const bool, expected: []const Json, expected_nulls: ?[]const bool) !bool {
     if (actual.len != expected.len or actual.len != columns.len) return false;
     if (nulls) |flags| if (flags.len != actual.len) return false;
     if (expected_nulls) |flags| if (flags.len != actual.len) return false;

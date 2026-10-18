@@ -2009,6 +2009,9 @@ pub const StatusSource = struct {
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
+        /// Tagged stored-view resolution, not a claim that a physical engine
+        /// or older metadata peer can publish/serve view records.
+        supports_sql_views: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
@@ -2734,6 +2737,7 @@ pub const StatusSource = struct {
         return .{
             .system_catalog = Gen.systemCatalog,
             .supports_query_definitions = true,
+            .supports_sql_views = true,
             .supports_object_tables = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
@@ -7917,7 +7921,16 @@ pub const ApiHttpServer = struct {
         database: []const u8,
         schema_version: ?u32,
     ) !?[]u8 {
-        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .read);
+        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .read, null);
+    }
+
+    pub const ViewPolicyDelegation = struct {
+        grant: usermgr.UserManager.ViewDelegation,
+        logical_source: []const u8,
+    };
+    pub fn rowPolicyViewReadProof(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: *const AuthenticatedIdentity, context: api_operation.RequestContext, table_id: u64, physical_table: []const u8, database: []const u8, schema_version: u32, delegation: ViewPolicyDelegation) !?[]u8 {
+        if (!try tablePermissionCurrentlyAllowed(identity.*, delegation.grant.logical_view, .read)) return error.Forbidden;
+        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .read, delegation);
     }
 
     fn rowPolicyProof(
@@ -7930,6 +7943,7 @@ pub const ApiHttpServer = struct {
         database: []const u8,
         schema_version: ?u32,
         permission: usermgr.PermissionType,
+        delegation: ?ViewPolicyDelegation,
     ) !?[]u8 {
         if (table_id == 0 or physical_table.len == 0 or database.len == 0) return error.RowPolicyCatalogChanged;
         var internal_context = context;
@@ -7945,13 +7959,28 @@ pub const ApiHttpServer = struct {
             return error.RowPolicyCatalogChanged;
         const serving = (try publication.servingAuthority()) orelse return null;
         const authenticated = identity orelse return error.RowPolicyAuthenticationRequired;
-        const signed = try self.signRowPolicyPrincipal(authenticated, .{
+        const scope: usermgr.row_policy_authority.Scope = .{
             .table_id = table_id,
             .table = physical_table,
             .database = database,
             .policy_generation = serving.generation,
             .catalog_epoch = serving.catalog_epoch,
-        }, permission);
+        };
+        const signed = if (delegation) |value| delegated: {
+            if (permission != .read or authenticated.is_internal_service) return error.Forbidden;
+            const manager = authenticated.live_user_manager orelse return error.RowPolicyAuthenticationRequired;
+            break :delegated try manager.signRowPolicyViewRolesAuthorized(
+                self.alloc,
+                authenticated.username,
+                authenticated.credential_principal,
+                value.logical_source,
+                value.grant,
+                self.cfg.trusted_principal_secret orelse return error.RowPolicyAuthenticationRequired,
+                self.cfg.trusted_principal_issuer orelse return error.RowPolicyAuthenticationRequired,
+                scope,
+                @intCast(@divFloor(self.internalAuthRealtimeNs(), std.time.ns_per_s)),
+            );
+        } else try self.signRowPolicyPrincipal(authenticated, scope, permission);
         defer self.alloc.free(signed);
         return try alloc.dupe(u8, signed);
     }
@@ -7969,7 +7998,7 @@ pub const ApiHttpServer = struct {
             const admitted: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(credential));
             break :blk if (admitted.*) |*value| value else null;
         } else null;
-        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write);
+        return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write, null);
     }
 
     pub fn authorizeInferenceRequest(
@@ -29376,7 +29405,7 @@ fn cloneRowFilters(alloc: std.mem.Allocator, row_filters: []const usermgr.RowFil
     return try out.toOwnedSlice(alloc);
 }
 
-fn cloneAuthenticatedIdentity(
+pub fn cloneAuthenticatedIdentity(
     alloc: std.mem.Allocator,
     username: []const u8,
     credential_principal: []const u8,

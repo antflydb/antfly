@@ -2,6 +2,7 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-views-native-debug": {"command":["zig","build","antfly-api-sql-view-lifecycle-test","antfly-api-sql-document-view-lifecycle-test","antfly-api-sql-view-authority-test","antfly-metadata-sql-view-catalog-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-column-index-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-column-index-lifecycle-test","antfly-api-sql-expression-index-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-index-expression-drop-native-debug": {"command":["zig","build","antfly-api-sql-index-drop-lifecycle-test","antfly-api-sql-expression-index-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-index-drop-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_catalog_lifecycle.py"],"cwd":".","timeout_seconds":180},
@@ -4166,43 +4167,51 @@
     },
     {
       "id": "sql-0425",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted metadata HTTP and replicated view lifecycle commands. Durable identity, dependencies, rename/name reuse, replacement and owner restart are qualified alongside RLS and pgwire.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0426",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted metadata HTTP and replicated view lifecycle commands. Durable identity, dependencies, rename/name reuse, replacement and owner restart are qualified alongside RLS and pgwire.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0427",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted metadata HTTP and replicated view lifecycle commands. Durable identity, dependencies, rename/name reuse, replacement and owner restart are qualified alongside RLS and pgwire.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0428",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted metadata HTTP and replicated view lifecycle commands. Durable identity, dependencies, rename/name reuse, replacement and owner restart are qualified alongside RLS and pgwire.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0429",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: CREATE OR REPLACE VIEW IF NOT EXISTS is invalid syntax (42601). The mounted original SQL rejects it without catalog mutation; PostgreSQL verifies the contract.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0430",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted metadata HTTP and replicated view lifecycle commands. Durable identity, dependencies, rename/name reuse, replacement and owner restart are qualified alongside RLS and pgwire.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0431",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted metadata HTTP and replicated view lifecycle commands. Durable identity, dependencies, rename/name reuse, replacement and owner restart are qualified alongside RLS and pgwire.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0432",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted metadata HTTP and replicated view lifecycle commands. Durable identity, dependencies, rename/name reuse, replacement and owner restart are qualified alongside RLS and pgwire.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_lifecycle_integration_test.zig","test":"mounted SQL original views preserve identity dependencies and postimages across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0433",
@@ -8025,23 +8034,27 @@
     },
     {
       "id": "sql-0797",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0798",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0799",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: the original private mapped-view or grammar rejection is replaced by a real document-backed SQL view and standard typed-array execution. The exact query matches PostgreSQL types, rows, ordering and NULLs before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0800",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: the original private mapped-view or grammar rejection is replaced by a real document-backed SQL view and standard typed-array execution. The exact query matches PostgreSQL types, rows, ordering and NULLs before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0801",
@@ -8050,63 +8063,75 @@
     },
     {
       "id": "sql-0802",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0803",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0804",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0805",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0806",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0807",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0808",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0809",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0810",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0811",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0812",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0813",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0814",
@@ -8115,48 +8140,57 @@
     },
     {
       "id": "sql-0815",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0816",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0817",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0818",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0819",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0820",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0821",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0822",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0823",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0824",
@@ -8220,13 +8254,15 @@
     },
     {
       "id": "sql-0836",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: the original private mapped-view or grammar rejection is replaced by a real document-backed SQL view and standard typed-array execution. The exact query matches PostgreSQL types, rows, ordering and NULLs before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0837",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: the original private mapped-view or grammar rejection is replaced by a real document-backed SQL view and standard typed-array execution. The exact query matches PostgreSQL types, rows, ordering and NULLs before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0838",
@@ -8374,8 +8410,9 @@
     },
     {
       "id": "sql-0857",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0858",
@@ -8419,8 +8456,9 @@
     },
     {
       "id": "sql-0866",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0867",
@@ -8449,48 +8487,57 @@
     },
     {
       "id": "sql-0872",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0873",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0874",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0875",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0876",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0877",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0878",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP over a real document table and persisted support_view. PostgreSQL-derived output types, rows, ordering and SQL NULL flags match both before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0879",
-      "status": "unresolved",
-      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: the original private mapped-view or grammar rejection is replaced by a real document-backed SQL view and standard typed-array execution. The exact query matches PostgreSQL types, rows, ordering and NULLs before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0880",
-      "status": "unresolved",
-      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
+      "status": "superseded",
+      "reason": "PostgreSQL supersession: the original private mapped-view or grammar rejection is replaced by a real document-backed SQL view and standard typed-array execution. The exact query matches PostgreSQL types, rows, ordering and NULLs before and after owner restart.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/sql_view_document_integration_test.zig","test":"mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart","gate":"sql-original-views-native-debug"}]
     },
     {
       "id": "sql-0881",

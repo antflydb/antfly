@@ -1325,6 +1325,268 @@ test "SQL view catalog publishes attributes and reverse edges atomically and ver
     }
 }
 
+test "SQL view catalog physical source normalization retains nondefault namespace guards" {
+    const a = std.testing.allocator;
+    const key = try system_catalog_storage.recordKeyAlloc(a, 41, .namespace, system_catalog.default_namespace_id);
+    defer a.free(key);
+    const canonical = try std.json.Stringify.valueAlloc(a, system_catalog.default_namespace, .{});
+    defer a.free(canonical);
+    var implicit: RaftApplyStore.RelationSourceCut = .{ .revision = 1 };
+    const empty = implicit;
+    try implicit.feed(a, 41, key, canonical);
+    try std.testing.expect(implicit.eql(empty));
+    var changed = system_catalog.default_namespace;
+    changed.placement_policy.desired_replica_count = 3;
+    const encoded = try std.json.Stringify.valueAlloc(a, changed, .{});
+    defer a.free(encoded);
+    try implicit.feed(a, 41, key, encoded);
+    try std.testing.expect(!implicit.eql(empty));
+}
+
+test "SQL view catalog committed log delivery survives lost replies duplicate intents restart and lagging snapshot catchup" {
+    const T = struct {
+        fn deliver(store: *RaftApplyStore, group: u64, index: u64, term: u64, bytes: []const u8) !void {
+            const wire = try encodeTransitionCommand(store.alloc, .{ .apply_system_catalog = bytes });
+            defer store.alloc.free(wire);
+            const entries = try raft_state_machine.encodeCommittedEntries(store.alloc, &.{.{ .term = term, .index = index, .entry_type = .normal, .data = wire }});
+            defer store.alloc.free(entries);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = index, .entries_bytes = entries });
+        }
+    };
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths: [3][]const u8 = undefined;
+    var stores: [3]RaftApplyStore = undefined;
+    var initialized: usize = 0;
+    var live: [3]bool = @splat(false);
+    defer for (stores[0..initialized], paths[0..initialized], live[0..initialized]) |*store, path, active| {
+        if (active) store.deinit();
+        a.free(path);
+    };
+    for (&stores, &paths, 0..) |*store, *path, i| {
+        path.* = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/view-replica-{d}", .{ tmp.sub_path, i });
+        errdefer a.free(path.*);
+        store.* = try RaftApplyStore.init(a, .{ .root_dir = path.* });
+        live[i] = true;
+        initialized += 1;
+    }
+    const incarnation = "01010101010101010101010101010101".*;
+    try stores[0].applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{
+        .version = topology_protocol.current_version,
+        .incarnation = incarnation,
+        .member_count = 3,
+        .membership_fingerprint = @splat(7),
+    }, .{});
+    defer a.free(activation);
+    try stores[0].applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+    try adoptRelationWriterForTest(&stores[0], a, group);
+    _ = try publishLiveRelationRootWithCoverageForTest(&stores[0], a, group, .constraint_names);
+    const initial = try stores[0].snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(initial);
+    for (stores[1..]) |*store| try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 10, initial));
+    const revision = (try stores[0].systemCatalogMeta(a, group)).revision;
+    const request: sql_views.Request = .{ .expected_revision = revision, .mutation = .{
+        .target = .{ .table = "published" },
+        .operation = .{ .publish = .{ .definition = .{
+            .format = 1,
+            .query = "SELECT 1::BIGINT AS id",
+            .owner = .auth_disabled,
+            .security = .invoker,
+            .security_barrier = true,
+            .catalog_revision = null,
+            .setting_epoch = null,
+            .columns = &.{.{ .name = "id", .type = .integer, .element_type = .int64 }},
+            .sources = &.{},
+        } } },
+    } };
+    const command = sql_views.command(request);
+    const prepared = try stores[0].prepareSystemCatalogResult(a, group, command);
+    defer a.free(prepared);
+    var receipt = try std.json.parseFromSlice(sql_views.MutationResult, a, prepared, .{});
+    defer receipt.deinit();
+    const create = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(create);
+    for (stores[0..2]) |*store| try T.deliver(store, group, 11, 2, create);
+    // Lose the caller's receipt, then commit the same stale intent again.
+    // CAS replay cannot allocate another view or consume another catalog ID.
+    const committed = try stores[0].systemCatalogMeta(a, group);
+    for (stores[0..2]) |*store| try T.deliver(store, group, 12, 2, create);
+    try std.testing.expectEqualDeep(committed, try stores[0].systemCatalogMeta(a, group));
+    const checkpoint = try stores[1].snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(checkpoint);
+    // One follower missed both log entries; it catches up from a verified cut.
+    try std.testing.expect(try stores[2].snapshotBuilder().installSnapshot(a, group, 12, checkpoint));
+    stores[0].deinit();
+    live[0] = false;
+    stores[0] = try RaftApplyStore.init(a, .{ .root_dir = paths[0] });
+    live[0] = true;
+    const rename = try std.json.Stringify.valueAlloc(a, sql_views.command(.{ .expected_revision = committed.revision, .mutation = .{
+        .target = .{ .table = "published" },
+        .operation = .{ .rename = .{ .expected = receipt.value.identity.?, .name = "renamed" } },
+    } }), .{});
+    defer a.free(rename);
+    // A successor term uses the same identity, including on the restarted
+    // former leader. This tests state-machine delivery, not a fake election.
+    for (&stores) |*store| try T.deliver(store, group, 13, 3, rename);
+    for (&stores) |*store| {
+        const result = try store.resolveSystemCatalogIdentities(a, group, .{ .sql_sources = &.{ .{ .name = .{ .table = "published" } }, .{ .view_id = receipt.value.identity.?.id } } });
+        defer result.deinit(a);
+        try std.testing.expect(result.sql_sources[0] == null);
+        try std.testing.expectEqualStrings("renamed", result.sql_sources[1].?.target.table);
+        try std.testing.expectEqualDeep(try stores[1].systemCatalogMeta(a, group), try store.systemCatalogMeta(a, group));
+    }
+}
+
+test "SQL view catalog lifecycle commands preflight replay rename and cascade cyclic dependencies" {
+    const T = struct {
+        fn apply(store: *RaftApplyStore, group: u64, index: u64, request: sql_views.Request, replicated: bool) !sql_views.MutationResult {
+            const command = sql_views.command(request);
+            const result = try store.prepareSystemCatalogResult(store.alloc, group, command);
+            defer store.alloc.free(result);
+            var parsed = try std.json.parseFromSlice(sql_views.MutationResult, store.alloc, result, .{});
+            defer parsed.deinit();
+            const json = try std.json.Stringify.valueAlloc(store.alloc, command, .{});
+            defer store.alloc.free(json);
+            if (replicated) {
+                const wire = try encodeTransitionCommand(store.alloc, .{ .apply_system_catalog = json });
+                defer store.alloc.free(wire);
+                const entries = try raft_state_machine.encodeCommittedEntries(store.alloc, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = wire }});
+                defer store.alloc.free(entries);
+                try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = index, .entries_bytes = entries });
+            } else try store.applyStandaloneCommand(group, .{ .apply_system_catalog = json });
+            const meta = try store.systemCatalogMeta(store.alloc, group);
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(json, &hash, .{});
+            try std.testing.expectEqual(parsed.value.revision, meta.revision);
+            try std.testing.expectEqual(hash, meta.last_command);
+            return parsed.value;
+        }
+    };
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| {
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/view-lifecycle-{s}", .{ tmp.sub_path, if (replicated) "raft" else "native" });
+        defer a.free(root);
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const incarnation = "01010101010101010101010101010101".*;
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+        const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{
+            .version = topology_protocol.current_version,
+            .incarnation = incarnation,
+            .member_count = 1,
+            .membership_fingerprint = @splat(7),
+        }, .{});
+        defer a.free(activation);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        try adoptRelationWriterForTest(&store, a, group);
+        _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+        const original_revision = (try store.systemCatalogMeta(a, group)).revision;
+        var definition: @import("antfly_local_sources").sql_view_definition.Definition = .{
+            .format = 1,
+            .query = "SELECT 1::BIGINT AS id",
+            .owner = .auth_disabled,
+            .security = .invoker,
+            .security_barrier = true,
+            .catalog_revision = null,
+            .setting_epoch = null,
+            .columns = &.{.{ .name = "id", .type = .integer, .element_type = .int64 }},
+            .sources = &.{},
+        };
+        const create: sql_views.Request = .{ .expected_revision = original_revision, .mutation = .{
+            .target = .{ .table = "base" },
+            .operation = .{ .publish = .{ .definition = definition } },
+        } };
+        const preview = try store.prepareSystemCatalogResult(a, group, sql_views.command(create));
+        a.free(preview);
+        try std.testing.expectEqual(original_revision, (try store.systemCatalogMeta(a, group)).revision);
+        const first = try T.apply(&store, group, 100, create, replicated);
+        var base = first.identity.?;
+        const resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .sql_sources = &.{ .{ .name = .{ .table = "base" } }, .{ .view_id = base.id } } });
+        defer resolved.deinit(a);
+        try std.testing.expect(resolved.sql_sources_resolved and resolved.sql_sources.len == 2);
+        var record = try sql_views.Record.decode(a, resolved.sql_sources[0].?.value.view.source_json);
+        defer record.deinit();
+        const source: @import("antfly_local_sources").sql_view_definition.Source = .{
+            .kind = .view,
+            .reference = .{ .table = "base" },
+            .database = "default",
+            .namespace = "public",
+            .name = "base",
+            .physical_name = "",
+            .table_id = base.id,
+            .schema_version = base.generation,
+            .schema_digest = record.value.attributes.epoch.digest,
+            .columns = &.{.{ .name = "id", .signature = record.value.attributes.columns[0].signature, .ordinal = 0, .virtual = false }},
+        };
+        definition.query = "SELECT id FROM base";
+        definition.sources = &.{source};
+        const child = try T.apply(&store, group, 101, .{ .expected_revision = first.revision, .mutation = .{
+            .target = .{ .table = "child" },
+            .operation = .{ .publish = .{ .definition = definition } },
+        } }, replicated);
+        const child_resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .sql_sources = &.{.{ .view_id = child.identity.?.id }} });
+        defer child_resolved.deinit(a);
+        var child_record = try sql_views.Record.decode(a, child_resolved.sql_sources[0].?.value.view.source_json);
+        defer child_record.deinit();
+        var cyclic = source;
+        cyclic.reference.table = "child";
+        cyclic.name = "child";
+        cyclic.table_id = child.identity.?.id;
+        cyclic.schema_version = child.identity.?.generation;
+        cyclic.schema_digest = child_record.value.attributes.epoch.digest;
+        definition.query = "SELECT id FROM child";
+        definition.sources = &.{cyclic};
+        // PostgreSQL accepts cyclic replacements, then rejects their use.
+        // Catalog traversal and CASCADE must still be finite and atomic.
+        const cycle = try T.apply(&store, group, 102, .{
+            .expected_revision = child.revision,
+            .mutation = .{ .target = .{ .table = "base" }, .operation = .{ .publish = .{ .definition = definition, .replace = true, .expected = base } } },
+        }, replicated);
+        base = cycle.identity.?;
+        const renamed = try T.apply(&store, group, 103, .{ .expected_revision = cycle.revision, .mutation = .{
+            .target = .{ .table = "base" },
+            .operation = .{ .rename = .{ .expected = base, .name = "renamed" } },
+        } }, replicated);
+        const names = try store.resolveSystemCatalogIdentities(a, group, .{ .sql_sources = &.{ .{ .name = .{ .table = "base" } }, .{ .view_id = base.id } } });
+        defer names.deinit(a);
+        try std.testing.expect(names.sql_sources[0] == null);
+        try std.testing.expectEqualStrings("renamed", names.sql_sources[1].?.target.table);
+        const drop: sql_views.Request = .{ .expected_revision = renamed.revision, .mutation = .{
+            .target = .{ .table = "renamed" },
+            .operation = .{ .drop = .{ .expected = base } },
+        } };
+        try std.testing.expectError(error.SqlDependentObjectsExist, store.prepareSystemCatalogResult(a, group, sql_views.command(drop)));
+        var cascade = drop;
+        cascade.mutation.operation.drop.cascade = true;
+        {
+            var buffer: [160]u8 = undefined;
+            const orphan = try sql_views.dependencyKey(&buffer, group, .{ .kind = .view, .id = base.id, .column = 999 }, child.identity.?.id);
+            var write = try store.store.beginWriteTxn();
+            errdefer write.abort();
+            try write.put(orphan, &.{1});
+            try write.commit();
+            try std.testing.expectError(error.InvalidSqlViewRecord, store.prepareSystemCatalogResult(a, group, sql_views.command(cascade)));
+            try std.testing.expectEqual(renamed.revision, (try store.systemCatalogMeta(a, group)).revision);
+            var repair = try store.store.beginWriteTxn();
+            errdefer repair.abort();
+            try repair.delete(orphan);
+            try repair.commit();
+        }
+        const removed = try T.apply(&store, group, 104, cascade, replicated);
+        try std.testing.expectEqual(@as(usize, 2), removed.removed);
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        try verifySqlViewCheckpointTxn(a, &txn);
+        try std.testing.expect((try sql_views.firstDependent(&txn, group, .view, base.id, null)) == null);
+    }
+}
+
 test "system catalog SQL column identities publish with source schemas reject stale apply and survive snapshots and cold reopen" {
     const T = struct {
         const schema1 =
@@ -20836,6 +21098,7 @@ pub const RaftApplyStore = struct {
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: SystemCatalogCommand) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
+        if (command.sql_view != null) return std.json.Stringify.valueAlloc(alloc, try self.applySqlViewLifecycleTxn(&txn, group_id, command, false), .{});
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -20874,19 +21137,105 @@ pub const RaftApplyStore = struct {
         return self.resolveSystemCatalogResultTxn(Result, alloc, &txn, group_id, target);
     }
 
+    fn resolveSqlSourceTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, meta: system_catalog_storage.Meta, lookup: system_catalog.SqlSourceLookup, include_definition: bool) !?system_catalog.SqlSource {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        var target: system_catalog.Target = undefined;
+        var resource: ?system_catalog.Resource = null;
+        var table: ?system_catalog.ResolvedTable = null;
+        switch (lookup) {
+            .name => |name| {
+                try name.validate();
+                target = name;
+                const namespace = (try resolveSystemCatalogNamespaceTxn(a, txn, group, name.database, name.namespace)) orelse return null;
+                resource = try view.lookup(.view, namespace, name.table);
+                table = try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, txn, group, name);
+                if (resource != null and table != null) return error.InvalidCatalogRecord;
+            },
+            .table_id, .view_id => |id| {
+                if (id == 0) return error.InvalidCatalogMutation;
+                const kind: system_catalog.Kind = if (lookup == .view_id) .view else .table;
+                resource = try view.byId(kind, id);
+                if (resource) |binding| {
+                    const namespace = (try view.byId(.namespace, binding.parent_id)) orelse return error.InvalidCatalogRecord;
+                    const database = (try view.byId(.database, namespace.parent_id)) orelse return error.InvalidCatalogRecord;
+                    target = .{ .database = database.name, .namespace = namespace.name, .table = binding.name };
+                    if (kind == .table) {
+                        table = try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, txn, group, target);
+                        if (table == null or table.?.table_id != id) return error.InvalidCatalogRecord;
+                        resource = null;
+                    }
+                } else if (kind == .view) return null else {
+                    var buffer: [160]u8 = undefined;
+                    const bytes = (try stagingGet(txn, try tableKeyForGroup(&buffer, group, id))) orelse return null;
+                    table = try decodeTableIdentity(a, bytes);
+                    if (table.?.table_id != id) return error.InvalidCatalogRecord;
+                    target = .{ .table = table.?.name };
+                    // A raw physical record is not proof of public existence:
+                    // hidden/retired restore generations can retain one. Use
+                    // the ordinary name index and visibility rules as well.
+                    table = (try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, txn, group, target)) orelse return null;
+                    if (table.?.table_id != id) return error.InvalidCatalogRecord;
+                }
+            },
+        }
+        if (table == null and resource == null) return null;
+        var result: system_catalog.SqlSource = .{
+            .target = .{ .database = try alloc.dupe(u8, target.database), .namespace = "", .table = "" },
+            .value = .{ .table = .{ .binding = .{ .table_id = 0, .name = "" } } },
+        };
+        errdefer result.deinit(alloc);
+        result.target.namespace = try alloc.dupe(u8, target.namespace);
+        result.target.table = try alloc.dupe(u8, target.table);
+        if (resource) |binding| {
+            _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_catalog_version);
+            var record = try sql_views.Record.decode(a, binding.source_json);
+            defer record.deinit();
+            if (record.value.id != binding.id) return error.InvalidSqlViewRecord;
+            result.value = .{ .view = try system_catalog.cloneResource(alloc, binding) };
+        } else {
+            var binding = table.?;
+            if (include_definition) binding.query_definition = try self.queryTableDefinitionTxn(a, txn, group, binding.name);
+            result.value = .{ .table = .{ .binding = try binding.clone(alloc) } };
+            if (include_definition) {
+                const key = try column_identities.key(.{ .group = group, .table = binding.table_id });
+                if (try stagingGet(txn, &key)) |bytes|
+                    result.value.table.column_identities_json = try alloc.dupe(u8, bytes);
+            }
+        }
+        return result;
+    }
+
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
         return self.resolveSystemCatalogIdentitiesWithContext(alloc, group_id, request, .{});
     }
 
     pub fn resolveSystemCatalogIdentitiesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.ResolvedMany {
         try context.ensureActive();
-        if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len or request.relations.len > 256 - request.targets.len - request.storage_names.len) return error.CatalogCommandTooLarge;
+        if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len or request.relations.len > 256 - request.targets.len - request.storage_names.len or request.sql_sources.len > 256 - request.targets.len - request.storage_names.len - request.relations.len) return error.CatalogCommandTooLarge;
         if (request.expected_relation_epoch != null and request.relations.len == 0) return error.InvalidCatalogMutation;
         for (request.relations) |target| try target.validate();
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         if (request.expected_revision) |expected| if (expected != meta.revision) return error.CatalogGenerationChanged;
+        if (request.sql_sources.len != 0) {
+            if (request.name_allocation or request.relations.len != 0 or request.targets.len != 0 or request.storage_names.len != 0 or request.expected_relation_epoch != null) return error.InvalidCatalogMutation;
+            const resolved = try alloc.alloc(?system_catalog.SqlSource, request.sql_sources.len);
+            var initialized_sources: usize = 0;
+            errdefer {
+                for (resolved[0..initialized_sources]) |entry| if (entry) |value| value.deinit(alloc);
+                alloc.free(resolved);
+            }
+            for (request.sql_sources, resolved) |lookup, *entry| {
+                try context.ensureActive();
+                entry.* = try self.resolveSqlSourceTxn(alloc, &txn, group_id, meta, lookup, request.include_query_definitions);
+                initialized_sources += 1;
+            }
+            return .{ .revision = meta.revision, .tables = &.{}, .sql_sources = resolved, .sql_sources_resolved = true };
+        }
         if (request.name_allocation and request.relations.len != 0 and
             (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group_id)) == null)
             return self.resolveAllocationNamesTxn(alloc, &txn, group_id, meta.revision, request, context);
@@ -21129,6 +21478,13 @@ pub const RaftApplyStore = struct {
         defer parsed.deinit();
         const command = parsed.value;
         if (command.version != 1 and command.version != 2) return error.InvalidCatalogMutation;
+        if (command.sql_view != null) {
+            _ = self.applySqlViewLifecycleTxn(txn, group_id, command, true) catch |err| switch (err) {
+                error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded => return,
+                else => return err,
+            };
+            return;
+        }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -24565,6 +24921,7 @@ pub const RaftApplyStore = struct {
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
+                metadataSnapshotProjectionBit(.sql_column_identities) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_settings => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
@@ -26664,6 +27021,12 @@ pub const RaftApplyStore = struct {
     fn relationSourceKey(group_id: u64, key: []const u8) !bool {
         var buf: [160]u8 = undefined;
         const prefix = try system_catalog_storage.prefixForGroup(&buf, group_id);
+        // Stored views have their own catalog revision, immutable identities
+        // and checkpoint/dependency verification. They do not rebuild the
+        // physical table/index namespace. Including their records here would
+        // change an equal-clock physical source cut and reject valid catch-up.
+        if (std.mem.startsWith(u8, key, prefix) and
+            std.mem.startsWith(u8, key[prefix.len..], "record:view:")) return false;
         return try capturedRelationTableId(key, group_id) != null or
             try index_publication.sourceKey(key, group_id) != null or
             try relationFkSourceTableId(key, group_id) != null or
@@ -26678,6 +27041,27 @@ pub const RaftApplyStore = struct {
         rows: u64 = 0,
         fingerprint: u256 = 0,
         fn feed(self: *@This(), a: std.mem.Allocator, group: u64, key: []const u8, value: []const u8) !void {
+            if (!try relationSourceKey(group, key)) return;
+            // The default namespace/database exist logically before their
+            // first durable catalog write. Materializing those exact defaults
+            // is not a physical source change. Non-default options still hash
+            // normally and remain protected by the equal-clock comparison.
+            var prefix_buf: [160]u8 = undefined;
+            const prefix = try system_catalog_storage.prefixForGroup(&prefix_buf, group);
+            if (std.mem.startsWith(u8, key, prefix)) {
+                const tail = key[prefix.len..];
+                const implicit: ?system_catalog.Resource = if (std.mem.eql(u8, tail, "record:database:1"))
+                    system_catalog.default_database
+                else if (std.mem.eql(u8, tail, "record:namespace:2"))
+                    system_catalog.default_namespace
+                else
+                    null;
+                if (implicit) |resource| {
+                    const canonical = try std.json.Stringify.valueAlloc(a, resource, .{});
+                    defer a.free(canonical);
+                    if (std.mem.eql(u8, canonical, value)) return;
+                }
+            }
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update("antfly.relation-source-cut.v2");
             const value_digest = try relationSourceValueDigest(a, group, key, value);
@@ -30139,13 +30523,15 @@ pub const RaftApplyStore = struct {
         return prepared.value.encode(alloc);
     }
 
-    const SqlViewIdentity = struct { id: u64, generation: u32 };
+    const SqlViewIdentity = sql_views.Identity;
     const SqlViewPublication = struct {
         expected_revision: u64,
         target: system_catalog.Target,
         definition: @import("antfly_local_sources").sql_view_definition.Definition,
         replace: bool = false,
         expected: ?SqlViewIdentity = null,
+        dry_run: bool = false,
+        command_hash: ?[32]u8 = null,
     };
 
     /// The caller owns the containing catalog transaction and admission
@@ -30231,12 +30617,14 @@ pub const RaftApplyStore = struct {
         // An existing forward record cannot silently heal missing/forged edges.
         for (previous_dependencies) |dependency| {
             const key = try sql_views.dependencyKey(&key_buf, group, dependency, id);
-            if (!std.mem.eql(u8, try txn.get(key), &.{1})) return error.InvalidSqlViewRecord;
+            if (!std.mem.eql(u8, (try stagingGet(txn, key)) orelse return error.InvalidSqlViewRecord, &.{1})) return error.InvalidSqlViewRecord;
         }
+        if (request.dry_run) return .{ .id = id, .generation = prepared.value.generation };
         const resource: system_catalog.Resource = .{ .kind = .view, .id = id, .parent_id = namespace.id, .name = request.target.table, .source_json = bytes };
         var upserts = [_]system_catalog.Resource{resource};
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        if (request.command_hash) |value| hash = value;
         for (previous_dependencies) |dependency| try txn.delete(try sql_views.dependencyKey(&key_buf, group, dependency, id));
         for (bootstrap.items) |item| {
             try txn.put(item.key, item.value);
@@ -30248,6 +30636,148 @@ pub const RaftApplyStore = struct {
         // The durable bytes own the result; never return the local arena.
         // Callers discover the admitted record through the existing receipt.
         return .{ .id = id, .generation = prepared.value.generation };
+    }
+
+    /// Planning and replay use the same semantic checks. Preflight is strictly
+    /// read-only, including listeners; replay writes only after the complete
+    /// bounded dependency closure and all reverse edges have been verified.
+    fn applySqlViewLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand, apply: bool) !sql_views.MutationResult {
+        const request = command.sql_view orelse return error.InvalidCatalogMutation;
+        try request.validate();
+        if (command.version != 2 or command.topology != null or command.placement_update != null or
+            command.constraint_name_admission != null or command.mutation.kind != .view or
+            command.mutation.table_id != 0 or command.mutation.storage_name.len != 0 or
+            !std.mem.eql(u8, command.mutation.database, request.target.database) or
+            !std.mem.eql(u8, command.mutation.namespace, request.target.namespace) or
+            !std.mem.eql(u8, command.mutation.name, request.target.table))
+            return error.InvalidCatalogMutation;
+        const action: system_catalog.Action = switch (request.operation) {
+            .publish => .create,
+            .rename => .rename,
+            .drop => .drop,
+        };
+        if (command.mutation.action != action) return error.InvalidCatalogMutation;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
+        if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        if (request.operation == .publish) {
+            const input = request.operation.publish;
+            const identity = try self.publishSqlViewTxn(txn, group, .{
+                .expected_revision = command.expected_revision,
+                .target = request.target,
+                .definition = input.definition,
+                .replace = input.replace,
+                .expected = input.expected,
+                .dry_run = !apply,
+                .command_hash = hash,
+            });
+            return .{ .revision = command.expected_revision + 1, .identity = identity };
+        }
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_catalog_version);
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
+        if (meta.revision == std.math.maxInt(u64)) return error.CatalogRevisionExhausted;
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        const namespace = try view.namespaceFor(request.target.database, request.target.namespace);
+        const resource = (try system_catalog_storage.find(a, txn, group, .view, namespace.id, request.target.table)) orelse {
+            if (request.operation == .drop and request.operation.drop.if_exists and request.operation.drop.expected == null)
+                return .{ .revision = meta.revision, .identity = null };
+            return error.CatalogNotFound;
+        };
+        var record = try sql_views.Record.decode(a, resource.value.source_json);
+        defer record.deinit();
+        if (record.value.id != resource.value.id) return error.InvalidSqlViewRecord;
+        const identity: sql_views.Identity = .{ .id = record.value.id, .generation = record.value.generation };
+        const expected: ?sql_views.Identity = switch (request.operation) {
+            .rename => |input| input.expected,
+            .drop => |input| input.expected,
+            .publish => unreachable,
+        };
+        if (expected) |value| {
+            if (value.id != identity.id or value.generation != identity.generation) return error.CatalogGenerationChanged;
+        } else return error.CatalogGenerationChanged;
+        if (request.operation == .rename) {
+            const name = request.operation.rename.name;
+            var registry = try RelationRegistry(docstore.DocStore.Txn).init(a, txn, group);
+            const live = registry.live orelse return error.CatalogPublicationProofPending;
+            if (!try relationWriterEnabledTxn(txn, group)) return error.InvalidCatalogRecord;
+            if (live.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
+            if (!live.root.epoch.eql(try relationSourceEpochTxn(txn, group))) return error.CatalogGenerationChanged;
+            if (try registry.getEntry(.{ .namespace_id = namespace.id, .name = name }) != null or
+                try view.lookup(.table, namespace.id, name) != null or
+                try view.lookup(.view, namespace.id, name) != null) return error.CatalogAlreadyExists;
+            var renamed = resource.value;
+            renamed.name = name;
+            if (apply) {
+                // applyDelta removes an old name before installing its new
+                // spelling; dependencies retain durable IDs unchanged.
+                var removes = [_]system_catalog.Resource{resource.value};
+                var upserts = [_]system_catalog.Resource{renamed};
+                try self.applySystemCatalogDeltaTxn(a, txn, group, .{ .upserts = &upserts, .removes = &removes, .next_id = meta.next_id }, meta, hash);
+                self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group });
+            }
+            return .{ .revision = meta.revision + 1, .identity = identity };
+        }
+        var removes: std.ArrayList(system_catalog.Resource) = .empty;
+        try removes.append(a, resource.value);
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        try seen.put(a, identity.id, {});
+        var edges: std.ArrayList([]const u8) = .empty;
+        var edge_set: std.StringHashMapUnmanaged(void) = .empty;
+        var incoming: std.ArrayList([]const u8) = .empty;
+        var size: usize = resource.value.source_json.len;
+        if (size > sql_views.max_bytes) return error.SqlProgramLimitExceeded;
+        var position: usize = 0;
+        while (position < removes.items.len) : (position += 1) {
+            const current = removes.items[position];
+            var current_record = try sql_views.Record.decode(a, current.source_json);
+            defer current_record.deinit();
+            if (current_record.value.id != current.id) return error.InvalidSqlViewRecord;
+            var key_buf: [160]u8 = undefined;
+            for (try current_record.value.dependencies(a)) |dependency| {
+                const key = try sql_views.dependencyKey(&key_buf, group, dependency, current.id);
+                if (!std.mem.eql(u8, (try stagingGet(txn, key)) orelse return error.InvalidSqlViewRecord, &.{1})) return error.InvalidSqlViewRecord;
+                if (edges.items.len >= 16384) return error.SqlProgramLimitExceeded;
+                try edges.append(a, try a.dupe(u8, key));
+                try edge_set.put(a, edges.items[edges.items.len - 1], {});
+            }
+            const prefix = try sql_views.dependencyPrefix(&key_buf, group, .view, current.id, null);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            while (row) |item| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, item.key, prefix)) break;
+                const edge = (try sql_views.dependencyFromKey(item.key, group)) orelse return error.InvalidSqlViewRecord;
+                if (!std.mem.eql(u8, item.value, &.{1})) return error.InvalidSqlViewRecord;
+                if (!request.operation.drop.cascade) return error.SqlDependentObjectsExist;
+                if (incoming.items.len >= 16384) return error.SqlProgramLimitExceeded;
+                try incoming.append(a, try a.dupe(u8, item.key));
+                if (seen.contains(edge.view)) continue;
+                if (seen.count() >= 256) return error.SqlProgramLimitExceeded;
+                const child = (try system_catalog_storage.getById(a, txn, group, .view, edge.view)) orelse return error.InvalidSqlViewRecord;
+                // Charge queued records immediately, not when visited: a
+                // wide dependency frontier must not retain hundreds of large
+                // definitions before noticing that its byte budget is full.
+                size = std.math.add(usize, size, child.value.source_json.len) catch return error.SqlProgramLimitExceeded;
+                if (size > sql_views.max_bytes) return error.SqlProgramLimitExceeded;
+                try seen.put(a, edge.view, {});
+                try removes.append(a, child.value);
+            }
+        }
+        // A forged incoming edge must not expand the drop set or survive as
+        // an orphan after publication. Every reverse edge must be justified
+        // by a verified forward definition in this same closure.
+        for (incoming.items) |key| if (!edge_set.contains(key)) return error.InvalidSqlViewRecord;
+        if (apply) {
+            for (edges.items) |key| try txn.delete(key);
+            try self.applySystemCatalogDeltaTxn(a, txn, group, .{ .upserts = &.{}, .removes = removes.items, .next_id = meta.next_id }, meta, hash);
+            self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group });
+        }
+        return .{ .revision = meta.revision + 1, .identity = identity, .removed = removes.items.len };
     }
 
     /// Only a containing catalog publication may bootstrap IDs. Ordinary

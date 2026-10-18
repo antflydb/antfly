@@ -133,6 +133,21 @@ fn resolveOnPath(native_backend: catalog.Backend, alloc: std.mem.Allocator, name
     return error.TableNotFound;
 }
 
+fn resolveReadOnPath(native_backend: catalog.Backend, alloc: std.mem.Allocator, name: ast.Name, path: ?*const @import("../pgwire/search_path.zig").Path) !catalog.ReadRelation {
+    if (name.namespace != null or name.database != null or path == null) return native_backend.resolveRead(alloc, name);
+    const selected = path.?;
+    for (selected.entries[0..selected.len]) |*entry| {
+        var scoped = name;
+        scoped.namespace = entry.slice();
+        const relation = native_backend.resolveRead(alloc, scoped) catch |err| switch (err) {
+            error.TableNotFound => continue,
+            else => return err,
+        };
+        return relation;
+    }
+    return error.TableNotFound;
+}
+
 test "SQL pgwire ordered native resolver falls back only on exact table absence" {
     // sql-0038 / sql-0040: SET SESSION and SET LOCAL share this ordered,
     // authorization-fenced native binding path after pgwire scope selection.
@@ -453,8 +468,10 @@ const OwnedRead = struct {
     stream: *Pull.Stream,
     columns: []const wire.Column,
     policies: []const Policy,
+    view_authorities: []const *const @import("sql_read_authority.zig").Context = &.{},
+    view_bindings: []const @import("sql_prepared.zig").Binding = &.{},
     detached: bool = false,
-    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0 };
+    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0, authority_table: ?catalog.Table = null };
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
@@ -501,6 +518,11 @@ const OwnedRead = struct {
         self.authority.request.session_id = self.session_id;
         try request.read_requirements.validate(.sql);
         self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        self.native_adapter.prepared_bindings = try viewBindings(arena, self.authority.request.binding_guard);
+        var captured_authorities: std.ArrayListUnmanaged(*const @import("sql_read_authority.zig").Context) = .empty;
+        self.native_adapter.collect_view_authorities = &captured_authorities;
+        var captured_bindings: std.ArrayListUnmanaged(@import("sql_prepared.zig").Binding) = .empty;
+        self.native_adapter.collect_prepared_bindings = &captured_bindings;
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
@@ -549,7 +571,24 @@ const OwnedRead = struct {
         self.native_adapter.shared_receipt_wait_budget = null;
         self.authority.request.read_receipt_budget = null;
         self.stream = opened.?;
+        self.native_adapter.collect_view_authorities = null;
+        self.native_adapter.collect_prepared_bindings = null;
         errdefer self.stream.close();
+        var view_bindings: std.ArrayListUnmanaged(@import("sql_prepared.zig").Binding) = .empty;
+        for (captured_bindings.items) |binding| {
+            if (binding.kind != .view) continue;
+            var owned = binding;
+            owned.database = try arena.dupe(u8, binding.database);
+            owned.namespace = try arena.dupe(u8, binding.namespace);
+            owned.name = try arena.dupe(u8, binding.name);
+            owned.physical_name = "";
+            try view_bindings.append(arena, owned);
+        }
+        self.view_bindings = try view_bindings.toOwnedSlice(arena);
+        const view_authorities = try arena.alloc(*const @import("sql_read_authority.zig").Context, captured_authorities.items.len);
+        for (captured_authorities.items, view_authorities) |value, *owned|
+            owned.* = try @import("sql_read_authority.zig").clone(arena, value);
+        self.view_authorities = view_authorities;
         if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
             _ = (try server.txn_sessions.stage(server.alloc, id, &self.range_guards)) orelse return error.SqlTransactionNotActive;
@@ -562,7 +601,20 @@ const OwnedRead = struct {
         const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else if (binding.table != null) 1 else 0);
         for (policies, 0..) |*policy, i| {
             const table = if (binding.relation) |relation| relation.scans[i].table else binding.table.?;
-            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try http.resolveEffectiveRowFilterJson(arena, self.identity, table.physical_name) };
+            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try @import("sql_read_authority.zig").filter(arena, table, self.identity) };
+            if (@import("sql_read_authority.zig").context(table)) |value| {
+                var capsule = table;
+                capsule.physical_name = policy.table;
+                capsule.columns = &.{};
+                capsule.read_authority = try @import("sql_read_authority.zig").clone(arena, value);
+                if (table.scope) |scope| capsule.scope = .{
+                    .database = try arena.dupe(u8, scope.database),
+                    .namespace = try arena.dupe(u8, scope.namespace),
+                    .name = try arena.dupe(u8, scope.name),
+                    .revision = scope.revision,
+                };
+                policy.authority_table = capsule;
+            }
             if (table.scope) |scope| {
                 policy.name = .{ .database = try arena.dupe(u8, scope.database), .namespace = try arena.dupe(u8, scope.namespace), .table = try arena.dupe(u8, scope.name) };
                 policy.id = table.id;
@@ -588,6 +640,7 @@ const OwnedRead = struct {
     fn validateCursor(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request) !void {
         try request.check();
         try self.authority.credential.validate();
+        try self.validateViewBindings(alloc, request);
         var admission: ?http.RequestAdmission.Lease = if (self.detached) try self.adapter.server.acquireSqlExecution(false) else null;
         defer if (admission) |*lease| lease.release();
         const original = self.authority.request;
@@ -599,12 +652,21 @@ const OwnedRead = struct {
         // Resolve definitions only: never reacquire or rerun the row snapshot.
         var current: ?http.AuthenticatedIdentity = try self.authority.credential.identity(self.adapter.server.alloc);
         defer current.?.deinit(self.adapter.server.alloc);
+        for (self.view_authorities) |value| try @import("sql_read_authority.zig").validateGrants(alloc, value);
         try validatePolicies(self.adapter.server.alloc, &current.?, self.identity.?, self.policies);
         var authority: Authority = .{ .credential = self.authority.credential, .identity = &current, .request = request };
         var adapter: execution.Adapter = .{ .server = self.adapter.server, .identity = &current, .context = try authority.context(), .database = original.database.?, .namespace = original.namespace.? };
         const catalog_backend = adapter.backend();
         for (self.policies) |policy| if (policy.name) |name| {
-            const table = try catalog_backend.vtable.resolve(catalog_backend.ptr, alloc, name, .read);
+            var scoped = adapter;
+            var effective: ?http.AuthenticatedIdentity = null;
+            defer if (effective) |*identity| identity.deinit(self.adapter.server.alloc);
+            if (policy.authority_table) |pinned| {
+                effective = try http.cloneCatalogIdentity(self.adapter.server.alloc, @import("sql_read_authority.zig").context(pinned).?.effective);
+                scoped.identity = &effective;
+            }
+            const resolver = if (effective != null) scoped.backend() else catalog_backend;
+            const table = try resolver.vtable.resolve(resolver.ptr, alloc, name, .read);
             if (table.id != policy.id or table.schema_version != policy.schema_version or !std.mem.eql(u8, table.physical_name, policy.table)) return error.CatalogGenerationChanged;
         };
     }
@@ -623,6 +685,7 @@ const OwnedRead = struct {
         // later Execute messages carry a newer per-request deadline.
         try self.authority.request.check();
         try self.authority.credential.validate();
+        try self.validateViewBindings(alloc, request);
         if (self.session_id) |id_hex| {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
             if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
@@ -632,6 +695,7 @@ const OwnedRead = struct {
         }
         var fresh = try self.authority.credential.identity(alloc);
         defer fresh.deinit(alloc);
+        for (self.view_authorities) |value| try @import("sql_read_authority.zig").validateGrants(alloc, value);
         try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
         var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
@@ -645,6 +709,37 @@ const OwnedRead = struct {
         } };
     }
 
+    fn validateViewBindings(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request) !void {
+        if (self.view_bindings.len == 0) return;
+        const sources = @import("antfly_local_sources");
+        const domain = sources.system_catalog_domain;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const lookups = try a.alloc(domain.SqlSourceLookup, self.view_bindings.len);
+        for (self.view_bindings, lookups) |binding, *lookup| lookup.* = .{ .view_id = binding.id };
+        var authority = self.authority;
+        authority.request = request;
+        const bytes = try self.adapter.server.source.systemCatalog(a, try authority.context(), .{ .resolve_many = .{ .sql_sources = lookups } });
+        const current = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+        if (!current.sql_sources_resolved or current.sql_sources.len != lookups.len) return error.CatalogGenerationChanged;
+        for (self.view_bindings, current.sql_sources) |binding, resolved| {
+            const found = resolved orelse return error.CatalogGenerationChanged;
+            if (found.value != .view or !std.mem.eql(u8, binding.database, found.target.database) or
+                !std.mem.eql(u8, binding.namespace, found.target.namespace) or !std.mem.eql(u8, binding.name, found.target.table))
+                return error.CatalogGenerationChanged;
+            var record = try @import("../system_catalog/views.zig").Record.decode(a, found.value.view.source_json);
+            defer record.deinit();
+            try @import("sql_prepared.zig").Binding.verifyView(&.{binding}, @import("sql_prepared.zig").Binding.fromView(
+                found.target,
+                record.value.id,
+                record.value.generation,
+                record.value.attributes.epoch.digest,
+                current.revision,
+            ));
+        }
+    }
+
     fn validatePolicies(alloc: std.mem.Allocator, fresh: *http.AuthenticatedIdentity, admitted: http.AuthenticatedIdentity, policies: []const Policy) !void {
         // The catalog resolves logical resources to private physical names.
         // Reapply only the pinned aliases to fresh authority, never its old
@@ -652,6 +747,10 @@ const OwnedRead = struct {
         // they need not cause another native cursor.next call.
         for (admitted.catalog_aliases) |alias| try http.projectCatalogIdentity(alloc, fresh, alias.logical, alias.physical);
         for (policies) |policy| {
+            if (policy.authority_table) |table| {
+                try @import("sql_read_authority.zig").validateFilters(alloc, table, fresh.*, policy.filter);
+                continue;
+            }
             if (!(try http.tablePermissionCurrentlyAllowed(fresh.*, policy.table, .read))) return error.Forbidden;
             const filter = try http.resolveEffectiveRowFilterJson(alloc, fresh.*, policy.table);
             defer if (filter) |value| alloc.free(value);
@@ -937,6 +1036,8 @@ const Job = struct {
             .setting_overlay_source = .connection,
             .expected_setting_epoch = self.request.setting_epoch,
         };
+        var captured_bindings: std.ArrayList(@import("sql_prepared.zig").Binding) = .empty;
+        if (self.kind == .describe) native_adapter.collect_prepared_bindings = &captured_bindings else native_adapter.prepared_bindings = try viewBindings(self.alloc, self.request.binding_guard);
         // describe/execute capture a single settings view. The adapter's
         // loader checks expected_setting_epoch on that exact captured epoch.
         var guarded = GuardedCatalog{
@@ -974,7 +1075,7 @@ const Job = struct {
                 .columns = columns,
                 .parameter_types = parameter_types,
                 .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
-                .binding_guard = try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
+                .binding_guard = if (hasViewBindings(captured_bindings.items)) try encodeViewBindings(self.alloc, captured_bindings.items) else try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
                 .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
             return;
@@ -1254,7 +1355,7 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve_read = resolveRead, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
     }
     fn generateRowId(raw: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
@@ -1265,7 +1366,7 @@ const GuardedCatalog = struct {
     }
     fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table.physical_name);
+        try self.checkRead(table);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const resolve_owners = self.native.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlShape;
         return resolve_owners(self.native.ptr, alloc, scratch_alloc, table, target, mutations);
@@ -1280,23 +1381,33 @@ const GuardedCatalog = struct {
         try checkpoint(raw);
         try self.authority.credential.validate();
         const table = try resolveOnPath(self.native, alloc, name, action, if (self.authority.request.search_path) |*path| path else null);
-        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        if (self.expected_guard) |guard| if (!std.mem.startsWith(u8, guard, view_binding_magic)) try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
         return table;
+    }
+    fn resolveRead(raw: *anyopaque, alloc: std.mem.Allocator, name: ast.Name) !catalog.ReadRelation {
+        const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        try checkpoint(raw);
+        try self.authority.credential.validate();
+        const relation = try resolveReadOnPath(self.native, alloc, name, if (self.authority.request.search_path) |*path| path else null);
+        if (relation == .table) if (self.expected_guard) |guard| if (!std.mem.startsWith(u8, guard, view_binding_magic))
+            try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, relation.table);
+        return relation;
     }
     fn scan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table.physical_name);
+        try self.checkRead(table);
         return self.native.vtable.scan(self.native.ptr, alloc, table, request);
     }
-    fn checkRead(self: *GuardedCatalog, table: []const u8) !void {
+    fn checkRead(self: *GuardedCatalog, table: catalog.Table) !void {
         try checkpoint(self);
         try self.authority.credential.validate();
-        if (!(try http.tablePermissionCurrentlyAllowed(self.authority.identity.*, table, .read))) return error.Forbidden;
+        if (table.read_authority != null) return @import("sql_read_authority.zig").check(table);
+        if (!(try http.tablePermissionCurrentlyAllowed(self.authority.identity.*, table.physical_name, .read))) return error.Forbidden;
     }
     const ReadCursor = struct {
         alloc: std.mem.Allocator,
         guard: *GuardedCatalog,
-        table: []u8,
+        table: catalog.Table,
         inner: catalog.Cursor,
 
         fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
@@ -1342,10 +1453,12 @@ const GuardedCatalog = struct {
             errdefer alloc.free(cursors);
             errdefer for (cursors[0..wrapped]) |child| child.close(child.ptr);
             for (children, cursors) |child, *out| {
-                const name = try alloc.dupe(u8, self.table);
+                const name = try alloc.dupe(u8, self.table.physical_name);
                 errdefer alloc.free(name);
+                var table = self.table;
+                table.physical_name = name;
                 const owner = try alloc.create(ReadCursor);
-                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .inner = child };
+                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = table, .inner = child };
                 out.* = owner.cursor(close);
                 wrapped += 1;
             }
@@ -1369,20 +1482,22 @@ const GuardedCatalog = struct {
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.inner.close(self.inner.ptr);
-            self.alloc.free(self.table);
+            self.alloc.free(self.table.physical_name);
             self.alloc.destroy(self);
         }
     };
     fn openScan(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        try self.checkRead(table.physical_name);
+        try self.checkRead(table);
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
         errdefer inner.close(inner.ptr);
         const name = try alloc.dupe(u8, table.physical_name);
         errdefer alloc.free(name);
+        var retained = table;
+        retained.physical_name = name;
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .inner = inner };
+        cursor.* = .{ .alloc = alloc, .guard = self, .table = retained, .inner = inner };
         // Materialized execution closes before returning; streaming execution
         // retains the heap-owned guard and authority in its OwnedRead capsule.
         return cursor.cursor(ReadCursor.close);
@@ -1419,7 +1534,7 @@ const GuardedCatalog = struct {
         fn close(raw: *anyopaque) void {
             const self: *StatementRead = @ptrCast(@alignCast(raw));
             self.inner.close(self.inner.ptr);
-            for (self.wrappers) |wrapper| self.alloc.free(wrapper.table);
+            for (self.wrappers) |wrapper| self.alloc.free(wrapper.table.physical_name);
             self.alloc.free(self.wrappers);
             self.alloc.free(self.cursors);
             self.alloc.destroy(self);
@@ -1428,7 +1543,7 @@ const GuardedCatalog = struct {
 
     fn openStatement(raw: *anyopaque, alloc: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
-        for (scans) |scan_request| try self.checkRead(scan_request.table.physical_name);
+        for (scans) |scan_request| try self.checkRead(scan_request.table);
         const open = self.native.vtable.open_statement orelse return error.SqlStatementSnapshotRequired;
         const inner = try open(self.native.ptr, alloc, scans);
         errdefer inner.close(inner.ptr);
@@ -1440,9 +1555,11 @@ const GuardedCatalog = struct {
         const cursors = try alloc.alloc(catalog.Cursor, scans.len);
         errdefer alloc.free(cursors);
         var count: usize = 0;
-        errdefer for (wrappers[0..count]) |wrapper| alloc.free(wrapper.table);
+        errdefer for (wrappers[0..count]) |wrapper| alloc.free(wrapper.table.physical_name);
         for (scans, inner.cursors, wrappers, cursors) |scan_request, cursor, *wrapper, *out| {
-            wrapper.* = .{ .alloc = alloc, .guard = self, .table = try alloc.dupe(u8, scan_request.table.physical_name), .inner = cursor };
+            var table = scan_request.table;
+            table.physical_name = try alloc.dupe(u8, table.physical_name);
+            wrapper.* = .{ .alloc = alloc, .guard = self, .table = table, .inner = cursor };
             count += 1;
             out.* = wrapper.cursor(StatementRead.borrowedClose);
         }
@@ -1466,6 +1583,87 @@ const GuardedCatalog = struct {
         return dispatch_ddl(self.native.ptr, wire_allocators, input);
     }
 };
+
+const view_binding_magic = "AVBG2\x00";
+test "SQL pgwire view manifests retain durable identities and reject malformed guards" {
+    const a = std.testing.allocator;
+    const Binding = @import("sql_prepared.zig").Binding;
+    const binding = Binding.fromView(.{ .table = "stored" }, 7, 2, @splat(3), 8);
+    const guard = try encodeViewBindings(a, &.{binding});
+    defer a.free(guard);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const retained = (try viewBindings(arena.allocator(), guard)).?;
+    try std.testing.expectEqual(@as(usize, 1), retained.len);
+    try Binding.verifyView(retained, binding);
+    var renamed = binding;
+    renamed.name = "new_name";
+    renamed.revision += 1;
+    try Binding.verifyView(retained, renamed);
+    renamed.schema_version += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(retained, renamed));
+    for ([_][]const u8{ view_binding_magic, view_binding_magic ++ "[]", view_binding_magic ++ "null", view_binding_magic ++ "[{}]", view_binding_magic ++ "[1]" }) |invalid|
+        try std.testing.expectError(error.CatalogGenerationChanged, viewBindings(arena.allocator(), invalid));
+    try std.testing.expect((try viewBindings(arena.allocator(), null)) == null);
+    try std.testing.expect((try viewBindings(arena.allocator(), "legacy-table-guard")) == null);
+}
+
+test "SQL pgwire view resolver preserves search path and stops on authority errors" {
+    const search_path = @import("../pgwire/search_path.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        failure: anyerror = error.TableNotFound,
+        query: ast.Select = .{},
+        fn read(raw: *anyopaque, _: std.mem.Allocator, name: ast.Name) !catalog.ReadRelation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (std.mem.eql(u8, name.namespace orelse "", "tenant")) return self.failure;
+            return .{ .view = .{ .id = 7, .generation = 1, .query = &self.query, .columns = &.{}, .backend = self.backend(), .security_barrier = true } };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve_read = read, .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = undefined } };
+        }
+    };
+    var fixture: Fixture = .{};
+    var path: search_path.Path = .{};
+    try path.append(try search_path.Namespace.init("tenant"));
+    try path.append(try search_path.Namespace.init("public"));
+    const relation = try resolveReadOnPath(fixture.backend(), std.testing.allocator, .{ .table = "stored" }, &path);
+    try std.testing.expect(relation == .view);
+    try std.testing.expectEqual(@as(u64, 7), relation.view.id);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    for ([_]anyerror{ error.Forbidden, error.CatalogGenerationChanged, error.QueryCanceled }) |failure| {
+        fixture = .{ .failure = failure };
+        try std.testing.expectError(failure, resolveReadOnPath(fixture.backend(), std.testing.allocator, .{ .table = "stored" }, &path));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+}
+
+fn hasViewBindings(bindings: []const @import("sql_prepared.zig").Binding) bool {
+    for (bindings) |binding| if (binding.kind == .view) return true;
+    return false;
+}
+fn encodeViewBindings(a: std.mem.Allocator, bindings: []const @import("sql_prepared.zig").Binding) ![]const u8 {
+    if (bindings.len == 0 or bindings.len > 64 or !hasViewBindings(bindings)) return error.InvalidSqlBackendResponse;
+    const bytes = try std.json.Stringify.valueAlloc(a, bindings, .{});
+    defer a.free(bytes);
+    return std.mem.concat(a, u8, &.{ view_binding_magic, bytes });
+}
+fn viewBindings(a: std.mem.Allocator, guard: ?[]const u8) !?[]const @import("sql_prepared.zig").Binding {
+    const bytes = guard orelse return null;
+    if (!std.mem.startsWith(u8, bytes, view_binding_magic)) return null;
+    if (bytes.len > 256 * 1024) return error.CatalogGenerationChanged;
+    const bindings = std.json.parseFromSliceLeaky([]const @import("sql_prepared.zig").Binding, a, bytes[view_binding_magic.len..], .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.CatalogGenerationChanged,
+    };
+    if (bindings.len == 0 or bindings.len > 64 or !hasViewBindings(bindings)) return error.CatalogGenerationChanged;
+    for (bindings) |binding| {
+        if (binding.id == 0 or binding.database.len == 0 or binding.namespace.len == 0 or binding.name.len == 0) return error.CatalogGenerationChanged;
+        if (binding.kind == .view and (binding.schema_version == 0 or binding.definition_digest == null)) return error.CatalogGenerationChanged;
+    }
+    return bindings;
+}
 
 fn statementBindingGuard(alloc: std.mem.Allocator, revision: ?u64, binding: describe_sql.BoundStatement) !?[]const u8 {
     var scans: [64]catalog.StatementScan = undefined;

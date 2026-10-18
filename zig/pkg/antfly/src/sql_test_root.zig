@@ -18,6 +18,8 @@ test {
     _ = @import("sql/subquery_shape_test.zig");
     _ = @import("sql/joined_mutation_test.zig");
     _ = @import("antfly_local_sources").system_catalog_policies;
+    _ = @import("antfly_local_sources").storage_db_row_policy_bundle;
+    _ = @import("antfly_local_sources").storage_db_table_catalog;
     _ = @import("antfly_local_sources").system_catalog_domain;
     // Keep SQL schema lowering and native uniqueness/conflict admission in
     // one qualification gate; the build selects the cross-layer contract.

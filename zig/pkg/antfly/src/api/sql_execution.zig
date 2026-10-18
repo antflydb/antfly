@@ -250,10 +250,11 @@ pub const Adapter = struct {
     setting_overlay_source: SettingOverlaySource = .durable_session,
     expected_setting_epoch: ?u64 = null,
     collect_prepared_bindings: ?*std.ArrayListUnmanaged(@import("sql_prepared.zig").Binding) = null,
+    collect_view_authorities: ?*std.ArrayListUnmanaged(*const @import("sql_read_authority.zig").Context) = null,
     /// One linearizable publication lookup and role capture per table in a
     /// statement. Owner verification still fences every scan against the
     /// exact serving generation, including a publication changed mid-read.
-    policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
+    policy_proofs: ?std.AutoHashMapUnmanaged(@import("sql_read_authority.zig").ProofKey, ?[]u8) = null,
 
     pub fn decisionRuntime(self: *Adapter) !?@import("antfly_local_sources").functions_runtime.Runtime {
         if (self.server.cfg.node_config) |config| {
@@ -660,15 +661,24 @@ pub const Adapter = struct {
         };
     }
 
+    // Both tables have static storage. Runtime fields inside an address-of
+    // literal would instead return a dangling pointer to this call's stack.
+    const view_vtable: catalog.Backend.VTable = .{ .resolve_read = resolveRead, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint };
+    const table_vtable: catalog.Backend.VTable = blk: {
+        var value = view_vtable;
+        value.resolve_read = null;
+        break :blk value;
+    };
+
     pub fn backend(self: *Adapter) catalog.Backend {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
-        return .{ .owner = .{ .ptr = self, .load = loadSettings }, .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database }, .overlay = self.setting_overlay };
+        return .{ .owner = .{ .ptr = self, .load = loadSettings }, .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database }, .sql_user = if (self.identity.*) |identity| identity.username else null, .overlay = self.setting_overlay };
     }
 
     fn loadSettings(ptr: *anyopaque, alloc: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
@@ -735,6 +745,45 @@ pub const Adapter = struct {
         try checkpoint(ptr.?);
     }
 
+    fn resolveRead(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name) !catalog.ReadRelation {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (self.prepared_bindings) |bindings| {
+            for (bindings) |binding| {
+                if (binding.kind != .view or !std.mem.eql(u8, binding.database, name.database orelse self.database) or
+                    !std.mem.eql(u8, binding.namespace, name.namespace orelse self.namespace) or
+                    !std.mem.eql(u8, binding.name, name.table)) continue;
+                // A prepared root is already bound. A rename/name reuse may
+                // change the spelling, never the stored identity being read.
+                const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{
+                    .sql_sources = &.{.{ .view_id = binding.id }},
+                    .expected_revision = self.revision,
+                    .include_query_definitions = true,
+                } });
+                const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+                if (!snapshot.sql_sources_resolved or snapshot.sql_sources.len != 1) return error.UnsupportedSqlExecution;
+                if (self.revision) |revision| if (revision != snapshot.revision) return error.CatalogGenerationChanged;
+                self.revision = snapshot.revision;
+                const source = snapshot.sql_sources[0] orelse return error.CatalogGenerationChanged;
+                if (source.value != .view or source.value.view.id != binding.id) return error.CatalogGenerationChanged;
+                return @import("sql_view_execution.zig").prepare(self, alloc, source.target, source.value.view, null);
+            }
+        }
+        const table = resolve(ptr, alloc, name, .read) catch |err| switch (err) {
+            error.TableNotFound => {
+                const views = @import("sql_view_execution.zig");
+                const target: system_catalog.Target = .{ .database = name.database orelse self.database, .namespace = name.namespace orelse self.namespace, .table = name.table };
+                const snapshot = try views.lookup(self, alloc, target);
+                const source = snapshot.sql_sources[0] orelse return error.TableNotFound;
+                return switch (source.value) {
+                    .view => |resource| views.prepare(self, alloc, source.target, resource, null),
+                    .table => |value| .{ .table = try self.bindResolvedTable(alloc, source.target, value.binding, snapshot.revision, .read) },
+                };
+            },
+            else => return err,
+        };
+        return .{ .table = table };
+    }
+
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         const target: system_catalog.Target = .{ .database = name.database orelse self.database, .namespace = name.namespace orelse self.namespace, .table = name.table };
@@ -756,6 +805,17 @@ pub const Adapter = struct {
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
         if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
         const table = snapshot.tables[0] orelse return error.TableNotFound;
+        return self.bindResolvedTable(alloc, target, table, snapshot.revision, action);
+    }
+
+    pub fn bindResolvedTable(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, table: system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
+        return self.bindResolvedTableImpl(alloc, target, table, revision, action, true);
+    }
+    pub fn bindViewSource(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, table: system_catalog.ResolvedTable, revision: u64) !catalog.Table {
+        return self.bindResolvedTableImpl(alloc, target, table, revision, .read, false);
+    }
+    fn bindResolvedTableImpl(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, table: system_catalog.ResolvedTable, revision: u64, action: catalog.Action, capture_prepared: bool) !catalog.Table {
+        const logical = try target.resourceNameAlloc(alloc);
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
@@ -773,13 +833,14 @@ pub const Adapter = struct {
                 .indexes_json = definition.indexes_json,
             }),
         };
-        binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = snapshot.revision };
-        self.revision = snapshot.revision;
+        binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = revision };
+        self.revision = revision;
         self.target = target;
-        if (self.prepared_bindings) |bindings| try @import("sql_prepared.zig").Binding.verify(bindings, binding);
-        if (self.collect_prepared_bindings) |bindings| {
+        if (capture_prepared) if (self.prepared_bindings) |bindings| try @import("sql_prepared.zig").Binding.verify(bindings, binding);
+        if (if (capture_prepared) self.collect_prepared_bindings else null) |bindings| {
             const current = try @import("sql_prepared.zig").Binding.from(binding);
             const existing = for (bindings.items) |entry| {
+                if (entry.kind != .table) continue;
                 if (std.mem.eql(u8, entry.database, current.database) and std.mem.eql(u8, entry.namespace, current.namespace) and std.mem.eql(u8, entry.name, current.name)) {
                     try @import("sql_prepared.zig").Binding.verify(&.{entry}, binding);
                     break true;
@@ -850,10 +911,24 @@ pub const Adapter = struct {
     }
 
     fn rowPolicyProof(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !?[]const u8 {
-        if (self.policy_proofs) |*proofs| if (proofs.get(table.id)) |cached| return cached;
+        const authority_api = @import("sql_read_authority.zig");
+        try authority_api.check(table);
+        const key = try authority_api.ProofKey.from(table);
+        if (self.policy_proofs) |*proofs| if (proofs.get(key)) |cached| return cached;
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const identity: ?*const http_server.AuthenticatedIdentity = if (self.identity.*) |*value| value else null;
-        const signed = try self.server.rowPolicyReadProof(
+        const proof_alloc = if (self.policy_proofs != null) self.server.alloc else alloc;
+        const signed = if (authority_api.context(table)) |authority| delegated: {
+            const caller = identity orelse return error.Forbidden;
+            if (authority.delegation) |grant| {
+                if (!std.mem.eql(u8, authority.effective.username, grant.owner) or !std.mem.eql(u8, &authority.instance, &grant.owner_instance)) return error.Forbidden;
+                const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
+                defer alloc.free(logical);
+                break :delegated try self.server.rowPolicyViewReadProof(proof_alloc, caller, self.context, table.id, table.physical_name, scope.database, table.schema_version, .{ .grant = grant, .logical_source = logical });
+            }
+            if (!std.mem.eql(u8, caller.username, authority.effective.username)) return error.Forbidden;
+            break :delegated try self.server.rowPolicyReadProof(proof_alloc, caller, self.context, table.id, table.physical_name, scope.database, table.schema_version);
+        } else try self.server.rowPolicyReadProof(
             if (self.policy_proofs != null) self.server.alloc else alloc,
             identity,
             self.context,
@@ -864,7 +939,7 @@ pub const Adapter = struct {
         );
         if (self.policy_proofs) |*proofs| {
             errdefer if (signed) |token| self.server.alloc.free(token);
-            try proofs.put(self.server.alloc, table.id, signed);
+            try proofs.put(self.server.alloc, key, signed);
             return signed;
         }
         return signed;
@@ -876,7 +951,9 @@ pub const Adapter = struct {
             if (self.range_reads == null or request.primary_key != null or request.after != null or request.primary_order or
                 probe.name.len == 0 or probe.values.len == 0 or probe.values.len > 32) return error.UnsupportedSqlExecution;
         }
-        if (self.identity.*) |identity| {
+        if (table.read_authority != null) {
+            try @import("sql_read_authority.zig").check(table);
+        } else if (self.identity.*) |identity| {
             if (!http_server.permissionsAllow(identity.permissions, .table, table.physical_name, .read)) return error.Forbidden;
         }
         const conditions = try alloc.alloc(db_types.RelationalRowQuery.Condition, request.conditions.len);
@@ -923,7 +1000,7 @@ pub const Adapter = struct {
             scan_request.opts.inclusive_from = true;
             scan_request.opts.exclusive_to = true;
         }
-        if (try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name)) |filter| {
+        if (try @import("sql_read_authority.zig").filter(alloc, table, self.identity.*)) |filter| {
             try http_server.injectRowFilterIntoScanRequest(alloc, &scan_request, filter);
         }
         // Routing spans are half-open. [key, key + NUL) includes exactly the
@@ -985,7 +1062,7 @@ pub const Adapter = struct {
             const staged = self.staged.?;
             // A session SELECT needs one native statement snapshot. Multi-owner
             // sources without that guarantee remain explicitly unsupported.
-            const row_filter = try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name);
+            const row_filter = try @import("sql_read_authority.zig").filter(alloc, table, self.identity.*);
             defer if (row_filter) |filter| alloc.free(filter);
             var ordered = request;
             ordered.primary_order = true;
@@ -1164,7 +1241,7 @@ pub const Adapter = struct {
             if (self.policy_proofs == null) alloc.free(proof);
             return error.RowPolicyUnsupported;
         }
-        if (try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name)) |filter| {
+        if (try @import("sql_read_authority.zig").filter(alloc, table, self.identity.*)) |filter| {
             alloc.free(filter);
             return error.RowPolicyUnsupported;
         }
@@ -1632,7 +1709,7 @@ pub const Adapter = struct {
             wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.*, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
-                const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, bound_table);
+                const row_filter = try @import("sql_read_authority.zig").filter(temporary, request.table, self.identity.*);
                 cursor.* = try @import("sql_session_overlay.zig").open(alloc, cursor.*, staged, request.table, query, row_filter);
             }
             retained.opened += 1;
@@ -1714,7 +1791,7 @@ pub const Adapter = struct {
             wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
-                const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, request.table.physical_name);
+                const row_filter = try @import("sql_read_authority.zig").filter(temporary, request.table, self.identity.*);
                 var ordered = request.request;
                 ordered.primary_order = true;
                 cursor.* = try @import("sql_session_overlay.zig").open(alloc, cursor.*, staged, request.table, ordered, row_filter);
@@ -1736,6 +1813,7 @@ pub const Adapter = struct {
     }
 
     fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
+        if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
         const images = @import("antfly_local_sources").sql_mutation_images;
@@ -1776,6 +1854,7 @@ pub const Adapter = struct {
     }
 
     fn mutateInternal(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, already_prepared: bool) !catalog.MutationOutcome {
+        if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
         const guards = try conflictGuards(alloc, input);

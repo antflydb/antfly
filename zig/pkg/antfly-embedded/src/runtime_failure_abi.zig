@@ -775,6 +775,13 @@ pub const Status = enum(u32) {
     invalid_ordered_apply_receipt = 815,
     conflicting_ordered_apply_receipt = 816,
     index_owner_receipt_changed = 817,
+    invalid_sql_view_record = 818,
+    sql_view_cycle = 819,
+    sql_view_column_rename = 820,
+    sql_view_column_type_changed = 821,
+    sql_view_column_dropped = 822,
+    sql_dependent_objects_exist = 823,
+    sql_program_limit_exceeded = 824,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

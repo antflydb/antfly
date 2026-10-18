@@ -3259,6 +3259,29 @@ fn prepareProvisionedGroupConsistency(
     };
 }
 
+/// Quorum synchronization is independent of primary-row authorization. An
+/// empty-key lookup is not an admission primitive on an RLS-protected table.
+fn admitRoutedStatementGroup(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    barrier: raft_mod.ReadSafetyBarrier,
+    fence: metadata_api.CatalogRouteFence,
+    group_id: u64,
+    table_name: []const u8,
+) !void {
+    try fence.validate();
+    if (fence.route.group_id != group_id) return error.TopologyChanged;
+    try fence.admission_cancellation.check();
+    try table_catalog.validateCatalogRouteFenceUntil(alloc, catalog, table_name, fence, catalog.routeFenceDeadline(fence));
+    try prepareProvisionedGroupConsistency(barrier, group_id, .{ .lookup = .{ .key = "", .opts = .{
+        .execution_deadline_ns = fence.admission_deadline_ns,
+        .execution_io = fence.admission_deadline_io,
+        .cancellation = fence.admission_cancellation,
+    } } }, .read_index, false);
+    try table_catalog.validateCatalogRouteFenceUntil(alloc, catalog, table_name, fence, catalog.routeFenceDeadline(fence));
+    try fence.admission_cancellation.check();
+}
+
 /// A multi-owner cut is legal only because every owner primitive rejects
 /// unresolved intents while holding its primary and replay capture leases.
 fn certifyDelayedOwnerCut(owner_count: usize) !void {
@@ -3827,6 +3850,34 @@ pub const ProvisionedTableReadSource = struct {
 
     fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
+        var requested_deadline: ?u64 = null;
+        for (scans) |input| if (input.opts.execution_deadline_ns) |deadline| {
+            requested_deadline = @min(requested_deadline orelse deadline, deadline);
+        };
+        var budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = requested_deadline }));
+        budget.deadline_ns = @min(budget.deadline_ns orelse std.math.maxInt(u64), budget.nowNs() +| 5 * std.time.ns_per_s);
+        const bounded = try alloc.dupe(@import("antfly_local_sources").api_table_read_source.RelationalStatementScan, scans);
+        defer alloc.free(bounded);
+        for (bounded) |*input| input.opts.execution_deadline_ns = budget.deadline_ns;
+        var backoff: u64 = std.time.ns_per_ms;
+        while (true) {
+            for (scans) |input| if (input.opts.cancellation) |token| try token.check();
+            budget.checkpoint() catch |err| return if (err == error.CatalogRoutingSnapshotTimeout) error.SqlStatementReadUnavailable else err;
+            return openRelationalStatementOnce(ptr, alloc, bounded, consistency) catch |err| {
+                if (err != error.ReadUnavailable and err != error.SqlStatementReadUnavailable) return err;
+                // Once has unwound every view, native fence, route/admission
+                // and proof arena. Let queued apply progress before acquiring
+                // an entirely new cohort. No row/provider evaluation has run.
+                budget.sleepNs(backoff) catch |wait_err| return if (wait_err == error.CatalogRoutingSnapshotTimeout) error.SqlStatementReadUnavailable else wait_err;
+                backoff = @min(backoff * 2, 20 * std.time.ns_per_ms);
+                continue;
+            };
+        }
+    }
+
+    fn openRelationalStatementOnce(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null and self.distributed_router == null) return error.SqlStatementSnapshotRequired;
         if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
@@ -4098,6 +4149,7 @@ pub const ProvisionedTableReadSource = struct {
             .remote_statement_fences_safe = if (self.local_read_source) |local| local.remote_statement_fences_safe else false,
             .supports_sql_range_guards = true,
             .vtable = &.{
+                .admit_statement_read_group_local_routed = admitStatementReadGroupRouted,
                 .acquire_join_view = JoinReadBinding(ProvisionedTableReadSource).acquire,
                 .open_relational_read = openRelationalRead,
                 .open_relational_statement = openRelationalStatement,
@@ -5130,6 +5182,12 @@ pub const ProvisionedTableReadSource = struct {
         routed.expected_route_fence_catalog = self.catalog;
         routed.catalog = pinned.source();
         routed.expected_route_fence = fence;
+    }
+
+    fn admitStatementReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8) !void {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHotStandbyReadAllowed(.read_index);
+        return admitRoutedStatementGroup(alloc, self.catalog, self.read_safety_barrier, fence, group_id, table_name);
     }
 
     fn lookupGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
@@ -6356,7 +6414,7 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     fn internalExecutor(self: *HostedProvisionedTableReadSource) http_common.RequestExecutor {
-        return .{ .ptr = self, .vtable = &.{
+        return .{ .ptr = self, .clock_io = self.executor.clock_io, .vtable = &.{
             .execute = executeInternalRequest,
             .execute_stream = executeInternalRequestStream,
         } };
@@ -6366,7 +6424,7 @@ pub const HostedProvisionedTableReadSource = struct {
     // catalog fence. The remote endpoint independently checks service auth,
     // scope, Plan and read-index, and the owner resolves the hidden descriptor.
     fn handoffReceiptExecutor(self: *HostedProvisionedTableReadSource) http_common.RequestExecutor {
-        return .{ .ptr = self, .vtable = &.{ .execute = executeHandoffReceiptRequest } };
+        return .{ .ptr = self, .clock_io = self.executor.clock_io, .vtable = &.{ .execute = executeHandoffReceiptRequest } };
     }
 
     fn executeHandoffReceiptRequest(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
@@ -6696,6 +6754,11 @@ pub const HostedProvisionedTableReadSource = struct {
         routed.catalog = pinned.source();
     }
 
+    fn admitStatementReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8) !void {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return admitRoutedStatementGroup(alloc, self.catalog, self.read_safety_barrier, fence, group_id, table_name);
+    }
+
     fn lookupGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (opts.restore_staging_scope != null) {
@@ -6865,6 +6928,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .supports_sql_range_guards = true,
             .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
             .vtable = &.{
+                .admit_statement_read_group_local_routed = admitStatementReadGroupRouted,
                 .acquire_join_view = JoinReadBinding(HostedProvisionedTableReadSource).acquire,
                 .open_relational_read = openRelationalRead,
                 .open_relational_statement = openRelationalStatement,
@@ -16998,9 +17062,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 2), fixture.closes);
             try std.testing.expectEqual(@as(usize, 0), admission.active);
             fixture.fail_final_validation = true;
-            try std.testing.expectError(error.SqlStatementReadUnavailable, routed.source().openRelationalStatement(std.testing.allocator, &.{ input, input }, .stale));
+            const retried = try routed.source().openRelationalStatement(std.testing.allocator, &.{ input, input }, .stale);
             try std.testing.expectEqual(@as(usize, 4), fixture.closes);
-            try std.testing.expectEqual(@as(usize, 2), fixture.releases);
+            try std.testing.expectEqual(@as(usize, 6), fixture.opens);
+            try std.testing.expectEqual(@as(usize, 3), fixture.releases);
+            retried.deinit();
+            try std.testing.expectEqual(@as(usize, 6), fixture.closes);
             try std.testing.expectEqual(@as(usize, 0), admission.active);
             try std.testing.expect(!fixture.held);
             fixture.persistently_unavailable = true;

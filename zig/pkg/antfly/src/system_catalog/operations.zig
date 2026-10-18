@@ -28,6 +28,38 @@ const settings = @import("antfly_local_sources").system_catalog_settings;
 
 pub const Request = domain.Request;
 
+pub fn mutateSqlView(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("views.zig").Request) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.mutation.validate();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_view_catalog_version);
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.ensureLinearizableReadWithContext(context);
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const command = @import("views.zig").command(request);
+    const result = try store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command);
+    errdefer alloc.free(result);
+    var parsed = try std.json.parseFromSlice(@import("views.zig").MutationResult, alloc, result, .{});
+    defer parsed.deinit();
+    if (parsed.value.revision == request.expected_revision) return result;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const meta = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    if (meta.revision != parsed.value.revision or !std.mem.eql(u8, &hash, &meta.last_command)) return error.MetadataMutationOutcomeUnknown;
+    return result;
+}
+
 pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     const enroll = input == .store_root_enroll;
     if (enroll and !context.setting_admin) return error.Forbidden;
@@ -1333,6 +1365,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             // become a replayable pre-admission error on the forwarding hop.
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
+        .sql_view_mutate => |request| mutateSqlView(svc, alloc, context, request),
         .mutate => |request| mutate(svc, alloc, context, request),
     };
 }

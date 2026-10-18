@@ -129,24 +129,11 @@ pub const Installed = struct {
         std.crypto.hash.Blake3.hash(encoded, &digest, .{});
         if (!std.mem.eql(u8, &digest, &bundle.schema_digest)) return error.RowPolicyCatalogChanged;
 
-        // The SQL binder supports exactly these logical column kinds. Reject
-        // an unsupported schema at install, not halfway through a scan.
+        // Use the query binder's complete native domain, not a second coarse
+        // type mapping that rejects tables containing arrays/exact numerics.
         const columns = try alloc.alloc(sql_catalog.Column, schema.relational_columns.len);
         defer alloc.free(columns);
-        for (schema.relational_columns, columns) |column, *out| out.* = .{
-            .name = column.name,
-            .path = column.path,
-            .nullable = !column.required or column.allows_null,
-            .type = switch (column.column_type) {
-                .string => .string,
-                .integer => .integer,
-                .number => .number,
-                .boolean => .boolean,
-                .datetime => .datetime,
-                .json => .json,
-                else => return error.UnsupportedSqlExecution,
-            },
-        };
+        for (schema.relational_columns, columns) |column, *out| out.* = try sql_catalog.Column.fromRelational(column);
         const table: sql_catalog.Table = .{ .id = table_id, .physical_name = "", .schema_version = schema.version, .columns = columns };
         const SettingOwner = struct {
             fn load(ptr: *anyopaque, arena: std.mem.Allocator, scope: settings.Scope) !settings.Snapshot {
@@ -185,6 +172,7 @@ pub const Installed = struct {
     }
 
     pub fn captureEvaluation(self: *const Installed, alloc: std.mem.Allocator, schema: schema_mod.TableSchema, principal: *const role_authority.Payload, action: policies.Evaluator.Action) !*ReadEvaluation {
+        if (principal.policy_principal != null and (principal.access != .read or action != .select)) return error.RowPolicyAuthenticationRequired;
         const bundle = self.parsed.value;
         if ((bundle.phase != .serving_install and bundle.phase != .active) or bundle.table_id != principal.table_id or
             bundle.policy_generation != principal.policy_generation or bundle.catalog_epoch != principal.catalog_epoch or
@@ -200,24 +188,12 @@ pub const Installed = struct {
                 return .{ .scope = scope, .epoch = installed.parsed.value.catalog_epoch, .definitions = definitions };
             }
         };
-        result.setting_view = try setting_catalog.View.capture(alloc, .{ .ptr = @constCast(self), .load = SettingOwner.load }, .{ .principal = principal.principal, .database = principal.database }, &.{});
+        result.setting_view = try setting_catalog.View.capture(alloc, .{ .ptr = @constCast(self), .load = SettingOwner.load }, .{ .principal = principal.setting_principal orelse principal.principal, .database = principal.database }, &.{});
         errdefer result.setting_view.deinit();
+        try result.setting_view.pinSqlUser(principal.principal);
         const columns = try alloc.alloc(sql_catalog.Column, schema.relational_columns.len);
         defer alloc.free(columns);
-        for (schema.relational_columns, columns) |column, *out| out.* = .{
-            .name = column.name,
-            .path = column.path,
-            .nullable = !column.required or column.allows_null,
-            .type = switch (column.column_type) {
-                .string => .string,
-                .integer => .integer,
-                .number => .number,
-                .boolean => .boolean,
-                .datetime => .datetime,
-                .json => .json,
-                else => return error.UnsupportedSqlExecution,
-            },
-        };
+        for (schema.relational_columns, columns) |column, *out| out.* = try sql_catalog.Column.fromRelational(column);
         const PolicyOwner = struct {
             fn load(ptr: *anyopaque, _: std.mem.Allocator, table_id: u64, principal_name: []const u8, database: []const u8) !policies.Snapshot {
                 const installed: *const Installed = @ptrCast(@alignCast(ptr));
@@ -238,7 +214,7 @@ pub const Installed = struct {
         const table: sql_catalog.Table = .{ .id = bundle.table_id, .physical_name = "", .schema_version = schema.version, .columns = columns };
         result.policy_view = try policies.View.capture(alloc, .{ .ptr = @constCast(self), .load = PolicyOwner.load }, table, bundle.schema_digest, &result.setting_view);
         errdefer result.policy_view.deinit();
-        result.evaluator = try policies.Evaluator.initForAuthenticatedRoles(alloc, &result.policy_view, &result.setting_view, action, principal.roles);
+        result.evaluator = try policies.Evaluator.initForAuthenticatedPrincipal(alloc, &result.policy_view, &result.setting_view, action, principal.policy_principal orelse principal.principal, principal.roles);
         errdefer result.evaluator.deinit();
         result.scratch = try gate.EvaluationScratch.init(alloc, &result.evaluator);
         return result;
@@ -309,6 +285,110 @@ test "row-policy receipt preserves exact Raft and bundle identity" {
     var corrupt = encoded;
     corrupt[29] = 1;
     try std.testing.expectError(error.InvalidRowPolicyReceipt, Receipt.decode(&corrupt));
+}
+
+test "installed view policy selects owner roles but evaluates caller settings" {
+    const a = std.testing.allocator;
+    const schema: schema_mod.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "amount", .path = "amount", .column_type = .numeric, .sql_element_type = .numeric },
+        .{ .name = "tags", .path = "tags", .column_type = .sql_array, .sql_element_type = .text },
+    } };
+    const row = [_]@import("../../sql/scalar.zig").Datum{ .{}, .{} };
+    const schema_bytes = try schema_mod.serializeSchema(a, schema);
+    defer a.free(schema_bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_bytes, &digest, .{});
+    const using: policies.Predicate = .{ .instructions = &.{
+        .{ .type = .{ .kind = .string }, .operation = .{ .call = .{ .function = .current_setting, .args = &.{}, .setting_identity = .{ .id = 1, .generation = 1 } } } },
+        .{ .type = .{ .kind = .string }, .operation = .{ .literal = .{ .string = "allow" } } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .eq, .left = 0, .right = 1 } } },
+        .{ .type = .{ .kind = .string }, .operation = .{ .call = .{ .function = .@"$current_user", .args = &.{} } } },
+        .{ .type = .{ .kind = .string }, .operation = .{ .literal = .{ .string = "caller" } } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .eq, .left = 3, .right = 4 } } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .@"and", .left = 2, .right = 5 } } },
+    }, .root = 6 };
+    const bytes = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{
+        .table_id = 7,
+        .schema_version = 2,
+        .schema_digest = digest,
+        .policy_generation = 3,
+        .catalog_epoch = 5,
+        .phase = .active,
+        .records = &.{.{
+            .id = 1,
+            .generation = 1,
+            .table_id = 7,
+            .schema_version = 2,
+            .schema_digest = digest,
+            .name = "view_owner_policy",
+            .commands = .{ .select = true },
+            .roles = &.{"owner"},
+            .using = using,
+        }},
+        .settings = &.{.{
+            .identity = .{ .id = 1, .generation = 1 },
+            .name = "app.visibility",
+            .kind = .string,
+            .policy_sensitive = true,
+            .default = .{ .string = "deny" },
+            .role_defaults = &.{
+                .{ .database = "main", .principal = "caller", .value = .{ .string = "allow" } },
+                .{ .database = "main", .principal = "api-key:allowed", .value = .{ .string = "allow" } },
+                .{ .database = "main", .principal = "api-key:denied", .value = .{ .string = "deny" } },
+            },
+        }},
+    }, .{});
+    defer a.free(bytes);
+    var installed = try Installed.init(a, bytes, 7, schema);
+    defer installed.deinit();
+    var principal: role_authority.Payload = .{
+        .principal = "caller",
+        .policy_principal = "owner",
+        .roles = &.{},
+        .auth_revision = 1,
+        .table_id = 7,
+        .table = "rows",
+        .database = "main",
+        .policy_generation = 3,
+        .catalog_epoch = 5,
+        .access = .read,
+        .expires = 100,
+    };
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(try evaluation.evaluator.permits(a, &row));
+        try std.testing.expectEqualStrings("caller", evaluation.setting_view.scope.principal);
+    }
+    principal.setting_principal = "api-key:allowed";
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(try evaluation.evaluator.permits(a, &row));
+        try std.testing.expectEqualStrings("api-key:allowed", evaluation.setting_view.scope.principal);
+        try std.testing.expectEqualStrings("caller", evaluation.setting_view.sql_user.?);
+    }
+    principal.setting_principal = "api-key:denied";
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(!try evaluation.evaluator.permits(a, &row));
+    }
+    principal.setting_principal = null;
+    principal.policy_principal = null;
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(!try evaluation.evaluator.permits(a, &row));
+    }
+    principal.policy_principal = "owner";
+    principal.principal = "owner";
+    {
+        var evaluation = try installed.captureReadEvaluation(a, schema, &principal);
+        defer evaluation.deinit();
+        try std.testing.expect(!try evaluation.evaluator.permits(a, &row));
+    }
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, installed.captureEvaluation(a, schema, &principal, .insert));
 }
 
 test "installed row policy applies USING to old images and WITH CHECK to new images" {
