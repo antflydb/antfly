@@ -65,6 +65,7 @@ class ReleaseLicenseTests(unittest.TestCase):
             root = Path(directory)
             for name in (
                 "scripts/packaging/build_zig_release_archive.sh",
+                "scripts/packaging/fixture_process.py",
                 "scripts/packaging/create_reproducible_tar.py",
                 "scripts/packaging/render_libantfly_pkgconfig.py",
                 "zig/pkg/antfly-embedded/libantfly.pc.in",
@@ -90,8 +91,10 @@ class ReleaseLicenseTests(unittest.TestCase):
             (root / "zig/tools").mkdir(parents=True)
             (root / "zig/pkg/inference").mkdir(parents=True)
             (root / "zig/tools/run_bounded_zig_build.py").write_text(
-                "import json, os, subprocess, sys\n"
+                "import json, os, sys\n"
                 "from pathlib import Path\n"
+                "sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/packaging'))\n"
+                "from fixture_process import run_fixture\n"
                 "args = sys.argv[1:]\n"
                 "Path('build-args.json').write_text(json.dumps(args))\n"
                 "prefix = Path(args[args.index('--prefix') + 1])\n"
@@ -99,7 +102,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "    root = Path(__file__).resolve().parents[1]\n"
                 "    entry = 'cache-embedded.build.zig' if 'lite' in args else 'cache-server.build.zig'\n"
                 "    options = [arg for arg in args if arg.startswith(('-Dtarget=', '-Doptimize='))]\n"
-                "    built = subprocess.run([os.environ['RELEASE_CACHE_PROBE_ZIG'], 'build', '--build-file', entry, '--summary', 'all', '--cache-dir', args[args.index('--cache-dir') + 1], *options], cwd=root, capture_output=True, text=True, timeout=180)\n"
+                "    built = run_fixture([os.environ['RELEASE_CACHE_PROBE_ZIG'], 'build', '--build-file', entry, '--summary', 'all', '--cache-dir', args[args.index('--cache-dir') + 1], *options], cwd=root, timeout=180)\n"
                 "    Path('cache-summary.txt').write_text(built.stdout + built.stderr)\n"
                 "    if built.returncode: raise RuntimeError(built.stdout + built.stderr)\n"
                 "inference = Path.cwd().name == 'inference'\n"
