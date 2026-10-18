@@ -87,6 +87,7 @@ jobs:
           python3 -m unittest zig/tools/test_run_bounded_zig_build.py
           python3 -m unittest zig.tools.test_capi_exports.ExportPolicyTests.test_release_metadata_is_linked_once_per_final_image
           python3 -m unittest zig.tools.test_capi_exports.ExportPolicyTests.test_lite_worker_uses_the_linked_inference_owner
+          python3 -m unittest scripts.packaging.test_release_licenses scripts.packaging.test_fixture_process
 
       - name: Install pinned macOS cross-compilation SDK
         if: ${{ matrix.macos_sdk == 'true' }}
@@ -157,4 +158,5 @@ jobs:
             ${{ runner.temp }}/antfly-zig-release-*/*attempt*.log
             ${{ runner.temp }}/antfly-zig-release-*/archive-contents.txt
             ${{ runner.temp }}/antfly-zig-release-*/zig-cache/o/*/libantfly.map
+            ${{ github.workspace }}/.zig-cache/release/o/*/libantfly.map
           if-no-files-found: warn

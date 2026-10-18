@@ -225,6 +225,7 @@ jobs:
             ${{ runner.temp }}/antfly-zig-release-*/*attempt*.log
             ${{ runner.temp }}/antfly-zig-release-*/archive-contents.txt
             ${{ runner.temp }}/antfly-zig-release-*/zig-cache/o/*/libantfly.map
+            ${{ github.workspace }}/.zig-cache/release/o/*/libantfly.map
           if-no-files-found: warn
 
   test-macos-homebrew:

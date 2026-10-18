@@ -187,7 +187,10 @@ export SOURCE_DATE_EPOCH="$source_date_epoch"
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${product}-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
-local_cache="${work_root}/zig-cache"
+# Keep project objects outside product scratch so server, embedded, standalone
+# inference and repeated archive builds can reuse compatible compile results.
+# Zig keys these objects by source, toolchain, target and compile options.
+local_cache="$repo_root/.zig-cache/release"
 cache_root="${ANTFLY_ZIG_CACHE_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache}"
 
 if [ -z "${ANTFLY_ZIG_CACHE_ROOT:-}" ] && [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
@@ -248,19 +251,15 @@ zig_install_args=(
 )
 
 run_zig_build_steps() {
-  # Darwin storage reserves 28 GiB and API reserves 24 GiB. Use the bounded
-  # runner's 80% host/cgroup budget for Darwin rather than an arbitrary cap
-  # that rejects these units or prevents safe overlap on larger CI hosts.
+  # Use the bounded runner's host/cgroup budget on every target. A fixed cap
+  # left larger release runners idle by preventing independent units from
+  # overlapping even when their reservations fit within 80% of container RAM.
   local -a command=(
     python3
     "$repo_root/zig/tools/run_bounded_zig_build.py"
     --zig
     zig
   )
-  case "$target" in
-    *macos*) ;;
-    *) command+=(--max-rss-cap 21474836480) ;;
-  esac
   command+=(-- build --summary all)
 
   if [[ "$product" = lite || "$product" = embedded ]]; then
