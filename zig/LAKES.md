@@ -1169,3 +1169,12 @@ required. Storage/topology loss, recipe/incarnation changes, expiry and unavaila
 cuts fail explicitly instead of selecting newer data. See
 [Composed query sources](../docs/plans/composed-query-sources.md) for the complete
 contract and operational tradeoffs.
+
+### Compact Parquet data encodings
+
+The native reader supports plain and dictionary pages plus DELTA_BINARY_PACKED,
+DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT. Both nullable V1
+and V2 pages use the same selected-row semantics. Delta navigation keeps compact
+predecessor checkpoints; split streams gather selected lanes; prefix strings are
+reconstructed when demanded. Complete materializers share the same physical codec.
+The encoding is detected from Parquet metadata and requires no attachment option.

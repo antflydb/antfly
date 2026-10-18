@@ -164,7 +164,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     for (shared_columns) |*column| column.* = replay_keys.next().?.*;
     var replay = @import("lake_index_build_replay.zig").Replay.init(a, &input, shared_columns);
     defer replay.deinit();
-    replay.only_files = replay_files;
+    replay.only_files = if (replay_files) |mask| try @import("lake_index_build_replay.zig").Needed.fromMask(a, mask) else null;
     if (shared_columns.len != 0) input.replay = &replay;
     var files: std.StringHashMapUnmanaged(u32) = .empty;
     defer files.deinit(a);

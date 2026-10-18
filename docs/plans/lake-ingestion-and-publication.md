@@ -1996,9 +1996,9 @@ subtrees with confirmed hash ranges. Changed-file iterators seek past those rang
 they do not clone the archive into mutable file descriptors and flags. Producers
 keep a sparse overlay for changed document counts, key widths and document-block
 references. Text construction likewise records only the reached file manifests.
-The complete read-only source inventory remains shared, and shared replay union
-planning still retains a compact file-selection mask. Legacy inputs and incompatible
-checkpoints use the full reconciliation path.
+The complete read-only source inventory remains shared. Shared replay union
+planning now uses the sparse selection described below. Legacy inputs and
+incompatible checkpoints use the full reconciliation path.
 
 Dense and sparse metadata v3 persist per-file state in authenticated page trees.
 Initial publication streams the census in hash order into a bottom-up tree builder;
@@ -2028,3 +2028,51 @@ Bloom probes require physically equivalent equality bytes and decline signed zer
 and narrowed DOUBLE-backed REAL. OffsetIndex cache admission exhaustion declines
 the optional index and retains sequential page scanning; allocator and provider
 failures remain errors.
+
+### Native replay, probe cohorts, and compact Parquet encoding follow-up
+
+Replay planning runs only when shared replay has multiple consumers. A sparse
+union uses native Roaring sparse/dense containers for needed file ordinals.
+Compatible text roots and completed ordered roots borrow the publication's authenticated source delta without loading their
+complete file catalogs. Source, schema and predecessor snapshot must match. Text
+coverage must match the predecessor file population. Partial or older checkpoints
+retain their own reconciliation path. Dense/sparse paged roots likewise add only
+changed ordinals. Algebraic coverage can still require a full file pass. The sparse
+union governs replay reuse only; an uncaptured file retains ordinary source reads.
+The source inventory and ordered-index construction's slot reconciliation remain
+shared/full-population work; total publication is not claimed to be delta-only.
+
+Spilled hash joins collect candidates across probe rows within one pinned physical
+block. A per-probe match bitmap replaces the single current-row flag. Residual
+acceptance updates both probe and build state; unmatched probe rows become visible
+only after the block's pending residual decisions finish. Block release, partition
+advance and outer completion remain cohort boundaries. Scalar residual fallback
+and delivered-prefix error handling keep their existing authority. This enables
+vector residuals on one-to-one joins, as well as duplicate-key and skew joins.
+
+Parquet readers support DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY,
+DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT in addition to plain/dictionary pages.
+The shared physical codec retains one predecessor checkpoint per 32 delta values
+and one cached decoded block. Length streams retain offsets into immutable suffix
+bytes; prefix strings reconstruct only demanded values and reuse previously
+reconstructed immutable prefixes. Byte-stream-split gathers selected physical
+lanes without transposing the whole page. Nullable V1/V2 framing, signed wrapping,
+logical decimal/timestamp conversion and declared SQL widths remain separate.
+General full-column materializers use the same codec through bounded plain-wire
+expansion. Footer eligibility recognizes the new data encodings independently of
+RLE definition levels. Existing request/cache admission and cancellation apply;
+no new SQL syntax, public identities or native sidecar wire version is introduced.
+
+Checked-in independent PyArrow fixtures and their generator cover both page
+versions, NULLs, signed 32/64-bit deltas, floating/integer/decimal split streams,
+and both string delta encodings. Public E2Es attach generated files, run filtered
+queries, and repeat after restart. Archive-scale latency/RSS measurements and
+live-provider retention qualification remain separate work.
+
+Follow-up qualification on Zig 0.17.0: 79 SQL join tests and 265 embedded lake
+reader/cursor tests passed without leaks, along with the focused sparse-replay,
+append/removal aggregate, and keyed-contribution regressions. A complete stripped
+Debug Antfly server build passed. The new two-case public E2E was attempted locally
+but stopped before server launch by storage admission (about 2.1 GiB available;
+16.25 GiB required). These HTTP attachment/restart cases still need execution in
+`e2e-full` or another environment with sufficient disk headroom.

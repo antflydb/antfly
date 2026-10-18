@@ -363,7 +363,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     const replay_columns = try replay_api.columnsForBuild(a, na, table, &provider, base_source);
     var replay = replay_api.Replay.init(a, &provider, replay_columns);
     defer replay.deinit();
-    if (current.value.published) |previous| if (candidates.len != 0 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
+    if (replay_columns.len != 0 and provider.replay_recommended) if (current.value.published) |previous| if (candidates.len != 0 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
         replay.only_files = try replay_api.changedFilesIndexed(a, na, &provider, scoped, candidates, previous_contributions, cancellation, &contribution_index);
     };
     if (replay_columns.len != 0 and provider.replay_recommended) provider.replay = &replay;

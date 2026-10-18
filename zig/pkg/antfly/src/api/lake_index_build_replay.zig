@@ -82,15 +82,44 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     }.less);
     return columns;
 }
+/// Sparse union owned by the publication planner. No archive-sized replay mask.
+pub const Needed = struct {
+    files: local.encoding_roaring.RoaringBitmap,
+    pub fn deinit(self: *Needed) void {
+        self.files.deinit();
+    }
+    pub fn contains(self: *const Needed, ordinal: usize) bool {
+        return self.files.contains(std.math.cast(u32, ordinal) orelse return false);
+    }
+    pub fn fromMask(a: A, mask: []const bool) !Needed {
+        var self: Needed = .{ .files = .init(a) };
+        errdefer self.deinit();
+        for (mask, 0..) |needed, ordinal| if (needed) try self.add(ordinal);
+        return self;
+    }
+    fn add(self: *Needed, ordinal: usize) !void {
+        try self.files.add(std.math.cast(u32, ordinal) orelse return error.InvalidNativeLakeFileState);
+    }
+    fn addPlan(self: *Needed, plan: *const @import("lake_index_native_state.zig").Plan) !void {
+        var it = plan.iterator(true);
+        while (try it.next()) |item| try self.add(item.ordinal);
+    }
+};
+fn deltaMatches(provider: *Provider, source: []const u8, schema: []const u8, snapshot: []const u8) bool {
+    const delta = provider.native_delta orelse return false;
+    return delta.count() == provider.source.inventory.files.len and delta.prior_snapshot != null and std.mem.eql(u8, delta.prior_snapshot.?, snapshot) and
+        std.mem.eql(u8, delta.source, source) and std.mem.eql(u8, delta.schema, schema);
+}
 /// Union changed native files so delta builders share only the necessary input.
 /// Unknown/legacy producer formats conservatively request a complete replay.
-pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?[]const bool {
+pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?Needed {
     return changedFilesIndexed(a, out, provider, store, declarations, contributions, cancellation, null);
 }
-pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?[]const bool {
+pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?Needed {
     const state = @import("lake_index_native_state.zig");
-    const needed = try out.alloc(bool, provider.source.inventory.files.len);
-    @memset(needed, false);
+    var needed: Needed = .{ .files = .init(out) };
+    var returned = false;
+    defer if (!returned) needed.deinit();
     const aggregate = @import("lake_index_native_aggregates.zig");
     var old: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer old.deinit(a);
@@ -110,15 +139,16 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             const recipe = try @import("lake_index_aggregate_artifact.zig").loadRecipe(ca, store, declaration.artifact, cancellation);
             if (!aggregate.incrementalRecipe(recipe) or provider.source.inventory.deleted_row_groups.len != 0 or (if (provider.source.scanner.iceberg_delete_plan) |plan| plan.files.len != 0 else false)) return null;
             const fingerprint = recipe.fingerprint();
-            for (file_keys, needed) |key, *required| {
+            for (file_keys, 0..) |key, ordinal| {
                 const lookup_key = aggregate.contributionKey(key, fingerprint, declaration.name);
-                if (!required.* and !old.contains(lookup_key)) {
-                    required.* = if (index) |lookup| missing: {
+                if (!needed.contains(ordinal) and !old.contains(lookup_key)) {
+                    const missing = if (index) |lookup| missing: {
                         if (lookup.has_file_coverage) break :missing !lookup.covered_files.contains(key);
                         var scratch = std.heap.ArenaAllocator.init(a);
                         defer scratch.deinit();
                         break :missing (try lookup.lookup(scratch.allocator(), lookup_key)) == null;
                     } else true;
+                    if (missing) try needed.add(ordinal);
                 }
             }
             continue;
@@ -128,6 +158,12 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
                 const native = @import("lake_index_native_text.zig");
                 if (declaration.artifact.metadata_version != native.metadata_version) return null;
                 const directory = try native.loadRootDirectory(ca, store, declaration.artifact, cancellation, null);
+                if (directory.inventory_version == 3 and directory.checkpoint_base == null and directory.checkpoint_files == null and directory.inventory_delta_version != 0 and deltaMatches(provider, directory.binding.source_id, directory.binding.schema_fingerprint, directory.binding.snapshot_id) and directory.file_count == provider.native_delta.?.prior_count) {
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
+                    continue;
+                }
                 if (directory.inventory_version == 3) {
                     const records = try native.text_directory.fileRecords(ca, directory, store, null, cancellation);
                     const files = try ca.alloc(state.File, records.len);
@@ -144,7 +180,9 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
                 if (!native.supportsMetadata(declaration.artifact.metadata_version)) return null;
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_directory != null and state.canUseDelta(provider, root.binding.snapshot_id)) {
-                    for (needed, 0..) |*file, ordinal| file.* = file.* or provider.native_delta.?.isChanged(ordinal);
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
                     continue;
                 }
                 break :sparse if (root.file_directory) |directory| try state.directoryFiles(ca, store, directory, root.generation.domain, cancellation) else root.file_states;
@@ -154,7 +192,9 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
                 if (!native.supportsMetadata(declaration.artifact.metadata_version)) return null;
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_directory != null and state.canUseDelta(provider, root.binding.snapshot_id)) {
-                    for (needed, 0..) |*file, ordinal| file.* = file.* or provider.native_delta.?.isChanged(ordinal);
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
                     continue;
                 }
                 break :dense if (root.file_directory) |directory| try state.directoryFiles(ca, store, directory, root.generation.domain, cancellation) else root.file_states;
@@ -162,6 +202,13 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             .ordered_row_index => ordered: {
                 const native = @import("lake_index_ordered_rows.zig");
                 if (!native.supportsBuildMetadata(declaration.artifact.metadata_version)) return null;
+                const lazy = try native.loadRootLazy(ca, store, declaration.artifact, cancellation, null);
+                if (!lazy.building and deltaMatches(provider, lazy.source, declaration.binding.schema_fingerprint, lazy.snapshot)) {
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
+                    continue;
+                }
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_fingerprints.len != root.files.len) return null;
                 const files = try ca.alloc(state.File, root.files.len);
@@ -172,8 +219,9 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
         };
         var plan = try state.Plan.init(a, ca, provider, previous);
         defer plan.deinit();
-        for (needed, 0..) |*file, ordinal| file.* = file.* or plan.isChanged(ordinal);
+        try needed.addPlan(&plan);
     }
+    returned = true;
     return needed;
 }
 pub const Replay = struct {
@@ -190,12 +238,13 @@ pub const Replay = struct {
     readers: usize = 0,
     mutex: std.Io.Mutex = .init,
     max_spill_bytes: u64 = 1024 * 1024 * 1024,
-    only_files: ?[]const bool = null,
+    only_files: ?Needed = null,
     const Range = struct { begin: spill.Sequential.Position, end: u64 };
     pub fn init(a: A, provider: *Provider, columns: []const []const u8) Replay {
         return .{ .provider = provider, .columns = columns, .arena = .init(a), .budget = .{ .backing = a, .limit = 256 * 1024 * 1024 } };
     }
     pub fn deinit(self: *Replay) void {
+        if (self.only_files) |*needed| needed.deinit();
         if (self.run) |*run| {
             run.close();
             self.manager.deinit();
@@ -349,8 +398,8 @@ pub const Replay = struct {
         defer self.mutex.unlock(io);
         if (self.readers != 0 and self.captured_file != file_index) return null;
         if (self.only_files) |needed| {
-            if (needed.len != self.provider.source.inventory.files.len or file_index >= needed.len) return error.SidecarSourceBindingMismatch;
-            if (!needed[file_index]) return null;
+            if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
+            if (!needed.contains(file_index)) return null;
         }
         // Oversized individual files retain the ordinary streaming path. The
         // replay optimization must never make an otherwise valid scan fail.
@@ -486,4 +535,51 @@ test "external lake bounded replay releases files and falls back for oversized s
     try std.testing.expect((try replay.open(a, binding, 0, .none)) == null);
     try std.testing.expect(replay.run == null);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
+}
+
+test "external lake replay sparse union borrows authenticated deltas without opening file catalogs" {
+    const state = @import("lake_index_native_state.zig");
+    const text = @import("lake_index_native_text.zig");
+    const ordered = @import("lake_index_ordered_rows.zig");
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("sparse-replay-union");
+    defer directory.cleanup();
+    var memory = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer memory.deinit();
+    var store = memory.artifactStore();
+    store.upload_scope = .{ .domain = @splat(1), .attempt = @splat(2) };
+    // Valid references deliberately have no payload in the store. Planning
+    // compatible generations must authenticate only the small root records.
+    const missing: tree.Ref = .{ .digest = @splat(3), .bytes = 128, .height = 0, .records = 3 };
+    const binding: Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "s", .snapshot_id = "before", .schema_fingerprint = "schema", .column_bindings = &.{"body"}, .index_config_hash = "config" };
+    const text_root: text.Root = .{ .domain = @splat(1), .binding = binding, .config_json = "{}", .inventory_version = 3, .inventory_delta_version = 2, .file_count = 3, .directories = .{ .files = missing } };
+    var first = try store.putWithCancellation(try std.json.Stringify.valueAlloc(out, text_root, .{}), .none);
+    defer first.deinit(a);
+    const ordered_root: ordered.Root = .{ .fingerprint = @splat(4), .domain = @splat(1), .page = null, .source = "s", .snapshot = "before", .file_dictionary = .{ .count = 3, .slots = missing, .names = missing, .public = missing } };
+    var second = try store.putWithCancellation(try std.json.Stringify.valueAlloc(out, ordered_root, .{}), .none);
+    defer second.deinit(a);
+    var files = [_]state.File{ .{ .id = "a", .digest = @splat(1) }, .{ .id = "b", .digest = @splat(2) }, .{ .id = "c", .digest = @splat(3) } };
+    var flags = [_]bool{ false, true, false };
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.inventory = .{ .format = .parquet, .source_id = @constCast("s"), .source_uri = @constCast("s3://bucket/source"), .snapshot_id = @constCast("after"), .schema_fingerprint = @constCast("schema"), .files = &.{} };
+    source.inventory.files = try out.alloc(local.serverless_external_source_types.FileEntry, files.len);
+    for (source.inventory.files, files) |*file, prior| file.* = .{ .file_id = @constCast(prior.id), .object_uri = @constCast("s3://bucket/source/file"), .byte_len = 1, .row_count = 0, .row_groups = &.{} };
+    var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .native_delta = .{ .source = "s", .schema = "schema", .prior_snapshot = "before", .prior_count = 3, .files = &files, .changed = &flags, .prior_changed = &.{}, .by_id = .empty } };
+    var ordered_binding = binding;
+    ordered_binding.sidecar_kind = .ordered_rows;
+    const declarations = [_]local.serverless_segment_sidecar_manifest.DeclaredArtifact{
+        .{ .name = "text", .binding = binding, .artifact = .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = first.artifact_id, .checksum = first.checksum, .byte_len = first.byte_len } },
+        .{ .name = "ordered", .binding = ordered_binding, .artifact = .{ .kind = .ordered_row_index, .metadata_version = ordered.metadata_version, .artifact_id = second.artifact_id, .checksum = second.checksum, .byte_len = second.byte_len } },
+    };
+    var needed = (try changedFiles(a, a, &provider, store, &declarations, &.{}, .none)).?;
+    defer needed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), needed.files.cardinality());
+    try std.testing.expect(needed.files.contains(1));
+    // Snapshot mismatch cannot turn a partial predecessor into a delta proof.
+    try std.testing.expect(!deltaMatches(&provider, "s", "schema", "older"));
+    try std.testing.expect(!deltaMatches(&provider, "other", "schema", "before"));
 }

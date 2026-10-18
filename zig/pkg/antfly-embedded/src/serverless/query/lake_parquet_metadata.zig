@@ -1299,7 +1299,7 @@ fn parseFirstEncodingAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     for (0..list.len) |_| {
         const value = try reader.readI32();
         // This is a set, not a page order. RLE may describe definition levels.
-        if (value == 2 or value == 8) data_encoding = value else if (value == 0 and data_encoding == null) data_encoding = value;
+        if (value == 2 or value == 8) data_encoding = value else if ((value == 5 or value == 6 or value == 7 or value == 9) and data_encoding != 2 and data_encoding != 8) data_encoding = value else if (value == 0 and data_encoding == null) data_encoding = value;
     }
     return try alloc.dupe(u8, encodingName(data_encoding orelse -1));
 }

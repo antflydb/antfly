@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 import requests
+from lake_encoded_fixtures import write_compact_parquet
+
 from conftest import (
     AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
@@ -6290,6 +6292,81 @@ def test_typed_floating_pruning_skips_pages_and_preserves_nan(
         assert not count("unreadable", "n > 2").ok
         matching = "0.10000000149011612" if declared == "float32" else "0.1"
         assert not count("unreadable", f"n = {matching}").ok
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("page_version", [1, 2])
+def test_compact_parquet_encodings_attach_query_and_restart(tmp_path, page_version):
+    pytest.importorskip("pyarrow")
+    path = tmp_path / "encoded.parquet"
+    write_compact_parquet(path, page_version)
+    payload = path.read_bytes()
+    objects = tmp_path / "lake" / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+        response = _request_with_idle_ddl_retry(
+            server,
+            "POST",
+            "/tables/compact_encodings",
+            {
+                "num_shards": 1,
+                "indexes": {},
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "compact-encodings",
+                        "format": "parquet",
+                        "uri": (tmp_path / "lake").as_uri(),
+                    },
+                },
+            },
+            retry_ddl=True,
+        )
+        assert response.ok, response.text + server.debug_logs()
+        expected = [
+            [
+                str(i - 150),
+                str(i * 13 - 1000),
+                None if i % 11 == 0 else str(i + 0.25),
+                str(i + 0.5),
+                None if i % 13 == 0 else f"prefix-{i:05d}",
+                None if i % 19 == 0 else str(i),
+                f"{Decimal(i - 100) / 100:.2f}",
+            ]
+            for i in range(288, 300)
+            if i % 17 != 0
+        ]
+        for cold in (False, True):
+            if cold:
+                server.restart()
+            for statement, rows in (
+                ("SELECT COUNT(*) FROM compact_encodings", [["300"]]),
+                (
+                    'SELECT small,bsint,n,"real",label,short,exact '
+                    "FROM compact_encodings WHERE amount >= 288 ORDER BY amount",
+                    expected,
+                ),
+            ):
+                response = _request_with_idle_ddl_retry(
+                    server, "POST", "/sql", {"statement": statement}
+                )
+                assert response.ok, response.text + server.debug_logs()
+                assert response.json()["rows"] == rows
         failed = False
     finally:
         server.stop(test_failed=failed)

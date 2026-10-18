@@ -2198,6 +2198,10 @@ fn buildPlainColumnsAlloc(
         var chunk = findColumnChunk(row_group, input.column_id) orelse return error.ParquetColumnNotFound;
         if (limits.page_encoding) |encoding| chunk.encoding = switch (encoding) {
             .plain => @constCast("plain"),
+            .delta_binary_packed => @constCast("delta_binary_packed"),
+            .delta_length_byte_array => @constCast("delta_length_byte_array"),
+            .delta_byte_array => @constCast("delta_byte_array"),
+            .byte_stream_split => @constCast("byte_stream_split"),
             .plain_dictionary => @constCast("plain_dictionary"),
             .rle_dictionary => @constCast("rle_dictionary"),
             else => return error.UnsupportedParquetPage,
@@ -3277,7 +3281,19 @@ fn timestampI64ModeForColumnChunk(chunk: external_source.ColumnChunk, unit: Time
     return error.UnsupportedParquetPage;
 }
 
-fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !SupportedColumnMode {
+fn supportedColumnModeForColumnChunk(input: external_source.ColumnChunk) !SupportedColumnMode {
+    var chunk = input;
+    const delta_integer = std.mem.eql(u8, chunk.encoding, "delta_binary_packed");
+    const delta_bytes = std.mem.eql(u8, chunk.encoding, "delta_length_byte_array") or std.mem.eql(u8, chunk.encoding, "delta_byte_array");
+    const split = std.mem.eql(u8, chunk.encoding, "byte_stream_split");
+    if (delta_integer or delta_bytes or split) {
+        const integer = std.mem.eql(u8, chunk.physical_type, "int32") or std.mem.eql(u8, chunk.physical_type, "int64");
+        const bytes = std.mem.eql(u8, chunk.physical_type, "byte_array");
+        const fixed = std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array") and std.mem.eql(u8, chunk.logical_type, "decimal");
+        const number = std.mem.eql(u8, chunk.physical_type, "float") or std.mem.eql(u8, chunk.physical_type, "double");
+        if ((delta_integer and !integer) or (delta_bytes and !bytes) or (split and !integer and !number and !fixed)) return error.UnsupportedParquetPage;
+        chunk.encoding = @constCast("plain");
+    }
     if (std.mem.startsWith(u8, chunk.logical_type, "uint") or std.mem.eql(u8, chunk.logical_type, "unsupported")) return error.UnsupportedParquetPage;
     if (std.mem.startsWith(u8, chunk.logical_type, "int")) {
         const physical = if (std.mem.eql(u8, chunk.logical_type, "int64")) "int64" else "int32";

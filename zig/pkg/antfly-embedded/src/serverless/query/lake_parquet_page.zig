@@ -238,7 +238,96 @@ pub fn parsePageHeader(bytes: []const u8) !ParsedHeader {
     return .{ .header = header, .header_len = reader.cursor };
 }
 
-pub fn decodePlainI64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]i64 {
+// Full materializers share the compact codec with selected cursors. Only
+// callers requesting a complete physical column expand it into plain wire.
+const ExtendedPhysical = union(enum) { integer: usize, number: usize, bytes, fixed: usize };
+const NormalizedPage = struct {
+    header: Header,
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+    fn deinit(self: @This(), a: Allocator) void {
+        if (self.owned) |bytes| a.free(bytes);
+    }
+};
+fn validatePhysicalHeader(header: Header, physical: ExtendedPhysical) !void {
+    var view = header;
+    const supported = switch (header.encoding) {
+        .delta_binary_packed => physical == .integer,
+        .delta_length_byte_array, .delta_byte_array => physical == .bytes,
+        .byte_stream_split => physical == .integer or physical == .number or physical == .fixed,
+        else => false,
+    };
+    if (supported) view.encoding = .plain;
+    try view.validatePlainRequired();
+}
+fn normalizeExtended(a: Allocator, header: Header, payload: []const u8, physical: ExtendedPhysical, optional: bool) !NormalizedPage {
+    const encoding = header.encoding;
+    if (encoding != .delta_binary_packed and encoding != .delta_length_byte_array and encoding != .delta_byte_array and encoding != .byte_stream_split) return .{ .header = header, .bytes = payload };
+    try header.validateResourceLimits();
+    if (header.data_payload_offset > payload.len or header.repetition_level_bytes != 0) return error.InvalidParquetPage;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    var count: usize = header.value_count;
+    if (optional) {
+        if (header.definition_level_bytes > header.data_payload_offset) return error.InvalidParquetPage;
+        const index = try DefinitionIndex.init(work, payload[0..header.definition_level_bytes], count);
+        count = index.present;
+    }
+    const data = payload[header.data_payload_offset..];
+    const codec = @import("lake_parquet_encoded.zig");
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(a);
+    try output.appendSlice(a, payload[0..header.data_payload_offset]);
+    if (count == 0) {
+        if (data.len != 0) return error.InvalidParquetPage;
+    } else if (encoding == .delta_binary_packed) {
+        if (physical != .integer) return error.UnsupportedParquetPage;
+        const width = physical.integer;
+        var delta = try codec.Delta.init(work, data, count, @intCast(width * 8));
+        if (delta.consumed != data.len or count > (max_uncompressed_page_bytes -| output.items.len) / width) return error.InvalidParquetPage;
+        const start = output.items.len;
+        try output.resize(a, start + count * width);
+        for (0..count) |i| {
+            const value = try delta.at(i);
+            if (width == 4) std.mem.writeInt(i32, output.items[start + i * width ..][0..4], @intCast(value), .little) else std.mem.writeInt(i64, output.items[start + i * width ..][0..8], value, .little);
+        }
+    } else if (encoding == .byte_stream_split) {
+        const width = switch (physical) {
+            .integer, .number, .fixed => |n| n,
+            else => return error.UnsupportedParquetPage,
+        };
+        if (width == 0 or width > 16 or count > (max_uncompressed_page_bytes -| output.items.len) / width or data.len != count * width) return error.InvalidParquetPage;
+        const start = output.items.len;
+        try output.resize(a, start + data.len);
+        for (0..count) |row| for (0..width) |byte| {
+            output.items[start + row * width + byte] = data[byte * count + row];
+        };
+    } else {
+        if (physical != .bytes) return error.UnsupportedParquetPage;
+        var strings = try codec.Strings.init(work, data, count, encoding == .delta_byte_array);
+        // Reject expansion before reconstructing a potentially wide prefix.
+        for (0..count) |i| {
+            const prefix: usize = if (strings.prefixes) |*p| @intCast(try p.at(i)) else 0;
+            const length = prefix + strings.offsets[i + 1] - strings.offsets[i];
+            if (length + 4 > max_uncompressed_page_bytes -| output.items.len) return error.ParquetPageTooLarge;
+            var size: [4]u8 = undefined;
+            std.mem.writeInt(u32, &size, @intCast(length), .little);
+            try output.appendSlice(a, &size);
+            try output.appendSlice(a, try strings.at(i));
+        }
+    }
+    var normalized = header;
+    normalized.encoding = .plain;
+    const owned = try output.toOwnedSlice(a);
+    return .{ .header = normalized, .bytes = owned, .owned = owned };
+}
+
+pub fn decodePlainI64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]i64 {
+    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .integer = 8 }, false);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -275,7 +364,11 @@ pub fn scanUncompressedPlainInt96TimestampNsColumnChunkAlloc(alloc: Allocator, c
     return try scanPlainInt96TimestampNsColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
 }
 
-pub fn decodePlainF64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]f64 {
+pub fn decodePlainF64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]f64 {
+    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .number = 8 }, false);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -294,7 +387,11 @@ pub fn scanUncompressedPlainF64ColumnChunkAlloc(alloc: Allocator, column_chunk_b
     return try scanPlainF64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
 }
 
-pub fn decodePlainI32AsI64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]i64 {
+pub fn decodePlainI32AsI64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]i64 {
+    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .integer = 4 }, false);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -312,7 +409,11 @@ pub fn scanUncompressedPlainI32AsI64ColumnChunkAlloc(alloc: Allocator, column_ch
     return try scanPlainI32AsI64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
 }
 
-pub fn decodePlainF32AsF64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]f64 {
+pub fn decodePlainF32AsF64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]f64 {
+    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .number = 4 }, false);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -384,7 +485,7 @@ pub fn scanPlainF32AsF64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .number = 4 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -409,7 +510,7 @@ pub fn scanPlainI32AsI64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .integer = 4 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -434,7 +535,7 @@ pub fn scanPlainI64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .integer = 8 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -484,7 +585,7 @@ pub fn scanPlainF64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .number = 8 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -1443,8 +1544,10 @@ pub fn decodeOptionalPlainI64V2HybridLevelsAlloc(
     original_payload: []const u8,
 ) !NullableI64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const header = flat.header;
-    const page_payload = flat.payload;
+    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .integer = 8 }, true);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1539,8 +1642,10 @@ pub fn decodeOptionalPlainF64V2HybridLevelsAlloc(
     original_payload: []const u8,
 ) !NullableF64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const header = flat.header;
-    const page_payload = flat.payload;
+    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .number = 8 }, true);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1588,8 +1693,10 @@ pub fn decodeOptionalPlainI32V2HybridLevelsAsI64Alloc(
     original_payload: []const u8,
 ) !NullableI64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const header = flat.header;
-    const page_payload = flat.payload;
+    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .integer = 4 }, true);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1657,7 +1764,7 @@ pub fn scanOptionalPlainI64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .integer = 8 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -1738,7 +1845,7 @@ pub fn scanOptionalPlainI32AsI64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .integer = 4 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -1768,8 +1875,10 @@ pub fn decodeOptionalPlainF32V2HybridLevelsAsF64Alloc(
     original_payload: []const u8,
 ) !NullableF64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const header = flat.header;
-    const page_payload = flat.payload;
+    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .number = 4 }, true);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1938,7 +2047,7 @@ pub fn scanOptionalPlainF32AsF64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .number = 4 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -1975,7 +2084,7 @@ pub fn scanOptionalPlainF64ColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .number = 8 });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -2121,7 +2230,11 @@ pub fn scanOptionalDictionaryF32AsF64ColumnChunkAllocCached(
     };
 }
 
-pub fn decodePlainByteArraysAlloc(alloc: Allocator, header: Header, page_payload: []const u8) ![][]u8 {
+pub fn decodePlainByteArraysAlloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![][]u8 {
+    const normalized = try normalizeExtended(alloc, original_header, original_payload, .bytes, false);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     var cursor = header.data_payload_offset;
@@ -2151,8 +2264,10 @@ pub fn decodeOptionalPlainByteArraysV2HybridLevelsAlloc(
     original_payload: []const u8,
 ) !NullableByteArrayValues {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const header = flat.header;
-    const page_payload = flat.payload;
+    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .bytes, true);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -2219,7 +2334,7 @@ pub fn scanPlainByteArrayColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .bytes);
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -2260,7 +2375,7 @@ pub fn scanOptionalPlainByteArrayColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .bytes);
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -2303,10 +2418,14 @@ pub fn decodePlainByteArrayDictionaryPageAlloc(alloc: Allocator, header: Header,
 
 pub fn decodePlainFixedLenByteArraysAlloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
     type_length: usize,
 ) ![][]u8 {
+    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .fixed = type_length }, false);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (type_length == 0) return error.InvalidParquetPage;
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
@@ -2335,8 +2454,10 @@ pub fn decodeOptionalPlainFixedLenByteArraysV2HybridLevelsAlloc(
     type_length: usize,
 ) !NullableByteArrayValues {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const header = flat.header;
-    const page_payload = flat.payload;
+    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .fixed = type_length }, true);
+    defer normalized.deinit(alloc);
+    const header = normalized.header;
+    const page_payload = normalized.bytes;
     try header.validatePlainRequired();
     if (type_length == 0) return error.InvalidParquetPage;
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
@@ -2582,7 +2703,7 @@ pub fn scanPlainFixedLenByteArrayColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .fixed = type_length });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -2617,7 +2738,7 @@ pub fn scanOptionalPlainFixedLenByteArrayColumnChunkAlloc(
     var cursor: usize = 0;
     while (cursor < column_chunk_bytes.len) {
         const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
-        try parsed.header.validatePlainRequired();
+        try validatePhysicalHeader(parsed.header, .{ .fixed = type_length });
         cursor += parsed.header_len;
         if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
         const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
@@ -4611,4 +4732,46 @@ test "lake SQL nullable definition ranks retain runs compact packed bits and unw
     try std.testing.expectError(error.InvalidParquetPage, DefinitionIndex.init(std.testing.allocator, &.{ 2, 2 }, 1));
     try std.testing.expectError(error.InvalidParquetPage, DefinitionIndex.init(std.testing.allocator, &.{0x80}, 2048));
     try std.testing.expectError(error.InvalidParquetPage, DefinitionIndex.init(std.testing.allocator, &.{ 2, 1, 0 }, 1));
+}
+
+test "parquet compact full materializers share delta and split codecs with optional levels" {
+    const a = std.testing.allocator;
+    const codec = @import("lake_parquet_encoded.zig");
+    const delta = try codec.testDelta(a, &.{ -10, 20, 19 });
+    defer a.free(delta);
+    const header: Header = .{ .page_type = .data_page, .encoding = .delta_binary_packed, .compressed_page_size = @intCast(delta.len), .uncompressed_page_size = @intCast(delta.len), .value_count = 3 };
+    const required = try decodePlainI64Alloc(a, header, delta);
+    defer a.free(required);
+    try std.testing.expectEqualSlices(i64, &.{ -10, 20, 19 }, required);
+    // V1 nullable framing: present, NULL, present, present.
+    const payload = try std.mem.concat(a, u8, &.{ &.{ 2, 0, 0, 0, 3, 13 }, delta });
+    defer a.free(payload);
+    var optional_header = header;
+    optional_header.value_count = 4;
+    var optional = try decodeOptionalPlainI64V2HybridLevelsAlloc(a, optional_header, payload);
+    defer optional.deinit(a);
+    try std.testing.expectEqualSlices(i64, &.{ -10, 0, 20, 19 }, optional.values);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, optional.nulls);
+    var wire: [12]u8 = undefined;
+    for ([_]f32{ -1.5, 0, 12.25 }, 0..) |value, row| {
+        var bits: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bits, @bitCast(value), .little);
+        for (bits, 0..) |byte, lane| wire[lane * 3 + row] = byte;
+    }
+    var split_header = header;
+    split_header.encoding = .byte_stream_split;
+    const floats = try decodePlainF32AsF64Alloc(a, split_header, &wire);
+    defer a.free(floats);
+    try std.testing.expectEqualSlices(f64, &.{ -1.5, 0, 12.25 }, floats);
+    const lengths = try codec.testDelta(a, &.{ 2, 0, 3 });
+    defer a.free(lengths);
+    const encoded_strings = try std.mem.concat(a, u8, &.{ lengths, "abxyz" });
+    defer a.free(encoded_strings);
+    var string_header = header;
+    string_header.encoding = .delta_length_byte_array;
+    const strings = try decodePlainByteArraysAlloc(a, string_header, encoded_strings);
+    defer freePlainByteArrays(a, strings);
+    try std.testing.expectEqualStrings("ab", strings[0]);
+    try std.testing.expectEqualStrings("", strings[1]);
+    try std.testing.expectEqualStrings("xyz", strings[2]);
 }

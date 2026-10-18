@@ -955,8 +955,7 @@ test "external lake aggregate radix reductions reuse unchanged subtrees across a
         if (phase != 0) {
             const changed = (try @import("lake_index_build_replay.zig").changedFiles(a, output.allocator(), &provider, store, previous.declarations, previous.contributions, .none)).?;
             replay.only_files = changed;
-            var count: usize = 0;
-            for (changed) |file| count += @intFromBool(file);
+            const count = changed.files.cardinality();
             try std.testing.expectEqual(@as(usize, if (phase == 1) 1 else 0), count);
         }
         const built = try buildIncremental(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, previous.contributions);
@@ -1061,9 +1060,9 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         index.counted = true;
         index.prior_roots = previous_roots;
         if (phase != 0) {
-            const changed = (try @import("lake_index_build_replay.zig").changedFilesIndexed(a, output.allocator(), &provider, store, previous.declarations, &.{}, .none, &index)).?;
-            var count: usize = 0;
-            for (changed) |file| count += @intFromBool(file);
+            var changed = (try @import("lake_index_build_replay.zig").changedFilesIndexed(a, output.allocator(), &provider, store, previous.declarations, &.{}, .none, &index)).?;
+            defer changed.deinit();
+            const count = changed.files.cardinality();
             try std.testing.expectEqual(@as(usize, if (phase == 1) 1 else 0), count);
         }
         const built = try buildIndexed(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, &.{}, &index);

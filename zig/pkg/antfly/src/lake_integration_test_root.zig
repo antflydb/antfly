@@ -38,6 +38,7 @@ test {
     _ = @import("api/lake_sql_integration_test.zig");
     _ = @import("api/lake_index_row_source.zig");
     _ = @import("api/lake_index_publication.zig");
+    _ = @import("api/lake_index_build_replay.zig");
     _ = @import("api/lake_index_store.zig");
     _ = @import("api/lake_index_coordinator.zig");
     _ = @import("api/lake_index_selection.zig");
