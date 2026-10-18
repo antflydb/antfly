@@ -823,6 +823,9 @@ pub const Gemma4AudioLocalAttentionParams = struct {
     exclude_farthest_key: bool = false,
     /// Segmented entries carry +/- (clip_start + 1); negative is invalid.
     segmented: bool = false,
+    packed_qkv: bool = false,
+    packed_clamp_flags: u32 = 0,
+    packed_bounds: [6]f32 = @splat(0),
 };
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
@@ -2057,6 +2060,11 @@ pub const ComputeBackend = struct {
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
         embeddingModelVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingModelVisibility = null,
+        embeddingWorkspacePrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingWorkspaceSpec) anyerror!void = null,
+        embeddingWorkspaceNorm: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight, input: CT, residual: ?CT, dim: usize, eps: f32, scale: f32) anyerror!?CT = null,
+        maskedMeanBatch: ?*const fn (ctx: *anyopaque, input: CT, mask: ?[]const i64, batch: usize, sequence: usize, width: usize, dimensions: usize, normalize: bool) anyerror!?CT = null,
+        embeddingComposeRows: ?*const fn (ctx: *anyopaque, wrappers: ?CT, media: CT, map: []const i32, width: usize) anyerror!?CT = null,
+        embeddingMediaTemplate: ?*const fn (ctx: *anyopaque, key: u64, ids: ?[]const i64, mask: ?[]const i64) anyerror!?EmbeddingMediaTemplate = null,
         embeddingModelPrepare: ?*const fn (ctx: *anyopaque, layers: usize) anyerror!void = null,
         embeddingModelWeight: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight) ?CT = null,
         embeddingModelScalar: ?*const fn (ctx: *anyopaque, layer: usize) ?f32 = null,
@@ -2078,6 +2086,7 @@ pub const ComputeBackend = struct {
         audioFrontend: ?*const fn (ctx: *anyopaque, input: CT, auxiliary: ?CT, params: AudioFrontendParams) anyerror!?CT = null,
         supportsLinearPackedNamed: ?*const fn (ctx: *anyopaque) bool = null,
         gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
+        gemma4AudioPackedAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers
         /// fall back to host materialization or a broadcast scalar tensor.
@@ -6502,3 +6511,12 @@ pub const EmbeddingModelVisibility = struct {
     global_metadata: CT,
     window_metadata: CT,
 };
+
+pub const EmbeddingWorkspaceSpec = struct {
+    rows: usize,
+    hidden: usize,
+    alternate_qkv_width: usize,
+    /// packed QKV, attention output, packed FFN, down, PLE gate, PLE output.
+    widths: [6]usize,
+};
+pub const EmbeddingMediaTemplate = struct { ids: []i64, mask: []i64 };

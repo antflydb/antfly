@@ -286,6 +286,9 @@ fn globalWeight(cb: *const ComputeBackend, comptime kind: ops.EmbeddingModelWeig
 }
 
 fn norm(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: CT, dim: usize, eps: f32) !CT {
+    if (comptime ops.EmbeddingModelWeight.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingWorkspaceNorm) |run| {
+        if (try run(cb.ptr, layer, kind, input, null, dim, eps, 1)) |result| return result;
+    };
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     return cb.rmsNorm(input, w, dim, eps);
@@ -298,6 +301,9 @@ fn normLastUse(cb: *const ComputeBackend, layer: usize, comptime suffix: []const
 }
 
 fn normResidual(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: *?CT, residual: CT, dim: usize, eps: f32, output_scale: f32) !CT {
+    if (comptime ops.EmbeddingModelWeight.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingWorkspaceNorm) |run| {
+        if (try run(cb.ptr, layer, kind, input.*.?, residual, dim, eps, output_scale)) |result| return finishLastUse(cb, input, result);
+    };
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     if (try cb.rmsNormResidual(input.*.?, w, residual, dim, eps, 1, output_scale)) |result| return finishLastUse(cb, input, result);
@@ -884,6 +890,12 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (mask.len != rows) return error.InvalidEmbeddingInputLength;
     if (cb.vtable.embeddingModelPrepare) |prepare| try prepare(cb.ptr, cfg.num_hidden_layers);
+    if (cb.vtable.embeddingWorkspacePrepare) |prepare| try prepare(cb.ptr, .{
+        .rows = rows,
+        .hidden = cfg.hidden_size,
+        .alternate_qkv_width = (cfg.num_attention_heads + 2 * cfg.kvHeads(5)) * cfg.headDim(5),
+        .widths = .{ (cfg.num_attention_heads + 2 * cfg.kvHeads(0)) * cfg.headDim(0), cfg.hidden_size, 2 * cfg.intermediate_size, cfg.hidden_size, cfg.per_layer_input_dim, cfg.hidden_size },
+    });
     const cached = if (cb.vtable.embeddingModelVisibility) |get| try get(cb.ptr, mask, batch, seq, cfg.sliding_window) else null;
     var vis = if (cached) |view| Visibility{ .ranges = view.ranges, .positions = view.positions, .key_positions = view.positions, .gather = view.gather, .windowed = view.windowed, .global_metadata = view.global_metadata, .window_metadata = view.window_metadata, .allocator = allocator, .borrowed = true } else try visibility(allocator, mask, batch, seq);
     defer vis.deinit();
@@ -1052,6 +1064,14 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
 /// Mean commutes only with the final linear projection, never with token RMSNorm.
 fn poolProjectNormalize(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, normalized: CT, projection: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
     if (cb.kind() == .metal) {
+        if (cb.vtable.maskedMeanBatch) |pool| {
+            if (try pool(cb.ptr, normalized, mask, batch, seq, cfg.hidden_size, cfg.hidden_size, false)) |pooled| {
+                defer cb.free(pooled);
+                const projected = try cb.linearNoBias(pooled, projection, batch, cfg.hidden_size, cfg.embedding_dim);
+                defer cb.free(projected);
+                return (try pool(cb.ptr, projected, null, batch, 1, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
+            }
+        }
         const mean = cb.vtable.maskedMeanRows orelse return error.EmbeddingGemma2OperationUnavailable;
         const normalize = cb.vtable.maskedMeanNormalizedRows orelse return error.EmbeddingGemma2OperationUnavailable;
         const pooled = (try cb.allocUninitF32Shape(&.{ @intCast(batch), @intCast(cfg.hidden_size) })) orelse return error.EmbeddingGemma2OperationUnavailable;

@@ -29,7 +29,21 @@ pub const State = struct {
     geometry_retry: u64 = 0,
     geometry_hits: u64 = 0,
     geometries: [2]?*Geometry = @splat(null),
+    workspaces: [2]?*Workspace = @splat(null),
+    workspace_retry: u64 = 0,
+    workspace_hits: u64 = 0,
+    templates: [8]?*Template = @splat(null),
+    template_clock: u64 = 0,
+    template_hits: u64 = 0,
     pub fn deinit(self: *State) void {
+        for (self.workspaces) |entry| if (entry) |workspace| {
+            workspace.owner.deinit();
+            std.heap.c_allocator.destroy(workspace);
+        };
+        for (self.templates) |entry| if (entry) |template| {
+            template.deinit();
+            std.heap.c_allocator.destroy(template);
+        };
         for (self.geometries) |entry| if (entry) |geometry| {
             geometry.deinit();
             std.heap.c_allocator.destroy(geometry);
@@ -56,5 +70,45 @@ pub const Geometry = struct {
             if (self.local) |ct| drop(ct);
         }
         std.heap.c_allocator.free(self.storage);
+    }
+};
+
+/// Explicit encoder-layer liveness: six projection views share one range;
+/// scratch norm, attention residual, FFN residual and alternating hidden rows
+/// each have separate ranges. No projection input aliases its output.
+pub const Workspace = struct {
+    owner: tape.Plan = .{ .host_bytes = @sizeOf(Workspace), .metadata_bytes = @sizeOf(Workspace) },
+    spec: ops.EmbeddingWorkspaceSpec,
+    stamp: u64,
+    views: [12]?ops.CT = @splat(null),
+    pub fn projection(kind: ops.EmbeddingModelProjection) ?usize {
+        return switch (kind) {
+            .packed_qkv => 0,
+            .attention_out => 1,
+            .packed_ffn => 2,
+            .down => 3,
+            .ple_gate => 4,
+            .ple_out => 5,
+            else => null,
+        };
+    }
+    pub fn norm(kind: ops.EmbeddingModelWeight, layer: usize) ?usize {
+        return switch (kind) {
+            .input_norm, .pre_ffn_norm => 6,
+            .post_attention_norm => 7,
+            .post_ffn_norm => 8,
+            .post_ple_norm => 9 + layer % 2,
+            else => null,
+        };
+    }
+};
+pub const Template = struct {
+    key: u64,
+    stamp: u64,
+    bytes: usize,
+    view: ops.EmbeddingMediaTemplate,
+    pub fn deinit(self: *Template) void {
+        std.heap.c_allocator.free(self.view.ids);
+        std.heap.c_allocator.free(self.view.mask);
     }
 };

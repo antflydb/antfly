@@ -1373,31 +1373,90 @@ run repeats singleton and cohort audio embeddings, checks every vector against t
 checkpoint oracle, and rejects unsupported schedule capture. Route counters
 must demonstrate replay before treating the run as replay qualification.
 
-Pretrained Metal qualification covers a 492-instruction singleton schedule
+Pretrained Metal qualification covers a 420-instruction singleton schedule
 with 96 prepared linear slots, 132 retained coefficient bindings and zero named
-lookups during replay. The full output arena is 1,200 KiB; retained host bytes
-including descriptors are about 782 KiB. Three four-layer cohort schedules each
-prepare 32 slots and 44 coefficient bindings, with zero named lookups, a
-2,400 KiB arena and about 264 KiB retained host bytes. Repeated singleton,
+lookups during replay. The full output arena is 1,300 KiB; retained host bytes
+including descriptors are about 688 KiB. Three four-layer cohort schedules each
+prepare 32 slots and 44 coefficient bindings in 140 instructions, with zero named
+lookups, a 2,600 KiB arena and about 232 KiB retained host bytes. Repeated singleton,
 cohort and two-wave public audio calls pass the pinned checkpoint oracle.
+Compared with split QKV, packed consumption removes 72 singleton instructions
+and reduces retained host plan metadata by about 12%; its audio arena is about
+8% larger. Split/coalesce layout reduces fragmentation while keeping live ranges
+disjoint.
 The backbone shares 170 norm coefficient bindings in one 304 KiB allocation,
 with validated scalars and 144 indexed projection hits per warmed forward pass
-for the pinned model. Bindings survive request wrappers and yield to model pressure.
+for the pinned model. Twelve output descriptors per geometry serve 264 projection
+and norm operations per warmed forward. Bindings, layouts and token templates
+survive request wrappers and yield to model pressure.
 
 `ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION=1` adds an offline, completed
-comparison to the ordered-media oracle. It alternates phase order across two
-rounds, warms each route, collects twelve samples per route and validates every
-vector. Use a ReleaseFast test binary. The baseline disables prepared backbone
+comparison to the ordered-media oracle. It alternates old/new request pairs
+(AB/BA) across two rounds, warms fourteen pairs per round, then collects twelve
+completed samples per route and validates every vector. Use a ReleaseFast test binary. The baseline disables prepared backbone
 bindings and selects the earlier linear-only arena policy; the optimized route
 uses indexed backbone bindings and reusable descriptors for nonlinear outputs.
 `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PREPARED_BACKBONE=1` and
 `ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA=1` select those diagnostic
 policies independently. Audio arena policy participates in the schedule key.
 
-Two local M4 Max ReleaseFast comparisons passed every reference vector. Completed
-singleton medians were 28.53 → 27.37 ms and 25.22 → 23.05 ms; two-clip cohort
-medians were 34.50 → 28.44 ms and 26.38 → 25.09 ms. Each comparison used twelve
-samples per route after warmup, with phase order reversed between rounds.
-The measured gains vary with host load: about 4–9% for singleton audio and 5–18%
-for this cohort fixture. These measurements compare native execution policies;
-they do not establish a speed comparison against PyTorch.
+Metal F32 backbone execution also retains up to two admitted activation layouts,
+keyed by row count and projection geometry. Six non-overlapping projection
+lifetimes share one range; scratch norms, attention/FFN residuals and alternating
+hidden rows have separate ranges. Normal and global-attention QKV shapes retain
+separate descriptors over the shared projection range. Each layout is capped at
+64 MiB; oversized or denied layouts keep the existing allocation path, and
+transient admission denial retries after eight forward visits. Model pressure
+releases layouts before language matrix slots. Request outputs remain independent.
+Unsupported fused-kernel capabilities decline before encoding to the existing
+device path. Reusable private outputs do not retain host readback snapshots;
+planned writes invalidate any mirror populated by a host fallback. These are
+reusable output views with ordinary command encoding.
+
+Audio arena layout splits oversized expired ranges and coalesces adjacent expired
+ranges before growing storage. This avoids fragmentation when packed producers
+replace several smaller outputs. Seeded randomized lifetime checks verify that
+simultaneously live outputs never overlap.
+
+Audio attention can read packed QKV rows directly, applying each projection's
+optional output clamps at load time. This removes dense Q/K/V slicing and clamp
+intermediates while preserving segmented masks, query scaling and reduction
+order. Backends without this capability keep the split path. Metal pooling and
+final normalization process batch members in batched dispatches and write the
+final rows directly, preserving truncation before normalization.
+
+Single-media token templates use an eight-entry model-owned cache keyed by loaded
+immutable tokenizer generation and instance, media kind, soft-token count and
+token limit. Custom tokenizers without an immutable generation keep normal
+encoding. Misses use the
+original tokenizer; warm requests reuse its exact IDs and masks. Retention is
+admitted and model pressure releases it. Metal composition looks up only wrapper,
+text and padding positions, then merges those rows and projected media in one
+indexed device dispatch. Unsupported kernels retain the row-copy path. Masked
+padding retains its original token lookup values.
+
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP=1` selects the previous execution
+policy for qualification; this policy participates in audio schedule identity.
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP=1` adds the completed alternating-route
+comparison to the ReleaseFast pretrained ordered-media oracle, retaining the
+previous prepared bindings and audio arenas on both routes.
+
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_COMPONENTS=1` expands the follow-up comparison
+to workspace reuse, packed QKV, the batched head and token templates separately.
+Diagnostic controls are `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE`,
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV`,
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD`, and
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES`. Packed-QKV policy also
+participates in audio schedule identity. Controls are restored after qualification.
+
+On an M4 Max, the ReleaseFast ordered-media fixture measured completed median
+singleton latency of 23.089 ms with the previous policy and 22.626 ms with all
+four changes; the two-clip cohort measured 24.956 ms and 24.166 ms respectively
+(about 2% and 3% lower). Each route uses 12 measured samples after warmup, with
+paired AB/BA ordering, GPU completion, readback and reference-vector checks.
+Individual component measurements vary: the batched head and templates slightly
+increased singleton latency in this run while reducing cohort latency. These
+fixture results do not establish broad workload speedups or PyTorch parity.
+Qualification includes 270 passing Metal checks (50 skipped), 35 portable checks
+from a CUDA-enabled Linux build, and the pretrained ordered-media oracle; Linux
+CUDA device execution was not exercised.

@@ -1148,6 +1148,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> sdpa_f32_grouped_softmax_pipeline;
     id<MTLComputePipelineState> sdpa_f32_grouped_unpack_pipeline;
     id<MTLComputePipelineState> masked_mean_rows_pipeline;
+    id<MTLComputePipelineState> masked_mean_batch_pipeline;
+    id<MTLComputePipelineState> compose_rows_pipeline;
     id<MTLComputePipelineState> normalize_embedding_pipeline;
 
     id<MTLComputePipelineState> modernbert_training_attention_forward_pipeline;
@@ -5891,6 +5893,9 @@ typedef struct termite_metal_gemma4_audio_attention_params {
     float logit_cap;
     float invalid_value;
     float reserved_f;
+    uint32_t qkv_stride;
+    uint32_t qkv_flags;
+    float qkv_bounds[6];
 } termite_metal_gemma4_audio_attention_params;
 
 #define TERMITE_GEMMA4_AUDIO_MAX_CONTEXT 64u
@@ -6739,7 +6744,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_gemma4_audio_clamp_params { uint total; uint flags; float min_value; float max_value; };\n"
            "struct termite_metal_gemma4_audio_rows_params { uint rows; uint dim; uint extra; uint reserved; };\n"
            "struct termite_metal_gemma4_audio_channel_norm_params { uint channels; uint positions; float eps; uint reserved; };\n"
-           "struct termite_metal_gemma4_audio_attention_params { uint rows; uint hidden; uint heads; uint head_dim; uint chunk; uint context_left; uint context; uint reserved; float k_scale; float logit_cap; float invalid_value; float reserved_f; };\n"
+           "struct termite_metal_gemma4_audio_attention_params { uint rows; uint hidden; uint heads; uint head_dim; uint chunk; uint context_left; uint context; uint reserved; float k_scale; float logit_cap; float invalid_value; float reserved_f; uint qkv_stride; uint qkv_flags; float qkv_bounds[6]; };\n"
            "struct termite_metal_training_accumulate_params { uint elem_count; float scale; uint first; uint reserved; };\n"
            "struct termite_metal_training_accumulate_into_params { uint elem_count; float divisor; float renormalize; uint flags; };\n"
            "struct termite_metal_training_adamw_params { uint elem_count; float lr; float beta1; float beta2; float eps; float weight_decay; float bias_correction1; float bias_correction2; float grad_scale; uint reserved0; uint reserved1; uint reserved2; };\n"
@@ -10645,6 +10650,11 @@ static NSString *termite_metal_shader_source(void) {
            // The logit cap's tanh saturates well below |x| = 16 in f32; the device
            // tanh is not trusted there (it returned a non-saturated value for
            // x ~ 44 and dropped that key from the softmax), so clamp first.
+           "inline float antfly_audio_qkv_load(device const float *x, uint row, uint col, uint part, constant termite_metal_gemma4_audio_attention_params &p) {\n"
+           "    uint stride = p.qkv_stride ? p.qkv_stride : p.hidden; float value = x[row * stride + col + (p.qkv_stride ? part * p.hidden : 0u)];\n"
+           "    if (p.qkv_flags & (1u << (part * 2u))) value = max(value, p.qkv_bounds[part * 2u]);\n"
+           "    if (p.qkv_flags & (2u << (part * 2u))) value = min(value, p.qkv_bounds[part * 2u + 1u]); return value;\n"
+           "}\n"
            "kernel void termite_gemma4_audio_local_attention(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *rel [[buffer(3)]], device const float *q_scales [[buffer(4)]], device const float *valid [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_gemma4_audio_attention_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.heads; if (gid >= total) return;\n"
            "    uint q_idx = gid / p.heads; uint head = gid - q_idx * p.heads;\n"
@@ -10669,8 +10679,8 @@ static NSString *termite_metal_shader_source(void) {
            "        uint rel_base = (uint)rel_idx * p.hidden + head_base;\n"
            "        float score = 0.0f;\n"
            "        for (uint d = 0u; d < p.head_dim; ++d) {\n"
-           "            float qv = q[q_base + d] * q_scales[d];\n"
-           "            score += qv * (k[k_base + d] * p.k_scale);\n"
+           "            float qv = antfly_audio_qkv_load(q, q_idx, head_base + d, 0u, p) * q_scales[d];\n"
+           "            score += qv * (antfly_audio_qkv_load(k, uint(k_idx), head_base + d, 1u, p) * p.k_scale);\n"
            "            score += qv * rel[rel_base + d];\n"
            "        }\n"
            "        float capped_arg = score / p.logit_cap;\n"
@@ -10690,7 +10700,7 @@ static NSString *termite_metal_shader_source(void) {
            "            if (prob == 0.0f) continue;\n"
            "            int k_idx = (int)(block_start + c) - past;\n"
            "            if (k_idx < 0 || k_idx >= (int)p.rows) continue; if ((p.reserved & 2u) ? valid[k_idx] != valid[q_idx] : valid[k_idx] == 0.0f) continue; if (k_idx > (int)q_idx || (int)q_idx - k_idx > past - int(p.reserved & 1u)) continue;\n"
-           "            acc += prob * v[(uint)k_idx * p.hidden + head_base + d];\n"
+           "            acc += prob * antfly_audio_qkv_load(v, uint(k_idx), head_base + d, 2u, p);\n"
            "        }\n"
            "        output[out_base + d] = acc;\n"
            "    }\n"
@@ -10712,7 +10722,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint clip_start = (p.reserved & 2u) ? uint(valid[q_idx]) - 1u : 0u; uint block_start = clip_start + ((q_idx - clip_start) / p.chunk) * p.chunk;\n"
            "    uint q_off = q_idx - block_start;\n"
            "    int past = (int)p.context_left - 1;\n"
-           "    float qv = q[q_idx * p.hidden + head_base + tid] * q_scales[tid];\n"
+           "    float qv = antfly_audio_qkv_load(q, q_idx, head_base + tid, 0u, p) * q_scales[tid];\n"
            "    for (uint c = 0u; c < p.context; ++c) {\n"
            "        int rel_idx = (int)c - (int)q_off;\n"
            "        int k_idx = (int)(block_start + c) - past;\n"
@@ -10722,7 +10732,7 @@ static NSString *termite_metal_shader_source(void) {
            "        if (ok) {\n"
            "            uint k_base = (uint)k_idx * p.hidden + head_base;\n"
            "            uint rel_base = (uint)rel_idx * p.hidden + head_base;\n"
-           "            prod = qv * (k[k_base + tid] * p.k_scale) + qv * rel[rel_base + tid];\n"
+           "            prod = qv * (antfly_audio_qkv_load(k, uint(k_idx), head_base + tid, 1u, p) * p.k_scale) + qv * rel[rel_base + tid];\n"
            "        }\n"
            "        float sum = simd_sum(prod);\n"
            "        if (lane == 0u) partial[sg] = sum;\n"
@@ -10758,7 +10768,7 @@ static NSString *termite_metal_shader_source(void) {
            "        if (prob == 0.0f) continue;\n"
            "        int k_idx = (int)(block_start + c) - past;\n"
            "        if (k_idx < 0 || k_idx >= (int)p.rows) continue; if ((p.reserved & 2u) ? valid[k_idx] != valid[q_idx] : valid[k_idx] == 0.0f) continue; if (k_idx > (int)q_idx || (int)q_idx - k_idx > past - int(p.reserved & 1u)) continue;\n"
-           "        acc += prob * v[(uint)k_idx * p.hidden + head_base + tid];\n"
+           "        acc += prob * antfly_audio_qkv_load(v, uint(k_idx), head_base + tid, 2u, p);\n"
            "    }\n"
            "    output[out_base + tid] = acc;\n"
            "}\n"
@@ -10766,7 +10776,7 @@ static NSString *termite_metal_shader_source(void) {
 "threadgroup float scores[64],query[1024];uint head=tgid.x,q_idx=tgid.y,head_base=head*p.head_dim,out_base=q_idx*p.hidden+head_base;\n"
 "bool row_valid=((p.reserved&2u) ? valid[q_idx]>0.f : valid[q_idx]!=0.f);\n"
 "if(!row_valid) {for(uint d=tid;d<p.head_dim;d+=256) output[out_base+d]=0.f;return;}\n"
-"for(uint d=tid;d<p.head_dim;d+=256) query[d]=q[out_base+d]*q_scales[d];\n"
+"for(uint d=tid;d<p.head_dim;d+=256) query[d]=antfly_audio_qkv_load(q, q_idx, head_base + d, 0u, p)*q_scales[d];\n"
 "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 "uint clip_start=(p.reserved&2u) ? uint(valid[q_idx])-1u : 0u,block_start=clip_start+((q_idx-clip_start)/p.chunk)*p.chunk,q_off=q_idx-block_start;int past=int(p.context_left)-1;\n"
 "for(uint c=sg;c<p.context;c+=8) {\n"
@@ -10774,7 +10784,7 @@ static NSString *termite_metal_shader_source(void) {
 "bool ok=rel_idx>=0 && rel_idx<int(p.context_left) && k_idx>=0 && k_idx<int(p.rows);\n"
 "if(ok) ok=((p.reserved&2u) ? valid[k_idx]==valid[q_idx] : valid[k_idx]!=0.f) && k_idx<=int(q_idx) && int(q_idx)-k_idx<=past-int(p.reserved&1u);\n"
 "float total=0.f;\n"
-"for(uint base=0;base<p.head_dim;base+=32) {uint d=base+lane;float prod=0.f;if(ok) prod=query[d]*(k[uint(k_idx)*p.hidden+head_base+d]*p.k_scale)+query[d]*rel[uint(rel_idx)*p.hidden+head_base+d];float part=simd_sum(prod);if(lane==0) total+=part;}\n"
+"for(uint base=0;base<p.head_dim;base+=32) {uint d=base+lane;float prod=0.f;if(ok) prod=query[d]*(antfly_audio_qkv_load(k, uint(k_idx), head_base + d, 1u, p)*p.k_scale)+query[d]*rel[uint(rel_idx)*p.hidden+head_base+d];float part=simd_sum(prod);if(lane==0) total+=part;}\n"
 "if(lane==0) {float arg=total/p.logit_cap;scores[c]=ok ? (arg>=16.f ? 1.f : (arg<=-16.f ? -1.f : tanh(arg)))*p.logit_cap : p.invalid_value;}\n"
 "}\n"
 "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -10798,7 +10808,7 @@ static NSString *termite_metal_shader_source(void) {
 "        if (prob == 0.0f) continue;\n"
 "        int k_idx = (int)(block_start + c) - past;\n"
 "        if (k_idx < 0 || k_idx >= (int)p.rows) continue; if ((p.reserved & 2u) ? valid[k_idx] != valid[q_idx] : valid[k_idx] == 0.0f) continue; if (k_idx > (int)q_idx || (int)q_idx - k_idx > past - int(p.reserved & 1u)) continue;\n"
-"        acc += prob * v[(uint)k_idx * p.hidden + head_base + dim];\n"
+"        acc += prob * antfly_audio_qkv_load(v, uint(k_idx), head_base + dim, 2u, p);\n"
 "    }\n"
 "    output[out_base + dim] = acc;\n"
 "    }\n"
@@ -12461,13 +12471,23 @@ static NSString *termite_metal_shader_source(void) {
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "}\n"
+           "kernel void antfly_compose_rows(device const float *wrappers [[buffer(0)]], device const float *media [[buffer(1)]], device const int *map [[buffer(2)]], device float *output [[buffer(3)]], constant uint2 &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p.x * p.y) return; uint row = gid / p.y, col = gid % p.y; int source = map[row];\n"
+           "    output[gid] = source < 0 ? media[uint(-source - 1) * p.y + col] : wrappers[uint(source) * p.y + col];\n"
+           "}\n"
+           "kernel void antfly_masked_mean_batch(device const float *input [[buffer(0)]], device const long *mask [[buffer(1)]], device float *output [[buffer(2)]], constant uint4 &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p.z * p.w) return; uint b = gid / p.z, d = gid % p.z; float sum = 0.0f; float count = float(mask[p.x * p.w + b]);\n"
+           "    for (uint r = 0; r < p.x; ++r) if (mask[b * p.x + r] != 0) sum += input[(b * p.x + r) * p.y + d] / count;\n"
+           "    output[gid] = sum;\n"
+           "}\n"
            "kernel void termite_masked_mean_rows(device const float *input [[buffer(0)]], device const long *mask [[buffer(1)]], device float *output [[buffer(2)]], constant uint4 &p [[buffer(3)]], uint d [[thread_position_in_grid]]) {\n"
            "    if (d >= p.z) return;\n"
            "    float sum = 0.0f;\n"
            "    for (uint r = 0; r < p.x; ++r) if (mask[r] != 0) sum += input[r * p.y + d] / float(p.w);\n"
            "    output[d] = sum;\n"
            "}\n"
-           "kernel void termite_normalize_embedding(device float *values [[buffer(0)]], constant uint &dimensions [[buffer(1)]], uint t [[thread_index_in_threadgroup]], uint3 group [[threads_per_threadgroup]]) {\n"
+           "kernel void termite_normalize_embedding(device float *values [[buffer(0)]], constant uint &dimensions [[buffer(1)]], uint t [[thread_index_in_threadgroup]], uint3 group [[threads_per_threadgroup]], uint3 row [[threadgroup_position_in_grid]]) {\n"
+           "    values += row.x * dimensions;\n"
            "    threadgroup float scratch[256];\n"
            "    uint n = group.x;\n"
            "    float peak = 0.0f;\n"
@@ -28850,6 +28870,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->sdpa_f32_segments_wide_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_segments_wide");
         runtime->sdpa_f32_segments_blocks_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_segments_blocks");
         runtime->masked_mean_rows_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_masked_mean_rows");
+        runtime->masked_mean_batch_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_masked_mean_batch");
+        runtime->compose_rows_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_compose_rows");
         runtime->normalize_embedding_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_normalize_embedding");
         runtime->sdpa_f32_grouped_unpack_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_grouped_unpack");
         runtime->sdpa_f32_grouped_softmax_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_grouped_softmax");
@@ -29826,6 +29848,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->sdpa_f32_segments_wide_pipeline = nil;
     runtime->sdpa_f32_segments_blocks_pipeline = nil;
     runtime->masked_mean_rows_pipeline = nil;
+    runtime->masked_mean_batch_pipeline = nil;
+    runtime->compose_rows_pipeline = nil;
     runtime->normalize_embedding_pipeline = nil;
     runtime->sdpa_f32_grouped_unpack_pipeline = nil;
     runtime->sdpa_f32_grouped_softmax_pipeline = nil;
@@ -49366,6 +49390,78 @@ static int termite_metal_decode_runtime_masked_mean_rows_impl(termite_metal_deco
     }
 }
 
+int antfly_metal_compose_rows(termite_metal_decode_runtime *runtime, void *wrappers_handle, size_t wrappers_offset, size_t wrappers_rows, void *media_handle, size_t media_offset, size_t media_rows, const int32_t *map, size_t rows, size_t width, void *output_handle, size_t output_offset) {
+    if (!runtime || !runtime->compose_rows_pipeline || !media_handle || !map || !output_handle || !rows || !width || width > UINT32_MAX || rows > UINT32_MAX / width) return -1;
+    for (size_t row = 0; row < rows; ++row) {
+        if (map[row] < 0) { if ((uint64_t)(-(int64_t)map[row] - 1) >= media_rows) return -2; }
+        else if ((uint64_t)map[row] >= wrappers_rows || !wrappers_handle) return -2;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> media = (__bridge id<MTLBuffer>)media_handle;
+        id<MTLBuffer> wrappers = wrappers_handle ? (__bridge id<MTLBuffer>)wrappers_handle : media;
+        id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
+        const size_t media_bytes = media_rows * width * sizeof(float), wrapper_bytes = wrappers_rows * width * sizeof(float), output_bytes = rows * width * sizeof(float);
+        if (media_offset > media.length || media_bytes > media.length - media_offset || (wrappers_handle && (wrappers_offset > wrappers.length || wrapper_bytes > wrappers.length - wrappers_offset)) || output_offset > output.length || output_bytes > output.length - output_offset) return -2;
+        bool frame_owned = runtime->active_frame_cb == nil;
+        termite_metal_host_staging_slice staged = { nil, 0 };
+        if (termite_metal_decode_runtime_stage_host_bytes(runtime, map, rows * sizeof(int32_t), frame_owned, &staged) != 0) return -3;
+        id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (cb == nil) return -4;
+        termite_metal_planned_encoder_range accesses[3];
+        if (termite_metal_planned_range_make(media, media_offset, media_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -5) != 0 || termite_metal_planned_range_make(wrappers, wrappers_handle ? wrappers_offset : media_offset, wrappers_handle ? wrapper_bytes : media_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -5) != 0 || termite_metal_planned_range_make(output, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -5) != 0 || termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -5) != 0) return -5;
+        BOOL owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_EMBEDDING, &owned);
+        if (encoder == nil) return -6;
+        const uint32_t p[2] = { (uint32_t)rows, (uint32_t)width };
+        [encoder setComputePipelineState:runtime->compose_rows_pipeline];
+        [encoder setBuffer:wrappers offset:wrappers_handle ? wrappers_offset : media_offset atIndex:0];
+        [encoder setBuffer:media offset:media_offset atIndex:1];
+        [encoder setBuffer:staged.buffer offset:staged.offset atIndex:2];
+        [encoder setBuffer:output offset:output_offset atIndex:3];
+        [encoder setBytes:p length:sizeof(p) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(rows * width, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->compose_rows_pipeline, rows * width), 1, 1)];
+        termite_metal_end_scoped_compute_encoder(encoder, owned);
+        return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -7);
+    }
+}
+
+int antfly_metal_masked_mean_batch(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t batch, void *output_handle, size_t output_offset, bool normalize) {
+    if (runtime == NULL || runtime->masked_mean_batch_pipeline == nil || input_handle == NULL || output_handle == NULL || mask == NULL || batch == 0 || batch > 64 || rows == 0 || dimensions == 0 || dimensions > width || rows > UINT32_MAX || width > UINT32_MAX || rows > UINT32_MAX / width / batch) return -1;
+    if (normalize && (runtime->normalize_embedding_pipeline == nil || runtime->normalize_embedding_pipeline.maxTotalThreadsPerThreadgroup == 0)) return -1;
+    @autoreleasepool {
+        bool frame_owned = runtime->active_frame_cb == nil;
+        id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle, output = (__bridge id<MTLBuffer>)output_handle;
+        const size_t input_bytes = batch * rows * width * sizeof(float), output_bytes = batch * dimensions * sizeof(float);
+        if (input_offset > input.length || input_bytes > input.length - input_offset || output_offset > output.length || output_bytes > output.length - output_offset) return -2;
+        termite_metal_host_staging_slice staged = { nil, 0 };
+        if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, (batch * rows + batch) * sizeof(int64_t), frame_owned, &staged) != 0) return -3;
+        id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (cb == nil) return -4;
+        termite_metal_planned_encoder_range accesses[2];
+        if (termite_metal_planned_range_make(input, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -5) != 0 || termite_metal_planned_range_make(output, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[1], -5) != 0 || termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 2, -5) != 0) return -5;
+        BOOL owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_EMBEDDING, &owned);
+        if (encoder == nil) return -6;
+        uint32_t p[4] = { (uint32_t)rows, (uint32_t)width, (uint32_t)dimensions, (uint32_t)batch };
+        [encoder setComputePipelineState:runtime->masked_mean_batch_pipeline]; [encoder setBuffer:input offset:input_offset atIndex:0]; [encoder setBuffer:staged.buffer offset:staged.offset atIndex:1]; [encoder setBuffer:output offset:output_offset atIndex:2]; [encoder setBytes:p length:sizeof(p) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(batch * dimensions, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->masked_mean_batch_pipeline, dimensions), 1, 1)];
+        if (normalize) {
+            id<MTLResource> resource = output;
+            [encoder memoryBarrierWithResources:&resource count:1];
+            [encoder setComputePipelineState:runtime->normalize_embedding_pipeline];
+            [encoder setBuffer:output offset:output_offset atIndex:0];
+            const uint32_t count = (uint32_t)dimensions;
+            [encoder setBytes:&count length:sizeof(count) atIndex:1];
+            size_t threads = 256;
+            while (threads > runtime->normalize_embedding_pipeline.maxTotalThreadsPerThreadgroup) threads /= 2;
+            [encoder dispatchThreadgroups:MTLSizeMake(batch, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        }
+        termite_metal_end_scoped_compute_encoder(encoder, owned);
+        return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -7);
+    }
+}
+
+
 int termite_metal_decode_runtime_masked_mean_rows(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t active, void *output_handle, size_t output_offset) {
     return termite_metal_decode_runtime_masked_mean_rows_impl(runtime, input_handle, input_offset, mask, rows, width, dimensions, active, output_handle, output_offset, false);
 }
@@ -54784,11 +54880,13 @@ int termite_metal_decode_runtime_gemma4_audio_local_attention_device(
     if (params->rows == 0 || params->hidden == 0 || params->heads == 0 || params->head_dim == 0 || params->chunk == 0 ||
         params->context_left == 0 || params->context == 0 || params->context > TERMITE_GEMMA4_AUDIO_MAX_CONTEXT ||
         params->heads * params->head_dim != params->hidden || params->logit_cap == 0.0f) return -3;
+    if (params->qkv_stride != 0 && params->qkv_stride != params->hidden * 3u) return -3;
     const size_t elems = (size_t)params->rows * (size_t)params->hidden;
+    const size_t source_elems = params->qkv_stride ? (size_t)params->rows * params->qkv_stride : elems;
     const termite_metal_gemma4_audio_binding bindings[7] = {
-        { (__bridge id<MTLBuffer>)q_handle, q_offset, elems * sizeof(float), false },
-        { (__bridge id<MTLBuffer>)k_handle, k_offset, elems * sizeof(float), false },
-        { (__bridge id<MTLBuffer>)v_handle, v_offset, elems * sizeof(float), false },
+        { (__bridge id<MTLBuffer>)q_handle, q_offset, source_elems * sizeof(float), false },
+        { (__bridge id<MTLBuffer>)k_handle, k_offset, source_elems * sizeof(float), false },
+        { (__bridge id<MTLBuffer>)v_handle, v_offset, source_elems * sizeof(float), false },
         { (__bridge id<MTLBuffer>)rel_handle, rel_offset, (size_t)params->context_left * (size_t)params->hidden * sizeof(float), false },
         { (__bridge id<MTLBuffer>)scales_handle, scales_offset, (size_t)params->head_dim * sizeof(float), false },
         { (__bridge id<MTLBuffer>)valid_handle, valid_offset, (size_t)params->rows * sizeof(float), false },

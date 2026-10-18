@@ -1154,6 +1154,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     audio_execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     audio_capture: ?*audio_tape.Capture = null,
     embedding_bindings_enabled: bool = false,
+    embedding_workspace: ?*@import("metal_embedding_bindings.zig").Workspace = null,
     data: *WeightStore,
     provider: if (false) ?mlx_quant.Provider else void =
         if (false) null else {},
@@ -8581,6 +8582,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
+        if (buf.persistent_model and buf.metal_tensor != null and !hasHostView(buf)) {
+            if (buf.integer_storage) return error.UnsupportedTensorType;
+            var source = buf.metal_tensor.?;
+            const values = try allocator.alloc(f32, source.elemCount());
+            errdefer allocator.free(values);
+            try source.downloadBytesInto(std.mem.sliceAsBytes(values));
+            return values;
+        }
         if (buf.integer_storage) return error.UnsupportedTensorType;
         if (buf.quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
@@ -13683,6 +13692,62 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(output);
     }
 
+    fn embeddingComposeRowsOp(ctx: *anyopaque, wrappers: ?CT, media: CT, map: []const i32, width: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (map.len == 0 or width == 0 or try std.math.mul(usize, map.len, width) > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        var pixels = try self.ownedDeviceMetalTensorFromCt(media);
+        defer pixels.deinit();
+        var text: ?MetalTensor = if (wrappers) |tensor| try self.ownedDeviceMetalTensorFromCt(tensor) else null;
+        defer if (text) |*tensor| tensor.deinit();
+        if (pixels.elemCount() % width != 0 or (text != null and text.?.elemCount() % width != 0)) return error.InvalidTensorShape;
+        if (pixels.dtype != .f32 or pixels.elemCount() > std.math.maxInt(u32) or (text != null and (text.?.dtype != .f32 or text.?.elemCount() > std.math.maxInt(u32)))) return error.InvalidTensorShape;
+        const media_rows = pixels.elemCount() / width;
+        const wrapper_rows = if (text) |tensor| tensor.elemCount() / width else 0;
+        for (map) |source| {
+            if (source < 0) {
+                if (@as(u64, @intCast(-@as(i64, source) - 1)) >= media_rows) return error.OutOfBounds;
+            } else if (@as(usize, @intCast(source)) >= wrapper_rows) return error.OutOfBounds;
+        }
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var output = try MetalTensor.deviceAllocate(runtime, map.len * width * 4, .private, &.{ @intCast(map.len), @intCast(width) });
+        errdefer output.deinit();
+        const rc = metal_runtime.antfly_metal_compose_rows(runtime, if (text) |tensor| tensor.deviceHandle() else null, if (text) |tensor| tensor.deviceByteOffset() else 0, wrapper_rows, pixels.deviceHandle(), pixels.deviceByteOffset(), media_rows, map.ptr, map.len, width, output.deviceHandle(), output.deviceByteOffset());
+        if (rc == -1) {
+            output.deinit();
+            return null;
+        }
+        if (rc != 0) return error.MetalKernelFailed;
+        return self.ctFromOwnedMetalTensor(output);
+    }
+    fn maskedMeanBatchOp(ctx: *anyopaque, input: CT, mask: ?[]const i64, batch: usize, sequence: usize, width: usize, dimensions: usize, normalize: bool) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if ((audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD"))) return null;
+        if (batch == 0 or batch > 64 or sequence == 0 or width == 0 or dimensions == 0 or dimensions > width) return error.InvalidTensorShape;
+        const rows = try std.math.mul(usize, batch, sequence);
+        const count = try std.math.mul(usize, rows, width);
+        if (count > std.math.maxInt(u32) or batch * dimensions > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const x = denseDeviceF32(input) orelse return null;
+        if (x.elemCount() != count or (mask != null and mask.?.len != rows)) return error.InvalidTensorShape;
+        const metadata = try self.allocator.alloc(i64, rows + batch);
+        defer self.allocator.free(metadata);
+        if (mask) |values| @memcpy(metadata[0..rows], values) else @memset(metadata[0..rows], 1);
+        for (0..batch) |item| {
+            var active: i64 = 0;
+            for (metadata[item * sequence ..][0..sequence]) |v| active += @intFromBool(v != 0);
+            if (active == 0) return error.EmptyEmbeddingInput;
+            metadata[rows + item] = active;
+        }
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var result = try MetalTensor.deviceAllocate(runtime, batch * dimensions * 4, .private, &.{ @intCast(batch), @intCast(dimensions) });
+        errdefer result.deinit();
+        const rc = metal_runtime.antfly_metal_masked_mean_batch(runtime, x.deviceHandle(), x.deviceByteOffset(), metadata.ptr, sequence, width, dimensions, batch, result.deviceHandle(), result.deviceByteOffset(), normalize);
+        if (rc == -1) {
+            result.deinit();
+            return null;
+        }
+        if (rc != 0) return error.MetalKernelFailed;
+        return self.ctFromOwnedMetalTensor(result);
+    }
     fn maskedMeanRowsOp(ctx: *anyopaque, input_ct: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(input_ct);
@@ -15640,6 +15705,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .logit_cap = params.logit_cap,
             .invalid_value = params.invalid_value,
             .reserved = @as(u32, @intFromBool(params.exclude_farthest_key)) | (@as(u32, @intFromBool(params.segmented)) << 1),
+            .qkv_stride = if (params.packed_qkv) std.math.cast(u32, std.math.mul(usize, params.hidden, 3) catch return null) orelse return null else 0,
+            .qkv_flags = params.packed_clamp_flags,
+            .qkv_bounds = params.packed_bounds,
         };
         if (try metal_runtime.decoderRuntimeGemma4AudioLocalAttention(self.provider_impl, q_mt, k_mt, v_mt, rel_mt, scales_mt, valid_mt, raw)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
@@ -16088,13 +16156,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
     fn embeddingModelPrepareOp(ctx: *anyopaque, layers: usize) anyerror!void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.embedding_workspace = null;
         self.embedding_bindings_enabled = self.require_f32_linears and self.shared_provider_lease_io != null and layers > 0 and layers <= 24 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PREPARED_BACKBONE");
         if (!self.embedding_bindings_enabled) return;
         const p = self.provider_impl;
         p.embedding_binding_clock += 1;
         if (p.embedding_bindings) |state| {
             if (state.layers != layers) return error.InvalidEmbeddingGemma2Weight;
-            if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) std.debug.print("metal_embedding_bindings ready=true weights={d} slot_hits={d} geometry_hits={d} host_bytes={d} backend_bytes={d}\n", .{ layers * 7 + 2, state.linear_hits, state.geometry_hits, state.owner.host_bytes, state.owner.backend_bytes });
+            if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) std.debug.print("metal_embedding_bindings ready=true weights={d} slot_hits={d} geometry_hits={d} workspace_hits={d} template_hits={d} host_bytes={d} backend_bytes={d}\n", .{ layers * 7 + 2, state.linear_hits, state.geometry_hits, state.workspace_hits, state.template_hits, state.owner.host_bytes, state.owner.backend_bytes });
             return;
         }
         if (p.embedding_binding_clock < p.embedding_binding_retry) return;
@@ -16179,6 +16248,187 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         p.embeddinggemma2_cache_admission = cache;
         p.embedding_bindings = state;
+    }
+    fn embeddingWorkspacePrepareOp(ctx: *anyopaque, spec: ops.EmbeddingWorkspaceSpec) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.embedding_workspace = null;
+        if (!self.embedding_bindings_enabled or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR") or (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE"))) return;
+        const state = self.provider_impl.embedding_bindings orelse return;
+        const clock = self.provider_impl.embedding_binding_clock;
+        var victim: usize = 0;
+        for (state.workspaces, 0..) |entry, i| {
+            if (entry) |workspace| {
+                if (std.meta.eql(workspace.spec, spec)) {
+                    workspace.stamp = clock;
+                    self.embedding_workspace = workspace;
+                    return;
+                }
+            }
+            if (entry == null or (state.workspaces[victim] != null and entry.?.stamp < state.workspaces[victim].?.stamp)) victim = i;
+        }
+        if (clock < state.workspace_retry) return;
+        const fresh = self.prepareEmbeddingWorkspace(spec, clock) catch |err| {
+            state.workspace_retry = clock + 8;
+            switch (err) {
+                error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
+                else => return err,
+            }
+        };
+        if (state.workspaces[victim]) |old| {
+            old.owner.deinit();
+            state.owner.host_bytes -= old.owner.host_bytes;
+            state.owner.backend_bytes -= old.owner.backend_bytes;
+            if (self.data.tier_cache) |*cache| {
+                self.data.prefetch.lock();
+                cache.noteRelease(.host, old.owner.host_bytes);
+                cache.noteRelease(.backend, old.owner.backend_bytes);
+                self.data.prefetch.unlock();
+            }
+            std.heap.c_allocator.destroy(old);
+        }
+        state.owner.host_bytes += fresh.owner.host_bytes;
+        state.owner.backend_bytes += fresh.owner.backend_bytes;
+        state.workspaces[victim] = fresh;
+        self.embedding_workspace = fresh;
+    }
+    fn prepareEmbeddingWorkspace(self: *MetalCompute, spec: ops.EmbeddingWorkspaceSpec, clock: u64) !*@import("metal_embedding_bindings.zig").Workspace {
+        const Workspace = @import("metal_embedding_bindings.zig").Workspace;
+        if (spec.rows == 0 or spec.hidden == 0) return error.InvalidTensorShape;
+        var widest = spec.alternate_qkv_width;
+        for (spec.widths) |width| {
+            if (width == 0) return error.InvalidTensorShape;
+            widest = @max(widest, width);
+        }
+        const projection_bytes = std.mem.alignForward(usize, try std.math.mul(usize, try std.math.mul(usize, spec.rows, widest), 4), 4096);
+        const norm_bytes = std.mem.alignForward(usize, try std.math.mul(usize, try std.math.mul(usize, spec.rows, spec.hidden), 4), 4096);
+        const bytes = try std.math.add(usize, projection_bytes, try std.math.mul(usize, norm_bytes, 5));
+        if (bytes > 64 * 1024 * 1024) return error.AudioScheduleAdmission;
+        const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
+        self.data.prefetch.lock();
+        cache.reserve(.host, @sizeOf(Workspace)) catch |err| {
+            self.data.prefetch.unlock();
+            return err;
+        };
+        self.data.prefetch.unlock();
+        const a = std.heap.c_allocator;
+        const workspace = a.create(Workspace) catch |err| {
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, @sizeOf(Workspace));
+            self.data.prefetch.unlock();
+            return err;
+        };
+        workspace.* = .{ .spec = spec, .stamp = clock };
+        workspace.owner.outputs = &workspace.views;
+        errdefer {
+            workspace.owner.deinit();
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, workspace.owner.host_bytes);
+            cache.noteRelease(.backend, workspace.owner.backend_bytes);
+            self.data.prefetch.unlock();
+            a.destroy(workspace);
+        }
+        var storage = (try self.audioPlanBuffer(&workspace.owner, bytes, false)) orelse return error.AudioScheduleAdmission;
+        defer storage.deinit();
+        for (&workspace.views, 0..) |*dest, i| {
+            const width = if (i < 6) spec.widths[i] else if (i == 11) spec.alternate_qkv_width else spec.hidden;
+            const offset = if (i < 6 or i == 11) 0 else projection_bytes + (i - 6) * norm_bytes;
+            var view = try storage.retainedView(offset, spec.rows * width * 4, &.{ @intCast(spec.rows), @intCast(width) });
+            dest.* = self.audioPersistentCt(&workspace.owner, view) catch |err| {
+                view.deinit();
+                return err;
+            };
+            toBuf(dest.*.?).persistent_model = true;
+        }
+        return workspace;
+    }
+    fn embeddingWorkspaceNormOp(ctx: *anyopaque, layer: usize, kind: ops.EmbeddingModelWeight, input: CT, residual: ?CT, dim: usize, eps: f32, scale: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const state = self.provider_impl.embedding_bindings orelse return null;
+        const workspace = self.embedding_workspace orelse return null;
+        const index = @import("metal_embedding_bindings.zig").Workspace.norm(kind, layer) orelse return null;
+        if (layer >= state.layers or dim != workspace.spec.hidden) return null;
+        const w = denseDeviceF32(state.weights[kind.index(layer)] orelse return null) orelse return null;
+        if (w.elemCount() != dim) return error.InvalidEmbeddingGemma2Weight;
+        const x = denseDeviceF32(input) orelse return null;
+        if (x.elemCount() != workspace.spec.rows * dim) return null;
+        const output = workspace.views[index].?;
+        toBuf(output).metal_tensor.?.invalidateHostMirror();
+        const out = denseDeviceF32(output).?;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (residual) |r_ct| {
+            const r = denseDeviceF32(r_ct) orelse return null;
+            if (r.elemCount() != x.elemCount()) return error.InvalidTensorShape;
+            const rc = metal_runtime.antfly_metal_norm_residual_weight(runtime, x.deviceHandle(), x.deviceByteOffset(), w.deviceHandle(), w.deviceByteOffset(), r.deviceHandle(), r.deviceByteOffset(), workspace.spec.rows, dim, eps, 1, scale, out.deviceHandle(), out.deviceByteOffset());
+            if (rc == -1) return null; // Capability decline occurs before encoding.
+            if (rc != 0) return error.MetalKernelFailed;
+        } else {
+            const params = ops.NormClampParams{ .rows = @intCast(workspace.spec.rows), .dim = @intCast(dim), .flags = 0, .eps = eps, .lo = 0, .hi = 0 };
+            const rc = metal_runtime.antfly_metal_norm_clamp(runtime, x.deviceHandle(), x.deviceByteOffset(), w.deviceHandle(), w.deviceByteOffset(), &params, out.deviceHandle(), out.deviceByteOffset());
+            if (rc == -1) return null;
+            if (rc != 0) return error.MetalKernelFailed;
+        }
+        state.workspace_hits += 1;
+        return output;
+    }
+    fn embeddingMediaTemplateOp(ctx: *anyopaque, key: u64, ids: ?[]const i64, mask: ?[]const i64) anyerror!?ops.EmbeddingMediaTemplate {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.embedding_bindings_enabled or (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES"))) return null;
+        const state = self.provider_impl.embedding_bindings orelse return null;
+        state.template_clock += 1;
+        var victim: usize = 0;
+        for (state.templates, 0..) |entry, i| {
+            if (entry) |template| {
+                if (template.key == key) {
+                    template.stamp = state.template_clock;
+                    state.template_hits += 1;
+                    return template.view;
+                }
+            }
+            if (entry == null or (state.templates[victim] != null and entry.?.stamp < state.templates[victim].?.stamp)) victim = i;
+        }
+        const input = ids orelse return null;
+        const active = mask orelse return error.InvalidTensorShape;
+        if (input.len == 0 or input.len > 1024 or active.len != input.len) return null;
+        const Template = @import("metal_embedding_bindings.zig").Template;
+        const bytes = @sizeOf(Template) + input.len * 16;
+        const cache = if (self.data.tier_cache) |*v| v else return null;
+        self.data.prefetch.lock();
+        cache.reserve(.host, bytes) catch {
+            self.data.prefetch.unlock();
+            return null;
+        };
+        self.data.prefetch.unlock();
+        var committed = false;
+        defer if (!committed) {
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, bytes);
+            self.data.prefetch.unlock();
+        };
+        const a = std.heap.c_allocator;
+        const template = a.create(Template) catch return null;
+        errdefer a.destroy(template);
+        const copied_ids = a.dupe(i64, input) catch {
+            a.destroy(template);
+            return null;
+        };
+        const copied_mask = a.dupe(i64, active) catch {
+            a.free(copied_ids);
+            a.destroy(template);
+            return null;
+        };
+        template.* = .{ .key = key, .stamp = state.template_clock, .bytes = bytes, .view = .{ .ids = copied_ids, .mask = copied_mask } };
+        if (state.templates[victim]) |old| {
+            old.deinit();
+            state.owner.host_bytes -= old.bytes;
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, old.bytes);
+            self.data.prefetch.unlock();
+            a.destroy(old);
+        }
+        state.templates[victim] = template;
+        state.owner.host_bytes += bytes;
+        committed = true;
+        return template.view;
     }
     fn embeddingModelVisibilityOp(ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?ops.EmbeddingModelVisibility {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -16339,7 +16589,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             slot.* = entry.slot;
         }
         state.linear_hits += 1;
-        return audioPreparedLinearOp(ctx, input, slot.*.?, rows, in_dim, out_dim, null, null);
+        const output = if (self.embedding_workspace) |workspace| blk: {
+            var index = @import("metal_embedding_bindings.zig").Workspace.projection(kind) orelse break :blk null;
+            if (kind == .packed_qkv and out_dim == workspace.spec.alternate_qkv_width) index = 11;
+            if (workspace.spec.rows != rows or (if (index == 11) workspace.spec.alternate_qkv_width else workspace.spec.widths[index]) != out_dim) break :blk null;
+            state.workspace_hits += 1;
+            break :blk workspace.views[index];
+        } else null;
+        return audioPreparedLinearOp(ctx, input, slot.*.?, rows, in_dim, out_dim, null, output);
     }
     fn audioTapeAppend(self: *MetalCompute, capture: *audio_tape.Capture, node: audio_tape.Node, output: CT) void {
         _ = self;
@@ -16638,6 +16895,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const node: *const audio_tape.Node = @ptrCast(@alignCast(raw));
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (toBuf(output).metal_tensor) |*tensor| tensor.invalidateHostMirror();
         const out = denseDeviceF32(output) orelse return false;
         const V = struct {
             fn get(v: []const ?CT, id: u16) !MetalTensor {
@@ -16723,7 +16981,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const rel = try V.get(values, a.rel);
                 const scales = try V.get(values, a.q_dim_scales);
                 const valid = try V.get(values, a.valid);
-                const p = metal_runtime.RawGemma4AudioAttentionParams{ .rows = @intCast(a.params.rows), .hidden = @intCast(a.params.hidden), .heads = @intCast(a.params.heads), .head_dim = @intCast(a.params.head_dim), .chunk = @intCast(a.params.chunk), .context_left = @intCast(a.params.context_left), .context = @intCast(a.params.context), .k_scale = a.params.k_scale, .logit_cap = a.params.logit_cap, .invalid_value = a.params.invalid_value, .reserved = @as(u32, @intFromBool(a.params.exclude_farthest_key)) | (@as(u32, @intFromBool(a.params.segmented)) << 1) };
+                const p = metal_runtime.RawGemma4AudioAttentionParams{ .rows = @intCast(a.params.rows), .hidden = @intCast(a.params.hidden), .heads = @intCast(a.params.heads), .head_dim = @intCast(a.params.head_dim), .chunk = @intCast(a.params.chunk), .context_left = @intCast(a.params.context_left), .context = @intCast(a.params.context), .k_scale = a.params.k_scale, .logit_cap = a.params.logit_cap, .invalid_value = a.params.invalid_value, .reserved = @as(u32, @intFromBool(a.params.exclude_farthest_key)) | (@as(u32, @intFromBool(a.params.segmented)) << 1), .qkv_stride = if (a.params.packed_qkv) @intCast(a.params.hidden * 3) else 0, .qkv_flags = a.params.packed_clamp_flags, .qkv_bounds = a.params.packed_bounds };
                 break :blk metal_runtime.termite_metal_decode_runtime_gemma4_audio_local_attention_device(runtime, q.deviceHandle(), q.deviceByteOffset(), k.deviceHandle(), k.deviceByteOffset(), v.deviceHandle(), v.deviceByteOffset(), rel.deviceHandle(), rel.deviceByteOffset(), scales.deviceHandle(), scales.deviceByteOffset(), valid.deviceHandle(), valid.deviceByteOffset(), &p, oh, oo);
             },
             .sliceLastDim => |a| blk: {
@@ -16742,6 +17000,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer x.deinit();
         if (x.elemCount() != rows * in_dim) return error.InvalidTensorShape;
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (output) |ct| if (toBuf(ct).metal_tensor) |*tensor| tensor.invalidateHostMirror();
         var mt = if (output) |ct| try denseDeviceF32(ct).?.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * out_dim * 4, .private, &.{ @intCast(rows), @intCast(out_dim) });
         var moved = false;
         defer if (!moved) mt.deinit();
@@ -16775,7 +17034,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const policy: u8 = @as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR"))) |
             (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR"))) << 1) |
             (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_SERIAL_ATTENTION"))) << 2) |
-            (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA"))) << 3);
+            (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA"))) << 3) |
+            (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP"))) << 4) |
+            (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV"))) << 5);
         hash.update(std.mem.asBytes(&policy));
 
         hash.update(std.mem.asBytes(&inputs.len));
@@ -34697,6 +34958,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.flattenChannelsTimeFreq = flattenChannelsTimeFreqOp;
         vt.channelLayerNormRelu = channelLayerNormReluOp;
         vt.gemma4AudioLocalAttention = audioTapeGemma4AudioLocalAttention;
+        vt.gemma4AudioPackedAttention = audioTapeGemma4AudioLocalAttention;
         vt.rmsNormAddTensor = rmsNormAddTensorOp;
         vt.rmsNormResidual = audioTapeRmsNormResidual;
         vt.modelScalarBounds = modelScalarBoundsOp;
@@ -34705,6 +34967,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rmsNormClamped = audioTapeRmsNormClamped;
         vt.audioPreparedLinear = audioPreparedLinearOp;
         vt.audioNodeInto = audioNodeIntoOp;
+        vt.embeddingWorkspacePrepare = embeddingWorkspacePrepareOp;
+        vt.embeddingWorkspaceNorm = embeddingWorkspaceNormOp;
+        vt.maskedMeanBatch = maskedMeanBatchOp;
+        vt.embeddingMediaTemplate = embeddingMediaTemplateOp;
+        vt.embeddingComposeRows = embeddingComposeRowsOp;
         vt.embeddingModelPrepare = embeddingModelPrepareOp;
         vt.embeddingModelVisibility = embeddingModelVisibilityOp;
         vt.embeddingModelWeight = embeddingModelWeightOp;
@@ -45767,6 +46034,64 @@ test "embeddinggemma2 Metal indexed backbone bindings survive wrappers and yield
             };
             try std.testing.expectEqual(@as(usize, 2), count);
         }
+        const spec = ops.EmbeddingWorkspaceSpec{ .rows = 2, .hidden = 4, .alternate_qkv_width = 12, .widths = .{ 8, 4, 16, 4, 4, 4 } };
+        if (request == 0) {
+            store.tier_cache.?.budget.backend_limit_bytes = store.tier_cache.?.backend_bytes;
+            try cb.vtable.embeddingWorkspacePrepare.?(cb.ptr, spec);
+            try std.testing.expect(compute.embedding_workspace == null);
+            store.tier_cache.?.budget.backend_limit_bytes = 1024 * 1024;
+            compute.provider_impl.embedding_binding_clock = compute.provider_impl.embedding_bindings.?.workspace_retry;
+        }
+        try cb.vtable.embeddingWorkspacePrepare.?(cb.ptr, spec);
+        const workspace = compute.embedding_workspace.?;
+        try std.testing.expect(workspace.owner.backend_bytes >= 24576 and workspace.owner.backend_bytes <= 64 * 1024 * 1024);
+        const projected = MetalCompute.toBuf(workspace.views[0].?).metal_tensor.?;
+        const packed_ffn = MetalCompute.toBuf(workspace.views[2].?).metal_tensor.?;
+        try std.testing.expectEqual(projected.deviceHandle(), packed_ffn.deviceHandle());
+        try std.testing.expectEqual(projected.deviceByteOffset(), packed_ffn.deviceByteOffset());
+        const scratch = MetalCompute.toBuf(workspace.views[6].?).metal_tensor.?;
+        try std.testing.expect(scratch.deviceByteOffset() >= 4096);
+        const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, -2, 1, 0, 3 }, &.{ 2, 4 }));
+        defer cb.free(x);
+        const expected = try cb.rmsNorm(x, gamma, 4, 1e-6);
+        defer cb.free(expected);
+        var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        compute.allocator = fail.allocator();
+        const actual = cb.vtable.embeddingWorkspaceNorm.?(cb.ptr, 0, .input_norm, x, null, 4, 1e-6, 1) catch |err| {
+            compute.allocator = a;
+            return err;
+        };
+        compute.allocator = a;
+        try std.testing.expectEqual(@as(usize, 0), fail.alloc_index);
+        try std.testing.expectEqual(workspace.views[6], actual);
+        const want = try cb.toFloat32(expected, a);
+        defer a.free(want);
+        const got = try cb.toFloat32(actual.?, a);
+        defer a.free(got);
+        for (want, got) |w, g| try std.testing.expectApproxEqAbs(w, g, 1e-6);
+        try std.testing.expectEqual(@as(usize, 0), MetalCompute.toBuf(actual.?).metal_tensor.?.len);
+        const second_input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 0, 0, 0, 2, 1, 0, 0, 0 }, &.{ 2, 4 }));
+        defer cb.free(second_input);
+        const second_output = (try cb.vtable.embeddingWorkspaceNorm.?(cb.ptr, 0, .input_norm, second_input, null, 4, 1e-6, 1)).?;
+        const reread = try cb.toFloat32(second_output, a);
+        defer a.free(reread);
+        try std.testing.expectEqual(@as(f32, 0), reread[0]);
+        try std.testing.expect(reread[3] > 1.9);
+        try std.testing.expect(got[0] > 0.3); // Earlier host copy remains independent.
+        if (request == 0) {
+            var bad = spec;
+            bad.hidden = 8;
+            try cb.vtable.embeddingWorkspacePrepare.?(cb.ptr, bad);
+            try std.testing.expectError(error.InvalidEmbeddingGemma2Weight, cb.vtable.embeddingWorkspaceNorm.?(cb.ptr, 0, .input_norm, second_input, null, 8, 1e-6, 1));
+        }
+        try cb.vtable.embeddingWorkspacePrepare.?(cb.ptr, spec);
+        try std.testing.expectEqual(workspace, compute.embedding_workspace.?);
+        const template = (try cb.vtable.embeddingMediaTemplate.?(cb.ptr, 123, &.{ 2, 258880, 1 }, &.{ 1, 1, 1 })).?;
+        cb.free(actual.?); // Persistent view remains model-owned.
+        const cached_template = (try cb.vtable.embeddingMediaTemplate.?(cb.ptr, 123, null, null)).?;
+        try std.testing.expectEqual(template.ids.ptr, cached_template.ids.ptr);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 258880, 1 }, cached_template.ids);
+        for (0..10) |key| _ = try cb.vtable.embeddingMediaTemplate.?(cb.ptr, 1000 + key, &.{ 2, 1 }, &.{ 1, 1 });
         ones[0] = 9;
         scalar[0] = 3; // The prepared snapshot never borrows source bytes.
     }
@@ -45775,4 +46100,98 @@ test "embeddinggemma2 Metal indexed backbone bindings survive wrappers and yield
     try std.testing.expect(p.embedding_bindings == null);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
+}
+
+test "embeddinggemma2 Metal batched head preserves masked means truncation and normalization" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var data: [32]f32 = undefined;
+    for (&data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i)) / 7 - 2;
+    const source = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ 8, 4 }));
+    defer cb.free(source);
+    const view = try cb.sliceRows2D(a, source, 2, 6, 4);
+    defer cb.free(view);
+    const mask = [_]i64{ 1, 0, 1, 0, 1, 1 };
+    for ([_]bool{ false, true }) |normalize| {
+        const result = (try cb.vtable.maskedMeanBatch.?(cb.ptr, view, &mask, 2, 3, 4, 3, normalize)).?;
+        defer cb.free(result);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (0..2) |item| {
+            const rows = try cb.sliceRows2D(a, view, item * 3, 3, 4);
+            defer cb.free(rows);
+            const old = if (normalize) (try cb.vtable.maskedMeanNormalizedRows.?(cb.ptr, rows, mask[item * 3 ..][0..3], 4, 3)).? else (try cb.vtable.maskedMeanRows.?(cb.ptr, rows, mask[item * 3 ..][0..3], 4, 3)).?;
+            defer cb.free(old);
+            const expected = try cb.toFloat32(old, a);
+            defer a.free(expected);
+            for (expected, actual[item * 3 ..][0..3]) |w, g| try std.testing.expectApproxEqAbs(w, g, 1e-6);
+        }
+    }
+    try std.testing.expectError(error.EmptyEmbeddingInput, cb.vtable.maskedMeanBatch.?(cb.ptr, view, &.{ 1, 1, 1, 0, 0, 0 }, 2, 3, 4, 3, false));
+    const all = (try cb.vtable.maskedMeanBatch.?(cb.ptr, view, null, 2, 3, 4, 4, false)).?;
+    defer cb.free(all);
+}
+
+test "embeddinggemma2 Metal packed audio attention preserves clamps and segmented masks" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 32, 128 }) |dim| {
+        const rows = 7;
+        const width = dim * 2;
+        const values = try a.alloc(f32, rows * width * 3);
+        defer a.free(values);
+        for (values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 37)) / 9 - 2;
+        const bounds = [_]f32{ -0.4, 0.6, -0.9, 0.3, -0.2, 0.8 };
+        var separate: [3]CT = undefined;
+        var made: usize = 0;
+        defer for (separate[0..made]) |ct| cb.free(ct);
+        for (&separate, 0..) |*ct, part| {
+            const dense = try a.alloc(f32, rows * width);
+            defer a.free(dense);
+            for (0..rows) |row| {
+                for (0..width) |col| dense[row * width + col] = @min(bounds[part * 2 + 1], @max(bounds[part * 2], values[row * width * 3 + part * width + col]));
+            }
+            ct.* = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(dense, &.{ rows, @intCast(width) }));
+            made += 1;
+        }
+        const packed_source = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(values, &.{ rows, @intCast(width * 3) }));
+        defer cb.free(packed_source);
+        const relative = try a.alloc(f32, 13 * width);
+        defer a.free(relative);
+        @memset(relative, 0.005);
+        const scales = try a.alloc(f32, dim);
+        defer a.free(scales);
+        @memset(scales, 0.2);
+        const rel = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(relative, &.{ 13, @intCast(width) }));
+        defer cb.free(rel);
+        const sc = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(scales, &.{@intCast(dim)}));
+        defer cb.free(sc);
+        const valid = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 1, 1, -1, 5, 5, 5 }, &.{rows}));
+        defer cb.free(valid);
+        var params = ops.Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = width, .heads = 2, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = 0.5, .logit_cap = 50, .invalid_value = -1e9, .segmented = true, .exclude_farthest_key = true };
+        const old = (try cb.gemma4AudioLocalAttention(separate[0], separate[1], separate[2], rel, sc, valid, params)).?;
+        defer cb.free(old);
+        params.packed_qkv = true;
+        params.packed_clamp_flags = 63;
+        params.packed_bounds = bounds;
+        const result = (try cb.vtable.gemma4AudioPackedAttention.?(cb.ptr, packed_source, packed_source, packed_source, rel, sc, valid, params)).?;
+        defer cb.free(result);
+        const expected = try cb.toFloat32(old, a);
+        defer a.free(expected);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (expected, actual) |w, g| try std.testing.expectApproxEqAbs(w, g, 1e-6);
+    }
 }

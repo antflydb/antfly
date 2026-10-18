@@ -3550,7 +3550,11 @@ fn audioQkvFits(rows: usize, width: usize) bool {
     return rows != 0 and width != 0 and bytes <= 64 * 1024 * 1024;
 }
 
-fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, width: usize, layer: usize) !?ops.LinearTripleResult {
+const AudioQkv = union(enum) {
+    separate: ops.LinearTripleResult,
+    interleaved: struct { tensor: CT, specs: [3]ClampSpec },
+};
+fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, width: usize, layer: usize) !?AudioQkv {
     if (store.gguf != null or !cb.supportsLinearPackedNamed() or !audioQkvFits(rows, width) or audioHostOps().clamp) return null;
     var specs: [3]ClampSpec = undefined;
     var names: [3][]u8 = undefined;
@@ -3579,7 +3583,12 @@ fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     const clipped = if (specs[0].clipsInput()) try clampScalarCt(cb, a, input, rows, width, specs[0].input_min, specs[0].input_max) else input;
     defer if (clipped != input) cb.free(clipped);
     const packed_rows = (try cb.linearPackedNamed(clipped, &.{ names[0], names[1], names[2] }, &.{ width, width, width }, rows, width)) orelse return null;
+    if (cb.vtable.gemma4AudioPackedAttention != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
     defer cb.free(packed_rows);
+    return .{ .separate = try splitAudioQkv(cb, a, packed_rows, rows, width, specs) };
+}
+
+fn splitAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, packed_rows: CT, rows: usize, width: usize, specs: [3]ClampSpec) !ops.LinearTripleResult {
     var results: [3]CT = undefined;
     var made: usize = 0;
     errdefer for (results[0..made]) |tensor| cb.free(tensor);
@@ -3606,7 +3615,43 @@ fn audioSelfAttention(
     const valid_mask = inputs.valid_mask;
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
-    const packed_rows = try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
+    var key_buf: [192]u8 = undefined;
+    const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative_key.v1.{d}.{d}.{d}", .{ layer, cfg.attention_context_left, cfg.audio_hidden });
+    const cache_relative = store.gguf == null;
+    const rel = if (cache_relative) (try cb.modelConstant(rel_key, null)) orelse blk: {
+        const source = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
+        break :blk try publishAudioConstant(cb, rel_key, source, true);
+    } else try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
+    defer cb.free(rel);
+    const choice = try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
+    const packed_rows: ?ops.LinearTripleResult = if (choice) |value| switch (value) {
+        .separate => |triple| triple,
+        .interleaved => |interleaved| blk: {
+            defer cb.free(interleaved.tensor);
+            if (cfg.attention_context_right == 0 and (inputs.segments.len == 0 or inputs.segment_valid != null)) {
+                var params = audioLocalAttentionParams(cfg, rows);
+                params.segmented = inputs.segments.len != 0;
+                params.packed_qkv = true;
+                for (interleaved.specs, 0..) |spec, i| {
+                    if (spec.output_min) |v| {
+                        params.packed_bounds[i * 2] = v;
+                        params.packed_clamp_flags |= @as(u32, 1) << @intCast(i * 2);
+                    }
+                    if (spec.output_max) |v| {
+                        params.packed_bounds[i * 2 + 1] = v;
+                        params.packed_clamp_flags |= @as(u32, 2) << @intCast(i * 2);
+                    }
+                }
+                const validity = if (params.segmented) inputs.segment_valid.? else inputs.valid_ct;
+                if (try cb.vtable.gemma4AudioPackedAttention.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
+                    defer cb.free(result);
+                    audioProfileMark(.attn_kernel);
+                    return linearNoBiasMaybeClipped(cb, allocator, store, result, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
+                }
+            }
+            break :blk try splitAudioQkv(cb, allocator, interleaved.tensor, rows, cfg.audio_hidden, interleaved.specs);
+        },
+    } else null;
     var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
     defer if (remaining_k) |tensor| cb.free(tensor);
     var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
@@ -3619,14 +3664,6 @@ fn audioSelfAttention(
     const v = remaining_v orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
     remaining_v = null;
     defer cb.free(v);
-    var key_buf: [192]u8 = undefined;
-    const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative_key.v1.{d}.{d}.{d}", .{ layer, cfg.attention_context_left, cfg.audio_hidden });
-    const cache_relative = store.gguf == null;
-    const rel = if (cache_relative) (try cb.modelConstant(rel_key, null)) orelse blk: {
-        const source = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
-        break :blk try publishAudioConstant(cb, rel_key, source, true);
-    } else try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
-    defer cb.free(rel);
     audioProfileMark(.attn_proj);
 
     const out_ct = try audioLocalAttention(cb, allocator, cfg, q, k, v, rel, layer, inputs);
@@ -7964,9 +8001,9 @@ fn checkPackedAudioScalars(cb: ComputeBackend, _: ComputeBackend) !void {
     for (0..2) |pass| {
         const before = cb.trainingRuntimeStats().d2h_bytes;
         for (0..12) |layer| if (try packedAudioQkv(&cb, std.testing.allocator, &weights, input, 1, 16, layer)) |result| {
-            cb.free(result.first);
-            cb.free(result.second);
-            cb.free(result.third);
+            cb.free(result.separate.first);
+            cb.free(result.separate.second);
+            cb.free(result.separate.third);
         };
         if (pass == 1) try std.testing.expectEqual(before, cb.trainingRuntimeStats().d2h_bytes);
     }

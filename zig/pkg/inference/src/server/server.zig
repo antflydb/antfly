@@ -37347,7 +37347,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         for (waves.vectors) |vector| for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
         std.debug.print("embeddinggemma2 audio_wave_schedule clips=6 gate_validation=true parity=true\n", .{});
     }
-    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION")) {
+    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP"))) {
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
@@ -37357,6 +37357,17 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                 return sorted[sorted.len / 2];
             }
         };
+        const only_followup = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP");
+        const followup_flag = "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP";
+        const saved_followup = if (platform.env.getenv(followup_flag)) |v| try a.dupeSentinel(u8, v, 0) else null;
+        defer if (saved_followup) |v| a.free(v);
+        defer {
+            if (saved_followup) |v| {
+                _ = Env.setenv(followup_flag, v, 1);
+            } else {
+                _ = Env.unsetenv(followup_flag);
+            }
+        }
         const backbone_flag = "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PREPARED_BACKBONE";
         const arena_flag = "ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA";
         const saved_backbone = if (platform.env.getenv(backbone_flag)) |v| try a.dupeSentinel(u8, v, 0) else null;
@@ -37375,38 +37386,61 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                 _ = Env.unsetenv(arena_flag);
             }
         }
-        var singleton: [2][12]u64 = undefined;
-        var cohort: [2][12]u64 = undefined;
-        // Reverse phase order on the second round. Each geometry warms and
-        // qualifies before six completed samples; every vector checks parity.
-        for (0..2) |round| for (0..2) |phase| {
-            const route = round ^ phase;
-            try std.testing.expect(Env.setenv(backbone_flag, if (route == 0) "1" else "0", 1) == 0);
-            try std.testing.expect(Env.setenv(arena_flag, if (route == 0) "1" else "0", 1) == 0);
-            for (0..20) |iteration| {
-                const start = platform.time.monotonicNs();
-                const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
-                defer a.free(result.vector);
-                const elapsed = platform.time.monotonicNs() -| start;
-                for (result.vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
-                if (iteration >= 14) singleton[route][round * 6 + iteration - 14] = elapsed;
-            }
-            for (0..20) |iteration| {
-                const start = platform.time.monotonicNs();
-                const result = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
-                defer {
-                    freeDirectDenseVectors(a, result.vectors);
-                    a.free(result.input_tokens);
-                }
-                const elapsed = platform.time.monotonicNs() -| start;
-                for (result.vectors, audio_errors) |vector, err| {
-                    try std.testing.expectEqual(@as(?anyerror, null), err);
-                    for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
-                }
-                if (iteration >= 14) cohort[route][round * 6 + iteration - 14] = elapsed;
+        const components = [_][]const u8{ "all", "workspace", "packed_qkv", "head", "templates" };
+        const component_flags = [_][*:0]const u8{ "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES" };
+        var saved_flags: [4]?[:0]u8 = @splat(null);
+        defer for (component_flags, saved_flags) |flag, saved| {
+            if (saved) |value| {
+                _ = Env.setenv(flag, value, 1);
+                a.free(value);
+            } else {
+                _ = Env.unsetenv(flag);
             }
         };
-        std.debug.print("embeddinggemma2 prepared_execution old_singleton_ns={d} new_singleton_ns={d} old_cohort_ns={d} new_cohort_ns={d} samples=12 parity=true\n", .{ Env.median(singleton[0]), Env.median(singleton[1]), Env.median(cohort[0]), Env.median(cohort[1]) });
+        for (component_flags, &saved_flags) |flag, *saved| if (platform.env.getenv(std.mem.span(flag))) |value| {
+            saved.* = try a.dupeSentinel(u8, value, 0);
+        };
+        const component_count: usize = if (only_followup and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_COMPONENTS")) components.len else 1;
+        for (components[0..component_count]) |component| {
+            var singleton: [2][12]u64 = undefined;
+            var cohort: [2][12]u64 = undefined;
+            // Pair routes per iteration (AB/BA), reversing on the next round.
+            // Fourteen warm pairs precede six measured pairs per round. This
+            // limits host-load drift between policies and validates every vector.
+            for (0..2) |round| for (0..20) |iteration| for (0..2) |phase| {
+                const route = round ^ phase ^ (iteration & 1);
+                try std.testing.expect(Env.setenv(backbone_flag, if (!only_followup and route == 0) "1" else "0", 1) == 0);
+                try std.testing.expect(Env.setenv(arena_flag, if (!only_followup and route == 0) "1" else "0", 1) == 0);
+                try std.testing.expect(Env.setenv(followup_flag, if (only_followup and route == 0) "1" else "0", 1) == 0);
+                for (component_flags, components[1..]) |flag, feature| {
+                    const disabled = only_followup and route != 0 and !std.mem.eql(u8, component, "all") and !std.mem.eql(u8, component, feature);
+                    try std.testing.expect(Env.setenv(flag, if (disabled) "1" else "0", 1) == 0);
+                }
+                {
+                    const start = platform.time.monotonicNs();
+                    const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                    defer a.free(result.vector);
+                    const elapsed = platform.time.monotonicNs() -| start;
+                    for (result.vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+                    if (iteration >= 14) singleton[route][round * 6 + iteration - 14] = elapsed;
+                }
+                {
+                    const start = platform.time.monotonicNs();
+                    const result = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
+                    defer {
+                        freeDirectDenseVectors(a, result.vectors);
+                        a.free(result.input_tokens);
+                    }
+                    const elapsed = platform.time.monotonicNs() -| start;
+                    for (result.vectors, audio_errors) |vector, err| {
+                        try std.testing.expectEqual(@as(?anyerror, null), err);
+                        for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+                    }
+                    if (iteration >= 14) cohort[route][round * 6 + iteration - 14] = elapsed;
+                }
+            };
+            std.debug.print("embeddinggemma2 {s} old_singleton_ns={d} new_singleton_ns={d} old_cohort_ns={d} new_cohort_ns={d} samples=12 parity=true component={s}\n", .{ if (only_followup) "metal_followup_execution" else "prepared_execution", Env.median(singleton[0]), Env.median(singleton[1]), Env.median(cohort[0]), Env.median(cohort[1]), component });
+        }
     }
     // Qualify real batched raster execution against the encoded-image path.
     // Use different aspect ratios and padded renderer strides, preserving the

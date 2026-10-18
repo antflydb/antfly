@@ -15,6 +15,7 @@
 
 //! Ordered text/image/audio/video groups, one embedding per group.
 const std = @import("std");
+const platform = @import("antfly_platform");
 const factory = @import("../architectures/session_factory.zig");
 const encoder = @import("../architectures/embedding_gemma2.zig");
 const projector = @import("../architectures/gemma4_projector.zig");
@@ -1383,10 +1384,13 @@ const PreparedGroup = struct {
     embeddings: ?[]f32,
     tensor: ?CT = null,
     backend: ?*const ComputeBackend = null,
+    borrowed_tokens: bool = false,
 
     fn deinit(self: PreparedGroup, a: std.mem.Allocator) void {
-        a.free(self.ids);
-        a.free(self.mask);
+        if (!self.borrowed_tokens) {
+            a.free(self.ids);
+            a.free(self.mask);
+        }
         if (self.embeddings) |embeddings| a.free(embeddings);
         if (self.tensor) |tensor| self.backend.?.free(tensor);
     }
@@ -2441,6 +2445,16 @@ fn runResidentImageBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: e
 fn runResidentMediaBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options, is_audio: bool, permit: ?*RunPermit) ![][]f32 {
     return runResidentMediaBatchObserved(a, cb, cfg, tokenizer, projected, options, is_audio, permit, null);
 }
+fn mediaTemplateKey(tokenizer: Tokenizer, count: usize, max_sequence: usize, is_audio: bool) ?u64 {
+    const generation = tokenizer.cache_identity orelse return null;
+    var hash = std.hash.Wyhash.init(0x6d65646961746f6b);
+    const identity = .{ @intFromPtr(tokenizer.ptr), @intFromPtr(tokenizer.vtable), generation };
+    inline for (identity) |value| hash.update(std.mem.asBytes(&value));
+    hash.update(std.mem.asBytes(&count));
+    hash.update(std.mem.asBytes(&max_sequence));
+    hash.update(std.mem.asBytes(&is_audio));
+    return hash.final();
+}
 fn runResidentMediaBatchObserved(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options, is_audio: bool, permit: ?*RunPermit, input_tokens: ?[]usize) ![][]f32 {
     const max_sequence: usize = @min(options.max_tokens, if (is_audio) @as(usize, 1024) else raster_max_sequence);
     const marker: i64 = if (is_audio) 258881 else 258880;
@@ -2448,11 +2462,20 @@ fn runResidentMediaBatchObserved(a: std.mem.Allocator, cb: *const ComputeBackend
     const batch = projected.tokens_per_image.len;
     if (batch == 0 or batch > raster_max_batch or projected.hidden_size != 512) return error.InvalidInputShape;
     if (input_tokens) |counts| if (counts.len != batch) return error.InvalidInputShape;
+    if (cb.vtable.embeddingModelPrepare) |prepare| try prepare(cb.ptr, cfg.num_hidden_layers);
     var tokens: [raster_max_batch]PreparedGroup = undefined;
     var initialized: usize = 0;
     defer for (tokens[0..initialized]) |row| row.deinit(a);
     for (projected.tokens_per_image) |count| {
         if (count == 0 or count > (if (is_audio) @as(usize, 1020) else 280)) return error.InvalidTensorShape;
+        const template_key = mediaTemplateKey(tokenizer, count, max_sequence, is_audio);
+        const template_cache = if (template_key != null) cb.vtable.embeddingMediaTemplate else null;
+        if (template_cache) |cache| if (try cache(cb.ptr, template_key.?, null, null)) |template| {
+            tokens[initialized] = .{ .ids = template.ids, .mask = template.mask, .embeddings = null, .borrowed_tokens = true };
+            if (input_tokens) |counts| counts[initialized] = template.ids.len;
+            initialized += 1;
+            continue;
+        };
         var rendered = std.ArrayList(u8).empty;
         defer rendered.deinit(a);
         try rendered.appendSlice(a, if (is_audio) "<|audio>" else "<|image>");
@@ -2468,7 +2491,13 @@ fn runResidentMediaBatchObserved(a: std.mem.Allocator, cb: *const ComputeBackend
         const mask = try a.alloc(i64, length);
         for (ids, encoded.ids[0..length]) |*dest, id| dest.* = id;
         for (mask, encoded.attention_mask[0..length]) |*dest, m| dest.* = m;
-        tokens[initialized] = .{ .ids = ids, .mask = mask, .embeddings = null };
+        if (template_cache) |cache| {
+            if (try cache(cb.ptr, template_key.?, ids, mask)) |template| {
+                a.free(ids);
+                a.free(mask);
+                tokens[initialized] = .{ .ids = template.ids, .mask = template.mask, .embeddings = null, .borrowed_tokens = true };
+            } else tokens[initialized] = .{ .ids = ids, .mask = mask, .embeddings = null };
+        } else tokens[initialized] = .{ .ids = ids, .mask = mask, .embeddings = null };
         if (input_tokens) |counts| counts[initialized] = length;
         initialized += 1;
     }
@@ -2538,11 +2567,65 @@ fn packResidentMediaRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: 
     }
     const weight = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(weight);
-    const raw = try cb.embeddingLookup(weight, ids, ids.len, 512);
-    defer cb.free(raw);
-    const scaled = (try cb.multiplyScalar(raw, if (cb.kind() == .cuda) @as(f32, 22.625) else @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable;
-    const input = try cb.ensureDeviceResidentOwned(scaled);
+    const compact_lookup = cb.kind() == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES");
+    const compact_ids = if (compact_lookup) blk: {
+        var count: usize = 0;
+        for (ids) |id| count += @intFromBool(id != marker);
+        const selected = try a.alloc(i64, count);
+        var cursor: usize = 0;
+        for (ids) |id| if (id != marker) {
+            selected[cursor] = id;
+            cursor += 1;
+        };
+        break :blk selected;
+    } else ids;
+    defer if (compact_lookup) a.free(compact_ids);
+    const raw: ?CT = if (compact_ids.len != 0) try cb.embeddingLookup(weight, compact_ids, compact_ids.len, 512) else null;
+    defer if (raw) |tensor| cb.free(tensor);
+    const scaled: ?CT = if (raw) |tensor| (try cb.multiplyScalar(tensor, if (cb.kind() == .cuda) @as(f32, 22.625) else @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable else null;
+    defer if (compact_lookup) if (scaled) |tensor| cb.free(tensor);
+    if (compact_lookup) if (cb.vtable.embeddingComposeRows) |compose| {
+        const map = try a.alloc(i32, ids.len);
+        defer a.free(map);
+        var wrapper_index: usize = 0;
+        var media_offset: usize = 0;
+        for (rows, lengths, 0..) |row, count, item| {
+            var found: usize = 0;
+            for (0..sequence) |pos| {
+                const destination = item * sequence + pos;
+                if (ids[destination] == marker) {
+                    if (pos >= row.ids.len or row.mask[pos] == 0 or found >= count) return error.InvalidEmbeddingGroup;
+                    map[destination] = -@as(i32, @intCast(media_offset + found + 1));
+                    found += 1;
+                } else {
+                    map[destination] = @intCast(wrapper_index);
+                    wrapper_index += 1;
+                }
+            }
+            if (found != count or count == 0) return error.InvalidEmbeddingGroup;
+            media_offset += count;
+        }
+        if (try compose(cb.ptr, scaled, projected, map, 512)) |input| return .{ .embeddings = input, .mask = mask, .sequence = sequence };
+    };
+    // Resident media supplies every marker row; retain original lookup values
+    // for all other positions, including masked padding, with exact rounding.
+    const input = if (compact_lookup) (try cb.allocUninitF32Shape(&.{ @intCast(ids.len), 512 })) orelse return error.ResidentImageOperationUnavailable else try cb.ensureDeviceResidentOwned(scaled.?);
     errdefer cb.free(input);
+    if (compact_lookup) {
+        var source: usize = 0;
+        var cursor: usize = 0;
+        while (cursor < ids.len) {
+            if (ids[cursor] == marker) {
+                cursor += 1;
+                continue;
+            }
+            const first = cursor;
+            while (cursor < ids.len and ids[cursor] != marker) : (cursor += 1) {}
+            const count = cursor - first;
+            if (!try cb.copyRows2D(a, input, first, scaled.?, source, count, 512)) return error.ResidentImageOperationUnavailable;
+            source += count;
+        }
+    }
     var source_offset: usize = 0;
     for (rows, lengths, 0..) |row, count, index| {
         var found: usize = 0;
@@ -3675,4 +3758,59 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
         }
         try std.testing.expect(dot / @sqrt(x2 * y2) >= 0.9999);
     }
+}
+
+test "embeddinggemma2 Metal media composition looks up wrappers and padding without soft tokens" {
+    const Case = struct {
+        fn populate(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+            // Marker 258880 is deliberately outside this vocabulary. The
+            // projection supplies its rows; only IDs 0, 1 and 2 may be looked up.
+            try @import("../ops/media_residency_test.zig").putWeight(store, "language_model.embed_tokens.weight", &.{ 3, 512 }, 0.125);
+        }
+        fn check(cb: ComputeBackend, _: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            var first = [_]i64{ 1, 258880, 258880, 2 };
+            var second = [_]i64{ 2, 258880, 1 };
+            var first_mask = [_]i64{ 1, 1, 1, 1 };
+            var second_mask = [_]i64{ 1, 1, 1 };
+            const rows = [_]PreparedGroup{
+                .{ .ids = &first, .mask = &first_mask, .embeddings = null },
+                .{ .ids = &second, .mask = &second_mask, .embeddings = null },
+            };
+            var media: [3 * 512]f32 = undefined;
+            for (&media, 0..) |*v, i| v.* = @as(f32, @floatFromInt(5 + i / 512)) / 10;
+            const source = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&media, &.{ 3, 512 }));
+            defer cb.free(source);
+            const result = try packResidentMediaRows(a, &cb, &rows, source, &.{ 2, 1 }, 258880, 32);
+            defer result.deinit(a, &cb);
+            const values = try cb.toFloat32(result.embeddings, a);
+            defer a.free(values);
+            const expected = [_]f32{ 0.125 * @sqrt(@as(f32, 512)), 0.5, 0.6, 0.125 * @sqrt(@as(f32, 512)), 0.125 * @sqrt(@as(f32, 512)), 0.7, 0.125 * @sqrt(@as(f32, 512)), 0.125 * @sqrt(@as(f32, 512)) };
+            for (expected, 0..) |value, row| for (values[row * 512 ..][0..512]) |actual| try std.testing.expectApproxEqAbs(value, actual, 1e-6);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1, 1, 1, 1, 1, 0 }, result.mask);
+            var marker = [_]i64{258880};
+            var active = [_]i64{1};
+            const pure = try packResidentMediaRows(a, &cb, &.{.{ .ids = &marker, .mask = &active, .embeddings = null }}, source, &.{1}, 258880, 32);
+            defer pure.deinit(a, &cb);
+            const projected = try cb.toFloat32(pure.embeddings, a);
+            defer a.free(projected);
+            for (projected) |value| try std.testing.expectEqual(@as(f32, 0.5), value);
+        }
+    };
+    try @import("../ops/media_residency_test.zig").onMetal(Case.populate, Case.check);
+}
+
+test "embeddinggemma2 media templates require immutable tokenizer generations" {
+    var context: u8 = 0;
+    const table: Tokenizer.VTable = undefined;
+    var tokenizer = Tokenizer{ .ptr = &context, .vtable = &table };
+    try std.testing.expect(mediaTemplateKey(tokenizer, 4, 32, false) == null);
+    tokenizer.cache_identity = 42;
+    const key = mediaTemplateKey(tokenizer, 4, 32, false).?;
+    try std.testing.expectEqual(key, mediaTemplateKey(tokenizer, 4, 32, false).?);
+    try std.testing.expect(key != mediaTemplateKey(tokenizer, 5, 32, false).?);
+    try std.testing.expect(key != mediaTemplateKey(tokenizer, 4, 64, false).?);
+    try std.testing.expect(key != mediaTemplateKey(tokenizer, 4, 32, true).?);
+    tokenizer.cache_identity = 43;
+    try std.testing.expect(key != mediaTemplateKey(tokenizer, 4, 32, false).?);
 }

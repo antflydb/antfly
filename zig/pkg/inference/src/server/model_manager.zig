@@ -2615,9 +2615,11 @@ pub const LoadedModel = struct {
     }
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
-        if (self.hf_tok) |ht| return ht.tokenizer();
-        if (self.sp_tok) |sp| return sp.tokenizer();
-        unreachable;
+        var tokenizer = if (self.hf_tok) |ht| ht.tokenizer() else if (self.sp_tok) |sp| sp.tokenizer() else unreachable;
+        // Managed tokenizers are immutable for this loaded model generation.
+        // A pinned handle keeps both tokenizer and backend provider alive.
+        tokenizer.cache_identity = if (self.embedding_asset_signature) |signature| std.hash.Wyhash.hash(0, &signature) else null;
+        return tokenizer;
     }
 
     pub fn getEmbeddingPrototypeCache(self: *LoadedModel, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !*@import("../extractors/embedding_prototypes.zig").Cache {

@@ -729,3 +729,45 @@ the execution gate; each ready wave acquires it for device execution and release
 it before waiting for the next wave. Invalid CPU inputs require no execution
 lease. Preparation leases, cancellation checks and ordered output ownership
 remain in force.
+
+
+Metal F32 backbone execution also retains up to two admitted activation layouts,
+keyed by row count and projection geometry. Six non-overlapping projection
+lifetimes share one range; scratch norms, attention/FFN residuals and alternating
+hidden rows have separate ranges. Normal and global-attention QKV shapes retain
+separate descriptors over the shared projection range. Each layout is capped at
+64 MiB; oversized or denied layouts keep the existing allocation path, and
+transient admission denial retries after eight forward visits. Model pressure
+releases layouts before language matrix slots. Request outputs remain independent.
+Unsupported fused-kernel capabilities decline before encoding to the existing
+device path. Reusable private outputs do not retain host readback snapshots;
+planned writes invalidate any mirror populated by a host fallback. These are
+reusable output views with ordinary command encoding.
+
+Audio arena layout splits oversized expired ranges and coalesces adjacent expired
+ranges before growing storage. This avoids fragmentation when packed producers
+replace several smaller outputs. Seeded randomized lifetime checks verify that
+simultaneously live outputs never overlap.
+
+Audio attention can read packed QKV rows directly, applying each projection's
+optional output clamps at load time. This removes dense Q/K/V slicing and clamp
+intermediates while preserving segmented masks, query scaling and reduction
+order. Backends without this capability keep the split path. Metal pooling and
+final normalization process batch members in batched dispatches and write the
+final rows directly, preserving truncation before normalization.
+
+Single-media token templates use an eight-entry model-owned cache keyed by loaded
+immutable tokenizer generation and instance, media kind, soft-token count and
+token limit. Custom tokenizers without an immutable generation keep normal
+encoding. Misses use the
+original tokenizer; warm requests reuse its exact IDs and masks. Retention is
+admitted and model pressure releases it. Metal composition looks up only wrapper,
+text and padding positions, then merges those rows and projected media in one
+indexed device dispatch. Unsupported kernels retain the row-copy path. Masked
+padding retains its original token lookup values.
+
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP=1` selects the previous execution
+policy for qualification; this policy participates in audio schedule identity.
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP=1` adds the completed alternating-route
+comparison to the ReleaseFast pretrained ordered-media oracle, retaining the
+previous prepared bindings and audio arenas on both routes.

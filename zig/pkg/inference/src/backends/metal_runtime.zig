@@ -10512,7 +10512,9 @@ pub fn decoderRuntimeGemma4AudioLocalAttention(
     const hidden: usize = params.hidden;
     if (rows == 0 or hidden == 0) return null;
     const elems = rows * hidden;
-    if (q.elemCount() != elems or k.elemCount() != elems or v.elemCount() != elems) return null;
+    const source_elems = if (params.qkv_stride != 0) rows * params.qkv_stride else elems;
+    if (params.qkv_stride != 0 and params.qkv_stride != hidden * 3) return error.InvalidTensorShape;
+    if (q.elemCount() != source_elems or k.elemCount() != source_elems or v.elemCount() != source_elems) return null;
     if (rel.elemCount() != @as(usize, params.context_left) * hidden) return null;
     if (q_scales.elemCount() != params.head_dim or valid.elemCount() != rows) return null;
     const shape = [_]i32{ @intCast(rows), @intCast(hidden) };
@@ -23139,6 +23141,9 @@ pub const RawGemma4AudioAttentionParams = extern struct {
     logit_cap: f32,
     invalid_value: f32,
     reserved_f: f32 = 0,
+    qkv_stride: u32 = 0,
+    qkv_flags: u32 = 0,
+    qkv_bounds: [6]f32 = @splat(0),
 };
 pub extern fn termite_metal_decode_runtime_gemma4_audio_clamp_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -49542,3 +49547,7 @@ pub fn decoderRuntimeAudioClampInto(self: anytype, input: MetalTensor, output: M
 }
 
 pub extern fn antfly_metal_audio_replay_scope(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;
+
+pub extern fn antfly_metal_masked_mean_batch(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, metadata: [*]const i64, sequence: usize, width: usize, dimensions: usize, batch: usize, output: ?*anyopaque, output_offset: usize, normalize: bool) c_int;
+
+pub extern fn antfly_metal_compose_rows(runtime: ?*RawMetalDecodeRuntime, wrappers: ?*anyopaque, wrappers_offset: usize, wrappers_rows: usize, media: ?*anyopaque, media_offset: usize, media_rows: usize, map: [*]const i32, rows: usize, width: usize, output: ?*anyopaque, output_offset: usize) c_int;
