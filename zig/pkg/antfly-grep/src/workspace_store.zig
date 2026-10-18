@@ -31,6 +31,7 @@ pub const Entry = struct {
     prepared: ?source.Prepared = null,
 };
 pub const Generation = struct {
+    refs: usize = 1,
     backing: A,
     budget: Budget,
     arena: std.heap.ArenaAllocator,
@@ -40,34 +41,72 @@ pub const Generation = struct {
     source_bytes: usize = 0,
     watch_fallback: bool = false,
     source_bytes_read: usize = 0,
+    sources_opened: usize = 0,
+    discovery_reused: bool = false,
     source_bytes_reused: usize = 0,
     preparations_built: usize = 0,
     preparations_reused: usize = 0,
+    parent_revision: ?[64]u8 = null,
+    changes: std.ArrayList([]const u8) = .empty,
     pub fn capture(a: A, io: std.Io, o: *const Options, previous: ?*const Generation) !*Generation {
         return captureWatched(a, io, o, previous, null);
     }
     pub fn captureWatched(a: A, io: std.Io, o: *const Options, previous: ?*const Generation, watcher: ?*Watch) !*Generation {
         if (watcher) |w| w.beginRefresh();
-        return captureOnce(a, io, o, previous, watcher) catch |err| {
+        return captureOnce(a, io, o, previous, watcher, null, false) catch |err| {
             if (watcher) |w| if (w.fd >= 0) {
                 // Witness resources must never turn a capture that fits without
                 // watchers into an error. Retry once with every witness lost.
                 w.deinit();
-                const next = try captureOnce(a, io, o, previous, watcher);
+                const next = try captureOnce(a, io, o, previous, watcher, null, false);
                 next.watch_fallback = true;
                 return next;
             };
             return err;
         };
     }
-    fn captureOnce(a: A, io: std.Io, o: *const Options, previous: ?*const Generation, watcher: ?*Watch) !*Generation {
+    pub fn captureJournal(a: A, io: std.Io, o: *const Options, previous: ?*Generation, watcher: ?*Watch, journal: ?*@import("discovery_journal.zig").Journal) !*Generation {
+        const w = watcher orelse return captureWatched(a, io, o, previous, null);
+        const j = journal orelse return captureWatched(a, io, o, previous, w);
+        w.beginRefresh();
+        const clean = previous != null and j.clean();
+        if (clean and j.sources_covered and !w.failed and w.fd >= 0 and j.source_epoch == w.epoch) {
+            const old = previous.?;
+            old.refs += 1;
+            old.captured_at = std.Io.Clock.real.now(io).toSeconds();
+            old.source_bytes_read = 0;
+            old.sources_opened = 0;
+            old.source_bytes_reused = old.source_bytes;
+            old.preparations_reused += old.preparations_built;
+            old.preparations_built = 0;
+            old.discovery_reused = true;
+            return old;
+        }
+        if (!clean) j.reset();
+        const next = captureOnce(a, io, o, previous, w, j, clean) catch {
+            w.deinit();
+            j.deinit();
+            j.sealed = false;
+            j.coverage = false;
+            j.sources_covered = false;
+            const fallback = try captureOnce(a, io, o, previous, w, null, false);
+            fallback.watch_fallback = true;
+            return fallback;
+        };
+        j.seal(w, next.entries.items);
+        return next;
+    }
+    fn captureOnce(a: A, io: std.Io, o: *const Options, previous: ?*const Generation, watcher: ?*Watch, journal: ?*@import("discovery_journal.zig").Journal, trusted: bool) !*Generation {
         if (o.workspace_memory_limit < @sizeOf(Generation)) return error.OutOfMemory;
         const self = try a.create(Generation);
         self.* = .{ .backing = a, .budget = .{ .backing = a, .limit = o.workspace_memory_limit - @sizeOf(Generation) }, .arena = undefined };
         self.arena = .init(self.budget.allocator());
         errdefer self.deinit();
-        var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous, .watcher = watcher };
-        if (o.paths.items.len == 0) try collector.path(".") else for (o.paths.items) |path| try collector.path(path);
+        var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous, .watcher = watcher, .journal = journal, .trusted_membership = trusted };
+        self.discovery_reused = trusted;
+        if (trusted) {
+            for (previous.?.entries.items) |entry| try collector.addFile(entry.path, entry.path, entry.explicit_file);
+        } else if (o.paths.items.len == 0) try collector.path(".") else for (o.paths.items) |path| try collector.path(path);
         std.mem.sort(Entry, self.entries.items, {}, struct {
             fn less(_: void, x: Entry, y: Entry) bool {
                 return std.mem.order(u8, x.path, y.path) == .lt;
@@ -87,6 +126,23 @@ pub const Generation = struct {
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         self.revision = std.fmt.bytesToHex(digest, .lower);
+        if (previous) |old| {
+            self.parent_revision = old.revision;
+            if (std.mem.eql(u8, &self.revision, &old.revision)) {
+                self.parent_revision = old.parent_revision;
+                for (old.changes.items) |path| try self.changes.append(self.arena.allocator(), try self.arena.allocator().dupe(u8, path));
+            }
+            var left: usize = 0;
+            var right: usize = 0;
+            while (left < old.entries.items.len or right < self.entries.items.len) {
+                const order: std.math.Order = if (left == old.entries.items.len) .gt else if (right == self.entries.items.len) .lt else std.mem.order(u8, old.entries.items[left].path, self.entries.items[right].path);
+                const path = if (order == .lt) old.entries.items[left].path else self.entries.items[right].path;
+                if (order != .eq or !std.mem.eql(u8, &old.entries.items[left].revision, &self.entries.items[right].revision) or old.entries.items[left].explicit_file != self.entries.items[right].explicit_file)
+                    try self.changes.append(self.arena.allocator(), try self.arena.allocator().dupe(u8, path));
+                if (order != .gt) left += 1;
+                if (order != .lt) right += 1;
+            }
+        }
         self.captured_at = std.Io.Clock.real.now(io).toSeconds();
         return self;
     }
@@ -97,12 +153,14 @@ pub const Generation = struct {
         return bytes;
     }
     pub fn deinit(self: *Generation) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
         const a = self.backing;
         for (self.entries.items) |entry| entry.blob.release();
         self.arena.deinit();
         a.destroy(self);
     }
-    fn find(self: *const Generation, path_name: []const u8) ?*const Entry {
+    pub fn find(self: *const Generation, path_name: []const u8) ?*const Entry {
         var begin: usize = 0;
         var end = self.entries.items.len;
         while (begin < end) {
@@ -171,15 +229,18 @@ const Collector = struct {
     options: *const Options,
     previous: ?*const Generation,
     watcher: ?*Watch = null,
+    journal: ?*@import("discovery_journal.zig").Journal = null,
+    trusted_membership: bool = false,
     fn path(self: *Collector, name: []const u8) !void {
         if (std.mem.eql(u8, name, "-")) return error.WorkspaceStdinUnsupported;
         var scratch = std.heap.ArenaAllocator.init(self.generation.budget.allocator());
         defer scratch.deinit();
         const a = scratch.allocator();
+        if (self.journal) |journal| journal.dependency(name);
         const info = try std.Io.Dir.cwd().statFile(self.io, name, .{});
         if (info.kind == .directory) {
             const full = try std.Io.Dir.cwd().realPathFileAlloc(self.io, name, a);
-            var discovery = @import("discovery.zig").Discovery{ .a = a, .io = self.io, .options = self.options };
+            var discovery = @import("discovery.zig").Discovery{ .a = a, .io = self.io, .options = self.options, .journal = self.journal };
             defer discovery.deinit();
             try discovery.prepare(full);
             try discovery.walk(full, if (std.mem.eql(u8, name, ".") and self.options.paths.items.len == 0) "" else name, self);
@@ -198,6 +259,17 @@ const Collector = struct {
     fn addFile(self: *Collector, path_name: []const u8, display: []const u8, explicit_file: bool) !void {
         const generation = self.generation;
         if (generation.entries.items.len >= self.options.workspace_max_files) return error.WorkspaceFileLimit;
+        if (self.trusted_membership) if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
+            if (old.blob.watcher == watcher and old.blob.token != null and watcher.intact(old.blob.token.?)) {
+                const available = generation.budget.limit -| generation.budget.live;
+                old.blob.refs += 1;
+                errdefer old.blob.release();
+                try self.append(old.blob, display, explicit_file, old.revision, true, available);
+                generation.source_bytes_reused += old.bytes.len;
+                return;
+            }
+        };
+        generation.sources_opened += 1;
         var file_handle = try std.Io.Dir.cwd().openFile(self.io, path_name, .{});
         defer file_handle.close(self.io);
         const before = try file_handle.stat(self.io);

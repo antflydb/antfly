@@ -14,8 +14,9 @@
 // limitations under the License.
 
 //! Per-file kernel witnesses, used only to skip unchanged content reads.
-//! Discovery and ignore/config evaluation always run normally. Every shortcut
-//! also opens/stats the current path and verifies device/inode + caller stamps.
+//! Uncertified callers open/stat paths and check device/inode + stamps. The
+//! optional discovery journal may use raw intact tokens only while namespace,
+//! configuration and ancestor coverage remain complete.
 //! Missing watches, failures, overflow and watch loss fail closed. No events
 //! change the published immutable snapshot; refresh remains explicit.
 const std = @import("std");
@@ -27,6 +28,7 @@ pub const Watch = struct {
     failed: bool = false,
     limit: usize = if (builtin.os.tag == .macos) 256 else 4096,
     generation: u64 = 0,
+    epoch: u64 = 0,
     handles: std.AutoHashMapUnmanaged(c_int, usize) = .empty,
     slots: [4096]Slot = @splat(.{}),
     const Slot = struct { handle: c_int = -1, users: usize = 0, dirty: bool = true, generation: u64 = 0, sequence: u64 = 0, device: u64 = 0, inode: u64 = 0 };
@@ -62,6 +64,7 @@ pub const Watch = struct {
     }
     pub fn reset(self: *Watch) void {
         self.deinit();
+        self.epoch +%= 1;
         self.failed = false;
         self.open();
     }
@@ -85,6 +88,12 @@ pub const Watch = struct {
         return .{ .device = if (comptime builtin.os.tag == .macos) @as(u32, @bitCast(stat.dev)) else @intCast(stat.dev), .inode = @intCast(stat.ino) };
     }
     pub fn arm(self: *Watch, file: std.Io.File) ?Token {
+        return self.armKind(file, false);
+    }
+    pub fn armDirectory(self: *Watch, dir: std.Io.Dir) ?Token {
+        return self.armKind(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } }, true);
+    }
+    fn armKind(self: *Watch, file: std.Io.File, directory: bool) ?Token {
         if (comptime !supported) return null;
         self.poll();
         if (self.fd < 0 or self.failed) return null;
@@ -94,7 +103,8 @@ pub const Watch = struct {
             var path: [64]u8 = undefined;
             const name = std.mem.printSentinel(&path, "/proc/self/fd/{d}", .{file.handle}, 0) catch return null;
             const IN = std.os.linux.IN;
-            handle = std.c.inotify_add_watch(self.fd, name, IN.MODIFY | IN.ATTRIB | IN.CLOSE_WRITE | IN.DELETE_SELF | IN.MOVE_SELF | IN.UNMOUNT);
+            const changes: u32 = if (directory) IN.CREATE | IN.DELETE | IN.MOVED_FROM | IN.MOVED_TO else IN.MODIFY | IN.CLOSE_WRITE;
+            handle = std.c.inotify_add_watch(self.fd, name, changes | IN.ATTRIB | IN.DELETE_SELF | IN.MOVE_SELF | IN.UNMOUNT | IN.MASK_ADD);
             if (handle < 0) return null;
             if (self.handles.get(handle)) |i| {
                 const slot = &self.slots[i];
@@ -152,6 +162,10 @@ pub const Watch = struct {
             slot.dirty = false;
         };
     }
+    pub fn intact(self: *Watch, token: Token) bool {
+        const slot = self.get(token) orelse return false;
+        return !slot.dirty and token.sequence == slot.sequence;
+    }
     pub fn clean(self: *Watch, token: Token, file: std.Io.File) bool {
         if (comptime !supported) return false;
         self.poll();
@@ -183,6 +197,7 @@ pub const Watch = struct {
                         self.failed = true;
                         return;
                     }
+                    self.epoch +%= 1;
                     dirty(&self.slots[event.udata - 1]);
                 }
             } else {
@@ -216,6 +231,7 @@ pub const Watch = struct {
                         return;
                     }
                     if (self.handles.get(event.wd)) |i| {
+                        self.epoch +%= 1;
                         // Lost kernel subscriptions cannot be recertified by
                         // a later read. Unknown handles may be our own removals.
                         if (event.mask & std.os.linux.IN.IGNORED != 0) {

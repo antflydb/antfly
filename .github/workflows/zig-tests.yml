@@ -72,7 +72,7 @@ jobs:
   grep-qualification:
     name: native grep qualification
     needs: admission
-    if: needs.admission.result == 'success' && inputs.validation_scope != 'inference-e2e' && (inputs.pr_number == '' || github.run_attempt == 1)
+    if: ${{ !cancelled() && needs.admission.result == 'success' && inputs.validation_scope != 'inference-e2e' && (inputs.pr_number == '' || github.run_attempt == 1) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

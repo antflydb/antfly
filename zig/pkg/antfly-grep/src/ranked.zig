@@ -41,6 +41,7 @@ pub fn Heap(comptime Candidate: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.considered += 1;
+            if (self.capacity == 0) return false;
             if (self.items.items.len < self.capacity) return true;
             const worst = self.items.items[0];
             return betterFields(score, path, ordinal, worst.score, worst.path, worst.ordinal);

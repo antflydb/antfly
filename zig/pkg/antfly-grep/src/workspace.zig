@@ -38,12 +38,24 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         watcher.deinit();
         a.destroy(watcher);
     };
-    var generation = try Generation.captureWatched(a, io, base, null, watch);
+    const Journal = @import("discovery_journal.zig").Journal;
+    const journal: ?*Journal = if (watch != null) blk: {
+        const value = try a.create(Journal);
+        value.* = Journal.init(a, io);
+        break :blk value;
+    } else null;
+    defer if (journal) |value| {
+        value.deinit();
+        a.destroy(value);
+    };
+    var generation = try Generation.captureJournal(a, io, base, null, watch, journal);
     defer generation.deinit();
     var session = @import("session.zig").Session.init(a, io);
     defer session.deinit();
     var reuse = Search.Reuse.init(a, io);
     defer reuse.deinit();
+    var registrations: @import("prepared_query.zig").Registry(Search) = .{ .a = a, .io = io };
+    defer registrations.deinit();
     var valid = true;
     try ready(a, io, generation, null);
     // A frame cannot grow with repository size. Source bytes are captured by
@@ -56,7 +68,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false };
+        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, delta: bool = false };
         const parsed = std.json.parseFromSlice(Request, scratch, line, .{}) catch {
             try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
             continue;
@@ -79,24 +91,53 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidForceRescanOperation" });
             continue;
         }
-        if (std.mem.eql(u8, request.op, "invalidate")) {
+        if (request.delta and (!std.mem.eql(u8, request.op, "search") or request.query_handle == null or request.if_result_token == null)) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidDeltaOperation" });
+            continue;
+        }
+        if (request.query_handle != null and (!std.mem.eql(u8, request.op, "search") and !std.mem.eql(u8, request.op, "forget") or request.args.len != 0)) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidQueryHandleOperation" });
+            continue;
+        }
+        if (std.mem.eql(u8, request.op, "register")) {
+            const plan = registrations.register(base, request.args, request.compact) catch |err| {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
+                continue;
+            };
+            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_compact) @as(u32, 2) else 1 });
+        } else if (std.mem.eql(u8, request.op, "forget")) {
+            if (request.query_handle == null or !registrations.forget(request.query_handle.?)) {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });
+                continue;
+            }
+            try emit(a, io, .{ .type = "query_forgotten", .id = request.id });
+        } else if (std.mem.eql(u8, request.op, "invalidate")) {
             valid = false;
+            // External invalidation may describe a kernel-invisible write or
+            // lost notification. The next refresh must recertify by reading.
+            if (watch) |watcher| watcher.reset();
+            if (journal) |value| value.reset();
             try emit(a, io, .{ .type = "workspace_invalidated", .id = request.id, .revision = generation.revision });
         } else if (std.mem.eql(u8, request.op, "trim")) {
             // Protocol requests are serial and every search joins its workers.
             // Drop optional state without changing the published source lease.
-            const released = session.plans.physical.load(.monotonic) + reuse.files.bytes + reuse.queries.bytes + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
+            const released = registrations.retainedBytes() + session.plans.physical.load(.monotonic) + reuse.files.bytes + reuse.queries.bytes + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
             if (watch) |watcher| watcher.reset();
+            if (journal) |value| value.reset();
             session.deinit();
             session = @import("session.zig").Session.init(a, io);
             reuse.deinit();
             reuse = Search.Reuse.init(a, io);
+            registrations.deinit();
             @import("memory_pressure.zig").trim();
             try emit(a, io, .{ .type = "workspace_trimmed", .id = request.id, .revision = generation.revision, .retained_source_bytes = generation.retainedBytes(), .retained_cache_bytes = @as(usize, 0), .released_cache_bytes = released });
         } else if (std.mem.eql(u8, request.op, "refresh")) {
             valid = false;
-            if (request.force_rescan) if (watch) |watcher| watcher.reset();
-            const next = Generation.captureWatched(a, io, base, generation, watch) catch |err| {
+            if (request.force_rescan) {
+                if (watch) |watcher| watcher.reset();
+                if (journal) |value| value.reset();
+            }
+            const next = Generation.captureJournal(a, io, base, generation, watch, journal) catch |err| {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 continue;
             };
@@ -109,8 +150,12 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = if (!valid) "WorkspaceInvalidated" else "WorkspaceRevisionMismatch" });
                 continue;
             }
+            const plan = if (request.query_handle) |handle| registrations.get(handle) orelse {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });
+                continue;
+            } else null;
             try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
-            const code = search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token) catch |err| blk: {
+            const code = (if (plan) |prepared| registered(Search, a, io, generation, &session, &reuse, prepared, request.if_result_token, request.delta) else search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token)) catch |err| blk: {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 break :blk @as(u8, 2);
             };
@@ -123,40 +168,12 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     return 0;
 }
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
-    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .source_bytes_reused = generation.source_bytes_reused });
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .sources_opened = generation.sources_opened, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
 }
 fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8, if_result_token: ?[]const u8) !u8 {
-    var o: Options = .{};
-    defer o.deinit(a);
-    // Provider identity and credentials remain process-owned. Requests may
-    // choose a query/model but never mutate the captured discovery contract.
-    inline for (.{ "typesafe_api_key", "endpoint", "model", "token", "backend", "decision_context", "models_dir", "library_path", "provider_name", "cache_dir", "cache_ttl_seconds", "model_revision", "jobs", "jobs_auto", "decision_concurrency", "batch_size", "decision_batch_wait_ms", "no_cache", "retries", "retry_base_ms", "timeout_ms", "home", "global_ignore", "git_config", "temporary_dir", "hostname" }) |name| @field(o, name) = @field(base.*, name);
-    if (base.jobs_auto) {
-        o.jobs = 0;
-        o.jobs_auto = false;
-    }
-    try o.parse(a, args);
-    var provider_arena = std.heap.ArenaAllocator.init(a);
-    defer provider_arena.deinit();
-    try o.finalizeProvider(provider_arena.allocator());
-    if (o.jobs == 0) {
-        o.jobs_auto = true;
-        o.jobs = base.jobs;
-    }
-    if (o.paths.items.len != 0 or o.table_config != null or o.pre != null or o.hostname_bin != null or o.search_zip or o.pattern_files.items.len != 0 or o.inventory or o.files or o.cache_clear or o.generate != null or o.help or o.version or o.pcre2_version or o.type_list or o.sort != null or
-        o.globs.items.len != 0 or o.iglobs.items.len != 0 or o.types.items.len != 0 or o.types_not.items.len != 0 or o.ignore_files.items.len != 0 or o.type_clear.items.len != 0 or o.type_add.items.len != 0 or o.exclude.items.len != 0 or o.triage or o.workspace_watch) return error.UnsupportedWorkspaceQueryOptions;
-    const defaults: Options = .{};
-    inline for (.{ "hidden", "no_ignore", "no_ignore_vcs", "no_ignore_global", "no_ignore_parent", "no_ignore_dot", "no_ignore_exclude", "no_ignore_files", "follow", "one_file_system", "max_depth", "max_files", "include_dependencies", "include_sensitive" }) |name| {
-        if (@field(o, name) != @field(defaults, name)) return error.UnsupportedWorkspaceQueryOptions;
-    }
-    // The protocol always carries ordinary JSON result events. Discovery
-    // filters belong to capture; queries cannot silently read the live tree.
-    o.json = true;
-    o.heading = false;
-    o.color = .never;
-    o.max_files = std.math.maxInt(usize);
-    o.temporary_dir = base.temporary_dir;
-    try o.paths.append(a, ".");
+    var option_arena = std.heap.ArenaAllocator.init(a);
+    defer option_arena.deinit();
+    var o = try @import("workspace_options.zig").prepare(option_arena.allocator(), base, args, null);
     var searcher = try Search.init(a, io, &o);
     defer searcher.deinit();
     if (o.ask != null) try session.configure(&o);
@@ -177,4 +194,40 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
     const interrupt = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
     defer interrupt.deinit();
     return searcher.run();
+}
+
+fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, plan: *@import("prepared_query.zig").Registry(Search).Plan, token: ?[]const u8, delta: bool) !u8 {
+    if (token) |value| if (try Search.conditional(a, io, &plan.options, generation, reuse, plan.identity, value)) |code| return code;
+    var searcher = try Search.initCompiled(a, io, &plan.options, &plan.matcher, plan.cwd);
+    defer searcher.deinit();
+    if (plan.options.ask != null) try session.configure(&plan.options);
+    searcher.workspace_generation = generation;
+    searcher.reuse = reuse;
+    searcher.reuse_identity = plan.identity;
+    searcher.evaluation_identity = plan.evaluation;
+    searcher.if_result_token = token;
+    searcher.executor = &session.files;
+    searcher.region_plans = &session.plans;
+    searcher.decider.executor = &session.providers;
+    searcher.decider.shared_local = session.local;
+    if (session.http) |*http| searcher.decider.shared_http = http;
+    if (!plan.options.no_cache and plan.options.cache_dir != null) searcher.decider.batch_store = &session.batches;
+    if (Search.incrementalEligible(&plan.options) and (plan.incremental_disabled_revision == null or !std.mem.eql(u8, &plan.incremental_disabled_revision.?, &generation.revision))) {
+        if (!plan.index.valid(plan.options.cache_ttl_seconds) or (plan.index.revision != null and !std.mem.eql(u8, &plan.index.revision.?, &generation.revision) and (generation.parent_revision == null or !std.mem.eql(u8, &plan.index.revision.?, &generation.parent_revision.?)))) plan.index.clear();
+        searcher.incremental = &plan.index;
+        if (plan.delivery != null) searcher.prior_delivery = &plan.delivery.?;
+        if (delta and token != null and plan.delivery != null and std.mem.eql(u8, token.?, &plan.delivery.?.token)) searcher.delta_base = &plan.delivery.?;
+    }
+    const guard = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
+    defer guard.deinit();
+    const code = try searcher.run();
+    if (searcher.incremental != null and code <= 1 and searcher.summary.complete and plan.index.healthy and plan.index.files.count() == generation.entries.items.len) {
+        plan.index.revision = generation.revision;
+        plan.incremental_disabled_revision = null;
+        if (searcher.last_result_token) |value| plan.remember(value);
+    } else if (searcher.incremental != null) {
+        plan.incremental_disabled_revision = generation.revision;
+        plan.index.clear();
+    }
+    return code;
 }

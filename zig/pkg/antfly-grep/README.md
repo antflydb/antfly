@@ -1803,9 +1803,11 @@ This is an explicit snapshot contract, not an automatically fresh filesystem
 view. A capture reads each file consistently with before/after metadata checks;
 it is not an atomic filesystem-wide snapshot. Integrations can report any
 change, watcher overflow, disconnect or lost event using `invalidate`; searches
-then fail closed until a successful full `refresh`. No OS watcher is installed
-by this command. Refresh rereads discovery rules and source bytes, verifies
-content identities, and reuses preparations for unchanged path/content pairs.
+then fail closed until a successful `refresh`. Default refresh rereads discovery
+rules and source bytes, verifies content identities, and reuses preparations for
+unchanged path/content pairs. Opt-in `--workspace-watch` can certify unchanged
+namespace/configuration/source state and skip redundant work; `force_rescan`
+always uses a conservative capture.
 It publishes only a complete generation. Failed refresh preserves the old
 allocation but leaves it invalidated; it never silently searches stale data.
 Content revisions remain deterministic for unchanged captures. No chain of old
@@ -2036,15 +2038,23 @@ resident until close. Combined retained cache caps are now 16 + 8 + 4 + 4 MiB
 Refresh defaults to conservative discovery, reads and hashing. Opt in with
 `antfly-grep workspace serve --workspace-watch PATH` to let native kqueue (macOS)
 or inotify (Linux) witnesses skip unchanged content reads. Witness state is
-allocated only when explicitly enabled. Every refresh still
-rediscovers files and evaluates ignore/config rules; each reused path is opened
-and its device/inode, size, timestamps and live witness checked. Subscriptions
+allocated only when explicitly enabled. A bounded discovery journal covers
+visited directories, their ancestors, optional/missing ignore/config inputs, Git
+includes/HEAD/gitdir dependencies, and canonical symlink-target ancestors. While
+that coverage remains complete and clean, refresh can reuse discovery membership
+and skip opens for intact source witnesses. With no source or dependency events,
+it republishes the same owned generation without an O(file-count) inventory walk.
+Otherwise uncertified paths use open/stat/device/inode/timestamp checks and normal
+reads; incomplete namespace coverage uses ordinary discovery. Subscriptions
 are bounded (at most 256 macOS files/4096 Linux files, further capped by the
 file-descriptor limit); missing subscriptions, admission failures, overflow,
 watch loss, unsupported targets and errors fall back to ordinary reads. Linux
 event dispatch uses a bounded handle map. Capture retries without watches if
 watch resources cause a capture failure. `workspace_ready` reports
-`source_bytes_read`, `source_bytes_reused` and `watch_fallback`.
+`source_bytes_read`, `source_bytes_reused`, `sources_opened`, `discovery_reused`
+and `watch_fallback`. The dependency journal has a 1 MiB allocation cap and its
+own bounded native watch table. Resource-related capture failure closes both
+watch owners and retries conservatively without watch allocations during capture.
 
 Use watching only where kernel events cover the writers/filesystem in use.
 Linux mmap writes and remote filesystem changes may not produce inotify events.
@@ -2164,3 +2174,126 @@ Evidence: [paired full replay](bench/results/replay-synthetic-paired-macos.json)
 [generated comparisons](bench/results/replay-differential.json),
 [validation/source hashes](bench/results/replay-validation.json), and
 [release archives](bench/results/replay-archives.json).
+
+
+### Registered queries and exact incremental delivery
+
+For an editor or agent retaining results, register the query once. Registrations
+bind immutable effective options, provider/authentication, policy and model
+identity to an opaque process-local handle. Compact JSON is the default for this
+new operation; set `compact:false` during registration for legacy JSON. Ordinary
+`search` requests keep their existing output defaults.
+
+```json
+{"version":1,"id":1,"op":"register","args":["--ask=retry","--model=MODEL","--max-result-files=15"]}
+```
+
+Retain the `query_registered.query_handle`. Searches using it supply no `args`:
+
+```json
+{"version":1,"id":2,"op":"search","revision":"REVISION","query_handle":"HANDLE"}
+{"version":1,"id":3,"op":"search","revision":"REVISION","query_handle":"HANDLE","if_result_token":"TOKEN"}
+```
+
+Matching conditional hits check the bound identity, current valid revision,
+oldest-evidence TTL, output budget and final cancellation without parsing options,
+compiling/cloning matchers, hashing option JSON, looking up cwd or configuring a
+provider. Misses use the registered compiled program with ordinary search
+semantics. Handles never authorize a different model, credential or policy.
+`forget` retires one handle; `trim` retires all; LRU eviction reports
+`UnknownQueryHandle` and clients can register again. Failed registration preserves
+existing handles.
+
+Each eligible registration maintains a bounded exact index of **all** completed
+positive and negative file outcomes, plus an ordered treap of qualifying scores.
+The index owns compressed/dense selection evidence and declaration labels, not
+source bytes. It accounts for each file's logical scan statistics. A refresh
+publishes changed paths and the preceding distinct content revision. When that
+revision matches, only added/changed files enter the existing bounded worker
+queue/provider batching; deletions simply retire records. A lone changed file
+bypasses the cross-worker batching wait. Selecting new winners walks the score
+index, including previously losing candidates. Unchanged winning payloads borrow
+an immutable prior-result lease through rendering and transactional admission.
+Changed/promoted winners materialize from owned outcomes and current source
+preparations, with current URI, revision, snapshot and observation metadata.
+
+This path requires complete, live evidence and compatible raw UTF-8/newline
+inputs. Finite global region budgets, transformed/unsupported inputs, skipped
+revision chains, expired evidence or memory admission loss use ordinary search.
+Optional index admission failure disables rebuilding for that content revision,
+so complete-query hits remain cheap. No approximation substitutes for missing
+state. Cache hits reset per-invocation work counters; `incremental_cache_hits`
+and `incremental_files_evaluated` expose actual incremental execution separately
+from logical corpus/evidence counts.
+
+After a refresh, a client retaining the previous complete result can request:
+
+```json
+{"version":1,"id":4,"op":"search","revision":"NEW_REVISION","query_handle":"HANDLE","if_result_token":"PREVIOUS_TOKEN","delta":true}
+```
+
+A matching retained baseline can produce `workspace_delta` with `base_token`,
+current `revision`/`observed_at`, the complete ordered selected-path list, and
+removed paths. Only changed/promoted selected files emit ordinary begin/result/end
+payloads; unchanged files keep their retained view and rebase snapshot observation
+metadata from the delta. Unknown/missing baselines return a full response.
+Stage changes and commit only after a complete summary and
+`workspace_end` with exit 0 or 1; errors or partial results preserve the previous view as an old
+snapshot. Replace the baseline only with a `result_token` actually received. If
+none is supplied, clear conditional state and request full results next time.
+
+Use editor-owned file-change events to request refresh/search when needed; the
+service blocks on stdin while idle and has no polling timer or live subscription
+claim. Kernel-invisible changes still require `force_rescan`. Valid conditional
+hits make zero provider calls, but retained memory, validation, I/O and edits have
+resource costs.
+
+Registrations are optional and bounded to eight LRU plans. Each plan has a 2 MiB
+cap covering owned options, compiled patterns and retained delivery metadata, and
+a separate 4 MiB file-index cap. Admission constructs one extra plan before
+replacing a victim: at most 50 MiB plus fixed owner headers across retained plans
+and registration construction, additional to existing caches/source/runtime/query
+memory. These are ceilings, not eagerly allocated reservations. Large programs
+can use ordinary requests if registration admission fails. Typed-cache and region
+plan leases now return physical quota **after** backing deallocation; the checked
+adversarial allocator interleaving stays below its cap.
+
+#### Registered-query qualification
+
+The final binary was tested with 215 CLI cases on native macOS and Linux ARM64
+under a two-CPU Docker VM, 1,000 seeded differential cases (zero differences or
+timeouts), package tests, hardening tests, and Windows cross-compilation. Windows
+runtime behavior and native Linux hardware performance remain unverified.
+
+A paired, warm, synthetic 128-file macOS fixture compared ordinary compact search
+with registered search using the **same production binary**. Every trial checks
+that the reconstructed delta view matches full results, including source URI and
+content revision. Medians include framing and client JSON decoding:
+
+| Operation | Ordinary | Registered | Observation |
+|---|---:|---:|---|
+| Full replay | 1.388 ms | 1.291 ms | Same 140,374-byte response |
+| Conditional hit | 69.75 µs | 34.17 µs | 2.04× faster; zero provider calls |
+| One-file edit | 3.089 ms | 0.314 ms | 9.83× faster; one provider evaluation each |
+| Edit response | 140,381 bytes | 1,927 bytes | 98.63% fewer bytes |
+| Refresh | 9.594 ms | 0.507 ms | Forced rescan versus opt-in certified journal |
+
+The refresh comparison intentionally uses different capture guarantees: the
+conservative side opens 128 files, while the certified side opens one changed
+file. It is not a same-mode I/O speedup. Full replay improves modestly; retained
+state primarily benefits conditional hits and edits. Sample RSS after warming was
+9,200/9,456 KiB (ordinary/registered), and after edits 12,288/11,408 KiB. Trim
+released 1,731,556/1,938,844 accounted cache bytes; allocator RSS need not fall by
+that amount. This is retained-memory work, not a zero-footprint service.
+
+Seven-round warm local controls on the same shared host measured 12.42/12.12 ms
+for literal misses (antfly-grep/ripgrep), 6.78/9.71 ms for SDK file discovery, and
+7.40/10.78 ms for SDK search. These small, noisy controls do not establish a
+universal win over ripgrep. No new JIT optimization or provider billing reduction
+is inferred from the registered-query fixture.
+
+Evidence: [paired protocol trials](bench/results/handles-protocol-macos.json),
+[local controls](bench/results/handles-local-controls-macos.json),
+[differential results](bench/results/handles-differential.json),
+[validation and source identities](bench/results/handles-validation.json), and
+[verified release archives](bench/results/handles-archives.json).

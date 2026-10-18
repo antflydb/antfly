@@ -126,6 +126,7 @@ const Dispatcher = struct {
 
 const Override = struct { pattern: regex.PreparedPattern, basename: bool, include: bool, directory: bool = false, insensitive: bool = false };
 pub const Discovery = struct {
+    journal: ?*@import("discovery_journal.zig").Journal = null,
     a: Allocator,
     io: std.Io,
     options: *const Options,
@@ -148,6 +149,10 @@ pub const Discovery = struct {
     scan_remote: bool = true,
     remote_urls: std.ArrayList([]const u8) = .empty,
     config_roots: std.ArrayList(struct { path: []const u8, base: []const u8 }) = .empty,
+    fn readDependency(self: *Discovery, path: []const u8, limit: usize) ![]u8 {
+        if (self.journal) |journal| journal.dependency(path);
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, self.a, .limited(limit));
+    }
     pub fn deinit(self: *Discovery) void {
         for (self.remote_urls.items) |url| self.a.free(url);
         self.remote_urls.deinit(self.a);
@@ -234,10 +239,11 @@ pub const Discovery = struct {
         while (candidate) |dir| {
             const marker = try std.fs.path.join(self.a, &.{ dir, ".git" });
             defer self.a.free(marker);
+            if (self.journal) |journal| journal.dependency(marker);
             if (std.Io.Dir.cwd().statFile(self.io, marker, .{})) |_| {
                 self.git_root = try self.a.dupe(u8, dir);
                 self.git_directory = try self.a.dupe(u8, marker);
-                if (std.Io.Dir.cwd().readFileAlloc(self.io, marker, self.a, .limited(4096))) |bytes| {
+                if (self.readDependency(marker, 4096)) |bytes| {
                     defer self.a.free(bytes);
                     if (std.mem.startsWith(u8, bytes, "gitdir:")) {
                         const resolved = try std.fs.path.resolveAlloc(self.a, &.{ dir, std.mem.trim(u8, bytes[7..], " \t\r\n") });
@@ -272,7 +278,7 @@ pub const Discovery = struct {
             var gitdir: []const u8 = marker;
             var owned: ?[]u8 = null;
             defer if (owned) |v| self.a.free(v);
-            if (std.Io.Dir.cwd().readFileAlloc(self.io, marker, self.a, .limited(4096))) |bytes| {
+            if (self.readDependency(marker, 4096)) |bytes| {
                 defer self.a.free(bytes);
                 if (std.mem.startsWith(u8, bytes, "gitdir:")) {
                     owned = try std.fs.path.resolveAlloc(self.a, &.{ repo, std.mem.trim(u8, bytes[7..], " \t\r\n") });
@@ -283,7 +289,7 @@ pub const Discovery = struct {
             defer if (common) |value| self.a.free(value);
             const common_file = try std.fs.path.join(self.a, &.{ gitdir, "commondir" });
             defer self.a.free(common_file);
-            if (std.Io.Dir.cwd().readFileAlloc(self.io, common_file, self.a, .limited(4096))) |bytes| {
+            if (self.readDependency(common_file, 4096)) |bytes| {
                 defer self.a.free(bytes);
                 common = try std.fs.path.resolveAlloc(self.a, &.{ gitdir, std.mem.trim(u8, bytes, " \t\r\n") });
             } else |_| {}
@@ -392,6 +398,7 @@ pub const Discovery = struct {
         }
         var dir = try parent.openDir(self.io, entry_name, .{ .iterate = true });
         defer dir.close(self.io);
+        if (self.journal) |journal| journal.directory(path);
         var it = dir.iterate();
         // Most directories contain no ignore files. A bounded lookahead avoids
         // two failing opens per directory without a second directory scan or
@@ -540,7 +547,7 @@ pub const Discovery = struct {
     }
     fn configDepth(self: *Discovery, path: []const u8, base: []const u8, depth: usize, forbid_remote: bool) anyerror!void {
         if (depth > 10) return error.GitConfigIncludeDepthExceeded;
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.a, .limited(1024 * 1024)) catch |err| switch (err) {
+        const bytes = self.readDependency(path, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return,
             else => return err,
         };
@@ -625,7 +632,7 @@ pub const Discovery = struct {
         if (insensitive) raw = raw[9..] else if (std.mem.startsWith(u8, raw, "gitdir:")) raw = raw[7..] else if (std.mem.startsWith(u8, raw, "onbranch:")) {
             const headpath = try std.fs.path.join(self.a, &.{ self.git_directory orelse return false, "HEAD" });
             defer self.a.free(headpath);
-            const head = std.Io.Dir.cwd().readFileAlloc(self.io, headpath, self.a, .limited(4096)) catch return false;
+            const head = self.readDependency(headpath, 4096) catch return false;
             defer self.a.free(head);
             const prefix = "ref: refs/heads/";
             if (!std.mem.startsWith(u8, head, prefix)) return false;
@@ -664,7 +671,7 @@ pub const Discovery = struct {
         try self.load(path, dir, 3);
     }
     fn load(self: *Discovery, path: []const u8, base: []const u8, priority: u8) !void {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.a, .limited(1024 * 1024)) catch |err| switch (err) {
+        const bytes = self.readDependency(path, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return,
             else => return err,
         };

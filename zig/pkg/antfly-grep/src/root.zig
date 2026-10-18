@@ -27,6 +27,8 @@ pub const decision = @import("decision.zig");
 const Allocator = std.mem.Allocator;
 pub const Summary = struct {
     index_requests: usize = 0,
+    incremental_cache_hits: usize = 0,
+    incremental_files_evaluated: usize = 0,
     query_cache_hits: usize = 0,
     file_evaluation_cache_hits: usize = 0,
     source_cache_hits: usize = 0,
@@ -134,6 +136,7 @@ fn evaluationRuns(a: Allocator, selected: []const bool, probabilities: []const f
     }
     return try runs.toOwnedSlice(a);
 }
+const Incremental = @import("incremental.zig").Index(Summary, SavedEvaluation);
 const WorkspaceReuse = struct {
     queries: @import("reuse_cache.zig").Cache(SavedQuery, 32, 4 * 1024 * 1024),
     files: @import("reuse_cache.zig").Cache(SavedEvaluation, 4096, 8 * 1024 * 1024),
@@ -190,6 +193,14 @@ const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
     pub const Reuse = WorkspaceReuse;
+    pub const IncrementalIndex = Incremental;
+    pub const Delivery = @import("incremental.zig").Delivery;
+    incremental: ?*Incremental = null,
+    pending_record: ?*Incremental.File = null,
+    delta_base: ?*const Delivery = null,
+    prior_delivery: ?*const Delivery = null,
+    last_result_token: ?[64]u8 = null,
+    delta_used: bool = false,
     reuse: ?*Reuse = null,
     reuse_identity: ?[32]u8 = null,
     evaluation_identity: ?[32]u8 = null,
@@ -280,6 +291,38 @@ pub const Search = struct {
         const tty = std.Io.File.stdout().isTty(io) catch false;
         return .{ .a = a, .io = io, .options = o, .matcher = matcher, .decider = decision.Client.init(a, io, o), .dictionary = dictionary, .stdout_tty = tty, .local_cwd = cwd, .owns_cwd = cwd != null };
     }
+    pub fn initCompiled(a: Allocator, io: std.Io, o: *const Options, matcher: *const Matcher, cwd: [:0]const u8) !Search {
+        return .{ .a = a, .io = io, .options = o, .matcher = try matcher.clone(a), .decider = decision.Client.init(a, io, o), .local_cwd = cwd };
+    }
+    /// A registered conditional hit needs no matcher, provider, cwd lookup,
+    /// option parsing or option hashing. The immutable handle already binds
+    /// those inputs; evidence lifetime and final cancellation remain live checks.
+    pub fn conditional(a: Allocator, io: std.Io, o: *const Options, generation: *const @import("workspace_store.zig").Generation, reuse: *Reuse, identity: [32]u8, token: []const u8) !?u8 {
+        if (o.ask == null or o.no_cache or o.cache_dir == null or o.cache_ttl_seconds == 0 or o.debug or o.trace or !o.ranked or o.quiet or o.count or o.count_matches or o.files_with_matches or o.files_without_match or o.multiline or o.max_result_files == std.math.maxInt(usize)) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&identity);
+        hash.update(&generation.revision);
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        const lease = reuse.queries.lease(key, o.cache_ttl_seconds) orelse return null;
+        defer lease.release();
+        const expected = std.fmt.bytesToHex(lease.token, .lower);
+        if (!std.mem.eql(u8, token, &expected)) return null;
+        var search: Search = .{ .a = a, .io = io, .options = o, .matcher = undefined, .decider = decision.Client.init(a, io, o) };
+        defer search.output_buffer.deinit(a);
+        defer search.decider.deinit();
+        errdefer search.flushOutput() catch {};
+        const guard = @import("interrupt.zig").Guard.init(&search.limits.cancel);
+        defer guard.deinit();
+        const started = std.Io.Clock.awake.now(io);
+        search.summary = lease.value.summary;
+        search.summary.query_cache_hits = 1;
+        search.summary.file_evaluation_cache_hits = 0;
+        search.summary.incremental_cache_hits = 0;
+        search.summary.incremental_files_evaluated = 0;
+        if (!search.limits.cancel.load(.acquire)) try search.protocolJson(.{ .type = "workspace_unchanged", .result_token = expected, .revision = generation.revision, .observed_at = generation.captured_at }, false);
+        return try search.finish(started);
+    }
     fn initShared(root: *Search) !Search {
         const matcher = try root.matcher.clone(root.a);
         var result: Search = .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
@@ -289,6 +332,7 @@ pub const Search = struct {
         result.reuse = root.reuse;
         result.reuse_identity = root.reuse_identity;
         result.evaluation_identity = root.evaluation_identity;
+        result.incremental = root.incremental;
         result.decider.shareCache(&root.decider);
         result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
@@ -359,16 +403,6 @@ pub const Search = struct {
         }
         self.shared_limits = &self.limits;
         self.decider.limits = &self.limits;
-        if (self.options.ask != null) {
-            if (!self.options.no_cache and self.options.cache_dir != null) {
-                const views = try self.a.create(@import("source_views.zig").Store);
-                views.* = .{ .a = self.a };
-                self.source_views = views;
-                self.source_cache_state.views = views;
-            }
-            self.decider.prepareCache();
-            try self.decider.ensureLocal();
-        }
         const implicit_directory = self.options.ask != null and self.options.paths.items.len == 0 and self.options.table_config == null and (try std.Io.File.stdin().isTty(self.io));
         self.query_reuse_eligible = (self.options.ask != null and self.options.ranked and self.options.sort == null and
             self.options.max_result_files != std.math.maxInt(usize) and !self.hasStdinPath() and
@@ -377,13 +411,16 @@ pub const Search = struct {
             !self.options.files and !self.options.files_with_matches and !self.options.files_without_match and
             !self.options.inventory and !self.options.multiline);
         const query_key = self.queryReuseKey();
-        if (query_key) |key| if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
+        if (self.incremental == null or self.incremental.?.revision != null) if (query_key) |key| if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
             defer pinned.release();
             self.summary = pinned.value.summary;
             self.summary.query_cache_hits = 1;
             self.summary.file_evaluation_cache_hits = 0;
+            self.summary.incremental_cache_hits = 0;
+            self.summary.incremental_files_evaluated = 0;
             self.decider.evidence_times.merge(pinned.times);
             const token = std.fmt.bytesToHex(pinned.token, .lower);
+            self.last_result_token = token;
             var unchanged = false;
             if (!self.limits.cancel.load(.acquire)) {
                 if (self.if_result_token != null and std.mem.eql(u8, self.if_result_token.?, &token)) {
@@ -398,6 +435,17 @@ pub const Search = struct {
             }
             return code;
         };
+        if (self.incremental) |index| if (try self.runIncremental(index, started)) |code| return code;
+        if (self.options.ask != null) {
+            if (!self.options.no_cache and self.options.cache_dir != null) {
+                const views = try self.a.create(@import("source_views.zig").Store);
+                views.* = .{ .a = self.a };
+                self.source_views = views;
+                self.source_cache_state.views = views;
+            }
+            self.decider.prepareCache();
+            try self.decider.ensureLocal();
+        }
         if (self.query_reuse_eligible) {
             const ranking = try self.a.create(Ranking);
             ranking.* = .{ .a = self.a, .io = self.io, .limits = &self.limits, .capacity = self.options.max_result_files, .max_bytes = self.options.max_pending_output };
@@ -505,7 +553,8 @@ pub const Search = struct {
             self.saveQuery(key);
             if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
                 defer pinned.release();
-                try self.protocolJson(.{ .type = "result_token", .result_token = std.fmt.bytesToHex(pinned.token, .lower) }, true);
+                self.last_result_token = std.fmt.bytesToHex(pinned.token, .lower);
+                try self.protocolJson(.{ .type = "result_token", .result_token = self.last_result_token.? }, true);
                 try self.flushOutput();
             }
         };
@@ -1190,6 +1239,10 @@ pub const Search = struct {
         self.binary_offset = null;
         self.replacement_file_context = false;
         self.json_started = false;
+        defer if (self.incremental) |index| {
+            index.commit(self.pending_record, summaryDelta(self.summary, before), self.best_probability);
+            self.pending_record = null;
+        };
         self.readFile(path_name, display) catch |err| {
             try self.jsonEnd(display, before);
             return err;
@@ -2259,7 +2312,9 @@ pub const Search = struct {
         var forward = ForwardSink{ .search = self, .writer = .{ .vtable = &.{ .drain = ForwardSink.drain }, .buffer = &.{} } };
         forward.started = true;
         renderer.sink = &forward.writer;
+        const delta = try self.beginDelta(items);
         for (items) |c| {
+            if (delta and !self.deltaChanged(c.path)) continue;
             if (self.limits.cancel.load(.acquire)) return;
             try self.rankedBoundary(c.filename);
             const render_started = std.Io.Clock.awake.now(self.io);
@@ -2532,7 +2587,225 @@ pub const Search = struct {
         hash.final(&key);
         return key;
     }
+    fn summaryDelta(after: Summary, before: Summary) Summary {
+        var out: Summary = .{};
+        inline for (@typeInfo(Summary).@"struct".field_names) |name| {
+            if (@TypeOf(@field(out, name)) == bool) @field(out, name) = @field(after, name) else @field(out, name) = @field(after, name) - @field(before, name);
+        }
+        return out;
+    }
+    pub fn incrementalEligible(o: *const Options) bool {
+        return o.ask != null and o.ranked and o.max_result_files != std.math.maxInt(usize) and !o.no_cache and o.cache_dir != null and o.cache_ttl_seconds != 0 and o.max_regions == std.math.maxInt(usize) and !o.multiline and !o.crlf and !o.null_data and std.mem.eql(u8, o.encoding, "auto") and !o.quiet and !o.count and !o.count_matches and !o.files_with_matches and !o.files_without_match;
+    }
+    fn beginDelta(self: *Search, items: anytype) !bool {
+        const base = self.delta_base orelse return false;
+        const index = self.incremental orelse return false;
+        if (!index.valid(self.options.cache_ttl_seconds) or !std.mem.eql(u8, &index.revision.?, &self.workspace_generation.?.revision)) return false;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const order = try a.alloc([]const u8, items.len);
+        for (items, order) |item, *path| path.* = item.path;
+        var removed: std.ArrayList([]const u8) = .empty;
+        for (base.members) |old| {
+            var retained = false;
+            for (items) |item| if (std.mem.eql(u8, old.path, item.path)) {
+                retained = true;
+                break;
+            };
+            if (!retained) try removed.append(a, old.path);
+        }
+        try self.protocolJson(.{ .type = "workspace_delta", .base_token = base.token, .revision = self.workspace_generation.?.revision, .observed_at = self.workspace_generation.?.captured_at, .order = order, .removed = removed.items }, false);
+        self.delta_used = true;
+        return true;
+    }
+    fn deltaChanged(self: *Search, path: []const u8) bool {
+        const current = self.incremental.?.files.get(path) orelse return true;
+        for (self.delta_base.?.members) |old| if (std.mem.eql(u8, old.path, path)) return !std.mem.eql(u8, &old.tag, &current.tag);
+        return true;
+    }
+    fn runIncremental(self: *Search, index: *Incremental, started: std.Io.Timestamp) !?u8 {
+        const generation = self.workspace_generation orelse return null;
+        if (!index.valid(self.options.cache_ttl_seconds)) return null;
+        const same = std.mem.eql(u8, &index.revision.?, &generation.revision);
+        if (!same and (generation.parent_revision == null or !std.mem.eql(u8, &index.revision.?, &generation.parent_revision.?))) return null;
+        self.decider.prepareCache();
+        try self.decider.ensureLocal();
+        var changed: usize = 0;
+        if (!same) {
+            // Retire all old dirty records before producers start. The existing
+            // bounded queue, persistent workers, coalescer and shared budgets
+            // then evaluate only upserts; deletion never needs a provider call.
+            for (generation.changes.items) |path| {
+                index.remove(path);
+                if (generation.find(path) != null) changed += 1;
+            }
+            if (changed != 0) {
+                var discard = Ranking{ .a = self.a, .io = self.io, .limits = &self.limits, .capacity = 0, .max_bytes = self.options.max_pending_output };
+                defer discard.deinit();
+                self.ranking = &discard;
+                defer self.ranking = null;
+                self.discovery_stream = true;
+                self.single_source = changed == 1;
+                self.pipeline = try Pipeline.start(self);
+                errdefer if (self.pipeline) |pool| {
+                    pool.finish() catch {};
+                    self.pipeline = null;
+                };
+                for (generation.changes.items) |path| {
+                    if (self.stopped()) break;
+                    const entry = generation.find(path) orelse continue;
+                    self.workspace_entry = entry;
+                    self.explicit_file = entry.explicit_file;
+                    self.render_filename = true;
+                    self.file(entry.path, entry.path) catch |err| try self.reportError(entry.path, err);
+                }
+                self.workspace_entry = null;
+                const pool = self.pipeline.?;
+                pool.finish() catch |err| {
+                    self.pipeline = null;
+                    return err;
+                };
+                self.pipeline = null;
+                changed = self.summary.files;
+            }
+        }
+        const errors = self.summary.errors;
+        self.summary = index.aggregate;
+        self.summary.errors += errors;
+        self.summary.incremental_cache_hits = 1;
+        self.summary.incremental_files_evaluated = changed;
+        self.summary.file_evaluation_cache_hits = 0;
+        self.summary.complete = self.summary.complete and self.summary.errors == 0 and index.healthy and index.files.count() == generation.entries.items.len;
+        if (self.summary.complete) index.revision = generation.revision else index.fail();
+        self.decider.evidence_times.merge(index.times);
+        const ranking = try self.a.create(Ranking);
+        ranking.* = .{ .a = self.a, .io = self.io, .limits = &self.limits, .capacity = self.options.max_result_files, .max_bytes = self.options.max_pending_output };
+        self.ranking = ranking;
+        self.owns_ranking = true;
+        var previous: ?@TypeOf(self.reuse.?.queries).Lease = null;
+        defer if (previous) |lease| lease.release();
+        if (self.prior_delivery) |base| {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(&self.reuse_identity.?);
+            hash.update(&base.revision);
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |lease| {
+                const token = std.fmt.bytesToHex(lease.token, .lower);
+                if (std.mem.eql(u8, &token, &base.token)) previous = lease else lease.release();
+            }
+        }
+        var items: std.ArrayList(SavedCandidate) = .empty;
+        defer items.deinit(self.a);
+        var current = index.first();
+        var count: usize = 0;
+        while (current) |record| : (current = Incremental.next(record)) {
+            if (count >= self.options.max_result_files or self.limits.cancel.load(.acquire)) break;
+            const entry = generation.find(record.path) orelse continue;
+            if (!std.mem.eql(u8, &entry.revision, &record.revision) or entry.prepared == null) continue;
+            var borrowed: ?SavedCandidate = null;
+            if (previous) |lease| if (self.prior_delivery) |base| {
+                for (base.members) |old| if (std.mem.eql(u8, old.path, record.path) and std.mem.eql(u8, &old.tag, &record.tag)) {
+                    for (lease.value.items) |candidate| if (std.mem.eql(u8, candidate.path, record.path)) {
+                        borrowed = candidate;
+                        break;
+                    };
+                    break;
+                };
+            };
+            if (borrowed) |candidate| {
+                try items.append(self.a, candidate);
+                count += 1;
+                continue;
+            }
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const prepared = entry.prepared.?;
+            const selected = try a.alloc(bool, prepared.lines.len);
+            const probabilities = try a.alloc(f64, selected.len);
+            const scores = try a.alloc(f64, selected.len);
+            restoreEvaluation(record.evaluation, selected, probabilities, scores);
+            var n: usize = 0;
+            for (selected) |*yes| if (yes.*) {
+                if (n == self.options.max_count) yes.* = false else n += 1;
+            };
+            var evidence: @import("evidence.zig").Evidence = .{ .index = prepared.index, .line_scores = scores, .file_score = record.evaluation.file_score };
+            evidence.regions.items = record.evaluation.regions;
+            evidence.regions.capacity = record.evaluation.regions.len;
+            self.evidence = &evidence;
+            defer self.evidence = null;
+            self.best_probability = record.score;
+            const previous_source = self.provenance;
+            defer self.provenance = previous_source;
+            self.provenance = .{ .uri = try @import("document.zig").localUriAt(a, self.local_cwd.?, record.path), .revision = &entry.revision, .snapshot = &generation.revision, .observed_at = generation.captured_at, .freshness = .snapshot };
+            self.render_filename = true;
+            self.file_before = .{};
+            try self.retainCandidate(a, record.path, entry.bytes, prepared.lines, selected, probabilities, self.options.jev_mode);
+            if (self.deferred_candidate) |candidate| {
+                self.deferred_candidate = null;
+                candidate.summary = record.summary;
+                try ranking.offer(candidate);
+                var saved: SavedCandidate = undefined;
+                inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| @field(saved, name) = @field(candidate, name);
+                try items.append(self.a, saved);
+            }
+            count += 1;
+        }
+        try self.renderCandidates(items.items, index.qualifying, true);
+        const code = try self.finish(started);
+        if (code <= 1 and self.summary.complete) if (self.queryReuseKey()) |key| {
+            self.reuse.?.queries.put(key, self.decider.evidence_times, .{ .summary = self.summary, .considered = index.qualifying, .items = items.items });
+            if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |lease| {
+                defer lease.release();
+                self.last_result_token = std.fmt.bytesToHex(lease.token, .lower);
+                try self.protocolJson(.{ .type = "result_token", .result_token = self.last_result_token.? }, true);
+                try self.flushOutput();
+            }
+        };
+        return code;
+    }
+    fn restoreEvaluation(value: SavedEvaluation, selected: []bool, probabilities: []f64, scores: []f64) void {
+        if (value.dense) |dense| {
+            @memcpy(selected, dense.selected);
+            @memcpy(probabilities, dense.probabilities);
+            @memcpy(scores, dense.line_scores);
+        } else {
+            var start: usize = 0;
+            for (value.runs) |span| {
+                @memset(selected[start..span.end], span.selected);
+                @memset(probabilities[start..span.end], span.probability);
+                @memset(scores[start..span.end], span.line_score);
+                start = span.end;
+            }
+        }
+    }
     fn evaluateFile(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !bool {
+        defer if (self.incremental) |index| {
+            if (self.workspace_entry) |entry| {
+                if (entry.prepared == null or bytes.ptr != entry.bytes.ptr or bytes.len != entry.bytes.len) {
+                    index.fail();
+                } else {
+                    var scratch: @import("antfly_regex").Budget = .{ .backing = self.a, .limit = 2 * 1024 * 1024 };
+                    const runs = evaluationRuns(scratch.allocator(), selected, probabilities, self.evidence.?.line_scores) catch null;
+                    if (runs) |spans| {
+                        defer scratch.allocator().free(spans);
+                        self.pending_record = index.capture(path, entry.revision, .{
+                            .line_count = selected.len,
+                            .runs = spans,
+                            .dense = if (selected.len != 0 and spans.len == 0) .{ .selected = selected, .probabilities = probabilities, .line_scores = self.evidence.?.line_scores } else null,
+                            .regions = self.evidence.?.regions.items,
+                            .file_score = self.evidence.?.file_score,
+                            .best = self.best_probability,
+                            .considered = 0,
+                            .evaluated = 0,
+                            .preview_rejected = false,
+                        }, self.decider.evidence_times);
+                    } else index.fail();
+                }
+            } else index.fail();
+        };
         const evidence = self.evidence.?;
         const key = self.evaluationReuseKey(path);
         if (key) |k| if (self.reuse.?.files.lease(k, self.options.cache_ttl_seconds)) |hit| {

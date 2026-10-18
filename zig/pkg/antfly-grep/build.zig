@@ -103,7 +103,8 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     bench.addArtifactArg(exe);
     bench.addPassthruArgs();
     b.step("grep-bench", "Benchmark grep throughput and peak RSS against optional ripgrep").dependOn(&bench.step);
-    const tests = b.addTest(.{ .root_module = lib });
+    const tests = b.addTest(.{ .name = "antfly-grep-unit-test", .root_module = lib });
+    b.step("grep-unit-build", "Build portable package unit tests without executing them").dependOn(&b.addInstallArtifact(tests, .{}).step);
     const test_run = b.addRunArtifact(tests);
     const test_step = b.step("grep-test", "Run native grep unit and integration tests");
     const unit_step = b.step("grep-unit", "Run native grep, regex, grammar and dictionary unit tests");

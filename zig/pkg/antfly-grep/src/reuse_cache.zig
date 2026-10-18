@@ -86,9 +86,10 @@ pub fn Cache(comptime Value: type, comptime capacity: usize, comptime limit: usi
             fn release(entry: *Entry) void {
                 if (entry.refs.fetchSub(1, .acq_rel) != 1) return;
                 const owner = entry.owner;
-                _ = owner.physical.fetchSub(entry.budget.live + @sizeOf(Entry), .monotonic);
+                const size = entry.budget.live + @sizeOf(Entry);
                 entry.arena.deinit();
                 owner.a.destroy(entry);
+                _ = owner.physical.fetchSub(size, .monotonic);
             }
         };
         pub const Hit = struct { times: Times, value: Value };
@@ -270,4 +271,57 @@ test "associative cache preserves active colliding questions and failed foreign 
     var evicted: [32]u8 = @splat(0);
     evicted[0] = 8;
     try std.testing.expect(cache.lease(evicted, 100) == null);
+}
+
+const QuotaTestCache = Cache([]const u8, 4, 16384);
+const payload: [2300]u8 = @splat('x');
+const Probe = struct {
+    backing: std.mem.Allocator = std.testing.allocator,
+    cache: ?*QuotaTestCache = null,
+    times: Times = .{},
+    live: usize = 0,
+    peak: usize = 0,
+    inject: bool = false,
+    fn allocator(self: *Probe) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *Probe = @ptrCast(@alignCast(raw));
+        const p = self.backing.rawAlloc(len, alignment, ret) orelse return null;
+        self.live += len;
+        self.peak = @max(self.peak, self.live);
+        return p;
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *Probe = @ptrCast(@alignCast(raw));
+        if (self.inject) {
+            self.inject = false;
+            // Pause the last lease's first free, and interleave two successful
+            // admissions exactly as another worker could before free returns.
+            self.cache.?.put(@splat(4), self.times, &payload);
+            self.cache.?.put(@splat(5), self.times, &payload);
+        }
+        self.live -= memory.len;
+        self.backing.rawFree(memory, alignment, ret);
+    }
+};
+test "last lease retains quota until backing memory is released" {
+    var probe: Probe = .{};
+    var cache: QuotaTestCache = .{ .a = probe.allocator(), .io = std.testing.io };
+    probe.cache = &cache;
+    probe.times.add(std.Io.Clock.real.now(std.testing.io).toSeconds());
+    defer cache.deinit();
+    var leases: [3]QuotaTestCache.Lease = undefined;
+    for (0..3) |i| {
+        const key: [32]u8 = @splat(@intCast(i));
+        cache.put(key, probe.times, &payload);
+        leases[i] = cache.lease(key, 100).?;
+    }
+    cache.deinit();
+    probe.inject = true;
+    leases[0].release();
+    defer leases[1].release();
+    defer leases[2].release();
+
+    try std.testing.expect(probe.peak <= 16384);
 }

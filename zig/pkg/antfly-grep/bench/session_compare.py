@@ -229,7 +229,13 @@ def main():
                     return {
                         key: value
                         for key, value in summary["stats"].items()
-                        if key not in ("query_cache_hits", "file_evaluation_cache_hits")
+                        if key
+                        not in (
+                            "query_cache_hits",
+                            "file_evaluation_cache_hits",
+                            "incremental_cache_hits",
+                            "incremental_files_evaluated",
+                        )
                     }
 
                 if logical_stats(pair["baseline"]["summary"]) != logical_stats(

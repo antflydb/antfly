@@ -37,9 +37,11 @@ pub const Plan = struct {
     pub fn release(self: *Plan) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const a = self.backing;
-        if (self.owner) |cache| _ = cache.physical.fetchSub(self.budget.live + @sizeOf(Plan), .monotonic);
+        const owner = self.owner;
+        const size = self.budget.live + @sizeOf(Plan);
         self.arena.deinit();
         a.destroy(self);
+        if (owner) |cache| _ = cache.physical.fetchSub(size, .monotonic);
     }
     // Called only after this window has reserved its evaluation budget. Keys
     // outside the admitted window remain unmaterialized, even on a cold query.

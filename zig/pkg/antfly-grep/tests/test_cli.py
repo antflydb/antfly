@@ -179,6 +179,8 @@ class DecisionHandler(BaseHTTPRequestHandler):
         gate = getattr(self.server, "provider_lanes", None)
         if gate is not None:
             gate.acquire()
+        self.request_active = True
+        self.request_gate = gate
         with self.server.lock:
             self.server.active += 1
             self.server.peak = max(self.server.peak, self.server.active)
@@ -194,10 +196,16 @@ class DecisionHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            with self.server.lock:
-                self.server.active -= 1
-            if gate is not None:
-                gate.release()
+            self.finish_provider_work()
+
+    def finish_provider_work(self):
+        with self.server.lock:
+            if not self.request_active:
+                return
+            self.request_active = False
+            self.server.active -= 1
+        if self.request_gate is not None:
+            self.request_gate.release()
 
     def index_query(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -472,6 +480,11 @@ class DecisionHandler(BaseHTTPRequestHandler):
                 "usage": {"input_tokens": 10, "output_tokens": 2},
             }
         ).encode()
+        if getattr(self.server, "measure_provider_work", False):
+            # Account decision work before exposing the completed response.
+            # Otherwise a client can read the body and release its lane before
+            # this Python handler reaches finally(), inflating peak by one.
+            self.finish_provider_work()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
@@ -1853,6 +1866,7 @@ class CliTests(unittest.TestCase):
         self.server.peak = 0
         self.server.strict_decisions = False
         self.server.stagger_scores = False
+        self.server.measure_provider_work = False
         self.server.after_decision = None
         self.server.delay = 0
         self.server.barrier = None
@@ -5893,6 +5907,8 @@ class CliTests(unittest.TestCase):
                     "workspace_invalidated",
                     "workspace_closed",
                     "workspace_trimmed",
+                    "query_registered",
+                    "query_forgotten",
                 ):
                     return rows
 
@@ -5912,6 +5928,291 @@ class CliTests(unittest.TestCase):
             proc.stderr.close()
             self.assertNotIn(b"leaked", stderr)
             self.assertNotIn(b"panic", stderr)
+
+    def test_workspace_registered_queries_bind_options_and_compact_delivery(self):
+        self.write("src/a.txt", "STOP HIGH\n")
+        args = [*self.decision_args(), "--no-refine", "--max-result-files=1"]
+        with self.workspace("src") as (ready, request):
+            registered = request("register", args=args)[0]
+            self.assertEqual(registered["type"], "query_registered", registered)
+            self.assertEqual(registered["result_schema_version"], 2)
+            handle = registered["query_handle"]
+            rows = request("search", revision=ready["revision"], query_handle=handle)
+            self.assertEqual(rows[-1]["exit_code"], 0, rows)
+            self.assertTrue(any(r["type"] == "match" and "file_id" in r for r in rows))
+            token = next(r["result_token"] for r in rows if r["type"] == "result_token")
+            warm = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+            )
+            self.assertTrue(any(r["type"] == "workspace_unchanged" for r in warm), warm)
+            self.assertEqual(
+                next(r for r in warm if r["type"] == "summary")["requests"], 0
+            )
+            self.assertEqual(
+                request(
+                    "search",
+                    revision=ready["revision"],
+                    query_handle=handle,
+                    args=["--only=other"],
+                )[0]["message"],
+                "InvalidQueryHandleOperation",
+            )
+            self.assertEqual(
+                request("register", args=["-P", "("])[0]["type"], "workspace_error"
+            )
+            self.assertEqual(
+                request("search", revision=ready["revision"], query_handle=handle)[-1][
+                    "exit_code"
+                ],
+                0,
+            )
+            self.assertEqual(
+                request("forget", query_handle=handle)[0]["type"], "query_forgotten"
+            )
+            self.assertEqual(
+                request("search", revision=ready["revision"], query_handle=handle)[0][
+                    "message"
+                ],
+                "UnknownQueryHandle",
+            )
+
+    def test_workspace_registered_incremental_ranking_and_delta_promote_losers(self):
+        winner = self.write("src/a.txt", "STOP HIGH\n")
+        self.write("src/b.txt", "STOP LOW\n")
+        noise = self.write("src/c.txt", "nothing relevant\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=1",
+            "--max-requests=unlimited",
+            "--threads=2",
+        ]
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=args)[0]["query_handle"]
+
+            def run(token=None):
+                extra = {"delta": True, "if_result_token": token} if token else {}
+                rows = request(
+                    "search", revision=ready["revision"], query_handle=handle, **extra
+                )
+                self.assertEqual(rows[-1]["exit_code"], 0, rows)
+                return rows
+
+            initial = run()
+            token = next(
+                r["result_token"] for r in initial if r["type"] == "result_token"
+            )
+            winner.unlink()
+            ready = request("refresh")[0]
+            promoted = run(token)
+            delta = next(r for r in promoted if r["type"] == "workspace_delta")
+            self.assertEqual(delta["order"], ["src/b.txt"])
+            self.assertEqual(delta["removed"], ["src/a.txt"])
+            self.assertEqual(
+                next(r for r in promoted if r["type"] == "begin")["data"]["path"][
+                    "text"
+                ],
+                "src/b.txt",
+            )
+            summary = next(r for r in promoted if r["type"] == "summary")
+            self.assertEqual(summary["requests"], 0)
+            self.assertEqual(summary["stats"]["incremental_cache_hits"], 1)
+            self.assertEqual(summary["stats"]["incremental_files_evaluated"], 0)
+            token = next(
+                r["result_token"] for r in promoted if r["type"] == "result_token"
+            )
+            noise.write_text("new irrelevant text\n")
+            ready = request("refresh")[0]
+            changed = run(token)
+            self.assertTrue(
+                any(r["type"] == "workspace_delta" for r in changed), changed
+            )
+            self.assertFalse(
+                any(r["type"] in ("begin", "match", "file") for r in changed), changed
+            )
+            self.assertEqual(
+                next(r for r in changed if r["type"] == "summary")["stats"][
+                    "incremental_files_evaluated"
+                ],
+                1,
+            )
+            # A missing baseline always produces an ordinary complete response.
+            full = run("0" * 64)
+            self.assertTrue(any(r["type"] == "match" for r in full), full)
+            self.assertFalse(any(r["type"] == "workspace_delta" for r in full))
+            # An empty result is a successful complete delta with grep exit 1.
+            token = next(r["result_token"] for r in full if r["type"] == "result_token")
+            (self.root / "src/b.txt").unlink()
+            ready = request("refresh")[0]
+            empty = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+                delta=True,
+            )
+            self.assertEqual(empty[-1]["exit_code"], 1, empty)
+            self.assertEqual(
+                next(r for r in empty if r["type"] == "workspace_delta")["order"], []
+            )
+            self.assertTrue(
+                next(r for r in empty if r["type"] == "summary")["stats"]["complete"]
+            )
+
+    def test_workspace_registered_handles_expire_on_trim_and_lru_eviction(self):
+        self.write("a.txt", "STOP\n")
+        with self.workspace("a.txt") as (ready, request):
+            handles = [
+                request("register", args=["STOP", "--json"])[0]["query_handle"]
+                for _ in range(9)
+            ]
+            self.assertEqual(
+                request("search", revision=ready["revision"], query_handle=handles[0])[
+                    0
+                ]["message"],
+                "UnknownQueryHandle",
+            )
+            self.assertEqual(
+                request("search", revision=ready["revision"], query_handle=handles[-1])[
+                    -1
+                ]["exit_code"],
+                0,
+            )
+            request("trim")
+            self.assertEqual(
+                request("search", revision=ready["revision"], query_handle=handles[-1])[
+                    0
+                ]["message"],
+                "UnknownQueryHandle",
+            )
+
+    def test_workspace_journal_tracks_configuration_and_avoids_unchanged_opens(self):
+        self.write("src/a.txt", "STOP HIGH\n")
+        other = self.write("src/b.txt", "STOP LOW\n")
+        config = self.write(
+            "global.gitconfig",
+            "[core]\n excludesFile = " + str(self.root / "exclude") + "\n",
+        )
+        self.write("exclude", "\n")
+        self.env["GIT_CONFIG_GLOBAL"] = str(config)
+        self.write("src/.git/HEAD", "ref: refs/heads/main\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            request("refresh")
+            stable = request("refresh")[0]
+            if not stable["discovery_reused"]:
+                self.skipTest(
+                    "kernel discovery coverage unavailable; conservative fallback is active"
+                )
+            self.assertEqual(stable["sources_opened"], 0)
+            other.write_text("STOP new contents\n")
+            changed = request("refresh")[0]
+            self.assertEqual(changed["sources_opened"], 1, changed)
+            self.assertTrue(changed["discovery_reused"])
+            self.write("exclude", "b.txt\n")
+            filtered = request("refresh")[0]
+            self.assertEqual(filtered["files"], 1, filtered)
+            self.assertFalse(filtered["discovery_reused"])
+            self.write("src/new.txt", "new member\n")
+            self.assertEqual(request("refresh")[0]["files"], 2)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertFalse(forced["discovery_reused"])
+            self.assertEqual(forced["sources_opened"], 2)
+
+    def test_workspace_registered_expiry_and_output_failure_never_acknowledge_stale_results(
+        self,
+    ):
+        self.write("src/a.txt", "STOP HIGH\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=1",
+            "--cache-ttl=1",
+        ]
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=args)[0]["query_handle"]
+            first = request("search", revision=ready["revision"], query_handle=handle)
+            token = next(
+                r["result_token"] for r in first if r["type"] == "result_token"
+            )
+            time.sleep(1.1)
+            expired = request(
+                "search",
+                revision=ready["revision"],
+                query_handle=handle,
+                if_result_token=token,
+            )
+            self.assertEqual(expired[-1]["exit_code"], 0, expired)
+            self.assertFalse(any(r["type"] == "workspace_unchanged" for r in expired))
+            self.assertGreater(
+                next(r for r in expired if r["type"] == "summary")["requests"], 0
+            )
+            limited = request("register", args=[*args, "--max-output-bytes=300"])[0][
+                "query_handle"
+            ]
+            partial = request(
+                "search", revision=ready["revision"], query_handle=limited
+            )
+            self.assertEqual(partial[-1]["exit_code"], 2, partial)
+            self.assertFalse(
+                any(
+                    r["type"] in ("workspace_unchanged", "result_token")
+                    for r in partial
+                )
+            )
+
+    def test_workspace_journal_detects_symlink_target_ancestor_replacement(self):
+        external = self.write("external/deep/a.txt", "old target\n")
+        link = self.root / "link.txt"
+        link.symlink_to(external)
+        with self.workspace("--workspace-watch", "link.txt") as (ready, request):
+            request("refresh")
+            os.rename(self.root / "external", self.root / "retired")
+            self.write("external/deep/a.txt", "new target\n")
+            changed = request("refresh")[0]
+            rows = request("search", revision=changed["revision"], args=["new target"])
+            self.assertEqual(rows[-1]["exit_code"], 0, rows)
+            self.assertEqual(
+                next(r for r in rows if r["type"] == "match")["data"]["lines"]["text"],
+                "new target\n",
+            )
+
+    def test_workspace_registered_transcoded_files_use_complete_fallback(self):
+        a = self.write("src/a.txt", "STOP HIGH\n".encode("utf-16"))
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=1",
+            "--max-requests=unlimited",
+        ]
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=args)[0]["query_handle"]
+            first = request("search", revision=ready["revision"], query_handle=handle)
+            self.assertEqual(first[-1]["exit_code"], 0, first)
+            a.write_bytes("STOP HIGH changed\n".encode("utf-16"))
+            ready = request("refresh")[0]
+            changed = request("search", revision=ready["revision"], query_handle=handle)
+            self.assertEqual(changed[-1]["exit_code"], 0, changed)
+            self.assertTrue(any(r["type"] == "match" for r in changed), changed)
+            self.assertEqual(
+                next(r for r in changed if r["type"] == "summary")["stats"][
+                    "incremental_cache_hits"
+                ],
+                0,
+            )
+
+    def test_workspace_explicit_invalidation_forces_journal_recertification(self):
+        self.write("src/a.txt", "first\n")
+        self.write("src/b.txt", "second\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            request("refresh")
+            request("invalidate")
+            recaptured = request("refresh")[0]
+            self.assertEqual(recaptured["source_bytes_read"], ready["bytes"])
+            self.assertEqual(recaptured["sources_opened"], 2)
+            self.assertFalse(recaptured["discovery_reused"])
 
     def test_workspace_pins_bytes_and_invalidates_before_transactional_refresh(self):
         path = self.write("src/a.txt", "STOP old\n")
@@ -6574,6 +6875,7 @@ class CliTests(unittest.TestCase):
         self.raw_cli("workspace", "serve", "--workspace-memory-limit=1K", "src", code=2)
 
     def test_provider_concurrency_is_independent_and_reports_transport_cost(self):
+        self.server.measure_provider_work = True
         self.server.delay = 0.02
         for i in range(16):
             self.write(f"src/f{i:02}.txt", "STOP HIGH\n")
