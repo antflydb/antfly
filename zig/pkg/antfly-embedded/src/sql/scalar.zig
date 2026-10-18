@@ -410,10 +410,15 @@ pub const Program = struct {
         for (self.instructions) |instruction| {
             if (instruction.operation != .call) continue;
             const call = instruction.operation.call;
-            if (call.function != .@"$contains" and call.function != .@"$overlaps" and !(call.function == .array_position and call.args.len == 2)) continue;
-            const source = if (call.function == .@"$overlaps" and self.constant_arrays.contains(call.args[1])) call.args[1] else call.args[0];
+            const quantified = call.function == .@"$array_quantified" and self.instructions[call.args[2]].operation == .literal and self.instructions[call.args[3]].operation == .literal and
+                self.instructions[call.args[2]].operation.literal == .integer and self.instructions[call.args[3]].operation.literal == .bool and
+                ((self.instructions[call.args[2]].operation.literal.integer == @backingInt(arrays.Comparison.eq) and !self.instructions[call.args[3]].operation.literal.bool) or
+                    (self.instructions[call.args[2]].operation.literal.integer == @backingInt(arrays.Comparison.ne) and self.instructions[call.args[3]].operation.literal.bool));
+            if (!quantified and call.function != .@"$contains" and call.function != .@"$overlaps" and !(call.function == .array_position and call.args.len == 2)) continue;
+            const source = if (quantified or (call.function == .@"$overlaps" and self.constant_arrays.contains(call.args[1]))) call.args[1] else call.args[0];
             if (self.constant_memberships.contains(source)) continue;
             const array = self.constant_arrays.get(source) orelse continue;
+            if (quantified and (array.cardinality() < 32 or array.element_type == .numeric)) continue;
             if (pool.memory.isExhausted() or pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) break;
             const index = try a.create(arrays.Membership);
             var work: arrays.Budget = .{ .remaining = pool.remaining };
@@ -483,7 +488,7 @@ pub const Program = struct {
             const expected = self.parameter_descriptors[ordinal];
             if (actual.kind != expected.kind or actual.element_type != expected.element_type or actual.nullable != expected.nullable) return error.ConflictingSqlParameterTypes;
         }
-        return .{ .program = self, .parameters = frame.values };
+        return .{ .program = self, .parameters = frame.values, .lookup = frame.lookup() };
     }
 };
 
@@ -492,14 +497,15 @@ pub const Program = struct {
 pub const PreparedEvaluation = struct {
     program: *const Program,
     parameters: []const Datum,
+    lookup: @import("parameter_frame.zig").Frame.Lookup = .{},
 
     pub fn evaluateInstruction(self: PreparedEvaluation, alloc: Allocator, index: u32) !Datum {
-        var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .typed_parameters = self.parameters, .limits = .{} };
+        var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .typed_parameters = self.parameters, .parameter_lookup = self.lookup, .limits = .{} };
         return context.runDatum(index, 0);
     }
 
     pub fn evaluate(self: PreparedEvaluation, alloc: Allocator, cells: []const Datum, limits: EvalLimits) !Datum {
-        var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = cells, .parameters = &.{}, .typed_parameters = self.parameters, .limits = limits };
+        var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = cells, .parameters = &.{}, .typed_parameters = self.parameters, .parameter_lookup = self.lookup, .limits = limits };
         const result = try context.runDatum(self.program.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
@@ -3074,6 +3080,7 @@ const Evaluator = struct {
     cells: []const Datum,
     parameters: []const Json,
     typed_parameters: ?[]const Datum = null,
+    parameter_lookup: @import("parameter_frame.zig").Frame.Lookup = .{},
     limits: EvalLimits,
     work_owner: ?@import("numeric_value.zig").Context = null,
     pattern_steps: usize = 0,
@@ -3125,6 +3132,27 @@ const Evaluator = struct {
         }
         var work = self.workBudget();
         return compareWithBudget(left, right, &work);
+    }
+
+    fn quantifiedMembership(self: *Evaluator, input: u32, array: *const arrays.Value, element: Datum, work: *arrays.Budget) !?*const arrays.Membership {
+        if (element.sql_null) return null;
+        if (self.program.constant_memberships.get(input)) |index| return index;
+        const parameters = self.typed_parameters orelse return null;
+        const lookup = if (self.program.invocation) |invocation| (if (invocation.frame) |*bound_frame| bound_frame.lookup() else self.parameter_lookup) else self.parameter_lookup;
+        // Only identity casts can borrow a parameter's immutable index. A
+        // conversion creates a different array and retains ordinary execution.
+        var node = input;
+        while (true) {
+            const instruction = self.program.instructions[node];
+            switch (instruction.operation) {
+                .parameter => |ordinal| return lookup.membership(ordinal, array, parameters, work),
+                .cast => |cast| {
+                    if (cast.type != .array or cast.numeric_modifier != null or self.program.instructions[cast.operand].type.element_type != instruction.type.element_type) return null;
+                    node = cast.operand;
+                },
+                else => return null,
+            }
+        }
     }
 
     fn charge(self: *Evaluator, bytes: usize) !void {
@@ -3472,6 +3500,12 @@ const Evaluator = struct {
                             arrays.Element.json(try self.convert(probe.value, arrayScalarType(array.element_type)));
                         const accepted = if (exact_number) try self.numericQuantified(probe, array.*, compare_op, every.bool) else ordinary: {
                             var work = self.workBudget();
+                            if (!mixed_number and ((compare_op == .eq and !every.bool) or (compare_op == .ne and every.bool))) {
+                                if (try self.quantifiedMembership(call.args[1], array, element, &work)) |membership_index| {
+                                    const found = try membership_index.equalAny(element, &work);
+                                    break :ordinary if (found) |yes| (if (every.bool) !yes else yes) else null;
+                                }
+                            }
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
@@ -6799,13 +6833,13 @@ test "SQL native dynamic containment scratch measurement" {
     var work: arrays.Budget = .{};
     for (0..count) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &work);
     const source = try builder.finish(region, .{}, &work);
-    var cells: [32]Datum = undefined;
-    for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(count - 32 + i) });
+    var cells: [256]Datum = undefined;
     var compiled = try @import("compiler.zig").compileScalar(a, "a @> b", .{});
     defer compiled.deinit();
     var program = try bind(a, compiled.expression, &.{ .{ .name = "a", .type = .array, .element_type = .int64 }, .{ .name = "b", .type = .array, .element_type = .int64 } }, &.{}, .{});
     defer program.deinit();
-    for ([_]usize{ 0, 1, 4, 32 }) |probes| {
+    for ([_]usize{ 0, 1, 4, 32, 65, 256 }) |probes| {
+        for (cells[0..probes], 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(count - probes + i) });
         const right = try arrays.Value.init(.int64, if (probes == 0) &.{} else &.{.{ .length = @intCast(probes) }}, cells[0..probes], .{});
         var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 64 * 1024 * 1024 };
         var arena = std.heap.ArenaAllocator.init(counter.allocator());
@@ -6818,5 +6852,26 @@ test "SQL native dynamic containment scratch measurement" {
         }
         const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
         std.debug.print("SQL_DYNAMIC_CONTAINMENT repetitions=20 source_cells={} probes={} peak={} retained={} elapsed_ns={}\n", .{ count, probes, counter.peak, counter.live, elapsed });
+    }
+}
+
+test "SQL native constant equality quantifiers share bounded immutable indexes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "needle = ANY('", "needle <> ALL('" }) |prefix| {
+        var sql: std.Io.Writer.Allocating = .init(a);
+        defer sql.deinit();
+        try sql.writer.writeAll(prefix);
+        try sql.writer.writeAll("{NULL");
+        for (0..64) |i| try sql.writer.print(",{d}", .{i});
+        try sql.writer.writeAll("}'::bigint[])");
+        var compiled = try @import("compiler.zig").compileScalar(a, sql.written(), .{});
+        defer compiled.deinit();
+        var program = try bindTyped(a, compiled.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int64 }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(@as(usize, 1), program.constant_memberships.count());
+        for ([_]Datum{ .{}, .json(.{ .integer = 7 }), .json(.{ .integer = 999 }) }, 0..) |cell, i| {
+            const result = try program.evaluate(std.testing.failing_allocator, &.{cell}, &.{}, .{});
+            if (i != 1) try std.testing.expect(result.sql_null) else try std.testing.expectEqual(std.mem.indexOf(u8, prefix, "<>") == null, result.value.bool);
+        }
     }
 }

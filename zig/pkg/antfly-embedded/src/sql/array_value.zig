@@ -1057,7 +1057,10 @@ pub fn dynamicMembership(backing: Allocator, left: Value, right: Value, overlap:
         }
         return !overlap;
     }
-    const swapped = overlap and b.cardinality() < a.cardinality();
+    // A small open-addressed table lives entirely on the stack. Equality
+    // verifies collisions; duplicate probes share a single matched bit.
+    if (probes.cardinality() <= 64) return smallMembership(source, probes, overlap, work);
+    const swapped = b.cardinality() < a.cardinality();
     // Metadata is allocated too; include it in the temporary memory allowance.
     if (limits.bytes < @sizeOf(MemoryBudget)) return error.SqlProgramLimitExceeded;
     var scratch_limits = limits;
@@ -1065,7 +1068,56 @@ pub fn dynamicMembership(backing: Allocator, left: Value, right: Value, overlap:
     var index = try Membership.initValidated(MemoryBudget.reclaimingAllocator(backing), if (swapped) b else a, scratch_limits);
     defer index.deinit();
     try index.populate(work);
-    return if (overlap) index.overlaps(if (swapped) a else b, work) else index.contains(b, work);
+    if (overlap) return index.overlaps(if (swapped) a else b, work);
+    if (!swapped) return index.contains(b, work);
+    return index.containedBy(a, work);
+}
+
+fn smallMembership(source: Value, probes: Value, overlap: bool, work: *Budget) !bool {
+    const Slot = struct { hash: u64 = 0, ordinal: ?u8 = null, matched: bool = false };
+    var slots: [128]Slot = @splat(.{});
+    var remaining: usize = 0;
+    for (0..probes.cardinality()) |i| {
+        const cell = probes.flatCell(i);
+        try work.consume(1);
+        if (cell.sql_null) {
+            if (!overlap) return false;
+            continue;
+        }
+        const hash = try hashElement(probes.element_type, cell, work);
+        var bucket: usize = @intCast(hash & 127);
+        while (slots[bucket].ordinal) |ordinal| {
+            try work.consume(1);
+            if (slots[bucket].hash == hash and try compareElement(probes.element_type, probes.flatCell(ordinal), cell, work) == .eq) break;
+            bucket = (bucket + 1) & 127;
+        } else {
+            slots[bucket] = .{ .hash = hash, .ordinal = @intCast(i) };
+            remaining += 1;
+        }
+    }
+    if (remaining == 0) return !overlap;
+    for (0..source.cardinality()) |i| {
+        const cell = source.flatCell(i);
+        try work.consume(1);
+        if (cell.sql_null) continue;
+        const hash = try hashElement(source.element_type, cell, work);
+        var bucket: usize = @intCast(hash & 127);
+        while (slots[bucket].ordinal) |ordinal| {
+            const entry = &slots[bucket];
+            try work.consume(1);
+            if (entry.hash == hash and try compareElement(source.element_type, probes.flatCell(ordinal), cell, work) == .eq) {
+                if (overlap) return true;
+                if (!entry.matched) {
+                    entry.matched = true;
+                    remaining -= 1;
+                }
+                if (remaining == 0) return true;
+                break;
+            }
+            bucket = (bucket + 1) & 127;
+        }
+    }
+    return false;
 }
 
 /// Reusable equality membership, O(n) build and expected O(m) probes. The
@@ -1160,6 +1212,54 @@ pub const Membership = struct {
             if (try self.find(element, try hashElement(other.element_type, element, work), work) != null) return true;
         }
         return false;
+    }
+
+    /// This index describes the required probes. Scan the larger source once
+    /// and track distinct entries, independently of dimensions/lower bounds.
+    fn containedBy(self: *Membership, source: Value, work: *Budget) !bool {
+        if (self.first_null != null) return false;
+        var remaining = self.entries.items.len;
+        if (remaining == 0) return true;
+        const a = self.budget.allocator();
+        const matched = a.alloc(u8, (remaining + 7) / 8) catch |err| return allocationError(self.budget, err);
+        defer a.free(matched);
+        @memset(matched, 0);
+        for (0..source.cardinality()) |i| {
+            const cell = source.flatCell(i);
+            try work.consume(1);
+            if (cell.sql_null) continue;
+            const hash = try hashElement(source.element_type, cell, work);
+            var next = self.heads.get(hash);
+            while (next) |slot| {
+                const entry = self.entries.items[slot];
+                if (try compareElement(source.element_type, self.value.flatCell(entry.ordinal), cell, work) == .eq) {
+                    const mask = @as(u8, 1) << @intCast(slot % 8);
+                    if (matched[slot / 8] & mask == 0) {
+                        matched[slot / 8] |= mask;
+                        remaining -= 1;
+                    }
+                    if (remaining == 0) return true;
+                    break;
+                }
+                next = entry.next;
+            }
+        }
+        return false;
+    }
+
+    /// Hashed equality ANY preserves SQL NULL provenance. The caller excludes
+    /// mixed/exact numeric comparisons that require a different hash domain.
+    pub fn equalAny(self: *const Membership, element: Element, work: *Budget) !?bool {
+        try validateElement(switch (self.value.element_type) {
+            .int16, .int32 => .int64,
+            .float32 => .float64,
+            else => self.value.element_type,
+        }, element, work);
+        try work.consume(1);
+        if (self.value.cardinality() == 0) return false;
+        if (element.sql_null) return null;
+        if (try self.find(element, try hashElement(self.value.element_type, element, work), work) != null) return true;
+        return if (self.first_null != null) null else false;
     }
 
     pub fn firstPosition(self: *const Membership, element: Element, work: *Budget) !?i32 {
@@ -1626,15 +1726,21 @@ test "SQL native dynamic membership matches indexes across representations and p
         for ([_]Value{ prepared, native }) |source| {
             var index = try Membership.init(a, source, .{});
             defer index.deinit();
-            for (0..7) |count| {
+            for (case.cells) |probe| try std.testing.expectEqual(try source.quantified(probe, .eq, .any, &work), try index.equalAny(probe, &work));
+            for ([_]usize{ 0, 1, 4, 5, 32, 64, 65, 96 }) |count| {
                 const probes = try Value.init(case.kind, if (count == 0) &.{} else &.{.{ .length = @intCast(count), .lower = 4 }}, cells[0..count], .{});
                 for ([_]bool{ false, true }) |overlap| {
                     const expected = if (overlap) try index.overlaps(probes, &work) else try index.contains(probes, &work);
-                    const alloc = if (count <= 4) std.testing.failing_allocator else a;
+                    const alloc = if (count <= 64) std.testing.failing_allocator else a;
                     try std.testing.expectEqual(expected, try dynamicMembership(alloc, source, probes, overlap, .{}, &work));
                     if (overlap) try std.testing.expectEqual(expected, try dynamicMembership(alloc, probes, source, true, .{}, &work));
                 }
             }
+            // Large duplicate probe sets exercise distinct-match accounting.
+            var repeated: [65]Element = undefined;
+            for (&repeated, 0..) |*cell, i| cell.* = case.cells[if (i % 2 == 0) 0 else 2];
+            const duplicates = try Value.init(case.kind, &.{.{ .length = 65 }}, &repeated, .{});
+            try std.testing.expect(try dynamicMembership(a, source, duplicates, false, .{}, &work));
             // Probe sets without NULLs test duplicate and NaN/zero matches.
             const probes = try Value.init(case.kind, &.{.{ .length = 3 }}, &.{ case.cells[2], case.cells[0], case.cells[0] }, .{});
             try std.testing.expect(try dynamicMembership(std.testing.failing_allocator, source, probes, false, .{}, &work));
@@ -1663,7 +1769,7 @@ test "SQL native dynamic membership reclaims indexed scratch and preserves admis
     var cells: [129]Element = undefined;
     for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
     const source = try Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
-    const probes = try Value.init(.int64, &.{.{ .length = 8 }}, cells[121..], .{});
+    const probes = try Value.init(.int64, &.{.{ .length = 65 }}, cells[64..], .{});
     const Fixture = struct {
         fn run(backing: Allocator, left: Value, right: Value) !void {
             var arena = std.heap.ArenaAllocator.init(backing);
