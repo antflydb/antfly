@@ -2689,6 +2689,9 @@ def test_late_qualified_windows_and_repeated_apply_keep_physical_work_bounded(gr
     for tail in (
         "MATCH (b) WHERE b.score=999 RETURN b.score LIMIT 1",
         "CALL { WITH b MATCH (b) WHERE b.score=999 RETURN b.score AS qualified_score } RETURN qualified_score LIMIT 1",
+        "CALL { WITH b MATCH (b) WHERE b.score=999 RETURN b.score AS qualified_score LIMIT 1 } RETURN qualified_score LIMIT 1",
+        "CALL { WITH b MATCH (b) WHERE b.score=999 RETURN DISTINCT b.score AS qualified_score } RETURN qualified_score LIMIT 1",
+        "CALL { WITH b MATCH (b) RETURN max(b.score) AS qualified_score } WITH qualified_score WHERE qualified_score=999 RETURN qualified_score LIMIT 1",
     ):
         try:
             result = db.cypher_json(
@@ -2707,6 +2710,7 @@ def test_late_qualified_windows_and_repeated_apply_keep_physical_work_bounded(gr
     assert [row[0]["value"] for row in result["rows"]] == ["32", "999"]
     for tail in (
         "MATCH (b) WHERE CASE WHEN b.score=999 THEN 1/0 ELSE 0 END=1 RETURN b.score LIMIT 1",
+        "CALL { WITH b MATCH (b) RETURN CASE WHEN max(b.score)=999 THEN 1/0 ELSE 0 END AS n } WITH n WHERE n=1 RETURN n LIMIT 1",
         "WITH DISTINCT CASE WHEN b.score=999 THEN 1/0 ELSE b.score END AS score RETURN score LIMIT 3",
     ):
         with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
