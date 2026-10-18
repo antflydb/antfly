@@ -1892,6 +1892,7 @@ const TestDriver = struct {
     pending: bool = false,
     build_pages: usize = 0,
     build_failed: bool = false,
+    duplicate_claims: bool = false,
     cancellation_requests: usize = 0,
     inventory_pages: usize = 0,
     generation_pages: usize = 0,
@@ -2132,6 +2133,7 @@ const TestDriver = struct {
         try command.validate();
         if (self.claims_sealed) return error.PrivateIndexTargetSealed;
         self.claim_batches += 1;
+        if (self.duplicate_claims and !self.pending) return error.UniqueConstraintViolation;
         if (self.cancel_after_commit) |signal| signal.store(true, .release);
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ClaimOutcome, alloc, .{
             .binding = command.binding,
@@ -2519,8 +2521,12 @@ const TestSchedulerHost = struct {
 };
 
 fn testSchedulerFailedBuild(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    for ([_]bool{ false, true }) |duplicate| try testSchedulerFailedBuildMode(alloc, permission, binding, root, duplicate);
+}
+
+fn testSchedulerFailedBuildMode(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State, duplicate: bool) !void {
     const worker = @import("../metadata/relational_index_worker.zig");
-    var driver: TestDriver = .{ .value = permission, .binding = binding, .build_failed = true, .pending = true };
+    var driver: TestDriver = .{ .value = permission, .binding = binding, .build_failed = !duplicate, .duplicate_claims = duplicate, .pending = true };
     var host: TestSchedulerHost = .{ .driver = &driver };
     var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
     var transport = sender.localTransport();
@@ -2545,9 +2551,15 @@ fn testSchedulerFailedBuild(alloc: std.mem.Allocator, permission: publication.Ow
     }
     try std.testing.expectEqual(@as(usize, 1), driver.cancellation_requests);
     try std.testing.expectEqual(.canceling, driver.value.head.phase);
-    try std.testing.expectEqual(.invalid_candidate, driver.value.head.failure);
-    try std.testing.expectEqual(@as(usize, 0), driver.source_reads);
-    try std.testing.expectEqual(@as(usize, 0), driver.claim_batches);
+    try std.testing.expectEqual(if (duplicate) local.storage_db_relational_index_publication_progress.Failure.duplicate_key else .invalid_candidate, driver.value.head.failure);
+    if (duplicate) {
+        try std.testing.expect(driver.source_reads != 0 and driver.claim_batches != 0);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), driver.source_reads);
+        try std.testing.expectEqual(@as(usize, 0), driver.claim_batches);
+    }
+    try std.testing.expectEqual(@as(usize, 0), driver.acceptance_calls);
+    try std.testing.expectEqual(@as(usize, 0), driver.consumption_calls);
     try std.testing.expectEqual(@as(usize, 0), driver.installation_calls);
     try std.testing.expectEqual(@as(usize, 0), driver.release_calls);
     try std.testing.expectEqual(@as(u16, 0), driver.value.head.counts[5]);

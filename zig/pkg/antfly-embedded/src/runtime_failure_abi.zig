@@ -774,6 +774,7 @@ pub const Status = enum(u32) {
     schema_validation_cancellation_required = 814,
     invalid_ordered_apply_receipt = 815,
     conflicting_ordered_apply_receipt = 816,
+    index_owner_receipt_changed = 817,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

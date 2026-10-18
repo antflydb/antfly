@@ -28,6 +28,71 @@ from psycopg import sql as pgsql
 
 
 class IndexLifecycleTest(unittest.TestCase):
+    def test_original_secondary_index_drop_retires_enforcement_and_reuses_name(self):
+        originals = {
+            entry["id"]: entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE usage_records "
+                "(id UUID PRIMARY KEY, email TEXT, tenant_id TEXT, status TEXT)"
+            )
+            db.execute(
+                "INSERT INTO usage_records VALUES "
+                "('00000000-0000-0000-0000-000000000001',NULL,'tenant','pending'),"
+                "('00000000-0000-0000-0000-000000000002','owner@example.com','tenant','active')"
+            )
+            insert = (
+                "INSERT INTO usage_records VALUES "
+                "('00000000-0000-0000-0000-000000000003',NULL,'other','pending')"
+            )
+            for _ in range(2):
+                db.execute(
+                    "CREATE UNIQUE INDEX usage_records_status_idx "
+                    "ON usage_records(status)"
+                )
+                with self.assertRaises(psycopg.Error) as duplicate:
+                    db.execute(insert)
+                self.assertEqual("23505", duplicate.exception.sqlstate)
+                before = db.execute(
+                    "SELECT * FROM usage_records ORDER BY id"
+                ).fetchall()
+                self.assertEqual(
+                    "DROP INDEX", db.execute(originals["sql-0724"]["sql"]).statusmessage
+                )
+                self.assertIsNone(
+                    db.execute(
+                        "SELECT to_regclass('usage_records_status_idx')"
+                    ).fetchone()[0]
+                )
+                self.assertEqual(
+                    before,
+                    db.execute("SELECT * FROM usage_records ORDER BY id").fetchall(),
+                )
+                db.execute(insert)
+                self.assertEqual(
+                    [(str(row[0]), *row[1:]) for row in before]
+                    + [
+                        (
+                            "00000000-0000-0000-0000-000000000003",
+                            None,
+                            "other",
+                            "pending",
+                        )
+                    ],
+                    [
+                        (str(row[0]), *row[1:])
+                        for row in db.execute("SELECT * FROM usage_records ORDER BY id")
+                    ],
+                )
+                db.execute(
+                    "DELETE FROM usage_records "
+                    "WHERE id='00000000-0000-0000-0000-000000000003'"
+                )
+
     def test_column_nullability_validation_preserves_rows_and_expressions(self):
         with postgres() as db:
             db.execute(

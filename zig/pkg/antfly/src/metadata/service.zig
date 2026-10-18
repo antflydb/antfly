@@ -11651,6 +11651,7 @@ pub const MetadataHttpService = struct {
         });
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         current_status.metrics = self.metrics();
+        self.applyRuntimeStatusProtocolDiagnostics(&current_status);
         return current_status;
     }
 
@@ -12341,6 +12342,15 @@ pub const MetadataHttpService = struct {
 
     pub fn projectedStore(self: *MetadataHttpService) ?*metadata_storage.RaftApplyStore {
         return self.raft.host.owned_metadata_store;
+    }
+
+    pub fn relationalIndexWorkJson(self: *MetadataHttpService, alloc: std.mem.Allocator, request: api_operation.RequestContext, query: @import("relational_index_work.zig").Query) ![]u8 {
+        try self.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.relationalIndexWorkJson(alloc, self.metadata_group_id, query);
     }
 
     pub fn metadataIncarnation(self: *MetadataHttpService) !?metadata_mod.MetadataClusterIncarnation {

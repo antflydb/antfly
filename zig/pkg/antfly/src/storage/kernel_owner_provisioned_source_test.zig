@@ -119,7 +119,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         var rooted = try owners.nativeIndexOwnerReceiptAtRoot(alloc, 7501, "items", .{ .identity = identity, .effect = .fenced }, .{});
         defer rooted.deinit();
         try std.testing.expect(rooted.outcome.value == null);
-        try std.testing.expectEqual(accepted_root_generation, rooted.root_generation);
+        try std.testing.expectEqual(try local.storage_db_root_signing_identity.attestedRootGeneration(accepted_root_generation), rooted.root_generation);
         const schema = try owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{});
         try schema.observation.validateFor(schema_binding);
         try std.testing.expect(schema.observation.header == null and !schema.observation.replication_pending);
@@ -177,7 +177,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
     const empty = try raft_owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{});
     try std.testing.expectError(error.OnlineSourceScopeChanged, raft_owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{}));
     try std.testing.expect(empty.observation.binding == null and empty.observation.applied == null);
-    try std.testing.expectEqual(table_reads.backend_current_root_generation, empty.root_generation);
+    try std.testing.expectEqual(try local.storage_db_root_signing_identity.attestedRootGeneration(table_reads.backend_current_root_generation), empty.root_generation);
     const before_json = (try Catalog.snapshot(&catalog)).tables[0].schema_json;
     const after_json =
         \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}},"relational_indexes":[{"name":"id_idx","keys":[{"column":"id"}]}],"unique_constraints":[{"name":"id_idx","origin":"index","columns":["id"]}]}
@@ -193,6 +193,22 @@ test "native index owner adapter inspects cold native ownership and rejects fore
     try prepared.preparation.validate(header, local.storage_db_relational_index_inputs.digest(candidate.inputs.bytes));
     try std.testing.expectEqual(empty.root_generation, prepared.root_generation);
     try std.testing.expectEqualDeep(empty, try raft_owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{}));
+    // A preparation lease must not prevent the control executor from retiring
+    // the resident entry before committed-descriptor apply. Rejoin the same
+    // physical root through the real compiled owner, never reuse its pointer.
+    var session = try raft_owners.acquireRaftIndexOwnerSession(7501, "items", identity, .{});
+    defer session.deinit();
+    session.releaseForApply();
+    try std.testing.expectEqual(@as(usize, 1), raft_owners.retireTable("items"));
+    try session.reacquireAfterApply();
+    try std.testing.expectEqualDeep(empty, try session.observe(alloc));
+    session.releaseForApply();
+    session.root_generation += 1;
+    try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, session.reacquireAfterApply());
+    try std.testing.expect(!session.lease.active);
+    session.root_generation -= 1;
+    try session.reacquireAfterApply();
+    try std.testing.expectEqualDeep(empty, try session.observe(alloc));
 }
 
 test "native index owner adapter executes fresh permission stages and recovers reserved LSM receipts after restart" {
@@ -300,7 +316,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
                     if (ack.signed.receipt.action == .canceled) {
                         self.cleanup_ack = ack;
                         self.cleanup_acks += @intFromBool(update.changed);
-                        self.value.native_cancel_release = .{ .canceled = ack.cancellation.?.record, .cleanup_proof = ack.signed.proof, .decision_digest = try publication.cancellationReleaseDecisionDigest(self.value.metadata_group_id, self.value.metadata_incarnation, self.value.head) };
+                        self.value.cancellation_release = .{ .canceled = ack.cancellation.?.record, .cleanup_proof = ack.signed.proof, .decision_digest = try publication.cancellationReleaseDecisionDigest(self.value.metadata_group_id, self.value.metadata_incarnation, self.value.head) };
                         if (self.lose_cleanup_ack_reply) {
                             self.lose_cleanup_ack_reply = false;
                             return error.MetadataMutationOutcomeUnknown;
@@ -351,11 +367,11 @@ test "native index owner adapter executes fresh permission stages and recovers r
                     value.dispatch = null;
                     value.inputs = null;
                     value.native_signing = null;
-                    value.native_cancel_release = null;
+                    value.cancellation_release = null;
                     return std.json.Stringify.valueAlloc(a, value, .{});
                 }
             }
-            if (call.relational_index_owner_decision.operation != .cancel_release) value.native_cancel_release = null;
+            if (call.relational_index_owner_decision.operation != .cancel_release) value.cancellation_release = null;
             if (call.relational_index_owner_decision.claim_groups) |groups| {
                 if (groups.items.len != 0) return error.UnexpectedFixtureDestination;
                 value.claim_routes = .{ .items = &.{} };
@@ -438,7 +454,8 @@ test "native index owner adapter executes fresh permission stages and recovers r
     };
     // Choose a non-default descriptor generation, then recover the actual
     // persisted cut from that root after all process-local owners are closed.
-    var root_generation: u64 = 7;
+    const root_generation: u64 = 7;
+    var root_selection = try local.storage_db_root_signing_identity.rootSelectionForAttestedGeneration(root_generation);
     const request: execution.Request = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .operation = .fence };
     var prepared: ?publication.Prepared = null;
     defer if (prepared) |*value| value.deinit();
@@ -448,7 +465,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
     {
         var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
         owners.online_source_authority = .native;
-        owners.group_visible_root_generation = .{ .ptr = &root_generation, .visible_root_generation_for_group = RootGeneration.read };
+        owners.group_visible_root_generation = .{ .ptr = &root_selection, .visible_root_generation_for_group = RootGeneration.read };
         defer owners.deinit();
         // Read the actual newly provisioned owner's epoch and catalog instead
         // of guessing them from the metadata fixture's synthetic defaults.
@@ -518,7 +535,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
     {
         var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
         owners.online_source_authority = .native;
-        owners.group_visible_root_generation = .{ .ptr = &root_generation, .visible_root_generation_for_group = RootGeneration.read };
+        owners.group_visible_root_generation = .{ .ptr = &root_selection, .visible_root_generation_for_group = RootGeneration.read };
         defer owners.deinit();
         var reserve_request = request;
         reserve_request.operation = .reserve;
@@ -535,7 +552,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(.native, authority.kind);
         try std.testing.expectEqualSlices(u8, &local.storage_db_online_source_contract.namespaceBytes(reserved_receipt.owner.namespace), &authority.namespace);
         try std.testing.expect(authority.sequence >= reserved_receipt.position.native.sequence);
-        try std.testing.expectEqual(root_generation, observed.metadata.lsm_root_generation);
+        try std.testing.expectEqual(root_selection, observed.metadata.lsm_root_generation);
         try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
         // Exercise cancellation through the actual leased compiled owner, not
         // a synthetic source callback. Metadata/RPC authentication is a
@@ -740,7 +757,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         const signed_consumption = try consumed_result.response().requireSignedConsumption(consume_request);
         try std.testing.expectEqual(accepted.decision_digest, signed_consumption.decision_digest);
         var forged_consumption = signed_consumption;
-        forged_consumption.position.sequence += 1;
+        forged_consumption.position.native.sequence += 1;
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, forged_consumption.verify());
         var wrong_authority = consumed.outcome.value.record.?;
         wrong_authority.position = .{ .raft = .{ .term = 1, .index = accepted.source_sequence + 1 } };
@@ -916,7 +933,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(progress.Phase.cancel_releasing, metadata.value.head.phase);
         try std.testing.expectEqualDeep(cleanup_progress.head, metadata.value.head);
         try std.testing.expectEqual(@as(usize, 1), metadata.cleanup_acks);
-        const release_intent = metadata.value.native_cancel_release.?.intent();
+        const release_intent = metadata.value.cancellation_release.?.intent();
         try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, 0, signing_root.root_incarnation, .{}));
         try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, root_generation + 1, signing_root.root_incarnation, .{}));
         try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, root_generation, other_root, .{}));
@@ -939,9 +956,9 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqualDeep(released.outcome.value.receipt, release_retry.outcome.value.receipt);
         try std.testing.expectEqual(released.outcome.value.position, release_retry.outcome.value.position);
         // A caller-chosen digest is not permission, even for a committed cut.
-        metadata.value.native_cancel_release.?.decision_digest[0] ^= 1;
+        metadata.value.cancellation_release.?.decision_digest[0] ^= 1;
         try std.testing.expectError(error.InvalidCatalogRecord, execution.cancelReleaseStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{}));
-        metadata.value.native_cancel_release.?.decision_digest[0] ^= 1;
+        metadata.value.cancellation_release.?.decision_digest[0] ^= 1;
         var receiving_release = try execution.cancelReleaseStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
         defer receiving_release.deinit();
         try std.testing.expect(receiving_release == .released and receiving_release.released.outcome.value.duplicate);
@@ -955,7 +972,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         const release_ack = (try terminal.ack()).?;
         try release_ack.validate();
         try std.testing.expect(release_ack.cancellation == null);
-        try publication.requireNativeCancellationReleaseReceipt(metadata.value.metadata_group_id, metadata.value.metadata_incarnation, metadata.value.head, metadata.value.owner, try publication.StoredProof.decode(alloc, retained_proof.slice()), release_ack.signed);
+        try publication.requireCancellationReleaseReceipt(metadata.value.metadata_group_id, metadata.value.metadata_incarnation, metadata.value.head, metadata.value.owner, try publication.StoredProof.decode(alloc, retained_proof.slice()), release_ack.signed, null);
         for (0..100) |_| {
             const before = transport.calls;
             _ = try cancellation_scheduler.step(std.testing.io, alloc, null, &metadata, &local_transport, cancellation_now);
@@ -974,7 +991,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expect(metadata.cancellation_status_reads >= 2);
         // A subsequent routing/root switch must not relabel the already
         // recovered receipt as belonging to the replacement physical root.
-        root_generation += 1;
+        root_selection += 1;
         try std.testing.expectEqual(@as(u64, 7), completed.root_generation);
         try std.testing.expectEqual(@as(u64, 7), recovered.recovered.root_generation);
         try std.testing.expectEqual(@as(u64, 7), source_result.rootGeneration().?);

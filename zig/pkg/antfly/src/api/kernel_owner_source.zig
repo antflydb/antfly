@@ -69,7 +69,11 @@ fn platformDeadlineContext(context: request_operation.RequestContext) !request_o
 /// Both terminal operations must check the accepted generation on their
 /// applying lease before calling the native boundary, never after fence lift.
 fn requireAcceptedNativeRootGeneration(actual: u64, expected: u64) !void {
-    if (expected == 0 or actual != expected) return error.PrivateIndexRootRecoveryRequired;
+    if (expected == 0 or try indexRootEpoch(actual) != expected) return error.PrivateIndexRootRecoveryRequired;
+}
+
+fn indexRootEpoch(selection: u64) !u64 {
+    return @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(selection) catch error.PrivateIndexRootRecoveryRequired;
 }
 
 test "native index owner adapter rejects cancellation deadline and foreign group before acquisition" {
@@ -3711,6 +3715,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// receipt recovery and signing. A second route lookup is not provenance.
     pub const RaftIndexOwnerSession = struct {
         lease: Lease,
+        root_generation: u64,
         table_name: []const u8,
         identity: raft_index_control.Identity,
         context: request_operation.RequestContext,
@@ -3718,6 +3723,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         pub fn deinit(self: *@This()) void {
             self.lease.deinit();
             self.* = undefined;
+        }
+
+        /// A committed descriptor can require retiring this resident owner.
+        /// Never pin its preparation lease while waiting for ordered apply.
+        pub fn releaseForApply(self: *@This()) void {
+            self.lease.deinit();
+        }
+
+        /// Rejoin only the same physical root, never relabel a replacement
+        /// root's observation with the preparation epoch. Failed reacquisition
+        /// leaves the session released and safe for its caller's defer.
+        pub fn reacquireAfterApply(self: *@This()) !void {
+            std.debug.assert(!self.lease.active);
+            var next = try self.lease.source.acquireRaftIndexOwnerSession(self.identity.owner_group_id, self.table_name, self.identity, self.context);
+            errdefer next.deinit();
+            if (next.root_generation != self.root_generation) return error.PrivateIndexRootRecoveryRequired;
+            self.lease = next.lease;
         }
 
         pub fn observe(self: *@This(), alloc: std.mem.Allocator) !RootedRaftIndexOwnerObservation {
@@ -3736,7 +3758,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             var cancellation = normalized.cancellation;
             const result = try self.lease.owner().raftIndexOwnerObservation(alloc, self.table_name, self.identity, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
             try context.ensureActive();
-            return .{ .identity = self.identity, .root_generation = self.lease.entry.generation, .observation = result };
+            return .{ .identity = self.identity, .root_generation = self.root_generation, .observation = result };
         }
 
         pub fn claims(self: *@This(), alloc: std.mem.Allocator, command: native_index_control.ClaimCommand, recover_committed: bool) !std.json.Parsed(?native_index_control.DeliveredClaims) {
@@ -3777,7 +3799,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
 
         pub fn rootGeneration(self: *const @This()) u64 {
-            return self.lease.entry.generation;
+            return self.root_generation;
         }
 
         pub fn cancelStep(self: *@This(), alloc: std.mem.Allocator, request: raft_index_control.CancellationRequest, prepare_work: bool) !std.json.Parsed(raft_index_control.CancellationPreparation) {
@@ -3811,8 +3833,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn acquireRaftIndexOwnerSession(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, identity: raft_index_control.Identity, context: request_operation.RequestContext) !RaftIndexOwnerSession {
         var lease = try self.acquireIndexOwner(group_id, table_name, identity, context);
         errdefer lease.deinit();
-        if (lease.entry.generation == 0) return error.PrivateIndexRootRecoveryRequired;
-        return .{ .lease = lease, .table_name = table_name, .identity = identity, .context = context };
+        return .{ .lease = lease, .root_generation = try indexRootEpoch(lease.entry.generation), .table_name = table_name, .identity = identity, .context = context };
     }
 
     /// Root provenance belongs to the exact leased owner that returned these
@@ -3824,7 +3845,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const normalized = try platformDeadlineContext(context);
         var cancellation = normalized.cancellation;
         const result = try lease.owner().raftIndexOwnerObservation(alloc, table_name, identity, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
-        return .{ .identity = identity, .root_generation = lease.entry.generation, .observation = result };
+        return .{ .identity = identity, .root_generation = try indexRootEpoch(lease.entry.generation), .observation = result };
     }
 
     pub const RootedRaftIndexOwnerPreparation = struct {
@@ -3843,7 +3864,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const normalized = try platformDeadlineContext(context);
         var cancellation = normalized.cancellation;
         const result = try lease.owner().raftIndexOwnerAdmissionPreparation(alloc, table_name, header, manifest, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
-        return .{ .root_generation = lease.entry.generation, .preparation = result };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .preparation = result };
     }
 
     /// Claim bytes and expected binding are not a remote capability. The
@@ -3923,7 +3944,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer result.deinit();
         try result.value.validateFor(request);
         if (result.value.physicalAudit().audit.root_incarnation != audit_root_incarnation) return error.InvalidPrivateIndexNativeReceipt;
-        return .{ .root_generation = lease.entry.generation, .outcome = result };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = result };
     }
 
     pub const RootedNativeIndexOwnerRelease = struct {
@@ -3963,7 +3984,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer result.deinit();
         try result.value.validate();
         if (!std.meta.eql(result.value.intent, intent)) return error.InvalidPrivateIndexNativeReceipt;
-        return .{ .root_generation = lease.entry.generation, .outcome = result };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = result };
     }
 
     pub const RootedNativeIndexOwnerCancellationCompletion = struct {
@@ -4013,7 +4034,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer result.deinit();
         try result.value.validate();
         if (!std.meta.eql(result.value.intent, intent)) return error.InvalidPrivateIndexNativeReceipt;
-        return .{ .root_generation = lease.entry.generation, .outcome = result };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = result };
     }
 
     /// The applying lease supplies the observed generation. No physical job,
@@ -4041,7 +4062,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &binding.id, &identity.id) or !std.mem.eql(u8, &binding.plan_digest, &identity.plan_digest) or
             !std.mem.eql(u8, &binding.owner_digest, &identity.owner_digest) or binding.ordinal != identity.ordinal or
             binding.fence.owner_group_id != identity.owner_group_id or !binding.fence.namespace.eql(identity.namespace)) return error.PrivateIndexOwnerJobChanged;
-        return .{ .root_generation = lease.entry.generation, .outcome = result };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = result };
     }
 
     /// Source bytes and root generation come from one pinned compiled owner.
@@ -4062,7 +4083,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var result = try parsed.value.decode(alloc, identity);
         errdefer result.deinit();
         try context.ensureActive();
-        return .{ .root_generation = lease.entry.generation, .outcome = result, .wire = parsed };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = result, .wire = parsed };
     }
 
     pub fn stepNativeIndexOwnerBuildAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: native_index_control.BuildRequest, audit_root_incarnation: ?u128, context: request_operation.RequestContext) !RootedNativeIndexOwnerBuild {
@@ -4090,7 +4111,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try result.value.validateFor(request);
         if (result.value == .audit and result.value.audit.audit.root_incarnation != audit_root_incarnation) return error.InvalidPrivateIndexNativeReceipt;
         if (result.value == .validated and result.value.validated.physical.audit.root_incarnation != audit_root_incarnation) return error.InvalidPrivateIndexNativeReceipt;
-        return .{ .root_generation = lease.entry.generation, .outcome = result };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = result };
     }
 
     pub fn applyNativeIndexOwnerClaimsAtRoot(
@@ -4122,7 +4143,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var parsed = try std.json.parseFromSlice(native_index_control.ClaimOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
         errdefer parsed.deinit();
         try parsed.value.validateFor(command);
-        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = parsed };
     }
 
     /// Uses the generation of the actual applying lease, not a later lookup.
@@ -4153,7 +4174,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer parsed.deinit();
         try parsed.value.validateFor(command);
         // Preserve committed/pending results even if ingress was canceled.
-        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = parsed };
     }
 
     pub fn applyNativeIndexOwnerClaims(
@@ -4238,7 +4259,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer parsed.deinit();
         if (parsed.value) |value| try value.validateRecovery(request);
         return .{
-            .root_generation = lease.entry.generation,
+            .root_generation = try indexRootEpoch(lease.entry.generation),
             .outcome = parsed,
         };
     }
@@ -4489,7 +4510,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var parsed = try std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
         errdefer parsed.deinit();
         if (!canceling) try parsed.value.validateFor(command);
-        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
+        return .{ .root_generation = try indexRootEpoch(lease.entry.generation), .outcome = parsed };
     }
 
     pub fn applyFkGenerationNative(

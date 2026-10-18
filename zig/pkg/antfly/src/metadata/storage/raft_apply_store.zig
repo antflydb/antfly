@@ -4781,7 +4781,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const runtimes = try a.dupe(metadata.RuntimeGroupStatusReport, report.runtime_statuses);
         groups[0].raft_applied_index = scope.completed_index;
         groups[0].raft_term = scope.leader_term;
-        runtimes[0].lsm_root_generation = scope.root_generation;
+        runtimes[0].lsm_root_generation = try @import("antfly_local_sources").storage_db_root_signing_identity.rootSelectionForAttestedGeneration(scope.root_generation);
         var observed = header;
         observed.group_statuses = groups;
         observed.runtime_statuses = runtimes;
@@ -5700,7 +5700,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const address = try RaftApplyStore.ReportAddress.active(a, &txn, group, current.store_id);
         const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &txn, group, address, signed.receipt.owner.group_id, true)).?;
         const runtimes = try a.dupe(@TypeOf(report.runtime_statuses[0]), report.runtime_statuses);
-        runtimes[0].lsm_root_generation = generation;
+        runtimes[0].lsm_root_generation = try @import("antfly_local_sources").storage_db_root_signing_identity.rootSelectionForAttestedGeneration(generation);
         var refreshed = current;
         refreshed.runtime_statuses = runtimes;
         refreshed.group_statuses = report.group_statuses;
@@ -6511,7 +6511,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             owners[0].receipt_authority = authority;
             plan.owners = &owners;
             var groups = [_]metadata.GroupStatusReport{.{ .group_id = owners[0].range.group_id, .raft_applied_index = 10, .raft_term = 2 }};
-            var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = owners[0].range.group_id, .table_id = plan.before.table_id, .store_id = 3, .node_id = 2, .lsm_root_generation = 6 }};
+            var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = owners[0].range.group_id, .table_id = plan.before.table_id, .store_id = 3, .node_id = 2, .lsm_root_generation = 5 }};
             runtimes[0].source_authority = .{
                 .kind = if (authority == .native) .native else .raft,
                 .namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{ .table_id = plan.before.table_id, .shard_id = 301, .range_id = 301 }),
@@ -6743,7 +6743,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                         switch (fault) {
                             .root_identity, .reader_role, .reader_unknown, .reader_semantic, .reader_encoding, .placement_store, .placement_state, .source_mode, .source_namespace, .source_unknown, .range_namespace => try std.testing.expect(view == null),
                             .reporter => try std.testing.expectEqual(changed.reporter_incarnation, view.?.reporter_incarnation),
-                            .root_generation => try std.testing.expectEqual(changed_runtime[0].lsm_root_generation, view.?.root_generation),
+                            .root_generation => try std.testing.expectEqual(try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(changed_runtime[0].lsm_root_generation), view.?.root_generation),
                             .placement_replica => try std.testing.expectEqual(changed_placement.record.replica_id, view.?.replica_id),
                             .observed_position => try std.testing.expectEqual(@as(u64, 0), view.?.reported_applied_index),
                             else => try std.testing.expect(view != null),
@@ -7128,13 +7128,13 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     _ = try store.updateListingStoreTxn(&txn, group, current.store_id, new_store);
                     var historical = ack;
                     historical.expected_revision = 3;
-                    historical.signed.proof.root_generation = root_status[0].lsm_root_generation;
+                    historical.signed.proof.root_generation = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(root_status[0].lsm_root_generation);
                     historical.signed.proof = try historical.signed.proof.sign(root, try historical.signed.receipt.digest());
                     const historical_bytes = try std.json.Stringify.valueAlloc(a, historical, .{});
                     defer a.free(historical_bytes);
                     try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, historical_bytes));
                     reserved.expected_revision = 3;
-                    reserved.signed.proof.root_generation = root_status[0].lsm_root_generation;
+                    reserved.signed.proof.root_generation = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(root_status[0].lsm_root_generation);
                     reserved.signed.proof = try reserved.signed.proof.sign(root, try reserved.signed.receipt.digest());
                     const latest_bytes = try std.json.Stringify.valueAlloc(a, reserved, .{});
                     defer a.free(latest_bytes);
@@ -7180,7 +7180,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     try std.testing.expectEqual(.acknowledged, read_only.value.disposition);
                     try std.testing.expect(read_only.value.raft_recovery != null and read_only.value.dispatch == null and read_only.value.inputs == null);
                     try std.testing.expectEqualDeep(ack.signed, read_only.value.raft_recovery.?.accepted);
-                    try std.testing.expectEqual(new_runtimes[0].lsm_root_generation, read_only.value.raft_recovery.?.signing.root_generation);
+                    try std.testing.expectEqual(try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(new_runtimes[0].lsm_root_generation), read_only.value.raft_recovery.?.signing.root_generation);
                     try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, read_only.value.raftExecutionIdentity(owner_request));
                     var next = owner_request;
                     next.operation = .reserve;
@@ -7195,7 +7195,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, executing.value.raftExecutionIdentity(next));
                 }
                 var refreshed = ack;
-                refreshed.signed.proof.root_generation = new_runtimes[0].lsm_root_generation;
+                refreshed.signed.proof.root_generation = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(new_runtimes[0].lsm_root_generation);
                 refreshed.signed.proof = try refreshed.signed.proof.sign(root, try refreshed.signed.receipt.digest());
                 {
                     const reply = try store.relationalIndexOwnerAckStatusJson(a, group, refreshed);
@@ -19228,8 +19228,9 @@ pub const RaftApplyStore = struct {
         const report = (try readStoreGroupReportTxn(a, txn, group_id, address, owner.group_id, true)) orelse return error.IndexOwnerReceiptChanged;
         if (report.runtime_statuses.len != 1) return error.IndexOwnerReceiptChanged;
         const runtime = report.runtime_statuses[0];
+        const root_epoch = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(runtime.lsm_root_generation) catch return error.IndexOwnerReceiptChanged;
         if (runtime.table_id != owner.namespace.table_id or runtime.store_id != current.store_id or runtime.node_id != current.node_id or
-            runtime.lsm_root_generation != proof.root_generation or runtime.lsm_root_generation == 0) return error.IndexOwnerReceiptChanged;
+            root_epoch != proof.root_generation) return error.IndexOwnerReceiptChanged;
         // Raft cuts require the owner observation to have caught up; a native
         // commit sequence is deliberately never compared to a Raft index.
         switch (cut) {
@@ -19647,11 +19648,12 @@ pub const RaftApplyStore = struct {
         const runtime = report.runtime_statuses[0];
         const status = report.group_statuses[0];
         if (runtime.group_id != owner.group_id or runtime.table_id != owner.namespace.table_id or
-            runtime.store_id != current.store_id or runtime.node_id != current.node_id or runtime.lsm_root_generation == 0 or
+            runtime.store_id != current.store_id or runtime.node_id != current.node_id or
             status.group_id != owner.group_id or status.raft_term == 0) return null;
         const source = runtime.source_authority orelse return null;
         if (source.kind != .raft or source.sequence != 0 or !std.mem.eql(u8, &source.namespace, &@import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(owner.namespace))) return null;
-        const view: index_publication.RaftSigningView = .{ .identity = identity, .reporter_incarnation = current.reporter_incarnation, .group_id = owner.group_id, .namespace = owner.namespace, .replica_id = placement.record.replica_id, .root_generation = runtime.lsm_root_generation, .reported_term = status.raft_term, .reported_applied_index = status.raft_applied_index };
+        const root_epoch = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(runtime.lsm_root_generation) catch return null;
+        const view: index_publication.RaftSigningView = .{ .identity = identity, .reporter_incarnation = current.reporter_incarnation, .group_id = owner.group_id, .namespace = owner.namespace, .replica_id = placement.record.replica_id, .root_generation = root_epoch, .reported_term = status.raft_term, .reported_applied_index = status.raft_applied_index };
         try view.validate(incarnation, owner);
         return view;
     }
@@ -20081,8 +20083,12 @@ pub const RaftApplyStore = struct {
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
         // Authority is selected by the metadata owner, never by a public index
         // option or a caller-supplied placement/report description.
-        if (try stagingGet(&txn, try standalone_native_owner.key(&buf, group_id)) == null) return error.UnsupportedNativeIndexOwner;
-        _ = (try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation)) orelse return error.CatalogPublicationProofPending;
+        const authority: index_progress.Authority = if (try stagingGet(&txn, standalone_catalog_key) != null) blk: {
+            // A missing standalone binding is not evidence of Raft ownership.
+            if (try stagingGet(&txn, try standalone_native_owner.key(&buf, group_id)) == null) return error.UnsupportedNativeIndexOwner;
+            _ = (try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation)) orelse return error.CatalogPublicationProofPending;
+            break :blk .native;
+        } else .raft;
         const ids = try self.indexedTableRangeIdsBoundedTxn(a, &txn, group_id, before.table_id, index_progress.max_owners);
         if (ids.len == 0) return error.GenerationPublicationChanged;
         const ranges = try a.alloc(metadata.RangeRecord, ids.len);
@@ -20097,7 +20103,7 @@ pub const RaftApplyStore = struct {
             _ = try index_publication.verifyJob(self.alloc, &txn, group_id, before.table_id);
             expected_head = try head.encode();
         }
-        const cut: index_publication.PrepareCut = .{ .metadata_incarnation = incarnation, .namespace_id = namespace_id, .table_guard = request.guard, .before = before, .ranges = ranges, .authority = .native, .expected_head = expected_head };
+        const cut: index_publication.PrepareCut = .{ .metadata_incarnation = incarnation, .namespace_id = namespace_id, .table_guard = request.guard, .before = before, .ranges = ranges, .authority = authority, .expected_head = expected_head };
         try cut.requireRequest(a, request);
         return cut.encode(alloc);
     }

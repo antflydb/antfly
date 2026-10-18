@@ -13,9 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Bounded native-owner scheduling. Only a host holding the actual standalone
-//! writer lease may supply Authority. Raft execution is a separate authority;
-//! native receipts never substitute for committed data-Raft effects.
+//! Bounded owner scheduling. Hosts supply their actual metadata writer/leader
+//! lease; receiving owners independently authorize every physical operation.
+//! Native receipts never substitute for committed data-Raft effects.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const work = @import("relational_index_work.zig");
@@ -50,7 +50,29 @@ fn jobQuantumBudget(owner_count: u16) usize {
 }
 const completed_owner_quanta = 2 + std.meta.tags(producer.Phase).len;
 
-pub const Authority = struct { metadata_incarnation: [32]u8, binding_digest: [32]u8, writer_generation: u64 };
+pub const Authority = struct {
+    kind: enum { native_writer, metadata_raft } = .native_writer,
+    metadata_incarnation: [32]u8,
+    binding_digest: [32]u8,
+    writer_generation: u64,
+
+    /// Scheduling identity, never a physical execution capability. Renewal
+    /// leaves useful work resident; loss/reacquisition or a term change does not.
+    pub fn metadataLease(incarnation: [32]u8, group: u64, node: u64, term: ?u64, lease: @import("reconcile_lease.zig").Stats, now_ms: u64) ?Authority {
+        const current_term = term orelse return null;
+        if (current_term == 0 or group == 0 or node == 0 or std.mem.allEqual(u8, &incarnation, 0) or
+            !lease.held_by_local or lease.owner_node_id != node or lease.acquisition_count == 0 or
+            (lease.enabled and lease.expires_at_ms <= now_ms)) return null;
+        var bytes: [32]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], group, .little);
+        std.mem.writeInt(u64, bytes[8..16], node, .little);
+        std.mem.writeInt(u64, bytes[16..24], current_term, .little);
+        std.mem.writeInt(u64, bytes[24..32], lease.acquisition_count, .little);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+        return .{ .kind = .metadata_raft, .metadata_incarnation = incarnation, .binding_digest = digest, .writer_generation = current_term };
+    }
+};
 const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, cancel, resolve_cancel, build, deliver, inventory, install, release, cleanup, cleanup_complete, cancel_release };
 const Owner = struct {
     ordinal: u16,
@@ -244,7 +266,6 @@ const Job = struct {
                     self.cohort.?.deinit();
                     self.cohort = null;
                 }
-                for (self.cohort.?.targets) |target| if (target.owner.authority != .native) return error.UnsupportedNativeIndexOwner;
                 self.table_name = try alloc.dupe(u8, capture.table_name.?);
                 capture.deinit();
                 self.capture = null;
@@ -439,6 +460,15 @@ const Job = struct {
             .deliver => {
                 const prior = owner.stream.?.phase;
                 const result = owner.stream.?.step(transport, host) catch |err| switch (@as(anyerror, err)) {
+                    error.UniqueConstraintViolation => {
+                        // A rejected claim batch committed nothing. Preserve
+                        // the SQL failure reason while the normal coordinated
+                        // cancellation retires all prior accepted work.
+                        owner.stream.?.deinit();
+                        owner.stream = null;
+                        try owner.requestCancellation(.duplicate_key);
+                        return;
+                    },
                     error.IndexOwnerReceiptChanged, error.PrivateIndexRootRecoveryRequired => {
                         owner.stream.?.deinit();
                         owner.stream = null;
@@ -780,6 +810,35 @@ pub const Coordinator = struct {
         return false;
     }
 };
+
+test "relational index publication root epochs distinguish current selection from unbound and replacement" {
+    const root = local.storage_db_root_signing_identity;
+    try std.testing.expectEqual(@as(u64, 1), try root.attestedRootGeneration(0));
+    try std.testing.expectEqual(@as(u64, 2), try root.attestedRootGeneration(1));
+    try std.testing.expectEqual(@as(u64, 0), try root.rootSelectionForAttestedGeneration(1));
+    try std.testing.expectEqual(@as(u64, 1), try root.rootSelectionForAttestedGeneration(2));
+    try std.testing.expectError(error.InvalidRootGeneration, root.attestedRootGeneration(std.math.maxInt(u64)));
+    try std.testing.expectError(error.InvalidRootGeneration, root.rootSelectionForAttestedGeneration(0));
+}
+
+test "relational index publication metadata lease fences loss without canceling renewal" {
+    var lease: @import("reconcile_lease.zig").Stats = .{ .enabled = true, .held_by_local = true, .owner_node_id = 7, .expires_at_ms = 200, .acquisition_count = 1 };
+    const initial = Authority.metadataLease(@splat(1), 3, 7, 11, lease, 100).?;
+    lease.expires_at_ms = 300;
+    try std.testing.expectEqualDeep(initial, Authority.metadataLease(@splat(1), 3, 7, 11, lease, 200).?);
+    try std.testing.expect(Authority.metadataLease(@splat(1), 3, 7, 11, lease, 300) == null);
+    try std.testing.expect(Authority.metadataLease(@splat(1), 3, 7, null, lease, 200) == null);
+    try std.testing.expect(Authority.metadataLease(@splat(1), 3, 8, 11, lease, 200) == null);
+    try std.testing.expect(!std.meta.eql(initial, Authority.metadataLease(@splat(1), 3, 7, 12, lease, 200).?));
+    lease.acquisition_count += 1;
+    try std.testing.expect(!std.meta.eql(initial, Authority.metadataLease(@splat(1), 3, 7, 11, lease, 200).?));
+    lease.held_by_local = false;
+    try std.testing.expect(Authority.metadataLease(@splat(1), 3, 7, 11, lease, 200) == null);
+    lease.enabled = false;
+    lease.held_by_local = true;
+    try std.testing.expect(Authority.metadataLease(@splat(1), 3, 7, null, lease, 400) == null);
+    try std.testing.expect(Authority.metadataLease(@splat(1), 3, 7, 11, lease, 400) != null);
+}
 
 test "relational index publication scheduler reserves a full completed-owner sweep before useful work" {
     for (1..progress.max_owners + 1) |count| {

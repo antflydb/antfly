@@ -6158,6 +6158,8 @@ pub const AntflyApiHandler = struct {
                 .diagnostic = receipt.diagnostic,
                 .restore_job_id = receipt.restore_job_id,
                 .idempotency_key = receipt.idempotency_key,
+                .fk_generation_publication_id = receipt.fk_generation_publication_id,
+                .index_publication_token = receipt.index_publication_token,
             } else null,
             .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {

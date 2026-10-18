@@ -2381,6 +2381,14 @@ fn batchMutatesDocuments(req: antfly.db.types.BatchRequest) bool {
 }
 
 fn needsDenseRepairWritePreflight(req: antfly.db.types.BatchRequest) bool {
+    // Private index effects already require independent metadata permission.
+    // Their own fence deliberately closes ordinary writer admission, including
+    // between logical publication and physical install/release. Only a fully
+    // validated isolated control can omit this unrelated writer preflight.
+    if (req.relational_index_owner_control != null) {
+        @import("antfly_local_sources").storage_db_relational_index_raft_contract.validateBatchRequest(req) catch return true;
+        return false;
+    }
     // Exact topology controls retire fences and advance ownership. They are
     // not dense-repair writes. In particular, a child-schema install or
     // parent ACK cannot acquire an ordinary writer on its own fenced owner.
@@ -6743,8 +6751,8 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_parent = .{ .ptr = self, .execute_fn = fkGenerationParentControl };
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
-        api_server_cfg.relational_index_claims = .{ .ptr = self, .execute_fn = nativeIndexClaimsControl };
-        api_server_cfg.relational_index_control = .{ .ptr = self, .execute_fn = nativeIndexOwnerControl };
+        api_server_cfg.relational_index_claims = self.relationalIndexClaimPort();
+        api_server_cfg.relational_index_control = self.relationalIndexControlPort();
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -11637,6 +11645,24 @@ pub const DataServer = struct {
         return receipt;
     }
 
+    pub fn relationalIndexClaimPort(self: *DataServer) antfly.public_api.relational_index_owner_execution.ClaimPort {
+        return .{ .ptr = self, .execute_fn = nativeIndexClaimsControl };
+    }
+
+    /// Preparation owns its transport bytes. Drain the resident lease before
+    /// waiting on Raft: the committed descriptor may need an owner transition.
+    /// Recovery must reacquire and verify the original physical root epoch.
+    fn proposeRaftIndexOwnerBatch(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, request: antfly.db.types.BatchRequest, route: DataRaftBatchRoute) !void {
+        std.debug.assert(request.relational_index_owner_control != null);
+        session.releaseForApply();
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, request, route);
+        try session.reacquireAfterApply();
+    }
+
+    pub fn relationalIndexControlPort(self: *DataServer) antfly.public_api.relational_index_owner_execution.ControlPort {
+        return .{ .ptr = self, .execute_fn = nativeIndexOwnerControl };
+    }
+
     fn nativeIndexClaimsControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.ClaimRequest, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.ClaimResult {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
@@ -11713,7 +11739,7 @@ pub const DataServer = struct {
                     if (now >= deadline) return error.DeadlineExceeded;
                     break :remaining deadline - now;
                 } else 30 * std.time.ns_per_s;
-                try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .consume = command } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = &permission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context, .accepted_source = accepted } });
+                try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, &session, .{ .relational_index_owner_control = .{ .consume = command } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = &permission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context, .accepted_source = accepted } });
                 var recovered = try session.sourceProjected(alloc, true, true);
                 defer recovered.deinit();
                 const committed = recovered.value.consumed orelse return error.InvalidPrivateIndexClaimReceipt;
@@ -11758,7 +11784,7 @@ pub const DataServer = struct {
                 if (now >= deadline) return error.DeadlineExceeded;
                 break :remaining deadline - now;
             } else 30 * std.time.ns_per_s;
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .claims = command } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = &permission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context } });
+            try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, &session, .{ .relational_index_owner_control = .{ .claims = command } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = &permission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context } });
             var recovered = try session.claims(alloc, command, true);
             defer recovered.deinit();
             break :committed recovered.value orelse return error.InvalidPrivateIndexClaimReceipt;
@@ -11859,7 +11885,7 @@ pub const DataServer = struct {
             var prepared = try session.build(alloc, build, true);
             defer prepared.deinit();
             const progress = if (prepared.value == .page) committed: {
-                try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .build = prepared.value.page } }, route);
+                try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, &session, .{ .relational_index_owner_control = .{ .build = prepared.value.page } }, route);
                 var recovered = try session.build(alloc, build, false);
                 defer recovered.deinit();
                 break :committed recovered.value.progress;
@@ -11872,7 +11898,7 @@ pub const DataServer = struct {
         if (already == null) {
             if (rooted.observation.binding) |binding| {
                 const command = try permission.value.raftControl(lookup, binding);
-                try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .control = command } }, route);
+                try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, &session, .{ .relational_index_owner_control = .{ .control = command } }, route);
             } else {
                 if (request.operation != .fence) return error.GenerationAdmissionPending;
                 // Fetch immutable schema-sized inputs only for a genuinely
@@ -11894,7 +11920,7 @@ pub const DataServer = struct {
                 _ = std.base64.standard.Encoder.encode(b64, manifest.bytes);
                 const command: contract.Control = .{ .effect = .admitted, .binding = prepared.binding, .inputs_b64 = b64 };
                 route.index_owner_permission = .{ .decision = &admission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context };
-                try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .control = command } }, route);
+                try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, &session, .{ .relational_index_owner_control = .{ .control = command } }, route);
             }
             rooted = try session.recoverCommitted(alloc);
         }
@@ -12007,7 +12033,7 @@ pub const DataServer = struct {
                         if (now >= deadline) return error.DeadlineExceeded;
                         break :remaining deadline - now;
                     } else 30 * std.time.ns_per_s;
-                    try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .release_gc = gc } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = permission, .request = lookup, .root_generation = session.rootGeneration(), .context = context } });
+                    try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, session, .{ .relational_index_owner_control = .{ .release_gc = gc } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = permission, .request = lookup, .root_generation = session.rootGeneration(), .context = context } });
                     var recovered = try session.lifecycle(alloc, .{ .release = intent }, false, null);
                     defer recovered.deinit();
                     progress_ = recovered.value.progress.release;
@@ -12065,7 +12091,7 @@ pub const DataServer = struct {
             else => return error.InvalidRelationalIndexValidation,
         };
         if (command) |value| {
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = value }, original_route);
+            try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, session, .{ .relational_index_owner_control = value }, original_route);
             var recovered = try session.build(alloc, validation, false);
             defer recovered.deinit();
             const response: execution.RaftValidationControlResponse = .{ .root_generation = rooted.root_generation, .state = .{ .progress = recovered.value.validation } };
@@ -12089,7 +12115,7 @@ pub const DataServer = struct {
             const seal = try audited.outcome.logicalCommand();
             var route = original_route;
             route.index_owner_permission.?.audited_validation = seal;
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .validation_seal = seal } }, route);
+            try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, session, .{ .relational_index_owner_control = .{ .validation_seal = seal } }, route);
             // Retain the exact audited body, and recover only its committed
             // seal. No uncancellable filesystem lock/scan follows commit.
             var recovered = try session.build(alloc, validation, false);
@@ -12147,7 +12173,7 @@ pub const DataServer = struct {
         }
         var progress = prepared.value.progress;
         if (command) |value| {
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = value }, route);
+            try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, session, .{ .relational_index_owner_control = value }, route);
             var recovered = try session.cancelStep(alloc, input, false);
             defer recovered.deinit();
             progress = recovered.value.progress;
@@ -12207,7 +12233,7 @@ pub const DataServer = struct {
         if (command) |value| {
             var route = original_route;
             if (value == .install) route.index_owner_permission.?.audited_installation = value.install;
-            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = value }, route);
+            try self.proposeRaftIndexOwnerBatch(alloc, group_id, table_name, session, .{ .relational_index_owner_control = value }, route);
             // Only recover bounded retained records after commit. Keep the
             // pre-proposal physical audit; never start an uncancellable scan.
             var recovered = try session.lifecycle(alloc, input, false, null);
@@ -13767,7 +13793,8 @@ pub const DataServer = struct {
                         else
                             try owner_source.loadDescriptor(alloc, group_id, table_name);
                         if (route.index_owner_permission) |permission| {
-                            if (storage_owner_descriptor.?.generation != permission.root_generation) return error.PrivateIndexRootRecoveryRequired;
+                            const epoch = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(storage_owner_descriptor.?.generation) catch return error.PrivateIndexRootRecoveryRequired;
+                            if (epoch != permission.root_generation) return error.PrivateIndexRootRecoveryRequired;
                         }
                     }
                 }
@@ -34789,10 +34816,10 @@ fn consumerTests() type {
             const control: antfly.public_api.relational_index_owner_execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
             const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
             var signal = std.atomic.Value(bool).init(true);
-            try std.testing.expectError(error.Canceled, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{ .cancellation = .fromAtomic(&signal) }));
+            try std.testing.expectError(error.Canceled, server.relationalIndexControlPort().execute(std.testing.allocator, "docs", 7, control, .{ .cancellation = .fromAtomic(&signal) }));
             try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{ .deadline_ns = 0 }));
             try std.testing.expectError(error.GenerationPublicationChanged, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 8, control, .{}));
-            try std.testing.expectError(error.Canceled, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
+            try std.testing.expectError(error.Canceled, server.relationalIndexClaimPort().execute(std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
             try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .deadline_ns = 0 }));
             server.api_server_cfg = .{ .deployment_mode = .standalone };
             server.data_raft = @ptrFromInt(4096);
@@ -47925,6 +47952,37 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(usize, 2), fake.public_calls);
                 try std.testing.expectEqual(@as(usize, 2), fake.private_calls);
             }
+        }
+
+        test "pure index control bypasses only ordinary dense repair writer preflight" {
+            const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+            const request: antfly.db.types.BatchRequest = .{ .relational_index_owner_control = .{ .cancel_intent = .{
+                .id = @splat(1),
+                .plan_digest = @splat(2),
+                .owner_digest = @splat(3),
+                .ordinal = 0,
+                .candidate_digest = @splat(4),
+                .reservation_digest = @splat(5),
+                .fence = .{ .role = .index_build, .transition_id = 1, .attempt = 1, .owner_group_id = 7, .peer_group_id = 7, .namespace = .{ .table_id = 3, .shard_id = 7, .range_id = 7 }, .admission_epoch = 1, .catalog_digest = @splat(6) },
+            } } };
+            try contract.validateBatchRequest(request);
+            try std.testing.expect(!needsDenseRepairWritePreflight(request));
+            var mixed = request;
+            mixed.writes = &.{.{ .key = "row", .value = "{}" }};
+            try std.testing.expect(needsDenseRepairWritePreflight(mixed));
+            try std.testing.expectError(error.InvalidBatchRequest, contract.validateBatchRequest(mixed));
+            mixed = request;
+            mixed.row_policy_principal_proof = "untrusted";
+            try std.testing.expect(needsDenseRepairWritePreflight(mixed));
+            mixed = request;
+            mixed.schema_version = 2;
+            try std.testing.expect(needsDenseRepairWritePreflight(mixed));
+            mixed = request;
+            mixed.relational_topology = .{ .action = .begin, .fence = request.relational_index_owner_control.?.cancel_intent.fence };
+            try std.testing.expect(needsDenseRepairWritePreflight(mixed));
+            mixed = request;
+            mixed.relational_index_owner_control.?.cancel_intent.id = @splat(0);
+            try std.testing.expect(needsDenseRepairWritePreflight(mixed));
         }
 
         test "pure topology control bypasses only ordinary dense repair writer preflight" {

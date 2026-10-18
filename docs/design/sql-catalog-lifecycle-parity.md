@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `0f85c7907f` (verified 2026-10-17). Earlier implementation and
+at `0f85c7907f` (verified 2026-10-18). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -9,12 +9,12 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-548 implemented / 131 rejected / 125 superseded / 782 unresolved. Counts below
+559 implemented / 131 rejected / 125 superseded / 771 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
-| 1 | DDL, catalog and sessions | 291 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
+| 1 | DDL, catalog and sessions | 280 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 126 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 62 | Document-specific schema/index profiles, complete postimages and integrity admission |
@@ -22,13 +22,122 @@ are unresolved family pools, not promises that one implementation closes them.
 
 ## Replicated index execution: current boundary
 
-The mounted distributed UNIQUE-index gate still rejects CREATE with `501`:
-replicated publication is not fully activated. Admission stays guarded and no
-original cases receive credit for storage-only work. Next delivery must cross
-the public owner/coordinator boundary, not merely add more protocol contracts.
-The mounted Debug lifecycle campaign was rerun with real local listeners after
-the dispatcher integration: the unchanged first UNIQUE/NND statement still
-returns `501` / `0A000`. The public producer remains closed; this is not a pass.
+The mounted distributed UNIQUE-index positive-path gate now passes in Debug:
+originals `sql-0692`, `sql-0706` and `sql-0705` execute unchanged, await their exact
+token-bound public publication, enforce duplicate/NULL semantics, verify complete
+postimages and recover the same owner after a cold restart. The gate has no skips
+or leaks. The failed-build campaign also passes for those same originals:
+duplicate detection reaches token-bound terminal cancellation with no replication
+debt, preserves the old definition and complete row postimage, and permits an
+explicit repair and fresh resubmission followed by cold restart. Exactly these
+three original dispositions are now implemented. Additional expression/DROP
+qualification follows below; this is not blanket CREATE INDEX qualification.
+
+Coordinator integration initially reproduced the historical `501` / `0A000`
+guard, then exposed that HTTP admission and constraint readiness do not imply
+index publication. The HTTP DDL adapter now retains the generated index recovery
+token and FK publication ID, and the campaign waits on the exact publication.
+
+The mounted boundary trace now isolates a separate integration failure:
+the compiled owner and local status cache contain durable source authority,
+but control snapshots report decoder readiness as zero. Store reporting then
+correctly strips the V19 field, preventing root permission from being granted.
+`MetadataHttpService.metadataStatus()` now applies the same negotiated protocol
+diagnostics as `status()`, so administrative/control snapshots do not erase
+readiness. The mounted campaign asserts that the control snapshot carries the
+actual negotiated profile before executing the original SQL declarations.
+The mounted Debug rerun verifies this boundary: negotiated/activated V19 and
+the real Raft source identity now reach metadata, and publication passes fencing.
+The stripping barrier remains intact. The next run exposed a native-only target
+reply branch in the delivery producer. It now accepts committed `raft_applied`
+outcomes without treating Raft cuts as native sequences; the existing signed
+delivery and exact partition checks still run. The mounted rerun passes building
+and validation; at that intermediate checkpoint it still timed out at installation.
+The installation repairs below resolve that observed timeout.
+
+The installation failure `IntegrityTopologyBusy` is repaired by preserving the
+durable owner catalog across index-job reopen, using the same mechanism as schema
+validation. Only the exact predecessor schema/index snapshot remains readable;
+the successor stays deferred until authorized install/release. Cold startup still
+runs the existing recovery validation. The storage-page Debug gate passes 26
+tests, including reopening with a successor descriptor without installing it.
+Index preparation leases are released before waiting for ordered apply, then
+reacquired only at the original physical-root epoch. Three compiled-owner Debug
+tests pass, including retirement/reacquisition and rejecting epoch substitution.
+
+The last public installation rejection was ordinary dense-write preflight trying
+to acquire the job's deliberately fenced writer. Pure index controls now omit
+that unrelated preflight only after the existing reflective batch validator
+accepts their entire isolated shape; metadata permission remains independently
+required. Four focused data-runtime Debug tests pass, including mixed-command
+and invalid-command rejection. The public positive-path gate then passes all
+three profiles. The PostgreSQL 18 oracle independently passes all 17 catalog
+lifecycle tests with psycopg 3.3.6. The retryable
+`IndexOwnerReceiptChanged` error also now has its own append-only compiled status
+identity instead of collapsing to `StorageKernelFailure`; all seven focused
+Debug identity tests pass.
+
+The failed-build campaign exposed a second nonterminal loop: duplicate claims
+escaped the delivery worker instead of initiating cancellation. Duplicate-key
+delivery failure now closes its stream and enters the existing coordinated
+cleanup path without acknowledging uncommitted acceptance or consumption. The
+metadata Debug gate passes 75 tests plus its decoder-floor test, including this
+failure path. Both mounted public campaigns pass together (89/89 build steps,
+zero skips, failures or leaks). Bounded HTTP DDL may legitimately return 202
+with its recovery token; the campaign then requires exact terminal duplicate-key
+failure and completed cancellation before checking atomicity. The SQL
+until-deadline admission contract retains its terminal 23505 behavior.
+
+The next vertical Debug campaign qualifies four more unchanged originals:
+`sql-0017`, `sql-0722`, `sql-0723` and `sql-0724`. Expression-index creation waits
+for its exact publication token before inspecting physical contents. Named
+partial-index probes carry the same typed `status = 'active'` membership
+condition as SQL; omitting it remains an error. That rejection now retains its
+exact runtime callback identity, with all 33 runtime-error Debug tests passing.
+The DROP campaign requires its receipt's target schema version and completed
+retirement, not the predecessor's constraint readiness. It verifies unchanged
+complete rows, removed declarations and index-owned UNIQUE enforcement, name
+reuse, cold recovery of the rebuilt index and a second DROP after recovery.
+Documented ownership-change status observations can be retried within the fixed
+deadline; mutation outcomes cannot. Both public campaigns pass together with
+89/89 build steps and zero skips, failures or leaks. The PostgreSQL 18 catalog
+oracle passes 18 tests and the expression-index oracle passes four. Concurrent
+DROP (`sql-0725`), dependency/multi-owner DROP and distributed fault coverage
+remain unqualified and are not credited by this checkpoint.
+
+The next four unchanged originals (`sql-0695`, `sql-0704`, `sql-0710`,
+`sql-0711`) also pass the mounted Debug owner/restart campaign. Coverage includes
+partial membership, exact key and covering-column declarations, negative BIGINT
+predicate literals, NULL predicate values and a NULL index key whose non-key
+amount predicate is true. Complete SQL postimages and physical equality spans
+over pending/done/NULL keys agree after updates, insertion, deletion and restart.
+Conditional re-execution preserves schema version, index generation and
+comparison identity both before and after restart. The native column and
+expression campaigns pass together (89/89 steps, no skips/failures/leaks), and
+the PostgreSQL expression/column-index oracle passes five tests. Included-column
+verification is not an index-only performance benchmark.
+
+Two independently observed limits are not hidden by this qualification:
+implicit-column `INSERT INTO table VALUES (...)` is not accepted, so these index
+fixtures explicitly name their setup columns; none of their original DDL is
+rewritten. Coordinated proof-carrying named-index reads currently admit exact
+equality spans, not arbitrary/unbounded index ranges. The campaign checks every
+fixture status key and expected absence using that actual contract. General
+index-range/phantom protection remains separate work. The larger next read
+cohort is persisted document-view mapping/expansion, whose catalog, dependency
+and owner/RLS requirements are detailed below; the mega branch's index-JSON
+mapping side channel is not a substitute for that integration.
+
+Additional integration repairs distinguish the physical current-root selector
+(which may be zero) from its nonzero proof epoch through a checked reversible
+`selector + 1` mapping. No selector is clamped or confused with an explicit root.
+The disposable cluster fixture explicitly enrolls its administrator-owned root
+using the existing signed enrollment and metadata Raft path; production store
+registration still does not authorize a root. The combined stats/source-cut
+observation also forwards through the compiled storage boundary. Its isolated
+Debug regression passes for native and Raft owners before and after reopen.
+The broader owner gate is not green: its existing schema-handoff prerequisite
+fails with `InvalidArgument`, and attribution remains unverified.
 
 The existing bounded physical builder now supports trusted committed Raft apply
 using the same page, progress CAS and claim-source queue as standalone execution.
@@ -208,14 +317,25 @@ separately authorized fence release. Metadata regressions cover both restart
 boundaries, cold reopen, incomplete retirement, substituted physical context and
 corrupt predecessor commitments in live ACK and snapshot verification.
 
-Public activation still needs coordinator integration and distributed fault
-qualification: the bounded coordinator is currently mounted only by
-`LocalStandaloneMetadata.IndexWorkHost`, not the distributed metadata runtime.
-The next integration must use the existing metadata reconcile/leader lease and
-shared runtime maintenance lane, plus the routed owner ports, without placing
-network waits on the metadata control loop. The worker's Raft cohort guard and
-public preparation guard remain; no original SQL case is closed by these
-component changes.
+Public activation initially needed qualification of coordinator integration and
+distributed faults. `MetadataServer` now wires the existing bounded coordinator
+to a separate shared-runtime maintenance task, not the metadata control loop or
+the restore supervisor. Scheduling captures the actual Raft leadership term and
+unexpired reconcile lease; renewal retains resident work, while term changes,
+loss and reacquisition invalidate it. Discovery uses a linearizable metadata
+read, and each owner RPC resolves current data-bearing placement through the
+existing authenticated HTTP client. Shutdown cancels and drains the task before
+destroying coordinator state. The current focused Debug gates pass 75 metadata,
+four data-runtime and one decoder-floor tests, including the scheduling-lease
+and duplicate-claim cancellation regressions. Preparation now selects Raft
+authority only outside the durable standalone deployment marker; a missing
+standalone binding still fails closed. The worker no longer rejects Raft cohorts
+before dispatch. Mounted public CREATE, enforcement, duplicate-build atomicity,
+repair and cold restart now qualify the three exact originals listed above;
+component changes alone are not case evidence. Ordinary DROP and the three
+UNIQUE expression-index originals are additionally qualified above. Next:
+concurrent/dependency DROP and distributed fault
+qualification, crediting only exact original contracts that pass their gates.
 Cancellation intent now commits at a real Raft position, including an owner's
 first entry or an owner that has not visited the job. Ordinary work stays closed;
 explicit cancellation controls drain and burn the exact generation. Cleanup

@@ -2210,9 +2210,8 @@ pub const PrepareCut = struct {
             !std.mem.eql(u8, actual.logical_table, expected.logical_table) or actual.constraint_name_admission != null or
             self.before.table_id != expected.owner.table_id or self.before.name.len == 0 or
             !std.mem.eql(u8, &digest(self.before.schema_json), &expected.owner.schema_digest)) return error.CatalogGenerationChanged;
-        // Hosted/Raft execution is not mounted yet. Never admit its jobs as a
-        // native alias merely because a peer can decode the same plan format.
-        if (self.authority != .native) return error.UnsupportedNativeIndexOwner;
+        // Authority comes from the metadata snapshot. The plan retains it for
+        // every owner; Raft observations must never become native aliases.
         var relation_incarnation: [16]u8 = undefined;
         _ = std.fmt.hexToBytes(&relation_incarnation, &self.metadata_incarnation) catch return error.InvalidMetadataIncarnation;
         if (!std.mem.eql(u8, &relation_incarnation, &actual.incarnation)) return error.CatalogGenerationChanged;

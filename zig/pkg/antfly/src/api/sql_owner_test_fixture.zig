@@ -29,6 +29,36 @@ const test_helpers = @import("../public_test_helpers.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
+/// The fixture is the cluster administrator for this disposable deployment.
+/// Registration only advertises a key; it must not silently approve a root.
+/// Use the real signed enrollment and Raft apply path before campaigns need it.
+fn enrollOwnedTestRoot(ctx: *Context, root_dir: []const u8) !void {
+    const local = @import("antfly_local_sources");
+    const enrollment = @import("../metadata/store_root_enrollment.zig");
+    const root = try local.storage_db_root_signing_identity.load(ctx.alloc, ctx.io, root_dir);
+    const registration = ctx.data.store_registration orelse return error.StoreRegistrationUnavailable;
+    const identity: enrollment.Identity = .{
+        .metadata_incarnation = try ctx.metadata.server.svc.metadataIncarnation() orelse return error.MetadataIncarnationUnavailable,
+        .node_id = registration.node_id,
+        .store_id = registration.store_id,
+        .root_incarnation = root.root_incarnation,
+        .public_key = root.public_key,
+    };
+    const source = http_server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const context: local.api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s };
+    const response = source.systemCatalog(ctx.alloc, context, .{ .store_root_enroll = try enrollment.Request.sign(identity, root.seed) }) catch |err| switch (err) {
+        error.MetadataMutationOutcomeUnknown => null,
+        else => return err,
+    };
+    if (response) |bytes| ctx.alloc.free(bytes);
+    // Unknown admission is observed, not replayed or assumed successful.
+    const observed = try source.systemCatalog(ctx.alloc, context, .{ .store_root_enrollment_status = identity });
+    defer ctx.alloc.free(observed);
+    var confirmed = try std.json.parseFromSlice(enrollment.Identity, ctx.alloc, observed, .{});
+    defer confirmed.deinit();
+    try std.testing.expectEqualDeep(identity, confirmed.value);
+}
+
 /// Wait on the same read-only ownership proof ALTER consumes, never retry an
 /// admitted mutation or manufacture a publication receipt in the fixture.
 pub fn waitRelationPublication(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, name: []const u8) !void {
@@ -379,6 +409,7 @@ pub fn run(comptime Campaign: type) !void {
         .progress = .{ &meta_raft, &meta_control, &data_raft, &data_control },
     };
     var campaign: Campaign = .{};
+    try enrollOwnedTestRoot(&context, data_root);
     try campaign.beforeRestart(&context);
     try context.checkDrivers();
     // Recover the same durable owner storage while metadata keeps serving.

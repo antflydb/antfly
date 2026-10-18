@@ -23,7 +23,7 @@ const lifecycle = @import("sql_index_lifecycle_integration_test.zig");
 const server = @import("http_server.zig");
 const wire = @import("antfly_metadata_openapi").types;
 
-const Profile = struct { id: []const u8, namespace: []const u8, unique: bool = false, partial: bool = false, covering: bool = false, mutable: bool = false };
+const Profile = struct { id: []const u8, namespace: []const u8, unique: bool = false, partial: bool = false, covering: bool = false, mutable: bool = false, column_key: bool = false, include_amount: bool = false };
 const profiles = [_]Profile{
     .{ .id = "sql-0017", .namespace = "expr_replace_unique", .unique = true },
     .{ .id = "sql-0712", .namespace = "expr_concat", .mutable = true },
@@ -46,6 +46,7 @@ fn command(ctx: *fixture.Context, profile: Profile, sql: []const u8, ddl: bool) 
         std.debug.print("expression index command case={s} status={d} sql={s} body={s}\n", .{ profile.id, response.status, sql, response.body });
         return error.ExpressionIndexCommandFailed;
     }
+    if (ddl and std.mem.startsWith(u8, sql, "CREATE UNIQUE INDEX")) try lifecycle.awaitIndexPublication(ctx, profile.namespace, sql, response);
 }
 fn rejection(ctx: *fixture.Context, profile: Profile, sql: []const u8) !void {
     return failure(ctx, profile, sql, "23505", .write_admission, 400);
@@ -141,7 +142,16 @@ fn indexedRows(ctx: *fixture.Context, profile: Profile, name: []const u8, expect
                     .include_range_proofs = true,
                     .execution_deadline_ns = deadline,
                     .limit = 128,
-                    .relational_query = .{ .index = name, .schema_version = table.owner.schema_version, .fields = &.{"id"}, .lower = .{ .values = tuple }, .upper = .{ .values = tuple } },
+                    .relational_query = .{
+                        .index = name,
+                        .schema_version = table.owner.schema_version,
+                        .fields = &.{"id"},
+                        .lower = .{ .values = tuple },
+                        .upper = .{ .values = tuple },
+                        // Exact named reads need the same typed membership
+                        // predicate as SQL, not just equal key bounds.
+                        .conditions = if (profile.partial) &.{.{ .column = "status", .op = .eq, .value = .{ .string = "active" } }} else &.{},
+                    },
                 }, .read_index) catch |err| switch (err) {
                     // No read view or row has escaped admission. Reopen the whole
                     // cut, just as the mounted SQL read client does; never retry
@@ -223,9 +233,15 @@ fn ready(ctx: *fixture.Context, profile: Profile, name: []const u8, expected_id:
         var found = false;
         for (definitions) |definition| if (std.mem.eql(u8, name, definition.object.get("name").?.string)) {
             const keys = definition.object.get("keys").?.array.items;
-            try std.testing.expectEqual(@as(usize, if (profile.partial) 2 else 1), keys.len);
-            try std.testing.expect(keys[keys.len - 1].object.get("expression") != null);
-            try std.testing.expectEqual(@as(usize, @intFromBool(profile.covering)), definition.object.get("include_columns").?.array.items.len);
+            try std.testing.expectEqual(@as(usize, if (profile.partial and !profile.column_key) 2 else 1), keys.len);
+            try std.testing.expectEqual(!profile.column_key, keys[keys.len - 1].object.get("expression") != null);
+            if (profile.column_key) try std.testing.expectEqualStrings("status", keys[0].object.get("column").?.string);
+            try std.testing.expectEqual(@as(usize, if (profile.include_amount) 2 else @intFromBool(profile.covering)), definition.object.get("include_columns").?.array.items.len);
+            if (profile.include_amount) {
+                const included = definition.object.get("include_columns").?.array.items;
+                try std.testing.expectEqualStrings("tenant_id", included[0].string);
+                try std.testing.expectEqualStrings("amount", included[1].string);
+            }
             try std.testing.expectEqual(profile.partial, definition.object.get("where").?.array.items.len != 0);
             found = true;
         };
@@ -381,6 +397,215 @@ test "mounted SQL original expression indexes build maintain partial keys and re
     // Exact originals sql-0017, sql-0712, sql-0713, sql-0714, sql-0715,
     // sql-0716, sql-0717, sql-0718, sql-0722, sql-0723, unchanged.
     try fixture.run(Campaign(false));
+}
+
+const column_profiles = [_]Profile{
+    .{ .id = "sql-0695", .namespace = "column_partial", .partial = true, .column_key = true },
+    .{ .id = "sql-0704", .namespace = "column_cover", .partial = true, .column_key = true, .covering = true, .include_amount = true },
+    .{ .id = "sql-0710", .namespace = "column_conditional", .partial = true, .column_key = true },
+    .{ .id = "sql-0711", .namespace = "column_negative", .partial = true, .column_key = true },
+};
+const ColumnRow = struct { id: u8, status: ?[]const u8, amount: ?i64 };
+const column_seed = [_]ColumnRow{
+    .{ .id = 1, .status = "pending", .amount = -1 },
+    .{ .id = 2, .status = "done", .amount = -1 },
+    .{ .id = 3, .status = "pending", .amount = 5 },
+    .{ .id = 4, .status = null, .amount = null },
+    .{ .id = 6, .status = null, .amount = -1 },
+};
+const column_changed = [_]ColumnRow{
+    .{ .id = 1, .status = "done", .amount = 2 },
+    .{ .id = 3, .status = "done", .amount = -1 },
+    .{ .id = 4, .status = null, .amount = null },
+    .{ .id = 5, .status = "pending", .amount = -1 },
+    .{ .id = 6, .status = null, .amount = -1 },
+};
+const column_recovered = [_]ColumnRow{
+    .{ .id = 1, .status = "done", .amount = 2 },
+    .{ .id = 3, .status = "done", .amount = -1 },
+    .{ .id = 4, .status = "pending", .amount = -1 },
+    .{ .id = 5, .status = "pending", .amount = -1 },
+    .{ .id = 6, .status = null, .amount = -1 },
+};
+
+fn columnMember(profile: Profile, row: ColumnRow) bool {
+    return if (std.mem.eql(u8, profile.id, "sql-0711")) row.amount != null and row.amount.? == -1 else row.status != null and std.mem.eql(u8, row.status.?, "pending");
+}
+
+fn columnCells(ctx: *fixture.Context, cells: []const std.json.Value, nulls: []const bool, expected: ColumnRow) !void {
+    try std.testing.expectEqual(@as(usize, 4), cells.len);
+    try std.testing.expectEqual(@as(usize, 4), nulls.len);
+    const id = try std.fmt.allocPrint(ctx.alloc, "00000000-0000-0000-0000-{d:0>12}", .{expected.id});
+    defer ctx.alloc.free(id);
+    try std.testing.expectEqualStrings(id, cells[0].string);
+    try std.testing.expectEqualStrings("tenant", cells[2].string);
+    try std.testing.expect(!nulls[0] and !nulls[2]);
+    try std.testing.expectEqual(expected.status == null, nulls[1]);
+    try std.testing.expectEqual(expected.amount == null, nulls[3]);
+    if (expected.status) |status| try std.testing.expectEqualStrings(status, cells[1].string) else try std.testing.expect(cells[1] == .null);
+    if (expected.amount) |amount| try std.testing.expectEqual(amount, try fixture.sqlInteger(cells[3])) else try std.testing.expect(cells[3] == .null);
+}
+
+fn columnRows(ctx: *fixture.Context, profile: Profile, name: []const u8, expected: []const ColumnRow) !void {
+    const predicate = if (std.mem.eql(u8, profile.id, "sql-0711")) "amount = -1" else "status = 'pending'";
+    for ([_]bool{ false, true }) |filtered| {
+        const query = try std.fmt.allocPrint(ctx.alloc, "SELECT id,status,tenant_id,amount FROM usage_records {s}{s} ORDER BY id", .{ if (filtered) "WHERE " else "", if (filtered) predicate else "" });
+        defer ctx.alloc.free(query);
+        var response = try client.executeIn(ctx, profile.namespace, query, .read);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 4), parsed.value.columns.len);
+        for (parsed.value.columns, [_][]const u8{ "id", "status", "tenant_id", "amount" }) |column, label| try std.testing.expectEqualStrings(label, column.name);
+        var count: usize = 0;
+        for (expected) |row| {
+            if (filtered and !columnMember(profile, row)) continue;
+            try std.testing.expect(count < parsed.value.rows.len);
+            try columnCells(ctx, parsed.value.rows[count], parsed.value.sql_nulls.?[count], row);
+            count += 1;
+        }
+        try std.testing.expectEqual(count, parsed.value.rows.len);
+    }
+    // Prove actual partial-index membership, not only the SQL fallback scan.
+    const domain = local.system_catalog_domain;
+    const metadata = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .namespace = profile.namespace, .name = "usage_records" }} };
+    const bytes = try metadata.systemCatalog(ctx.alloc, .{}, .{ .resolve_many = lookup });
+    defer ctx.alloc.free(bytes);
+    var resolved = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+    defer resolved.deinit();
+    try resolved.value.validateRelations(lookup);
+    const table = resolved.value.relations[0] orelse return error.MissingCreatedRelation;
+    const reader = ctx.data.http_server.?.table_reads orelse return error.MissingOwnerReadSource;
+    const writer = ctx.data.http_server.?.table_writes orelse return error.MissingOwnerWriteSource;
+    try writer.activateRangeTracking(ctx.alloc, table.table.name, .{});
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    // The coordinated named-index contract carries exact equality proofs.
+    // Probe every key used by the fixture, including expected nonmembers and
+    // a NULL key whose non-key amount predicate can still admit the row.
+    for ([_]std.json.Value{ .{ .string = "pending" }, .{ .string = "done" }, .null }) |key| {
+        const tuple = [_]std.json.Value{key};
+        const view = admitted: while (platform.time.monotonicNs() < deadline) {
+            try ctx.checkDrivers();
+            const result = reader.openRelationalRead(ctx.alloc, table.table.name, "", "", .{
+                .fields = &.{ "id", "status", "tenant_id", "amount" },
+                .include_documents = true,
+                .include_range_proofs = true,
+                .execution_deadline_ns = deadline,
+                .limit = 128,
+                .relational_query = .{
+                    .index = name,
+                    .schema_version = table.owner.schema_version,
+                    .fields = &.{ "id", "status", "tenant_id", "amount" },
+                    .lower = .{ .values = &tuple },
+                    .upper = .{ .values = &tuple },
+                    .conditions = if (std.mem.eql(u8, profile.id, "sql-0711")) &.{.{ .column = "amount", .op = .eq, .value = .{ .integer = -1 } }} else &.{.{ .column = "status", .op = .eq, .value = .{ .string = "pending" } }},
+                },
+            }, .read_index) catch |err| switch (err) {
+                error.SqlStatementReadUnavailable => {
+                    try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            break :admitted result orelse return error.MissingOwnerReadSource;
+        } else return error.IndexProbeAdmissionTimeout;
+        defer view.deinit();
+        var page = try view.next(ctx.alloc, 128);
+        defer page.deinit();
+        try std.testing.expect(page.after == null);
+        var members: usize = 0;
+        for (expected) |row| {
+            if (!columnMember(profile, row)) continue;
+            if (row.status) |status| {
+                if (key != .string or !std.mem.eql(u8, status, key.string)) continue;
+            } else if (key != .null) continue;
+            const id = try std.fmt.allocPrint(ctx.alloc, "00000000-0000-0000-0000-{d:0>12}", .{row.id});
+            defer ctx.alloc.free(id);
+            var found: usize = 0;
+            for (page.rows) |physical| {
+                const actual_id = try physical.cell("id");
+                if (actual_id.sql_null or !std.mem.eql(u8, id, actual_id.value.string)) continue;
+                found += 1;
+                const status = try physical.cell("status");
+                const tenant = try physical.cell("tenant_id");
+                const amount = try physical.cell("amount");
+                try std.testing.expect(!tenant.sql_null);
+                try std.testing.expectEqualStrings("tenant", tenant.value.string);
+                try std.testing.expectEqual(row.status == null, status.sql_null);
+                try std.testing.expectEqual(row.amount == null, amount.sql_null);
+                if (row.status) |value| try std.testing.expectEqualStrings(value, status.value.string);
+                if (row.amount) |value| try std.testing.expectEqual(value, try fixture.sqlInteger(amount.value));
+            }
+            try std.testing.expectEqual(@as(usize, 1), found);
+            members += 1;
+        }
+        try std.testing.expectEqual(members, page.rows.len);
+    }
+}
+
+const ColumnCampaign = struct {
+    ids: [column_profiles.len]u64 = undefined,
+    cuts: [column_profiles.len]Cut = undefined,
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        for (column_profiles, 0..) |profile, i| {
+            const ns = try std.fmt.allocPrint(ctx.alloc, "CREATE SCHEMA {s}", .{profile.namespace});
+            defer ctx.alloc.free(ns);
+            try command(ctx, .{ .id = profile.id, .namespace = "public" }, ns, true);
+            try std.testing.expect((try lifecycle.relationOwner(ctx, profile.namespace)) == null);
+            try command(ctx, profile, "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT,tenant_id TEXT,amount BIGINT)", true);
+            self.ids[i] = try lifecycle.owner(ctx, profile.namespace);
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.ids[i]);
+            try lifecycle.waitEnforced(ctx, profile.namespace);
+            try command(ctx, profile, "INSERT INTO usage_records(id,status,tenant_id,amount) VALUES('00000000-0000-0000-0000-000000000001','pending','tenant',-1),('00000000-0000-0000-0000-000000000002','done','tenant',-1),('00000000-0000-0000-0000-000000000003','pending','tenant',5),('00000000-0000-0000-0000-000000000004',NULL,'tenant',NULL),('00000000-0000-0000-0000-000000000006',NULL,'tenant',-1)", false);
+            const original = try corpus.get(profile.id);
+            try std.testing.expectEqual(@as(usize, 0), original.params.len);
+            var compiled = try local.sql_compiler.compile(ctx.alloc, original.sql, .{});
+            defer compiled.deinit();
+            const name = compiled.statement.catalog_ddl.schema_change.?.create_index.name;
+            try command(ctx, profile, original.sql, true);
+            self.cuts[i] = try ready(ctx, profile, name, self.ids[i]);
+            if (std.mem.eql(u8, profile.id, "sql-0710")) {
+                try command(ctx, profile, original.sql, true);
+                try std.testing.expectEqualDeep(self.cuts[i], try ready(ctx, profile, name, self.ids[i]));
+            }
+            try columnRows(ctx, profile, name, &column_seed);
+            try command(ctx, profile, "UPDATE usage_records SET status='done',amount=2 WHERE id='00000000-0000-0000-0000-000000000001'", false);
+            try command(ctx, profile, "UPDATE usage_records SET status='pending',amount=5 WHERE id='00000000-0000-0000-0000-000000000002'", false);
+            try command(ctx, profile, "UPDATE usage_records SET status='done',amount=-1 WHERE id='00000000-0000-0000-0000-000000000003'", false);
+            try command(ctx, profile, "INSERT INTO usage_records(id,status,tenant_id,amount) VALUES('00000000-0000-0000-0000-000000000005','pending','tenant',-1)", false);
+            try command(ctx, profile, "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000002'", false);
+            try columnRows(ctx, profile, name, &column_changed);
+        }
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        for (column_profiles, 0..) |profile, i| {
+            try std.testing.expectEqual(self.ids[i], try lifecycle.owner(ctx, profile.namespace));
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.ids[i]);
+            const original = try corpus.get(profile.id);
+            var compiled = try local.sql_compiler.compile(ctx.alloc, original.sql, .{});
+            defer compiled.deinit();
+            const name = compiled.statement.catalog_ddl.schema_change.?.create_index.name;
+            try std.testing.expectEqualDeep(self.cuts[i], try ready(ctx, profile, name, self.ids[i]));
+            try columnRows(ctx, profile, name, &column_changed);
+            if (std.mem.eql(u8, profile.id, "sql-0710")) {
+                try command(ctx, profile, original.sql, true);
+                try std.testing.expectEqualDeep(self.cuts[i], try ready(ctx, profile, name, self.ids[i]));
+            }
+            try command(ctx, profile, "UPDATE usage_records SET status='pending',amount=-1 WHERE id='00000000-0000-0000-0000-000000000004'", false);
+            try columnRows(ctx, profile, name, &column_recovered);
+        }
+    }
+};
+
+test "mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart" {
+    // Exact originals sql-0695, sql-0704, sql-0710, sql-0711.
+    try fixture.run(ColumnCampaign);
 }
 
 const UnsupportedOwnerCampaign = struct {

@@ -548,6 +548,43 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     try std.testing.expectError(error.OnlineSourceScopeChanged, Call.run(transfer.Status, &target, .{ .write = .{ .descriptor = descriptor, .offset = 0, .data_base64 = first_retry.value.data_base64, .digest = first_retry.value.digest } }));
 }
 
+test "opaque owner runtime source authority crosses compiled boundary and survives reopen" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const authority = local.storage_source_authority;
+    const namespace: local.storage_db_doc_identity.Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7101 };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    for ([_]authority.Kind{ .native, .raft }) |kind| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/status-{s}", .{ root, @tagName(kind) });
+        defer alloc.free(path);
+        for (0..2) |_| {
+            var owner = try client.Owner.open(.{
+                .path = .fromSlice(path),
+                .table_name = .fromSlice("docs"),
+                .group_id = 7101,
+                .has_identity_namespace = 1,
+                .identity_table_id = namespace.table_id,
+                .identity_shard_id = namespace.shard_id,
+                .identity_range_id = namespace.range_id,
+                .online_source_authority = @backingInt(kind),
+                .schema_json = .fromSlice("{}"),
+            });
+            defer owner.deinit();
+            var response = try ownerStatusEventually(&owner);
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(struct { metadata: struct { source_authority: ?authority.State = null } }, alloc, response.bytes(), .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const state = parsed.value.metadata.source_authority orelse return error.MissingOwnerSourceAuthority;
+            try std.testing.expectEqual(kind, state.kind);
+            try std.testing.expectEqual(@as(u64, 0), state.sequence);
+            try std.testing.expectEqualDeep(local.storage_db_online_source_contract.namespaceBytes(namespace), state.namespace);
+        }
+    }
+}
+
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
     const contract = @import("antfly_local_sources").api_local_query_contract;

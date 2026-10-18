@@ -312,6 +312,7 @@ pub const VTable = struct {
     stats: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(types.DBStats),
     runtimeStatusStatsConsistent: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(types.DBStats),
     runtimeStatusStatsConsistentIfAvailable: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(?types.DBStats),
+    runtimeStatusObservationConsistentIfAvailable: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(?DB.RuntimeStatusObservation),
     reassignIdentityNamespaceForInternalTransition: *const fn (self: *DB, namespace: @import("db/doc_identity.zig").Namespace) Outcome(void),
     attachRestoreStagingReplicationMirror: *const fn (self: *DB, mirror: ?db.ReplicationAsyncEffectMirror) Outcome(void),
     reserveRestoreStagingScoped: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Scope) Outcome(void),

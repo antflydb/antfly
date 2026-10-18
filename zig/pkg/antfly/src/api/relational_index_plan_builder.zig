@@ -212,5 +212,7 @@ test "relational index publication plan builder owns actual burned catalog alloc
     try std.testing.expectError(error.CatalogGenerationChanged, build(&reader, a, std.testing.io, .{}, foreign_cut, request, plan.after.schema_json));
     foreign_cut = cut;
     foreign_cut.authority = .raft;
-    try std.testing.expectError(error.UnsupportedNativeIndexOwner, build(&reader, a, std.testing.io, .{}, foreign_cut, request, plan.after.schema_json));
+    var replicated = try build(&reader, a, std.testing.io, .{}, foreign_cut, request, plan.after.schema_json);
+    defer replicated.deinit();
+    for (replicated.request.begin.plan.owners) |owner| try std.testing.expectEqual(local.storage_db_relational_index_publication_progress.Authority.raft, owner.receipt_authority);
 }

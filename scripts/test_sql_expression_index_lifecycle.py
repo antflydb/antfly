@@ -43,6 +43,140 @@ def row(number, email, status):
 
 
 class ExpressionIndexTest(unittest.TestCase):
+    def test_original_partial_column_indexes_cover_nulls_and_conditional_creation(self):
+        originals = {
+            entry["id"]: entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        with postgres() as db:
+            for case in ("sql-0695", "sql-0704", "sql-0710", "sql-0711"):
+                with self.subTest(case=case):
+                    namespace = "col_" + case.replace("-", "_")
+                    db.execute(f'CREATE SCHEMA "{namespace}"')
+                    db.execute(f'SET search_path TO "{namespace}"')
+                    db.execute(
+                        "CREATE TABLE usage_records "
+                        "(id UUID PRIMARY KEY,status TEXT,tenant_id TEXT,amount BIGINT)"
+                    )
+
+                    def value(number, status, amount):
+                        return (
+                            f"00000000-0000-0000-0000-{number:012}",
+                            status,
+                            "tenant",
+                            amount,
+                        )
+
+                    expected = [
+                        value(1, "pending", -1),
+                        value(2, "done", -1),
+                        value(3, "pending", 5),
+                        value(4, None, None),
+                        value(6, None, -1),
+                    ]
+                    for item in expected:
+                        db.execute(
+                            "INSERT INTO usage_records(id,status,tenant_id,amount) VALUES(%s::uuid,%s,%s,%s)",
+                            item,
+                        )
+                    predicate = (
+                        "amount = -1" if case == "sql-0711" else "status = 'pending'"
+                    )
+
+                    def verify():
+                        self.assertEqual(
+                            expected,
+                            db.execute(
+                                "SELECT id::text,status,tenant_id,amount FROM usage_records ORDER BY id"
+                            ).fetchall(),
+                        )
+                        selected = [
+                            item
+                            for item in expected
+                            if (
+                                item[3] == -1
+                                if case == "sql-0711"
+                                else item[1] == "pending"
+                            )
+                        ]
+                        self.assertEqual(
+                            selected,
+                            db.execute(
+                                "SELECT id::text,status,tenant_id,amount FROM usage_records WHERE "
+                                + predicate
+                                + " ORDER BY id"
+                            ).fetchall(),
+                        )
+
+                    original = originals[case]
+                    self.assertEqual([], original["params"])
+                    self.assertEqual(
+                        "CREATE INDEX", db.execute(original["sql"]).statusmessage
+                    )
+                    name = (
+                        "usage_records_status_cover_idx"
+                        if case == "sql-0704"
+                        else "usage_records_negative_amount_idx"
+                        if case == "sql-0711"
+                        else "usage_records_status_idx"
+                    )
+
+                    def definition():
+                        return db.execute(
+                            "SELECT c.oid,pg_get_indexdef(c.oid),i.indnkeyatts,i.indnatts,i.indisunique,i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname=%s AND i.indrelid='usage_records'::regclass",
+                            (name,),
+                        ).fetchall()
+
+                    before = definition()
+                    self.assertEqual(1, len(before))
+                    self.assertEqual(
+                        (1, 3 if case == "sql-0704" else 1, False, True), before[0][2:]
+                    )
+                    if case == "sql-0710":
+                        self.assertEqual(
+                            "CREATE INDEX", db.execute(original["sql"]).statusmessage
+                        )
+                        self.assertEqual(before, definition())
+                    verify()
+                    for number, status, amount in (
+                        (1, "done", 2),
+                        (2, "pending", 5),
+                        (3, "done", -1),
+                    ):
+                        db.execute(
+                            "UPDATE usage_records SET status=%s,amount=%s WHERE id=%s::uuid",
+                            (status, amount, value(number, status, amount)[0]),
+                        )
+                    db.execute(
+                        "INSERT INTO usage_records(id,status,tenant_id,amount) VALUES(%s::uuid,%s,%s,%s)",
+                        value(5, "pending", -1),
+                    )
+                    db.execute(
+                        "DELETE FROM usage_records WHERE id=%s::uuid",
+                        (value(2, None, None)[0],),
+                    )
+                    expected = [
+                        value(1, "done", 2),
+                        value(3, "done", -1),
+                        value(4, None, None),
+                        value(5, "pending", -1),
+                        value(6, None, -1),
+                    ]
+                    verify()
+                    if case == "sql-0710":
+                        self.assertEqual(
+                            "CREATE INDEX", db.execute(original["sql"]).statusmessage
+                        )
+                        self.assertEqual(before, definition())
+                    db.execute(
+                        "UPDATE usage_records SET status='pending',amount=-1 WHERE id=%s::uuid",
+                        (value(4, None, None)[0],),
+                    )
+                    expected[2] = value(4, "pending", -1)
+                    verify()
+
     def test_join_access_placement_and_shared_producer_semantics(self):
         with postgres() as db:
             print(

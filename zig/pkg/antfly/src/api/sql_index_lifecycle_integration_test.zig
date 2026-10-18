@@ -61,6 +61,64 @@ fn command(ctx: *fixture.Context, namespace: []const u8, statement: []const u8) 
         std.debug.print("SQL index campaign command status={d} statement={s} body={s}\n", .{ response.status, statement, response.body });
         return error.SqlIndexCampaignCommandFailed;
     }
+    if (std.mem.startsWith(u8, statement, "CREATE UNIQUE INDEX")) try awaitIndexPublication(ctx, namespace, statement, response);
+}
+
+pub fn awaitIndexPublication(ctx: *fixture.Context, namespace: []const u8, statement: []const u8, response: http.HttpResponse) !void {
+    return awaitIndexTerminal(ctx, namespace, statement, response, .published);
+}
+
+fn awaitIndexTerminal(ctx: *fixture.Context, namespace: []const u8, statement: []const u8, response: http.HttpResponse, expected: enum { published, duplicate_key }) !void {
+    const Receipt = struct { table_id: []const u8, index_publication_token: ?[]const u8 = null };
+    var result = try std.json.parseFromSlice(struct { ddl_receipt: ?Receipt = null }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+    defer result.deinit();
+    const receipt = result.value.ddl_receipt orelse return error.MissingSqlIndexReceipt;
+    const token = receipt.index_publication_token orelse return error.MissingSqlIndexPublicationToken;
+    var compiled = try sources.sql_compiler.compile(ctx.alloc, statement, .{});
+    defer compiled.deinit();
+    const name = compiled.statement.catalog_ddl.schema_change.?.create_index.name;
+    const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/databases/default/namespaces/{s}/tables/usage_records/indexes/{s}/publication", .{ namespace, name });
+    defer ctx.alloc.free(suffix);
+    const headers = try ctx.alloc.alloc(http.RequestHeader, ctx.headers.len + 1);
+    defer ctx.alloc.free(headers);
+    @memcpy(headers[0..ctx.headers.len], ctx.headers);
+    headers[ctx.headers.len] = .{ .name = "X-Antfly-Index-Publication-Token", .value = token };
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    var last_phase: ?@import("antfly_indexes_openapi").types.IndexPublicationPhase = null;
+    while (platform.time.monotonicNs() < deadline) {
+        try ctx.checkDrivers();
+        var observed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, headers, ctx.base, suffix, .GET, null, 1_000);
+        defer observed.deinit(ctx.alloc);
+        if (observed.status == 200) {
+            var status = try std.json.parseFromSlice(@import("antfly_indexes_openapi").types.IndexPublicationStatus, ctx.alloc, observed.body, .{});
+            defer status.deinit();
+            try std.testing.expectEqualStrings(token, status.value.publication_token);
+            try std.testing.expectEqualStrings(receipt.table_id, status.value.table_id);
+            try std.testing.expectEqualStrings(name, status.value.index_name);
+            last_phase = status.value.phase;
+            switch (status.value.state) {
+                .published => if (!status.value.replication_pending) {
+                    try std.testing.expectEqual(.published, expected);
+                    return;
+                },
+                .failed => {
+                    try std.testing.expectEqual(.duplicate_key, expected);
+                    try std.testing.expectEqual(@import("antfly_indexes_openapi").types.IndexPublicationFailure.duplicate_key, status.value.failure.?);
+                    try std.testing.expectEqual(@import("antfly_indexes_openapi").types.IndexPublicationPhase.canceled, status.value.phase.?);
+                    try std.testing.expect(!status.value.replication_pending);
+                    return;
+                },
+                .canceled => return error.SqlIndexCampaignBuildFailed,
+                .pending, .admission_unknown => {},
+            }
+        } else if (observed.status != 503) {
+            std.debug.print("SQL index publication status={d} body={s}\n", .{ observed.status, observed.body });
+            return error.SqlIndexCampaignStatusFailed;
+        }
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    std.debug.print("SQL index publication timeout namespace={s} phase={s}\n", .{ namespace, if (last_phase) |phase| @tagName(phase) else "unknown" });
+    return error.SqlIndexCampaignPublicationTimeout;
 }
 
 pub fn relationOwner(ctx: *fixture.Context, namespace: []const u8) !?u64 {
@@ -205,6 +263,17 @@ const duplicate = "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('
 const Campaign = struct {
     table_ids: [profiles.len]u64 = undefined,
     pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        // Control snapshots drive report projection. They must carry the same
+        // negotiated decoder readiness as the public status endpoint, or a
+        // healthy owner proof is stripped before it reaches metadata.
+        {
+            const ready = try ctx.metadata.server.svc.status();
+            var control = try ctx.metadata.server.svc.controlSnapshot();
+            defer ctx.metadata.server.svc.freeAdminSnapshot(&control);
+            const protocol = @import("../metadata/runtime_status_protocol.zig");
+            try std.testing.expect(protocol.profileSatisfies(ready.runtime_status_protocol_ready_version, protocol.source_authority_record_version));
+            try std.testing.expectEqual(ready.runtime_status_protocol_ready_version, control.status.runtime_status_protocol_ready_version);
+        }
         var corpus = try sources.sql_parity_fixtures.Corpus.init(ctx.alloc);
         defer corpus.deinit();
         for (profiles, &self.table_ids) |profile, *id| {
@@ -243,6 +312,7 @@ const Campaign = struct {
 };
 
 test "mounted SQL original unique indexes enforce exact postimages across owner restart" {
+    // Exact corpus originals: sql-0692, sql-0706, sql-0705.
     try fixture.run(Campaign);
 }
 
@@ -278,16 +348,20 @@ const FailedBuildCampaign = struct {
             try std.testing.expectEqual(@as(usize, 0), original.params.len);
             var response = try execute(ctx, namespace, original.sql, false);
             defer response.deinit(ctx.alloc);
+            // Bounded HTTP DDL may return its preowned recovery handle.
+            // Require exact terminal failure AND fence/claim cleanup before
+            // observing atomicity; old constraint readiness proves neither.
+            if (response.status == 202) {
+                try awaitIndexTerminal(ctx, namespace, original.sql, response, .duplicate_key);
+            } else try expectRejected(ctx, response);
             const state = try waitTerminalActivation(ctx, namespace);
             const after_rows = try snapshotRows(ctx, namespace);
             defer ctx.alloc.free(after_rows);
             const after_definition = try snapshotDefinition(ctx, namespace);
             defer ctx.alloc.free(after_definition);
-            if (response.status != 400) std.debug.print("regular unique-index failure case={s} state={s} same_rows={} same_definition={}\n", .{ profile.id, @tagName(state), std.mem.eql(u8, before_rows, after_rows), std.mem.eql(u8, before_definition, after_definition) });
             try std.testing.expectEqualStrings(before_rows, after_rows);
             try std.testing.expect(std.mem.eql(u8, before_definition, after_definition));
             try std.testing.expectEqual(ConstraintState.enforced, state);
-            try expectRejected(ctx, response);
             // The old owner and enforcement remain usable after a rejected
             // build. Repair is an explicit new user operation, never replay.
             try std.testing.expectEqual(table_id, try owner(ctx, namespace));
@@ -329,5 +403,147 @@ fn repairedPostimage(ctx: *fixture.Context, namespace: []const u8, null_email: b
 }
 
 test "mounted SQL regular unique index build failure is atomic" {
+    // Exact corpus originals: sql-0692, sql-0706, sql-0705; no rewritten SQL.
     try fixture.run(FailedBuildCampaign);
+}
+
+const DropCampaign = struct {
+    const namespace = "drop_secondary";
+    const index_name = "usage_records_status_idx";
+    const create_index = "CREATE UNIQUE INDEX usage_records_status_idx ON usage_records(status)";
+    const insert_conflict = "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000003',NULL,'other','pending')";
+    table_id: u64 = undefined,
+
+    fn write(ctx: *fixture.Context, statement: []const u8, conflict: bool) !void {
+        // Publication may retire a resident read owner. Only the established
+        // definite, pre-admission read failure can retry; a pending/ambiguous
+        // write is never repeated to make this lifecycle test pass.
+        var response = try @import("sql_owner_test_client.zig").executeIn(ctx, namespace, statement, .write_admission);
+        defer response.deinit(ctx.alloc);
+        if (conflict) return expectRejected(ctx, response);
+        if (response.status != 200) std.debug.print("SQL index DROP write status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+    }
+
+    fn expectDeclared(ctx: *fixture.Context, declared: bool) !void {
+        const bytes = try snapshotDefinition(ctx, namespace);
+        defer ctx.alloc.free(bytes);
+        var definition = try std.json.parseFromSlice(struct { definition: struct { schema_json: []const u8 } }, ctx.alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer definition.deinit();
+        var schema = try std.json.parseFromSlice(std.json.Value, ctx.alloc, definition.value.definition.schema_json, .{});
+        defer schema.deinit();
+        for ([_][]const u8{ "relational_indexes", "unique_constraints" }) |field| {
+            var found: usize = 0;
+            if (schema.value.object.get(field)) |entries| for (entries.array.items) |entry| {
+                if (std.mem.eql(u8, index_name, entry.object.get("name").?.string)) found += 1;
+            };
+            try std.testing.expectEqual(@as(usize, @intFromBool(declared)), found);
+        }
+    }
+
+    fn dropAndCheck(ctx: *fixture.Context) !void {
+        var corpus = try sources.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        const original = try corpus.get("sql-0724");
+        try std.testing.expectEqual(@as(usize, 0), original.params.len);
+        const before = try snapshotRows(ctx, namespace);
+        defer ctx.alloc.free(before);
+        var response = try execute(ctx, namespace, original.sql, false);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200 and response.status != 202) {
+            std.debug.print("SQL index DROP status={d} body={s}\n", .{ response.status, response.body });
+            return error.SqlIndexCampaignCommandFailed;
+        }
+        // A bounded DROP can still serve its predecessor while retirement
+        // runs. Old constraint enforcement cannot certify the target epoch.
+        var result = try std.json.parseFromSlice(struct { ddl_receipt: struct { table_id: []const u8, schema_version: u32 } }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer result.deinit();
+        try awaitRetirement(ctx, result.value.ddl_receipt.schema_version, try std.fmt.parseInt(u64, result.value.ddl_receipt.table_id, 10));
+        try expectDeclared(ctx, false);
+        const after = try snapshotRows(ctx, namespace);
+        defer ctx.alloc.free(after);
+        try std.testing.expectEqualStrings(before, after);
+        // Removing an index-owned UNIQUE key must retire its enforcement too;
+        // otherwise a metadata-only DROP could appear successful indefinitely.
+        try write(ctx, insert_conflict, false);
+        const rows = try snapshotRows(ctx, namespace);
+        defer ctx.alloc.free(rows);
+        var parsed = try std.json.parseFromSlice(std.json.Value, ctx.alloc, rows, .{});
+        defer parsed.deinit();
+        const actual = (try fixture.field(parsed.value, "rows")).array.items;
+        try std.testing.expectEqual(@as(usize, 3), actual.len);
+        for (actual, 0..) |row, i| {
+            const cells = row.array.items;
+            try std.testing.expectEqual(@as(usize, 4), cells.len);
+            const id = try std.fmt.allocPrint(ctx.alloc, "00000000-0000-0000-0000-{d:0>12}", .{i + 1});
+            defer ctx.alloc.free(id);
+            try std.testing.expectEqualStrings(id, cells[0].string);
+            if (i == 1) try std.testing.expectEqualStrings("owner@example.com", cells[1].string) else try std.testing.expect(cells[1] == .null);
+            try std.testing.expectEqualStrings(if (i == 2) "other" else "tenant", cells[2].string);
+            try std.testing.expectEqualStrings(if (i == 1) "active" else "pending", cells[3].string);
+        }
+    }
+
+    fn awaitRetirement(ctx: *fixture.Context, version: u32, table_id: u64) !void {
+        const suffix = "/db/v1/databases/default/namespaces/" ++ namespace ++ "/tables/usage_records/constraints/status";
+        const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+        while (platform.time.monotonicNs() < deadline) {
+            try ctx.checkDrivers();
+            var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .GET, null, 1_000);
+            defer response.deinit(ctx.alloc);
+            if (response.status == 200) {
+                var parsed = try std.json.parseFromSlice(struct {
+                    schema_version: u32,
+                    state: ConstraintState,
+                    retirement: ?struct { failure: ?[]const u8 = null } = null,
+                }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                const status = parsed.value;
+                if (status.retirement) |retirement| {
+                    if (retirement.failure != null) return error.SqlIndexCampaignRetirementFailed;
+                } else if (status.schema_version == version and status.state == .enforced) {
+                    try std.testing.expectEqual(table_id, try owner(ctx, namespace));
+                    return;
+                }
+                if (status.schema_version > version) return error.SchemaVersionChanged;
+            } else if (response.status != 503 and response.status != 409) {
+                std.debug.print("SQL index retirement status={d} body={s}\n", .{ response.status, response.body });
+                return error.SqlIndexCampaignStatusFailed;
+            }
+            try ctx.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        return error.SqlIndexCampaignRetirementTimeout;
+    }
+
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try command(ctx, "public", "CREATE SCHEMA drop_secondary");
+        try std.testing.expect((try relationOwner(ctx, namespace)) == null);
+        try command(ctx, namespace, "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT)");
+        self.table_id = try owner(ctx, namespace);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.table_id);
+        try waitEnforced(ctx, namespace);
+        try command(ctx, namespace, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000001',NULL,'tenant','pending'),('00000000-0000-0000-0000-000000000002','owner@example.com','tenant','active')");
+        try command(ctx, namespace, create_index);
+        try expectDeclared(ctx, true);
+        try write(ctx, insert_conflict, true);
+        try dropAndCheck(ctx);
+        try write(ctx, "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000003'", false);
+        try command(ctx, namespace, create_index);
+        try expectDeclared(ctx, true);
+        try write(ctx, insert_conflict, true);
+    }
+
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try std.testing.expectEqual(self.table_id, try owner(ctx, namespace));
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.table_id);
+        try waitEnforced(ctx, namespace);
+        try expectDeclared(ctx, true);
+        try write(ctx, insert_conflict, true);
+        try dropAndCheck(ctx);
+    }
+};
+
+test "mounted SQL original secondary index drop retires enforcement and permits name reuse across restart" {
+    // sql-0724; the original statement is executed without rewriting.
+    try fixture.run(DropCampaign);
 }

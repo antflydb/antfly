@@ -4093,16 +4093,17 @@ pub const DB = struct {
             );
             core_owned = false;
             core_owner_initialized = true;
-            const schema_validation_protected = if (opts.schema_before_index_load != null) protected: {
+            const owner_catalog_protected = if (opts.schema_before_index_load != null) protected: {
                 var read = try core_owner.store.beginReadTxn();
                 defer read.abort();
-                break :protected try @import("relational_nullability_job.zig").protectedOwnerCatalog(alloc, &read, core_owner.identity_namespace) != null;
+                break :protected try @import("relational_index_owner_job.zig").protectsOwnerCatalog(&read, core_owner.identity_namespace) or
+                    try @import("relational_nullability_job.zig").protectedOwnerCatalog(alloc, &read, core_owner.identity_namespace) != null;
             } else false;
             // Reject a stale catalog-authoritative descriptor as soon as the
             // durable schema is known, before binding source authority or
             // starting any owner-side maintenance. Historical Raft apply is
             // allowed to replay against the newer on-disk schema instead.
-            if (opts.reject_stale_schema_before_index_load and !schema_validation_protected) {
+            if (opts.reject_stale_schema_before_index_load and !owner_catalog_protected) {
                 if (opts.schema_before_index_load) |prepared_schema| {
                     if (core_owner.schema) |durable_schema| {
                         if (durable_schema.version > prepared_schema.runtime_schema.version)
@@ -4270,7 +4271,7 @@ pub const DB = struct {
                 // after this physical DB has durably installed a newer schema.
                 // Keep that newer epoch; the older entry's native applied
                 // marker decides whether it still needs its data mutation.
-                if (schema_validation_protected) {
+                if (owner_catalog_protected) {
                     // The durable job owns this catalog, including an installed
                     // but unpublished successor. Preserve it before index load;
                     // the outer descriptor policy still controls public reads.
@@ -9412,7 +9413,7 @@ pub const DB = struct {
     pub const SchemaOwnerCatalogPolicy = enum { unprotected, readable, deferred };
 
     /// Catalog hints cannot install a successor or reconcile indexes through a
-    /// validation job. Exact predecessor reads may use the durable runtime;
+    /// validation or index job. Exact predecessor reads may use the durable runtime;
     /// installation remains unpublished until coordinated release. Historical
     /// descriptors only force deferral, never grant serving/mutation authority.
     pub fn schemaOwnerCatalogPolicy(self: *DB, schema_json: []const u8, historical: bool) !SchemaOwnerCatalogPolicy {
@@ -9426,6 +9427,33 @@ pub const DB = struct {
         defer resident.deinit();
         self.core.unlockApplyShared();
         apply_shared = false;
+        const index_job = @import("relational_index_owner_job.zig");
+        if (try index_job.protectsOwnerCatalog(&read, self.core.identity_namespace)) {
+            const binding = (try index_job.load(&read)) orelse return .deferred;
+            if (historical or schema_json.len == 0 or binding.phase == .installed) return .deferred;
+            const identity: NativeIndexOwnerIdentity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
+            if (binding.authority == .native) {
+                _ = try index_job.inspectNative(&read, identity);
+            } else {
+                _ = try RaftIndexOwnerControl.inspect(&read, identity);
+            }
+            var inputs = try @import("relational_index_inputs.zig").Prepared.load(self.alloc, &read, binding.inputs_digest);
+            defer inputs.deinit();
+            const parts = try @import("relational_index_inputs.zig").decode(inputs.bytes);
+            const before = std.mem.eql(u8, schema_json, parts.before_json);
+            if (!before and !std.mem.eql(u8, schema_json, parts.after_json)) return error.PrivateIndexOwnerJobChanged;
+            if (!before) return .deferred;
+            const view = resident.view orelse return error.PrivateIndexRootRecoveryRequired;
+            const encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
+            defer self.alloc.free(encoded);
+            if (!std.mem.eql(u8, &@import("relational_index_inputs.zig").digest(encoded), &binding.schema_before)) return error.PrivateIndexRootRecoveryRequired;
+            const expected = if (binding.phase == .reserved) binding.physical_reserved else binding.physical_before;
+            if (expected) |head| {
+                const indexes = resident.indexes orelse return error.PrivateIndexRootRecoveryRequired;
+                if (!indexes.head.eql(head) or indexes.plan.schemaView().epoch != view.epoch) return error.PrivateIndexRootRecoveryRequired;
+            } else if (resident.indexes != null) return error.PrivateIndexRootRecoveryRequired;
+            return .readable;
+        }
         const header = (try job.protectedOwnerCatalog(self.alloc, &read, self.core.identity_namespace)) orelse return .unprotected;
         if (header.phase == .installed) try resident.require(header) else try resident.requireBefore(header.binding);
         if (historical or schema_json.len == 0) return .deferred;
@@ -38043,6 +38071,7 @@ pub const DB = struct {
     /// Sample the durable source cut under the same apply guard as the stats;
     /// a later mutation may advance it, but cannot make this cut optimistic.
     pub fn runtimeStatusObservationConsistentIfAvailable(self: *DB, alloc: Allocator) !?RuntimeStatusObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("runtimeStatusObservationConsistentIfAvailable", .{ self, alloc });
         if (self.open_mode == .status_only) {
             return .{ .stats = try self.statusOnlyStats(alloc) };
         }

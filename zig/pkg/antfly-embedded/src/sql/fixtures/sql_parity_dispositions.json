@@ -2,6 +2,11 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-column-index-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-column-index-lifecycle-test","antfly-api-sql-expression-index-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-index-expression-drop-native-debug": {"command":["zig","build","antfly-api-sql-index-drop-lifecycle-test","antfly-api-sql-expression-index-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-index-drop-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_catalog_lifecycle.py"],"cwd":".","timeout_seconds":180},
+    "sql-unique-index-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-index-lifecycle-test","antfly-api-sql-index-build-atomicity-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-unique-index-lifecycle-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_catalog_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-document-conflict-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL document conflict originals","-Dtest-filter=httpx SQL document root originals","-Dtest-filter=httpx SQL document campaign verifies exact native mutation and storage outcomes"],"cwd":"zig","timeout_seconds":1800},
     "sql-document-conflict-unit-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j1","-Dtest-filter=SQL conflict","-Dtest-filter=SQL document"],"cwd":"zig","timeout_seconds":1800},
     "sql-document-conflict-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_document_root.py"],"cwd":".","timeout_seconds":180},
@@ -606,8 +611,12 @@
     },
     {
       "id": "sql-0017",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original UNIQUE expression-index declaration publishes through real metadata/data owners, maintains physical expression keys across inserts and updates, rejects conflicting mutations with 23505 and unchanged complete postimages, and retains enforcement and physical indexed membership after cold restart. PostgreSQL independently executes the same original and mutation campaign.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original expression indexes build maintain partial keys and recover owners","gate":"sql-index-expression-drop-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original expression indexes build maintain partial keys and recover owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0018",
@@ -7220,8 +7229,13 @@
     },
     {
       "id": "sql-0692",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original UNIQUE index SQL executes through mounted HTTP and real metadata/data Raft owners. Exact token-bound publication, duplicate/NULL enforcement, full postimages and cold owner restart pass. Failed builds require terminal duplicate-key cancellation and cleanup, unchanged rows and schema, then successful repaired resubmission with recovered enforcement. PostgreSQL 18 independently verifies the same originals. HTTP bounded recovery receipts are observed, never replayed; DROP and multi-node leadership-fault campaigns are separate qualifications.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original unique indexes enforce exact postimages across owner restart","gate":"sql-unique-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL regular unique index build failure is atomic","gate":"sql-unique-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original unique indexes enforce exact postimages across owner restart","gate":"sql-unique-index-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0693",
@@ -7235,8 +7249,12 @@
     },
     {
       "id": "sql-0695",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged partial status-index declaration builds on actual metadata/data owners. Complete SQL postimages and proof-carrying physical equality spans over every fixture status key (including NULL and expected absence) agree before and after predicate-changing updates, insertion, deletion and cold restart. PostgreSQL independently verifies the same original, NULL semantics and mutations.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-column-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0696",
@@ -7315,18 +7333,32 @@
     },
     {
       "id": "sql-0704",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged covering partial-index declaration retains the exact status key and tenant_id/amount include-column order. Complete SQL results and physical indexed projections agree across NULLs, predicate transitions, insertion, deletion and cold owner recovery. PostgreSQL independently verifies the original definition, include-column cardinality and complete mutation postimages. This does not claim an index-only performance benchmark.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-column-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0705",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original UNIQUE index SQL executes through mounted HTTP and real metadata/data Raft owners. Exact token-bound publication, duplicate/NULL enforcement, full postimages and cold owner restart pass. Failed builds require terminal duplicate-key cancellation and cleanup, unchanged rows and schema, then successful repaired resubmission with recovered enforcement. PostgreSQL 18 independently verifies the same originals. HTTP bounded recovery receipts are observed, never replayed; DROP and multi-node leadership-fault campaigns are separate qualifications.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original unique indexes enforce exact postimages across owner restart","gate":"sql-unique-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL regular unique index build failure is atomic","gate":"sql-unique-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original unique indexes enforce exact postimages across owner restart","gate":"sql-unique-index-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0706",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original UNIQUE index SQL executes through mounted HTTP and real metadata/data Raft owners. Exact token-bound publication, duplicate/NULL enforcement, full postimages and cold owner restart pass. Failed builds require terminal duplicate-key cancellation and cleanup, unchanged rows and schema, then successful repaired resubmission with recovered enforcement. PostgreSQL 18 independently verifies the same originals. HTTP bounded recovery receipts are observed, never replayed; DROP and multi-node leadership-fault campaigns are separate qualifications.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original unique indexes enforce exact postimages across owner restart","gate":"sql-unique-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL regular unique index build failure is atomic","gate":"sql-unique-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original unique indexes enforce exact postimages across owner restart","gate":"sql-unique-index-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0707",
@@ -7353,13 +7385,21 @@
     },
     {
       "id": "sql-0710",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged conditional partial-index declaration succeeds on a fresh owner and is an explicit no-op when the name exists. Schema version, physical index generation and comparison identity remain unchanged across conditional re-execution before and after cold restart. Complete SQL and proof-carrying physical membership results also survive NULLs, predicate transitions, insertion and deletion; PostgreSQL independently confirms the original, stable index identity and mutation postimages.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-column-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0711",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged negative-literal partial-index declaration binds amount = -1 on a typed BIGINT fixture. SQL results and physical status-key spans include a NULL status key when its amount predicate is true and exclude unknown/NULL predicate values. Complete postimages and membership survive predicate-changing updates, insertion, deletion and cold restart. PostgreSQL independently verifies the same original and typed NULL/negative-literal semantics.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-column-index-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0712",
@@ -7441,18 +7481,30 @@
     },
     {
       "id": "sql-0722",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original partial UNIQUE expression-index declaration publishes through real metadata/data owners. Native physical probes carry the required typed membership predicate; SQL and physical results agree across membership-changing mutations, conflicting writes preserve complete postimages with 23505, and exact owner/index cuts recover after cold restart. PostgreSQL independently verifies the same original and mutation campaign.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original expression indexes build maintain partial keys and recover owners","gate":"sql-index-expression-drop-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original expression indexes build maintain partial keys and recover owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0723",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original partial UNIQUE expression-index declaration publishes through real metadata/data owners. Native physical probes carry the required typed membership predicate; SQL and physical results agree across membership-changing mutations, conflicting writes preserve complete postimages with 23505, and exact owner/index cuts recover after cold restart. PostgreSQL independently verifies the same original and mutation campaign.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original expression indexes build maintain partial keys and recover owners","gate":"sql-index-expression-drop-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original expression indexes build maintain partial keys and recover owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0724",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original DROP executes through real metadata/data owners. Its exact receipt target epoch and completed retirement are required before observing removed declarations, unchanged complete row postimages and retired index-owned UNIQUE enforcement. The same index name can be rebuilt, its enforcement survives cold restart, and the original DROP succeeds again on the recovered owner. PostgreSQL independently verifies DROP, enforcement retirement, unchanged rows and name reuse. This does not qualify concurrent DROP.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original secondary index drop retires enforcement and permits name reuse across restart","gate":"sql-index-expression-drop-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig","test":"mounted SQL original secondary index drop retires enforcement and permits name reuse across restart","gate":"sql-index-drop-postgres"}
+      ]
     },
     {
       "id": "sql-0725",

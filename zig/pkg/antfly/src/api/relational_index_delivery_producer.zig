@@ -232,8 +232,14 @@ pub const Producer = struct {
                 defer response.deinit();
                 try response.value.validate(request);
                 if (response.value == .acknowledged) return .{ .pending = self.phase };
-                if (response.value != .applied) return error.InvalidPrivateIndexClaimReceipt;
-                if (response.value.applied.outcome.replication_pending or response.value.applied.outcome.error_name != null or response.value.applied.signed_delivery == null) return .{ .pending = self.phase };
+                switch (response.value) {
+                    .applied => |value| if (value.outcome.replication_pending or value.outcome.error_name != null or value.signed_delivery == null) return .{ .pending = self.phase },
+                    // A Raft reply contains the committed, ordered outcome,
+                    // not a native outbox obligation. Require its real proof;
+                    // never cast that position to a native source sequence.
+                    .raft_applied => |value| if (value.signed_delivery == null) return .{ .pending = self.phase },
+                    else => return error.InvalidPrivateIndexClaimReceipt,
+                }
                 const signed = try response.value.requireSignedDelivery(request);
                 try signed.verifyPartition(self.plan.?, self.cohort, self.next_target);
                 self.delivered.?[self.next_target] = .{ .index = @intCast(self.next_target), .signed = signed };

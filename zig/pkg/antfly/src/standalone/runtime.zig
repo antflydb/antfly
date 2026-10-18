@@ -3861,8 +3861,8 @@ const LocalStandaloneMetadata = struct {
 
     fn reconcileIndexes(self: *LocalStandaloneMetadata) !void {
         const server = self.data_server orelse return;
-        const control = server.api_server_cfg.relational_index_control orelse return;
-        const claims = server.api_server_cfg.relational_index_claims orelse return;
+        const control = server.relationalIndexControlPort();
+        const claims = server.relationalIndexClaimPort();
         const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
         var host: IndexWorkHost = .{ .metadata = self };
         var transport: @import("../api/relational_index_local_delivery.zig").Transport = .{ .control_port = control, .claim_port = claims };

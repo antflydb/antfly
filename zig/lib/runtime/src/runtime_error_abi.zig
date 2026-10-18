@@ -854,7 +854,14 @@ pub const Detail = enum(c_int) {
     private_index_root_recovery_required,
     invalid_relational_index_budget,
     private_index_claim_backlog_full,
+    partial_index_predicate_not_implied,
 };
+
+test "partial index proof rejection preserves exact callback error identity" {
+    const wire = statusFromError(error.PartialIndexPredicateNotImplied);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.PartialIndexPredicateNotImplied, errorFromStatus(wire));
+}
 
 test "schema reader requirement validation preserves exact callback error identity" {
     const wire = statusFromError(error.InvalidSchemaReaderRequirements);
@@ -1231,6 +1238,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidRelationalIndexProgress => status(.corrupt, .invalid_relational_index_progress),
         error.MissingRelationalIndexDefinitions => status(.corrupt, .missing_relational_index_definitions),
         error.IndexOwnerReceiptChanged => status(.conflict, .index_owner_receipt_changed),
+        error.PartialIndexPredicateNotImplied => status(.invalid_argument, .partial_index_predicate_not_implied),
         error.InvalidIndexOwnerReceipt => status(.invalid_argument, .invalid_index_owner_receipt),
         error.PreparedGenerationChanged => status(.conflict, .prepared_generation_changed),
         error.PreparedReadSetChanged => status(.conflict, .prepared_read_set_changed),
@@ -2073,6 +2081,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_relational_index_progress => "InvalidRelationalIndexProgress",
         .missing_relational_index_definitions => "MissingRelationalIndexDefinitions",
         .index_owner_receipt_changed => "IndexOwnerReceiptChanged",
+        .partial_index_predicate_not_implied => "PartialIndexPredicateNotImplied",
         .invalid_index_owner_receipt => "InvalidIndexOwnerReceipt",
         .prepared_generation_changed => "PreparedGenerationChanged",
         .prepared_read_set_changed => "PreparedReadSetChanged",

@@ -250,6 +250,17 @@ pub fn load(txn: anytype) !?Binding {
     return if (try optional(txn, key)) |bytes| try Binding.decode(bytes) else null;
 }
 
+/// Suppress descriptor reconciliation while the actual durable owner fence is
+/// active. This is preservation, never execution or serving authority. Current
+/// also verifies a never-visited cancellation's exact intent when no job exists;
+/// that owner must still reopen to admit and finish its bounded cleanup.
+pub fn protectsOwnerCatalog(txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace) !bool {
+    const fence = (try topology.current(txn)) orelse return false;
+    if (fence.role != .index_build) return false;
+    if (!fence.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+    return true;
+}
+
 /// Cold preparation owns its input bytes before any further store read. This
 /// compiler work belongs outside serialized apply, never on a build-page path.
 pub fn reopenCandidate(alloc: std.mem.Allocator, txn: anytype, binding: Binding) !candidate_mod.Candidate {
