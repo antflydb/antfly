@@ -62,7 +62,7 @@ pub fn encodeOriginalArguments(a: std.mem.Allocator, args: std.process.Args) ![]
     return encoded;
 }
 
-/// Match only supervised GLiNER2.5 training and adapter-materialization routes.
+/// Match only supervised training and adapter-materialization routes.
 /// Keep the existing name for runtime ABI callers; unrelated invocations never
 /// receive an original-argv carrier.
 pub fn isTrainingInvocation(args: std.process.Args) bool {
@@ -80,7 +80,7 @@ pub fn isTrainingInvocation(args: std.process.Args) bool {
     if (!std.mem.eql(u8, domain, "train")) return false;
     argument = iterator.next() orelse return false;
     if (std.mem.eql(u8, argument, "run")) argument = iterator.next() orelse return false;
-    return std.mem.eql(u8, argument, "gliner25");
+    return std.mem.eql(u8, argument, "gliner25") or std.mem.eql(u8, argument, "embeddinggemma2");
 }
 
 pub const Arguments = struct {
@@ -138,7 +138,7 @@ pub fn matchesTrainingTail(arguments: []const []const u8, tail: []const []const 
     return invocationKind(arguments, tail) != null;
 }
 
-const InvocationKind = enum { standalone, training, merge };
+const InvocationKind = enum { standalone, gliner25_training, embeddinggemma2_training, merge };
 fn invocationKind(arguments: []const []const u8, tail: []const []const u8) ?InvocationKind {
     if (tail.len == 0 or arguments.len <= tail.len) return null;
     const prefix = arguments.len - tail.len;
@@ -154,7 +154,10 @@ fn invocationKind(arguments: []const []const u8, tail: []const []const u8) ?Invo
     if (!std.mem.eql(u8, arguments[index + 1], "train")) return null;
     index += 2;
     if (std.mem.eql(u8, arguments[index], "run")) index += 1;
-    return if (index + 1 == prefix and std.mem.eql(u8, arguments[index], "gliner25")) .training else null;
+    if (index + 1 != prefix) return null;
+    if (std.mem.eql(u8, arguments[index], "gliner25")) return .gliner25_training;
+    if (std.mem.eql(u8, arguments[index], "embeddinggemma2")) return .embeddinggemma2_training;
+    return null;
 }
 
 /// Recover the real executable invocation, and prove its complete command
@@ -301,15 +304,19 @@ test "one-shot training routes preserve public invocation boundaries" {
     const cases = [_]Case{
         .{ .argv = &.{ "antfly", "inference", "finetune", "train", "gliner25", "/tmp/job.json" }, .expected = true },
         .{ .argv = &.{ "antfly-inference", "finetune", "train", "run", "gliner25", "/tmp/job.json" }, .expected = true },
+        .{ .argv = &.{ "antfly", "inference", "finetune", "train", "run", "embeddinggemma2", "/tmp/job.json" }, .expected = true },
+        .{ .argv = &.{ "antfly-inference", "finetune", "train", "embeddinggemma2", "--help" }, .expected = true },
         .{ .argv = &.{ "antfly", "finetune", "train", "gliner25", "--help" }, .expected = true },
         .{ .argv = &.{ "antfly", "inference", "finetune", "adapter", "materialize", "gliner25", "/tmp/job.json" }, .expected = true },
         .{ .argv = &.{ "antfly-inference", "finetune", "adapter", "materialize", "gliner25", "--help" }, .expected = true },
         .{ .argv = &.{ "antfly-inference", "finetune", "adapter", "inspect", "gliner25", "--help" }, .expected = false },
         .{ .argv = &.{ "train-gliner25", "/tmp/job.json" }, .expected = false },
+        .{ .argv = &.{ "train-embeddinggemma2", "/tmp/job.json" }, .expected = false },
         .{ .argv = &.{ "antfly", "inference", "run" }, .expected = false },
         .{ .argv = &.{ "antfly", "inference", "finetune", "train", "gliner2" }, .expected = false },
         .{ .argv = &.{ "antfly", "inference", "finetune", "train", "run" }, .expected = false },
         .{ .argv = &.{ "antfly", "inference", "finetune", "eval", "gliner25" }, .expected = false },
+        .{ .argv = &.{ "antfly", "inference", "finetune", "eval", "run", "embeddinggemma2-retrieval" }, .expected = false },
         .{ .argv = &.{ "antfly", "--help" }, .expected = false },
     };
     for (cases) |case| try std.testing.expectEqual(case.expected, isTrainingInvocation(.{ .vector = case.argv }));
@@ -337,6 +344,24 @@ fn exerciseOriginalArguments(a: std.mem.Allocator) !void {
 test "one-shot original argv roundtrip owns every allocation" {
     try exerciseOriginalArguments(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseOriginalArguments, .{});
+}
+
+test "one-shot EmbeddingGemma 2 argv binds the training model across the runtime ABI" {
+    if (comptime !supported()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const original = std.process.Args{ .vector = &.{ "antfly", "inference", "finetune", "train", "run", "embeddinggemma2", "/tmp/job.json", "--stop-after-steps", "1" } };
+    const synthetic = std.process.Args{ .vector = &.{ "antfly-runtime", "finetune", "train", "run", "embeddinggemma2", "/tmp/job.json", "--stop-after-steps", "1" } };
+    const tail = [_][]const u8{ "/tmp/job.json", "--stop-after-steps", "1" };
+    const encoded = try encodeOriginalArguments(a, original);
+    defer a.free(encoded);
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    try environment.put(original_argv_env, encoded);
+    var recovered = try originalArguments(a, synthetic, &environment, &tail);
+    defer recovered.deinit();
+    for (original.vector, recovered.values) |expected, actual| try std.testing.expectEqualStrings(std.mem.span(expected), actual);
+    const redirected = std.process.Args{ .vector = &.{ "antfly-runtime", "finetune", "train", "run", "gliner25", "/tmp/job.json", "--stop-after-steps", "1" } };
+    try std.testing.expectError(error.InvalidTrainingInvocation, originalArguments(a, redirected, &environment, &tail));
 }
 
 fn exerciseMergeArguments(a: std.mem.Allocator) !void {

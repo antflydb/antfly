@@ -110,6 +110,12 @@ pub const Session = struct {
         if (result != 0) return error.InvalidVideoData;
         return self;
     }
+    /// Rebind both public preflight and allocator/poll callbacks between
+    /// sequential decode calls. Neither may outlive a borrowed window control.
+    pub fn setControl(self: *Session, control: media.source.Control) void {
+        self.options.control = control;
+        self.owner.control = control;
+    }
     pub fn destroy(self: *Session) void {
         // There are no worker threads, external buffers, OS handles or callbacks
         // in these configurations. Reclaim every allocation even after a parser
