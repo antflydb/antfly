@@ -4433,7 +4433,8 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         var state: index_progress.Update = .{ .head = head, .owner = owner, .changed = false };
         var buf: [192]u8 = undefined;
         for ([_]index_progress.Action{ .fenced, .reserved }, 0..) |action, i| {
-            const receipt: index_progress.Receipt = .{ .owner = owner.owner, .action = action, .position = .{ .raft = .{ .term = 2, .index = 5 + i } }, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = @splat(8) };
+            const cut: local.storage_db_receipt_position.Position = .{ .raft = .{ .term = 2, .index = 5 + i } };
+            const receipt: index_progress.Receipt = .{ .owner = owner.owner, .action = action, .position = cut, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = try local.storage_db_relational_index_raft_contract.effectEvidence(binding, if (action == .fenced) .fenced else .reserved, cut) };
             state = try index_progress.acknowledge(state.head, state.owner, state.head.revision, receipt);
             const signed: index_publication.SignedReceipt = .{ .receipt = receipt, .proof = try proof.sign(root, try receipt.digest()) };
             state.owner.attestations[@backingInt(action)] = try signed.commitment();
@@ -4588,7 +4589,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         for ([_]RecoveryCase{ .{ .head = validated_head, .owner = validated_owner, .ack = ack }, .{ .head = releasing.head, .owner = releasing.owner, .ack = installed_ack } }) |case| {
             var new_view = permission.raft_signing.?;
             new_view.root_generation += 1;
-            const grant = try index_publication.RaftRecoveryGrant.initPhysical(proof.identity.metadata_incarnation, case.head, case.owner, dispatch.value, .{ .signed = case.ack.signed, .validation = case.ack.validation, .installation = case.ack.installation }, new_view);
+            const grant = try index_publication.RaftRecoveryGrant.initRetained(proof.identity.metadata_incarnation, case.head, case.owner, dispatch.value, .{ .signed = case.ack.signed, .validation = case.ack.validation, .installation = case.ack.installation }, new_view);
             var fresh_scope = scope;
             fresh_scope.root_generation = new_view.root_generation;
             var fresh_audit = audit;
@@ -4648,6 +4649,148 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const snapshot = try store.buildMetadataSnapshotTxn(store.alloc, &txn, group, null);
         defer store.alloc.free(snapshot);
         try testRaftValidationRootRecovery(store.alloc, group, snapshot, lookup, audited, scope, root);
+        try testRaftCancellationRootRecovery(store.alloc, group, snapshot, lookup, audit, scope, root);
+    }
+
+    fn testRaftCancellationRootRecovery(alloc: std.mem.Allocator, group: u64, snapshot: []const u8, lookup: index_publication.OwnerRequest, audit: @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditOutcome, scope: index_publication.RaftLocalScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
+        const local = @import("antfly_local_sources");
+        const execution = @import("../../api/relational_index_owner_execution.zig");
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/raft-cancellation-recovery", .{tmp.sub_path});
+        defer alloc.free(path);
+        var expected: index_publication.Ack = undefined;
+        {
+            var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+            defer store.deinit();
+            try std.testing.expect(try store.snapshotBuilder().installSnapshot(alloc, group, 100, snapshot));
+            const before_bytes = try store.relationalIndexOwnerDecisionJson(alloc, group, lookup);
+            defer alloc.free(before_bytes);
+            var before = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, before_bytes, .{});
+            defer before.deinit();
+            try store.applyStandaloneCommand(group, .{ .cancel_relational_index_publication = .{ .table_id = lookup.table_id, .id = lookup.id, .expected_revision = before.value.head.revision, .failure = .requested } });
+            var actual = scope;
+            actual.root_generation += 1;
+            actual.completed_index = 14;
+            try setIndexTestRaftObservation(alloc, &store, group, actual, true);
+            var request = lookup;
+            request.operation = .cancel;
+            const permission_bytes = try store.relationalIndexOwnerDecisionJson(alloc, group, request);
+            defer alloc.free(permission_bytes);
+            var permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, permission_bytes, .{});
+            defer permission.deinit();
+            try permission.value.requireRequest(request);
+            try std.testing.expect(permission.value.raft_recovery == null and permission.value.dispatch != null);
+            try std.testing.expectEqual(actual.root_generation, permission.value.raft_signing.?.root_generation);
+            var ordinary = request;
+            ordinary.operation = .build;
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.relationalIndexOwnerDecisionJson(alloc, group, ordinary));
+            ordinary.operation = .install;
+            try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexOwnerDecisionJson(alloc, group, ordinary));
+            const admission = try permission.value.raftCancellationIntent();
+            const record: local.storage_db_relational_index_owner_job.Canceled = .{ .binding = audit.binding, .intent_position = .{ .raft = .{ .term = 2, .index = 12 } }, .position = .{ .raft = .{ .term = 2, .index = 14 } }, .cleanup = .{ .intent = admission, .position = .{ .raft = .{ .term = 2, .index = 13 } }, .claim_allocation = permission.value.dispatch.?.native_claim_allocation } };
+            const ack = try permission.value.signRaftCancellation(request, record, actual, root);
+            try std.testing.expectEqualDeep(try index_publication.cancellationPredecessorCommitment(before.value.owner), ack.cancellation.?.predecessor_commitment);
+            const valid_bytes = try std.json.Stringify.valueAlloc(alloc, ack, .{});
+            defer alloc.free(valid_bytes);
+            try store.validateRelationalIndexOwnerAck(group, valid_bytes);
+            var missing = ack;
+            missing.cancellation.?.predecessor_commitment = null;
+            const missing_bytes = try std.json.Stringify.valueAlloc(alloc, missing, .{});
+            defer alloc.free(missing_bytes);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, missing_bytes));
+            var forged = ack;
+            forged.cancellation.?.predecessor_commitment.?[0] ^= 1;
+            const forged_bytes = try std.json.Stringify.valueAlloc(alloc, forged, .{});
+            defer alloc.free(forged_bytes);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, forged_bytes));
+            try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = valid_bytes });
+            try verifyRelationRecoveryForTest(&store, alloc, group);
+            // Cleanup committed, but the root changed before cohort release.
+            // Metadata issues observation/re-attestation only; no release can
+            // borrow the previous root's permission.
+            actual.root_generation += 1;
+            try setIndexTestRaftObservation(alloc, &store, group, actual, true);
+            request.operation = .cancel_release;
+            const recovery_bytes = try store.relationalIndexOwnerDecisionJson(alloc, group, request);
+            defer alloc.free(recovery_bytes);
+            var recovery = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, recovery_bytes, .{});
+            defer recovery.deinit();
+            try recovery.value.requireRequest(request);
+            const grant = recovery.value.raft_recovery orelse return error.TestMissingRaftRecoveryGrant;
+            try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, recovery.value.raftExecutionIdentity(request));
+            const state: local.storage_db_relational_index_owner_job.RaftCancellationState = .{ .source = .{ .kind = .raft, .namespace = local.storage_db_online_source_contract.namespaceBytes(audit.binding.fence.namespace) }, .applied = .{ .raft = .{ .term = 2, .index = 14 } }, .intent = .{ .intent = admission, .position = record.intent_position }, .binding = record.binding, .admitted = .{ .raft = .{ .term = 2, .index = 4 } }, .fenced = .{ .raft = .{ .term = 2, .index = 5 } }, .reserved = .{ .raft = .{ .term = 2, .index = 6 } }, .cleanup = record.cleanup.position, .claim_allocation = record.cleanup.claim_allocation, .artifacts_retired = true, .claims_retired = true, .completed = record };
+            expected = try grant.signCanceled(recovery.value.head.revision, state, actual, root);
+            try std.testing.expectEqualDeep(ack.signed.receipt, expected.signed.receipt);
+            try std.testing.expectEqualDeep(ack.cancellation, expected.cancellation);
+            var incomplete = state;
+            incomplete.completed = null;
+            try std.testing.expectError(error.PrivateIndexCancellationPending, grant.signCanceled(recovery.value.head.revision, incomplete, actual, root));
+            incomplete = state;
+            incomplete.claims_retired = false;
+            try std.testing.expectError(error.InvalidPrivateIndexCancellation, grant.signCanceled(recovery.value.head.revision, incomplete, actual, root));
+            const control_request: execution.Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .cancel_release };
+            const response: execution.ControlResponse = .{ .raft_recovery = .{ .root_generation = actual.root_generation, .accepted = ack.signed, .state = state, .signed_ack = expected } };
+            try std.testing.expectEqualDeep(expected, (try response.recoveryAck(control_request)).?);
+            const refreshed_bytes = try std.json.Stringify.valueAlloc(alloc, expected, .{});
+            defer alloc.free(refreshed_bytes);
+            try store.validateRelationalIndexOwnerAck(group, refreshed_bytes);
+            try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = refreshed_bytes });
+            try verifyRelationRecoveryForTest(&store, alloc, group);
+            const next_bytes = try store.relationalIndexOwnerDecisionJson(alloc, group, request);
+            defer alloc.free(next_bytes);
+            var next = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, next_bytes, .{});
+            defer next.deinit();
+            try next.value.requireRequest(request);
+            try std.testing.expect(next.value.raft_recovery == null and next.value.cancellation_release != null);
+            try std.testing.expectEqual(actual.root_generation, next.value.cancellation_release.?.cleanup_proof.root_generation);
+        }
+        var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+        defer reopened.deinit();
+        try verifyRelationRecoveryForTest(&reopened, alloc, group);
+        const status_bytes = try reopened.relationalIndexOwnerAckStatusJson(alloc, group, expected);
+        defer alloc.free(status_bytes);
+        var status = try std.json.parseFromSlice(index_publication.AckStatus, alloc, status_bytes, .{});
+        defer status.deinit();
+        try std.testing.expect(try status.value.isAcknowledged(expected));
+        try std.testing.expectEqual(index_progress.Phase.cancel_releasing, status.value.head.phase);
+        var forged = expected;
+        forged.cancellation.?.predecessor_commitment.?[0] ^= 1;
+        try std.testing.expect(!try status.value.isAcknowledged(forged));
+        {
+            const proof = try index_publication.StoredProof.encode(forged.signed, null, null, forged.cancellation, null);
+            var txn = try reopened.store.beginWriteTxn();
+            defer txn.abort();
+            var key_buf: [192]u8 = undefined;
+            try txn.put(try index_publication.proofKey(&key_buf, group, expected.table_id, expected.signed.receipt.owner.ordinal, .canceled), proof.slice());
+            try std.testing.expectError(error.InvalidCatalogRecord, verifyIndexPublicationGroupTxn(alloc, &txn, group));
+        }
+    }
+
+    fn setIndexTestRaftObservation(alloc: std.mem.Allocator, store: *RaftApplyStore, group: u64, scope: index_publication.RaftLocalScope, cleanup_only: bool) !void {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const header = (try store.loadStoreHeaderTxn(&txn, group, scope.reporter.store_id)).?;
+        defer metadata_table_manager.freeStore(alloc, header);
+        const address = try RaftApplyStore.ReportAddress.active(a, &txn, group, header.store_id);
+        const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &txn, group, address, scope.group_id, true)).?;
+        const groups = try a.dupe(metadata.GroupStatusReport, report.group_statuses);
+        const runtimes = try a.dupe(metadata.RuntimeGroupStatusReport, report.runtime_statuses);
+        groups[0].raft_applied_index = scope.completed_index;
+        groups[0].raft_term = scope.leader_term;
+        runtimes[0].lsm_root_generation = scope.root_generation;
+        var observed = header;
+        observed.group_statuses = groups;
+        observed.runtime_statuses = runtimes;
+        if (cleanup_only) {
+            observed.role = "metadata";
+            observed.schema_reader = .{};
+        }
+        _ = try store.updateListingStoreTxn(&txn, group, header.store_id, observed);
+        try txn.commit();
     }
 
     fn testRaftValidationRootRecovery(alloc: std.mem.Allocator, group: u64, snapshot: []const u8, lookup: index_publication.OwnerRequest, audited: @import("antfly_local_sources").storage_db_relational_index_raft_contract.AuditProgress, scope: index_publication.RaftLocalScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
@@ -4734,27 +4877,9 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         var actual = scope;
         actual.completed_index = 13;
         const installed_ack = try permission.value.signRaftInstallation(request, installed, audit, audit.audit.physical_root_incarnation, actual, root);
-        {
-            // Synthetic physical summaries/cuts qualify the real metadata
-            // transaction, not storage execution. Report the same observed
-            // completed prefix before attempting acceptance.
-            var txn = try store.store.beginWriteTxn();
-            errdefer txn.abort();
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const a = arena.allocator();
-            const header = (try store.loadStoreHeaderTxn(&txn, group, scope.reporter.store_id)).?;
-            defer metadata_table_manager.freeStore(alloc, header);
-            const address = try RaftApplyStore.ReportAddress.active(a, &txn, group, header.store_id);
-            const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &txn, group, address, request.group_id, true)).?;
-            const groups = try a.dupe(metadata.GroupStatusReport, report.group_statuses);
-            groups[0].raft_applied_index = actual.completed_index;
-            var observed = header;
-            observed.group_statuses = groups;
-            observed.runtime_statuses = report.runtime_statuses;
-            _ = try store.updateListingStoreTxn(&txn, group, header.store_id, observed);
-            try txn.commit();
-        }
+        // Synthetic physical facts qualify metadata, not storage execution.
+        // Report the same completed prefix before attempting acceptance.
+        try setIndexTestRaftObservation(alloc, store, group, actual, false);
         const encoded = try std.json.Stringify.valueAlloc(alloc, installed_ack, .{});
         defer alloc.free(encoded);
         try store.validateRelationalIndexOwnerAck(group, encoded);
@@ -18981,11 +19106,13 @@ pub const RaftApplyStore = struct {
         const retained = try stagingGet(txn, try index_publication.proofKey(&buf, group_id, ack.table_id, ordinal, action));
         var previous_evidence: ?index_publication.AuditEvidence = null;
         var previous_terminal: ?[32]u8 = null;
+        var previous_cancellation_predecessor: ?[32]u8 = null;
         if (logical_present) {
             const previous = try index_publication.storedProof(self.alloc, retained orelse return error.InvalidCatalogRecord, head, previous_owner, action);
             if (previous.validation) |witness| previous_evidence = .{ .outcome = witness.outcome, .signed = witness.signed };
             if (previous.installation) |witness| previous_evidence = .{ .outcome = witness.outcome, .signed = witness.signed };
             if (previous.terminal) |witness| previous_terminal = witness.record_digest;
+            if (previous.cancellation) |witness| previous_cancellation_predecessor = witness.predecessor_commitment;
         } else if (retained != null) return error.InvalidCatalogRecord;
         const cleanup_refresh = head.phase == .canceling and logical_present and (action == .fenced or action == .reserved) and (try previous_owner.latestReceiptAction()) == action;
         try self.requireIndexOwnerRootProofTxn(txn, group_id, ack.signed.receipt.owner, ack.signed.receipt.position, ack.signed.proof, head.reader_requirements, action == .canceled or action == .cancel_released or cleanup_refresh);
@@ -19010,7 +19137,8 @@ pub const RaftApplyStore = struct {
                 !std.mem.eql(u8, &previous.signed.outcome_digest, &next_evidence.signed.outcome_digest)) return error.IndexOwnerReceiptChanged;
         }
         const terminal_changed = if (ack.terminal) |witness| logical_present and (previous_terminal == null or !std.mem.eql(u8, &witness.record_digest, &previous_terminal.?)) else false;
-        if (!std.mem.eql(u8, &root, &previous_root) or terminal_changed) {
+        const cancellation_join_changed = if (ack.cancellation) |witness| logical_present and !std.meta.eql(witness.predecessor_commitment, previous_cancellation_predecessor) else false;
+        if (!std.mem.eql(u8, &root, &previous_root) or terminal_changed or cancellation_join_changed) {
             if (!update.changed) {
                 // A different current root can re-attest only the latest
                 // completed stage. Never rewrite historical phase evidence.
@@ -19442,7 +19570,9 @@ pub const RaftApplyStore = struct {
         }
         if (request.cancellation) |witness| if (!std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.canceled)], 0)) {
             const retained = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .canceled)), head, owner, .canceled);
-            if (!std.meta.eql((retained.cancellation orelse return error.InvalidCatalogRecord).record, witness.record)) return error.InvalidCatalogRecord;
+            const accepted = retained.cancellation orelse return error.InvalidCatalogRecord;
+            if (!std.meta.eql(accepted.record, witness.record)) return error.InvalidCatalogRecord;
+            status.cancellation_predecessor = accepted.predecessor_commitment;
         };
         _ = try status.isAcknowledged(request);
         return std.json.Stringify.valueAlloc(alloc, status, .{});
@@ -19562,8 +19692,12 @@ pub const RaftApplyStore = struct {
         var decision: index_publication.OwnerDecision = .{ .metadata_group_id = group_id, .metadata_incarnation = incarnation, .head = head, .owner = owner, .disposition = permission };
         var attest = false;
         var raft_recovery_proof: ?index_publication.StoredProof.Decoded = null;
-        if (owner.owner.authority == .raft and head.phase != .published and head.phase != .canceled) {
-            if (try owner.latestReceiptAction()) |latest| if (latest == .fenced or latest == .reserved or latest == .validated or latest == .installed or latest == .released or latest == .cancel_released or (latest == .canceled and head.phase == .cancel_releasing)) {
+        // Cleanup has its own immutable admission and current-root inspection.
+        // It cannot reopen ordinary work, and must not wait for a build audit
+        // of the candidate it is retiring. Its ACK explicitly rejoins the
+        // retained predecessor commitment in the accepting transaction.
+        if (owner.owner.authority == .raft and head.phase != .published and head.phase != .canceled and !(request.operation == .cancel and permission == .execute)) {
+            if (try owner.latestReceiptAction()) |latest| if (latest == .fenced or latest == .reserved or latest == .validated or latest == .installed or latest == .released or latest == .cancel_released or latest == .canceled) {
                 const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, latest)), head, owner, latest);
                 const control_cleanup = (head.phase == .canceling and (latest == .fenced or latest == .reserved)) or latest == .canceled or latest == .cancel_released;
                 self.requireIndexOwnerRootProofTxn(&txn, group_id, accepted.signed.receipt.owner, accepted.signed.receipt.position, accepted.signed.proof, head.reader_requirements, control_cleanup) catch |err| switch (err) {
@@ -19620,16 +19754,18 @@ pub const RaftApplyStore = struct {
             const control = action == .fenced or action == .reserved;
             const cancellation_terminal = head.phase == .cancel_releasing and (action == .canceled or action == .cancel_released);
             const terminal = cancellation_terminal or (head.phase == .releasing and (action == .installed or action == .released));
-            const signing = (try self.raftIndexSigningViewModeTxn(&txn, group_id, incarnation, owner.owner, reporter, head.reader_requirements, (head.phase == .canceling and control) or cancellation_terminal)) orelse return error.IndexOwnerReceiptChanged;
+            const signing = (try self.raftIndexSigningViewModeTxn(&txn, group_id, incarnation, owner.owner, reporter, head.reader_requirements, (head.phase == .canceling and control) or action == .canceled or cancellation_terminal)) orelse return error.IndexOwnerReceiptChanged;
             if (terminal) {
                 const predecessor = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, if (cancellation_terminal) .canceled else .installed)), head, owner, if (cancellation_terminal) .canceled else .installed);
                 const metadata_decision = if (cancellation_terminal) try index_publication.cancellationReleaseDecisionDigest(group_id, incarnation, head) else try index_publication.ReleaseGrant.decisionDigest(group_id, incarnation, head);
                 decision.raft_recovery = try index_publication.RaftRecoveryGrant.initTerminal(group_id, incarnation, head, owner, d, accepted.signed, predecessor, metadata_decision, signing);
+            } else if (action == .canceled) {
+                decision.raft_recovery = try index_publication.RaftRecoveryGrant.initRetained(incarnation, head, owner, d, accepted, signing);
             } else if (!control) {
                 const frozen = try index_delivery.frozenTargetForRecovery(alloc, &txn, group_id, head, owner, incarnation);
                 const expected = if (accepted.validation) |w| w.outcome.expected else (accepted.installation orelse return error.InvalidCatalogRecord).outcome.expected;
                 if (!std.meta.eql(frozen.expected, expected)) return error.InvalidCatalogRecord;
-                decision.raft_recovery = try index_publication.RaftRecoveryGrant.initPhysical(incarnation, head, owner, d, accepted, signing);
+                decision.raft_recovery = try index_publication.RaftRecoveryGrant.initRetained(incarnation, head, owner, d, accepted, signing);
             } else {
                 decision.raft_recovery = try index_publication.RaftRecoveryGrant.init(incarnation, head, owner, d, accepted.signed, signing);
             }

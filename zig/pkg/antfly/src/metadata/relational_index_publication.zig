@@ -470,6 +470,9 @@ pub const InstallationWitness = struct {
 /// evidence, not an independent permission to cancel or lift the source fence.
 pub const CancellationWitness = struct {
     record: local.storage_db_relational_index_owner_job.Canceled,
+    /// Exact metadata-retained pre-cancellation root commitment. This is a
+    /// lineage join, not a caller-selected permission or a new logical cut.
+    predecessor_commitment: ?Digest = null,
     pub fn verifyFor(self: @This(), signed: SignedReceipt) !void {
         try signed.verifySignature();
         try self.verifyScope(signed);
@@ -477,8 +480,20 @@ pub const CancellationWitness = struct {
     fn verifyScope(self: @This(), signed: SignedReceipt) !void {
         if (signed.receipt.action != .canceled or
             !std.meta.eql(try self.record.receipt(), signed.receipt)) return error.InvalidIndexOwnerReceipt;
+        if (self.predecessor_commitment) |digest_| if (std.mem.allEqual(u8, &digest_, 0)) return error.InvalidIndexOwnerReceipt;
     }
 };
+
+pub fn cancellationPredecessorCommitment(owner: progress.OwnerState) !?Digest {
+    try owner.validate();
+    for ([_]progress.Action{ .validated, .reserved, .fenced }) |action| {
+        if (std.mem.allEqual(u8, &owner.receipts[@backingInt(action)], 0)) continue;
+        const commitment = owner.attestations[@backingInt(action)];
+        if (std.mem.allEqual(u8, &commitment, 0)) return error.InvalidCatalogRecord;
+        return commitment;
+    }
+    return null;
+}
 
 /// A replacement root cannot repeat a historical build audit after release:
 /// ordinary writes are already allowed. The held owner instead verifies this
@@ -535,7 +550,7 @@ fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, insta
 /// Native validation/installation retain mandatory bounded physical witnesses;
 /// neither bare receipts nor older private witness formats are accepted.
 pub const StoredProof = struct {
-    const magic = "AIVP\x04\x00\x00\x00";
+    const magic = "AIVP\x05\x00\x00\x00";
     bytes: [max_ack_bytes]u8,
     len: usize,
     const Witnesses = struct { validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness, terminal: ?TerminalWitness };
@@ -641,6 +656,7 @@ pub const AckStatus = struct {
     validation_digest: ?Digest = null,
     installation_digest: ?Digest = null,
     terminal_digest: ?Digest = null,
+    cancellation_predecessor: ?Digest = null,
     replication_pending: bool = false,
 
     pub fn isAcknowledged(self: AckStatus, request: Ack) !bool {
@@ -678,6 +694,7 @@ pub const AckStatus = struct {
             const retained = self.terminal_digest orelse return false;
             if (!std.mem.eql(u8, &retained, &witness.record_digest)) return false;
         }
+        if (request.cancellation) |witness| if (!std.meta.eql(witness.predecessor_commitment, self.cancellation_predecessor)) return false;
         return !self.replication_pending and std.mem.eql(u8, &root, &try request.signed.commitment());
     }
 };
@@ -950,8 +967,10 @@ pub fn requireReleaseReceipt(group: u64, incarnation: local.metadata_incarnation
 }
 
 /// Shared live/recovery binding. Unvisited owners need no invented prior cut;
-/// visited owners cannot adopt a replacement root or another physical job by
-/// presenting a fresh cancellation signature.
+/// visited owners must either retain the original signing root or explicitly
+/// rejoin its exact metadata commitment. Current enrollment/physical prefix are
+/// verified independently by the accepting transaction; cleanup is not a new
+/// build audit or permission to release the fence.
 pub fn requireCancellationWitness(group: u64, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, witness: CancellationWitness, signed: SignedReceipt, prior: ?StoredProof.Decoded) !void {
     if (group == 0) return error.InvalidCatalogRecord;
     try head.validate();
@@ -967,11 +986,22 @@ pub fn requireCancellationWitness(group: u64, head: progress.Head, owner: progre
     if (witness.record.cleanup.claim_allocation != dispatch.native_claim_allocation) return error.PrivateIndexOwnerJobChanged;
     if (prior) |accepted| {
         const previous = accepted.signed;
-        if (!witness.record.cleanup.position.strictlyAfter(previous.receipt.position) or
-            !std.meta.eql(previous.proof.identity, signed.proof.identity) or !std.meta.eql(previous.proof.authority, signed.proof.authority) or
+        if (!witness.record.cleanup.position.strictlyAfter(previous.receipt.position)) return error.IndexOwnerReceiptChanged;
+        if (witness.predecessor_commitment) |commitment| {
+            if (!std.mem.eql(u8, &commitment, &try previous.commitment())) return error.IndexOwnerReceiptChanged;
+            // A control-stage predecessor commits the precise local physical
+            // allocation as well as the plan. Adoption cannot substitute a
+            // different job that merely has the same logical metadata IDs.
+            if (previous.receipt.action == .fenced or previous.receipt.action == .reserved) {
+                if (previous.receipt.position == .raft) {
+                    const effect: raft_control.Effect = if (previous.receipt.action == .fenced) .fenced else .reserved;
+                    if (!std.mem.eql(u8, &previous.receipt.evidence_digest, &try raft_control.effectEvidence(binding, effect, previous.receipt.position))) return error.PrivateIndexOwnerJobChanged;
+                } else try local.storage_db_relational_index_owner_job.validateNativeReceipt(binding, if (previous.receipt.action == .fenced) .fenced else .reserved, previous.receipt.position.native, previous.receipt);
+            }
+        } else if (!std.meta.eql(previous.proof.identity, signed.proof.identity) or !std.meta.eql(previous.proof.authority, signed.proof.authority) or
             previous.proof.root_generation != signed.proof.root_generation or previous.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
         if (accepted.validation) |validation| if (!std.meta.eql(validation.outcome.binding, binding)) return error.PrivateIndexOwnerJobChanged;
-    }
+    } else if (witness.predecessor_commitment != null) return error.IndexOwnerReceiptChanged;
 }
 
 /// Metadata's accepted cleanup cut plus the root generation that must be
@@ -1028,7 +1058,7 @@ pub const RaftTerminalGrant = struct {
     pub fn intent(self: @This(), retained: RaftRecoveryGrant.Retained) !Intent {
         return switch (retained) {
             .installation => |installed| .{ .release = .{ .installed = installed, .metadata_decision = self.metadata_decision } },
-            .cancellation => |canceled| .{ .cancel_release = .{ .canceled = canceled, .metadata_decision = self.metadata_decision } },
+            .cancellation => |witness| .{ .cancel_release = .{ .canceled = witness.record, .metadata_decision = self.metadata_decision } },
             else => error.InvalidCatalogRecord,
         };
     }
@@ -1054,7 +1084,7 @@ pub const RaftRecoveryGrant = struct {
         control,
         validation: local.storage_db_relational_index_validation.Seal,
         installation: local.storage_db_relational_index_validation.Installed,
-        cancellation: local.storage_db_relational_index_owner_job.Canceled,
+        cancellation: CancellationWitness,
     };
     table_name: []const u8,
     intent: raft_control.Admission,
@@ -1070,7 +1100,7 @@ pub const RaftRecoveryGrant = struct {
         return result;
     }
 
-    pub fn initPhysical(incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, retained: StoredProof.Decoded, signing: RaftSigningView) !@This() {
+    pub fn initRetained(incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, retained: StoredProof.Decoded, signing: RaftSigningView) !@This() {
         try dispatch.requireOwner(owner.owner);
         var result: @This() = .{ .table_name = dispatch.table_name, .intent = .{ .id = head.plan_id, .plan_digest = head.plan_digest, .owner_digest = owner.owner.fence_digest, .ordinal = owner.owner.ordinal, .fence = try privateIndexFence(dispatch.id, dispatch.owner), .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest }, .accepted = retained.signed, .signing = signing };
         if (retained.validation) |witness| {
@@ -1081,6 +1111,10 @@ pub const RaftRecoveryGrant = struct {
             try witness.verifyFor(retained.signed);
             result.retained = .{ .installation = .{ .command = witness.command, .position = retained.signed.receipt.position } };
         }
+        if (retained.cancellation) |witness| {
+            try witness.verifyFor(retained.signed);
+            result.retained = .{ .cancellation = .{ .record = witness.record, .predecessor_commitment = try cancellationPredecessorCommitment(owner) } };
+        }
         try result.validateFor(incarnation, head, owner);
         return result;
     }
@@ -1089,7 +1123,7 @@ pub const RaftRecoveryGrant = struct {
         try dispatch.requireOwner(owner.owner);
         const terminal: RaftTerminalGrant = .{ .metadata_decision = metadata_decision, .predecessor_proof = predecessor.signed.proof };
         var result: @This() = .{ .table_name = dispatch.table_name, .intent = .{ .id = head.plan_id, .plan_digest = head.plan_digest, .owner_digest = owner.owner.fence_digest, .ordinal = owner.owner.ordinal, .fence = try privateIndexFence(dispatch.id, dispatch.owner), .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest }, .accepted = accepted, .signing = signing, .terminal = terminal };
-        if (predecessor.installation) |witness| result.retained = .{ .installation = .{ .command = witness.command, .position = predecessor.signed.receipt.position } } else if (predecessor.cancellation) |witness| result.retained = .{ .cancellation = witness.record } else return error.InvalidCatalogRecord;
+        if (predecessor.installation) |witness| result.retained = .{ .installation = .{ .command = witness.command, .position = predecessor.signed.receipt.position } } else if (predecessor.cancellation) |witness| result.retained = .{ .cancellation = .{ .record = witness.record, .predecessor_commitment = try cancellationPredecessorCommitment(owner) } } else return error.InvalidCatalogRecord;
         try terminal.validateFor(group, incarnation, head, owner, result.retained);
         try result.validateFor(incarnation, head, owner);
         return result;
@@ -1116,18 +1150,38 @@ pub const RaftRecoveryGrant = struct {
             .installed, .released => if (self.retained != .installation) return error.InvalidCatalogRecord,
             .canceled, .cancel_released => if (self.retained != .cancellation) return error.InvalidCatalogRecord,
         }
-        if ((action == .released or action == .canceled or action == .cancel_released) and self.terminal == null) return error.InvalidCatalogRecord;
+        if ((action == .released or action == .cancel_released) and self.terminal == null) return error.InvalidCatalogRecord;
         const predecessor: ?progress.Receipt = switch (self.retained) {
             .control => null,
             .validation => |seal| try seal.command.receiptAt(seal.position),
             .installation => |installed| try installed.command.receiptAt(installed.position),
-            .cancellation => |canceled| try canceled.receipt(),
+            .cancellation => |witness| blk: {
+                if ((head.phase != .canceling and head.phase != .cancel_releasing) or !std.meta.eql(witness.predecessor_commitment, try cancellationPredecessorCommitment(owner))) return error.InvalidCatalogRecord;
+                break :blk try witness.record.receipt();
+            },
         };
         if (action != .released and action != .cancel_released) if (predecessor) |receipt| if (!std.meta.eql(receipt, self.accepted.receipt)) return error.InvalidCatalogRecord;
     }
 
     pub fn terminalIntent(self: @This()) !RaftTerminalGrant.Intent {
         return (self.terminal orelse return error.PrivateIndexRootRecoveryRequired).intent(self.retained);
+    }
+
+    /// Completion already retired this exact physical job. Verify the held
+    /// owner's full retained cleanup state; never repeat a row/index audit or
+    /// invent a cleanup cut merely because its original signer restarted.
+    pub fn signCanceled(self: @This(), revision: u64, state: local.storage_db_relational_index_owner_job.RaftCancellationState, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        if (self.retained != .cancellation or self.accepted.receipt.action != .canceled) return error.PrivateIndexRootRecoveryRequired;
+        try self.signing.requireLocal(actual);
+        try state.validate(self.identity());
+        const record = state.completed orelse return error.PrivateIndexCancellationPending;
+        const witness = self.retained.cancellation;
+        if (!std.meta.eql(record, witness.record) or !raft_control.Admission.fromBinding(record.binding).eql(self.intent)) return error.PrivateIndexOwnerJobChanged;
+        const receipt = try record.receipt();
+        if (!std.meta.eql(receipt, self.accepted.receipt) or receipt.position.raft.term > actual.leader_term or receipt.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const result: Ack = .{ .table_id = receipt.owner.namespace.table_id, .expected_revision = revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = self.signing.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) }, .cancellation = witness };
+        try result.validate();
+        return result;
     }
 
     pub fn requireRetirementGC(self: @This(), command: raft_control.Command) !void {
@@ -1865,7 +1919,7 @@ pub const OwnerDecision = struct {
         const view = try self.raftSigningView(request);
         try view.requireLocal(actual);
         const receipt = try record.receipt();
-        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) }, .cancellation = .{ .record = record } };
+        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) }, .cancellation = .{ .record = record, .predecessor_commitment = try cancellationPredecessorCommitment(self.owner) } };
         try ack.validate();
         return ack;
     }
@@ -3283,6 +3337,26 @@ test "relational index publication Raft decisions bind immutable admission and e
         const api_request: api_execution.Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .reserve };
         const api_response: api_execution.ControlResponse = .{ .raft_recovery = .{ .root_generation = new_view.root_generation, .accepted = signed.signed, .state = inspected, .signed_ack = refreshed } };
         try std.testing.expectEqualDeep(refreshed, (try api_response.recoveryAck(api_request)).?);
+        // Cancellation may retire a reserved local job even when its latest
+        // accepted metadata stage is only the fence. Root adoption must still
+        // reproduce that fence's exact physical-context evidence.
+        var cleanup_binding = binding;
+        cleanup_binding.phase = .reserved;
+        const cleanup_head = try accepted_state.head.cancel(accepted_state.head.revision, .requested);
+        var cleanup_request = sign_request;
+        cleanup_request.operation = .cancel;
+        const cleanup_permission: OwnerDecision = .{ .metadata_group_id = decision.metadata_group_id, .metadata_incarnation = decision.metadata_incarnation, .head = cleanup_head, .owner = accepted_owner, .disposition = .execute, .dispatch = dispatch.value, .raft_signing = new_view };
+        const cleanup_record: local.storage_db_relational_index_owner_job.Canceled = .{ .binding = cleanup_binding, .intent_position = .{ .raft = .{ .term = 7, .index = 3 } }, .position = .{ .raft = .{ .term = 7, .index = 6 } }, .cleanup = .{ .intent = raft_control.Admission.fromBinding(cleanup_binding), .position = .{ .raft = .{ .term = 7, .index = 5 } }, .claim_allocation = dispatch.value.native_claim_allocation } };
+        var cleanup_scope = recovered_scope;
+        cleanup_scope.completed_index = 6;
+        const cleanup_ack = try cleanup_permission.signRaftCancellation(cleanup_request, cleanup_record, cleanup_scope, root);
+        const predecessor: StoredProof.Decoded = .{ .signed = signed.signed, .validation = null };
+        try requireCancellationWitness(decision.metadata_group_id, cleanup_head, accepted_owner, dispatch.value, cleanup_ack.cancellation.?, cleanup_ack.signed, predecessor);
+        var substituted_job = cleanup_ack;
+        substituted_job.cancellation.?.record.binding.physical_reserved.blob_digest[0] ^= 1;
+        substituted_job.signed.receipt = try substituted_job.cancellation.?.record.receipt();
+        substituted_job.signed.proof = try substituted_job.signed.proof.sign(root, try substituted_job.signed.receipt.digest());
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, requireCancellationWitness(decision.metadata_group_id, cleanup_head, accepted_owner, dispatch.value, substituted_job.cancellation.?, substituted_job.signed, predecessor));
     }
     try signing.requireRaftProposal(a, dispatch.value.table_name, sign_request, fence);
     try std.testing.expectError(error.GenerationPublicationChanged, signing.requireRaftProposal(a, "another-table", sign_request, fence));

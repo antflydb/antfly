@@ -536,6 +536,13 @@ pub const RaftRecoveryControlResponse = struct {
                     if (!std.meta.eql(try installed.command.receiptAt(installed.position), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
                     physical = observed.physical;
                 },
+                .canceled => {
+                    if (self.audit != null or self.installation != null) return error.InvalidIndexOwnerReceipt;
+                    const state = self.state orelse return error.InvalidIndexOwnerReceipt;
+                    try state.validate(local.storage_db_relational_index_raft_contract.Identity{ .id = owner.plan_id, .plan_digest = owner.plan_digest, .owner_digest = owner.fence_digest, .ordinal = owner.ordinal, .namespace = owner.namespace, .owner_group_id = owner.group_id });
+                    const record = state.completed orelse return error.PrivateIndexCancellationPending;
+                    if (!std.meta.eql(try record.receipt(), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
+                },
                 else => return error.InvalidIndexOwnerReceipt,
             }
         }
@@ -545,6 +552,9 @@ pub const RaftRecoveryControlResponse = struct {
                 !std.meta.eql(ack.signed.receipt, expected)) return error.InvalidIndexOwnerReceipt;
             if (self.terminal) |terminal| {
                 if (!self.terminal_retired or !std.meta.eql(try publication.TerminalWitness.fromRecord(terminal), ack.terminal orelse return error.InvalidIndexOwnerReceipt)) return error.InvalidIndexOwnerReceipt;
+            } else if (self.accepted.receipt.action == .canceled) {
+                const witness = ack.cancellation orelse return error.InvalidIndexOwnerReceipt;
+                if (!std.meta.eql(witness.record, self.state.?.completed.?)) return error.InvalidIndexOwnerReceipt;
             } else if (physical) |outcome| {
                 const witness = ack.auditEvidence() orelse return error.InvalidIndexOwnerReceipt;
                 if (!std.meta.eql(witness.outcome, outcome)) return error.InvalidIndexOwnerReceipt;

@@ -11929,21 +11929,21 @@ pub const DataServer = struct {
         if (grant.terminal != null) {
             if (try self.raftIndexRecoverTerminal(alloc, table_name, group_id, request, permission, &session, scope, context)) |terminal| return terminal;
             // No terminal effect exists. Installation can be re-audited while
-            // its fence remains held; completed cancellation needs its own
-            // retained-cleanup adoption, not an invented release or an audit
-            // of the now-deleted candidate.
-            if (grant.retained != .installation or grant.accepted.receipt.action != .installed) return error.PrivateIndexRootRecoveryRequired;
+            // its fence remains held; completed cancellation rejoins its
+            // retained cleanup record, not the now-deleted candidate.
+            if (!((grant.retained == .installation and grant.accepted.receipt.action == .installed) or
+                (grant.retained == .cancellation and grant.accepted.receipt.action == .canceled))) return error.PrivateIndexRootRecoveryRequired;
         }
         const runtime = try self.ensureBackendRuntime();
         const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         const control = grant.retained == .control;
-        if (control) {
+        if (control or grant.retained == .cancellation) {
             var observed = try session.cancelStep(alloc, .{ .cancel = grant.intent }, false);
             defer observed.deinit();
             response.state = observed.value.progress.cancel;
         }
         const root = local.storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir) catch |err| {
-            if (!control) return err;
+            if (response.state == null) return err;
             response.signing_failure = .identity_unavailable;
             try response.validate(request);
             return .{ .raft_recovery = response };
@@ -11976,7 +11976,7 @@ pub const DataServer = struct {
         }
         const ready = if (response.audit) |audit| audit.seal != null else if (response.installation) |installed| installed.command != null and installed.installed != null else true;
         if (ready) response.signed_ack = signed: {
-            const ack = if (response.state) |state| grant.sign(permission.head.revision, state, scope, root) else if (response.audit) |audit| grant.signPhysical(permission.head.revision, audit.outcome, audit.seal, null, audit.outcome.audit.physical_root_incarnation, scope, root) else grant.signPhysical(permission.head.revision, response.installation.?.physical.?, null, response.installation.?.installed, response.installation.?.physical.?.audit.physical_root_incarnation, scope, root);
+            const ack = if (response.state) |state| (if (grant.retained == .cancellation) grant.signCanceled(permission.head.revision, state, scope, root) else grant.sign(permission.head.revision, state, scope, root)) else if (response.audit) |audit| grant.signPhysical(permission.head.revision, audit.outcome, audit.seal, null, audit.outcome.audit.physical_root_incarnation, scope, root) else grant.signPhysical(permission.head.revision, response.installation.?.physical.?, null, response.installation.?.installed, response.installation.?.physical.?.audit.physical_root_incarnation, scope, root);
             break :signed ack catch |err| {
                 response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
                 break :signed null;

@@ -198,10 +198,24 @@ predecessors, and a footprint regression caps it at 4 KiB. The default-stack
 Debug gate passes 73 metadata, four receiver and one decoder-floor tests with
 zero failures or leaks. Normal terminal re-attestation is persisted and verified
 after cold metadata reopen; the shared cancellation-release join also rejects
-missing or changed record commitments. Completed-cancellation adoption before
-terminal release and distributed lifecycle fault qualification remain unfinished.
-The worker's Raft cohort guard remains, public CREATE stays guarded, and no
-original SQL case is closed by these component changes.
+missing or changed record commitments. Cleanup now explicitly rejoins the exact
+pre-cancellation receipt commitment rather than requiring a new audit of the
+candidate it is deleting. Control-stage predecessors additionally bind the exact
+physical job; validated predecessors must retain the identical binding. Normal
+cleanup uses current enrolled Raft authority even after reported reader/role
+loss, while completed cleanup can refresh its original cut read-only before a
+separately authorized fence release. Metadata regressions cover both restart
+boundaries, cold reopen, incomplete retirement, substituted physical context and
+corrupt predecessor commitments in live ACK and snapshot verification.
+
+Public activation still needs coordinator integration and distributed fault
+qualification: the bounded coordinator is currently mounted only by
+`LocalStandaloneMetadata.IndexWorkHost`, not the distributed metadata runtime.
+The next integration must use the existing metadata reconcile/leader lease and
+shared runtime maintenance lane, plus the routed owner ports, without placing
+network waits on the metadata control loop. The worker's Raft cohort guard and
+public preparation guard remain; no original SQL case is closed by these
+component changes.
 Cancellation intent now commits at a real Raft position, including an owner's
 first entry or an owner that has not visited the job. Ordinary work stays closed;
 explicit cancellation controls drain and burn the exact generation. Cleanup
