@@ -238,6 +238,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_http_runtime_test_mod, true, true);
     api_http_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
+    const schema_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/schema_contract_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, schema_contract_mod, true, true);
+    schema_contract_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const schema_contract_tests = b.addTest(.{
+        .root_module = schema_contract_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
+        .filters = &.{ "relational contract schema parsing uses bounded stack", "created nested response allowlists cover generated schemas", "api http public sort capability gate" },
+    });
+    const parser_source = schema_contract_mod.import_table.get("antfly_local_sources").?;
+    const parser_selection = b.addOptions();
+    parser_selection.addOption([]const []const u8, "names", &.{"schema_table_schema_impl"});
+    parser_source.addOptions("antfly_local_test_sources", parser_selection);
+    const schema_parser_tests = b.addTest(.{
+        .root_module = parser_source,
+        .filters = &.{"relational contract schema parsing uses bounded stack"},
+    });
+    const schema_contract_step = b.step("antfly-schema-contract-test", "Run bounded schema parsing and public response/sort contracts");
+    schema_contract_step.dependOn(&b.addRunArtifact(schema_contract_tests).step);
+    const install_schema_contracts = b.step("install-schema-contract-tests", "Install schema contract regressions for cross-platform qualification");
+    install_schema_contracts.dependOn(&b.addInstallArtifact(schema_contract_tests, .{ .dest_sub_path = "schema-contract-tests" }).step);
+    install_schema_contracts.dependOn(&b.addInstallArtifact(schema_parser_tests, .{ .dest_sub_path = "schema-parser-tests" }).step);
+
     const api_graph_metric_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_graph_metric_test_root.zig"),
         .target = target,

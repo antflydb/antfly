@@ -226,7 +226,9 @@ test "fragmented mp4 packet offsets DTS PTS durations and sync match ffprobe" {
             for (reader.packets, oracle.value.packets) |packet, expected| try std.testing.expectEqual(expected.dts - shift, packet.dts);
         }
     }
-    try std.testing.checkAllAllocationFailures(a, fragmentedAllocation, .{});
+    // Refuse backing remaps so every campaign enumerates the same allocations.
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), fragmentedAllocation, .{});
 }
 test "fragmented mp4 bad offsets missing tfdt and admission failures release metadata" {
     const bytes = try a.dupe(u8, fragmented_clip);

@@ -22,6 +22,8 @@ import wave
 from pathlib import Path
 
 import pytest
+
+from .conftest import FIRST_USE_REQUEST_TIMEOUT
 from .helpers import make_wav_b64
 from .models import default_generator_model_name
 
@@ -187,7 +189,10 @@ def test_dictate_cleanup_rewrites_transcript(api):
             "context": "chat message to a colleague",
             "max_tokens": 128,
         },
-        timeout=600,
+        # With one resident model, transcription leaves the cleanup generator
+        # cold. Use the same explicit first-use budget as /generate; subsequent
+        # dictation calls retain their ordinary request deadlines.
+        timeout=max(600, FIRST_USE_REQUEST_TIMEOUT),
     )
     if resp.status_code in (400, 404):
         pytest.skip(f"generator unavailable: {resp.text[:200]}")
