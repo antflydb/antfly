@@ -2297,13 +2297,13 @@ pub fn lockApplyGated(
     pending: ?*const std.atomic.Value(bool),
     comptime mode: enum { exclusive, shared },
 ) !void {
-    try enforcePortableRuntimeGate(pending);
+    try enforcePortableRuntimeGateOptional(pending);
     if (mode == .exclusive) mutex.lockExclusive() else mutex.lockShared();
     errdefer if (mode == .exclusive) mutex.unlockExclusive() else mutex.unlockShared();
-    try enforcePortableRuntimeGate(pending);
+    try enforcePortableRuntimeGateOptional(pending);
 }
 
-fn enforcePortableRuntimeGate(pending: ?*const std.atomic.Value(bool)) !void {
+pub fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
     const configured = pending orelse return;
     if (configured.load(.acquire)) return error.PortableRuntimeActivationPending;
 }

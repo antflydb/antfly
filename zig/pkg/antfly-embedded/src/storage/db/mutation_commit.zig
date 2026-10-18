@@ -4480,10 +4480,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try change_journal_mod.encodeRecord(alloc, record);
         }
 
-        pub fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
-            const configured = pending orelse return;
-            if (configured.load(.acquire)) return error.PortableRuntimeActivationPending;
-        }
+        pub const enforcePortableRuntimeGateOptional = execution_resources.enforcePortableRuntimeGateOptional;
 
         pub fn envBoolEnabled(raw: []const u8) bool {
             return !(std.mem.eql(u8, raw, "0") or
