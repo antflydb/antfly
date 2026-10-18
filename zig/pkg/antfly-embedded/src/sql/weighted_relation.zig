@@ -31,7 +31,7 @@ pub const Plan = struct {
         replay: struct { child: *Plan },
         window: struct { child: *Plan },
         union_all: struct { left: *Plan, right: *Plan },
-        cross: struct { child: *Plan, singleton: *const binding.Node, graph_left: bool, factor_only: bool },
+        cross: struct { child: *Plan, build: *Plan, singleton: *const binding.Node, graph_left: bool, factor_only: bool },
     };
     source: *const binding.Node,
     terminal: Terminal = .scan,
@@ -158,8 +158,9 @@ pub const Plan = struct {
             .join => |join| blk: {
                 if (join.correlation) return null;
                 if (join.condition) |program| if (!program.repeatable()) return null;
-                const graph_left = captureSafe(join.right, cursors, 0);
-                const graph = if (graph_left) join.left else if (captureSafe(join.left, cursors, 0)) join.right else return null;
+                const graph_left = captureSafe(join.right, cursors, 0, false) or
+                    (!captureSafe(join.left, cursors, 0, false) and captureSafe(join.right, cursors, 0, true));
+                const graph = if (graph_left) join.left else if (captureSafe(join.left, cursors, 0, true)) join.right else return null;
                 const single = if (graph_left) join.right else join.left;
                 if (join.membership != null and !graph_left) return null;
                 var factor_only = join.condition == null and join.membership == null and (join.kind == .inner or join.kind == .cross);
@@ -182,8 +183,25 @@ pub const Plan = struct {
                     out.* = .{ .fields = try names(a, fields), .multiplicity = request.multiplicity };
                 }
                 const nested = try child(a, graph, input, cursors, depth + stages.items.len + 1);
-                width += nested.width + single.columns.len;
-                break :blk .{ .cross = .{ .child = nested, .singleton = single, .graph_left = graph_left, .factor_only = factor_only } };
+                // Build one dependency partition shared by every probe slot. A
+                // build tuple carries its own bag weight through memory/spill.
+                var build_fields: Names = .empty;
+                var multiplicity: catalog.Multiplicity = .presence;
+                for (mapped) |request| {
+                    for (request.fields) |field| if (columnIndex(single, field) != null) try build_fields.put(a, field, {});
+                    if (request.multiplicity == .exact or (request.multiplicity == .capped and multiplicity == .presence)) multiplicity = request.multiplicity;
+                }
+                if (join.condition) |program| for (program.required_columns) |ordinal| {
+                    const name = node.columns[ordinal].internal;
+                    if (columnIndex(single, name) != null) try build_fields.put(a, name, {});
+                };
+                const keys = if (graph_left) join.right_keys else join.left_keys;
+                for (keys) |program| for (program.required_columns) |ordinal| try build_fields.put(a, single.columns[ordinal].internal, {});
+                const build_requests = try a.alloc(catalog.AggregateWeight, 1);
+                build_requests[0] = .{ .fields = try names(a, build_fields), .multiplicity = multiplicity };
+                const build = try child(a, single, build_requests, cursors, depth + stages.items.len + 1);
+                width += nested.width + build.width;
+                break :blk .{ .cross = .{ .child = nested, .build = build, .singleton = single, .graph_left = graph_left, .factor_only = factor_only } };
             },
             else => return null,
         };
@@ -217,12 +235,12 @@ pub const Plan = struct {
     /// Ordinary pinned scans may be captured into a bounded, spillable build.
     /// Capability inspection never advances a graph producer. Repeated or
     /// correlated evaluation and volatile expressions remain barriers.
-    fn captureSafe(node: *const binding.Node, cursors: []const catalog.Cursor, depth: usize) bool {
+    fn captureSafe(node: *const binding.Node, cursors: []const catalog.Cursor, depth: usize, weighted: bool) bool {
         if (depth >= 64) return false;
         return switch (node.operation) {
             .singleton, .literal_rows => true,
-            .scan => |scan| cursors[scan.index].enable_weights == null and cursors[scan.index].enable_aggregate_weights == null,
-            .materialized_ref => |source| captureSafe(source, cursors, depth + 1),
+            .scan => |scan| weighted or (cursors[scan.index].enable_weights == null and cursors[scan.index].enable_aggregate_weights == null),
+            .materialized_ref => |source| captureSafe(source, cursors, depth + 1, weighted),
             .query => |q| blk: {
                 if (q.constant_refs.len != 0) break :blk false;
                 if (q.binding.scalars.predicate) |p| if (!p.repeatable()) break :blk false;
@@ -237,11 +255,14 @@ pub const Plan = struct {
                     if (aggregate.having) |program| if (!program.repeatable()) break :blk false;
                     for (aggregate.ordered) |ordered| if (ordered.direct) |program| if (!program.repeatable()) break :blk false;
                 }
-                break :blk captureSafe(q.source, cursors, depth + 1);
+                break :blk captureSafe(q.source, cursors, depth + 1, weighted);
             },
-            .set => |set| captureSafe(set.left, cursors, depth + 1) and captureSafe(set.right, cursors, depth + 1),
+            .join => |join| !join.correlation and
+                (if (join.condition) |program| program.repeatable() else true) and
+                captureSafe(join.left, cursors, depth + 1, weighted) and captureSafe(join.right, cursors, depth + 1, weighted),
+            .set => |set| captureSafe(set.left, cursors, depth + 1, weighted) and captureSafe(set.right, cursors, depth + 1, weighted),
             .values => |arms| for (arms) |arm| {
-                if (!captureSafe(arm, cursors, depth + 1)) break false;
+                if (!captureSafe(arm, cursors, depth + 1, weighted)) break false;
             } else true,
             else => false,
         };

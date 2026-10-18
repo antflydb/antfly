@@ -2059,6 +2059,13 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)-[:CITES]->(d:Document) RETURN count(*),sum(d.rank)",
         "WITH b ORDER BY b.rank LIMIT 3 OPTIONAL MATCH (b)-[:CITES]->(d:Document) RETURN count(*),count(d)",
         "WITH b ORDER BY b.rank LIMIT 3 WITH DISTINCT * RETURN count(*),sum(b.rank)",
+        "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)<-[:CITES*0..3]-(d:Document) RETURN count(*),sum(d.rank)",
+        "WITH b ORDER BY b.rank LIMIT 3 OPTIONAL MATCH (b)<-[:CITES*0..3]-(d:Document) WHERE d.rank<0 RETURN count(*),count(d)",
+        "WITH b ORDER BY b.rank LIMIT 3 MATCH p=(b)<-[:CITES*0..3]-(d:Document) RETURN count(*),sum(length(p))",
+        "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)<-[:CITES*0..3]-(d:Document) WITH DISTINCT * RETURN count(*)",
+        "WITH b ORDER BY b.rank LIMIT 3 WITH b WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) } RETURN count(*),sum(b.rank)",
+        "WITH b ORDER BY b.rank LIMIT 3 RETURN count(EXISTS { MATCH (b)-[:CITES]->(d:Document) RETURN count(*) })",
+        "WITH b ORDER BY b.rank LIMIT 3 WITH b,[(b)-[:CITES]->(d:Document) | d.rank] AS xs UNWIND xs AS x RETURN count(*),sum(x)",
     }) |tail| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -2087,6 +2094,8 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "MATCH (a:Document)-[:CITES*1..2 {weight:1/0}]->(b:Document) WHERE a.rank<0 RETURN count(*)",
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b ORDER BY 1/0 RETURN count(*)",
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b,1/0 AS dead ORDER BY b.rank RETURN count(*)",
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b ORDER BY b.rank LIMIT 3 WITH b WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) WHERE false } AND 1/0=1 RETURN count(*)",
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b ORDER BY b.rank LIMIT 3 MATCH (b)-[:CITES*0..2]->(d:Document) WHERE b.rank<0 AND 1/0=1 RETURN count(*)",
     }) |text| {
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);

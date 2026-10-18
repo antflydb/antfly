@@ -2046,6 +2046,23 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
             },
         )
         assert [cell["value"] for cell in result["rows"][0]] == expected
+    window = "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) WITH b ORDER BY b.score LIMIT 5000000 "
+    for tail, expected in (
+        ("WITH b WHERE EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(*)", ["0"]),
+        ("WITH b WHERE NOT EXISTS { MATCH (b)-[:R]->(c:D) } RETURN count(*),sum(b.score)", ["5000000", "320000000"]),
+        ("RETURN count(EXISTS { MATCH (b)-[:R]->(c:D) RETURN count(*) })", ["5000000"]),
+        ("WITH b,[(b)-[:R]->(c:D) | c.score] AS xs UNWIND xs AS x RETURN count(*)", ["0"]),
+        ("MATCH (b)<-[:R*24..24]-(c:D) RETURN count(*)", ["83886080000000"]),
+        ("MATCH p=(b)<-[:R*24..24]-(c:D) WITH c WITH * RETURN count(*)", ["83886080000000"]),
+        ("MATCH (b)<-[:R*24..24]-(c:D) RETURN sum(c.score)", ["3355443200000000"]),
+        ("OPTIONAL MATCH (b)<-[:R*24..24]-(c:D) RETURN count(*),count(c)", ["83886080000000", "83886080000000"]),
+        ("MATCH (b)<-[:R*64..64]-(c:D) WITH DISTINCT c RETURN count(*)", ["1"]),
+    ):
+        result = db.cypher_json(
+            "g", {"query": window + tail, "limits": {"intermediate_states": 15000, "explored_edges": 1000}}
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == expected
+
     empty_binding = db.cypher_json(
         "g",
         {"query": "MATCH (:D {id:'start'})-[:R*64..64]->(:D) WITH * LIMIT 5000000 WITH DISTINCT * RETURN count(*)"},
@@ -2108,6 +2125,20 @@ def test_persisted_dimensions_membership_and_outer_joins_keep_weights(graph_db):
         started = time.monotonic()
         assert db.sql(f"SELECT count(*) FROM {relation} WHERE q.score {predicate}")["rows"] == [[str(count)]]
         assert time.monotonic() - started < 5
+    # Both inputs are graph producers. The build must retain its own bag
+    # weights, including duplicate endpoints, rather than decode every route.
+    vertices = "GRAPH_TABLE(g MATCH(d IS D) COLUMNS(d.score AS k)) d"
+    started = time.monotonic()
+    assert db.sql(f"SELECT count(*),sum(q.score) FROM {relation} JOIN {vertices} ON q.score=d.k")["rows"] == [
+        [str(full_count), str(full_sum)]
+    ]
+    weighted = f"GRAPH_TABLE(g MATCH {path} COLUMNS(b.score AS k)) d"
+    expected_count = sum(comb(i, 6) ** 2 for i in range(6, 18))
+    expected_sum = sum(i * comb(i, 6) ** 2 for i in range(6, 18))
+    assert db.sql(f"SELECT count(*),sum(q.score) FROM {relation} JOIN {weighted} ON q.score=d.k")["rows"] == [
+        [str(expected_count), str(expected_sum)]
+    ]
+    assert time.monotonic() - started < 5
     empty_graph = f"(SELECT q.score FROM {relation} WHERE q.score<0) q"
     assert db.sql(f"SELECT count(*),count(q.score),sum(d.k) FROM {empty_graph} FULL JOIN dim d ON q.score=d.k")[
         "rows"

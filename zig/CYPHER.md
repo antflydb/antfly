@@ -1368,13 +1368,17 @@ retain their error dependencies. Projected rows carry explicit aligned weights
 and active aggregate slots through filtering and pagination. A bounded operator
 tree concatenates UNION ALL contributions and carries them through cross joins
 with a repeatable side relation. Pinned table scans, literal relations and
-repeatable aggregate summaries are captured once before graph production;
-builds use the statement's scan and memory quotas and the typed hash join's
+repeatable aggregate summaries are captured once before graph production.
+Graph-derived builds negotiate their own dependency fields and multiplicity
+demand; a single build partition covers the union needed by probe consumers.
+Both arms retain compressed contributions. Private unsigned weight limbs travel
+with each build tuple through memory and spill, and matches multiply the two
+weights with the active consumers' exact or capped overflow policy. Builds use the statement's scan and memory quotas and the typed hash join's
 spill path. Unobserved side columns permit direct multiplication of contribution
 weights. Conditional inner, left/right and full outer joins preserve duplicate
 keys, SQL NULLs and ON residuals. Full and side-preserving outer joins track
-matched build entries and emit each unmatched dimension row once to every
-aggregate consumer. Membership lowering retains its NULL-aware summaries and
+matched build entries and emit each unmatched build contribution with its
+original weight to every aggregate consumer. Membership lowering retains its NULL-aware summaries and
 repeatable builds rather than expanding the graph input.
 Each unsupported child retains
 ordinary production with unit weights, so negotiation never requires advancing a
@@ -1509,9 +1513,19 @@ observes their order. Ordered finite windows retain compressed endpoint bags in
 a weighted TopK heap: excess multiplicities are trimmed at the worst key, SKIP
 consumes weights, and intermediate WITH windows pass the clipped exact bags to
 subsequent projections, filters, UNWIND, wildcard DISTINCT, MATCH, OPTIONAL MATCH
-and reductions. Each subsequent match expands one selected binding per bag and
-carries its exact input multiplicity onto the resulting bindings; trail scope
-and optional null extension remain clause-local. Expansion is
+and reductions. Pure correlated EXISTS and pattern-comprehension expressions
+run once per weighted binding, preserving their own aggregate scopes; writes
+and procedure calls remain execution barriers. Expression evaluation isolates
+nested profiling buffers from retained execution state.
+Each subsequent match negotiates a seed-aware weighted child producer. Binding
+liveness follows WITH scopes, including wildcard observation, match constraints
+and eager expression dependencies. Endpoint-only children retain compressed
+counts and multiply them by the parent contribution; observing route or interior
+identity keeps exact production. Presence reductions do not require exact path
+counts, COUNT retains its overflow sentinel, and numeric folds require exact
+weights. Finite child windows use capped counts only when a proven row goal fits
+the protocol's saturation bound. Trail scope and optional null extension remain
+clause-local. Expansion is
 reserved for external rows and consumers such as non-DISTINCT collect that need
 individual elements. Saturated path
 counts remain sufficient for a finite window. Other ordering, aggregation,

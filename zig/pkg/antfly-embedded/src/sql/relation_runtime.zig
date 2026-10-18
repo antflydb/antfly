@@ -206,6 +206,7 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
         fn checkpoint(_: *anyopaque) !void {}
         saturated: bool = false,
         dimension_count: usize = 3,
+        weighted_dimension: bool = false,
         opened: usize = 0,
         closed: usize = 0,
         const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "v", .path = "v", .type = .integer, .element_type = .int64, .nullable = false }} };
@@ -255,7 +256,7 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
             const state = try a.create(State);
             state.* = .{ .a = a, .owner = self, .dimension = std.mem.eql(u8, input.physical_name, "dim") };
             self.opened += 1;
-            return .{ .ptr = state, .next = State.next, .close = State.close, .enable_weights = if (state.dimension) null else State.enable };
+            return .{ .ptr = state, .next = State.next, .close = State.close, .enable_weights = if (state.dimension and !self.weighted_dimension) null else State.enable };
         }
         const Statement = struct {
             a: Allocator,
@@ -281,8 +282,8 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
             state.* = .{ .a = a, .cursors = cursors };
             return .{ .ptr = state, .cursors = cursors, .close = Statement.close };
         }
-        fn spillRun(a: Allocator) !void {
-            var self: @This() = .{ .dimension_count = 4096 };
+        fn spillRun(a: Allocator, weighted: bool) !void {
+            var self: @This() = .{ .dimension_count = 4096, .weighted_dimension = weighted };
             var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &self, .checkpoint = checkpoint, .async_writes = false };
             defer manager.deinit();
             const backend: catalog.Backend = .{ .ptr = &self, .spill_manager = &manager, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint } };
@@ -290,8 +291,8 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
             defer compiled.deinit();
             var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 5000 });
             defer result.deinit();
-            try std.testing.expectEqualStrings("409600", result.output.rows[0][0].string);
-            try std.testing.expectEqualStrings("206848", result.output.rows[0][1].string);
+            try std.testing.expectEqualStrings(if (weighted) "40960000" else "409600", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings(if (weighted) "20684800" else "206848", result.output.rows[0][1].string);
             try std.testing.expect(manager.written_bytes > 0);
             try std.testing.expectEqual(@as(usize, 0), manager.files);
             try std.testing.expectEqual(self.opened, self.closed);
@@ -319,6 +320,10 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 .{ .sql = "SELECT sum(d.v),count(*) FROM docs d WHERE d.v IN(SELECT v FROM dim)", .sum = "200", .count = "100" },
                 .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM cached", .sum = "200", .count = "100" },
                 .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM (SELECT v FROM cached UNION ALL SELECT v FROM cached) d", .sum = "400", .count = "200" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN docs x ON d.v=x.v", .sum = "20000", .count = "10000" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d FULL JOIN docs x ON d.v=x.v AND d.v=3", .sum = "200", .count = "200" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d CROSS JOIN docs x", .sum = "20000", .count = "10000" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT v FROM docs UNION ALL SELECT v FROM docs) x ON d.v=x.v", .sum = "40000", .count = "20000" },
             }) |case| {
                 var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
                 defer compiled.deinit();
@@ -326,6 +331,18 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 defer result.deinit();
                 try std.testing.expectEqualStrings(case.sum, result.output.rows[0][0].string);
                 try std.testing.expectEqualStrings(case.count, result.output.rows[0][1].string);
+            }
+            {
+                self.weighted_dimension = true;
+                defer self.weighted_dimension = false;
+                var compiled = try @import("compiler.zig").compile(a, "SELECT sum(d.v),sum(x.v),count(*),count(DISTINCT x.v) FROM docs d FULL JOIN dim x ON d.v=x.v", .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
+                defer result.deinit();
+                try std.testing.expectEqualStrings("20000", result.output.rows[0][0].string);
+                try std.testing.expectEqualStrings("20300", result.output.rows[0][1].string);
+                try std.testing.expectEqualStrings("10200", result.output.rows[0][2].string);
+                try std.testing.expectEqualStrings("2", result.output.rows[0][3].string);
             }
             {
                 var compiled = try @import("compiler.zig").compile(a, "SELECT count(*) FROM (SELECT 1/(v-2) AS bad FROM docs LIMIT 1 OFFSET 100) d", .{});
@@ -347,7 +364,8 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
         }
     };
     try Fixture.run(std.testing.allocator);
-    try Fixture.spillRun(std.testing.allocator);
+    try Fixture.spillRun(std.testing.allocator, false);
+    try Fixture.spillRun(std.testing.allocator, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
@@ -2287,8 +2305,8 @@ fn Engine(comptime Context: type) type {
             right: ?*WeightedReader = null,
             ordinary: ?*Iterator = null,
             fallback: bool = false,
-            singleton_iterator: ?*Iterator = null,
             side_count: usize = 0,
+            side_weight: u64 = 0,
             replay_reader: ?*Replay.Reader = null,
             membership_index: ?*operators.TupleMembership = null,
             unmatched_index: usize = 0,
@@ -2320,7 +2338,7 @@ fn Engine(comptime Context: type) type {
                         const cursor = engine.cursors[plan.source.operation.scan.index];
                         break :blk cursor.enable_weights != null or cursor.enable_aggregate_weights != null;
                     },
-                    .cross => |join| hasProducer(engine, join.child.*),
+                    .cross => |join| hasProducer(engine, join.child.*) or hasProducer(engine, join.build.*),
                     .replay => |replay| hasProducer(engine, replay.child.*),
                     .window => |window| hasProducer(engine, window.child.*),
                     .union_all => |set| hasProducer(engine, set.left.*) or hasProducer(engine, set.right.*),
@@ -2369,8 +2387,8 @@ fn Engine(comptime Context: type) type {
                     },
                     .cross => |join| {
                         self.left = try create(engine, join.child.*);
-                        self.singleton_iterator = try Iterator.create(engine, join.singleton);
-                        self.compressed = self.left.?.compressed;
+                        self.right = try create(engine, join.build.*);
+                        self.compressed = self.left.?.compressed or self.right.?.compressed;
                     },
                 }
                 return self;
@@ -2381,7 +2399,6 @@ fn Engine(comptime Context: type) type {
                 if (self.left) |child| child.deinit();
                 if (self.right) |child| child.deinit();
                 if (self.ordinary) |iterator| iterator.deinit();
-                if (self.singleton_iterator) |iterator| iterator.deinit();
                 if (self.replay_reader) |reader| reader.close();
                 if (self.membership_index) |index| index.deinit();
                 if (self.window_cursor) |cursor| cursor.close();
@@ -2389,6 +2406,17 @@ fn Engine(comptime Context: type) type {
                 if (self.cross_page) |*page| page.deinit();
                 if (self.cross_arena) |*arena| arena.deinit();
                 if (self.join_scratch) |*arena| arena.deinit();
+            }
+            fn buildWeight(values: []const Datum) u64 {
+                return (@as(u64, @intCast(values[values.len - 2].value.integer)) << 32) |
+                    @as(u64, @intCast(values[values.len - 1].value.integer));
+            }
+            fn combineWeight(self: *WeightedReader, left: u64, right: u64, add: bool, active: []const usize) !u64 {
+                const exact = for (active) |slot| {
+                    if (self.plan.requests[slot].multiplicity == .exact) break true;
+                } else false;
+                if (exact) return if (add) std.math.add(u64, left, right) catch error.SqlNumericOutOfRange else std.math.mul(u64, left, right) catch error.SqlNumericOutOfRange;
+                return @min(@as(u64, std.math.maxInt(i64)) + 1, if (add) left +| right else left *| right);
             }
             fn cloneValues(a: Allocator, values: []const Datum) ![]const Datum {
                 const result = try a.alloc(Datum, values.len);
@@ -2595,10 +2623,19 @@ fn Engine(comptime Context: type) type {
                             while (true) {
                                 _ = scratch.reset(.free_all);
                                 const temporary = scratch.allocator();
-                                const values = try self.singleton_iterator.?.next(temporary) orelse break;
+                                var build_page = try self.right.?.next(temporary, 1);
+                                defer build_page.deinit();
+                                if (build_page.rows.len == 0) {
+                                    if (build_page.after == null) break;
+                                    continue;
+                                }
+                                const values = try temporary.alloc(Datum, join.singleton.columns.len);
+                                for (join.singleton.columns, values) |column, *value| value.* = try build_page.rows[0].cell(column.internal);
+                                const build_weight = build_page.multiplicities.?[0];
                                 try self.engine.checkpoint();
                                 if (self.side_count >= self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                                 self.side_count += 1;
+                                if (join.factor_only) self.side_weight = try self.combineWeight(self.side_weight, build_weight, true, self.slots);
                                 if (join.factor_only) continue;
                                 const programs = if (join.graph_left) operation.right_keys else operation.left_keys;
                                 const keys = try temporary.alloc(Datum, programs.len);
@@ -2609,11 +2646,18 @@ fn Engine(comptime Context: type) type {
                                         if (key.sql_null) break true;
                                     } else false;
                                     if (!null_correlation) try index.add(keys);
-                                } else try self.join_hash.?.add(values, keys);
+                                } else {
+                                    // Two unsigned 32-bit limbs survive Datum's signed
+                                    // integer codec, including the overflow sentinel.
+                                    const payload = try temporary.alloc(Datum, values.len + 2);
+                                    @memcpy(payload[0..values.len], values);
+                                    payload[values.len] = Datum.json(.{ .integer = @intCast(build_weight >> 32) });
+                                    payload[values.len + 1] = Datum.json(.{ .integer = @intCast(build_weight & 0xffffffff) });
+                                    try self.join_hash.?.add(payload, keys);
+                                }
                             }
                             if (self.membership_index) |index| try index.seal();
-                            self.singleton_iterator.?.deinit();
-                            self.singleton_iterator = null;
+                            self.right.?.deinit();
                             self.singleton_ready = true;
                         }
                         var rows: std.ArrayList(catalog.Row) = .empty;
@@ -2631,7 +2675,7 @@ fn Engine(comptime Context: type) type {
                                     };
                                 }
                                 try rows.append(a, try row(a, self.plan.source.columns, values));
-                                try weights.append(a, 1);
+                                try weights.append(a, buildWeight(side));
                             };
                             return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = self.slots, .after = if (rows.items.len == limit) "unmatched" else null };
                         }
@@ -2710,10 +2754,8 @@ fn Engine(comptime Context: type) type {
                             }
                             try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values)));
                             const weight = page.multiplicities.?[self.cross_row];
-                            const capped = for (self.plan.requests) |request| {
-                                if (request.multiplicity == .exact) break false;
-                            } else true;
-                            const multiplied = if (!join.factor_only) weight else if (capped) @min(@as(u64, std.math.maxInt(i64)) + 1, weight *| self.side_count) else std.math.mul(u64, weight, self.side_count) catch return error.SqlNumericOutOfRange;
+                            const factor = if (join.factor_only) self.side_weight else if (single) |items| buildWeight(items) else 1;
+                            const multiplied = try self.combineWeight(weight, factor, false, page.aggregate_slots.?);
                             try weights.append(a, multiplied);
                             if (single == null) {
                                 self.join_probe = null;

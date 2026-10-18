@@ -948,6 +948,7 @@ const Engine = struct {
     component_proof: bool = false,
     component_leaves: []const ComponentLeaf = &.{},
     retain_windows: bool = false,
+    match_weight_demand: ?Multiplicity = null,
     pending_window: ?WeightedRows = null,
     weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
@@ -1132,6 +1133,8 @@ const Engine = struct {
         }
     };
     fn collectStreamingAggregates(self: *Engine, expression: *const ast.Expr, calls: *std.ArrayList(*const ast.Expr)) !bool {
+        // Pattern subqueries own their aggregate scope.
+        if (expression.value == .exists or expression.value == .pattern_comprehension) return true;
         if (expression.value == .call and aggregateName(expression.value.call.name)) {
             const call_value = expression.value.call;
             for (call_value.args) |arg| if (aggregates(arg)) return false;
@@ -1684,7 +1687,7 @@ const Engine = struct {
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
-        const weighted_top = !grouped and projection.limit != null and (projection.order.len != 0 or self.retain_windows);
+        const weighted_top = !grouped and (self.match_weight_demand != null or (projection.limit != null and (projection.order.len != 0 or self.retain_windows)));
         const count_endpoints = !count_shortest and operation.paths.len == 1 and path.selector == .all and (grouped or weighted_top) and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
@@ -2032,20 +2035,164 @@ const Engine = struct {
         }
         return null;
     }
+    // A pure correlated expression is evaluated once per binding; its
+    // result keeps that binding's multiplicity. Procedures and writes are
+    // execution barriers, including when nested inside EXISTS.
+    fn weightedExpression(value: anytype) bool {
+        if (@TypeOf(value) == ast.Clause) switch (value.operation) {
+            .match, .project, .unwind, .subquery => {},
+            else => return false,
+        };
+        switch (@typeInfo(@TypeOf(value))) {
+            .pointer => |pointer| {
+                if (pointer.size == .one and pointer.child == ast.Expr) return weightedExpression(value.*);
+                if (pointer.size == .slice and pointer.child != u8) for (value) |child| {
+                    if (!weightedExpression(child)) return false;
+                };
+            },
+            .@"struct" => |structure| inline for (structure.field_names) |name| {
+                if (!weightedExpression(@field(value, name))) return false;
+            },
+            .@"union" => switch (value) {
+                inline else => |payload| return weightedExpression(payload),
+            },
+            .optional => if (value) |child| return weightedExpression(child),
+            else => {},
+        }
+        return true;
+    }
     fn weightedTail(self: *Engine, clauses: []const ast.Clause) bool {
         _ = self;
         if (clauses.len == 0) return false;
         for (clauses) |clause| switch (clause.operation) {
-            .project => |p| {
-                for (p.value.items) |item| if (@import("expressions.zig").containsPattern(item.expression)) return false;
-                for (p.value.order) |order| if (@import("expressions.zig").containsPattern(order.expression)) return false;
-                if (p.value.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return false;
-            },
-            .match => {},
-            .unwind => |u| if (@import("expressions.zig").containsPattern(u.expression)) return false,
+            .project, .match, .unwind => if (!weightedExpression(clause)) return false,
             else => return false,
         };
         return true;
+    }
+    fn matchReferences(self: *Engine, names: *Names, shape: Row, value: anytype) anyerror!void {
+        if (@TypeOf(value) == ast.Projection) {
+            if (value.wildcard) for (shape) |entry| try names.put(self.a, entry.name, {});
+        }
+        if (@TypeOf(value) == ast.Match) for (value.paths) |path| {
+            for (path.nodes) |node| if (node.alias) |name| try names.put(self.a, name, {});
+            for (path.edges) |edge| if (edge.alias) |name| try names.put(self.a, name, {});
+            if (path.alias) |name| try names.put(self.a, name, {});
+        };
+        switch (@typeInfo(@TypeOf(value))) {
+            .pointer => |pointer| {
+                if (pointer.size == .one and pointer.child == ast.Expr) return self.retainReferences(names, shape, value);
+                if (pointer.size == .slice and pointer.child != u8) for (value) |child| try self.matchReferences(names, shape, child);
+            },
+            .@"struct" => |structure| inline for (structure.field_names) |name| try self.matchReferences(names, shape, @field(value, name)),
+            .@"union" => switch (value) {
+                inline else => |payload| return self.matchReferences(names, shape, payload),
+            },
+            .optional => if (value) |child| try self.matchReferences(names, shape, child),
+            else => {},
+        }
+    }
+    fn matchDemand(clauses: []const ast.Clause) Multiplicity {
+        for (clauses) |clause| switch (clause.operation) {
+            .match, .unwind => {},
+            .project => |p| {
+                var calls = false;
+                for (p.value.items) |item| calls = calls or aggregates(item.expression);
+                for (p.value.order) |order| if (aggregates(order.expression)) return .exact;
+                if (!calls and p.value.distinct) return .presence;
+                if (!calls and p.value.limit != null) {
+                    // The capped protocol saturates at i64 overflow. It can
+                    // select a finite window only when that covers SKIP+LIMIT.
+                    // Unknown/large row goals retain exact multiplicities.
+                    const limit = p.value.limit.?;
+                    if (limit.value != .literal or limit.value.literal != .integer or limit.value.literal.integer < 0) return .exact;
+                    const skip: u64 = if (p.value.skip) |expression| blk: {
+                        if (expression.value != .literal or expression.value.literal != .integer or expression.value.literal.integer < 0) return .exact;
+                        break :blk @intCast(expression.value.literal.integer);
+                    } else 0;
+                    return if (skip + @as(u64, @intCast(limit.value.literal.integer)) <= @as(u64, std.math.maxInt(i64)) + 1) .capped else .exact;
+                }
+                // COUNT can consume the overflow sentinel. Numeric folds
+                // need exact weights, including their eager error behavior.
+                if (calls) {
+                    for (p.value.items) |item| {
+                        const expr = item.expression;
+                        if (expr.value != .call or !std.ascii.eqlIgnoreCase(expr.value.call.name, "count")) return .exact;
+                    }
+                    return .capped;
+                }
+            },
+            else => return .exact,
+        };
+        return .exact;
+    }
+    fn weightedMatch(self: *Engine, input: Row, operation: ast.Match, tail: []const ast.Clause) !WeightedRows {
+        var shape: Row = input;
+        for (operation.paths) |path| {
+            for (path.nodes) |node| if (node.alias) |name| {
+                shape = try self.replace(shape, name, .null);
+            };
+            for (path.edges) |edge| if (edge.alias) |name| {
+                shape = try self.replace(shape, name, .null);
+            };
+            if (path.alias) |name| {
+                shape = try self.replace(shape, name, .null);
+            }
+        }
+        var names: Names = .empty;
+        // Track which original bindings survive each scope boundary. A later
+        // wildcard observes that scope, not discarded path/interior aliases.
+        var active = shape;
+        for (tail) |clause| {
+            var references: Names = .empty;
+            try self.matchReferences(&references, active, clause);
+            for (active) |entry| if (references.contains(entry.name)) try names.put(self.a, entry.name, {});
+            switch (clause.operation) {
+                .project => |p| {
+                    var next: std.ArrayList(v.Entry) = .empty;
+                    if (p.value.wildcard) for (active) |entry| {
+                        const shadowed = for (p.value.items) |item| {
+                            if (std.mem.eql(u8, entry.name, item.alias orelse try self.expressionName(item.expression))) break true;
+                        } else false;
+                        if (!shadowed) try next.append(self.a, entry);
+                    };
+                    active = next.items;
+                },
+                .unwind => |u| {
+                    var next: std.ArrayList(v.Entry) = .empty;
+                    for (active) |entry| if (!std.mem.eql(u8, entry.name, u.alias)) try next.append(self.a, entry);
+                    active = next.items;
+                },
+                else => {},
+            }
+        }
+        var items: std.ArrayList(ast.Item) = .empty;
+        for (shape) |entry| if (names.contains(entry.name)) {
+            const expression = try self.a.create(ast.Expr);
+            expression.* = .{ .span = .{}, .value = .{ .variable = entry.name } };
+            try items.append(self.a, .{ .expression = expression, .alias = entry.name });
+        };
+        const saved_columns = self.columns;
+        const saved_stages = self.stages.items.len;
+        const saved_demand = self.match_weight_demand;
+        const saved_retention = self.retain_windows;
+        defer self.columns = saved_columns;
+        defer self.stages.shrinkRetainingCapacity(saved_stages);
+        defer self.match_weight_demand = saved_demand;
+        defer self.retain_windows = saved_retention;
+        self.match_weight_demand = matchDemand(tail);
+        self.retain_windows = true;
+        if (try self.streamMatchProjection(&.{input}, operation, .{ .items = items.items }, &.{}, .{}, .{})) |_| {
+            const weighted = self.pending_window orelse return error.CypherInvalidBackendResponse;
+            self.pending_window = null;
+            return weighted;
+        }
+        self.match_weight_demand = null;
+        self.retain_windows = false;
+        const rows = try self.match(&.{input}, operation);
+        const weights = try self.a.alloc(u64, rows.len);
+        @memset(weights, 1);
+        return .{ .rows = rows, .weights = weights };
     }
     fn runNext(self: *Engine, clauses: []const ast.Clause, rows: []const Row, preserve_rows: bool) anyerror![]const Row {
         if (self.pending_window) |weighted| {
@@ -2064,18 +2211,19 @@ const Engine = struct {
             const before = bags.count();
             switch (clause.operation) {
                 .match => |operation| {
-                    // match() returns ordinary bindings for this one input.
-                    // Its internal collector must not publish a pending
-                    // window belonging to the enclosing weighted pipeline.
-                    const retain = self.retain_windows;
-                    self.retain_windows = false;
-                    defer self.retain_windows = retain;
                     var rows: std.ArrayList(Row) = .empty;
                     var weights: std.ArrayList(u64) = .empty;
+                    const demand = matchDemand(clauses[clause_index + 1 ..]);
                     for (bags.rows, bags.weights) |input, weight| {
-                        for (try self.match(&.{input}, operation)) |output| {
+                        const children = try self.weightedMatch(input, operation, clauses[clause_index + 1 ..]);
+                        for (children.rows, children.weights) |output, child_weight| {
                             try rows.append(self.a, output);
-                            try weights.append(self.a, weight);
+                            const combined = switch (demand) {
+                                .presence => @as(u64, 1),
+                                .capped => multiplyPathWays(weight, child_weight),
+                                .exact => std.math.mul(u64, weight, child_weight) catch return error.CypherNumericOverflow,
+                            };
+                            try weights.append(self.a, combined);
                         }
                     }
                     bags = .{ .rows = rows.items, .weights = weights.items };
@@ -2163,6 +2311,9 @@ const Engine = struct {
         const prior_retention = self.retain_windows;
         defer self.retain_windows = prior_retention;
         self.retain_windows = false;
+        const prior_match_demand = self.match_weight_demand;
+        self.match_weight_demand = null;
+        defer self.match_weight_demand = prior_match_demand;
         const prior_lower_graph = self.lower_graph;
         const prior_join = self.join;
         const prior_lookup = self.lookup;
@@ -3209,7 +3360,7 @@ const Engine = struct {
             const distinct_barrier = if (self.stream_fold) |fold| for (fold.middle) |clause| {
                 if (clause.operation == .project and clause.operation.project.value.distinct) break true;
             } else false else false;
-            const needs_weights = if (self.weighted_sink) |sink| sink.multiplicity == .exact else !distinct_barrier and for (self.stream_fold.?.calls, 0..) |expression, index| {
+            const needs_weights = if (self.weighted_sink) |sink| sink.multiplicity == .exact else if (self.match_weight_demand) |demand| demand == .exact else !distinct_barrier and for (self.stream_fold.?.calls, 0..) |expression, index| {
                 if (self.stream_fold.?.active_calls) |active| if (!active[index]) continue;
                 const aggregate_call = expression.value.call;
                 if (!aggregate_call.distinct and (std.ascii.eqlIgnoreCase(aggregate_call.name, "sum") or std.ascii.eqlIgnoreCase(aggregate_call.name, "avg"))) break true;
@@ -3254,7 +3405,7 @@ const Engine = struct {
                 }
                 const fold = self.stream_fold.?;
                 const previous_weight = fold.weight;
-                fold.weight = ways;
+                fold.weight = if (self.match_weight_demand == .presence) 1 else ways;
                 defer fold.weight = previous_weight;
                 try fold.add(self, row);
             }
@@ -5073,8 +5224,13 @@ const Engine = struct {
         regex: @import("regex.zig").Runtime,
         reads: @FieldType(Engine, "read_nodes"),
         cache_reads: bool,
+        stages: @FieldType(Engine, "stages"),
         fn enter(engine: *Engine, a: A) EvalScope {
-            const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads };
+            const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads, .stages = engine.stages };
+            // Correlated expression subplans use this scope's allocator.
+            // Never let their temporary stage buffers replace the owner's
+            // retained buffer; it must survive when this arena is reset.
+            engine.stages = .empty;
             engine.a = a;
             engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork };
             engine.strings = .{ .a = a, .ptr = engine, .charge = chargeWork };
@@ -5091,6 +5247,7 @@ const Engine = struct {
             engine.regex = scope.regex;
             engine.read_nodes = scope.reads;
             engine.cache_reads = scope.cache_reads;
+            engine.stages = scope.stages;
         }
     };
     const Pick = struct { arena: std.heap.ArenaAllocator, value: Projected };
@@ -5201,7 +5358,7 @@ const Engine = struct {
                     }
                 }
             }
-            self.total = std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
+            self.total = if (engine.match_weight_demand != null) @intCast(@min(total, std.math.maxInt(usize))) else std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
         }
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;
