@@ -103,6 +103,7 @@ def verify_identity(
         "version": document["version"],
         "python_version": document["registry_versions"]["python"],
         "npm_tag": channel["npm_tag"],
+        "publish_pypi": str(channel["publish_pypi"]).lower(),
     }
 
 
