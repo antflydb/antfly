@@ -66,6 +66,7 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
         .optimize = ctx.optimize,
         .link_libc = ctx.backend.link_libc,
     });
+    registry_module.addImport("antfly_platform", ctx.graph.platform_mod);
     registry_module.addImport("httpx", ctx.graph.httpx_mod);
     registry_module.addImport("protobuf", ctx.graph.protobuf_mod);
     const registry_tests = ctx.b.addTest(.{ .root_module = registry_module });

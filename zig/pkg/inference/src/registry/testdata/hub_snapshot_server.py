@@ -59,6 +59,21 @@ FILES = {
     "onnx/tokenizer.json": b"{}",
 }
 MODE = sys.argv[2]
+if MODE == "gliner-split":
+    FILES = {
+        "config.json": b"{}",
+        "antfly_inference_bundle.json": json.dumps(
+            {
+                "family": "gliner2_split_bundle/v1",
+                "wrapper": "gliner2",
+                "encoder": "gliner2-encoder.Q8_0.gguf",
+                "head": "gliner_head.gguf",
+            }
+        ).encode(),
+        "gliner2-encoder.Q8_0.gguf": b"quantized encoder",
+        "gliner_head.gguf": b"fp32 auxiliary head",
+        "unrelated.Q4_K.gguf": b"wrong model",
+    }
 if MODE == "onnx-only":
     FILES = {
         k: v for k, v in FILES.items() if k.startswith("onnx/") or k == "config.json"

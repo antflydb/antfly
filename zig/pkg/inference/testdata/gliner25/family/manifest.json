@@ -35,6 +35,22 @@
       "sha256": "1d92a5f3aa54d4ecdedaa6f030f9428eb45d688b8e5dd0f58ef7573b81e856cd",
       "size_bytes": 12838
     },
+    "decide_1b/q8_capacity/README.md": {
+      "sha256": "1b4b880a97a0d3dc3e9b589da3f7758f0931e513538283e7d27af202d8d59d36",
+      "size_bytes": 3915
+    },
+    "decide_1b/q8_capacity/concept_extraction.jsonl": {
+      "sha256": "daddb46838fd54537fd5f0803eb6c522fa51915ce603a693f661927f55d92abf",
+      "size_bytes": 4858
+    },
+    "decide_1b/q8_capacity/reference.json": {
+      "sha256": "cf09b4a7098bc7c5f11ce55438e3a30309fd56d7f4af72111015bda3fd899e75",
+      "size_bytes": 298047
+    },
+    "decide_1b/q8_capacity/supersession.jsonl": {
+      "sha256": "b83c6d3e206ed50097e8200e27383c83aa8f5f9b6533629890b7a44e9b4e0bc3",
+      "size_bytes": 2220
+    },
     "decide_1b/tokenizer_config.json": {
       "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3",
       "size_bytes": 559
