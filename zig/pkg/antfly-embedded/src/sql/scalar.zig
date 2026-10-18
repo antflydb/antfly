@@ -3029,6 +3029,10 @@ test "SQL shared scalar work owner retains zero allocation rows and linear array
     std.debug.print("SQL shared array cast/compare work: rows=128 work={} rows=1024 work={}\n", .{ measured[0], measured[1] });
 }
 
+fn supportedFixedArrayKind(kind: arrays.ElementType) bool {
+    return @import("array_compact.zig").supported(kind) and kind != .text;
+}
+
 const Evaluator = struct {
     program: *const Program,
     alloc: Allocator,
@@ -3297,9 +3301,7 @@ const Evaluator = struct {
                         const input = if (prepend) right else left;
                         const empty: arrays.Value = .{ .element_type = instruction.type.element_type.?, .dimensions = &.{}, .elements = &.{} };
                         const output = if (call.function == .array_cat) try left.array.?.concatenate(self.alloc, right.array.?.*, limits, &work) else try (input.array orelse &empty).append(self.alloc, if (prepend) left else right, prepend, limits, &work);
-                        // A region may retain dense capacity after sparse
-                        // finalization when its allocator cannot shrink.
-                        try self.charge(@max(try output.retainedBytes(), try @import("array_compact.zig").ResultBuilder.allocationBytes(output.element_type, output.cardinality(), output.dimensions.len)));
+                        try self.charge(try output.admissionBytes());
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
                         break :blk Datum.typedArray(owned);
@@ -3323,9 +3325,7 @@ const Evaluator = struct {
                         }
                         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
                         const output = if (call.function == .array_positions) try array.positions(self.alloc, needle, limits, &work) else try array.transform(self.alloc, needle, if (call.function == .array_remove) null else third, limits, &work);
-                        // A region may retain dense capacity after sparse
-                        // finalization when its allocator cannot shrink.
-                        try self.charge(@max(try output.retainedBytes(), try @import("array_compact.zig").ResultBuilder.allocationBytes(output.element_type, output.cardinality(), output.dimensions.len)));
+                        try self.charge(try output.admissionBytes());
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
                         break :blk Datum.typedArray(owned);
@@ -3829,21 +3829,30 @@ const Evaluator = struct {
             break :blk try self.alloc.alloc(Datum, args.len);
         };
         var admitted: @import("../common/sql_array_layout.zig").StackShape = .{};
+        var non_null: ?usize = 0;
         for (args, children) |arg, *child| {
             child.* = try self.runDatum(arg, depth);
             const shape: []const arrays.Dimension = if (child.sql_null) &.{} else (child.array orelse return error.SqlTypeMismatch).dimensions;
             var context = self.numericContext();
             try context.charge(1 + shape.len);
             try admitted.append(shape);
+            if (!child.sql_null and non_null != null) {
+                const array = child.array.?;
+                // These casts preserve NULLs; JSONB conversions can create them.
+                const count_preserved = array.element_type == kind or (supportedFixedArrayKind(array.element_type) and supportedFixedArrayKind(kind));
+                if (count_preserved) {
+                    if (try array.knownNonNullCount()) |present| non_null.? += present else non_null = null;
+                } else non_null = null;
+            }
         }
         const stacked = try admitted.finish((arrays.Limits{}).elements);
         const count: usize = stacked.count;
         const rank: usize = stacked.rank;
         const results = @import("array_compact.zig").ResultBuilder;
         const shape = stacked.axes[0..rank];
-        try self.charge(try results.allocationBytes(kind, count, rank));
+        try self.charge(try results.allocationBytesKnown(kind, count, rank, non_null));
         const limits: arrays.Limits = .{ .bytes = @min((arrays.Limits{}).bytes, self.limits.output_bytes) };
-        var output = try results.init(self.alloc, kind, shape, count, limits);
+        var output = try results.initKnown(self.alloc, kind, shape, count, non_null, limits);
         var work = self.workBudget();
         for (children) |child| if (child.array) |array| {
             for (0..array.cardinality()) |array_cell_0| {
@@ -3864,9 +3873,10 @@ const Evaluator = struct {
         if (source.element_type == target) return datum;
         if (!builtin_cast.allowed(source.element_type, target)) return error.SqlCannotCoerce;
         const results = @import("array_compact.zig").ResultBuilder;
-        try self.charge(try results.allocationBytes(target, source.cardinality(), source.dimensions.len));
+        const non_null = if (supportedFixedArrayKind(source.element_type) and supportedFixedArrayKind(target)) try source.knownNonNullCount() else null;
+        try self.charge(try results.allocationBytesKnown(target, source.cardinality(), source.dimensions.len, non_null));
         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes };
-        var output = try results.init(self.alloc, target, source.dimensions, source.cardinality(), limits);
+        var output = try results.initKnown(self.alloc, target, source.dimensions, source.cardinality(), non_null, limits);
         var work = self.workBudget();
         for (0..source.cardinality()) |array_cell_0| {
             const element = source.flatCell(array_cell_0);
@@ -5694,7 +5704,7 @@ test "SQL computed array sparse staging capacity stays inside evaluator admissio
     var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int32 }}, &.{}, .{});
     defer program.deinit();
     const results = @import("array_compact.zig").ResultBuilder;
-    const required = 2 * try results.allocationBytes(.int32, 65, 1) + try results.allocationBytes(.int32, 130, 1);
+    const required = 2 * try results.allocationBytes(.int32, 65, 1) + try results.allocationBytesKnown(.int32, 130, 1, 0);
     for ([_]bool{ false, true }) |admitted| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -5706,5 +5716,53 @@ test "SQL computed array sparse staging capacity stays inside evaluator admissio
             try std.testing.expectEqual(@as(usize, 130), value.cardinality());
             try std.testing.expectEqual(@as(i32, -7), value.dimensions[0].lower);
         } else try std.testing.expectError(error.SqlProgramLimitExceeded, result);
+    }
+}
+
+test "SQL sparse native array scalar paths fit bounded allocator and exact output admission" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    var source_builder = try @import("array_compact.zig").ResultBuilder.initKnown(source_arena.allocator(), .int64, &.{.{ .length = 32768, .lower = -7 }}, 32768, 0, .{});
+    var work: arrays.Budget = .{};
+    for (0..32768) |_| try source_builder.append(.{}, &work);
+    const source = try source_builder.finish(source_arena.allocator(), .{}, &work);
+    const cases = [_]struct { expression: []const u8, count: usize, rank: usize }{
+        .{ .expression = "a || a", .count = 65536, .rank = 1 },
+        .{ .expression = "array_append(a, NULL)", .count = 32769, .rank = 1 },
+        .{ .expression = "array_prepend(NULL, a)", .count = 32769, .rank = 1 },
+        .{ .expression = "ARRAY[a,a]", .count = 65536, .rank = 2 },
+        .{ .expression = "a::int4[]", .count = 32768, .rank = 1 },
+        .{ .expression = "array_remove(a, 999)", .count = 32768, .rank = 1 },
+        .{ .expression = "array_replace(a, NULL, NULL)", .count = 32768, .rank = 1 },
+        .{ .expression = "array_replace(a, 999, NULL)", .count = 32768, .rank = 1 },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.expression, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int64 }}, &.{}, .{});
+        defer program.deinit();
+        var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 64 * 1024 };
+        {
+            var arena = std.heap.ArenaAllocator.init(counter.allocator());
+            defer arena.deinit();
+            const value = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&source)}, &.{}, .{ .output_bytes = 64 * 1024, .steps = 1_048_576 })).array.?;
+            try std.testing.expectEqual(case.count, value.cardinality());
+            try std.testing.expectEqual(case.rank, value.dimensions.len);
+            try std.testing.expectEqual(@as(?usize, 0), try value.knownNonNullCount());
+            try std.testing.expect(value.flatCell(0).sql_null and value.flatCell(case.count - 1).sql_null);
+            try std.testing.expectEqual(try value.retainedBytes(), try value.admissionBytes());
+            const bounds = value.dimensions[case.rank - 1];
+            try std.testing.expectEqual(@as(i32, -7), bounds.lower);
+        }
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+        // Authentication without validation cannot supply a planning summary.
+        if (std.mem.eql(u8, case.expression, "a || a")) {
+            var view = source.stored.?.*;
+            view.validation = null;
+            var unproven = source;
+            unproven.stored = &view;
+            try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.failing_allocator, &.{Datum.typedArray(&unproven)}, &.{}, .{ .output_bytes = 64 * 1024, .steps = 1_048_576 }));
+        }
     }
 }

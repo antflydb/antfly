@@ -156,23 +156,33 @@ pub const CheckedBuilder = struct {
 /// capacity after sparse finalization. No borrowed allocator escapes finish.
 pub const ResultBuilder = union(enum) {
     cells: struct { kind: arrays.ElementType, dimensions: []const arrays.Dimension, elements: []arrays.Element, index: usize = 0 },
-    fixed: CheckedBuilder,
+    fixed: struct { builder: CheckedBuilder, expected_non_null: ?usize, capacity_bytes: usize },
 
     pub fn usesFixed(kind: arrays.ElementType, count: usize) bool {
         return count >= 32 and supported(kind) and kind != .text;
     }
     pub fn allocationBytes(kind: arrays.ElementType, count: usize, rank: usize) !usize {
+        return allocationBytesKnown(kind, count, rank, null);
+    }
+    /// Counts come from immutable validated native views or producer semantics.
+    /// Unknown counts reserve dense staging; known counts reserve exact bytes.
+    pub fn allocationBytesKnown(kind: arrays.ElementType, count: usize, rank: usize, non_null: ?usize) !usize {
         if (rank > 6 or count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         if ((rank == 0) != (count == 0)) return error.InvalidSqlArrayShape;
+        if (non_null) |present| if (present > count) return error.InvalidSqlArrayShape;
         const metadata = @sizeOf(arrays.Value) + rank * @sizeOf(arrays.Dimension);
-        if (usesFixed(kind, count)) return std.math.add(usize, metadata + @sizeOf(layout.View), try layout.sectionSize(kind, rank, count)) catch error.SqlProgramLimitExceeded;
+        if (usesFixed(kind, count)) return std.math.add(usize, metadata + @sizeOf(layout.View), try layout.encodedSectionSize(kind, rank, count, non_null orelse count)) catch error.SqlProgramLimitExceeded;
         return std.math.add(usize, metadata, std.math.mul(usize, count, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded) catch error.SqlProgramLimitExceeded;
     }
     pub fn init(a: A, kind: arrays.ElementType, dimensions: []const arrays.Dimension, count: usize, limits: arrays.Limits) !ResultBuilder {
+        return initKnown(a, kind, dimensions, count, null, limits);
+    }
+    pub fn initKnown(a: A, kind: arrays.ElementType, dimensions: []const arrays.Dimension, count: usize, non_null: ?usize, limits: arrays.Limits) !ResultBuilder {
         const empty = try arrays.validateShape(dimensions, count, limits);
         const axes = if (empty) &.{} else dimensions;
-        if (try allocationBytes(kind, count, axes.len) > limits.bytes) return error.SqlProgramLimitExceeded;
-        if (usesFixed(kind, count)) return .{ .fixed = try CheckedBuilder.init(a, kind, axes, count, count, 0, limits) };
+        const capacity_bytes = try allocationBytesKnown(kind, count, axes.len, non_null);
+        if (capacity_bytes > limits.bytes) return error.SqlProgramLimitExceeded;
+        if (usesFixed(kind, count)) return .{ .fixed = .{ .builder = try CheckedBuilder.init(a, kind, axes, count, non_null orelse count, 0, limits), .expected_non_null = non_null, .capacity_bytes = capacity_bytes } };
         const owned_axes = try a.dupe(arrays.Dimension, axes);
         const elements = try a.alloc(arrays.Element, count);
         return .{ .cells = .{ .kind = kind, .dimensions = owned_axes, .elements = elements } };
@@ -185,8 +195,10 @@ pub const ResultBuilder = union(enum) {
                 cells.index += 1;
             },
             .fixed => |*fixed| {
-                try arrays.validateElement(fixed.state.kind, element, work);
-                try fixed.state.append(element);
+                try arrays.validateElement(fixed.builder.state.kind, element, work);
+                // Reject an inconsistent plan before a packed payload write.
+                if (fixed.builder.state.compact and !element.sql_null) if (fixed.expected_non_null) |expected| if (fixed.builder.state.non_null >= expected) return error.InvalidSqlArrayShape;
+                try fixed.builder.state.append(element);
             },
         }
     }
@@ -198,8 +210,10 @@ pub const ResultBuilder = union(enum) {
                 break :blk try arrays.Value.initWithBudget(cells.kind, cells.dimensions, cells.elements, limits, work);
             },
             .fixed => |*fixed| blk: {
-                const state = &fixed.state;
+                const state = &fixed.builder.state;
                 if (state.index != state.count) return error.InvalidSqlArrayShape;
+                if (fixed.capacity_bytes > limits.bytes) return error.SqlProgramLimitExceeded;
+                if (fixed.expected_non_null) |expected| if (state.non_null != expected) return error.InvalidSqlArrayShape;
                 if (!state.compact and layout.usesCompact(state.kind, state.count, state.non_null)) {
                     // Pack into the dense prefix first, then shift right for
                     // checkpoints. Forward packing cannot overwrite unread
@@ -233,7 +247,9 @@ pub const ResultBuilder = union(enum) {
                     state.compact = true;
                     state.bytes[2] = 1;
                 }
-                break :blk try fixed.finish(a, limits);
+                var value = try fixed.builder.finish(a, limits);
+                value.prepared_footprint = fixed.capacity_bytes;
+                break :blk value;
             },
         };
     }
@@ -408,8 +424,7 @@ test "SQL computed array builder matches canonical storage and binary wire acros
                 const dimensions: [1]arrays.Dimension = .{.{ .length = @intCast(count), .lower = -7 }};
                 const axes = dimensions[0..@intFromBool(count != 0)];
                 const cells = try region.alloc(arrays.Element, count);
-                var output = try ResultBuilder.init(region, kind, axes, count, .{});
-                var work: arrays.Budget = .{};
+                var present: usize = 0;
                 for (cells, 0..) |*cell, i| {
                     const missing = switch (density) {
                         0 => false,
@@ -428,25 +443,30 @@ test "SQL computed array builder matches canonical storage and binary wire acros
                         } },
                         else => .{ .integer = @intCast(i) },
                     });
-                    try output.append(cell.*, &work);
+                    present += @intFromBool(!cell.sql_null);
                 }
-                const value = try output.finish(region, .{}, &work);
-                try std.testing.expectEqual(ResultBuilder.usesFixed(kind, count), value.stored != null);
-                if (value.stored) |view| {
-                    try std.testing.expect(view.validation != null);
-                    _ = try layout.View.open(kind, view.bytes, .{});
+                for ([_]?usize{ null, present }) |known| {
+                    var output = try ResultBuilder.initKnown(region, kind, axes, count, known, .{});
+                    var work: arrays.Budget = .{};
+                    for (cells) |cell| try output.append(cell, &work);
+                    const value = try output.finish(region, .{}, &work);
+                    try std.testing.expectEqual(ResultBuilder.usesFixed(kind, count), value.stored != null);
+                    if (value.stored) |view| {
+                        try std.testing.expect(view.validation != null);
+                        _ = try layout.View.open(kind, view.bytes, .{});
+                        const source = try arrays.Value.init(kind, axes, cells, .{});
+                        const canonical = try @import("array_storage.zig").encodeAlloc(region, source, .{});
+                        try std.testing.expectEqualSlices(u8, canonical, view.bytes);
+                    }
                     const source = try arrays.Value.init(kind, axes, cells, .{});
-                    const canonical = try @import("array_storage.zig").encodeAlloc(region, source, .{});
-                    try std.testing.expectEqualSlices(u8, canonical, view.bytes);
+                    var expected: std.Io.Writer.Allocating = .init(a);
+                    defer expected.deinit();
+                    var actual: std.Io.Writer.Allocating = .init(a);
+                    defer actual.deinit();
+                    try binary.encode(source, &expected.writer, .{});
+                    try binary.encode(value, &actual.writer, .{});
+                    try std.testing.expectEqualSlices(u8, expected.written(), actual.written());
                 }
-                const source = try arrays.Value.init(kind, axes, cells, .{});
-                var expected: std.Io.Writer.Allocating = .init(a);
-                defer expected.deinit();
-                var actual: std.Io.Writer.Allocating = .init(a);
-                defer actual.deinit();
-                try binary.encode(source, &expected.writer, .{});
-                try binary.encode(value, &actual.writer, .{});
-                try std.testing.expectEqualSlices(u8, expected.written(), actual.written());
             }
         }
     }
@@ -529,5 +549,130 @@ test "SQL computed array builder direct preparation and binary output measuremen
             std.debug.print("SQL_COMPUTED_ARRAY direct={} elements=65536 prepare_ns={} retained={} peak={} encode20_ns={} wire_bytes={}\n", .{ mode == 1, prepare_ns, try value.retainedBytes(), peak, encode_ns, discard.count });
         }
         try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "SQL sparse native array plans validate counts before writes and publication" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const region = arena.allocator();
+    var work: arrays.Budget = .{};
+    try std.testing.expectError(error.InvalidSqlArrayShape, ResultBuilder.initKnown(std.testing.failing_allocator, .int64, &.{.{ .length = 64 }}, 64, 65, .{}));
+    var zero = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 64 }}, 64, 0, .{});
+    try std.testing.expectError(error.InvalidSqlArrayShape, zero.append(.json(.{ .integer = 7 }), &work));
+    for (0..64) |_| try zero.append(.{}, &work);
+    const zero_value = try zero.finish(region, .{}, &work);
+    _ = try layout.View.open(.int64, zero_value.stored.?.bytes, .{});
+    var one = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 64 }}, 64, 1, .{});
+    for (0..64) |_| try one.append(.{}, &work);
+    try std.testing.expectError(error.InvalidSqlArrayShape, one.finish(region, .{}, &work));
+    // A nearly dense plan can use dense storage; publication must still
+    // reject a count mismatch even when no packed write could overflow.
+    var dense = try ResultBuilder.initKnown(region, .boolean, &.{.{ .length = 64 }}, 64, 63, .{});
+    for (0..64) |_| try dense.append(.json(.{ .bool = true }), &work);
+    try std.testing.expectError(error.InvalidSqlArrayShape, dense.finish(region, .{}, &work));
+    var packed_result = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 64 }}, 64, 1, .{});
+    try packed_result.append(.json(.{ .integer = 7 }), &work);
+    try std.testing.expectError(error.InvalidSqlArrayShape, packed_result.append(.json(.{ .integer = 9 }), &work));
+    for (1..64) |_| try packed_result.append(.{}, &work);
+    const exact = try ResultBuilder.allocationBytesKnown(.int64, 64, 1, 1);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, packed_result.finish(region, .{ .bytes = exact - 1 }, &work));
+    const value = try packed_result.finish(region, .{ .bytes = exact }, &work);
+    try std.testing.expectEqual(@as(i64, 7), value.flatCell(0).value.integer);
+    try std.testing.expect(value.flatCell(1).sql_null);
+    _ = try layout.View.open(.int64, value.stored.?.bytes, .{});
+}
+
+test "SQL sparse native array proofs and construction admission survive ownership copies and faults" {
+    const Fixture = struct {
+        fn run(a: A) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const region = arena.allocator();
+            var output = try ResultBuilder.init(region, .int64, &.{.{ .length = 129, .lower = -7 }}, 129, .{});
+            var work: arrays.Budget = .{};
+            for (0..129) |_| try output.append(.{}, &work);
+            const value = try output.finish(region, .{}, &work);
+            try std.testing.expect(try value.admissionBytes() > try value.retainedBytes());
+            try std.testing.expectEqual(@as(?usize, 0), try value.knownNonNullCount());
+            const copy = (try @import("operators.zig").cloneDatum(region, .typedArray(&value))).array.?;
+            try std.testing.expectEqual(try copy.retainedBytes(), try copy.admissionBytes());
+            var unproven_view = value.stored.?.*;
+            unproven_view.validation = null;
+            var unproven = value;
+            unproven.stored = &unproven_view;
+            try std.testing.expectEqual(@as(?usize, null), try unproven.knownNonNullCount());
+            var wrong_shape = value;
+            wrong_shape.dimensions = &.{.{ .length = 129, .lower = 1 }};
+            try std.testing.expectError(error.InvalidSqlArrayShape, wrong_shape.knownNonNullCount());
+            var wrong_kind = value;
+            wrong_kind.element_type = .float64;
+            try std.testing.expectError(error.InvalidSqlArrayShape, wrong_kind.knownNonNullCount());
+            // Exact native plans retain no stack allocator or source payload.
+            var result = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 129, .lower = -7 }}, 129, try value.knownNonNullCount(), .{});
+            for (0..129) |i| try result.append(value.flatCell(i), &work);
+            const exact = try result.finish(region, .{}, &work);
+            try std.testing.expectEqual(try exact.retainedBytes(), try exact.admissionBytes());
+            var denied: arrays.Budget = .{ .remaining = 0 };
+            var canceled = try ResultBuilder.initKnown(region, .int64, &.{.{ .length = 64 }}, 64, 0, .{});
+            try std.testing.expectError(error.SqlProgramLimitExceeded, canceled.append(.{}, &denied));
+            const Cancel = struct {
+                fn poll(_: ?*anyopaque) !void {
+                    return error.Canceled;
+                }
+            };
+            var parent: @import("numeric_value.zig").Context = .{ .alloc = region, .checkpoint = Cancel.poll };
+            denied = .{ .shared = &parent };
+            try std.testing.expectError(error.Canceled, canceled.append(.{}, &denied));
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL sparse native array construction peak and admission measurement" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    for (0..3) |density| {
+        const source_count = 32768;
+        const non_null: usize = switch (density) {
+            0 => 0,
+            1 => source_count / 16,
+            else => source_count,
+        };
+        var source_builder = try CheckedBuilder.init(source_arena.allocator(), .int64, &.{.{ .length = source_count, .lower = -7 }}, source_count, non_null, 0, .{});
+        var source_work: arrays.Budget = .{};
+        for (0..source_count) |i| try source_builder.appendChecked(if (density == 2 or (density == 1 and i % 16 == 0)) .json(.{ .integer = @intCast(i) }) else .{}, .int64, .{}, &source_work);
+        const source = try source_builder.finish(source_arena.allocator(), .{});
+        var unproven_view = source.stored.?.*;
+        unproven_view.validation = null;
+        var unproven = source;
+        unproven.stored = &unproven_view;
+        var oracle: ?[]u8 = null;
+        defer if (oracle) |bytes| a.free(bytes);
+        for ([_]usize{ 2 * 1024 * 1024, 64 * 1024 }) |limit| {
+            if (limit == 64 * 1024 and density != 0) continue;
+            for ([_]arrays.Value{ unproven, source }, 0..) |input, mode| {
+                var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = limit };
+                {
+                    var arena = std.heap.ArenaAllocator.init(counter.allocator());
+                    defer arena.deinit();
+                    var work: arrays.Budget = .{};
+                    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+                    const result = input.concatenate(arena.allocator(), input, .{ .bytes = limit }, &work);
+                    const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+                    if (limit == 64 * 1024 and mode == 0) {
+                        try std.testing.expectError(error.SqlProgramLimitExceeded, result);
+                    } else {
+                        const value = try result;
+                        if (oracle) |bytes| try std.testing.expectEqualSlices(u8, bytes, value.stored.?.bytes) else oracle = try a.dupe(u8, value.stored.?.bytes);
+                        std.debug.print("SQL_SPARSE_NATIVE density={} known={} limit={} peak={} retained={} admission={} prepare_ns={} identical_canonical=true\n", .{ density, mode == 1, limit, counter.peak, try value.retainedBytes(), try value.admissionBytes(), elapsed });
+                    }
+                }
+                try std.testing.expectEqual(@as(usize, 0), counter.live);
+            }
+        }
     }
 }

@@ -61,8 +61,11 @@ pub const Value = struct {
     stored: ?*const @import("../common/sql_array_layout.zig").View = null,
     /// Physical footprint of immutable prepared cells, including this header
     /// and dimensions, excluding the enclosing Datum. Constructors compute it
-    /// during their existing walk; owned copies preserve it. This is sizing
+    /// during their existing walk; prepared copies preserve it. This is sizing
     /// metadata, never a validation proof or permission to bypass quotas.
+    /// Computed native results use this slot for their construction capacity;
+    /// retainedBytes reads their view, while admissionBytes includes staging.
+    /// Native ownership copies reset it to the new owner's actual extent.
     /// A caller replacing cells or dimensions must clear this cache.
     prepared_footprint: ?usize = null,
 
@@ -76,6 +79,27 @@ pub const Value = struct {
             bytes +|= try operators.datumBytes(element);
         }
         return bytes;
+    }
+
+    /// Dense staging may remain in the construction region even after its
+    /// published view is sparse. Owned copies retain only canonical bytes.
+    pub fn admissionBytes(self: Value) !usize {
+        return @max(self.prepared_footprint orelse 0, try self.retainedBytes());
+    }
+
+    /// Only validated immutable native storage supplies reusable NULL counts.
+    /// Authentication-only views and prepared cells keep the bounded fallback.
+    pub fn knownNonNullCount(self: Value) !?usize {
+        if (self.stored) |view| {
+            const proof = view.validation orelse return null;
+            if (self.elements.len != 0 or self.element_type != view.kind or self.dimensions.len != view.rank or proof.non_null > view.count) return error.InvalidSqlArrayShape;
+            for (self.dimensions, 0..) |axis, i| {
+                const expected = try view.dimension(i);
+                if (axis.length != expected.length or axis.lower != expected.lower) return error.InvalidSqlArrayShape;
+            }
+            return proof.non_null;
+        }
+        return if (self.elements.len == 0 and self.dimensions.len == 0) 0 else null;
     }
 
     pub fn flatCell(self: Value, index: usize) Element {
@@ -227,7 +251,7 @@ pub const Value = struct {
             count += 1;
         };
         const dimensions: [1]Dimension = .{.{ .length = @intCast(count) }};
-        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, .int32, dimensions[0..@intFromBool(count != 0)], count, limits);
+        var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, .int32, dimensions[0..@intFromBool(count != 0)], count, count, limits);
         for (0..self.cardinality()) |i| if (try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq) {
             try output.append(Element.json(.{ .integer = @as(i64, self.dimensions[0].lower) + @as(i64, @intCast(i)) }), work);
         };
@@ -242,17 +266,30 @@ pub const Value = struct {
         try validateElement(self.element_type, needle, work);
         if (replacement) |value| try validateElement(self.element_type, value, work);
         var count = self.cardinality();
+        var non_null = try self.knownNonNullCount();
         if (replacement == null) for (0..self.cardinality()) |array_cell_0| {
             const element = self.flatCell(array_cell_0);
-            if (try compareElement(self.element_type, element, needle, work) == .eq) count -= 1;
+            if (try compareElement(self.element_type, element, needle, work) == .eq) {
+                count -= 1;
+                if (!element.sql_null and non_null != null) non_null.? -= 1;
+            }
         };
+        if (replacement) |value| {
+            if (needle.sql_null) {
+                if (!value.sql_null and non_null != null) non_null = count;
+            } else if (value.sql_null) {
+                if (non_null) |present| if (present != 0) {
+                    non_null = null;
+                };
+            }
+        }
         const rank_: usize = if (count == 0) 0 else self.dimensions.len;
         var axes: [6]Dimension = undefined;
         if (rank_ > axes.len) return error.SqlProgramLimitExceeded;
         const dimensions = axes[0..rank_];
         @memcpy(dimensions, self.dimensions[0..rank_]);
         if (replacement == null and count != 0) dimensions[0].length = @intCast(count);
-        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, self.element_type, dimensions, count, limits);
+        var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, self.element_type, dimensions, count, non_null, limits);
         for (0..self.cardinality()) |array_cell_0| {
             const element = self.flatCell(array_cell_0);
             const matches = try compareElement(self.element_type, element, needle, work) == .eq;
@@ -271,7 +308,8 @@ pub const Value = struct {
         const count = self.cardinality() + 1;
         const lower_bound: i32 = if (self.dimensions.len == 0) 1 else self.dimensions[0].lower;
         if (@as(i64, lower_bound) + @as(i64, @intCast(count)) > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, self.element_type, &.{.{ .length = @intCast(count), .lower = lower_bound }}, count, limits);
+        const non_null = if (try self.knownNonNullCount()) |present| present + @intFromBool(!element.sql_null) else null;
+        var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, self.element_type, &.{.{ .length = @intCast(count), .lower = lower_bound }}, count, non_null, limits);
         if (prepend) try output.append(element, work);
         for (0..self.cardinality()) |i| try output.append(self.flatCell(i), work);
         if (!prepend) try output.append(element, work);
@@ -304,7 +342,11 @@ pub const Value = struct {
         const dimensions = axes[0..higher.dimensions.len];
         @memcpy(dimensions, higher.dimensions);
         dimensions[0].length = first_length;
-        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, self.element_type, dimensions, count, limits);
+        var non_null: ?usize = null;
+        if (try self.knownNonNullCount()) |left| if (try other.knownNonNullCount()) |right| {
+            non_null = left + right;
+        };
+        var output = try @import("array_compact.zig").ResultBuilder.initKnown(alloc, self.element_type, dimensions, count, non_null, limits);
         for (0..self.cardinality()) |i| try output.append(self.flatCell(i), work);
         for (0..other.cardinality()) |i| try output.append(other.flatCell(i), work);
         return output.finish(alloc, limits, work);
