@@ -9048,7 +9048,9 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(name);
         const entity_key = if (key.len > 0) (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid entity key") else try ctx.allocator.dupe(u8, "");
         defer ctx.allocator.free(entity_key);
-        var result = try @import("resolvers.zig").handle(self.api_server, ctx.allocator, op, table, name, entity_key, (try ctx.body()) orelse "", ctx.request.uri.query orelse "", tableMutationContext(ctx, &identity));
+        var request = tableMutationContext(ctx, &identity);
+        request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&ctx.io);
+        var result = try @import("resolvers.zig").handle(self.api_server, ctx.allocator, op, table, name, entity_key, (try ctx.body()) orelse "", ctx.request.uri.query orelse "", request);
         return respondOwnedApiResponse(ctx, &result);
     }
 

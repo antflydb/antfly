@@ -375,7 +375,44 @@ pub fn planNamespaceMetadata(a: std.mem.Allocator, indexes_json: []const u8, nam
     return .{ .indexes_json = try std.json.Stringify.valueAlloc(a, root, .{}), .changed = true, .revision = next.curation_revision, .config_generation = next.config_generation };
 }
 
-pub const ReviewRequest = struct { expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null, operation: enum { reviews, review }, resolver: []const u8, cursor: ?[]const u8 = null, limit: u16 = 64, id: ?[]const u8 = null, decision: ?resolver.Decision = null, table: ?[]const u8 = null, key: ?[]const u8 = null };
+pub const ProgressRow = struct {
+    name: []const u8,
+    config_generation: u64,
+    effective_generation: u64,
+    curation_revision: u64,
+    backfill_pending: bool,
+    empty: bool = false,
+    resolution: @import("types.zig").ReplayStageStats,
+    promotion: @import("types.zig").ReplayStageStats,
+};
+pub const ProgressReport = struct { resolvers: []const ProgressRow };
+
+/// One compact owner observation for every resolver in a shard. This does not
+/// drain work: the owner’s ordinary reconciliation and detached workers retain
+/// sole responsibility for execution and publication.
+pub fn progressReportAlloc(db: anytype, alloc: std.mem.Allocator) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const configs = try db.listResolvers(a);
+    const stats = db.pendingWorkStats();
+    const backlog = try @import("resolution_runtime.zig").hasDurableReresolveBacklog(db.core.store);
+    const empty = try emptyReplayOwner(db, a, stats);
+    const rows = try a.alloc(ProgressRow, configs.len);
+    for (configs, rows) |cfg, *row| row.* = .{
+        .name = cfg.name,
+        .config_generation = cfg.config_generation,
+        .effective_generation = cfg.effectiveGeneration(),
+        .curation_revision = cfg.curation_revision,
+        .backfill_pending = backlog,
+        .empty = empty,
+        .resolution = stats.resolution,
+        .promotion = stats.promotion,
+    };
+    return std.json.Stringify.valueAlloc(alloc, ProgressReport{ .resolvers = rows }, .{});
+}
+
+pub const ReviewRequest = struct { expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null, operation: enum { reviews, review, progress }, resolver: []const u8 = "", cursor: ?[]const u8 = null, limit: u16 = 64, id: ?[]const u8 = null, decision: ?resolver.Decision = null, table: ?[]const u8 = null, key: ?[]const u8 = null };
 const ReviewToken = struct { doc_key: []const u8, local_id: []const u8, hash: []const u8 };
 const ReviewCursor = struct { after: ?[]const u8 = null, row: ?[]const u8 = null, offset: usize = 0 };
 pub fn encodeToken(a: std.mem.Allocator, value: anytype) ![]const u8 {
@@ -401,6 +438,9 @@ pub fn reviewOperation(db: anytype, alloc: std.mem.Allocator, body: []const u8) 
     const input = try std.json.parseFromSliceLeaky(ReviewRequest, a, body, .{});
     if (input.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
     if (input.limit == 0 or input.limit > 256) return error.InvalidResolverCurationRequest;
+    // Progress is table metadata, with no row/artifact contents. It must remain
+    // observable even when raw review access is denied by row security.
+    if (input.operation == .progress) return progressReportAlloc(db, alloc);
     var policy_lease = if (input.operation == .reviews) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
     defer policy_lease.release();
     const all = try db.listResolvers(a);
@@ -569,6 +609,12 @@ test "resolver curation reviews bind decisions to artifact revisions and paginat
     try std.testing.expectError(error.ResolverCurationConflict, reviewOperation(&db, a, decision));
     try db.local_execution.row_policy_gate.beginPreparing(.disabled);
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, reviewOperation(&db, a, "{\"operation\":\"reviews\",\"resolver\":\"concepts\"}"));
+    const progress = try reviewOperation(&db, a, "{\"operation\":\"progress\"}");
+    defer a.free(progress);
+    const report = try std.json.parseFromSlice(ProgressReport, a, progress, .{});
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.value.resolvers.len);
+    try std.testing.expectEqualStrings("concepts", report.value.resolvers[0].name);
 }
 
 test "resolver curation namespace maps negative policy and preserves text suppression" {
@@ -615,16 +661,24 @@ pub fn retainRetiredMetadata(alloc: std.mem.Allocator, before: []const u8, after
     return std.json.Stringify.valueAlloc(alloc, next, .{});
 }
 
+pub fn stageApplied(value: @import("types.zig").ReplayStageStats, empty: bool) bool {
+    if (value.blocked or value.catch_up_required) return false;
+    if (!value.enabled) return empty and value.target_sequence == 0 and value.applied_sequence == 0;
+    return value.applied_sequence >= value.target_sequence;
+}
+
+fn emptyReplayOwner(db: anytype, a: std.mem.Allocator, stats: anytype) !bool {
+    if (stats.derived_target_sequence != 0) return false;
+    const count = try @import("range_cardinality.zig").loadOrProveEmpty(a, db.core.store);
+    return count != null and count.? == 0;
+}
+
 pub fn applied(db: anytype, cfg: catalog.ResolverConfig) !bool {
     if (cfg.retired) return true;
     if (try @import("resolution_runtime.zig").hasDurableReresolveBacklog(db.core.store)) return false;
     const stats = db.pendingWorkStats();
-    const done = struct {
-        fn stage(value: @TypeOf(stats.resolution)) bool {
-            return value.enabled and !value.blocked and !value.catch_up_required and value.applied_sequence >= value.target_sequence;
-        }
-    }.stage;
-    return done(stats.resolution) and (!cfg.promote or done(stats.promotion));
+    const empty = try emptyReplayOwner(db, db.alloc, stats);
+    return stageApplied(stats.resolution, empty) and (!cfg.promote or stageApplied(stats.promotion, empty));
 }
 
 test "resolver curation durable drop fence cannot delete a reactivated fresh identity" {

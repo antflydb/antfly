@@ -57,6 +57,7 @@ def test_resolver_curation_round_trip(aflite_path):
         db.unsuppress_resolver_key("concepts", {"key": "concept/noise"})
         assert db.resolver_reviews({"operation": "reviews", "resolver": "concepts"})["reviews"] == []
         assert db.resolver_curation("concepts")["curation_revision"] == 4
+        assert db.pending_work_stats()["resolver_curation"]["resolvers"][0]["curation_revision"] == 4
     with antfly_embedded.open(aflite_path) as db:
         assert db.resolver_curation("concepts")["curation_revision"] == 4
         assert not db.render_resolver_key("concepts", {"text": "Noise", "label": "concept"})["suppressed"]

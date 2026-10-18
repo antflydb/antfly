@@ -1669,6 +1669,13 @@ from a source-journal review decision. `wait:{timeout_ms:...}` bounds observatio
 of detached replay; a timeout leaves the accepted mutation intact. Resolver GET
 reports per-group revision, freshness, durable backfill and resolution/promotion
 watermarks. An idle watermark alone does not prove the new revision is applied.
+If cached/heartbeat status omits resolver diagnostics or lags an accepted revision,
+status obtains compact observations from the current mutation owners, with at
+most 16 concurrent shard requests. Polling never drains replay on a request
+worker. A shard with no runtime completes only with a durable proof of no
+primary records and no derived replay sequence; absent observations alone never
+prove completion. Native `pending_work_stats` includes these per-resolver revisions under
+`resolver_curation`.
 Busy is HTTP 429 with `Retry-After`; capacity and metadata unavailability are
 explicit retry states. Curation needs table-write authorization; namespace
 migration additionally requires administrative route admission and authority to

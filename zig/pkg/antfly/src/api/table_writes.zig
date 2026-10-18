@@ -20191,7 +20191,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
             return try @import("antfly_local_sources").storage_db_resolver_curation.reviewOperation(cached.db, alloc, body);
         }

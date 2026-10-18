@@ -113,8 +113,20 @@ pub const GroupProgress = struct {
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
     backfill_pending: bool = true,
+    // A private owner proof, never inferred from an absent runtime snapshot.
+    empty: bool = false,
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "empty")) continue;
+            try jw.objectField(name);
+            try jw.write(@field(self, name));
+        }
+        try jw.endObject();
+    }
 };
 pub const Progress = struct { applied: bool, shards: []const GroupProgress };
 const Sample = struct {
@@ -128,15 +140,14 @@ const Sample = struct {
             row.* = if (self.observations.get(cfg.name)) |by_group| by_group.get(id) orelse .{ .group_id = id } else .{ .group_id = id };
             applied = applied and row.available and row.fresh and row.curation_revision >= revision and
                 row.config_generation >= cfg.config_generation and !row.backfill_pending and
-                row.resolution.enabled and !row.resolution.blocked and !row.resolution.catch_up_required and
-                row.resolution.applied_sequence >= row.resolution.target_sequence and
-                (!cfg.promote or (row.promotion.enabled and !row.promotion.blocked and !row.promotion.catch_up_required and row.promotion.applied_sequence >= row.promotion.target_sequence));
+                curation.stageApplied(row.resolution, row.empty) and
+                (!cfg.promote or curation.stageApplied(row.promotion, row.empty));
         }
         return .{ .applied = applied, .shards = rows };
     }
 };
 
-fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype) !Sample {
+fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool) !Sample {
     var result: Sample = .{};
     for (snapshot.ranges) |range| if (range.table_id == table.table_id) try result.groups.put(a, range.group_id, {});
     var statuses = try server.localTableRuntimeStatusesWithSnapshot(table.name, snapshot);
@@ -145,7 +156,10 @@ fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anyty
         if (!result.groups.contains(status.group_id)) continue;
         for (status.stats.resolver_replay.resolvers) |cfg| {
             const slot = try result.observations.getOrPut(a, cfg.name);
-            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            if (!slot.found_existing) {
+                slot.key_ptr.* = try a.dupe(u8, cfg.name);
+                slot.value_ptr.* = .empty;
+            }
             var resolution = status.stats.resolution;
             resolution.blocked_reason = try a.dupe(u8, resolution.blocked_reason);
             var promotion = status.stats.promotion;
@@ -163,7 +177,80 @@ fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anyty
             });
         }
     };
+    if (!probe_owners) return result;
+    // Heartbeats and read snapshots can omit resolver diagnostics. Ask the
+    // current mutation owner for one compact report per incomplete group,
+    // rather than mistaking an idle/read-only snapshot for applied curation.
+    const desired = try configs(a, table.indexes_json);
+    const Probe = struct {
+        group: u64,
+        bytes: ?[]u8 = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This(), owner: @TypeOf(server), name: []const u8, context: operation.RequestContext) void {
+            self.bytes = owner.executeResolverOperation(std.heap.smp_allocator, name, self.group, "{\"operation\":\"progress\"}", context) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var probes: std.ArrayListUnmanaged(Probe) = .empty;
+    defer for (probes.items) |probe| if (probe.bytes) |bytes| std.heap.smp_allocator.free(bytes);
+    for (result.groups.keys()) |group| {
+        const needs_probe = for (desired) |cfg| {
+            if (cfg.retired) continue;
+            const by_group = result.observations.get(cfg.name) orelse break true;
+            const row = by_group.get(group) orelse break true;
+            if (!row.available or !row.fresh or row.curation_revision < cfg.curation_revision or
+                row.config_generation < cfg.config_generation or row.backfill_pending or
+                !row.resolution.enabled or row.resolution.blocked or row.resolution.catch_up_required or
+                row.resolution.applied_sequence < row.resolution.target_sequence or
+                (cfg.promote and (!row.promotion.enabled or row.promotion.blocked or row.promotion.catch_up_required or row.promotion.applied_sequence < row.promotion.target_sequence))) break true;
+        } else false;
+        if (needs_probe) try probes.append(a, .{ .group = group });
+    }
+    var offset: usize = 0;
+    while (offset < probes.items.len) {
+        const batch = probes.items[offset..@min(probes.items.len, offset + 16)];
+        if (request.fanout_io orelse request.deadline_io) |borrow| {
+            var receiver = try borrow.receive();
+            const io = receiver.io();
+            var tasks: std.Io.Group = .init;
+            defer tasks.cancel(io);
+            for (batch) |*probe| tasks.async(io, Probe.run, .{ probe, server, table.name, request });
+            tasks.await(io) catch return error.Canceled;
+        } else for (batch) |*probe| Probe.run(probe, server, table.name, request);
+        for (batch) |probe| {
+            if (probe.failure) |err| switch (err) {
+                error.Canceled, error.Cancelled => return error.Canceled,
+                error.DeadlineExceeded => return err,
+                else => continue,
+            };
+            const bytes = probe.bytes orelse continue;
+            const report = try std.json.parseFromSliceLeaky(curation.ProgressReport, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+            try mergeOwnerProgress(a, &result, probe.group, report);
+        }
+        offset += batch.len;
+    }
     return result;
+}
+
+fn mergeOwnerProgress(a: std.mem.Allocator, result: *Sample, group: u64, report: curation.ProgressReport) !void {
+    for (report.resolvers) |row| {
+        const slot = try result.observations.getOrPut(a, row.name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.put(a, group, .{
+            .group_id = group,
+            .available = true,
+            .fresh = true,
+            .curation_revision = row.curation_revision,
+            .config_generation = row.config_generation,
+            .effective_generation = row.effective_generation,
+            .backfill_pending = row.backfill_pending,
+            .empty = row.empty,
+            .resolution = row.resolution,
+            .promotion = row.promotion,
+        });
+    }
 }
 
 fn tableByName(snapshot: anytype, name: []const u8) !@TypeOf(&snapshot.tables[0]) {
@@ -286,7 +373,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request);
     const all = try configs(a, table.indexes_json);
     if (op == .list) {
-        const observation = try sample(server, a, &snapshot, table);
+        const observation = try sample(server, a, &snapshot, table, request, true);
         var out = std.json.Array.init(a);
         for (all) |cfg| try out.append(try summary(a, table, cfg, observation));
         return response(alloc, 200, .{ .resolvers = std.json.Value{ .array = out } });
@@ -303,7 +390,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     switch (op) {
         .reviews, .review => return reviewsOperation(server, alloc, a, &snapshot, table, cfg, op, key, body, query, request),
         .resolve => return resolveQuery(server, alloc, a, table, all, cfg, body, request),
-        .get => return response(alloc, 200, try summary(a, table, cfg, try sample(server, a, &snapshot, table))),
+        .get => return response(alloc, 200, try summary(a, table, cfg, try sample(server, a, &snapshot, table, request, true))),
         .redirects => {
             const state = try resolver.curation.parseState(a, cfg.curation_json);
             return response(alloc, 200, .{ .redirects = try cfg.effectiveAliasesAlloc(a), .distinct = state.distinct, .revision = cfg.curation_revision });
@@ -385,7 +472,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             const end = @min(destinations.count(), offset + 256);
             const names = destinations.keys()[offset..end];
             const targets = try a.alloc(domain.Target, names.len);
-            for (names, targets) |name, *target| target.* = try domain.Target.literal(name);
+            for (names, targets) |name, *target| target.* = try domain.Target.parse(name);
             const reply = try server.source.systemCatalog(a, request, .{ .resolve_many = .{ .targets = targets, .expected_revision = revision } });
             const bound = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, reply, .{});
             if (bound.tables.len != names.len) return error.InvalidCatalogRecord;
@@ -446,7 +533,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         }
     }
     for (pending.items, failures) |item, failure| {
-        const observation = try sample(server, a, snapshot, &item.table);
+        const observation = try sample(server, a, snapshot, &item.table, request, false);
         for (item.plan.results) |result| {
             const cfg = try findConfig(item.configs, result.name);
             const remaining = (wait_deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
@@ -480,8 +567,11 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
             server.source.freeAdminSnapshot(&snapshot);
             return err;
         };
-        const observation = sample(server, scratch, &snapshot, table) catch |err| {
+        var observation_request = request;
+        if (wait != null) observation_request.deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), deadline);
+        const observation = sample(server, scratch, &snapshot, table, observation_request, wait != null) catch |err| {
             server.source.freeAdminSnapshot(&snapshot);
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
             return err;
         };
         server.source.freeAdminSnapshot(&snapshot);
@@ -504,7 +594,7 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
             return .{ .applied = progress.applied, .shards = rows };
         }
         var receiver = try borrow.?.receive();
-        try receiver.io().sleep(.fromMilliseconds(25), .awake);
+        try receiver.io().sleep(.fromMilliseconds(100), .awake);
     }
 }
 
@@ -605,7 +695,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
             defer scratch.deinit();
             const arena = scratch.allocator();
             const targets = try arena.alloc(domain.Target, names.len);
-            for (names, targets) |name, *target| target.* = try domain.Target.literal(name);
+            for (names, targets) |name, *target| target.* = try domain.Target.parse(name);
             const bytes = try self.server.source.systemCatalog(arena, self.request, .{ .resolve_many = .{ .targets = targets } });
             const result = try std.json.parseFromSliceLeaky(domain.ResolvedMany, arena, bytes, .{});
             if (result.tables.len != names.len) return error.InvalidCatalogRecord;
@@ -723,4 +813,33 @@ test "resolver curation progress requires the revision and complete bounded back
     try std.testing.expect(!(try observation.progress(a, cfg, 3)).applied);
     observation.observations.getPtr("concepts").?.getPtr(1).?.fresh = false;
     try std.testing.expect(!(try observation.progress(a, cfg, 2)).applied);
+}
+
+test "resolver curation progress obtains missing diagnostics from the current owner" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var observation: Sample = .{};
+    try observation.groups.put(a, 7, {});
+    const cfg: Config = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .promote = false };
+    try std.testing.expect(!(try observation.progress(a, cfg, 4)).applied);
+    const row: curation.ProgressRow = .{ .name = "concepts", .config_generation = 0, .effective_generation = 4, .curation_revision = 4, .backfill_pending = false, .resolution = .{ .enabled = true, .target_sequence = 9, .applied_sequence = 9 }, .promotion = .{} };
+    try mergeOwnerProgress(a, &observation, 7, .{ .resolvers = &.{row} });
+    try std.testing.expect((try observation.progress(a, cfg, 4)).applied);
+    try std.testing.expect(!(try observation.progress(a, cfg, 5)).applied);
+}
+
+test "resolver curation progress completes a proven empty owner without invented workers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var observation: Sample = .{};
+    try observation.groups.put(a, 1, {});
+    const cfg: Config = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .promote = false };
+    var row: curation.ProgressRow = .{ .name = "concepts", .config_generation = 0, .effective_generation = 4, .curation_revision = 4, .backfill_pending = false, .empty = true, .resolution = .{}, .promotion = .{} };
+    try mergeOwnerProgress(a, &observation, 1, .{ .resolvers = &.{row} });
+    try std.testing.expect((try observation.progress(a, cfg, 4)).applied);
+    row.resolution.target_sequence = 1;
+    try mergeOwnerProgress(a, &observation, 1, .{ .resolvers = &.{row} });
+    try std.testing.expect(!(try observation.progress(a, cfg, 4)).applied);
 }

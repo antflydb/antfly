@@ -4733,6 +4733,8 @@ pub fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) callconv(.c) capi.Error
 fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Value {
     const bytes = try std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{});
     var value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    const resolver_progress = try database.resolverReviewsJsonAlloc(a, "{\"operation\":\"progress\"}");
+    try value.object.put(a, "resolver_curation", try std.json.parseFromSliceLeaky(std.json.Value, a, resolver_progress, .{}));
     const debt = try database.listDerivedReplayDebt(a);
     defer {
         for (debt) |*item| item.deinit(a);
@@ -7705,15 +7707,17 @@ pub fn antfly_db_resolver_reviews_json(handle_ptr: ?*anyopaque, request_json: ca
         return @call(.auto, @extern(*const @TypeOf(antfly_db_resolver_reviews_json), .{ .name = "antfly_db_resolver_reviews_json" }), .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    if (request_json.len > 4 * 1024 * 1024) return capi.mapError(error.ResolverCurationLimitExceeded);
+    const input = std.json.parseFromSlice(@import("../storage/db/resolver_curation.zig").ReviewRequest, std.heap.c_allocator, request_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    defer input.deinit();
+    const guard = enterHandle(handle_ptr, if (input.value.operation == .review) .exclusive else .read) orelse return capi.mapError(error.InvalidArgument);
     var admitted = true;
     defer if (admitted) guard.leave();
     if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
     const bytes = @import("../storage/db/resolver_curation.zig").reviewOperation(guard.handle.database(), guard.handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer guard.handle.alloc.free(bytes);
     out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
-    const input = std.json.parseFromSlice(@import("../storage/db/resolver_curation.zig").ReviewRequest, std.heap.c_allocator, request_json.bytes(), .{}) catch return .ok;
-    defer input.deinit();
+    if (input.value.operation != .review) return .ok;
     admitted = false;
     guard.leave();
     return waitResolverCurationResponse(handle_ptr, if (input.value.wait) |wait| wait.timeout_ms else 0, out);
