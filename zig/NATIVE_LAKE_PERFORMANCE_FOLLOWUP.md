@@ -5891,3 +5891,11 @@ parameter regressions passed. The real Parquet E2E suite was extended for static
 REAL comparisons but could not be rerun: available disk remained below its
 16.25 GiB admission requirement. The earlier 61-case E2E result above applies to
 the prior executable, not this merged implementation.
+
+The branch includes origin/main through `055bd5f7c9` (merge `c0c0d6e6b0`).
+All 30 packaging tests completed successfully with pinned Zig 0.17 (two
+platform-specific checks skipped). Source/error catalogs, Python lint and
+formatting, whitespace, license headers, and the Apache boundary passed.
+The final installed CLI build and version smoke check passed after reclaiming
+completed task-local compiler intermediates. Required repository cache cleanup
+completed; its uv prune was stopped after waiting on the existing cache lock.
