@@ -79,8 +79,10 @@ pub const Cursor = struct {
         block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
         blocks: []const *@import("spill.zig").Sequential.OwnedBlock = &.{},
         payload_page: ?@import("spill.zig").PayloadReader.Page = null,
+        sorted_page: ?@import("spill.zig").Sort.Page = null,
         pub fn deinit(self: Lease) void {
             if (self.payload_page) |page| page.release();
+            if (self.sorted_page) |page| page.release();
             if (self.block) |block| block.release();
             for (self.blocks) |block| block.release();
             if (self.owner) |owner| owner.close();
@@ -120,33 +122,36 @@ pub const Cursor = struct {
         if (self.sorted) |top| {
             if (top.external == null) self.memory_leased = true;
             const capacity = @min(64, @min(maximum, self.count() - self.index));
+            if (top.external) |sort| if (sort.order_sort != null) {
+                while (self.sorted_offset != 0) : (self.sorted_offset -= 1) if (!try sort.skip()) return error.InvalidSqlSpill;
+                const page = try sort.nextPageLeased(capacity, byte_limit);
+                errdefer page.release();
+                if (page.rows.len == 0) return error.InvalidSqlSpill;
+                // Transport exposes payloads only. Release the separately
+                // retained sort keys without expanding delivery descriptors.
+                for (page.rows) |*row| {
+                    if (row.key_block) |block| block.release();
+                    row.key_block = null;
+                    row.key_index = null;
+                    row.keys = null;
+                }
+                self.index += page.rows.len;
+                _ = self.refs.fetchAdd(1, .monotonic);
+                return .{ .values = page.values, .sorted_page = page, .owner = self };
+            };
             const rows = try a.alloc(Location, capacity);
             const blocks = try a.alloc(*@import("spill.zig").Sequential.OwnedBlock, capacity);
             var held: usize = 0;
             errdefer for (blocks[0..held]) |block| block.release();
-            var gathered: ?@import("spill.zig").Sort.Page = null;
-            if (top.external) |sort| if (sort.order_sort != null) {
-                while (self.sorted_offset != 0) : (self.sorted_offset -= 1) if (!try sort.skip()) return error.InvalidSqlSpill;
-                gathered = try sort.nextPageLeased(capacity, byte_limit);
-                if (gathered.?.rows.len == 0) {
-                    gathered.?.release();
-                    return error.InvalidSqlSpill;
-                }
-            };
-            defer if (gathered) |page| page.release();
             var count_rows: usize = 0;
             var bytes: usize = 0;
             var leased_bytes: usize = capacity *| (@sizeOf(Location) + @sizeOf(*@import("spill.zig").Sequential.OwnedBlock));
-            while (count_rows < (if (gathered) |page| page.rows.len else capacity)) {
+            while (count_rows < capacity) {
                 if (top.external) |sort| {
                     while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
                         if (!try sort.skip()) return error.InvalidSqlSpill;
                     }
-                    const lease = if (gathered) |page| page.rows[count_rows] else (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
-                    if (gathered) |page| {
-                        page.rows[count_rows].block = null;
-                        page.rows[count_rows].key_block = null;
-                    }
+                    const lease = (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
                     if (lease.key_block) |keys| keys.release();
                     rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values, .typed = lease.values };
                     if (lease.block) |block| {
@@ -166,7 +171,7 @@ pub const Cursor = struct {
                 for (0..self.width) |column| bytes +|= try rows[count_rows].bytes(a, column);
                 self.index += 1;
                 count_rows += 1;
-                if (gathered == null and (bytes >= byte_limit or leased_bytes >= byte_limit)) break;
+                if (bytes >= byte_limit or leased_bytes >= byte_limit) break;
             }
             const View = struct {
                 rows: []const Location,
@@ -1053,4 +1058,144 @@ test "SQL native sorted heap leases and replay preserve frozen rows after produc
     };
     try Fixture.run(std.testing.allocator, 4096);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{@as(usize, 16)});
+}
+
+test "SQL bounded native delivery sorted cursor output admission" {
+    const a = std.testing.allocator;
+    const Datum = @import("scalar.zig").Datum;
+    const spill = @import("spill.zig");
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]usize{ 4000, 6000, 8000, 12000, 16000 }) |available| for ([_]usize{ 1, 64 }) |maximum| for ([_]bool{ false, true }) |via_cursor| {
+        var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+        defer std.debug.assert(budget.live == 0);
+        var token: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &token, .checkpoint = Hook.check, .compression = .none, .async_writes = false, .buffer_bytes = 128 };
+        defer manager.deinit();
+        const cursor = try Cursor.create(budget.allocator(), &manager, 2);
+        defer cursor.close();
+        var top = try @import("operators.zig").TopK.initWithSpill(budget.allocator(), 64, &.{.{}}, 8192, &manager);
+        defer top.deinit();
+        const body: [4096]u8 = @splat('x');
+        var values: [64][2]Datum = undefined;
+        var rows: [64][]const Datum = undefined;
+        var key_values: [64]Datum = undefined;
+        var keys: [64][]const Datum = undefined;
+        var ordinals: [64]u64 = undefined;
+        for (0..64) |i| {
+            values[i] = .{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = &body }) };
+            rows[i] = &values[i];
+            key_values[i] = Datum.json(.{ .integer = @intCast(i) });
+            keys[i] = key_values[i..][0..1];
+            ordinals[i] = i;
+        }
+        var input_arena = std.heap.ArenaAllocator.init(a);
+        defer input_arena.deinit();
+        try top.addBatch(input_arena.allocator(), .{ .rows = &rows }, &keys, &ordinals);
+        try Cursor.takeSorted(cursor, &top, 0, 64, false);
+        const sort = cursor.sorted.?.external.?;
+        const warm = try sort.nextPageLeased(1, 128 * 1024);
+        warm.release();
+        cursor.index = 1;
+        try std.testing.expect(sort.order_sort != null);
+        const ballast = try budget.allocator().alloc(u8, @import("memory_budget.zig").headroom(manager.alloc).? - available);
+        var ballast_live = true;
+        defer if (ballast_live) budget.allocator().free(ballast);
+        var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+        defer scratch.deinit();
+        var seen: usize = 0;
+        if (via_cursor) {
+            const lease = try cursor.nextLease(scratch.allocator(), maximum, 128 * 1024);
+            defer lease.deinit();
+            // Sorted delivery metadata belongs to the lease, not caller scratch.
+            _ = scratch.reset(.free_all);
+            seen = lease.values.len();
+            for (0..seen) |i| try std.testing.expectEqual(@as(i64, @intCast(i + 1)), (try lease.values.cell(scratch.allocator(), i, 0)).value.integer);
+        } else {
+            const page = try sort.nextPageLeased(maximum, 128 * 1024);
+            defer page.release();
+            seen = page.rows.len;
+            for (page.rows, 1..) |row, i| try std.testing.expectEqual(@as(i64, @intCast(i)), (try row.cell(0)).value.integer);
+        }
+        try std.testing.expect(!budget.isExhausted());
+        try std.testing.expect(seen > 0);
+        std.debug.print("NATIVE_CURSOR via_cursor={} available={d} maximum={d} seen={d} peak={d}\n", .{ via_cursor, available, maximum, seen, budget.peak });
+        // Remaining ranks must survive admission denials, including a key
+        // owner loaded before a denied head-scratch allocation.
+        budget.allocator().free(ballast);
+        ballast_live = false;
+        var expected = seen + 1;
+        while (expected < 64) {
+            if (via_cursor) {
+                const lease = try cursor.nextLease(scratch.allocator(), 64, 128 * 1024);
+                defer lease.deinit();
+                try std.testing.expect(lease.values.len() != 0);
+                for (0..lease.values.len()) |row| {
+                    try std.testing.expectEqual(@as(i64, @intCast(expected)), (try lease.values.cell(scratch.allocator(), row, 0)).value.integer);
+                    expected += 1;
+                }
+            } else {
+                const page = try sort.nextPageLeased(64, 128 * 1024);
+                defer page.release();
+                try std.testing.expect(page.rows.len != 0);
+                for (page.rows) |row| {
+                    try std.testing.expectEqual(@as(i64, @intCast(expected)), (try row.cell(0)).value.integer);
+                    expected += 1;
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 64), expected);
+        try std.testing.expect(!budget.isExhausted());
+    };
+}
+
+test "SQL bounded native delivery sorted cursor owns exact pages across faults and early close" {
+    const Harness = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator, compressed: bool) !void {
+            const spill = @import("spill.zig");
+            const Datum = @import("scalar.zig").Datum;
+            var token: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false, .buffer_bytes = 128 };
+            defer manager.deinit();
+            var cursor: ?*Cursor = try Cursor.create(a, &manager, 2);
+            defer if (cursor) |owner| owner.close();
+            var top = try @import("operators.zig").TopK.initWithSpill(a, 16, &.{.{}}, 8192, &manager);
+            defer top.deinit();
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const body: [4096]u8 = @splat('x');
+            var values: [16][2]Datum = undefined;
+            var rows: [16][]const Datum = undefined;
+            var keys: [16][]const Datum = undefined;
+            var ordinals: [16]u64 = undefined;
+            for (0..16) |i| {
+                values[i] = .{ Datum.json(.{ .integer = @intCast(15 - i) }), Datum.json(.{ .string = &body }) };
+                rows[i] = &values[i];
+                keys[i] = values[i][0..1];
+                ordinals[i] = i;
+            }
+            try top.addBatch(source.allocator(), .{ .rows = &rows }, &keys, &ordinals);
+            try Cursor.takeSorted(cursor.?, &top, 0, 16, false);
+            try std.testing.expect(cursor.?.sorted.?.external.?.order_sort != null);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const first = try cursor.?.nextLease(scratch.allocator(), 8, 128 * 1024);
+            defer first.deinit();
+            const second = try cursor.?.nextLease(scratch.allocator(), 8, 128 * 1024);
+            defer second.deinit();
+            try std.testing.expect(first.values.len() != 0 and second.values.len() != 0);
+            cursor.?.close();
+            cursor = null;
+            _ = scratch.reset(.free_all);
+            try std.testing.expectEqual(@as(i64, 0), (try first.values.cell(scratch.allocator(), 0, 0)).value.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(first.values.len())), (try second.values.cell(scratch.allocator(), 0, 0)).value.integer);
+            try std.testing.expectEqualStrings(&body, (try first.values.cell(scratch.allocator(), 0, 1)).value.string);
+        }
+    };
+    for ([_]bool{ false, true }) |compressed| {
+        try Harness.run(std.testing.allocator, compressed);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{compressed});
+    }
 }

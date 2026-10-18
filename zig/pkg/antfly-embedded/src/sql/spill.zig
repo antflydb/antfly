@@ -1107,6 +1107,17 @@ pub fn encodeColumnarBatchVersionAlloc(a: Allocator, values: @import("execution_
 pub fn appendColumnarBatchVersion(output_alloc: Allocator, scratch: Allocator, bytes: *std.ArrayList(u8), values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion) !void {
     return appendColumnarBatchVersionMode(output_alloc, scratch, bytes, values, ordinals, max_bytes, version, null);
 }
+// Canonical v2 singleton framing, shared by body emission and its streaming
+// equality probe. No payload bytes or producer pointers are retained here.
+fn singletonFrozenPrefix() [columnar_v2_magic.len + 42]u8 {
+    var prefix: [columnar_v2_magic.len + 42]u8 = @splat(0);
+    @memcpy(prefix[0..columnar_v2_magic.len], columnar_v2_magic);
+    std.mem.writeInt(u64, prefix[columnar_v2_magic.len..][0..8], 1, .little);
+    std.mem.writeInt(u64, prefix[columnar_v2_magic.len + 8 ..][0..8], 1, .little);
+    prefix[columnar_v2_magic.len + 32] = 255;
+    std.mem.writeInt(u64, prefix[columnar_v2_magic.len + 33 ..][0..8], 1, .little);
+    return prefix;
+}
 fn appendColumnarBatchVersionMode(output_alloc: Allocator, scratch: Allocator, bytes: *std.ArrayList(u8), values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion, manager: ?*Manager) !void {
     if (values.len() == 0 or values.len() > 256 or values.width() > 1024 or ordinals.len != values.len()) return error.InvalidSqlSpill;
     const start = bytes.items.len;
@@ -1238,6 +1249,7 @@ pub const JoinPayloads = struct {
     };
     const DiskCached = struct { hash: u64, length: usize, offset: u64, used: u64 };
     const CacheKind = enum { payload, body };
+    const BodyKey = struct { bytes: []const u8, kind: u8, hash: u64 };
     const IndexCache = struct {
         entries: [32]struct { offset: u64 = none, header: [24]u8 = undefined } = @splat(.{}),
         fn slot(offset: u64) usize {
@@ -1277,6 +1289,83 @@ pub const JoinPayloads = struct {
             self.next = (self.next + 1) % self.bodies.len;
         }
     };
+    fn lookupNativeBody(self: *JoinPayloads, key: BodyKey) !?u64 {
+        try self.file.manager.check();
+        var pressure: CachePressure = .{ .manager = self.file.manager, .context = self, .evict = evict };
+        self.disk_clock +|= 1;
+        // Empty slots imply a miss without any file read or index allocation.
+        for (&self.body_recent) |*entry| if (entry.*) |*cached| {
+            if (cached.hash != key.hash or cached.length != key.bytes.len) continue;
+            if (self.file.read_buffer.len == 0) pressure.prepare(@max(1, self.file.buffer_bytes orelse self.file.manager.buffer_bytes));
+            if (try self.sameNativeStored(cached.offset, key)) {
+                cached.used = self.disk_clock;
+                return cached.offset;
+            }
+        };
+        var ready = self.body_root != none;
+        if (!ready) {
+            ready = true;
+            for (self.body_recent) |entry| if (entry == null) {
+                ready = false;
+                break;
+            };
+        }
+        if (!ready) return null;
+        const buffer_bytes = @max(1, self.file.buffer_bytes orelse self.file.manager.buffer_bytes);
+        pressure.prepare((if (self.file.read_buffer.len == 0) buffer_bytes else 0) + (if (self.file.write_buffer.len == 0) buffer_bytes else 0));
+        try self.activateBodyIndex();
+        try self.prepareIndexCache();
+        return self.findBodyMatch(key.hash, key.bytes.len, .{ .native = key });
+    }
+    fn sameNativeStored(self: *JoinPayloads, offset: u64, key: BodyKey) !bool {
+        // Native frame tags 2/3 extend the ordinary frame with a nine-byte
+        // key descriptor. The physical body offset stays at the frame start.
+        var frame: [26]u8 = undefined;
+        try self.file.readRaw(offset, &frame);
+        const header = frame[0..17];
+        const framed_length = std.mem.readInt(u64, header[0..8], .little);
+        if (header[16] < 2 or header[16] > 3 or framed_length < 9 or framed_length - 9 > self.file.manager.max_record_bytes or framed_length > self.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
+        const length = framed_length - 9;
+        if (frame[17] != key.kind or std.mem.readInt(u64, frame[18..26], .little) != key.bytes.len) return false;
+        if (key.kind == 1) return self.sameParts(offset + header.len + framed_length, &.{key.bytes});
+        // This is the singleton mixed-column framing used by the shared v2
+        // codec, followed by the exact borrowed frozen token stream.
+        const prefix = singletonFrozenPrefix();
+        if (header[16] == 2) {
+            if (length != prefix.len + key.bytes.len) return false;
+            return self.sameParts(offset + frame.len, &.{ &prefix, key.bytes });
+        }
+        const Input = struct {
+            file: *File,
+            offset: u64,
+            length: u64,
+            pub fn readInto(self_: @This(), at: u64, out: []u8) !void {
+                if (at > self_.length or out.len > self_.length - at) return error.InvalidSqlSpill;
+                try self_.file.manager.check();
+                try self_.file.readRaw(self_.offset + at, out);
+            }
+        };
+        return snappy.equalsFromReader(Input{ .file = &self.file, .offset = offset + frame.len, .length = length }, &.{ &prefix, key.bytes }) catch |err| switch (err) {
+            error.CorruptInput => error.InvalidSqlSpill,
+            else => err,
+        };
+    }
+    fn sameParts(self: *JoinPayloads, offset: u64, parts: []const []const u8) !bool {
+        var buffer: [4096]u8 = undefined;
+        var at = offset;
+        for (parts) |part| {
+            var done: usize = 0;
+            while (done < part.len) {
+                try self.file.manager.check();
+                const count = @min(buffer.len, part.len - done);
+                try self.file.readRaw(at, buffer[0..count]);
+                if (!std.mem.eql(u8, buffer[0..count], part[done..][0..count])) return false;
+                at += count;
+                done += count;
+            }
+        }
+        return true;
+    }
     fn sameStored(self: *JoinPayloads, offset: u64, stored: []const u8, compressed: bool) !bool {
         var header: [17]u8 = undefined;
         try self.file.readRaw(offset, &header);
@@ -1359,10 +1448,17 @@ pub const JoinPayloads = struct {
         }
     }
     fn findBody(self: *JoinPayloads, hash: u64, length: usize, stored: []const u8, compressed: bool) !?u64 {
+        return self.findBodyMatch(hash, length, .{ .stored = .{ .bytes = stored, .compressed = compressed } });
+    }
+    const BodyMatch = union(enum) { native: BodyKey, stored: struct { bytes: []const u8, compressed: bool } };
+    fn findBodyMatch(self: *JoinPayloads, hash: u64, length: usize, match: BodyMatch) !?u64 {
         var leaf = (try self.bodyLeaf(hash, null)) orelse return null;
         while (true) {
             if (leaf.hash != hash) return null;
-            if (leaf.length == length and try self.sameStored(leaf.body, stored, compressed)) return leaf.body;
+            if (leaf.length == length and try switch (match) {
+                .native => |key| self.sameNativeStored(leaf.body, key),
+                .stored => |wire| self.sameStored(leaf.body, wire.bytes, wire.compressed),
+            }) return leaf.body;
             if (leaf.next == none) return null;
             if (leaf.next >= leaf.offset) return error.InvalidSqlSpill;
             var bytes: [40]u8 = undefined;
@@ -1494,8 +1590,22 @@ pub const JoinPayloads = struct {
     pub fn appendBatchWithReuse(self: *JoinPayloads, values: @import("execution_batch.zig").Batch, reuse: *BodyReuse) !u64 {
         const Batch = @import("execution_batch.zig").Batch;
         if (values.len() == 0 or values.len() > page_rows or values.width() > 1024) return error.InvalidSqlSpill;
-        // A single native cell already is a canonical body page.
-        if (values.len() == 1 and values.width() == 1) return self.appendInlineBatch(values, .payload);
+        // A singleton native cell can reuse the same body directly, without a
+        // manifest or a separate codec path.
+        if (values.len() == 1 and values.width() == 1) {
+            const frozen = try values.frozenJson(0, 0);
+            const text = if (frozen == null) try values.encodedJson(0, 0) else null;
+            const native = if (frozen) |value| value.bytes else text;
+            if (native) |bytes| if (bytes.len >= 256) {
+                const kind: u8 = if (frozen) |value| 2 + @as(u8, @intFromBool(value.lossless_text)) else 1;
+                const hash = reuse.fingerprints.bodyHash(bytes, kind);
+                if (reuse.find(bytes, kind, hash)) |offset| return offset;
+                const offset = try self.appendNativeBody(values, 0, 0, .{ .bytes = bytes, .kind = kind, .hash = hash });
+                reuse.put(bytes, kind, hash, offset);
+                return offset;
+            };
+            return self.appendInlineBatch(values, .payload, null);
+        }
         var pressure: CachePressure = .{ .manager = self.file.manager, .context = self, .evict = evict };
         var arena = std.heap.ArenaAllocator.init(pressure.allocator());
         defer arena.deinit();
@@ -1510,32 +1620,14 @@ pub const JoinPayloads = struct {
             const kind: u8 = if (frozen) |v| 2 + @as(u8, @intFromBool(v.lossless_text)) else 1;
             const hash = reuse.fingerprints.bodyHash(bytes, kind);
             const offset = reuse.find(bytes, kind, hash) orelse blk: {
-                const One = struct {
-                    source: *const Batch,
-                    row: usize,
-                    column: usize,
-                    fn cell(raw: *anyopaque, alloc: Allocator, _: usize, _: usize) anyerror!Datum {
-                        const self_: *@This() = @ptrCast(@alignCast(raw));
-                        return self_.source.cell(alloc, self_.row, self_.column);
-                    }
-                    fn getFrozen(raw: *anyopaque, _: usize, _: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
-                        const self_: *@This() = @ptrCast(@alignCast(raw));
-                        return self_.source.frozenJson(self_.row, self_.column);
-                    }
-                    fn json(raw: *anyopaque, _: usize, _: usize) anyerror!?[]const u8 {
-                        const self_: *@This() = @ptrCast(@alignCast(raw));
-                        return self_.source.encodedJson(self_.row, self_.column);
-                    }
-                };
-                var one: One = .{ .source = &values, .row = row, .column = column };
-                const offset = try self.appendInlineBatch(.{ .reader = .{ .ptr = &one, .read = One.cell, .read_frozen = One.getFrozen, .read_json = One.json, .count = 1, .width = 1 } }, .body);
+                const offset = try self.appendNativeBody(values, row, column, .{ .bytes = bytes, .kind = kind, .hash = hash });
                 // Publish only after the complete body has been written.
                 reuse.put(bytes, kind, hash, offset);
                 break :blk offset;
             };
             try bindings.append(a, .{ .row = row, .column = column, .offset = offset });
         };
-        if (bindings.items.len == 0) return self.appendInlineBatch(values, .payload);
+        if (bindings.items.len == 0) return self.appendInlineBatch(values, .payload, null);
         const View = struct {
             source: *const Batch,
             bindings: []const Binding,
@@ -1579,7 +1671,30 @@ pub const JoinPayloads = struct {
             try encoder.word(binding.column);
             try encoder.word(binding.offset);
         }
-        return self.appendWire(a, output.items, &.{}, null, &pressure, .payload);
+        return self.appendWire(a, output.items, &.{}, null, &pressure, .payload, null);
+    }
+    fn appendNativeBody(self: *JoinPayloads, values: @import("execution_batch.zig").Batch, row: usize, column: usize, key: BodyKey) !u64 {
+        const Batch = @import("execution_batch.zig").Batch;
+        const One = struct {
+            source: *const Batch,
+            row: usize,
+            column: usize,
+            fn cell(raw: *anyopaque, alloc: Allocator, _: usize, _: usize) anyerror!Datum {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                return self_.source.cell(alloc, self_.row, self_.column);
+            }
+            fn getFrozen(raw: *anyopaque, _: usize, _: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                return self_.source.frozenJson(self_.row, self_.column);
+            }
+            fn json(raw: *anyopaque, _: usize, _: usize) anyerror!?[]const u8 {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                return self_.source.encodedJson(self_.row, self_.column);
+            }
+        };
+        var one: One = .{ .source = &values, .row = row, .column = column };
+
+        return (try self.lookupNativeBody(key)) orelse try self.appendInlineBatch(.{ .reader = .{ .ptr = &one, .read = One.cell, .read_frozen = One.getFrozen, .read_json = One.json, .count = 1, .width = 1 } }, .body, key);
     }
     /// One immutable producer cohort, with one bounded content memo shared by
     /// packing and every physical append. Count distinct bodies per page so a
@@ -1651,7 +1766,7 @@ pub const JoinPayloads = struct {
         }
     }
 
-    fn appendInlineBatch(self: *JoinPayloads, values: @import("execution_batch.zig").Batch, cache_kind: CacheKind) !u64 {
+    fn appendInlineBatch(self: *JoinPayloads, values: @import("execution_batch.zig").Batch, cache_kind: CacheKind, body_key: ?BodyKey) !u64 {
         if (values.len() == 0 or values.len() > page_rows) return error.InvalidSqlSpill;
         const manager = self.file.manager;
         try manager.check();
@@ -1667,14 +1782,18 @@ pub const JoinPayloads = struct {
         const temporary = @import("memory_budget.zig").reclaimingAllocator(arena.allocator());
         defer output.deinit(temporary);
         const ordinals: [page_rows]u64 = @splat(0);
-        try appendColumnarBatchVersionMode(temporary, temporary, &output, values, ordinals[0..values.len()], manager.max_record_bytes, .v2, manager);
-        return self.appendWire(arena.allocator(), output.items, scalar_values, scalar_hash, &pressure, cache_kind);
+        if (body_key != null and body_key.?.kind >= 2) {
+            var encoder: Encoder = .{ .a = temporary, .bytes = &output, .limit = manager.max_record_bytes };
+            try encoder.append(&singletonFrozenPrefix());
+            try encoder.append(body_key.?.bytes);
+        } else try appendColumnarBatchVersionMode(temporary, temporary, &output, values, ordinals[0..values.len()], manager.max_record_bytes, .v2, manager);
+        return self.appendWire(arena.allocator(), output.items, scalar_values, scalar_hash, &pressure, cache_kind, body_key);
     }
-    fn appendWire(self: *JoinPayloads, a: Allocator, wire: []const u8, scalar_values: []const Datum, scalar_hash: ?u64, pressure: *CachePressure, cache_kind: CacheKind) !u64 {
+    fn appendWire(self: *JoinPayloads, a: Allocator, wire: []const u8, scalar_values: []const Datum, scalar_hash: ?u64, pressure: *CachePressure, cache_kind: CacheKind, body_key: ?BodyKey) !u64 {
         const manager = self.file.manager;
         self.encoded_pages += 1;
         const hash = std.hash.Wyhash.hash(0, wire);
-        for (self.recent) |entry| if (entry) |cached| {
+        if (body_key == null) for (self.recent) |entry| if (entry) |cached| {
             if (cached.hash == hash and std.mem.eql(u8, cached.bytes, wire)) return cached.offset;
         };
         const compressed = if (self.file.manager.compression == .snappy and wire.len >= 1024) try snappy.encode(a, wire) else null;
@@ -1682,7 +1801,7 @@ pub const JoinPayloads = struct {
         const stored = if (use_compressed) compressed.? else wire;
         self.disk_clock +|= 1;
         const disk_recent = if (cache_kind == .body) &self.body_recent else &self.disk_recent;
-        for (disk_recent) |*entry| if (entry.*) |*cached| {
+        if (body_key == null) for (disk_recent) |*entry| if (entry.*) |*cached| {
             if (cached.hash != hash or cached.length != wire.len) continue;
             if (self.file.read_buffer.len == 0) pressure.prepare(@max(1, self.file.buffer_bytes orelse manager.buffer_bytes));
             if (try self.sameStored(cached.offset, stored, use_compressed)) {
@@ -1690,32 +1809,28 @@ pub const JoinPayloads = struct {
                 return cached.offset;
             }
         };
-        if (cache_kind == .body) {
-            var ready = self.body_root != none;
-            if (!ready) {
-                ready = true;
-                for (self.body_recent) |entry| if (entry == null) {
-                    ready = false;
-                    break;
-                };
-            }
-            if (ready) {
-                const buffer_bytes = @max(1, self.file.buffer_bytes orelse manager.buffer_bytes);
-                pressure.prepare((if (self.file.read_buffer.len == 0) buffer_bytes else 0) + (if (self.file.write_buffer.len == 0) buffer_bytes else 0));
-                try self.activateBodyIndex();
-                try self.prepareIndexCache();
-                if (try self.findBody(hash, wire.len, stored, use_compressed)) |offset| return offset;
-            }
-        }
         var header: [17]u8 = undefined;
-        header[16] = @intFromBool(use_compressed);
-        std.mem.writeInt(u64, header[0..8], stored.len, .little);
+        const native_bytes: usize = if (body_key != null) 9 else 0;
+        header[16] = @as(u8, if (body_key != null) 2 else 0) + @intFromBool(use_compressed);
+        std.mem.writeInt(u64, header[0..8], stored.len + native_bytes, .little);
         std.mem.writeInt(u64, header[8..16], hash, .little);
-        const offset = self.file.size;
         if (self.file.write_buffer.len == 0) pressure.prepare(@max(1, self.file.buffer_bytes orelse manager.buffer_bytes));
+        const offset = self.file.size;
         try self.file.writeRaw(offset, &header);
-        try self.file.writeRaw(offset + header.len, stored);
-        if (cache_kind == .body and self.body_root != none) try self.indexBody(hash, wire.len, offset);
+        if (body_key) |key| {
+            var native: [9]u8 = undefined;
+            native[0] = key.kind;
+            std.mem.writeInt(u64, native[1..9], key.bytes.len, .little);
+            try self.file.writeRaw(offset + header.len, &native);
+        }
+        try self.file.writeRaw(offset + header.len + native_bytes, stored);
+        if (body_key) |key| {
+            // Frozen keys already occur verbatim in the body. Text keys retain
+            // exact spelling in quota-charged spill bytes, without a heap map
+            // or a borrowed producer address surviving the append.
+            if (key.kind == 1) try self.file.writeRaw(self.file.size, key.bytes);
+            if (self.body_root != none) try self.indexBody(key.hash, key.bytes.len, offset);
+        }
         self.file.manager.increment("compressed_records", @intFromBool(use_compressed));
         var victim: usize = 0;
         for (disk_recent, 0..) |entry, index| {
@@ -1725,7 +1840,7 @@ pub const JoinPayloads = struct {
             }
             if (entry.?.used < disk_recent[victim].?.used) victim = index;
         }
-        disk_recent[victim] = .{ .hash = hash, .length = wire.len, .offset = offset, .used = self.disk_clock };
+        disk_recent[victim] = .{ .hash = if (body_key) |key| key.hash else hash, .length = if (body_key) |key| key.bytes.len else wire.len, .offset = offset, .used = self.disk_clock };
         // Cache publication is optional and occurs after required I/O. Evict
         // the replaced entry before admission, and never poison the statement
         // budget by probing a known policy denial with an allocation.
@@ -1760,8 +1875,11 @@ pub const JoinPayloads = struct {
         };
         var header: [17]u8 = undefined;
         try self.file.readRaw(offset, &header);
-        const length = std.mem.readInt(u64, header[0..8], .little);
-        if (header[16] > 1 or length > self.file.manager.max_record_bytes or length > self.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
+        const framed_length = std.mem.readInt(u64, header[0..8], .little);
+        const native_bytes: usize = if (header[16] >= 2) 9 else 0;
+        if (header[16] > 3 or framed_length < native_bytes or framed_length - native_bytes > self.file.manager.max_record_bytes or framed_length > self.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
+        const length = framed_length - native_bytes;
+        const data_offset = offset + header.len + native_bytes;
         const stable = self.file.manager.allocator();
         const a = if (pressure) |scope| scope.allocator() else stable;
         const owner = try a.create(Sequential.OwnedBlock);
@@ -1770,11 +1888,11 @@ pub const JoinPayloads = struct {
         // Published blocks and lazy JSON owners may outlive the hash join and
         // this stack scope. Frees/growth use the identical stable backing.
         defer owner.arena.child_allocator = stable;
-        const wire = if (header[16] == 1) blk: {
+        const wire = if (header[16] & 1 == 1) blk: {
             // Compressed input is decode scratch, not retained page storage.
             const encoded = try a.alloc(u8, @intCast(length));
             defer a.free(encoded);
-            try self.file.readRaw(offset + header.len, encoded);
+            try self.file.readRaw(data_offset, encoded);
             const decoded_len = snappy.decodedLen(encoded) catch return error.InvalidSqlSpill;
             if (decoded_len > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
             break :blk snappy.decode(owner.arena.allocator(), encoded) catch |err| switch (err) {
@@ -1783,7 +1901,7 @@ pub const JoinPayloads = struct {
             };
         } else blk: {
             const encoded = try owner.arena.allocator().alloc(u8, @intCast(length));
-            try self.file.readRaw(offset + header.len, encoded);
+            try self.file.readRaw(data_offset, encoded);
             break :blk encoded;
         };
         if (std.hash.Wyhash.hash(0, wire) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
@@ -3019,13 +3137,21 @@ pub const Sequential = struct {
     /// Transfer a decoded arena without copying its cell payloads. The file
     /// retains only its forward physical offset; the lease owns this block.
     pub fn readOwnedBlock(self: *Sequential, offset: u64) !*OwnedBlock {
+        return self.readOwnedBlockWithPressure(offset, null);
+    }
+    fn readOwnedBlockWithPressure(self: *Sequential, offset: u64, pressure: ?*CachePressure) !*OwnedBlock {
         const a = self.file.manager.allocator();
-        const owner = try a.create(OwnedBlock);
+        const scoped = if (pressure) |scope| scope.allocator() else a;
+        if (pressure) |scope| if (self.file.read_buffer.len == 0) {
+            if (!scope.admit(@max(1, self.file.buffer_bytes orelse self.file.manager.buffer_bytes))) return error.OutOfMemory;
+        };
+        const owner = try scoped.create(OwnedBlock);
         errdefer a.destroy(owner);
         // A scalar merge may already have borrowed this record. Transfer its
         // arena once; subsequent records decode directly into compact columns.
         if (self.read_rows.len == 0 and self.read_single_offset != offset and offset == self.read_first) {
-            owner.* = .{ .a = a, .arena = .init(a) };
+            owner.* = .{ .a = a, .arena = .init(scoped) };
+            defer owner.arena.child_allocator = a;
             errdefer owner.arena.deinit();
             try self.decodeCompactBlock(owner, owner.arena.allocator(), offset);
             return owner;
@@ -3302,11 +3428,13 @@ pub const PayloadReader = struct {
         var header: [17]u8 = undefined;
         try self.pages.file.readRaw(offset, &header);
         var length = std.mem.readInt(u64, header[0..8], .little);
-        if (header[16] > 1 or length > self.pages.file.manager.max_record_bytes or length > self.pages.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
-        if (header[16] == 1) {
+        const native_bytes: usize = if (header[16] >= 2) 9 else 0;
+        if (header[16] > 3 or length < native_bytes or length - native_bytes > self.pages.file.manager.max_record_bytes or length > self.pages.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
+        length -= native_bytes;
+        if (header[16] & 1 == 1) {
             var size_prefix: [10]u8 = undefined;
             const count: usize = @intCast(@min(length, size_prefix.len));
-            try self.pages.file.readRaw(offset + header.len, size_prefix[0..count]);
+            try self.pages.file.readRaw(offset + header.len + native_bytes, size_prefix[0..count]);
             length = snappy.decodedLen(size_prefix[0..count]) catch return error.InvalidSqlSpill;
             if (length > self.pages.file.manager.max_record_bytes) return error.InvalidSqlSpill;
         }
@@ -3544,6 +3672,7 @@ pub const Sort = struct {
     heads: [8]?Decoded = @splat(null),
     owned_heads: [8]?*Sequential.OwnedBlock = @splat(null),
     owned_positions: [8]usize = @splat(0),
+    pending_heads: [8]bool = @splat(false),
     leased_reads: bool = false,
     head_arenas: [8]std.heap.ArenaAllocator = undefined,
     output_count: usize = 0,
@@ -3971,13 +4100,16 @@ pub const Sort = struct {
         self.deferred_count = total;
     }
     pub fn nextReference(self: *Sort) anyerror!?RowLease {
+        return self.nextReferenceWithPressure(null);
+    }
+    fn nextReferenceWithPressure(self: *Sort, pressure: ?*CachePressure) anyerror!?RowLease {
         try self.finishImpl(true);
         if (self.deferred_index < self.deferred_count) {
             const index = self.deferred_index;
             self.deferred_index += 1;
             return self.deferred_references[index].?;
         }
-        return self.order_sort.?.nextLeased();
+        return self.order_sort.?.nextLeasedWithPressure(pressure);
     }
     fn normalize(self: *const Sort, keys: []const Datum) !?@import("sort_key.zig").Key {
         if (!self.encoded_bytes) return @import("sort_key.zig").encode(keys, self.orders);
@@ -4564,7 +4696,9 @@ pub const Sort = struct {
     pub const Page = struct {
         rows: []RowLease,
         a: Allocator,
+        values: @import("execution_batch.zig").Batch,
         pub fn release(self: Page) void {
+            self.a.destroy(@as(*PageView, @ptrCast(@alignCast(self.values.reader.ptr))));
             for (self.rows) |lease| lease.release();
             self.a.free(self.rows);
         }
@@ -4581,7 +4715,16 @@ pub const Sort = struct {
         var bytes: usize = 0;
         const logical_rows = @max(1, byte_limit / @max(1, self.max_payload_bytes));
         while (count < @min(@min(maximum, logical_rows), keys.len)) {
-            const lease = (try self.nextReference()) orelse break;
+            // Crossing a physical key boundary must leave room to hydrate the
+            // already collected payload prefix. Within a resident key block,
+            // only descriptor growth needs admission.
+            const prefix_bytes = if (count != 0 and self.deferred_index == self.deferred_count and self.order_sort.?.keyBlockBoundary()) bytes else 0;
+            var pressure: CachePressure = .{ .manager = self.manager, .context = reader, .evict = if (count == 0) PayloadReader.evict else keepCollectedPayloads, .bounded = true, .reserve = prefix_bytes +| ((count + 1) * @sizeOf(RowLease) + @sizeOf(PageView)) };
+            const lease = (self.nextReferenceWithPressure(&pressure) catch |err| {
+                if (err != error.OutOfMemory or !pressure.denied) return err;
+                if (count != 0) break;
+                return error.SqlProgramLimitExceeded;
+            }) orelse break;
             errdefer lease.release();
             const reference = try PayloadReader.Reference.decode(&.{ try lease.cell(0), try lease.cell(1) });
             const repeated = for (references[0..count]) |prior| {
@@ -4601,12 +4744,14 @@ pub const Sort = struct {
         const pending = count + self.deferred_count - self.deferred_index;
         const backlog_bytes = if (pending > self.deferred_references.len) pending * @sizeOf(?RowLease) else 0;
         var storage: [64]PayloadReader.Payload = undefined;
-        const gathered = try reader.gatherForDelivery(&storage, references[0..count], byte_limit, @sizeOf(RowLease), 0, backlog_bytes);
+        const gathered = try reader.gatherForDelivery(&storage, references[0..count], byte_limit, @sizeOf(RowLease), @sizeOf(PageView), backlog_bytes);
         const payloads = gathered.storage[0..gathered.count];
         errdefer for (payloads) |payload| payload.release();
         const stable = self.manager.allocator();
         const output = try stable.alloc(RowLease, payloads.len);
         errdefer stable.free(output);
+        const view = try stable.create(PageView);
+        errdefer stable.destroy(view);
         try self.deferReferences(keys[payloads.len..count]);
         self.payload_reads = reader.reads;
         for (output, payloads, keys[0..payloads.len]) |*result, payload, *key| {
@@ -4614,9 +4759,78 @@ pub const Sort = struct {
             result.* = .{ .row = lease.row, .block = payload.block, .index = payload.index, .key_block = lease.block, .key_index = lease.index, .keys = lease.keys };
             key.* = null;
         }
-        return .{ .rows = output, .a = stable };
+        view.* = .{ .rows = output };
+        return .{ .rows = output, .a = stable, .values = .{ .reader = .{ .ptr = view, .read = PageView.cell, .read_frozen = PageView.frozen, .read_json = PageView.json, .read_identity = PageView.identity, .read_dictionary = PageView.dictionary, .count = output.len, .width = if (output.len == 0) 0 else output[0].block.?.width() } } };
+    }
+    const PageView = struct {
+        rows: []const RowLease,
+        fn shared(self: *const @This()) bool {
+            if (self.rows.len == 0) return false;
+            for (self.rows) |row| if (row.block != self.rows[0].block) return false;
+            return true;
+        }
+        fn cell(raw: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.rows[row].cell(column);
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const lease = self.rows[row];
+            return lease.block.?.encoded.?.frozenJson(lease.index, column, false);
+        }
+        fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const lease = self.rows[row];
+            return lease.block.?.encoded.?.encodedJson(lease.index, column, false);
+        }
+        fn identity(raw: *anyopaque, row: usize, column: usize) anyerror!?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.shared()) return null;
+            const lease = self.rows[row];
+            return lease.block.?.encoded.?.dictionaryIdentity(lease.index, column, false);
+        }
+        fn dictionary(raw: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.shared()) return null;
+            const Batch = @import("execution_batch.zig").Batch;
+            const source = try a.create(Batch);
+            source.* = try self.rows[0].block.?.batch(a, false);
+            const indices = try a.alloc(usize, self.rows.len);
+            for (indices, self.rows) |*index, row| index.* = row.index;
+            return (try source.select(a, indices)).dictionaryColumn(a, column);
+        }
+    };
+    // Refresh only at the next pull. The final row of a block is returnable
+    // before the following block is allocated, and a denied refresh consumes
+    // no row. Published arenas always use the stable statement allocator.
+    fn refreshLeasedHeads(self: *Sort, pressure: ?*CachePressure) !void {
+        for (self.pending_heads[0..self.output_count], 0..) |pending, index| if (pending) {
+            const prior = self.heads[index].?;
+            if (self.owned_heads[index] == null) {
+                self.owned_heads[index] = try self.outputs[index].?.readOwnedBlockWithPressure(prior.following, pressure);
+                self.owned_positions[index] = 0;
+            }
+            const arena = &self.head_arenas[index];
+            arena.child_allocator = if (pressure) |scope| scope.allocator() else self.a;
+            defer arena.child_allocator = self.a;
+            _ = arena.reset(.retain_capacity);
+            var row = try self.owned_heads[index].?.keyRowAlloc(arena.allocator(), self.owned_positions[index]);
+            row.normalized = try self.normalize(row.keys);
+            self.heads[index] = .{ .row = row, .next = none, .matched = false, .following = prior.following + 1 };
+            self.pending_heads[index] = false;
+        };
+    }
+    fn keepCollectedPayloads(_: *anyopaque) bool {
+        return false;
+    }
+    fn keyBlockBoundary(self: *Sort) bool {
+        for (self.pending_heads[0..self.output_count], self.owned_heads[0..self.output_count]) |pending, owner| if (pending and owner == null) return true;
+        return false;
     }
     pub fn nextLeased(self: *Sort) anyerror!?RowLease {
+        return self.nextLeasedWithPressure(null);
+    }
+    fn nextLeasedWithPressure(self: *Sort, pressure: ?*CachePressure) anyerror!?RowLease {
         try self.finishImpl(true);
         if (self.order_sort != null) {
             const keys = (try self.nextReference()) orelse return null;
@@ -4628,11 +4842,12 @@ pub const Sort = struct {
         }
         if (!self.leased_reads) {
             for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
-                self.owned_heads[index] = try self.outputs[index].?.readOwnedBlock(value.following - 1);
+                self.owned_heads[index] = try self.outputs[index].?.readOwnedBlockWithPressure(value.following - 1, pressure);
                 self.owned_positions[index] = 0;
             };
             self.leased_reads = true;
         }
+        try self.refreshLeasedHeads(pressure);
         var selected: ?usize = null;
         for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
             if (selected == null or (try self.compare(value.row, self.heads[selected.?].?.row)) == .lt) selected = index;
@@ -4644,20 +4859,13 @@ pub const Sort = struct {
             owner.retain();
             errdefer owner.release();
             self.owned_positions[index] += 1;
-            if (self.owned_positions[index] == owner.count()) {
+            const exhausted = self.owned_positions[index] == owner.count();
+            if (exhausted) {
                 self.owned_heads[index] = null;
                 owner.release();
-                if (head.following < self.outputs[index].?.size) {
-                    self.owned_heads[index] = try self.outputs[index].?.readOwnedBlock(head.following);
-                    self.owned_positions[index] = 0;
-                }
             }
-            self.heads[index] = if (self.owned_heads[index]) |block| blk: {
-                _ = self.head_arenas[index].reset(.retain_capacity);
-                var row = try block.keyRowAlloc(self.head_arenas[index].allocator(), self.owned_positions[index]);
-                row.normalized = try self.normalize(row.keys);
-                break :blk .{ .row = row, .next = none, .matched = false, .following = head.following + 1 };
-            } else null;
+            self.pending_heads[index] = !exhausted or head.following < self.outputs[index].?.size;
+            if (!self.pending_heads[index]) self.heads[index] = null;
             // A delivery lease exposes payload cells and ordinal. Merge keys
             // belong to the lane's reusable scratch, never to a payload lease.
             return .{ .row = .{ .values = &.{}, .keys = &.{}, .ordinal = head.row.ordinal }, .block = owner, .index = position };
@@ -7952,7 +8160,7 @@ test "SQL native body cache survives distinct parent pages across producer cohor
             ordinals[i] = i;
         }
         for (0..2) |_| try sort.addBatch(.{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.get, .count = 64, .width = 2 } }, &keys, &ordinals);
-        try std.testing.expectEqual(2 * (64 + cardinality), sort.payloads.?.encoded_pages);
+        try std.testing.expectEqual(128 + cardinality, sort.payloads.?.encoded_pages);
         try std.testing.expect(manager.written_bytes < 512 * 1024);
         try std.testing.expectEqual(cardinality > 16, sort.payloads.?.body_root != none);
         std.debug.print("BODY_CACHE compressed={} bodies={d} quota={d} encode_attempts={d} read_bytes={d} written={d}\n", .{ compressed, cardinality, quota, sort.payloads.?.encoded_pages, manager.read_bytes, manager.written_bytes });
@@ -8044,6 +8252,124 @@ test "SQL native delivery descriptors outlive caller scratch readers and files o
             try std.testing.expectEqual(@as(usize, 0), manager.files);
             try std.testing.expectEqualStrings(&body, (try first.values.cell(scratch.allocator(), 0, 0)).value.string);
             try std.testing.expectEqualStrings(&body, (try second.values.cell(scratch.allocator(), 0, 0)).value.string);
+        }
+    };
+    for ([_]bool{ false, true }) |compressed| {
+        try Harness.run(std.testing.allocator, compressed);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{compressed});
+    }
+}
+
+test "SQL bounded native delivery repeated producer bodies lookup before encoding" {
+    const Frozen = @import("execution_batch.zig").FrozenJson;
+    const Reader = struct {
+        value: Frozen,
+        base: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn frozen(raw: *anyopaque, _: usize, column: usize) anyerror!?Frozen {
+            return if (column == 0) @as(*@This(), @ptrCast(@alignCast(raw))).value else null;
+        }
+        fn cell(raw: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
+            if (column == 0) return error.UnexpectedMaterialization;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return Datum.json(.{ .integer = @intCast(self.base + row) });
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| {
+        var source = std.heap.ArenaAllocator.init(a);
+        defer source.deinit();
+        const sa = source.allocator();
+        const body = try sa.alloc(u8, 65536);
+        @memset(body, 'x');
+        var object: std.json.ObjectMap = .empty;
+        try object.put(sa, "body", .{ .string = body });
+        const wire = try encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(.{ .object = object })}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+        const block = try decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+        defer block.deinit();
+        var view: Reader = .{ .value = (try block.frozenJson(0, 0, false)).? };
+        var token: u8 = 0;
+        var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = Reader.check, .compression = if (compressed) .snappy else .none, .async_writes = false, .buffer_bytes = 128 };
+        defer manager.deinit();
+        var pages = try JoinPayloads.init(&manager);
+        defer pages.close();
+        var last: u64 = 0;
+        for (0..32) |cohort| {
+            view.base = cohort * 64;
+            last = try pages.appendBatch(.{ .reader = .{ .ptr = &view, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 64, .width = 2 } });
+        }
+        try std.testing.expectEqual(@as(usize, 33), pages.encoded_pages);
+        std.debug.print("NATIVE_BODY_LOOKUP compressed={} cohorts=32 frozen={d} attempts={d} reads={d} calls={d} writes={d}\n", .{ compressed, view.value.bytes.len, pages.encoded_pages, manager.read_bytes, manager.read_calls, manager.written_bytes });
+        try pages.file.seal();
+        var reader = PayloadReader.init(&pages);
+        defer reader.deinit();
+        const value = try reader.read(.{ .offset = last, .index = 63 });
+        defer value.release();
+        try std.testing.expectEqual(@as(i64, 2047), (try value.block.cell(63, 1)).value.integer);
+        try std.testing.expectEqualSlices(u8, view.value.bytes, (try value.block.encoded.?.frozenJson(63, 0, false)).?.bytes);
+    }
+}
+
+test "SQL bounded native delivery content keys survive producer reuse text spelling collisions and allocation faults" {
+    const Harness = struct {
+        fn check(_: *anyopaque) !void {}
+        const Reader = struct {
+            bytes: []const u8,
+            kind: u8,
+            fn frozen(raw: *anyopaque, _: usize, _: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return if (self.kind == 1) null else .{ .bytes = self.bytes, .lossless_text = self.kind == 3 };
+            }
+            fn json(raw: *anyopaque, _: usize, _: usize) anyerror!?[]const u8 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return if (self.kind == 1) self.bytes else null;
+            }
+            fn cell(_: *anyopaque, _: Allocator, _: usize, _: usize) anyerror!Datum {
+                return error.UnexpectedMaterialization;
+            }
+        };
+        fn run(a: Allocator, compressed: bool) !void {
+            var token: u8 = 0;
+            var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false, .buffer_bytes = 128 };
+            defer manager.deinit();
+            var pages = try JoinPayloads.init(&manager);
+            defer pages.close();
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const text = try source.allocator().alloc(u8, 4096);
+            @memset(text, 'x');
+            const json = try std.fmt.allocPrint(source.allocator(), "{{\"body\":\"{s}\"}}", .{text});
+            var object: std.json.ObjectMap = .empty;
+            try object.put(source.allocator(), "body", .{ .string = text });
+            const wire = try encodeColumnarBlockVersionAlloc(source.allocator(), &.{.{ .values = &.{Datum.json(.{ .object = object })}, .keys = &.{}, .ordinal = 0 }}, manager.max_record_bytes, .v2);
+            const block = try decodeColumnarBlockForForwarding(source.allocator(), a, wire, manager.max_record_bytes);
+            defer block.deinit();
+            const frozen = (try block.frozenJson(0, 0, false)).?;
+            var offsets: [20]u64 = undefined;
+            for (&offsets, 0..) |*offset, i| {
+                const bytes = if (i < 2) json else try source.allocator().dupe(u8, frozen.bytes);
+                const kind: u8 = if (i < 2) 1 else if (i == 2) 2 else 3;
+                if (i == 1) bytes[json.len - 3] = 'y';
+                if (i >= 4) @constCast(bytes)[bytes.len - 1] = @intCast(i + 32);
+                var reader: Reader = .{ .bytes = bytes, .kind = kind };
+                const key: JoinPayloads.BodyKey = .{ .bytes = bytes, .kind = kind, .hash = if (i < 5) 17 else i * 1024 };
+                try std.testing.expectEqual(@as(?u64, null), try pages.lookupNativeBody(key));
+                offset.* = try pages.appendInlineBatch(.{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.frozen, .read_json = Reader.json, .count = 1, .width = 1 } }, .body, key);
+                try std.testing.expectEqual(offset.*, (try pages.lookupNativeBody(key)).?);
+                // Index lookups must retain exact representation, even with
+                // an intentionally colliding hash and otherwise identical bytes.
+                if (i == 3) try std.testing.expect(offset.* != offsets[2]);
+            }
+            try std.testing.expect(pages.body_root != none);
+            // First frozen body's hash bucket is now cold in the 16-entry LRU.
+            const original: JoinPayloads.BodyKey = .{ .bytes = frozen.bytes, .kind = 2, .hash = 17 };
+            const before = pages.encoded_pages;
+            try std.testing.expectEqual(offsets[2], (try pages.lookupNativeBody(original)).?);
+            try std.testing.expectEqual(before, pages.encoded_pages);
+            var missing = try source.allocator().dupe(u8, frozen.bytes);
+            missing[missing.len - 1] ^= 1;
+            try std.testing.expectEqual(@as(?u64, null), try pages.lookupNativeBody(.{ .bytes = missing, .kind = 2, .hash = 17 }));
+            try std.testing.expectEqual(@as(?u64, null), try pages.lookupNativeBody(.{ .bytes = frozen.bytes, .kind = 1, .hash = 17 }));
         }
     };
     for ([_]bool{ false, true }) |compressed| {
