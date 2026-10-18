@@ -171,6 +171,7 @@ pub const TableApi = struct {
         GraphMetricMaterializationRejected,
         GraphMetricQueryBudgetExceeded,
         QueryCandidateBudgetExceeded,
+        DecisionLimitExceeded,
         RerankerCandidateLimitExceeded,
         GraphWorkBudgetExceeded,
         GraphMinWeightDomainViolation,
@@ -2089,6 +2090,7 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
                 return try queryDependencyErrorOwnedResponse(alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false);
             },
+            error.DecisionLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
             error.RerankRateLimited => {
                 return try queryDependencyErrorOwnedResponse(alloc, 429, "reranker_rate_limited", "reranker rate limited", true);
             },
@@ -4429,6 +4431,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.EmbedRateLimited, .status = 429, .body = "{\"code\":\"query_embedding_rate_limited\",\"error\":\"query_embedding_rate_limited\",\"message\":\"query embedding rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .err = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .err = error.DecisionLimitExceeded, .status = 422, .body = "{\"code\":\"decision_limit_exceeded\",\"error\":\"decision_limit_exceeded\",\"message\":\"decision evaluation budget exceeded\",\"retryable\":false}", .json = true },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "{\"code\":\"query_embedding_upstream_failure\",\"error\":\"query_embedding_upstream_failure\",\"message\":\"query embedding provider failed\",\"retryable\":false}", .json = true },
         .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },

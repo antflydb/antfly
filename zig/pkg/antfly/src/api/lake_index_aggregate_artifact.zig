@@ -159,6 +159,7 @@ pub fn publishCohort(a: A, result_alloc: A, store: *stores.ArtifactStore, names:
         output_bytes = std.math.add(u64, output_bytes, encoded.len) catch return error.NativeAggregateArtifactTooLarge;
         if (output_bytes > 512 * 1024 * 1024) return error.NativeAggregateArtifactTooLarge;
         const artifact = try upload.putWithCancellation(encoded, cancellation);
+        defer if (artifact.provider_version) |version| upload.allocator.free(version);
         try blocks.append(ca, .{ .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, .rows = @intCast(rows.items.len) });
         groups = std.math.add(u64, groups, rows.items.len) catch return error.NativeAggregateArtifactTooLarge;
     }
@@ -180,6 +181,7 @@ pub fn publishCohort(a: A, result_alloc: A, store: *stores.ArtifactStore, names:
         var upload = store.*;
         upload.allocator = result_alloc;
         const artifact = try upload.putWithCancellation(bytes, cancellation);
+        defer if (artifact.provider_version) |version| upload.allocator.free(version);
         reference.* = .{ .kind = .algebraic_segment, .name = name, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .metadata_version = metadata_version };
         initialized += 1;
     }
@@ -675,6 +677,7 @@ pub fn publishPartitionRoots(a: A, out: A, store: *stores.ArtifactStore, names: 
         var upload = store.*;
         upload.allocator = out;
         const artifact = try upload.putWithCancellation(bytes, cancellation);
+        defer if (artifact.provider_version) |version| upload.allocator.free(version);
         ref.* = .{ .kind = .algebraic_segment, .name = name, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .metadata_version = 3 };
         initialized += 1;
     }
@@ -760,6 +763,7 @@ test "external lake partitioned cohorts fuse once per block and decline late mis
     var upload = store;
     upload.allocator = out;
     const artifact = try upload.put(bytes);
+    defer if (artifact.provider_version) |version| upload.allocator.free(version);
     var mismatched = refs[1];
     mismatched.artifact_id = artifact.artifact_id;
     mismatched.checksum = artifact.checksum;

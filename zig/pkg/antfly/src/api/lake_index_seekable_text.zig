@@ -116,6 +116,7 @@ fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: C
     var writer = store.*;
     writer.allocator = a;
     const ref = try writer.putWithCancellation(bytes, cancellation);
+    defer if (ref.provider_version) |version| writer.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 fn initialMetadata(a: A, bytes: []const u8) ![]const Range {

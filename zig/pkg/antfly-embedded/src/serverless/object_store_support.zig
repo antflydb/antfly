@@ -210,7 +210,8 @@ pub const OpenedObjectStore = struct {
         defer alloc.free(path);
         const fs = try alloc.create(object_storage.FilesystemObjectStorage);
         errdefer alloc.destroy(fs);
-        fs.* = try object_storage.FilesystemObjectStorage.init(alloc, path);
+        const manifest = std.mem.endsWith(u8, path, ".parquet-manifest.json");
+        fs.* = try object_storage.FilesystemObjectStorage.init(alloc, if (manifest) std.fs.path.dirname(path) orelse "." else path);
 
         var owned_client = fs.client();
         errdefer owned_client.deinit();
@@ -222,7 +223,7 @@ pub const OpenedObjectStore = struct {
             .client = owned_client,
             .fs_client = fs,
             .bucket = owned_bucket,
-            .prefix = try alloc.dupe(u8, ""),
+            .prefix = try alloc.dupe(u8, if (manifest) std.fs.path.basename(path) else ""),
         };
     }
 

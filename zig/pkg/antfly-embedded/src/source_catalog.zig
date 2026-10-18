@@ -765,6 +765,9 @@ pub const serverless_external_source_object_snapshot = @import("serverless/exter
 pub const serverless_external_source_rowsource_bridge = @import("serverless/external_source/rowsource_bridge.zig");
 pub const serverless_manifest_artifact_ref = @import("serverless/manifest/artifact_ref.zig");
 pub const serverless_object_store_support = @import("serverless/object_store_support.zig");
+pub const serverless_query_lake_inventory_catalog = @import("serverless/query/lake_inventory_catalog.zig");
+pub const serverless_query_lake_file_census = @import("serverless/query/lake_file_census.zig");
+pub const serverless_query_lake_parquet_manifest = @import("serverless/query/lake_parquet_manifest.zig");
 pub const serverless_query_lake_decimal = @import("serverless/query/lake_decimal.zig");
 pub const serverless_query_lake_decoded_cache = @import("serverless/query/lake_decoded_cache.zig");
 pub const serverless_query_lake_iceberg_deletes = @import("serverless/query/lake_iceberg_deletes.zig");
@@ -799,6 +802,7 @@ pub const storage_rowsource_external = @import("storage/rowsource/external.zig")
 pub const storage_rowsource_local = @import("storage/rowsource/local.zig");
 pub const serverless_lake_host = @import("serverless/lake_host.zig");
 pub const sql_lake_cursor = @import("sql/lake_cursor.zig");
+pub const sql_lake_predicate_kernel = @import("sql/lake_predicate_kernel.zig");
 pub const sql_lake_values = @import("sql/lake_values.zig");
 pub const serverless_query_lake_fixtures = @import("serverless/query/lake_fixtures.zig");
 

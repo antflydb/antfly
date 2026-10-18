@@ -222,6 +222,11 @@ test "SQL scoped CPU metadata allocation and registry rejection roll back withou
 pub const LockedAllocator = struct {
     backing: A,
     mutex: std.atomic.Mutex = .unlocked,
+    /// Immutable parent identity for admission through this synchronizing wrapper.
+    pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
+        if (a.vtable.alloc != allocate) return null;
+        return @as(*LockedAllocator, @ptrCast(@alignCast(a.ptr))).backing;
+    }
     pub fn allocator(self: *LockedAllocator) A {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
     }
@@ -282,6 +287,15 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         return @min(requested, self.max_bytes -| self.bytes);
+    }
+    /// CPU pipelines leave half the node allowance for required/speculative
+    /// I/O. The caller lane is charged to its statement, like retained results.
+    pub fn cpuWorkspaceBudget(self: *Scheduler, requested: usize) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        const reserve = @min(self.max_io_bytes, self.max_bytes / 2);
+        const cpu_bytes = self.bytes - self.io_bytes;
+        return @min(requested, @min(self.max_bytes -| self.bytes, (self.max_bytes - reserve) -| cpu_bytes));
     }
     /// Advisory fan-out; submit still arbitrates races with other statements.
     /// One caller lane needs no lease. Every concurrent lane has a useful
@@ -678,4 +692,17 @@ test "SQL completed remote prefetch releases both admission classes before joini
     try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_bytes);
     try task.await(std.testing.io);
+}
+
+test "SQL aggregate CPU work preserves node IO headroom" {
+    var scheduler: Scheduler = .{ .max_bytes = 64 * 1024 * 1024, .max_io_bytes = 32 * 1024 * 1024 };
+    const budget = scheduler.cpuWorkspaceBudget(128 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), budget);
+    const width = scheduler.fanout(4, budget, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 4), width);
+    for (0..width - 1) |_| try std.testing.expect(scheduler.acquire(budget / width));
+    defer for (0..width - 1) |_| scheduler.release(budget / width);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), scheduler.cpuWorkspaceBudget(128 * 1024 * 1024));
+    try std.testing.expect(scheduler.acquireClass(.io, 16 * 1024 * 1024));
+    scheduler.releaseClass(.io, 16 * 1024 * 1024);
 }

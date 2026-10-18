@@ -24,6 +24,11 @@ const Allocator = std.mem.Allocator;
 pub const Cache = struct {
     alloc: Allocator,
     decoded: @import("lake_decoded_cache.zig").Cache,
+    /// Manifest decoding has separate admission from snapshot construction.
+    manifests: @import("lake_decoded_cache.zig").Cache,
+    inventory_chunks: @import("lake_decoded_cache.zig").Cache,
+    delete_files: @import("lake_decoded_cache.zig").Cache,
+    inventory_catalogs: @import("lake_inventory_catalog.zig").Cache,
     /// In-flight physical reads share owned results even when residency is denied.
     physical: @import("lake_decoded_cache.zig").Cache,
     mutex: std.atomic.Mutex = .unlocked,
@@ -201,7 +206,37 @@ pub const Cache = struct {
         }
         self.releaseFlight(claim.flight);
     }
-    const Entry = struct { cache: *Cache, bytes: []u8, touched: u64, protected: bool = false, refs: usize = 0 };
+    /// Alias entries pin one immutable provider response. Charge the full
+    /// envelope to each alias conservatively: a partially admitted envelope
+    /// must never retain unaccounted bytes after its siblings are evicted.
+    const Envelope = struct {
+        bytes: []u8,
+        refs: std.atomic.Value(usize) = .init(1),
+        // Guarded by Cache.mutex. One charge survives until the final alias
+        // leaves residency; pins keep their entries resident and charged.
+        residents: usize = 0,
+        fn release(self: *Envelope) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
+                std.heap.page_allocator.free(self.bytes);
+                std.heap.page_allocator.destroy(self);
+            }
+        }
+    };
+    const Entry = struct {
+        cache: *Cache,
+        bytes: []u8,
+        touched: u64,
+        protected: bool = false,
+        refs: usize = 0,
+        envelope: ?*Envelope = null,
+        fn charge(self: *const Entry) usize {
+            return if (self.envelope) |owner| (if (owner.residents == 1) owner.bytes.len else 0) else self.bytes.len;
+        }
+        fn destroy(self: *Entry) void {
+            if (self.envelope) |owner| owner.release() else self.cache.alloc.free(self.bytes);
+            self.cache.alloc.destroy(self);
+        }
+    };
     pub const Stats = struct {
         hits: u64 = 0,
         misses: u64 = 0,
@@ -261,7 +296,7 @@ pub const Cache = struct {
         return initWithMemoryLimit(alloc, 64 * 1024 * 1024);
     }
     pub fn initWithMemoryLimit(alloc: Allocator, maximum: usize) Cache {
-        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
+        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .manifests = .{ .a = alloc }, .inventory_chunks = .{ .a = alloc }, .delete_files = .{ .a = alloc }, .inventory_catalogs = .{ .budget = .{ .backing = alloc, .limit = 128 * 1024 * 1024 } }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
         // Request/status callers are quiescent. Cancel and join restoration
@@ -275,6 +310,10 @@ pub const Cache = struct {
         self.mappings.deinit(self.alloc);
         if (self.persistent) |*disk| disk.deinit();
         self.decoded.deinit();
+        self.delete_files.deinit();
+        self.inventory_catalogs.deinit();
+        self.inventory_chunks.deinit();
+        self.manifests.deinit();
         self.physical.deinit();
         std.debug.assert(self.flights.count() == 0);
         self.flights.deinit(self.alloc);
@@ -282,8 +321,7 @@ pub const Cache = struct {
         while (iter.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
             std.debug.assert(entry.value_ptr.*.refs == 0);
-            self.alloc.free(entry.value_ptr.*.bytes);
-            self.alloc.destroy(entry.value_ptr.*);
+            entry.value_ptr.*.destroy();
         }
         self.entries.deinit(self.alloc);
         self.* = undefined;
@@ -674,12 +712,16 @@ pub const Cache = struct {
         return try alloc.dupe(u8, lease.bytes);
     }
     fn store(self: *Cache, key: []const u8, bytes: []const u8) !void {
-        if (bytes.len > self.max_bytes or self.max_entries == 0) return;
+        return self.storeOwned(key, bytes, null);
+    }
+    fn storeOwned(self: *Cache, key: []const u8, bytes: []const u8, envelope: ?*Envelope) !void {
+        const capacity = if (envelope) |owner| owner.bytes.len else bytes.len;
+        if (capacity > self.max_bytes or self.max_entries == 0) return;
         const owned_key = try self.alloc.dupe(u8, key);
         defer self.alloc.free(owned_key);
-        const owned_bytes = try self.alloc.dupe(u8, bytes);
+        const owned_bytes = if (envelope != null) @constCast(bytes) else try self.alloc.dupe(u8, bytes);
         var admitted = false;
-        defer if (!admitted) self.alloc.free(owned_bytes);
+        defer if (!admitted and envelope == null) self.alloc.free(owned_bytes);
         const item = try self.alloc.create(Entry);
         defer if (!admitted) self.alloc.destroy(item);
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -688,7 +730,9 @@ pub const Cache = struct {
         if (self.entries.contains(key)) return;
         const lane = parquet.cacheLaneFromObjectRangeCacheKey(key);
         const protected = lane == .metadata or lane == .serving_sidecar;
-        while (self.entries.count() != 0 and (self.stats.stored_bytes > self.max_bytes - bytes.len or self.entries.count() >= self.max_entries)) {
+        // Recompute after every eviction: evicting this owner's last alias
+        // makes the next admission responsible for the whole buffer again.
+        while (self.entries.count() != 0 and (self.stats.stored_bytes > self.max_bytes - (if (envelope) |owner| (if (owner.residents == 0) capacity else 0) else capacity) or self.entries.count() >= self.max_entries)) {
             var oldest: ?[]const u8 = null;
             var touched: u64 = std.math.maxInt(u64);
             for (0..2) |pass| {
@@ -706,21 +750,26 @@ pub const Cache = struct {
                 if (oldest != null) break;
             }
             const removed = self.entries.fetchRemove(oldest orelse return).?;
-            self.stats.stored_bytes -= removed.value.bytes.len;
-            if (removed.value.protected) self.stats.protected_stored_bytes -= removed.value.bytes.len;
+            self.stats.stored_bytes -= removed.value.charge();
+            if (removed.value.protected) self.stats.protected_stored_bytes -= removed.value.charge();
+            if (removed.value.envelope) |owner| owner.residents -= 1;
             self.stats.evictions += 1;
             self.alloc.free(removed.key);
-            self.alloc.free(removed.value.bytes);
-            self.alloc.destroy(removed.value);
+            removed.value.destroy();
         }
         const map_key = try self.alloc.dupe(u8, owned_key);
         errdefer self.alloc.free(map_key);
         self.tick +%= 1;
-        item.* = .{ .cache = self, .bytes = owned_bytes, .touched = self.tick, .protected = protected };
+        item.* = .{ .cache = self, .bytes = owned_bytes, .touched = self.tick, .protected = protected, .envelope = envelope };
         try self.entries.put(self.alloc, map_key, item);
+        const charge = if (envelope) |owner| (if (owner.residents == 0) capacity else 0) else capacity;
+        if (envelope) |owner| {
+            owner.residents += 1;
+            _ = owner.refs.fetchAdd(1, .monotonic);
+        }
         admitted = true;
-        self.stats.stored_bytes += bytes.len;
-        if (protected) self.stats.protected_stored_bytes += bytes.len;
+        self.stats.stored_bytes += charge;
+        if (protected) self.stats.protected_stored_bytes += charge;
     }
 };
 pub const Reader = struct {
@@ -738,7 +787,16 @@ pub const Reader = struct {
         cancelled: std.atomic.Value(bool) = .init(false),
         page_end: ?u64 = null,
         page_limit: usize = 0,
+        members: []ranges.RangeRead = &.{},
+        claims: [8]?Cache.Claim = @splat(null),
+        fn releaseClaims(self: *Warm) void {
+            for (&self.claims) |*claim| if (claim.*) |held| {
+                self.reader.cache.finish(held, self.reader.context.io.?);
+                claim.* = null;
+            };
+        }
         fn destroy(self: *Warm) void {
+            self.releaseClaims();
             self.arena.deinit();
             std.heap.page_allocator.destroy(self);
         }
@@ -777,15 +835,59 @@ pub const Reader = struct {
         self.base.wait = null;
     }
     pub fn prefetch(self: *Reader, reads: []const ranges.RangeRead) !void {
-        return self.prefetchImpl(reads, null, 0);
+        if (self.context.io == null or self.cache.max_bytes == 0) return;
+        // Only explicitly planned cold ranges enter an envelope. Zero gap
+        // prevents a pruned page or unprojected column from being overread.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var cold: [8]ranges.RangeRead = undefined;
+        var count: usize = 0;
+        for (reads) |read| {
+            if (count == cold.len) break;
+            const key = try self.rangeKey(a, read);
+            if (self.cache.pin(key)) |lease| {
+                lease.release();
+                continue;
+            }
+            cold[count] = read;
+            count += 1;
+        }
+        const envelopes = try ranges.coalescePhysicalReadsAlloc(a, cold[0..count], .{ .max_range_bytes = 2 * 1024 * 1024 });
+        for (envelopes) |envelope| {
+            var members: [8]ranges.RangeRead = undefined;
+            var length: usize = 0;
+            for (cold[0..count]) |read| if (ranges.sameObjectVersion(read.object, envelope.object) and read.purpose == envelope.purpose and std.mem.eql(u8, read.compression_codec, envelope.compression_codec) and read.range.offset >= envelope.range.offset and read.range.end() <= envelope.range.end()) {
+                members[length] = read;
+                length += 1;
+            };
+            // Header/footer discovery retains its original interpretation.
+            const shared = length > 1 and envelope.purpose == .parquet_column_chunk;
+            try self.prefetchImpl(&.{envelope}, null, 0, if (shared) members[0..length] else &.{});
+        }
+    }
+    fn rangeKey(self: *Reader, a: Allocator, read: ranges.RangeRead) ![]u8 {
+        const key = try read.cacheKeyAlloc(a);
+        defer a.free(key);
+        return std.fmt.allocPrint(a, "{s}:{s}", .{ std.fmt.bytesToHex(self.scope, .lower), key });
+    }
+    fn ownRead(a: Allocator, read: ranges.RangeRead) !ranges.RangeRead {
+        var owned = read;
+        owned.object.bucket = try a.dupe(u8, read.object.bucket);
+        owned.object.key = try a.dupe(u8, read.object.key);
+        owned.object.version.etag = try a.dupe(u8, read.object.version.etag);
+        owned.object.version.version_id = try a.dupe(u8, read.object.version.version_id);
+        owned.compression_codec = try a.dupe(u8, read.compression_codec);
+        owned.decoded_column_id = try a.dupe(u8, read.decoded_column_id);
+        return owned;
     }
     /// Header discovery belongs to I/O workers. Reserve the bounded possible
     /// payload before discovering its size, rather than blocking a scan pull.
     pub fn prefetchPage(self: *Reader, read: ranges.RangeRead, chunk_end: u64, limit: usize) !void {
         if (chunk_end <= read.range.offset or limit < read.range.len) return;
-        return self.prefetchImpl(&.{read}, chunk_end, @intCast(@min(chunk_end - read.range.offset, @min(limit, 2 * 1024 * 1024))));
+        return self.prefetchImpl(&.{read}, chunk_end, @intCast(@min(chunk_end - read.range.offset, @min(limit, 2 * 1024 * 1024))), &.{});
     }
-    fn prefetchImpl(self: *Reader, reads: []const ranges.RangeRead, page_end: ?u64, page_limit: usize) !void {
+    fn prefetchImpl(self: *Reader, reads: []const ranges.RangeRead, page_end: ?u64, page_limit: usize, members: []const ranges.RangeRead) !void {
         self.reapPrefetch();
         const io = self.context.io orelse return;
         try self.context.ensureActive();
@@ -804,19 +906,27 @@ pub const Reader = struct {
             work.* = .{ .reader = self, .read = read, .arena = .init(std.heap.page_allocator) };
             work.page_end = page_end;
             work.page_limit = page_limit;
-            errdefer work.destroy();
+            var discarded = false;
+            errdefer if (!discarded) work.destroy();
             const a = work.arena.allocator();
-            work.read.object.bucket = try a.dupe(u8, read.object.bucket);
-            work.read.object.key = try a.dupe(u8, read.object.key);
-            work.read.object.version.etag = try a.dupe(u8, read.object.version.etag);
-            work.read.object.version.version_id = try a.dupe(u8, read.object.version.version_id);
-            work.read.compression_codec = try a.dupe(u8, read.compression_codec);
-            work.read.decoded_column_id = try a.dupe(u8, read.decoded_column_id);
+            work.read = try ownRead(a, read);
+            work.members = try a.alloc(ranges.RangeRead, members.len);
+            for (members, work.members, 0..) |member, *owned, i| {
+                owned.* = try ownRead(a, member);
+                const member_key = try self.rangeKey(a, member);
+                if (try self.cache.begin(member_key)) |claim| {
+                    if (claim.leader) work.claims[i] = claim else self.cache.finish(claim, io);
+                }
+            }
             const task = (if (self.context.execution) |execution|
                 try (Scheduling.ExecutionScope{ .execution = execution, .allocator = self.cache.alloc, .io = io, .wait = @import("../../sql/spill.zig").childWait(execution) }).submit(@intCast(reserved *| 2), std.heap.page_allocator, warmChild, .{work}, discardWarm)
             else
                 self.scheduler.submitIoTransient(io, @intCast(reserved *| 2), warm, .{work})) orelse {
                 work.destroy();
+                discarded = true;
+                // Shared admission may fit individual pages even when their
+                // envelope is too large. Preserve the useful smaller jobs.
+                if (members.len != 0) try self.prefetchImpl(members, null, 0, &.{});
                 continue;
             };
             self.pending[slot] = .{ .task = task, .bytes = @intCast(reserved), .key = key, .work = work };
@@ -846,11 +956,56 @@ pub const Reader = struct {
     fn warmFor(work: *Warm, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         const self = work.reader;
         const read = work.read;
+        defer work.releaseClaims();
         var worker: Reader = .{ .cache = self.cache, .base = self.base, .scope = self.scope, .context = self.context };
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = work, .is_cancelled_fn = Warm.canceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
         if (execution) |child| worker.bindExecution(child);
+        if (work.members.len != 0) {
+            var missing: [8]ranges.RangeRead = undefined;
+            var count: usize = 0;
+            for (work.members) |member| {
+                try worker.context.ensureActive();
+                const key = try worker.rangeKey(work.arena.allocator(), member);
+                if (self.cache.pin(key)) |lease| {
+                    lease.release();
+                    continue;
+                }
+                if (self.cache.persistentCache()) |disk| if (try disk.readAlloc(std.heap.page_allocator, key, member.range.len)) |bytes| {
+                    defer std.heap.page_allocator.free(bytes);
+                    try worker.context.ensureActive();
+                    self.cache.recordRead(true, bytes.len);
+                    self.cache.store(key, bytes) catch {};
+                    continue;
+                };
+                missing[count] = member;
+                count += 1;
+            }
+            // Cached members split remote envelopes. Never download a cached
+            // page merely to bridge two missing pages or overread a pruned gap.
+            const envelopes = try ranges.coalescePhysicalReadsAlloc(work.arena.allocator(), missing[0..count], .{ .max_range_bytes = 2 * 1024 * 1024 });
+            for (envelopes) |envelope| {
+                const owner = try std.heap.page_allocator.create(Cache.Envelope);
+                const bytes = worker.base.parquetReader().readPlannedAlloc(std.heap.page_allocator, envelope) catch |err| {
+                    std.heap.page_allocator.destroy(owner);
+                    return err;
+                };
+                owner.* = .{ .bytes = bytes };
+                defer owner.release();
+                try worker.context.ensureActive();
+                self.cache.recordRead(false, bytes.len);
+                for (missing[0..count]) |member| {
+                    if (member.range.offset < envelope.range.offset or member.range.end() > envelope.range.end()) continue;
+                    const key = try worker.rangeKey(work.arena.allocator(), member);
+                    const begin: usize = @intCast(member.range.offset - envelope.range.offset);
+                    const slice = bytes[begin..][0..@intCast(member.range.len)];
+                    if (self.cache.persistentCache()) |disk| _ = disk.enqueueWrite(key, slice);
+                    self.cache.storeOwned(key, slice, owner) catch {};
+                }
+            }
+            return;
+        }
         if (work.page_end) |end| {
             var probe = read;
             const page = @import("lake_parquet_page.zig");
@@ -931,7 +1086,8 @@ pub const Reader = struct {
             read: ranges.RangeRead,
             fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                 const self_loader: *@This() = @ptrCast(@alignCast(raw));
-                item.payload = .{ .footer = try self_loader.reader.decodeFooter(item.arena.allocator(), self_loader.read) };
+                const decoded = try self_loader.reader.decodeFooter(item.arena.allocator(), self_loader.read);
+                item.payload = .{ .footer = decoded };
             }
         }{ .reader = self, .read = read };
         return self.cache.decoded.acquire(key, 32 * 1024 * 1024, self.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
@@ -1088,10 +1244,10 @@ test "external lake prefetch rolls across blocked batches warms versions and joi
     try reader.prefetch(&reads);
     defer slow.gate.store(true, .release);
     for (0..200) |_| {
-        if (slow.entered.load(.acquire) >= 2) break;
+        if (slow.entered.load(.acquire) >= 1) break;
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
-    try std.testing.expect(slow.entered.load(.acquire) >= 2);
+    try std.testing.expect(slow.entered.load(.acquire) >= 1);
     var next_reads = reads;
     for (&next_reads) |*read| read.range.offset += 16;
     const Rolling = struct {
@@ -1121,12 +1277,12 @@ test "external lake prefetch rolls across blocked batches warms versions and joi
     try std.testing.expect(submitted_while_blocked);
     try std.testing.expectEqual(@as(usize, 32), reader.prefetch_bytes);
     reader.drain(false);
-    try std.testing.expectEqual(@as(usize, 8), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), slow.entered.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     const bytes = try reader.reader().readPlannedAlloc(a, reads[2]);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("ijkl", bytes);
-    try std.testing.expectEqual(@as(usize, 8), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), slow.entered.load(.acquire));
     try std.testing.expect(cache.snapshot().hits > 0);
     // Concurrent misses for an identical immutable range share one provider
     // request. Each waiter remains cancelable under its own read context.
@@ -1923,4 +2079,161 @@ test "lake SQL immutable artifact hash checkpoints discard an interrupted provid
     try std.testing.expectEqualSlices(u8, &payload, bytes);
     try std.testing.expect(fixture.checks >= 5);
     try std.testing.expectEqual(@as(usize, 2), fixture.loads);
+}
+
+test "external lake prefetch coalesces adjacent pages with shared bounded lease slices" {
+    const storage = @import("../../storage/object_storage.zig");
+    const a = std.testing.allocator;
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "pages", "abcdefghijklmnop", .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: std.atomic.Value(usize) = .init(0),
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    var cache = Cache.initWithMemoryLimit(a, 64);
+    defer cache.deinit();
+    var scheduler: Reader.Scheduling.Scheduler = .{ .max_io_workers = 8, .max_bytes = 128 };
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io }, .scheduler = &scheduler };
+    defer reader.drain(true);
+    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "pages", .byte_len = 16, .version = .{ .etag = put.etag.? } };
+    const reads = [_]ranges.RangeRead{
+        .{ .object = object, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk },
+        .{ .object = object, .range = .{ .offset = 4, .len = 4 }, .purpose = .parquet_column_chunk },
+        // The gap is never fetched speculatively.
+        .{ .object = object, .range = .{ .offset = 12, .len = 4 }, .purpose = .parquet_column_chunk },
+    };
+    try reader.prefetch(&reads);
+    // Required reads wait on member flights, then borrow their exact slices.
+    const first = try Reader.readLease(&reader, a, reads[0]);
+    defer first.release();
+    const second = try Reader.readLease(&reader, a, reads[1]);
+    defer second.release();
+    reader.drain(false);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
+    try std.testing.expectEqualStrings("abcd", first.bytes);
+    try std.testing.expectEqualStrings("efgh", second.bytes);
+    try std.testing.expectEqual(@intFromPtr(first.bytes.ptr) + 4, @intFromPtr(second.bytes.ptr));
+    try std.testing.expect(cache.snapshot().stored_bytes <= cache.max_bytes);
+    // A hot envelope is not fetched again, and pinned slices survive pressure.
+    try reader.prefetch(&reads);
+    reader.drain(false);
+    cache.max_bytes = 16;
+    try cache.store("pressure", "0123456789abcdef");
+    try std.testing.expectEqualStrings("efgh", second.bytes);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+}
+
+test "external lake coalesced prefetch reuses persisted page entries after restart" {
+    const storage = @import("../../storage/object_storage.zig");
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/coalesced-cache", .{tmp.sub_path});
+    defer a.free(root);
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "pages", "abcdefgh", .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: std.atomic.Value(usize) = .init(0),
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "pages", .byte_len = 8, .version = .{ .etag = put.etag.? } };
+    const reads = [_]ranges.RangeRead{
+        .{ .object = object, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk },
+        .{ .object = object, .range = .{ .offset = 4, .len = 4 }, .purpose = .parquet_column_chunk },
+    };
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        defer reader.drain(true);
+        try reader.prefetch(&reads);
+        reader.drain(false);
+        try std.testing.expectEqual(@as(usize, 1), provider.calls.load(.acquire));
+    }
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        defer reader.drain(true);
+        // Prove both exact credential/version-qualified pages exist on disk,
+        // without populating RAM or decoded cache residency.
+        for (reads) |read| {
+            const key = try reader.rangeKey(a, read);
+            defer a.free(key);
+            const disk = cache.persistentCache().?;
+            const bytes = (try disk.readAlloc(a, key, read.range.len)).?;
+            defer a.free(bytes);
+            try std.testing.expectEqual(@as(usize, 4), bytes.len);
+        }
+        const before = provider.calls.load(.acquire);
+        try reader.prefetch(&reads);
+        reader.drain(false);
+        const after = provider.calls.load(.acquire);
+        std.debug.print("persisted adjacent pages: extra provider GETs={d}\n", .{after - before});
+        try std.testing.expectEqual(before, after);
+    }
+}
+
+test "external lake shared envelope charges once across alias eviction and pinned pressure" {
+    const a = std.testing.allocator;
+    var cache = Cache.initWithMemoryLimit(a, 8);
+    defer cache.deinit();
+    const owner = try std.heap.page_allocator.create(Cache.Envelope);
+    owner.* = .{ .bytes = try std.heap.page_allocator.dupe(u8, "abcdefgh") };
+    defer owner.release();
+    try cache.storeOwned("one", owner.bytes[0..4], owner);
+    try cache.storeOwned("two", owner.bytes[4..8], owner);
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
+    const pinned = cache.pin("two").?;
+    try cache.store("pressure", "12345678");
+    // Evicting one alias cannot refund the still-pinned backing buffer.
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqualStrings("efgh", pinned.bytes);
+    try std.testing.expect(!cache.entries.contains("pressure"));
+    pinned.release();
+    try cache.store("pressure", "12345678");
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try std.testing.expectEqual(@as(usize, 0), owner.residents);
+    // Re-admission after the last alias was evicted charges the full owner.
+    try cache.storeOwned("again", owner.bytes[0..4], owner);
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.residents);
 }

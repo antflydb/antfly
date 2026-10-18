@@ -79,6 +79,13 @@ pub fn notNull(context: ?*Context, name: []const u8) anyerror {
     return error.SqlNotNullViolation;
 }
 
+/// Data/cardinality failures belong to their logical row. Speculative batch
+/// evaluation must replay its scalar prefix; resource and control errors abort.
+pub fn isRowEvaluationError(err: anyerror) bool {
+    const code = describe(err).code;
+    return std.mem.startsWith(u8, code, "22") or std.mem.startsWith(u8, code, "21") or err == error.SqlTypeMismatch;
+}
+
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => .{ .code = "22023", .message = "The read requirements or write receipt do not match this table generation.", .retryable = false },
@@ -300,4 +307,9 @@ test "durable SQL destination credential rejection is forbidden, not internal" {
     try std.testing.expectEqual(@as(u16, 403), value.httpStatus());
     try std.testing.expectEqual(@as(?bool, false), value.retryable);
     try std.testing.expect(std.mem.indexOf(u8, value.message, "StoredDestinationAuthorizationRevoked") == null);
+}
+
+test "SQL row evaluation classification preserves resource and control failures" {
+    for ([_]anyerror{ error.SqlInvalidTextRepresentation, error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlCardinalityViolation, error.SqlArraySubscriptError, error.SqlInvalidPowerArgument }) |err| try std.testing.expect(isRowEvaluationError(err));
+    for ([_]anyerror{ error.OutOfMemory, error.QueryCanceled, error.DeadlineExceeded, error.SqlProgramLimitExceeded, error.ArtifactIntegrityMismatch, error.InvalidSqlBackendResponse }) |err| try std.testing.expect(!isRowEvaluationError(err));
 }

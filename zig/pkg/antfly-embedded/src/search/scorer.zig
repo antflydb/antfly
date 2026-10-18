@@ -25,6 +25,31 @@ const Allocator = std.mem.Allocator;
 const inverted = @import("../section/inverted.zig");
 pub const WorkAuthority = @import("work_authority.zig").Authority;
 
+/// Compact logical order supplied by an immutable native source span map.
+/// The callback is pure and borrowed until every scoring task has joined.
+pub const TieRank = struct {
+    ptr: *const anyopaque,
+    rank: *const fn (*const anyopaque, u32) u64,
+    pub fn value(self: @This(), doc: u32) u64 {
+        return self.rank(self.ptr, doc);
+    }
+};
+pub fn betterWithRank(a: ScoredHit, b: ScoredHit, rank: ?TieRank) bool {
+    if (a.score != b.score) return a.score > b.score;
+    if (rank) |order| {
+        const left = order.value(a.doc_id);
+        const right = order.value(b.doc_id);
+        if (left != right) return left < right;
+    }
+    return a.doc_id < b.doc_id;
+}
+pub fn sortScoredHitsWithRank(hits: []ScoredHit, rank: ?TieRank) void {
+    std.mem.sort(ScoredHit, hits, rank, struct {
+        fn less(order: ?TieRank, l: ScoredHit, rr: ScoredHit) bool {
+            return betterWithRank(l, rr, order);
+        }
+    }.less);
+}
 pub const ScoredHit = struct {
     doc_id: u32,
     score: f32,
@@ -140,23 +165,26 @@ pub fn insertTopK(
 
 /// Worst-first bounded heap shared by filtered and unfiltered native ranking.
 pub fn offerTopK(alloc: Allocator, hits: *std.ArrayListUnmanaged(ScoredHit), k: u32, hit: ScoredHit) !void {
+    return offerTopKWithRank(alloc, hits, k, hit, null);
+}
+pub fn offerTopKWithRank(alloc: Allocator, hits: *std.ArrayListUnmanaged(ScoredHit), k: u32, hit: ScoredHit, rank: ?TieRank) !void {
     if (k == 0) return;
     if (hits.items.len < k) {
         try hits.append(alloc, hit);
         var child = hits.items.len - 1;
         while (child > 0) {
             const parent = (child - 1) / 2;
-            if (!scoredHitWorseThan(hits.items[child], hits.items[parent])) break;
+            if (!betterWithRank(hits.items[parent], hits.items[child], rank)) break;
             std.mem.swap(ScoredHit, &hits.items[child], &hits.items[parent]);
             child = parent;
         }
-    } else if (scoredHitBetterThan(hit, hits.items[0])) {
+    } else if (betterWithRank(hit, hits.items[0], rank)) {
         hits.items[0] = hit;
         var parent: usize = 0;
         while (parent < hits.items.len / 2) {
             var child = parent * 2 + 1;
-            if (child + 1 < hits.items.len and scoredHitWorseThan(hits.items[child + 1], hits.items[child])) child += 1;
-            if (!scoredHitWorseThan(hits.items[child], hits.items[parent])) break;
+            if (child + 1 < hits.items.len and betterWithRank(hits.items[child], hits.items[child + 1], rank)) child += 1;
+            if (!betterWithRank(hits.items[parent], hits.items[child], rank)) break;
             std.mem.swap(ScoredHit, &hits.items[child], &hits.items[parent]);
             parent = child;
         }
