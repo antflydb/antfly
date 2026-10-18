@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `408644a861` (2026-10-17). Earlier implementation and
+at `0f85c7907f` (verified 2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -138,6 +138,13 @@ only its exact audited command can authorize a seal proposal. Post-commit
 recovery reads the retained seal without an uncancellable filesystem audit.
 Validation responses carry explicit Raft cuts and mandatory physical witnesses;
 the worker recognizes progress, permanent failures and signed validation ACKs.
+Installation and release grants now retain authority-tagged validation and
+installation cuts, with mandatory physical installation witnesses for either
+authority. Raft proposal permission requires the receiver's exact audited
+installation command as well as metadata's grant. Installation signing checks
+the actual completed Raft prefix; release requires the accepted installation's
+same root, generation, reporter and replica identity. A changed root must use
+the distinct recovery/adoption protocol rather than a release signature.
 This is not complete public activation: the worker's Raft cohort guard,
 installation/release/cancellation receiver paths and root-adoption recovery
 remain unfinished, and public CREATE remains guarded. No original case is

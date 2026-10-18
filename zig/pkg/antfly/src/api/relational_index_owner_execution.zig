@@ -1615,7 +1615,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     const signing: SigningState = .{ .context = if (permission.value.native_signing) |view| .{ .view = view, .expected_revision = permission.value.head.revision, .request = request } else null };
     if (request.operation == .install) {
         const view = permission.value.native_signing orelse return error.NativeIndexSigningUnavailable;
-        const grant = permission.value.native_install orelse return error.InvalidCatalogRecord;
+        const grant = permission.value.installation orelse return error.InvalidCatalogRecord;
         // Metadata supplies the desired immutable binding. The kernel checks
         // the real reserved/installed job on the applying root; old inspection
         // APIs deliberately cannot manufacture an installed retry observation.
@@ -1628,7 +1628,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     }
     if (request.operation == .release) {
         const view = permission.value.native_signing orelse return error.NativeIndexSigningUnavailable;
-        const grant = permission.value.native_release orelse return error.InvalidCatalogRecord;
+        const grant = permission.value.release orelse return error.InvalidCatalogRecord;
         const intent = try permission.value.nativeReleaseIntent(hot_request);
         var rooted = try source.applyNativeIndexOwnerReleaseAtRoot(alloc, request.group_id, table_name, intent, grant.installation_proof.root_generation, view.identity.root_incarnation, context);
         errdefer rooted.outcome.deinit();
@@ -1798,7 +1798,7 @@ const TestDriver = struct {
                         const validated = self.validated_outcome orelse return error.TestMissingValidatedOutcome;
                         break :sealed local.storage_db_relational_index_validation.Seal{ .command = validated.logical.command, .position = .{ .native = validated.logical.position } };
                     };
-                    self.value.native_install = .{ .validation = seal, .decision_digest = try publication.NativeInstallGrant.decisionDigest(self.value.metadata_group_id, self.value.metadata_incarnation, self.value.head) };
+                    self.value.installation = .{ .validation = seal, .decision_digest = try publication.InstallGrant.decisionDigest(self.value.metadata_group_id, self.value.metadata_incarnation, self.value.head) };
                 }
                 if (self.decision_fault == .lost_reply or self.decision_fault == .pending or self.decision_fault == .restart_committed) {
                     if (self.decision_fault == .pending) self.decision_pending_checks = 3;
@@ -1881,23 +1881,23 @@ const TestDriver = struct {
         }
         const request = call.relational_index_owner_decision;
         var value = self.value;
-        if (request.operation != .install) value.native_install = null;
-        if (request.operation != .release) value.native_release = null;
+        if (request.operation != .install) value.installation = null;
+        if (request.operation != .release) value.release = null;
         if (self.release_acks != 0 and request.operation == .release) {
             value.disposition = .acknowledged;
             value.dispatch = null;
             value.inputs = null;
             value.native_signing = null;
-            value.native_release = null;
+            value.release = null;
         } else if (request.operation == .release) {
             const installed = self.installation_response.?.installed.logical;
-            value.native_release = .{ .installed = .{ .command = installed.command, .position = .{ .native = installed.position } }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(value.metadata_group_id, value.metadata_incarnation, value.head), .installation_proof = self.installation_proof orelse value.native_release.?.installation_proof };
+            value.release = .{ .installed = .{ .command = installed.command, .position = .{ .native = installed.position } }, .decision_digest = try publication.ReleaseGrant.decisionDigest(value.metadata_group_id, value.metadata_incarnation, value.head), .installation_proof = self.installation_proof orelse value.release.?.installation_proof };
         } else if (self.installation_acks != 0 and request.operation == .install) {
             value.disposition = .acknowledged;
             value.dispatch = null;
             value.inputs = null;
             value.native_signing = null;
-            value.native_install = null;
+            value.installation = null;
             value.target_expectation = null;
         } else if (self.validation_acks != 0 and (request.operation == .validate or request.operation == .build)) {
             self.validation_permission_acks += 1;
@@ -3043,7 +3043,7 @@ fn testSchedulerInstallationFaults(alloc: std.mem.Allocator, permission: publica
         if (automatic_decision) {
             driver.value.head.phase = .building;
             driver.value.head.revision -= 1;
-            driver.value.native_install = null;
+            driver.value.installation = null;
         }
         var host: TestSchedulerHost = .{ .driver = &driver };
         var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
@@ -3101,9 +3101,9 @@ fn testReleaseReceiverAndScheduler(alloc: std.mem.Allocator, permission: publica
     active.head = update.head;
     active.owner = update.owner;
     active.owner.attestations[@backingInt(progress.Action.installed)] = try installed_ack.signed.commitment();
-    active.native_install = null;
+    active.installation = null;
     const logical = installed.installed.logical;
-    active.native_release = .{ .installed = .{ .command = logical.command, .position = .{ .native = logical.position } }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(active.metadata_group_id, active.metadata_incarnation, active.head), .installation_proof = installed_ack.signed.proof };
+    active.release = .{ .installed = .{ .command = logical.command, .position = .{ .native = logical.position } }, .decision_digest = try publication.ReleaseGrant.decisionDigest(active.metadata_group_id, active.metadata_incarnation, active.head), .installation_proof = installed_ack.signed.proof };
     const request: Request = .{ .table_id = active.head.table_id, .group_id = active.owner.owner.group_id, .id = active.head.plan_id, .operation = .release };
     var driver: TestDriver = .{ .value = active, .installation_response = installed, .root_generation = installed_ack.signed.proof.root_generation };
     driver.root_generation += 1;
@@ -3230,13 +3230,13 @@ test "relational index publication installed receiver binds fresh decision and r
     const acknowledged = try progress.acknowledge(driver.value.head, driver.value.owner, driver.value.head.revision, validated.logical.receipt.?);
     driver.value.head = try acknowledged.head.decidePublish(acknowledged.head.revision);
     driver.value.owner = acknowledged.owner;
-    driver.value.native_install = .{ .validation = .{ .command = validated.logical.command, .position = .{ .native = validated.logical.position } }, .decision_digest = try publication.NativeInstallGrant.decisionDigest(13, driver.value.metadata_incarnation, driver.value.head) };
+    driver.value.installation = .{ .validation = .{ .command = validated.logical.command, .position = .{ .native = validated.logical.position } }, .decision_digest = try publication.InstallGrant.decisionDigest(13, driver.value.metadata_incarnation, driver.value.head) };
     const seed: [32]u8 = @splat(9);
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .public_key = pair.public_key.toBytes(), .root_incarnation = 7 };
     const owner_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
     driver.value.native_signing = .{ .identity = .{ .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key }, .reporter_incarnation = 4, .binding_digest = try owner_binding.digest() };
-    const command: local.storage_db_relational_index_validation.InstallCommand = .{ .validation = driver.value.native_install.?.validation, .metadata_decision = driver.value.native_install.?.decision_digest, .schema_digest = @splat(3), .activation_digest = @splat(4) };
+    const command: local.storage_db_relational_index_validation.InstallCommand = .{ .validation = driver.value.installation.?.validation, .metadata_decision = driver.value.installation.?.decision_digest, .schema_digest = @splat(3), .activation_digest = @splat(4) };
     const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 9 };
     driver.installation_response = .{ .installed = .{ .physical = validated.physical, .logical = .{ .command = command, .position = position, .duplicate = false, .receipt = try command.receipt(position) } } };
     const signing_view = driver.value.native_signing.?;

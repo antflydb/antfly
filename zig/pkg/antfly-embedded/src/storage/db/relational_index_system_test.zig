@@ -3002,6 +3002,31 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     const schema_generation = db.core.table_catalog.generation;
     try db.applyCommittedRaftIndexInstallation(&recovered_installation, 11, .{ .term = 16, .index = install_entry.index + 2 });
     try std.testing.expectEqual(schema_generation, db.core.table_catalog.generation);
+    {
+        var audit_directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-installed-index-audit");
+        defer audit_directory.cleanup();
+        const signing = @import("root_signing_identity.zig");
+        const root = try signing.loadOrCreate(alloc, std.testing.io, audit_directory.path());
+        const budget: @import("relational_index_jobs.zig").Budget = .{ .records = 1, .time_ns = std.time.ns_per_s };
+        var turns: usize = 0;
+        const audited = audited: while (turns < 64) : (turns += 1) {
+            const summary = try db.stepRaftIndexOwnerInstallationAudit(11, "usage_records", installation_intent, budget, audit_directory.path(), root.root_incarnation, .{});
+            try summary.validateFor(expected, root.root_incarnation);
+            try std.testing.expectEqual(install_entry.index + 2, (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectEqual(schema_generation, db.core.table_catalog.generation);
+            if (turns == 0) {
+                db.close();
+                db_live = false;
+                db = try db_mod.DB.open(alloc, directory.path(), options);
+                db_live = true;
+            }
+            if (summary.generation) |generation| if (generation.phase == .ready) break :audited summary;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(turns > 1);
+        try std.testing.expectEqualDeep(audited, try db.stepRaftIndexOwnerInstallationAudit(11, "usage_records", installation_intent, budget, audit_directory.path(), root.root_incarnation, .{}));
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.stepRaftIndexOwnerInstallationAudit(99, "usage_records", installation_intent, budget, audit_directory.path(), root.root_incarnation, .{}));
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.stepNativeIndexOwnerInstallationAudit("usage_records", installation_intent, budget, audit_directory.path(), root.root_incarnation, .{}));
+    }
     const released = @import("relational_index_release.zig");
     const release_intent: released.Intent = intent: {
         var read = try db.core.store.beginReadTxn();

@@ -454,14 +454,14 @@ pub const InstallationWitness = struct {
     signed: SignedAudit,
 
     pub fn verifyFor(self: @This(), receipt: SignedReceipt) !void {
-        if (receipt.receipt.action != .installed or receipt.receipt.position != .native) return error.InvalidIndexOwnerReceipt;
+        if (receipt.receipt.action != .installed) return error.InvalidIndexOwnerReceipt;
         try receipt.verifySignature();
         try self.verifyPhysicalAndScope(receipt);
     }
     fn verifyPhysicalAndScope(self: @This(), receipt: SignedReceipt) !void {
         try self.command.validate();
         if (!std.meta.eql(self.command.validation.command, try self.outcome.logicalCommand()) or
-            !std.meta.eql(try self.command.receipt(receipt.receipt.position.native), receipt.receipt)) return error.InvalidIndexOwnerReceipt;
+            !std.meta.eql(try self.command.receiptAt(receipt.receipt.position), receipt.receipt)) return error.InvalidIndexOwnerReceipt;
         try (AuditEvidence{ .outcome = self.outcome, .signed = self.signed }).verifyScope(receipt);
     }
 };
@@ -483,7 +483,7 @@ pub const CancellationWitness = struct {
 fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !void {
     const is_native = signed.receipt.owner.authority == .native;
     if ((signed.receipt.action == .validated) != (validation != null) or
-        (is_native and signed.receipt.action == .installed) != (installation != null) or
+        (signed.receipt.action == .installed) != (installation != null) or
         (is_native and signed.receipt.action == .canceled) != (cancellation != null)) return error.InvalidIndexOwnerReceipt;
 }
 
@@ -768,7 +768,7 @@ pub const RaftSigningView = struct {
 /// Root-independent logical install input derived only from metadata's retained
 /// accepted validation proof. Not a physical audit, transport authentication or
 /// permission to adopt a replacement root. ACK revisions do not change its ID.
-pub const NativeInstallGrant = struct {
+pub const InstallGrant = struct {
     validation: local.storage_db_relational_index_validation.Seal,
     decision_digest: Digest,
 
@@ -777,7 +777,7 @@ pub const NativeInstallGrant = struct {
         if (group == 0 or !local.metadata_incarnation.isValid(incarnation) or
             (head.phase != .installing and head.phase != .releasing and head.phase != .published)) return error.InvalidCatalogRecord;
         var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly/native-index-install-decision/v1");
+        state.update("antfly/index-install-decision/v1");
         state.update(&incarnation);
         state.update(&head.plan_id);
         state.update(&head.plan_digest);
@@ -795,8 +795,7 @@ pub const NativeInstallGrant = struct {
 
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
         try owner.validate();
-        if (self.validation.position != .native) return error.InvalidCatalogRecord;
-        const receipt = try self.validation.command.receipt(self.validation.position.native);
+        const receipt = try self.validation.command.receiptAt(self.validation.position);
         const expected = self.validation.command.expected;
         if (!std.mem.eql(u8, &self.decision_digest, &try decisionDigest(group, incarnation, head)) or
             owner.owner.namespace.table_id != head.table_id or owner.owner.ordinal >= head.owner_count or
@@ -839,7 +838,7 @@ pub fn cancellationReleaseDecisionDigest(group: u64, incarnation: local.metadata
     return result;
 }
 
-pub const NativeReleaseGrant = struct {
+pub const ReleaseGrant = struct {
     installed: local.storage_db_relational_index_validation.Installed,
     decision_digest: Digest,
     installation_proof: RootProof,
@@ -850,8 +849,8 @@ pub const NativeReleaseGrant = struct {
             (head.phase != .releasing and head.phase != .published) or
             head.counts[@backingInt(progress.Action.installed)] != head.owner_count) return error.InvalidCatalogRecord;
         var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly/native-index-release-decision/v1");
-        state.update(&try NativeInstallGrant.decisionDigest(group, incarnation, head));
+        state.update("antfly/index-release-decision/v1");
+        state.update(&try InstallGrant.decisionDigest(group, incarnation, head));
         var result: Digest = undefined;
         state.final(&result);
         return result;
@@ -862,9 +861,8 @@ pub const NativeReleaseGrant = struct {
     }
 
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
-        try (NativeInstallGrant{ .validation = self.installed.command.validation, .decision_digest = self.installed.command.metadata_decision }).validateFor(group, incarnation, head, owner);
-        if (self.installed.position != .native) return error.InvalidCatalogRecord;
-        const receipt = try self.installed.command.receipt(self.installed.position.native);
+        try (InstallGrant{ .validation = self.installed.command.validation, .decision_digest = self.installed.command.metadata_decision }).validateFor(group, incarnation, head, owner);
+        const receipt = try self.installed.command.receiptAt(self.installed.position);
         const signed: SignedReceipt = .{ .receipt = receipt, .proof = self.installation_proof };
         signed.verifySignature() catch return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, &self.decision_digest, &try decisionDigest(group, incarnation, head)) or
@@ -878,16 +876,15 @@ pub const NativeReleaseGrant = struct {
 
 /// Shared live-apply and recovery check. Root replacement requires a distinct
 /// physical recovery protocol; a release signature cannot adopt an old cut.
-pub fn requireNativeReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, installed: StoredProof.Decoded, signed: SignedReceipt) !void {
+pub fn requireReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, installed: StoredProof.Decoded, signed: SignedReceipt) !void {
     const witness = installed.installation orelse return error.InvalidCatalogRecord;
-    const grant: NativeReleaseGrant = .{
+    const grant: ReleaseGrant = .{
         .installed = .{ .command = witness.command, .position = installed.signed.receipt.position },
-        .decision_digest = try NativeReleaseGrant.decisionDigest(group, incarnation, head),
+        .decision_digest = try ReleaseGrant.decisionDigest(group, incarnation, head),
         .installation_proof = installed.signed.proof,
     };
     try grant.validateFor(group, incarnation, head, owner);
-    if (signed.receipt.position != .native or
-        !std.meta.eql(try grant.intent().receipt(signed.receipt.position.native), signed.receipt) or
+    if (!std.meta.eql(try grant.intent().receiptAt(signed.receipt.position), signed.receipt) or
         !std.meta.eql(installed.signed.proof.identity, signed.proof.identity) or
         !std.meta.eql(installed.signed.proof.authority, signed.proof.authority) or
         installed.signed.proof.root_generation != signed.proof.root_generation or
@@ -976,8 +973,8 @@ pub const OwnerDecision = struct {
     raft_signing: ?RaftSigningView = null,
     claim_routes: ?ClaimRoutes = null,
     target_expectation: ?local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = null,
-    native_install: ?NativeInstallGrant = null,
-    native_release: ?NativeReleaseGrant = null,
+    installation: ?InstallGrant = null,
+    release: ?ReleaseGrant = null,
     native_cancel_release: ?NativeCancellationReleaseGrant = null,
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
@@ -996,18 +993,23 @@ pub const OwnerDecision = struct {
                 expected.completion_revision != self.head.completion_revision or
                 !std.mem.eql(u8, &expected.metadata_incarnation, &self.metadata_incarnation)) return error.InvalidCatalogRecord;
         } else if (self.target_expectation != null) return error.InvalidCatalogRecord;
-        if (request.operation == .install and self.disposition == .execute and self.owner.owner.authority == .native) {
-            const grant = self.native_install orelse return error.InvalidCatalogRecord;
+        if (request.operation == .install and self.disposition == .execute) {
+            const grant = self.installation orelse return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
-        } else if (self.native_install != null) return error.InvalidCatalogRecord;
-        if (request.operation == .release and self.disposition == .execute and self.owner.owner.authority == .native) {
-            const grant = self.native_release orelse return error.InvalidCatalogRecord;
+        } else if (self.installation != null) return error.InvalidCatalogRecord;
+        if (request.operation == .release and self.disposition == .execute) {
+            const grant = self.release orelse return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
-            try self.requireRetainedNativeBinding(grant.installed.command.validation.command.binding);
-            const view = self.native_signing orelse return error.InvalidCatalogRecord;
-            if (!std.meta.eql(grant.installation_proof.identity, view.identity) or grant.installation_proof.reporter_incarnation != view.reporter_incarnation or
-                grant.installation_proof.authority != .native or !std.mem.eql(u8, &grant.installation_proof.authority.native, &view.binding_digest)) return error.InvalidCatalogRecord;
-        } else if (self.native_release != null) return error.InvalidCatalogRecord;
+            try self.requireRetainedBinding(grant.installed.command.validation.command.binding, self.owner.owner.authority);
+            if (self.owner.owner.authority == .native) {
+                const view = self.native_signing orelse return error.InvalidCatalogRecord;
+                if (!std.meta.eql(grant.installation_proof.identity, view.identity) or grant.installation_proof.reporter_incarnation != view.reporter_incarnation or
+                    grant.installation_proof.authority != .native or !std.mem.eql(u8, &grant.installation_proof.authority.native, &view.binding_digest)) return error.InvalidCatalogRecord;
+            } else if (self.raft_signing) |view| {
+                if (!std.meta.eql(grant.installation_proof.identity, view.identity) or grant.installation_proof.reporter_incarnation != view.reporter_incarnation or
+                    grant.installation_proof.authority != .raft or grant.installation_proof.authority.raft != view.replica_id or grant.installation_proof.root_generation != view.root_generation) return error.InvalidCatalogRecord;
+            } else return error.InvalidCatalogRecord;
+        } else if (self.release != null) return error.InvalidCatalogRecord;
         if (request.operation == .cancel_release and self.disposition == .execute and self.owner.owner.authority == .native) {
             const grant = self.native_cancel_release orelse return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
@@ -1347,7 +1349,12 @@ pub const OwnerDecision = struct {
     }
 
     pub fn signRaftAudit(self: OwnerDecision, request: OwnerRequest, outcome: native_control.AuditOutcome, physical_root_incarnation: u128, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !SignedAudit {
-        const validation_request = try self.raftInventoryValidation(request, outcome.binding, .{});
+        const validation_request = if (request.operation == .install) blk: {
+            const intent = try self.raftInstallationIntent(request, outcome.binding);
+            var prepared = try native_control.BuildRequest.initRaft(try self.raftExecutionIdentity(request), intent.validation.command.binding, .{});
+            prepared.target_expectation = intent.validation.command.expected;
+            break :blk prepared;
+        } else try self.raftInventoryValidation(request, outcome.binding, .{});
         try outcome.validateForRaft(validation_request);
         const digest_ = try outcome.readyDigest();
         const view = try self.raftSigningView(request);
@@ -1361,16 +1368,50 @@ pub const OwnerDecision = struct {
     }
 
     pub fn nativeInstallationIntent(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !local.storage_db_relational_index_validation.InstallIntent {
-        if (request.operation != .install) return error.InvalidGenerationPublication;
         try self.requireNativeBinding(request, observed);
+        return self.installationIntent(request, observed);
+    }
+
+    pub fn raftInstallationIntent(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !local.storage_db_relational_index_validation.InstallIntent {
+        _ = try self.raftExecutionIdentity(request);
+        try self.requireRetainedRaftBinding(observed);
+        return self.installationIntent(request, observed);
+    }
+
+    fn installationIntent(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !local.storage_db_relational_index_validation.InstallIntent {
+        if (request.operation != .install) return error.InvalidGenerationPublication;
         if (observed.phase != .reserved and observed.phase != .installed) return error.PrivateIndexOwnerJobChanged;
         var reserved = observed;
         reserved.phase = .reserved;
-        const grant = self.native_install orelse return error.InvalidCatalogRecord;
+        const grant = self.installation orelse return error.InvalidCatalogRecord;
         if (!std.meta.eql(reserved, grant.validation.command.binding)) return error.PrivateIndexOwnerJobChanged;
         const intent: local.storage_db_relational_index_validation.InstallIntent = .{ .validation = grant.validation, .metadata_decision = grant.decision_digest };
         try intent.validate();
         return intent;
+    }
+
+    /// A metadata grant alone cannot authorize installation of caller-selected
+    /// bytes: the receiver must also retain this root's exact audited command.
+    pub fn requireRaftInstallationProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: local.storage_db_relational_index_validation.InstallCommand, audited: ?local.storage_db_relational_index_validation.InstallCommand) !void {
+        const intent = try self.raftInstallationIntent(request, command.validation.command.binding);
+        try command.validate();
+        if (!std.meta.eql(intent, command.intent())) return error.GenerationPublicationChanged;
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+        if (!std.meta.eql(command, audited orelse return error.PrivateIndexTargetValidationRequired)) return error.PrivateIndexAuditScopeChanged;
+    }
+
+    pub fn signRaftInstallation(self: OwnerDecision, request: OwnerRequest, installed: local.storage_db_relational_index_validation.Installed, outcome: native_control.AuditOutcome, physical_root_incarnation: u128, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        const intent = try self.raftInstallationIntent(request, outcome.binding);
+        if (!std.meta.eql(intent, installed.command.intent()) or
+            !std.meta.eql(try outcome.logicalCommand(), installed.command.validation.command)) return error.PrivateIndexAuditScopeChanged;
+        const receipt = try installed.command.receiptAt(installed.position);
+        if (installed.position != .raft or installed.position.raft.term > actual.leader_term or installed.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const physical = try self.signRaftAudit(request, outcome, physical_root_incarnation, actual, root);
+        const view = try self.raftSigningView(request);
+        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) }, .installation = .{ .outcome = outcome, .command = installed.command, .signed = physical } };
+        try ack.validate();
+        return ack;
     }
     pub fn nativeInventoryValidation(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, budget: local.storage_db_relational_index_jobs.Budget) !native_control.BuildRequest {
         const expected = try self.nativeTargetExpectation(request, observed);
@@ -1385,7 +1426,7 @@ pub const OwnerDecision = struct {
     pub fn nativeReleaseIntent(self: OwnerDecision, request: OwnerRequest) !@FieldType(native_control.ReleaseOutcome, "intent") {
         if (request.operation != .release) return error.InvalidGenerationPublication;
         _ = try self.nativeExecutionIdentity(request);
-        const grant = self.native_release orelse return error.InvalidCatalogRecord;
+        const grant = self.release orelse return error.InvalidCatalogRecord;
         try self.requireRetainedNativeBinding(grant.installed.command.validation.command.binding);
         return grant.intent();
     }
@@ -1393,6 +1434,14 @@ pub const OwnerDecision = struct {
     fn requireNativeBinding(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !void {
         _ = try self.nativeExecutionIdentity(request);
         try self.requireRetainedNativeBinding(observed);
+    }
+
+    pub fn raftReleaseIntent(self: OwnerDecision, request: OwnerRequest) !@FieldType(native_control.ReleaseOutcome, "intent") {
+        if (request.operation != .release) return error.InvalidGenerationPublication;
+        _ = try self.raftExecutionIdentity(request);
+        const grant = self.release orelse return error.InvalidCatalogRecord;
+        try self.requireRetainedRaftBinding(grant.installed.command.validation.command.binding);
+        return grant.intent();
     }
 
     /// Immutable identity only, not live execution permission. Checkpoints use
@@ -2424,8 +2473,8 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
                 const cleanup = try storedProof(a, (try optionalGet(txn, try proofKey(&buf, group, table, @intCast(i), .canceled))) orelse return error.InvalidCatalogRecord, head, owner, .canceled);
                 requireNativeCancellationReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, cleanup, signed) catch return error.InvalidCatalogRecord;
             }
-            if (action == .released and owner.owner.authority == .native) {
-                requireNativeReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed) catch return error.InvalidCatalogRecord;
+            if (action == .released) {
+                requireReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed) catch return error.InvalidCatalogRecord;
             }
             if (retained.validation) |witness| {
                 const frozen = @import("relational_index_delivery_journal.zig").frozenTargetForRecovery(a, txn, group, head, owner, signed.proof.identity.metadata_incarnation) catch |err| switch (err) {

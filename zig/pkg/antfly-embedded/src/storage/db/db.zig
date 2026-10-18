@@ -8947,6 +8947,14 @@ pub const DB = struct {
     /// opens a fresh snapshot and checks the real successor before using the
     /// cached immutable predecessor; no snapshot survives a request boundary.
     pub fn stepNativeIndexOwnerInstallationAudit(self: *DB, table_name: []const u8, intent: @import("relational_index_validation.zig").InstallIntent, page_budget: @import("relational_index_jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+        return self.stepIndexOwnerInstallationAudit(table_name, intent, page_budget, signing_root_dir, signing_root_incarnation, context, false);
+    }
+    pub fn stepRaftIndexOwnerInstallationAudit(self: *DB, owner_group: u64, table_name: []const u8, intent: @import("relational_index_validation.zig").InstallIntent, page_budget: @import("relational_index_jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+        const b = intent.validation.command.binding;
+        try self.requireRaftIndexOwnerIdentity(owner_group, .{ .id = b.id, .plan_digest = b.plan_digest, .owner_digest = b.owner_digest, .ordinal = b.ordinal, .namespace = b.fence.namespace, .owner_group_id = b.fence.owner_group_id });
+        return self.stepIndexOwnerInstallationAudit(table_name, intent, page_budget, signing_root_dir, signing_root_incarnation, context, true);
+    }
+    fn stepIndexOwnerInstallationAudit(self: *DB, table_name: []const u8, intent: @import("relational_index_validation.zig").InstallIntent, page_budget: @import("relational_index_jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext, comptime replicated: bool) !@import("relational_index_audit_checkpoint.zig").Summary {
         const jobs = @import("relational_index_owner_job.zig");
         try context.ensureActive();
         try intent.validate();
@@ -8957,7 +8965,7 @@ pub const DB = struct {
         if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest) or
             !binding.fence.namespace.eql(self.core.identity_namespace)) return error.PrivateIndexOwnerJobChanged;
         const identity: NativeIndexOwnerIdentity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
-        var request = try NativeIndexOwnerBuildRequest.init(identity, binding, page_budget);
+        var request = if (replicated) try NativeIndexOwnerBuildRequest.initRaft(identity, binding, page_budget) else try NativeIndexOwnerBuildRequest.init(identity, binding, page_budget);
         request.target_expectation = expected;
         const installed = installed: {
             var read = try self.core.store.beginReadTxn();
@@ -8973,7 +8981,7 @@ pub const DB = struct {
             if (current.phase != .installed) return error.PrivateIndexOwnerJobChanged;
             break :installed true;
         };
-        if (!installed) return self.stepNativeIndexOwnerAudit(table_name, request, signing_root_dir, signing_root_incarnation, context);
+        if (!installed) return if (replicated) self.stepRaftIndexOwnerAudit(binding.fence.owner_group_id, table_name, request, signing_root_dir, signing_root_incarnation, context) else self.stepNativeIndexOwnerAudit(table_name, request, signing_root_dir, signing_root_incarnation, context);
         const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
         var memory_budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
         defer if (memory_budget) |*value| value.deinit();
@@ -8991,7 +8999,7 @@ pub const DB = struct {
         const binding = intent.validation.command.binding;
         const expected = intent.validation.command.expected;
         const page_budget = request.budget;
-        var lease = try self.native_index_build_cache.acquireInstalledAudit(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, intent, context);
+        var lease = if (binding.authority == .raft) try self.native_index_build_cache.acquireRaftInstalledAudit(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, intent, context) else try self.native_index_build_cache.acquireInstalledAudit(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, intent, context);
         defer lease.deinit();
         const history = lease.installedHistory() orelse return error.InvalidPrivateIndexOwnerJob;
         var guard = try checkpoint.open(task_alloc, io, signing_root_dir, signing_root_incarnation, self.root_incarnation, binding, expected, context);
@@ -9007,7 +9015,8 @@ pub const DB = struct {
                 const next = try claims.InventoryValidation.auditPage(task_alloc, &historical, binding, expected, self.root_incarnation, if (state) |value| value.inventory else null, page_budget, context);
                 state = .{ .inventory = next };
             } else if (state.?.inventory.fields.phase == .ready) {
-                const next = try verification.auditReadPage(task_alloc, self.core, &historical, binding, expected, &lease.reservation().artifacts.?.addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, page_budget, context);
+                const addition = if (binding.authority == .raft) &lease.raftReservation().artifacts.?.addition else &lease.reservation().artifacts.?.addition;
+                const next = try verification.auditReadPage(task_alloc, self.core, &historical, binding, expected, addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, page_budget, context);
                 if (state.?.generation) |*value| value.deinit();
                 state.?.generation = next;
             }

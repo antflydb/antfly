@@ -4548,6 +4548,44 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         // Validation permits, but never stages, the separate atomic catalog
         // publication decision. No descriptor is exposed by an owner ACK.
         try std.testing.expectEqual(index_progress.Phase.installing, (try validated_head.decidePublish(validated_head.revision)).phase);
+        // Qualify the authority-aware grants without pretending that this
+        // synthetic metadata fixture executes physical schema installation.
+        var installing = permission;
+        installing.head = try validated_head.decidePublish(validated_head.revision);
+        installing.owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group, head.table_id, owner.owner.ordinal)));
+        installing.target_expectation = null;
+        installing.installation = .{ .validation = audited.seal.?, .decision_digest = try index_publication.InstallGrant.decisionDigest(group, proof.identity.metadata_incarnation, installing.head) };
+        var install_request = lookup;
+        install_request.operation = .install;
+        const install_intent = try installing.raftInstallationIntent(install_request, binding);
+        try std.testing.expectEqualDeep(audited.seal.?, install_intent.validation);
+        const install_command: local.storage_db_relational_index_validation.InstallCommand = .{ .validation = install_intent.validation, .metadata_decision = install_intent.metadata_decision, .schema_digest = @splat(3), .activation_digest = @splat(4) };
+        try std.testing.expectError(error.PrivateIndexTargetValidationRequired, installing.requireRaftInstallationProposal(dispatch.value.table_name, install_request, install_command, null));
+        var changed_command = install_command;
+        changed_command.activation_digest[0] ^= 1;
+        try std.testing.expectError(error.PrivateIndexAuditScopeChanged, installing.requireRaftInstallationProposal(dispatch.value.table_name, install_request, install_command, changed_command));
+        try installing.requireRaftInstallationProposal(dispatch.value.table_name, install_request, install_command, install_command);
+        const installed: local.storage_db_relational_index_validation.Installed = .{ .command = install_command, .position = .{ .raft = .{ .term = 2, .index = 12 } } };
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, installing.signRaftInstallation(install_request, installed, audit, 9, scope, root));
+        scope.completed_index = 12;
+        const installed_ack = try installing.signRaftInstallation(install_request, installed, audit, 9, scope, root);
+        try installed_ack.validate();
+        var bare_installed = installed_ack;
+        bare_installed.installation = null;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, bare_installed.validate());
+        const installed_state = try index_progress.acknowledge(installing.head, installing.owner, installing.head.revision, installed_ack.signed.receipt);
+        var releasing = installing;
+        releasing.head = installed_state.head;
+        releasing.owner = installed_state.owner;
+        releasing.owner.attestations[@backingInt(index_progress.Action.installed)] = try installed_ack.signed.commitment();
+        releasing.installation = null;
+        releasing.release = .{ .installed = installed, .decision_digest = try index_publication.ReleaseGrant.decisionDigest(group, proof.identity.metadata_incarnation, releasing.head), .installation_proof = installed_ack.signed.proof };
+        var release_request = lookup;
+        release_request.operation = .release;
+        _ = try releasing.raftReleaseIntent(release_request);
+        var wrong_root = releasing;
+        wrong_root.raft_signing.?.root_generation += 1;
+        try std.testing.expectError(error.InvalidCatalogRecord, wrong_root.raftReleaseIntent(release_request));
         const snapshot = try store.buildMetadataSnapshotTxn(store.alloc, &txn, group, null);
         defer store.alloc.free(snapshot);
     }
@@ -5486,7 +5524,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             var permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, reply, .{});
             defer permission.deinit();
             try permission.value.requireRequest(lookup);
-            const grant = permission.value.native_install orelse return error.TestMissingNativeInstallGrant;
+            const grant = permission.value.installation orelse return error.TestMissingNativeInstallGrant;
             const intent = try permission.value.nativeInstallationIntent(lookup, grant.validation.command.binding);
             try std.testing.expectEqualDeep(grant.validation, intent.validation);
             try std.testing.expectEqual(grant.decision_digest, intent.metadata_decision);
@@ -5499,13 +5537,13 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             try std.testing.expectEqual(index_progress.Phase.installing, permission.value.head.phase);
             try std.testing.expectEqual(permission.value.head.completion_revision, grant.validation.command.expected.completion_revision);
             var missing = permission.value;
-            missing.native_install = null;
+            missing.installation = null;
             try std.testing.expectError(error.InvalidCatalogRecord, missing.requireRequest(lookup));
             var changed = permission.value;
-            changed.native_install.?.decision_digest[0] ^= 1;
+            changed.installation.?.decision_digest[0] ^= 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(lookup));
             changed = permission.value;
-            changed.native_install.?.validation.position.native.sequence += 1;
+            changed.installation.?.validation.position.native.sequence += 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(lookup));
             changed = permission.value;
             changed.head.revision += 1;
@@ -5566,7 +5604,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         defer alloc.free(reply);
         var permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, reply, .{});
         defer permission.deinit();
-        const grant = permission.value.native_install.?;
+        const grant = permission.value.installation.?;
         const ordinal = permission.value.owner.owner.ordinal;
         var buf: [192]u8 = undefined;
         const retained = retained: {
@@ -5704,38 +5742,38 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             const release_intent = try release_permission.value.nativeReleaseIntent(release_request);
             try std.testing.expectEqualDeep(command, release_intent.installed.command);
             try std.testing.expectEqualDeep(position, release_intent.installed.position.native);
-            const release_grant = release_permission.value.native_release.?;
+            const release_grant = release_permission.value.release.?;
             try std.testing.expectEqualDeep(ack.signed.proof, release_grant.installation_proof);
             var changed = release_permission.value;
-            changed.native_release = null;
+            changed.release = null;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
             changed = release_permission.value;
-            changed.native_release.?.decision_digest[0] ^= 1;
+            changed.release.?.decision_digest[0] ^= 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
             changed = release_permission.value;
-            changed.native_release.?.installed.position.native.sequence += 1;
+            changed.release.?.installed.position.native.sequence += 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
             changed = release_permission.value;
-            changed.native_release.?.installed.command.metadata_decision[0] ^= 1;
+            changed.release.?.installed.command.metadata_decision[0] ^= 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
             changed = release_permission.value;
-            changed.native_release.?.installation_proof.root_generation += 1;
+            changed.release.?.installation_proof.root_generation += 1;
             const installed_receipt = try release_grant.installed.command.receipt(release_grant.installed.position.native);
-            changed.native_release.?.installation_proof = try changed.native_release.?.installation_proof.sign(root, try installed_receipt.digest());
+            changed.release.?.installation_proof = try changed.release.?.installation_proof.sign(root, try installed_receipt.digest());
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
             try setIndexTestRootGeneration(alloc, &store, group, ack.signed, release_grant.installation_proof.root_generation + 1);
             try std.testing.expectError(error.IndexOwnerReceiptChanged, store.relationalIndexOwnerDecisionJson(alloc, group, release_request));
             try setIndexTestRootGeneration(alloc, &store, group, ack.signed, release_grant.installation_proof.root_generation);
             var later = release_permission.value.head;
             later.revision += 1;
-            try std.testing.expectEqualDeep(release_grant.decision_digest, try index_publication.NativeReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
+            try std.testing.expectEqualDeep(release_grant.decision_digest, try index_publication.ReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
             later.phase = .published;
             later.counts[@backingInt(index_progress.Action.released)] = later.owner_count;
-            try std.testing.expectEqualDeep(release_grant.decision_digest, try index_publication.NativeReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
+            try std.testing.expectEqualDeep(release_grant.decision_digest, try index_publication.ReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
             later = release_permission.value.head;
             later.phase = .installing;
             later.counts[@backingInt(index_progress.Action.installed)] = 0;
-            try std.testing.expectError(error.InvalidCatalogRecord, index_publication.NativeReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
+            try std.testing.expectError(error.InvalidCatalogRecord, index_publication.ReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
             try store.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-release-permission");
             defer store.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key) catch unreachable;
             try std.testing.expectError(error.MetadataReplicationPending, store.relationalIndexOwnerDecisionJson(alloc, group, release_request));
@@ -18630,7 +18668,7 @@ pub const RaftApplyStore = struct {
         if (ack.validation) |witness| _ = try self.verifyRelationalIndexAuditTxn(txn, group_id, witness.signed, witness.outcome);
         if (ack.installation) |witness| try self.verifyRelationalIndexInstallationTxn(txn, group_id, witness);
         if (ack.cancellation) |witness| try self.verifyRelationalIndexCancellationTxn(txn, group_id, head, previous_owner, witness, ack.signed);
-        if (action == .released and ack.signed.receipt.owner.authority == .native)
+        if (action == .released)
             try self.verifyRelationalIndexReleaseTxn(txn, group_id, head, previous_owner, ack.signed);
         if (action == .cancel_released and ack.signed.receipt.owner.authority == .native)
             try self.verifyRelationalIndexCancellationReleaseTxn(txn, group_id, head, previous_owner, ack.signed);
@@ -18786,14 +18824,14 @@ pub const RaftApplyStore = struct {
         const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, head.table_id, owner.owner.ordinal, .installed)), head, owner, .installed);
         const witness = accepted.installation orelse return error.InvalidCatalogRecord;
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
-        const grant: index_publication.NativeReleaseGrant = .{
+        const grant: index_publication.ReleaseGrant = .{
             .installed = .{ .command = witness.command, .position = accepted.signed.receipt.position },
-            .decision_digest = try index_publication.NativeReleaseGrant.decisionDigest(group_id, incarnation, head),
+            .decision_digest = try index_publication.ReleaseGrant.decisionDigest(group_id, incarnation, head),
             .installation_proof = accepted.signed.proof,
         };
         try grant.validateFor(group_id, incarnation, head, owner);
         _ = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, grant.installed.command.validation.command.binding, null, .installation);
-        try index_publication.requireNativeReleaseReceipt(group_id, incarnation, head, owner, accepted, signed);
+        try index_publication.requireReleaseReceipt(group_id, incarnation, head, owner, accepted, signed);
     }
 
     fn verifyRelationalIndexCancellationReleaseTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, owner: index_progress.OwnerState, signed: index_publication.SignedReceipt) !void {
@@ -18817,7 +18855,7 @@ pub const RaftApplyStore = struct {
         const expected_seal: @import("antfly_local_sources").storage_db_relational_index_validation.Seal = .{ .command = try validation_witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position };
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
         if (!std.meta.eql(witness.command.validation, expected_seal) or
-            !std.mem.eql(u8, &witness.command.metadata_decision, &try index_publication.NativeInstallGrant.decisionDigest(group_id, incarnation, head))) return error.IndexOwnerReceiptChanged;
+            !std.mem.eql(u8, &witness.command.metadata_decision, &try index_publication.InstallGrant.decisionDigest(group_id, incarnation, head))) return error.IndexOwnerReceiptChanged;
     }
 
     fn verifyRelationalIndexAuditModeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedAudit, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditOutcome, comptime mode: enum { validation, installation }) ![32]u8 {
@@ -19017,7 +19055,7 @@ pub const RaftApplyStore = struct {
         if (mode == .validation or mode == .installation or mode == .cancellation) {
             const permitted_phase = if (mode == .validation) head.phase == .building else if (mode == .installation) head.phase == .installing or head.phase == .releasing else head.phase == .canceling or head.phase == .cancel_releasing;
             if (!permitted_phase or (mode != .cancellation and std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.reserved)], 0))) return error.GenerationPublicationChanged;
-            if (mode == .validation and binding.authority == .raft) try decision.requireRetainedRaftBinding(binding) else try decision.requireRetainedNativeBinding(binding);
+            if (mode != .cancellation and binding.authority == .raft) try decision.requireRetainedRaftBinding(binding) else try decision.requireRetainedNativeBinding(binding);
         } else {
             const request: index_publication.OwnerRequest = .{ .table_id = table_id, .group_id = owner_group, .id = binding.id, .operation = .build };
             if (binding.authority == .native) _ = try decision.nativeBuild(request, binding, .{}) else _ = try decision.raftBuild(request, binding, .{});
@@ -19232,25 +19270,25 @@ pub const RaftApplyStore = struct {
         if (request.raft_reporter) |reporter| decision.raft_signing = try self.raftIndexSigningViewTxn(&txn, group_id, incarnation, owner.owner, reporter, head.reader_requirements);
         if (request.operation == .validate)
             decision.target_expectation = try index_delivery.targetExpectation(alloc, &txn, group_id, head, owner, incarnation);
-        if (owner.owner.authority == .native and request.operation == .install) {
+        if (request.operation == .install) {
             _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_decision_version);
             const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .validated)), head, owner, .validated);
             const witness = accepted.validation orelse return error.InvalidCatalogRecord;
             const frozen = try index_delivery.frozenTargetForRecovery(alloc, &txn, group_id, head, owner, incarnation);
             if (!std.meta.eql(frozen.expected, witness.outcome.expected)) return error.InvalidCatalogRecord;
-            decision.native_install = .{
+            decision.installation = .{
                 .validation = .{ .command = try witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position },
-                .decision_digest = try index_publication.NativeInstallGrant.decisionDigest(group_id, incarnation, head),
+                .decision_digest = try index_publication.InstallGrant.decisionDigest(group_id, incarnation, head),
             };
         }
-        if (owner.owner.authority == .native and request.operation == .release) {
+        if (request.operation == .release) {
             _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_release_version);
             const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .installed)), head, owner, .installed);
             const witness = accepted.installation orelse return error.InvalidCatalogRecord;
             try self.requireIndexOwnerRootReceiptTxn(&txn, group_id, accepted.signed, head.reader_requirements);
-            decision.native_release = .{
+            decision.release = .{
                 .installed = .{ .command = witness.command, .position = accepted.signed.receipt.position },
-                .decision_digest = try index_publication.NativeReleaseGrant.decisionDigest(group_id, incarnation, head),
+                .decision_digest = try index_publication.ReleaseGrant.decisionDigest(group_id, incarnation, head),
                 .installation_proof = accepted.signed.proof,
             };
         }

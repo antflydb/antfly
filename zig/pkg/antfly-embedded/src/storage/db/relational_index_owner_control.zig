@@ -2095,6 +2095,12 @@ pub const BuildCache = struct {
     /// Audit-only acquisition: current installed state is checked even for
     /// warm hits. The cached predecessor view grants no execution permission.
     pub fn acquireInstalledAudit(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, intent: validation.InstallIntent, context: RequestContext) !Lease {
+        return self.acquireInstalledAuditAuthority(io, backing, manager, core, request, intent, context, .native);
+    }
+    pub fn acquireRaftInstalledAudit(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, intent: validation.InstallIntent, context: RequestContext) !Lease {
+        return self.acquireInstalledAuditAuthority(io, backing, manager, core, request, intent, context, .raft);
+    }
+    fn acquireInstalledAuditAuthority(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, intent: validation.InstallIntent, context: RequestContext, comptime authority: @import("relational_index_publication_progress.zig").Authority) !Lease {
         try context.ensureActive();
         try intent.validate();
         const cache_digest = digest: {
@@ -2105,7 +2111,7 @@ pub const BuildCache = struct {
             if (!std.meta.eql(record.command.intent(), intent)) return error.InvalidPrivateIndexNativeReceipt;
             break :digest try record.command.evidenceDigest();
         };
-        return self.acquireMode(io, backing, manager, core, request, intent.validation.command.binding, context, cache_digest, true, .native);
+        return self.acquireMode(io, backing, manager, core, request, intent.validation.command.binding, context, cache_digest, true, authority);
     }
 
     fn acquireMode(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext, cache_digest: [32]u8, comptime installed_audit: bool, comptime authority: @import("relational_index_publication_progress.zig").Authority) !Lease {
@@ -2165,13 +2171,14 @@ pub const BuildCache = struct {
             var historical = history.reader(&read);
             var view = (try core.acquireSchemaVersionView(binding.physical_reserved.schema_version)) orelse return error.RelationalTableRequired;
             defer view.release();
-            var command: Command = .{ .effect = .reserved, .binding = binding };
+            var command: if (authority == .native) Command else @import("relational_index_raft_control.zig").Command = .{ .effect = .reserved, .binding = binding };
             command.binding.phase = .fencing;
-            const prepared = Prepared.control(alloc, view, &historical, command) catch |err| {
+            const Preparation = if (authority == .native) Prepared else @import("relational_index_raft_control.zig").Prepared;
+            const prepared = Preparation.control(alloc, view, &historical, command) catch |err| {
                 if (entry.budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
                 return err;
             };
-            entry.prepared = .{ .native = prepared };
+            entry.prepared = if (authority == .native) .{ .native = prepared } else .{ .raft = prepared };
         } else {
             var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
             defer view.release();
