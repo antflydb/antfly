@@ -546,7 +546,7 @@ fn testIntent() !Intent {
     const namespace: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 };
     const binding: owner.Binding = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .authority = .native, .phase = .reserved, .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .admission_epoch = 7, .owner_group_id = 11, .peer_group_id = 11, .namespace = namespace, .catalog_digest = @splat(4) }, .integrity_before = @splat(4), .integrity_reserved = @splat(5), .integrity_candidate = @splat(6), .schema_before = @splat(7), .physical_before = null, .physical_reserved = .{ .revision = 2, .schema_version = 1, .blob_digest = @splat(8) }, .physical_candidate = .{ .revision = 2, .schema_version = 2, .blob_digest = @splat(9) }, .index = .{ .generation = 2, .slot = 0 }, .inputs_digest = @splat(10) };
     const expected: @import("relational_index_private_claims.zig").TargetExpectation = .{ .metadata_incarnation = @splat('1'), .binding_digest = hash(&try binding.encode()), .generation = @splat(2), .completion_revision = 1, .source_consumption_digest = @splat(3), .source_progress_digest = @splat(4), .table_name_digest = hash("items"), .rows = 0, .inventory_xor = @splat(0), .provenance = @splat(0) };
-    const seal: validation.Seal = .{ .command = .{ .binding = binding, .expected = expected, .generation_digest = @splat(5), .inventory_digest = @splat(6), .source_members = 0, .generation_position = .{ .namespace = namespace, .sequence = 1 } }, .position = .{ .namespace = namespace, .sequence = 2 } };
+    const seal: validation.Seal = .{ .command = .{ .binding = binding, .expected = expected, .generation_digest = @splat(5), .inventory_digest = @splat(6), .source_members = 0, .generation_position = .{ .native = .{ .namespace = namespace, .sequence = 1 } } }, .position = .{ .native = .{ .namespace = namespace, .sequence = 2 } } };
     return .{ .installed = .{ .command = .{ .validation = seal, .metadata_decision = @splat(7), .schema_digest = @splat(8), .activation_digest = @splat(9) }, .position = .{ .namespace = namespace, .sequence = 3 } }, .metadata_decision = @splat(10) };
 }
 
@@ -574,6 +574,31 @@ test "relational index release receipt binds installed cut decision and later na
 
 test "relational index release terminal codec is bounded canonical and allocation failure clean" {
     const intent = try testIntent();
+    const seal = intent.installed.command.validation;
+    const actual_json = try std.json.Stringify.valueAlloc(std.testing.allocator, seal, .{});
+    defer std.testing.allocator.free(actual_json);
+    var parsed_seal = try std.json.parseFromSlice(validation.Seal, std.testing.allocator, actual_json, .{});
+    defer parsed_seal.deinit();
+    try std.testing.expectEqualDeep(seal, parsed_seal.value);
+    var actual_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer actual_wire.deinit();
+    var actual_stream: std.json.Stringify = .{ .writer = &actual_wire.writer };
+    const wire = @import("relational_integrity_json.zig");
+    try wire.write(seal, &actual_stream);
+    var parsed_wire = try std.json.parseFromSlice(validation.Seal, std.testing.allocator, actual_wire.written(), .{});
+    defer parsed_wire.deinit();
+    try std.testing.expectEqualDeep(seal, parsed_wire.value);
+    var raft_seal = seal;
+    raft_seal.command.binding.authority = .raft;
+    raft_seal.command.expected.binding_digest = hash(&try raft_seal.command.binding.encode());
+    raft_seal.command.generation_position = .{ .raft = .{ .term = 17, .index = std.math.maxInt(u64) - 1 } };
+    raft_seal.position = .{ .raft = .{ .term = 18, .index = std.math.maxInt(u64) } };
+    _ = try raft_seal.command.receiptAt(raft_seal.position);
+    const raft_json = try std.json.Stringify.valueAlloc(std.testing.allocator, raft_seal, .{});
+    defer std.testing.allocator.free(raft_json);
+    var parsed_raft = try std.json.parseFromSlice(validation.Seal, std.testing.allocator, raft_json, .{});
+    defer parsed_raft.deinit();
+    try std.testing.expectEqualDeep(raft_seal, parsed_raft.value);
     const record: Record = .{ .intent = intent, .position = .{ .namespace = intent.installed.position.namespace, .sequence = 4 } };
     const encoded = try record.encode();
     try std.testing.expectEqualDeep(record, try Record.decode(std.testing.allocator, encoded.slice()));

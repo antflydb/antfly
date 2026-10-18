@@ -41,7 +41,7 @@ consumption cut and the apply watermark commit together. Empty-backlog producer
 resumption recovers its previous header from that journal. Recovery distinguishes
 producer order from later consumption order when other pages are already queued.
 Target claim pairs and their immutable creation cuts also commit with the apply
-watermark. Native inventory values remain 40 bytes; Raft values use 48 bytes,
+watermark. Native inventory values use 40 bytes; Raft values use 48 bytes,
 retaining both term and index without repeating the binding per member. Exact
 retries and regrouping recover the maximum original member cut, not the current
 apply position, without growing a per-batch ledger. Range ownership and duplicate
@@ -50,14 +50,18 @@ now advances at committed Raft cuts too: it freezes new claims, checks both the
 generation inventory and authoritative claim namespace in bounded pages, and
 replays fixed intervals rather than rerunning time-based scheduling. Progress
 and the apply watermark commit together; READY survives cold recovery but grants
-neither installation nor publication authority. Native AICV v2 bytes and control
-reply shapes stay unchanged; explicit Raft cuts use AICV v3, without advertising
-the still-incomplete Raft lifecycle. Native proof adapters still reject Raft
+neither installation nor publication authority. Both authorities use one AICV v3
+format with an explicitly tagged position; earlier branch-local encodings are
+unsupported, not compatibility paths. Native proof adapters still reject Raft
 records. The same bounded physical verifier now checks primary coverage,
 forward tuples, reverse ownership and covering payloads at committed Raft cuts.
 Fixed-page replay, progress and the apply watermark remain atomic; cold recovery
-checks the durable cut and frozen source cardinality. Native AIGV v1 storage and
-reply bytes are unchanged; the explicit Raft representation uses AIGV v2.
+checks the durable cut and frozen source cardinality. Both authorities use AIGV v2.
+Logical validation seals now recheck those canonical records and commit with
+the actual Raft apply watermark. Later-entry retries retain the original seal
+cut, and cold recovery checks its authority, term/index and frozen generation.
+Both authorities use AIVS v2; no custom legacy JSON projection or parser is needed.
+The seal proves verification, not metadata permission to install or publish.
 This does not yet wire replicated claim delivery, validation seals,
 installation, cancellation or publication release through the public receiver.
 
@@ -71,8 +75,10 @@ Target controls cover compact authority-bound encoding, committed cut bounds,
 actual range checks, aborted claim pairs, expired apply, conflicting prepared
 writers, cold retry, regrouping and unchanged original inventory bytes.
 Verifier controls cover frozen late writers, permitted exact duplicates,
-bidirectional one-record pages, deterministic replay, cold READY and exact native
-v2 bytes, including 64-bit cuts and every allocation-failure boundary.
+bidirectional one-record pages, deterministic replay, cold READY and canonical
+tagged positions, including exact 64-bit cuts and every allocation-failure boundary.
+Seal controls cover aborted apply, allocation failures, expired preparation,
+foreign groups, retained retry cuts, cold recovery and checksummed future cuts.
 
 ## Document conflict delivery (2026-10-17)
 

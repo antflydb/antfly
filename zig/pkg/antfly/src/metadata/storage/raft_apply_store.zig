@@ -5369,7 +5369,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             changed.native_install.?.decision_digest[0] ^= 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(lookup));
             changed = permission.value;
-            changed.native_install.?.validation.position.sequence += 1;
+            changed.native_install.?.validation.position.native.sequence += 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(lookup));
             changed = permission.value;
             changed.head.revision += 1;
@@ -5440,7 +5440,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         };
         const physical = retained.validation.?;
         const command: @import("antfly_local_sources").storage_db_relational_index_validation.InstallCommand = .{ .validation = grant.validation, .metadata_decision = grant.decision_digest, .schema_digest = @splat(3), .activation_digest = @splat(4) };
-        var position = grant.validation.position;
+        var position = grant.validation.position.native;
         position.sequence += 1;
         const receipt = try command.receipt(position);
         const ack: index_publication.Ack = .{ .table_id = lookup.table_id, .expected_revision = permission.value.head.revision, .signed = .{ .receipt = receipt, .proof = try physical.signed.proof.sign(root, try receipt.digest()) }, .installation = .{ .outcome = physical.outcome, .command = command, .signed = physical.signed } };
@@ -18677,7 +18677,7 @@ pub const RaftApplyStore = struct {
         const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, table_id, ordinal)));
         const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, table_id, ordinal, .validated)), head, owner, .validated);
         const validation_witness = accepted.validation orelse return error.InvalidCatalogRecord;
-        const expected_seal: @import("antfly_local_sources").storage_db_relational_index_validation.Seal = .{ .command = try validation_witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position.native };
+        const expected_seal: @import("antfly_local_sources").storage_db_relational_index_validation.Seal = .{ .command = try validation_witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position };
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
         if (!std.meta.eql(witness.command.validation, expected_seal) or
             !std.mem.eql(u8, &witness.command.metadata_decision, &try index_publication.NativeInstallGrant.decisionDigest(group_id, incarnation, head))) return error.IndexOwnerReceiptChanged;
@@ -19099,7 +19099,7 @@ pub const RaftApplyStore = struct {
             const frozen = try index_delivery.frozenTargetForRecovery(alloc, &txn, group_id, head, owner, incarnation);
             if (!std.meta.eql(frozen.expected, witness.outcome.expected)) return error.InvalidCatalogRecord;
             decision.native_install = .{
-                .validation = .{ .command = try witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position.native },
+                .validation = .{ .command = try witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position },
                 .decision_digest = try index_publication.NativeInstallGrant.decisionDigest(group_id, incarnation, head),
             };
         }

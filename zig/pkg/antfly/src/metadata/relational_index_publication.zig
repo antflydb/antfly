@@ -795,7 +795,8 @@ pub const NativeInstallGrant = struct {
 
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
         try owner.validate();
-        const receipt = try self.validation.command.receipt(self.validation.position);
+        if (self.validation.position != .native) return error.InvalidCatalogRecord;
+        const receipt = try self.validation.command.receipt(self.validation.position.native);
         const expected = self.validation.command.expected;
         if (!std.mem.eql(u8, &self.decision_digest, &try decisionDigest(group, incarnation, head)) or
             owner.owner.namespace.table_id != head.table_id or owner.owner.ordinal >= head.owner_count or

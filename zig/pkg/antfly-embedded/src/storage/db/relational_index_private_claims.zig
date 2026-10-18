@@ -952,19 +952,15 @@ test "relational index system compact claim cuts preserve authority and committe
     }
 }
 
-test "relational index system inventory authority codecs preserve native v2 and exact Raft cuts" {
+test "relational index system inventory authority codec preserves exact native and Raft cuts" {
     const a = std.testing.allocator;
     const expected: TargetExpectation = .{ .metadata_incarnation = @splat('1'), .binding_digest = @splat(2), .generation = @splat(3), .completion_revision = 1, .source_consumption_digest = @splat(4), .source_progress_digest = @splat(5), .table_name_digest = @splat(6), .rows = 0, .inventory_xor = @splat(0), .provenance = @splat(0) };
     const native: Native = .{ .namespace = .{ .table_id = std.math.maxInt(u64), .shard_id = 2, .range_id = 3 }, .sequence = std.math.maxInt(u64) - 1 };
     const fields = try InventoryValidation.initial(expected);
     var record: InventoryValidation.Record = .{ .expected = expected, .fields = fields, .position = .{ .native = native }, .page_digest = @splat(7) };
-    const old_json = try std.json.Stringify.valueAlloc(a, .{ .expected = expected, .fields = fields, .position = native, .page_digest = record.page_digest }, .{});
-    defer a.free(old_json);
-    const old_bytes = try std.mem.concat(a, u8, &.{ "AICV\x02\x00\x00\x00", old_json, &hash(old_json) });
-    defer a.free(old_bytes);
     const native_bytes = try record.encode(a);
     defer a.free(native_bytes);
-    try std.testing.expectEqualSlices(u8, old_bytes, native_bytes);
+    try std.testing.expectEqualSlices(u8, "AICV\x03\x00\x00\x00", native_bytes[0..8]);
     try std.testing.expectEqualDeep(record, try InventoryValidation.Record.decode(a, native_bytes));
     record.position = .{ .raft = .{ .term = 3, .index = std.math.maxInt(u64) - 1 } };
     const raft_bytes = try record.encode(a);
@@ -1207,59 +1203,6 @@ pub const InventoryValidation = struct {
         fields: Fields,
         position: Position,
         page_digest: integrity.Digest,
-        pub const WirePosition = struct {
-            namespace: ?@import("doc_identity_namespace.zig").Namespace = null,
-            sequence: ?u64 = null,
-            raft: ?@FieldType(Position, "raft") = null,
-            pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-                return @field(self, name) == null;
-            }
-            pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-                var exact = options;
-                exact.parse_numbers = false;
-                const value = try std.json.innerParse(std.json.Value, a, source, exact);
-                if (value != .object) return error.UnexpectedToken;
-                exact.ignore_unknown_fields = false;
-                if (value.object.contains("namespace") and value.object.count() == 2) {
-                    var parsed = try std.json.parseFromValue(Native, a, value, exact);
-                    defer parsed.deinit();
-                    return .{ .namespace = parsed.value.namespace, .sequence = parsed.value.sequence };
-                }
-                if (!value.object.contains("raft") or value.object.count() != 1) return error.UnexpectedToken;
-                var parsed = try std.json.parseFromValue(Position, a, value, exact);
-                defer parsed.deinit();
-                if (parsed.value != .raft) return error.UnexpectedToken;
-                return .{ .raft = parsed.value.raft };
-            }
-        };
-        const Wire = struct { expected: TargetExpectation, fields: Fields, position: WirePosition, page_digest: integrity.Digest };
-        /// Native v2 bytes and native control replies retain their original
-        /// shape. The Raft form is explicit, not a synthetic namespace clock.
-        pub fn nativeJsonProjection(self: Record) Wire {
-            return .{ .expected = self.expected, .fields = self.fields, .position = switch (self.position) {
-                .native => |cut| .{ .namespace = cut.namespace, .sequence = cut.sequence },
-                .raft => |cut| .{ .raft = cut },
-            }, .page_digest = self.page_digest };
-        }
-        pub fn jsonStringify(self: Record, stream: anytype) @TypeOf(stream.*).Error!void {
-            try stream.beginObject();
-            try stream.objectField("expected");
-            try stream.write(self.expected);
-            try stream.objectField("fields");
-            try stream.write(self.fields);
-            try stream.objectField("position");
-            switch (self.position) {
-                .native => |cut| try stream.write(cut),
-                .raft => try stream.write(self.position),
-            }
-            try stream.objectField("page_digest");
-            try stream.write(self.page_digest);
-            try stream.endObject();
-        }
-        pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) !Record {
-            const wire = try std.json.innerParse(Wire, a, source, options);
-            return .{ .expected = wire.expected, .fields = wire.fields, .position = if (wire.position.raft) |cut| .{ .raft = cut } else .{ .native = .{ .namespace = wire.position.namespace.?, .sequence = wire.position.sequence.? } }, .page_digest = wire.page_digest };
-        }
         pub fn validate(self: Record) !void {
             try self.fields.validate(self.expected);
             try self.position.validate();
@@ -1270,15 +1213,14 @@ pub const InventoryValidation = struct {
             const json = try std.json.Stringify.valueAlloc(alloc, self, .{});
             defer alloc.free(json);
             if (json.len > max_record_bytes - 40) return error.InvalidPrivateIndexClaimInventory;
-            return std.mem.concat(alloc, u8, &.{ if (self.position == .native) "AICV\x02\x00\x00\x00" else "AICV\x03\x00\x00\x00", json, &hash(json) });
+            return std.mem.concat(alloc, u8, &.{ "AICV\x03\x00\x00\x00", json, &hash(json) });
         }
         pub fn decode(alloc: Allocator, bytes: []const u8) !Record {
-            if (bytes.len <= 40 or bytes.len > max_record_bytes or (!std.mem.eql(u8, bytes[0..8], "AICV\x02\x00\x00\x00") and !std.mem.eql(u8, bytes[0..8], "AICV\x03\x00\x00\x00")) or
+            if (bytes.len <= 40 or bytes.len > max_record_bytes or !std.mem.eql(u8, bytes[0..8], "AICV\x03\x00\x00\x00") or
                 !std.mem.eql(u8, bytes[bytes.len - 32 ..], &hash(bytes[8 .. bytes.len - 32]))) return error.InvalidPrivateIndexClaimInventory;
             var parsed = try std.json.parseFromSlice(Record, alloc, bytes[8 .. bytes.len - 32], .{ .ignore_unknown_fields = false, .max_value_len = 128 });
             defer parsed.deinit();
             try parsed.value.validate();
-            if ((bytes[4] == 2) != (parsed.value.position == .native)) return error.InvalidPrivateIndexClaimInventory;
             const canonical = try parsed.value.encode(alloc);
             defer alloc.free(canonical);
             if (!std.mem.eql(u8, bytes, canonical)) return error.InvalidPrivateIndexClaimInventory;

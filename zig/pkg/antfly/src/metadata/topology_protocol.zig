@@ -91,8 +91,9 @@ const std = @import("std");
 /// AIDA v3's fixed EOF-header prefix. This is not native validation capability.
 /// Version 44 decodes bounded physical-generation progress. It does not enable
 /// the authenticated native validation/install/release publication protocol.
-/// Version 45 decodes AICV v2's bidirectional claim-inventory audit. This is
-/// physical progress, not authenticated native publication capability.
+/// Version 45 decodes the AICV v3 bidirectional claim-inventory audit with an
+/// explicitly tagged native/Raft position. Earlier draft encodings are unsupported.
+/// This is physical progress, not authenticated native publication capability.
 /// Version 46 decodes bounded root-local audit progress on native validation
 /// replies. This still grants no authenticated publication/install capability.
 /// Version 47 decodes authenticated complete-audit witnesses. These are not

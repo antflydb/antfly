@@ -2369,10 +2369,90 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectEqualDeep([3]u64{ 1, 1, 1 }, verified.summary.fields.counts);
         try std.testing.expectEqual(last_validation_index - 1, verified.summary.position.raft.index);
         try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
-        try std.testing.expectError(error.InvalidControlReceiptPosition, physical.SealCommand.prepare(alloc, &read, reserved_binding, expected));
+        const logical = try physical.SealCommand.prepare(alloc, &read, reserved_binding, expected);
+        try std.testing.expectEqualDeep(verified.summary.position, logical.generation_position);
         const encoded = try verified.encodeAlloc(alloc);
         defer alloc.free(encoded);
         try std.testing.expectEqualSlices(u8, "AIGV\x02\x00\x00\x00", encoded[0..8]);
+    }
+    const seal_command = logical: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :logical try physical.SealCommand.prepare(alloc, &read, reserved_binding, expected);
+    };
+    var seal_prepared: owner_control.PreparedValidationSeal = .{ .alloc = alloc, .command = seal_command };
+    defer seal_prepared.deinit();
+    const seal_entry: receipts.OrderedApplyReceipt = .{ .term = 12, .index = last_validation_index + 1 };
+    try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .validation_seal = seal_command }).validate());
+    try std.testing.expectError(error.InvalidControlReceiptPosition, seal_prepared.preparePayload());
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexValidation(&seal_prepared, 99, seal_entry));
+    seal_prepared.context = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, db.applyCommittedRaftIndexValidation(&seal_prepared, 11, seal_entry));
+    seal_prepared.context = .{};
+    {
+        var aborted = try db.core.store.beginWriteTxn();
+        defer aborted.abort();
+        try std.testing.expectError(error.InvalidControlReceiptPosition, physical.Seal.stage(alloc, &aborted, seal_command, null));
+        try std.testing.expectError(error.InvalidControlReceiptPosition, physical.Seal.stageAt(alloc, &aborted, seal_command, null));
+        try seal_prepared.stageRaft(db.core, &aborted, 11, seal_entry);
+    }
+    const SealAllocationFaults = struct {
+        fn run(a: std.mem.Allocator, database: *db_mod.DB, command: physical.SealCommand, entry: receipts.OrderedApplyReceipt) !void {
+            var prepared: owner_control.PreparedValidationSeal = .{ .alloc = a, .command = command };
+            defer prepared.deinit();
+            var txn = try database.core.store.beginWriteTxn();
+            defer txn.abort();
+            try prepared.stageRaft(database.core, &txn, 11, entry);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, SealAllocationFaults.run, .{ &db, seal_command, seal_entry });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try physical.Seal.load(alloc, &read, reserved_binding) == null);
+        try std.testing.expectEqual(last_validation_index, (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+    }
+    try db.applyCommittedRaftIndexValidation(&seal_prepared, 11, seal_entry);
+    try db.applyCommittedRaftIndexValidation(&seal_prepared, 11, .{ .term = 13, .index = seal_entry.index + 1 });
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const sealed = (try physical.Seal.load(alloc, &read, reserved_binding)).?;
+        try std.testing.expectEqualDeep(seal_command, sealed.command);
+        try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = seal_entry.term, .index = seal_entry.index } }, sealed.position);
+        const receipt = try sealed.command.receiptAt(sealed.position);
+        try std.testing.expectEqual(.raft, receipt.owner.authority);
+        try std.testing.expectEqualDeep(sealed.position, receipt.position);
+        try std.testing.expectError(error.InvalidControlReceiptPosition, sealed.command.receipt(.{ .namespace = reserved_binding.fence.namespace, .sequence = 1 }));
+        try std.testing.expectError(error.InvalidControlReceiptPosition, (physical.InstallIntent{ .validation = sealed, .metadata_decision = @splat(1) }).validate());
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+        try std.testing.expectEqual(seal_entry.index + 1, (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+    }
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        const sealed = (try physical.Seal.load(alloc, &txn, reserved_binding)).?;
+        const bytes = try alloc.dupe(u8, try txn.get(physical.Seal.key));
+        defer alloc.free(bytes);
+        try std.testing.expectEqualSlices(u8, "AIVS\x02\x00\x00\x00", bytes[0..8]);
+        bytes[4] = 1;
+        @memcpy(bytes[bytes.len - 32 ..], &Integrity.hash(bytes[0 .. bytes.len - 32]));
+        try txn.put(physical.Seal.key, bytes);
+        try std.testing.expectError(error.InvalidRelationalIndexValidation, physical.Seal.load(alloc, &txn, reserved_binding));
+        var future = sealed;
+        future.position.raft.index += 1000;
+        const json = try std.json.Stringify.valueAlloc(alloc, future, .{});
+        defer alloc.free(json);
+        const body = try std.mem.concat(alloc, u8, &.{ "AIVS\x02\x00\x00\x00", json });
+        defer alloc.free(body);
+        const encoded = try std.mem.concat(alloc, u8, &.{ body, &Integrity.hash(body) });
+        defer alloc.free(encoded);
+        try txn.put(physical.Seal.key, encoded);
+        try std.testing.expectError(error.InvalidRelationalIndexValidation, physical.Seal.load(alloc, &txn, reserved_binding));
     }
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
@@ -5270,7 +5350,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                 defer txn.abort();
                 const staged = try Verification.Seal.stage(alloc, &txn, command, null);
                 try std.testing.expect(!staged.duplicate);
-                try std.testing.expectEqual(sequence + 1, staged.seal.position.sequence);
+                try std.testing.expectEqual(sequence + 1, staged.seal.position.native.sequence);
             }
             {
                 var read = try db.core.store.beginReadTxn();

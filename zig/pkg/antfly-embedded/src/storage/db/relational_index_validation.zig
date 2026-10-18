@@ -94,39 +94,6 @@ pub const Summary = struct {
     fields: Fields,
     position: Position,
     page_digest: Digest,
-    const Wire = struct {
-        expected: Expected,
-        inventory_digest: Digest,
-        source_members: u64,
-        fields: Fields,
-        position: claims.InventoryValidation.Record.WirePosition,
-        page_digest: Digest,
-    };
-    pub fn nativeJsonProjection(self: Summary) Wire {
-        return .{ .expected = self.expected, .inventory_digest = self.inventory_digest, .source_members = self.source_members, .fields = self.fields, .position = switch (self.position) {
-            .native => |cut| .{ .namespace = cut.namespace, .sequence = cut.sequence },
-            .raft => |cut| .{ .raft = cut },
-        }, .page_digest = self.page_digest };
-    }
-    pub fn jsonStringify(self: Summary, stream: anytype) @TypeOf(stream.*).Error!void {
-        try stream.beginObject();
-        inline for (.{ "expected", "inventory_digest", "source_members", "fields" }) |name| {
-            try stream.objectField(name);
-            try stream.write(@field(self, name));
-        }
-        try stream.objectField("position");
-        switch (self.position) {
-            .native => |cut| try stream.write(cut),
-            .raft => try stream.write(self.position),
-        }
-        try stream.objectField("page_digest");
-        try stream.write(self.page_digest);
-        try stream.endObject();
-    }
-    pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) !Summary {
-        const wire = try std.json.innerParse(Wire, a, source, options);
-        return .{ .expected = wire.expected, .inventory_digest = wire.inventory_digest, .source_members = wire.source_members, .fields = wire.fields, .position = if (wire.position.raft) |cut| .{ .raft = cut } else .{ .native = .{ .namespace = wire.position.namespace.?, .sequence = wire.position.sequence.? } }, .page_digest = wire.page_digest };
-    }
     pub fn validate(self: Summary) !void {
         try self.expected.validate();
         try self.fields.validate(self.source_members);
@@ -160,7 +127,7 @@ fn encodeRecord(alloc: Allocator, summary: Summary, cursor: []const u8) ![]u8 {
     defer alloc.free(json);
     if (json.len > max_summary) return error.InvalidRelationalIndexValidation;
     const bytes = try alloc.alloc(u8, 48 + json.len + cursor.len);
-    @memcpy(bytes[0..8], if (summary.position == .native) "AIGV\x01\x00\x00\x00" else "AIGV\x02\x00\x00\x00");
+    @memcpy(bytes[0..8], "AIGV\x02\x00\x00\x00");
     std.mem.writeInt(u32, bytes[8..12], @intCast(json.len), .little);
     std.mem.writeInt(u32, bytes[12..16], @intCast(cursor.len), .little);
     @memcpy(bytes[16..][0..json.len], json);
@@ -169,7 +136,7 @@ fn encodeRecord(alloc: Allocator, summary: Summary, cursor: []const u8) ![]u8 {
     return bytes;
 }
 fn decodeRecord(alloc: Allocator, bytes: []const u8) !Loaded {
-    if (bytes.len < 48 or bytes.len > max_record or (!std.mem.eql(u8, bytes[0..8], "AIGV\x01\x00\x00\x00") and !std.mem.eql(u8, bytes[0..8], "AIGV\x02\x00\x00\x00")) or !equal(bytes[bytes.len - 32 ..][0..32].*, hash(bytes[0 .. bytes.len - 32]))) return error.InvalidRelationalIndexValidation;
+    if (bytes.len < 48 or bytes.len > max_record or !std.mem.eql(u8, bytes[0..8], "AIGV\x02\x00\x00\x00") or !equal(bytes[bytes.len - 32 ..][0..32].*, hash(bytes[0 .. bytes.len - 32]))) return error.InvalidRelationalIndexValidation;
     const json_len = std.mem.readInt(u32, bytes[8..12], .little);
     const cursor_len = std.mem.readInt(u32, bytes[12..16], .little);
     if (json_len > max_summary or cursor_len > max_cursor or @as(u64, json_len) + cursor_len + 48 != bytes.len) return error.InvalidRelationalIndexValidation;
@@ -177,7 +144,6 @@ fn decodeRecord(alloc: Allocator, bytes: []const u8) !Loaded {
     defer parsed.deinit();
     const summary = parsed.value;
     try summary.validate();
-    if ((bytes[4] == 1) != (summary.position == .native)) return error.InvalidRelationalIndexValidation;
     const canonical = try std.json.Stringify.valueAlloc(alloc, summary, .{});
     defer alloc.free(canonical);
     const raw_cursor = bytes[16 + json_len ..][0..cursor_len];
@@ -270,13 +236,13 @@ pub const SealCommand = struct {
     generation_digest: Digest,
     inventory_digest: Digest,
     source_members: u64,
-    generation_position: Native,
+    generation_position: Position,
 
     pub fn validate(self: @This()) !void {
-        try self.expected.requireBinding(self.binding);
+        try self.expected.requireOwnerBinding(self.binding);
         try self.generation_position.validate();
-        if (self.binding.authority != .native or self.binding.phase != .reserved or
-            !self.generation_position.namespace.eql(self.binding.fence.namespace) or
+        if ((self.generation_position == .native) != (self.binding.authority == .native) or self.binding.phase != .reserved or
+            (self.generation_position == .native and !self.generation_position.native.namespace.eql(self.binding.fence.namespace)) or
             !nonzero(self.generation_digest) or !nonzero(self.inventory_digest)) return error.InvalidRelationalIndexValidation;
     }
 
@@ -297,28 +263,33 @@ pub const SealCommand = struct {
     /// the complete canonical records and frozen source/target scope in the
     /// applying transaction; a caller-supplied digest alone is not evidence.
     pub fn prepare(alloc: Allocator, txn: anytype, binding: owner.Binding, expected: Expected) !@This() {
-        const frozen = try claims.InventoryValidation.requireReady(alloc, txn, binding, expected);
+        const frozen = try claims.InventoryValidation.requireReadyAt(alloc, txn, binding, expected);
         var generation = (try load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
         defer generation.deinit();
         if (generation.summary.fields.phase != .ready or
             !equal(try generation.summary.expected.digest(), try expected.digest()) or
             !equal(generation.summary.inventory_digest, frozen.digest) or
             generation.summary.source_members != frozen.source_members or
-            generation.summary.position.native.sequence <= frozen.position.sequence) return error.PrivateIndexTargetValidationRequired;
-        const result: @This() = .{ .binding = binding, .expected = expected, .generation_digest = generation.digest, .inventory_digest = frozen.digest, .source_members = frozen.source_members, .generation_position = generation.summary.position.native };
+            !cutAfter(generation.summary.position, frozen.position)) return error.PrivateIndexTargetValidationRequired;
+        const result: @This() = .{ .binding = binding, .expected = expected, .generation_digest = generation.digest, .inventory_digest = frozen.digest, .source_members = frozen.source_members, .generation_position = generation.summary.position };
         try result.validate();
         return result;
     }
 
     pub fn receipt(self: @This(), position: Native) !@import("relational_index_publication_progress.zig").Receipt {
+        if (self.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return self.receiptAt(.{ .native = position });
+    }
+    pub fn receiptAt(self: @This(), position: Position) !@import("relational_index_publication_progress.zig").Receipt {
         try self.validate();
         try position.validate();
-        if (!position.namespace.eql(self.binding.fence.namespace) or position.sequence <= self.generation_position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        if (position == .native and !position.native.namespace.eql(self.binding.fence.namespace)) return error.InvalidPrivateIndexNativeReceipt;
+        if (!cutAfter(position, self.generation_position)) return if (position == .native and self.generation_position == .native) error.InvalidPrivateIndexNativeReceipt else error.InvalidControlReceiptPosition;
         const binding = self.binding;
         const result: @import("relational_index_publication_progress.zig").Receipt = .{
-            .owner = .{ .plan_id = binding.id, .plan_digest = binding.plan_digest, .ordinal = binding.ordinal, .group_id = binding.fence.owner_group_id, .namespace = binding.fence.namespace, .authority = .native, .fence_digest = binding.owner_digest },
+            .owner = .{ .plan_id = binding.id, .plan_digest = binding.plan_digest, .ordinal = binding.ordinal, .group_id = binding.fence.owner_group_id, .namespace = binding.fence.namespace, .authority = binding.authority, .fence_digest = binding.owner_digest },
             .action = .validated,
-            .position = .{ .native = position },
+            .position = position,
             .candidate_digest = binding.integrity_candidate,
             .reservation_digest = binding.integrity_reserved,
             .evidence_digest = try self.evidenceDigest(),
@@ -328,51 +299,70 @@ pub const SealCommand = struct {
     }
 };
 
-/// One reusable namespace slot, committed with native authority, the standby
-/// outbox and replay marker by the normal native effect transaction. No local
+/// One reusable namespace slot, committed with its authority and replay marker
+/// (plus the standby outbox for native execution). No local
 /// root identity is retained here. This seal is not publication permission.
 pub const Seal = struct {
     pub const key = owner.key ++ ":validated";
     pub const max_wire_bytes = 32 * 1024;
     command: SealCommand,
-    position: Native,
+    position: Position,
 
     pub fn load(alloc: Allocator, txn: anytype, binding: owner.Binding) !?@This() {
         const raw = (try optional(txn, Seal.key)) orelse return null;
-        if (raw.len < 40 or raw.len > Seal.max_wire_bytes or !std.mem.eql(u8, raw[0..8], "AIVS\x01\x00\x00\x00") or
+        if (raw.len < 40 or raw.len > Seal.max_wire_bytes or !std.mem.eql(u8, raw[0..8], "AIVS\x02\x00\x00\x00") or
             !equal(raw[raw.len - 32 ..][0..32].*, hash(raw[0 .. raw.len - 32]))) return error.InvalidRelationalIndexValidation;
         var parsed = try std.json.parseFromSlice(@This(), alloc, raw[8 .. raw.len - 32], .{ .ignore_unknown_fields = false, .max_value_len = 128 });
         defer parsed.deinit();
         const result = parsed.value;
-        _ = try result.command.receipt(result.position);
+        _ = try result.command.receiptAt(result.position);
         const canonical = try std.json.Stringify.valueAlloc(alloc, result, .{});
         defer alloc.free(canonical);
         if (!std.mem.eql(u8, canonical, raw[8 .. raw.len - 32])) return error.InvalidRelationalIndexValidation;
         if (!std.meta.eql(result.command.binding, binding)) return null;
-        const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        if (result.position.sequence > current.sequence) return error.InvalidRelationalIndexValidation;
+        if (result.position == .native) {
+            const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+            if (result.position.native.sequence > current.sequence) return error.InvalidRelationalIndexValidation;
+        } else {
+            _ = try authority.require(txn, .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+            const current = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidRelationalIndexValidation;
+            if (result.position.raft.index > current.index or result.position.raft.term > current.term or (result.position.raft.index == current.index and result.position.raft.term != current.term)) return error.InvalidRelationalIndexValidation;
+        }
         return result;
     }
 
-    pub fn stage(alloc: Allocator, txn: anytype, command: SealCommand, replay: ?Native) !struct { seal: Seal, duplicate: bool } {
+    pub const Outcome = struct { seal: Seal, duplicate: bool };
+    pub fn stage(alloc: Allocator, txn: anytype, command: SealCommand, replay: ?Native) !Outcome {
+        if (command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return stageAt(alloc, txn, command, if (replay) |cut| .{ .native = cut } else null);
+    }
+    pub fn stageAt(alloc: Allocator, txn: anytype, command: SealCommand, replay: ?Position) !Outcome {
         try command.validate();
-        if (replay) |position| _ = try command.receipt(position);
+        if (command.binding.authority == .raft and replay == null) return error.InvalidControlReceiptPosition;
+        if (replay) |position| _ = try command.receiptAt(position);
         const actual = try SealCommand.prepare(alloc, txn, command.binding, command.expected);
         if (!std.meta.eql(actual, command)) return error.InvalidRelationalIndexValidation;
         if (try Seal.load(alloc, txn, command.binding)) |existing| {
             if (!std.meta.eql(command, existing.command)) return error.InvalidRelationalIndexValidation;
-            if (replay) |position| if (!std.meta.eql(position, existing.position)) return error.InvalidPrivateIndexNativeReceipt;
+            if (replay) |position| {
+                if (position == .native and !std.meta.eql(position, existing.position)) return error.InvalidPrivateIndexNativeReceipt;
+                if (!std.meta.eql(position, existing.position) and !cutAfter(position, existing.position)) return error.InvalidControlReceiptPosition;
+            }
             return .{ .seal = existing, .duplicate = true };
         }
-        const position: Native = .{ .namespace = command.binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(command.binding.fence.namespace), if (replay) |value| value.sequence else null) };
+        const position: Position = if (command.binding.authority == .raft) replay.? else .{ .native = .{ .namespace = command.binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(command.binding.fence.namespace), if (replay) |value| value.native.sequence else null) } };
+        if (position == .raft) {
+            const current = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+            if (position.raft.index <= current.index or position.raft.term < current.term) return error.InvalidControlReceiptPosition;
+        }
         const result: @This() = .{ .command = command, .position = position };
-        _ = try command.receipt(position);
+        _ = try command.receiptAt(position);
         const json = try std.json.Stringify.valueAlloc(alloc, result, .{});
         defer alloc.free(json);
         if (json.len + 40 > Seal.max_wire_bytes) return error.InvalidRelationalIndexValidation;
         const bytes = try alloc.alloc(u8, json.len + 40);
         defer alloc.free(bytes);
-        @memcpy(bytes[0..8], "AIVS\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], "AIVS\x02\x00\x00\x00");
         @memcpy(bytes[8..][0..json.len], json);
         @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
         try txn.put(Seal.key, bytes);
@@ -387,7 +377,8 @@ pub const InstallIntent = struct {
     metadata_decision: Digest,
 
     pub fn validate(self: @This()) !void {
-        _ = try self.validation.command.receipt(self.validation.position);
+        if (self.validation.position != .native) return error.InvalidControlReceiptPosition;
+        _ = try self.validation.command.receipt(self.validation.position.native);
         if (!nonzero(self.metadata_decision)) return error.InvalidPrivateIndexNativeReceipt;
     }
 
@@ -435,8 +426,8 @@ pub const InstallCommand = struct {
     pub fn receipt(self: @This(), position: Native) !@import("relational_index_publication_progress.zig").Receipt {
         try self.validate();
         try position.validate();
-        if (!position.namespace.eql(self.validation.position.namespace) or position.sequence <= self.validation.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
-        var result = try self.validation.command.receipt(self.validation.position);
+        if (!position.namespace.eql(self.validation.position.native.namespace) or position.sequence <= self.validation.position.native.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        var result = try self.validation.command.receipt(self.validation.position.native);
         result.action = .installed;
         result.position = .{ .native = position };
         result.evidence_digest = try self.evidenceDigest();
@@ -1031,21 +1022,6 @@ test "relational index system generation checkpoint keeps maximum cursors out of
     defer loaded.deinit();
     try std.testing.expectEqualDeep(summary, loaded.summary);
     try std.testing.expectEqualSlices(u8, cursor, loaded.cursor);
-    // Existing native storage and control shapes remain byte-for-byte stable.
-    const original = .{ .expected = summary.expected, .inventory_digest = summary.inventory_digest, .source_members = summary.source_members, .fields = summary.fields, .position = summary.position.native, .page_digest = summary.page_digest };
-    const original_json = try std.json.Stringify.valueAlloc(alloc, original, .{});
-    defer alloc.free(original_json);
-    try std.testing.expectEqualSlices(u8, original_json, response);
-    const wire = @import("relational_integrity_json.zig");
-    var native_wire: std.Io.Writer.Allocating = .init(alloc);
-    defer native_wire.deinit();
-    var original_wire: std.Io.Writer.Allocating = .init(alloc);
-    defer original_wire.deinit();
-    var native_stream: std.json.Stringify = .{ .writer = &native_wire.writer };
-    var original_stream: std.json.Stringify = .{ .writer = &original_wire.writer };
-    try wire.write(summary, &native_stream);
-    try wire.write(original, &original_stream);
-    try std.testing.expectEqualSlices(u8, original_wire.written(), native_wire.written());
     const DecodeFaults = struct {
         fn run(a: Allocator, encoded: []const u8) !void {
             var decoded = try decodeRecord(a, encoded);
@@ -1064,7 +1040,7 @@ test "relational index system generation checkpoint keeps maximum cursors out of
         defer decoded.deinit();
         try std.testing.expectEqualDeep(exact, decoded.summary);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, DecodeFaults.run, .{encoded});
-        encoded[4] = if (cut == .native) 2 else 1;
+        encoded[4] = 1;
         @memcpy(encoded[encoded.len - 32 ..], &hash(encoded[0 .. encoded.len - 32]));
         try std.testing.expectError(error.InvalidRelationalIndexValidation, decodeRecord(alloc, encoded));
     }

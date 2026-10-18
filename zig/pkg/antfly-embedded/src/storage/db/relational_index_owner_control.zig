@@ -343,7 +343,10 @@ pub const Effect = union(enum) {
                 try value.validate();
                 if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
             },
-            .validation_seal => |value| try value.validate(),
+            .validation_seal => |value| {
+                try value.validate();
+                if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            },
             .install => |value| try value.validate(),
             .release => |value| try value.validate(),
             .cancel_release => |value| try value.validate(),
@@ -834,7 +837,7 @@ pub const AuditOutcome = struct {
     audit: @import("relational_index_audit_checkpoint.zig").Summary,
     pub fn logicalCommand(self: @This()) !validation.SealCommand {
         _ = try self.readyDigest();
-        return .{ .binding = self.binding, .expected = self.expected, .generation_digest = self.audit.generation_canonical_digest.?, .inventory_digest = self.audit.inventory_canonical_digest, .source_members = self.audit.source_members.?, .generation_position = self.audit.canonical_position.? };
+        return .{ .binding = self.binding, .expected = self.expected, .generation_digest = self.audit.generation_canonical_digest.?, .inventory_digest = self.audit.inventory_canonical_digest, .source_members = self.audit.source_members.?, .generation_position = .{ .native = self.audit.canonical_position.? } };
     }
     pub fn validateFor(self: @This(), request: BuildRequest) !void {
         try request.requireBinding(self.binding);
@@ -1088,17 +1091,27 @@ pub const PreparedValidationSeal = struct {
     pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !ValidationSealOutcome {
         try self.validate();
         const result = try validation.Seal.stage(self.alloc, txn, self.command, position);
-        return .{ .command = self.command, .position = result.seal.position, .duplicate = result.duplicate };
+        return .{ .command = self.command, .position = result.seal.position.native, .duplicate = result.duplicate };
+    }
+    pub fn stageRaft(self: *@This(), _: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        const binding = self.command.binding;
+        if (binding.authority != .raft or owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try validation.Seal.stageAt(self.alloc, txn, self.command, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return true;
     }
     pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ValidationSealOutcome) !void {
         const sealed = (try validation.Seal.load(self.alloc, txn, self.command.binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
-        if (!std.meta.eql(sealed.command, self.command) or !std.meta.eql(sealed.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
-        outcome.receipt = try sealed.command.receipt(sealed.position);
+        if (sealed.position != .native or !std.meta.eql(sealed.command, self.command) or !std.meta.eql(sealed.position.native, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        outcome.receipt = try sealed.command.receipt(sealed.position.native);
     }
     pub fn preparePayload(self: *@This()) !void {
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "validation_seal", self.command, validation.Seal.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {

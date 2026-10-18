@@ -1617,7 +1617,7 @@ const TestDriver = struct {
                     self.decision_effects += 1;
                     const seal = if (self.installation_response) |response| response.installed.logical.command.validation else sealed: {
                         const validated = self.validated_outcome orelse return error.TestMissingValidatedOutcome;
-                        break :sealed local.storage_db_relational_index_validation.Seal{ .command = validated.logical.command, .position = validated.logical.position };
+                        break :sealed local.storage_db_relational_index_validation.Seal{ .command = validated.logical.command, .position = .{ .native = validated.logical.position } };
                     };
                     self.value.native_install = .{ .validation = seal, .decision_digest = try publication.NativeInstallGrant.decisionDigest(self.value.metadata_group_id, self.value.metadata_incarnation, self.value.head) };
                 }
@@ -3051,7 +3051,7 @@ test "relational index publication installed receiver binds fresh decision and r
     const acknowledged = try progress.acknowledge(driver.value.head, driver.value.owner, driver.value.head.revision, validated.logical.receipt.?);
     driver.value.head = try acknowledged.head.decidePublish(acknowledged.head.revision);
     driver.value.owner = acknowledged.owner;
-    driver.value.native_install = .{ .validation = .{ .command = validated.logical.command, .position = validated.logical.position }, .decision_digest = try publication.NativeInstallGrant.decisionDigest(13, driver.value.metadata_incarnation, driver.value.head) };
+    driver.value.native_install = .{ .validation = .{ .command = validated.logical.command, .position = .{ .native = validated.logical.position } }, .decision_digest = try publication.NativeInstallGrant.decisionDigest(13, driver.value.metadata_incarnation, driver.value.head) };
     const seed: [32]u8 = @splat(9);
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .public_key = pair.public_key.toBytes(), .root_incarnation = 7 };
