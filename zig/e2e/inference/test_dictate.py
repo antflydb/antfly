@@ -189,9 +189,9 @@ def test_dictate_cleanup_rewrites_transcript(api):
             "context": "chat message to a colleague",
             "max_tokens": 128,
         },
-        # With one resident model, transcription leaves the cleanup generator
-        # cold. Use the same explicit first-use budget as /generate; subsequent
-        # dictation calls retain their ordinary request deadlines.
+        # With one resident model, each transcription leaves the cleanup
+        # generator cold. Use /generate's explicit first-use budget for the
+        # compound request; transcription-only tests keep their usual bounds.
         timeout=max(600, FIRST_USE_REQUEST_TIMEOUT),
     )
     if resp.status_code in (400, 404):
@@ -225,7 +225,7 @@ def test_dictate_streams_transcript_then_deltas_then_completion(api):
             "max_tokens": 128,
         },
         stream=True,
-        timeout=600,
+        timeout=max(600, FIRST_USE_REQUEST_TIMEOUT),
     )
     if resp.status_code in (400, 404):
         pytest.skip(f"generator unavailable: {resp.text[:200]}")
