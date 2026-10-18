@@ -230,6 +230,12 @@ pub const Value = struct {
     /// array is handled by the caller, separately from this non-NULL view.
     /// Empty arrays retain their quantifier identity even for a NULL scalar.
     pub fn quantified(self: Value, scalar_value: Element, comparison: Comparison, quantifier: Quantifier, work: *Budget) !?bool {
+        return (try self.quantifiedObserved(scalar_value, comparison, quantifier, work)).result;
+    }
+
+    /// Completed prefix length distinguishes expensive first-cell comparisons
+    /// from scans that actually benefit from a reusable membership index.
+    pub fn quantifiedObserved(self: Value, scalar_value: Element, comparison: Comparison, quantifier: Quantifier, work: *Budget) !QuantifiedResult {
         // The SQL probe can have a wider numeric type than the array cells:
         // comparing bigint against int[] must not narrow/overflow the probe.
         try validateElement(switch (self.element_type) {
@@ -250,10 +256,10 @@ pub const Value = struct {
                 continue;
             }
             const matched = comparison.accepts(try compareElement(self.element_type, scalar_value, element, work));
-            if (quantifier == .any and matched) return true;
-            if (quantifier == .all and !matched) return false;
+            if (quantifier == .any and matched) return .{ .result = true, .visited = array_cell_0 + 1 };
+            if (quantifier == .all and !matched) return .{ .result = false, .visited = array_cell_0 + 1 };
         }
-        return if (saw_null) null else quantifier == .all;
+        return .{ .result = if (saw_null) null else quantifier == .all, .visited = self.cardinality() };
     }
 
     pub fn lower(self: Value, dimension: i32) ?i32 {
@@ -964,7 +970,7 @@ test "SQL typed array owned copies and membership clean up under allocation faul
             var work: Budget = .{};
             try std.testing.expectEqual(@as(?i32, -3), try index.firstPosition(Element.json(.{ .string = "éx!" }), &work));
             try std.testing.expectEqual(@as(?i32, -2), try index.firstPosition(.{}, &work));
-            try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 1), index.count);
             const query = try Value.init(.text, &.{.{ .length = 2 }}, &.{ Element.json(.{ .string = "éx!" }), Element.json(.{ .string = "éx!" }) }, .{});
             try std.testing.expect(try index.contains(query, &work));
             try std.testing.expect(try index.overlaps(query, &work));
@@ -1028,8 +1034,12 @@ test "SQL typed array prepared membership bounds repeated probe work without all
     for (0..10) |_| try std.testing.expect(try index.contains(probes, &work));
     const indexed_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - indexed_start;
     try std.testing.expectEqual(retained, index.budget.live);
-    try std.testing.expect(work.remaining > 90000);
-    std.debug.print("SQL array membership: source_elements=4096 probe_elements=256 iterations=10 prepare_ns={} scan_ns={} indexed_ns={} retained_bytes={} probe_allocated_bytes=0\n", .{ prepared_ns, scan_ns, indexed_ns, retained });
+    // Bucket collisions now spend work explicitly, unlike the former opaque
+    // hash-map probes. Keep lookup work bounded per probe, far below a replay
+    // of the 4096-cell source, without depending on a specific hash layout.
+    const spent = 100000 - work.remaining;
+    try std.testing.expect(spent <= 8 * probes.cardinality() * 10);
+    std.debug.print("SQL array membership: source_elements=4096 probe_elements=256 iterations=10 prepare_ns={} scan_ns={} indexed_ns={} retained_bytes={} probe_work={} probe_allocated_bytes=0\n", .{ prepared_ns, scan_ns, indexed_ns, retained, spent });
 }
 
 /// One evaluation owns this scratch; immutable statement indexes use Membership
@@ -1120,15 +1130,23 @@ fn smallMembership(source: Value, probes: Value, overlap: bool, work: *Budget) !
     return false;
 }
 
+pub const QuantifiedResult = struct { result: ?bool, visited: usize };
+
 /// Reusable equality membership, O(n) build and expected O(m) probes. The
 /// immutable array owner must outlive this index. NULLs never satisfy @>/&&;
 /// firstPosition separately uses IS NOT DISTINCT FROM semantics.
 pub const Membership = struct {
-    const Entry = struct { ordinal: usize, next: ?usize };
+    const empty = std.math.maxInt(u32);
     budget: *MemoryBudget,
     value: Value,
-    heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
-    entries: std.ArrayList(Entry) = .empty,
+    // Each occupied bucket borrows the first matching source ordinal. Array
+    // cardinality is bounded by i32, leaving an unambiguous empty sentinel.
+    // One allocation contains ordinals followed by byte fingerprints. The
+    // fingerprints avoid decoding/comparing unrelated colliding text keys.
+    buffer: []u32 = &.{},
+    slots: []u32 = &.{},
+    tags: []u8 = &.{},
+    count: usize = 0,
     first_null: ?usize = null,
 
     pub fn init(backing: Allocator, value: Value, limits: Limits) !Membership {
@@ -1153,43 +1171,79 @@ pub const Membership = struct {
 
     fn populate(index: *Membership, work: *Budget) !void {
         const value = index.value;
-        const budget = index.budget;
-        // Mutable build buffers use the quota allocator directly: hash-table
-        // and entry-list growth must reclaim replaced capacity, not accumulate
-        // obsolete buffers in the immutable value's arena.
-        const a = budget.allocator();
-        for (0..value.cardinality(), 0..) |array_cell_0, ordinal| {
-            const element = value.flatCell(array_cell_0);
+        for (0..value.cardinality()) |ordinal| {
+            const element = value.flatCell(ordinal);
+            try work.consume(1);
             if (element.sql_null) {
                 if (index.first_null == null) index.first_null = ordinal;
                 continue;
             }
             const hash = try hashElement(value.element_type, element, work);
-            if (try index.find(element, hash, work) != null) continue;
-            const slot = index.entries.items.len;
-            const entry: Entry = .{ .ordinal = ordinal, .next = index.heads.get(hash) };
-            index.entries.append(a, entry) catch |err| return allocationError(budget, err);
-            index.heads.put(a, hash, slot) catch |err| return allocationError(budget, err);
+            if (try index.findSlot(element, hash, work) != null) continue;
+            // Distinct cardinality determines capacity. In particular, a large
+            // duplicate-heavy source remains cheap under a tight index quota.
+            if (index.count >= index.slots.len / 2) try index.grow(work);
+            var bucket = hash & (index.slots.len - 1);
+            while (index.slots[bucket] != empty) {
+                try work.consume(1);
+                bucket = (bucket + 1) & (index.slots.len - 1);
+            }
+            index.slots[bucket] = @intCast(ordinal);
+            index.tags[bucket] = @truncate(hash >> 56);
+            index.count += 1;
         }
     }
 
+    fn grow(self: *Membership, work: *Budget) !void {
+        const a = self.budget.allocator();
+        const capacity = if (self.slots.len == 0) @as(usize, 16) else std.math.mul(usize, self.slots.len, 2) catch return error.SqlProgramLimitExceeded;
+        const words = std.math.add(usize, capacity, capacity / 4) catch return error.SqlProgramLimitExceeded;
+        const buffer = a.alloc(u32, words) catch |err| return allocationError(self.budget, err);
+        errdefer a.free(buffer);
+        const slots = buffer[0..capacity];
+        const tags = std.mem.sliceAsBytes(buffer[capacity..]);
+        @memset(slots, empty);
+        for (self.slots) |ordinal| {
+            try work.consume(1);
+            if (ordinal == empty) continue;
+            const hash = try hashElement(self.value.element_type, self.value.flatCell(ordinal), work);
+            var bucket = hash & (slots.len - 1);
+            while (slots[bucket] != empty) {
+                try work.consume(1);
+                bucket = (bucket + 1) & (slots.len - 1);
+            }
+            slots[bucket] = ordinal;
+            tags[bucket] = @truncate(hash >> 56);
+        }
+        a.free(self.buffer);
+        self.buffer = buffer;
+        self.slots = slots;
+        self.tags = tags;
+    }
+
     pub fn deinit(self: *Membership) void {
-        self.heads.deinit(self.budget.allocator());
-        self.entries.deinit(self.budget.allocator());
+        self.budget.allocator().free(self.buffer);
         const backing = self.budget.backing;
         std.debug.assert(self.budget.live == 0);
         backing.destroy(self.budget);
         self.* = undefined;
     }
 
-    fn find(self: *const Membership, element: Element, hash: u64, budget: *Budget) !?usize {
-        var cursor = self.heads.get(hash);
-        while (cursor) |slot| {
-            const entry = self.entries.items[slot];
-            if (try compareElement(self.value.element_type, self.value.flatCell(entry.ordinal), element, budget) == .eq) return entry.ordinal;
-            cursor = entry.next;
+    fn findSlot(self: *const Membership, element: Element, hash: u64, work: *Budget) !?usize {
+        if (self.slots.len == 0) return null;
+        var bucket = hash & (self.slots.len - 1);
+        while (self.slots[bucket] != empty) {
+            if (self.tags[bucket] == @as(u8, @truncate(hash >> 56))) {
+                // Equality already charges this occupied bucket's visit.
+                if (try compareElement(self.value.element_type, self.value.flatCell(self.slots[bucket]), element, work) == .eq) return bucket;
+            } else try work.consume(1);
+            bucket = (bucket + 1) & (self.slots.len - 1);
         }
         return null;
+    }
+
+    fn find(self: *const Membership, element: Element, hash: u64, work: *Budget) !?usize {
+        return if (try self.findSlot(element, hash, work)) |slot| self.slots[slot] else null;
     }
 
     pub fn contains(self: *const Membership, other: Value, work: *Budget) !bool {
@@ -1218,10 +1272,10 @@ pub const Membership = struct {
     /// and track distinct entries, independently of dimensions/lower bounds.
     fn containedBy(self: *Membership, source: Value, work: *Budget) !bool {
         if (self.first_null != null) return false;
-        var remaining = self.entries.items.len;
+        var remaining = self.count;
         if (remaining == 0) return true;
         const a = self.budget.allocator();
-        const matched = a.alloc(u8, (remaining + 7) / 8) catch |err| return allocationError(self.budget, err);
+        const matched = a.alloc(u8, (self.slots.len + 7) / 8) catch |err| return allocationError(self.budget, err);
         defer a.free(matched);
         @memset(matched, 0);
         for (0..source.cardinality()) |i| {
@@ -1229,19 +1283,13 @@ pub const Membership = struct {
             try work.consume(1);
             if (cell.sql_null) continue;
             const hash = try hashElement(source.element_type, cell, work);
-            var next = self.heads.get(hash);
-            while (next) |slot| {
-                const entry = self.entries.items[slot];
-                if (try compareElement(source.element_type, self.value.flatCell(entry.ordinal), cell, work) == .eq) {
-                    const mask = @as(u8, 1) << @intCast(slot % 8);
-                    if (matched[slot / 8] & mask == 0) {
-                        matched[slot / 8] |= mask;
-                        remaining -= 1;
-                    }
-                    if (remaining == 0) return true;
-                    break;
+            if (try self.findSlot(cell, hash, work)) |slot| {
+                const mask = @as(u8, 1) << @intCast(slot % 8);
+                if (matched[slot / 8] & mask == 0) {
+                    matched[slot / 8] |= mask;
+                    remaining -= 1;
                 }
-                next = entry.next;
+                if (remaining == 0) return true;
             }
         }
         return false;
@@ -1808,4 +1856,48 @@ test "SQL native dynamic membership reclaims indexed scratch and preserves admis
     try std.testing.expectError(error.Canceled, dynamicMembership(a, empty, empty, false, .{}, &canceled));
     empty.element_type = .text;
     try std.testing.expectError(error.SqlTypeMismatch, dynamicMembership(a, source, empty, true, .{}, &work));
+}
+
+test "SQL compact membership handles collisions duplicates growth and bounded memory" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var cells: [256]Element = undefined;
+            // Deliberate shared low hash bits exercise collision equality and
+            // insertion-order-independent probing across multiple table grows.
+            var candidate: i64 = 0;
+            var work: Budget = .{};
+            for (&cells) |*cell| {
+                while (true) : (candidate += 1) {
+                    const element = Element.json(.{ .integer = candidate });
+                    if ((try hashElement(.int64, element, &work)) & 31 == 0) {
+                        cell.* = element;
+                        candidate += 1;
+                        break;
+                    }
+                }
+            }
+            const source = try Value.init(.int64, &.{.{ .length = cells.len, .lower = -7 }}, &cells, .{});
+            var index = try Membership.init(a, source, .{});
+            defer index.deinit();
+            for (cells, 0..) |cell, i| try std.testing.expectEqual(@as(?i32, @as(i32, @intCast(i)) - 7), try index.firstPosition(cell, &work));
+            try std.testing.expectEqual(@as(?bool, false), try index.equalAny(.json(.{ .integer = -1 }), &work));
+            try std.testing.expectEqual(@as(usize, 256), index.count);
+            try std.testing.expectEqual(index.slots.len * 5, index.budget.live);
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    var repeated: [8192]Element = @splat(.json(.{ .integer = 42 }));
+    repeated[31] = .{};
+    const source = try Value.init(.int64, &.{.{ .length = repeated.len, .lower = -7 }}, &repeated, .{});
+    var index = try Membership.initValidated(std.testing.allocator, source, .{ .bytes = 256 });
+    defer index.deinit();
+    var build_work: Budget = .{};
+    try index.populate(&build_work);
+    try std.testing.expectEqual(@as(usize, 1), index.count);
+    try std.testing.expect(index.budget.peak <= 256);
+    var work: Budget = .{};
+    try std.testing.expectEqual(@as(?i32, -7), try index.firstPosition(.json(.{ .integer = 42 }), &work));
+    try std.testing.expectEqual(@as(?i32, 24), try index.firstPosition(.{}, &work));
+    try std.testing.expectEqual(@as(?bool, null), try index.equalAny(.json(.{ .integer = 41 }), &work));
 }

@@ -3134,10 +3134,10 @@ const Evaluator = struct {
         return compareWithBudget(left, right, &work);
     }
 
-    fn quantifiedMembership(self: *Evaluator, input: u32, array: *const arrays.Value, element: Datum, work: *arrays.Budget) !?*const arrays.Membership {
-        if (element.sql_null) return null;
-        if (self.program.constant_memberships.get(input)) |index| return index;
-        const parameters = self.typed_parameters orelse return null;
+    fn quantifiedEqualAny(self: *Evaluator, input: u32, array: *const arrays.Value, element: Datum, work: *arrays.Budget) !?bool {
+        if (element.sql_null) return array.quantified(element, .eq, .any, work);
+        if (self.program.constant_memberships.get(input)) |index| return index.equalAny(element, work);
+        const parameters = self.typed_parameters orelse return array.quantified(element, .eq, .any, work);
         const lookup = if (self.program.invocation) |invocation| (if (invocation.frame) |*bound_frame| bound_frame.lookup() else self.parameter_lookup) else self.parameter_lookup;
         // Only identity casts can borrow a parameter's immutable index. A
         // conversion creates a different array and retains ordinary execution.
@@ -3145,12 +3145,12 @@ const Evaluator = struct {
         while (true) {
             const instruction = self.program.instructions[node];
             switch (instruction.operation) {
-                .parameter => |ordinal| return lookup.membership(ordinal, array, parameters, work),
+                .parameter => |ordinal| return lookup.equalAny(ordinal, array, parameters, element, work),
                 .cast => |cast| {
-                    if (cast.type != .array or cast.numeric_modifier != null or self.program.instructions[cast.operand].type.element_type != instruction.type.element_type) return null;
+                    if (cast.type != .array or cast.numeric_modifier != null or self.program.instructions[cast.operand].type.element_type != instruction.type.element_type) return array.quantified(element, .eq, .any, work);
                     node = cast.operand;
                 },
-                else => return null,
+                else => return array.quantified(element, .eq, .any, work),
             }
         }
     }
@@ -3501,10 +3501,8 @@ const Evaluator = struct {
                         const accepted = if (exact_number) try self.numericQuantified(probe, array.*, compare_op, every.bool) else ordinary: {
                             var work = self.workBudget();
                             if (!mixed_number and ((compare_op == .eq and !every.bool) or (compare_op == .ne and every.bool))) {
-                                if (try self.quantifiedMembership(call.args[1], array, element, &work)) |membership_index| {
-                                    const found = try membership_index.equalAny(element, &work);
-                                    break :ordinary if (found) |yes| (if (every.bool) !yes else yes) else null;
-                                }
+                                const found = try self.quantifiedEqualAny(call.args[1], array, element, &work);
+                                break :ordinary if (found) |yes| (if (every.bool) !yes else yes) else null;
                             }
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };

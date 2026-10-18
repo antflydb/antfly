@@ -76,17 +76,17 @@ fn probeCell(comptime kind: arrays.ElementType, value: arrays.Element) Cell(kind
 }
 
 /// Probe has already passed the scalar kernel's widened type validation.
-pub fn quantified(view: layout.View, probe: arrays.Element, comparison: arrays.Comparison, quantifier: arrays.Quantifier, work: *arrays.Budget) !?bool {
+pub fn quantified(view: layout.View, probe: arrays.Element, comparison: arrays.Comparison, quantifier: arrays.Quantifier, work: *arrays.Budget) !arrays.QuantifiedResult {
     if (probe.sql_null) {
         try work.consume(view.count);
-        return if (view.count == 0) quantifier == .all else null;
+        return .{ .result = if (view.count == 0) quantifier == .all else null, .visited = view.count };
     }
     return switch (view.kind) {
         inline .boolean, .int16, .int32, .int64, .float32, .float64, .text => |kind| quantifiedTyped(kind, view, probeCell(kind, probe), comparison, quantifier, work),
         else => error.InvalidSqlArrayShape,
     };
 }
-fn quantifiedTyped(comptime kind: arrays.ElementType, view: layout.View, probe: Cell(kind), comparison: arrays.Comparison, quantifier: arrays.Quantifier, work: *arrays.Budget) !?bool {
+fn quantifiedTyped(comptime kind: arrays.ElementType, view: layout.View, probe: Cell(kind), comparison: arrays.Comparison, quantifier: arrays.Quantifier, work: *arrays.Budget) !arrays.QuantifiedResult {
     var physical: usize = 0;
     var begin: usize = 0;
     var saw_null = false;
@@ -107,13 +107,13 @@ fn quantifiedTyped(comptime kind: arrays.ElementType, view: layout.View, probe: 
             const order = try orderCell(kind, probe, read(kind, view, begin + bit, physical), work);
             physical += 1;
             const matched = comparison.accepts(order);
-            if (quantifier == .any and matched) return true;
-            if (quantifier == .all and !matched) return false;
+            if (quantifier == .any and matched) return .{ .result = true, .visited = begin + bit + 1 };
+            if (quantifier == .all and !matched) return .{ .result = false, .visited = begin + bit + 1 };
         }
         try work.consume(count - charged);
         begin += count;
     }
-    return if (saw_null) null else quantifier == .all;
+    return .{ .result = if (saw_null) null else quantifier == .all, .visited = view.count };
 }
 
 /// Compare a shared prefix; callers retain their own shape tie-break. The
@@ -275,7 +275,7 @@ test "SQL native consumers retain quantified comparisons hashes and exact work" 
                 for (std.enums.values(arrays.Comparison)) |comparison| for (std.enums.values(arrays.Quantifier)) |quantifier| {
                     var fw: arrays.Budget = .{};
                     var sw: arrays.Budget = .{};
-                    try std.testing.expectEqual(try left.scalar_value.quantified(scalar, comparison, quantifier, &sw), try left.native_value.quantified(scalar, comparison, quantifier, &fw));
+                    try std.testing.expectEqualDeep(try left.scalar_value.quantifiedObserved(scalar, comparison, quantifier, &sw), try left.native_value.quantifiedObserved(scalar, comparison, quantifier, &fw));
                     try std.testing.expectEqual(sw.remaining, fw.remaining);
                     var denied: arrays.Budget = .{ .remaining = (arrays.Budget{}).remaining - fw.remaining - 1 };
                     try std.testing.expectError(error.SqlProgramLimitExceeded, left.native_value.quantified(scalar, comparison, quantifier, &denied));
