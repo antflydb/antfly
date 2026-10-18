@@ -5762,7 +5762,7 @@ fn serveUnifiedInner(
     }
     if (register_inference_routes) {
         if (comptime inline_inference) {
-            try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
+            try inference_host.linkedInferenceRegisterRoutesOnExcept(antfly_node, &server, @import("../api/inference_gateway.zig").public_paths);
         } else {
             const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
             try registerLinkedInferenceManifest(
@@ -5860,6 +5860,7 @@ fn registerLinkedInferenceManifest(
     if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
     for (entries) |entry| {
+        if (@import("../api/inference_gateway.zig").ownsPath(entry.path.slice())) continue;
         const route = try alloc.create(LinkedInferenceRoute);
         errdefer alloc.destroy(route);
         route.* = .{

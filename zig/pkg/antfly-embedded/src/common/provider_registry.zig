@@ -21,6 +21,20 @@ const reranking = @import("antfly_reranking");
 const decisions = @import("../functions/decisions.zig");
 
 const Allocator = std.mem.Allocator;
+pub const tasks = @import("inference_tasks.zig");
+pub const gateway = @import("inference_gateway.zig");
+
+test {
+    _ = gateway;
+    _ = @import("inference_telemetry.zig");
+}
+
+/// Tasks without an inline vendor adapter bind a runtime model to an existing
+/// physical connection. Credentials stay owned by that connection.
+pub const RuntimeBinding = struct {
+    model: []const u8,
+    connection: []const u8 = "local-inference",
+};
 
 pub const ChainLinkConfig = struct {
     generator_name: ?[]const u8 = null,
@@ -71,6 +85,10 @@ pub const Registry = struct {
     default_embedder: ?[]const u8 = null,
     chunker_configs: std.StringArrayHashMapUnmanaged(chunking.Config) = .{},
     default_chunker: ?[]const u8 = null,
+    extractor_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
+    rewriter_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
+    predictor_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
+    inference_capabilities: std.StringArrayHashMapUnmanaged(gateway.Capabilities) = .{},
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .allocator = alloc };
@@ -119,6 +137,17 @@ pub const Registry = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.decider_configs.deinit(self.allocator);
+        inline for (.{ "extractor_configs", "rewriter_configs", "predictor_configs" }) |field| {
+            var it = @field(self, field).iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.model);
+                self.allocator.free(entry.value_ptr.connection);
+            }
+            @field(self, field).deinit(self.allocator);
+        }
+        for (self.inference_capabilities.keys()) |key| self.allocator.free(key);
+        self.inference_capabilities.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -134,6 +163,35 @@ pub const Registry = struct {
         var registry = Registry.init(alloc);
         errdefer registry.deinit();
 
+        inline for (.{ .{ "extractors", "extractor_configs" }, .{ "rewriters", "rewriter_configs" }, .{ "predictors", "predictor_configs" } }) |field| {
+            if (value.object.get(field[0])) |configs| {
+                if (configs != .object) return error.InvalidRegistryConfig;
+                var it = configs.object.iterator();
+                while (it.next()) |entry| {
+                    const parsed = try std.json.parseFromValue(RuntimeBinding, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
+                    defer parsed.deinit();
+                    if (entry.key_ptr.*.len == 0 or parsed.value.model.len == 0 or parsed.value.connection.len == 0) return error.InvalidRegistryConfig;
+                    const key = try alloc.dupe(u8, entry.key_ptr.*);
+                    errdefer alloc.free(key);
+                    const model = try alloc.dupe(u8, parsed.value.model);
+                    errdefer alloc.free(model);
+                    const connection = try alloc.dupe(u8, parsed.value.connection);
+                    errdefer alloc.free(connection);
+                    try @field(registry, field[1]).put(alloc, key, .{ .model = model, .connection = connection });
+                }
+            }
+        }
+        if (value.object.get("inference_capabilities")) |configs| {
+            if (configs != .object) return error.InvalidRegistryConfig;
+            var it = configs.object.iterator();
+            while (it.next()) |entry| {
+                const parsed = try std.json.parseFromValue(gateway.Capabilities, alloc, entry.value_ptr.*, .{});
+                defer parsed.deinit();
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(key);
+                try registry.inference_capabilities.put(alloc, key, parsed.value);
+            }
+        }
         if (value.object.get("deciders")) |configs| {
             if (configs != .object) return error.InvalidRegistryConfig;
             var it = configs.object.iterator();
@@ -164,7 +222,7 @@ pub const Registry = struct {
 
     pub fn getDeciderConfig(self: *const Registry, name: ?[]const u8) !decisions.DeciderConfig {
         const resolved = name orelse self.default_decider orelse return error.NoDefaultDecider;
-        return self.decider_configs.get(resolved) orelse error.UnknownDecider;
+        return self.decider_configs.get(stripNamespace(resolved, "deciders/")) orelse error.UnknownDecider;
     }
 
     pub fn registerDeciderConfig(self: *Registry, name: []const u8, cfg: decisions.DeciderConfig) !void {
@@ -203,27 +261,27 @@ pub const Registry = struct {
 
     pub fn getGeneratorConfig(self: *const Registry, name: ?[]const u8) !generating.GeneratorConfig {
         const resolved = name orelse self.default_generator orelse return error.NoDefaultGenerator;
-        return self.generator_configs.get(resolved) orelse return error.UnknownGenerator;
+        return self.generator_configs.get(stripNamespace(resolved, "generators/")) orelse return error.UnknownGenerator;
     }
 
     pub fn getRerankerConfig(self: *const Registry, name: ?[]const u8) !reranking.Config {
         const resolved = name orelse self.default_reranker orelse return error.NoDefaultReranker;
-        return self.reranker_configs.get(resolved) orelse return error.UnknownReranker;
+        return self.reranker_configs.get(stripNamespace(resolved, "rerankers/")) orelse return error.UnknownReranker;
     }
 
     pub fn getEmbedderConfig(self: *const Registry, name: ?[]const u8) !embeddings.Config {
         const resolved = name orelse self.default_embedder orelse return error.NoDefaultEmbedder;
-        return self.embedder_configs.get(resolved) orelse return error.UnknownEmbedder;
+        return self.embedder_configs.get(stripNamespace(resolved, "embedders/")) orelse return error.UnknownEmbedder;
     }
 
     pub fn getChain(self: *const Registry, name: ?[]const u8) ![]const ChainLinkConfig {
         const resolved = name orelse self.default_chain orelse return error.NoDefaultChain;
-        return self.chains.get(resolved) orelse return error.UnknownChain;
+        return self.chains.get(stripNamespace(resolved, "chains/")) orelse return error.UnknownChain;
     }
 
     pub fn getChunkerConfig(self: *const Registry, name: ?[]const u8) !chunking.Config {
         const resolved = name orelse self.default_chunker orelse return error.NoDefaultChunker;
-        return self.chunker_configs.get(resolved) orelse return error.UnknownChunker;
+        return self.chunker_configs.get(stripNamespace(resolved, "chunkers/")) orelse return error.UnknownChunker;
     }
 
     pub fn registerGeneratorConfig(self: *Registry, name: []const u8, cfg: generating.GeneratorConfig) !void {
@@ -564,4 +622,8 @@ test "provider registry rejects invalid chain link sources" {
     ;
 
     try std.testing.expectError(error.InvalidChainLinkConfig, Registry.parseFromSlice(alloc, raw));
+}
+
+fn stripNamespace(name: []const u8, prefix: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
 }

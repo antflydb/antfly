@@ -784,11 +784,23 @@ pub fn optionalOwnedInferenceConnectionBytes(
 }
 
 pub fn invokeLocalInferenceConnectionFallible(context: *const inference_connection_abi.InvokeContext) !void {
-    return invokeLocalInferenceRoute(context, .post);
+    return invokeLocalInferenceRoute(context, context.method);
 }
 
 /// Dispatches `<method> /ai/v1/<operation>` to the runtime's HTTP handlers
 /// in memory. POST sends `context.body` as JSON; GET sends no body.
+fn inferenceRouteMatches(pattern: []const u8, path: []const u8) bool {
+    var expected = std.mem.splitScalar(u8, pattern, '/');
+    var actual = std.mem.splitScalar(u8, path, '/');
+    while (expected.next()) |segment| {
+        const value = actual.next() orelse return false;
+        if (std.mem.startsWith(u8, segment, ":") or std.mem.startsWith(u8, segment, "{")) {
+            if (value.len == 0) return false;
+        } else if (!std.mem.eql(u8, segment, value)) return false;
+    }
+    return actual.next() == null;
+}
+
 fn invokeLocalInferenceRoute(
     context: *const inference_connection_abi.InvokeContext,
     method: runtime_http_abi.HttpMethod,
@@ -823,7 +835,7 @@ fn invokeLocalInferenceRoute(
         if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     }
 
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
+    const path = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "/ml/v1/{s}", .{operation[3..]}) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
     defer alloc.free(path);
     const interactive_generate = isInteractiveGeneratePath(path);
     if (interactive_generate)
@@ -834,7 +846,7 @@ fn invokeLocalInferenceRoute(
     }
     const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
     const route_handle = for (entries) |entry| {
-        if (entry.method == method and std.mem.eql(u8, entry.path.slice(), path))
+        if (entry.method == method and inferenceRouteMatches(entry.path.slice(), path))
             break entry.route_handle;
     } else return error.UnsupportedInferenceOperation;
 

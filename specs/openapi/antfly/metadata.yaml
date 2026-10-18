@@ -2871,6 +2871,9 @@ components:
         - reader
         - transcriber
         - extractor
+        - decider
+        - synthesizer
+        - predictor
         - other
       description: |
         Model task type. Mirrors the inference registry taxonomy; "other" is
@@ -2884,6 +2887,15 @@ components:
         name:
           type: string
           description: Model identifier as reported by the provider.
+        id:
+          type: string
+          description: Canonical public gateway identity when available.
+        availability:
+          type: string
+          description: Availability observation independent of capability support.
+        freshness:
+          type: string
+          description: Whether metadata is configured, live, or cached.
         display_name:
           type: string
           description: Human-readable model name when the provider reports one.
@@ -2902,7 +2914,7 @@ components:
           $ref: "#/components/schemas/InferenceProviderType"
         url:
           type: string
-          description: Resolved endpoint URL when applicable.
+          description: Transport endpoint. Omitted from public inference discovery to keep server-owned URLs private.
         region:
           type: string
           description: Cloud region (Bedrock).

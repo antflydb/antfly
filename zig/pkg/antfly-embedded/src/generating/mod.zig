@@ -211,6 +211,7 @@ const ChatGPTBackend = struct {
 };
 
 const BackendState = struct {
+    http: *httpx.Client,
     quota: ?provider_limits.Handle = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     alloc: std.mem.Allocator,
@@ -218,6 +219,7 @@ const BackendState = struct {
     cfg: GeneratorConfig,
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
+    owned_base_url: ?[]u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     max_response_bytes: ?usize = null,
     execution: execution_context.Context = .{},
@@ -252,9 +254,18 @@ const BackendState = struct {
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         state.alloc = alloc;
         state.io = http.io;
+        state.http = http;
         state.cfg = cfg;
+        state.owned_base_url = if (cfg.provider == .antfly and cfg.url.len == 0 and embedded_antfly_provider == null)
+            if (execution.resolveAntflyEndpoint(null, false)) |endpoint|
+                try @import("../common/inference_gateway.zig").apiBaseAlloc(alloc, endpoint)
+            else
+                null
+        else
+            null;
+        errdefer if (state.owned_base_url) |endpoint| alloc.free(endpoint);
         state.api_key = switch (cfg.provider) {
-            .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
+            .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse (if (cfg.url.len == 0) inference_api_key else null), "ANTFLY_INFERENCE_API_KEY"),
             .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
             .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENROUTER_API_KEY"),
             .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "GEMINI_API_KEY"),
@@ -301,7 +312,7 @@ const BackendState = struct {
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
             else blk: {
-                var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082");
+                var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else state.owned_base_url orelse "http://127.0.0.1:8082");
                 errdefer provider.deinit();
                 try provider.setSourceTable(execution.routing.source_table);
                 if (cfg.capability_token) |token| try provider.setCapabilityToken(token);
@@ -326,8 +337,21 @@ const BackendState = struct {
             .vtable = &.{
                 .generate = generate,
                 .deinit = deinit,
+                .chat = chat,
             },
         };
+    }
+
+    fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, request: lib.ChatRequest) !lib.ChatResponse {
+        const self: *BackendState = @ptrCast(@alignCast(ptr));
+        var response = try chatResponseWithState(alloc, self, request);
+        defer response.deinit();
+        var result = lib.ChatResponse{ .allocator = alloc, .status = response.status.code, .body = try alloc.dupe(u8, response.body orelse "") };
+        errdefer result.deinit();
+        if (response.contentType()) |value| result.content_type = try alloc.dupe(u8, value);
+        if (response.header("retry-after")) |value| result.retry_after = try alloc.dupe(u8, value);
+        if (response.header("x-request-id")) |value| result.request_id = try alloc.dupe(u8, value);
+        return result;
     }
 
     pub fn deinit(ptr: *anyopaque) void {
@@ -341,6 +365,7 @@ const BackendState = struct {
         }
         if (self.quota) |*quota| quota.release();
         self.auth_header_cache.deinit(self.alloc);
+        if (self.owned_base_url) |endpoint| self.alloc.free(endpoint);
         if (self.api_key) |*api_key| api_key.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -633,7 +658,7 @@ test "generating optional env auth is skipped when unset" {
 
 test "generating explicit missing secret auth remains strict" {
     const alloc = std.testing.allocator;
-    var api_key = try common_secrets.SecretValue.initConfig(alloc, "secret://missing.generator_key") orelse return error.TestUnexpectedResult;
+    var api_key = try common_secrets.SecretValue.initConfig(alloc, "${secret:missing.generator_key}") orelse return error.TestUnexpectedResult;
     defer api_key.deinit(alloc);
 
     var state = BackendState{
@@ -655,8 +680,7 @@ pub fn executeChain(
     chain: []const ChainLink,
     messages: []const ChatMessage,
 ) !GenerateResult {
-    var factory_impl = BackendFactory.init(alloc, http);
-    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
+    return executeChainWithOptions(alloc, http, chain, .{}, messages);
 }
 
 pub fn executeChainWithAntflyProvider(
@@ -666,8 +690,7 @@ pub fn executeChainWithAntflyProvider(
     embedded_antfly_provider: ?managed_embedder.AntflyProvider,
     messages: []const ChatMessage,
 ) !GenerateResult {
-    var factory_impl = BackendFactory.initWithAntflyProvider(alloc, http, embedded_antfly_provider);
-    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
+    return executeChainWithOptions(alloc, http, chain, .{ .antfly_provider = embedded_antfly_provider }, messages);
 }
 
 pub fn executeChainWithOptions(
@@ -678,8 +701,19 @@ pub fn executeChainWithOptions(
     messages: []const ChatMessage,
 ) !GenerateResult {
     for (chain) |link| if (link.generator.provider == .chatgpt and (chain.len != 1 or link.retry != null)) return error.ChatGPTBillingFallbackForbidden;
-    var factory_impl = BackendFactory.initWithOptions(alloc, http, options);
-    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
+    var effective = options;
+    if (effective.request_context == null) effective.request_context = effective.execution.requestContext(http.io);
+    if (effective.request_context.?.deadline_ns == null) effective.request_context.?.deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s;
+    var factory_impl = BackendFactory.initWithOptions(alloc, http, effective);
+    const Control = struct {
+        options: BackendFactory.Options,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.options.request_context) |context| try context.check() else try self.options.execution.check(platform_time.monotonicNs());
+        }
+    };
+    const control = Control{ .options = effective };
+    return try lib.executeChainWithControl(alloc, http.io, chain, factory_impl.factory(), messages, .{ .context = &control, .check_fn = Control.check });
 }
 
 test "generating backend enforces shared policies and token budgets before dispatch" {
@@ -1514,4 +1548,77 @@ test "generating backend defaults OpenAI and OpenRouter credentials from the sto
         try group.await(io);
         if (failure) |err| return err;
     }
+}
+
+/// Rich Chat Completions transport for adapters that can preserve the wire
+/// contract. Uses the same state, credential identity and quotas as SQL. The
+/// sink receives actual upstream chunks, never a completed-result simulation.
+fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request: lib.ChatRequest) !httpx.Response {
+    const cfg = state.cfg;
+    const http = state.http;
+    if (state.request_context) |context| try context.check();
+    try validateGenerationMessagesTokenBudget(cfg, request.messages);
+    const base = switch (state.provider) {
+        .openai => |provider| provider.base_url,
+        .remote_antfly => |provider| provider.base_url,
+        else => return error.UnsupportedInferenceFeature,
+    };
+    const url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, base, "/")});
+    defer alloc.free(url);
+    const authorization = if (state.api_key) |*key| try optionalBearerAuthHeaderOwned(state, alloc, key) else null;
+    defer if (authorization) |value| alloc.free(value);
+    var headers: [3][2][]const u8 = undefined;
+    var header_count: usize = 0;
+    if (authorization) |value| {
+        headers[header_count] = .{ "Authorization", value };
+        header_count += 1;
+    }
+    const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else @as(?u64, 120_000);
+    const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms orelse 120_000});
+    defer alloc.free(timeout_header);
+    if (cfg.provider == .antfly) {
+        headers[header_count] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
+        header_count += 1;
+        headers[header_count] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
+        header_count += 1;
+    }
+    const request_options = httpx.RequestOptions{
+        .json = request.body_json,
+        .headers = headers[0..header_count],
+        .timeout_ms = timeout_ms,
+        .cancellation = if (state.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
+        .attempt_observer = state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1)),
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
+    };
+    if (request.stream) |sink| {
+        const Writer = struct {
+            sink: lib.ChatStream,
+            pub fn startResponse(self: *@This(), response: httpx.Response) !void {
+                try self.sink.start(self.sink.context, response.status.code, response.contentType() orelse "application/json", response.header("retry-after"), response.header("x-request-id"));
+            }
+            pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+                try self.sink.write(self.sink.context, bytes);
+            }
+        };
+        var writer = Writer{ .sink = sink };
+        var response = try http.requestToWriter(.POST, url, request_options, &writer, null, null);
+        errdefer response.deinit();
+        try sink.close(sink.context);
+        return response;
+    }
+    return http.post(url, request_options);
+}
+
+test "generating remote-only default endpoint is shared with named gateway execution" {
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(a, &client, .{ .execution = .{ .default_endpoint = "http://runtime.internal:8080" } });
+    var generator = try factory.factory().create(a, .{ .provider = .antfly, .model = "configured", .url = "" });
+    defer generator.deinit();
+    const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+    try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.provider.remote_antfly.base_url);
+    try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.quotaIdentity("configured").endpoint.endpoint);
 }

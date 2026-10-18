@@ -38,6 +38,7 @@ fn operationalError(err: anyerror) anyerror {
         error.DecisionUnauthorized,
         error.DecisionUpstreamFailure,
         error.InvalidDecisionOutput,
+        error.DecisionRefused,
         => err,
         error.ResponseTooLarge, error.ProviderTokenBudgetExceeded => error.DecisionLimitExceeded,
         error.InvalidRateLimitPolicy, error.ConflictingRateLimitPolicy => error.InvalidDeciderConfig,
@@ -64,6 +65,7 @@ pub const Runtime = struct {
     secret_store: ?*secrets.FileStore = null,
     antfly_provider: ?managed.AntflyProvider = null,
     antfly_url: ?[]const u8 = null,
+    antfly_api_key: ?[]const u8 = null,
     source_table: []const u8 = "",
     rows: u64 = 0,
     input_tokens: u64 = 0,
@@ -115,13 +117,13 @@ pub const Runtime = struct {
             const a = self.arena.allocator();
             const cfg = self.cfg;
             const body = try requestBody(a, cfg, self.request);
-            const base = if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_url orelse cfg.baseUrl() else cfg.baseUrl();
+            const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try registry_mod.gateway.apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
             const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
                 .antfly => "/decisions",
                 .jev => "/v1/systemone",
                 .openai => "/decisions",
             } });
-            var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key, switch (cfg.provider) {
+            var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key orelse (if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_api_key else null), switch (cfg.provider) {
                 .antfly => "ANTFLY_INFERENCE_API_KEY",
                 .jev => "TYPESAFE_API_KEY",
                 .openai => "OPENAI_API_KEY",
@@ -549,7 +551,7 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
     try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "openai", .questions = questions }}));
     var budgeted: Runtime = .{ .registry = &registry, .http = &client, .io = io };
     try std.testing.expectError(error.DecisionLimitExceeded, budgeted.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "budgeted-openai", .questions = questions }}));
-    for ([_]anyerror{ error.InvalidDecisionOutput, error.DecisionRateLimited, error.DecisionUnauthorized, error.DecisionUpstreamFailure, error.InvalidDecisionOutput }) |expected| {
+    for ([_]anyerror{ error.DecisionRefused, error.DecisionRateLimited, error.DecisionUnauthorized, error.DecisionUpstreamFailure, error.InvalidDecisionOutput }) |expected| {
         var failing: Runtime = .{ .registry = &registry, .http = &client, .io = io };
         failure = null;
         try group.concurrent(io, Run.run, .{ &failing, alloc, questions, 1, &failure });

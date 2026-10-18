@@ -51,10 +51,11 @@ type ResolveRequest struct {
 // fallback when no configured route matches; route policy takes precedence in
 // both paths.
 type RoutingContext struct {
-	Headers      map[string]string
-	Source       VerifiedSource
-	ExplicitPool string
-	Timestamp    time.Time
+	Headers        map[string]string
+	Source         VerifiedSource
+	ExplicitPool   string
+	Timestamp      time.Time
+	pinnedEndpoint *endpointRef
 }
 
 func (c RoutingContext) routeRequest(operation OperationType, model string) *RouteRequest {
@@ -421,6 +422,15 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		return nil, endpointReservation{}, err
 	}
 	allowed := capabilityLease.endpoints
+	if pinned := routing.pinnedEndpoint; pinned != nil {
+		if allowed != nil {
+			current, ok := allowed[pinned.endpoint.address]
+			if !ok || current.endpoint != pinned.endpoint || current.incarnation != pinned.incarnation {
+				return nil, endpointReservation{}, staleCapabilityResolutionError("session endpoint no longer authorized")
+			}
+		}
+		allowed = map[string]endpointRef{pinned.endpoint.address: *pinned}
+	}
 
 	if capabilityLease.scoped {
 		var current bool

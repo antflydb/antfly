@@ -53,4 +53,38 @@ describe("transformConnectionModels", () => {
     expect(models).toHaveLength(1);
     expect(models[0]).toMatchObject({ name: "Acme Chat", source: "acme/chat" });
   });
+  it("keeps offline configured aliases and their task identities usable without claiming live availability", () => {
+    const models = transformConnectionModels([
+      {
+        id: "named-inference",
+        name: "named-inference",
+        kind: "inference",
+        status: "configured",
+        capabilities: [],
+        sources: [],
+        inference: {
+          provider: "antfly",
+          models: {
+            generators: [{ name: "chains/support" }],
+            deciders: [{ name: "deciders/triage" }],
+            synthesizers: [{ name: "synthesizers/voice" }],
+            predictors: [{ name: "predictors/risk" }],
+          },
+        },
+      },
+    ]);
+    expect(models.map((model) => model.type)).toEqual(
+      expect.arrayContaining(["generator", "decider", "synthesizer", "predictor"])
+    );
+    expect(
+      models.every(
+        (model) =>
+          model.inRegistry &&
+          model.availability === "unknown" &&
+          model.freshness === "configured" &&
+          model.sourceUrl === ""
+      )
+    ).toBe(true);
+    expect(models.find((model) => model.type === "generator")?.source).toBe("chains/support");
+  });
 });

@@ -1360,13 +1360,16 @@ func extractModelNames(r io.Reader) ([]string, error) {
 var modelCategoryOperations = map[string][]OperationType{
 	"embedders":    {"embed", "embeddings"},
 	"generators":   {"generate", "generate.batch", "chat.completions"},
+	"chains":       {"generate", "generate.batch", "chat.completions"},
 	"readers":      {"read"},
 	"rerankers":    {"rerank"},
 	"chunkers":     {"chunk"},
 	"extractors":   {"extract"},
 	"deciders":     {"decide"},
 	"rewriters":    {"rewrite"},
-	"transcribers": {"transcribe"},
+	"transcribers": {"transcribe", "dictate", "transcription.sessions"},
+	"synthesizers": {"synthesize"},
+	"predictors":   {"predict"},
 }
 
 func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, error) {
@@ -1885,6 +1888,8 @@ type Proxy struct {
 	capabilityLeases       map[string]proxyCapabilityLease
 	capabilityLeaseByID    map[[sha256.Size]byte]string
 	verifiedSource         VerifiedSourceResolver
+	sessionMu              sync.Mutex
+	sessions               map[string]proxySession
 }
 
 // VerifiedSourceResolver authenticates source-scoped routing attributes for an
@@ -2079,14 +2084,23 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
+	// Canonical runtime contract; /decide remains a compatibility alias.
+	apiMux.HandleFunc("/ai/v1/decisions", p.handleDecide)
 	apiMux.HandleFunc("/ai/v1/decide", p.handleDecide)
 	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
 	apiMux.HandleFunc("/ai/v1/transcribe", p.handleTranscribe)
+	apiMux.HandleFunc("/ai/v1/dictate", func(w http.ResponseWriter, r *http.Request) { p.proxyRequest(w, r, "dictate") })
+	apiMux.HandleFunc("/ai/v1/synthesize", func(w http.ResponseWriter, r *http.Request) { p.proxyRequest(w, r, "synthesize") })
+	apiMux.HandleFunc("/ai/v1/transcription/sessions", p.handleTranscriptionSession)
+	apiMux.HandleFunc("/ai/v1/transcription/sessions/", p.handleTranscriptionSession)
+	apiMux.HandleFunc("/ml/v1/predict", func(w http.ResponseWriter, r *http.Request) { p.proxyRequest(w, r, "predict") })
 	apiMux.HandleFunc("/ai/v1/read", p.handleRead)
 	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
 	apiMux.HandleFunc("/ai/v1/generate/batch", p.handleGenerateBatch)
 	apiMux.HandleFunc("/ai/v1/chat/completions", p.handleChatCompletions)
 	apiMux.HandleFunc("/ai/v1/models", p.handleModels)
+	apiMux.HandleFunc("/ml/v1/models", p.handlePredictors)
+	apiMux.HandleFunc("/ml/v1/predictors", p.handlePredictors)
 	apiMux.HandleFunc("/healthz", p.handleHealth)
 	apiMux.HandleFunc("/readyz", p.handleReady)
 
@@ -2257,6 +2271,14 @@ const maxConcurrentGenerateBatchPartitions = 8
 // Results and execution reports are reconstructed in stable partition/item
 // order.
 func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request) {
+	// One deadline covers admission, all partitions, and every upstream attempt.
+	ctx, cancel := inferenceRequestContext(r)
+	defer cancel()
+	r = r.WithContext(ctx)
+	if ctx.Err() != nil {
+		http.Error(w, "inference deadline exceeded", http.StatusGatewayTimeout)
+		return
+	}
 	start := time.Now()
 	routing, err := p.routingContextForRequest(r, start)
 	if err != nil {
@@ -3331,15 +3353,19 @@ type catalogTaskScope struct {
 }
 
 var catalogTaskScopes = map[string]catalogTaskScope{
-	"read":       {Operation: "read", Category: "readers"},
-	"generate":   {Operation: "generate.batch", Category: "generators"},
-	"embed":      {Operation: "embed", Category: "embedders"},
-	"rerank":     {Operation: "rerank", Category: "rerankers"},
-	"chunk":      {Operation: "chunk", Category: "chunkers"},
-	"extract":    {Operation: "extract", Category: "extractors"},
-	"decide":     {Operation: "decide", Category: "deciders"},
-	"rewrite":    {Operation: "rewrite", Category: "rewriters"},
-	"transcribe": {Operation: "transcribe", Category: "transcribers"},
+	"read":                   {Operation: "read", Category: "readers"},
+	"generate":               {Operation: "generate.batch", Category: "generators"},
+	"embed":                  {Operation: "embed", Category: "embedders"},
+	"rerank":                 {Operation: "rerank", Category: "rerankers"},
+	"chunk":                  {Operation: "chunk", Category: "chunkers"},
+	"extract":                {Operation: "extract", Category: "extractors"},
+	"decide":                 {Operation: "decide", Category: "deciders"},
+	"rewrite":                {Operation: "rewrite", Category: "rewriters"},
+	"transcribe":             {Operation: "transcribe", Category: "transcribers"},
+	"dictate":                {Operation: "dictate", Category: "transcribers"},
+	"transcription.sessions": {Operation: "transcription.sessions", Category: "transcribers"},
+	"synthesize":             {Operation: "synthesize", Category: "synthesizers"},
+	"predict":                {Operation: "predict", Category: "predictors"},
 }
 
 func catalogTaskScopeFor(raw string) (catalogTaskScope, error) {
@@ -3377,24 +3403,35 @@ func catalogTaskScopeForOperation(rawTask, rawOperation string) (catalogTaskScop
 	return scope, nil
 }
 
+func (scope catalogTaskScope) categories() []string {
+	if scope.Category == "generators" {
+		return []string{"generators", "chains"}
+	}
+	return []string{scope.Category}
+}
+
 func catalogContainsTaskModel(catalog map[string]json.RawMessage, scope catalogTaskScope, model string) bool {
-	raw, ok := catalog[scope.Category]
-	if !ok {
-		return false
+	for _, category := range scope.categories() {
+		var models map[string]json.RawMessage
+		if json.Unmarshal(catalog[category], &models) != nil {
+			continue
+		}
+		if _, ok := catalogModelDescriptor(models, category, model); ok {
+			return true
+		}
 	}
-	var models map[string]json.RawMessage
-	if json.Unmarshal(raw, &models) != nil {
-		return false
-	}
-	_, ok = catalogModelDescriptor(models, scope.Category, model)
-	return ok
+	return false
 }
 
 type modelCatalogSnapshot map[string]map[string]json.RawMessage
 
 func canonicalCatalogContainsTaskModel(catalog modelCatalogSnapshot, scope catalogTaskScope, model string) bool {
-	_, ok := catalogModelDescriptor(catalog[scope.Category], scope.Category, model)
-	return ok
+	for _, category := range scope.categories() {
+		if _, ok := catalogModelDescriptor(catalog[category], category, model); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalCatalogModel(category, model string) string {
@@ -3468,6 +3505,11 @@ func mergeCanonicalCatalogModel(
 
 	model = canonicalCatalogModel(category, model)
 	if existing, duplicate := models[model]; duplicate {
+		if category == "predictors" && !equalPredictorSchema(existing, descriptor) {
+			// Retain no callable schema for a heterogeneous pool; equal vector
+			// dimensions alone do not establish output or feature semantics.
+			descriptor = json.RawMessage(`{"unavailable":true}`)
+		}
 		replacement := conservativeModelDescriptor(existing, descriptor)
 		models[model] = replacement
 		return catalogSizeAdd(added, len(replacement)-len(existing))
@@ -3489,8 +3531,8 @@ func mergeCanonicalCatalogModel(
 }
 
 var modelCatalogCategories = []string{
-	"embedders", "generators", "readers", "rerankers", "chunkers",
-	"extractors", "deciders", "rewriters", "transcribers",
+	"embedders", "generators", "chains", "readers", "rerankers", "chunkers",
+	"extractors", "deciders", "rewriters", "transcribers", "synthesizers", "predictors",
 }
 
 // parseCanonicalModelCatalog pays JSON validation and descriptor normalization
@@ -3551,11 +3593,13 @@ func mergeCanonicalModelCatalog(target map[string]map[string]json.RawMessage, so
 }
 
 func mergeCanonicalScopedModelCatalog(target map[string]map[string]json.RawMessage, source modelCatalogSnapshot, scope catalogTaskScope, model string, modelNames map[string]bool) int {
-	descriptor, ok := catalogModelDescriptor(source[scope.Category], scope.Category, model)
-	if !ok {
-		return 0
+	added := 0
+	for _, category := range scope.categories() {
+		if descriptor, ok := catalogModelDescriptor(source[category], category, model); ok {
+			added = catalogSizeAdd(added, mergeCanonicalCatalogModel(target, category, model, descriptor, modelNames))
+		}
 	}
-	return mergeCanonicalCatalogModel(target, scope.Category, model, descriptor, modelNames)
+	return added
 }
 
 func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, modelNames map[string]bool) int {
@@ -3577,21 +3621,19 @@ func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[
 }
 
 func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, scope catalogTaskScope, model string, modelNames map[string]bool) int {
-	raw := source[scope.Category]
-	var models map[string]json.RawMessage
-	if json.Unmarshal(raw, &models) != nil {
-		return 0
+	added := 0
+	for _, category := range scope.categories() {
+		var models map[string]json.RawMessage
+		if json.Unmarshal(source[category], &models) != nil {
+			continue
+		}
+		if descriptor, ok := catalogModelDescriptor(models, category, model); ok {
+			added = catalogSizeAdd(added, mergeCatalogModel(target, category, model, descriptor, modelNames))
+		}
 	}
-	descriptor, ok := catalogModelDescriptor(models, scope.Category, model)
-	if !ok {
-		return 0
-	}
-	return mergeCatalogModel(target, scope.Category, model, descriptor, modelNames)
+	return added
 }
 
-// Capability descriptors are admission contracts, so a malformed descriptor
-// from even one eligible endpoint must poison the merged model instead of
-// being silently weakened into a plausible-looking subset.
 func sanitizeModelDescriptor(raw json.RawMessage) json.RawMessage {
 	var descriptor map[string]any
 	if json.Unmarshal(raw, &descriptor) != nil {
@@ -4302,6 +4344,9 @@ func intersectStringValues(left, right any) []string {
 }
 
 func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation string) {
+	ctx, cancel := inferenceRequestContext(r)
+	defer cancel()
+	r = r.WithContext(ctx)
 	start := time.Now()
 	routing, err := p.routingContextForRequest(r, start)
 	if err != nil {
@@ -4680,6 +4725,17 @@ func (p *Proxy) proxyRequestWithBody(w http.ResponseWriter, r *http.Request, ope
 }
 
 func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext, routingPayload []byte, replay proxyReplayBody) {
+	// Session identity is transport independent. Never accept model/placement
+	// selection from JSON or framed metadata on a pinned follow-up.
+	if pinned, ok := r.Context().Value(proxySessionContextKey{}).(proxySession); ok {
+		ref, valid := p.registry.endpointRefAtIncarnation(pinned.address, pinned.incarnation)
+		if !valid {
+			http.Error(w, "session endpoint is gone", http.StatusConflict)
+			return
+		}
+		routing.pinnedEndpoint = &ref
+		routingPayload, _ = json.Marshal(map[string]string{"model": pinned.model})
+	}
 	model, err := proxyRequestModel(routingPayload, operation)
 	if err != nil {
 		if errors.Is(err, errProxyGenerateBatchTooLarge) {
@@ -4694,6 +4750,9 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if r.URL.Path == "/ai/v1/transcription/sessions" {
+		r = r.WithContext(context.WithValue(r.Context(), proxySessionModelKey{}, model))
+	}
 	lease, err := p.acquireRequestResolution(r.Context(), OperationType(operation), model, routing)
 	if err != nil {
 		if writeResolutionError(w, err) {
@@ -4719,6 +4778,15 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 	attempts := 1
 	if matchedRoute != nil && matchedRoute.RetryAttempts > 1 {
 		attempts = int(matchedRoute.RetryAttempts)
+	}
+	if operation == "transcription.sessions" {
+		attempts = 1
+	}
+	attempts = inferenceAttemptLimit(r, attempts)
+	if attempts == 0 {
+		lease.Release()
+		http.Error(w, "inference attempt budget exhausted", http.StatusTooManyRequests)
+		return
 	}
 	spillReservation := int64(0)
 	if attempts > 1 {
@@ -4789,6 +4857,22 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 
+		if r.URL.Path == "/ai/v1/transcription/sessions" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if err := p.pinSessionResponse(r, resp, endpoint); err != nil {
+				_ = resp.Body.Close()
+				lease.RecordFailure()
+				http.Error(w, "invalid session response", http.StatusBadGateway)
+				return
+			}
+		}
+		if pinned, ok := r.Context().Value(proxySessionContextKey{}).(proxySession); ok {
+			if err := rewriteSessionResponse(resp, pinned.publicID); err != nil {
+				_ = resp.Body.Close()
+				lease.RecordFailure()
+				http.Error(w, "invalid session response", http.StatusBadGateway)
+				return
+			}
+		}
 		streamErr := copyResponse(w, resp)
 		p.registry.RecordModelLatency(endpoint.address, model, time.Since(attemptStarted))
 
@@ -5890,6 +5974,10 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 	} else {
 		attemptCtx, cancel = context.WithCancel(r.Context())
 	}
+	if err := attemptCtx.Err(); err != nil {
+		cancel()
+		return nil, err
+	}
 	responseOwnsAttempt := false
 	defer func() {
 		if !responseOwnsAttempt {
@@ -5908,6 +5996,18 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	})
+	if outReq.URL.Path == "/ai/v1/decide" {
+		outReq.URL.Path = "/ai/v1/decisions"
+		outReq.URL.RawPath = ""
+	}
+	outReq.Header.Set("X-Antfly-Inference-Attempts-Remaining", "1")
+	if deadline, ok := attemptCtx.Deadline(); ok {
+		remaining := time.Until(deadline).Milliseconds()
+		if remaining < 1 {
+			remaining = 1
+		}
+		outReq.Header.Set("X-Antfly-Inference-Timeout-Ms", strconv.FormatInt(remaining, 10))
+	}
 	outReq.Host = targetURL.Host
 	outReq.RequestURI = ""
 	body, err := replay.Open()
@@ -6089,4 +6189,28 @@ func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req 
 			}
 		}
 	}
+}
+
+func equalPredictorSchema(left, right json.RawMessage) bool {
+	var a, b map[string]json.RawMessage
+	if json.Unmarshal(left, &a) != nil || json.Unmarshal(right, &b) != nil {
+		return false
+	}
+	for _, field := range []string{"task", "num_features", "num_outputs", "feature_names", "model_identity"} {
+		var x, y any
+		if raw := a[field]; raw != nil {
+			if json.Unmarshal(raw, &x) != nil {
+				return false
+			}
+		}
+		if raw := b[field]; raw != nil {
+			if json.Unmarshal(raw, &y) != nil {
+				return false
+			}
+		}
+		if !reflect.DeepEqual(x, y) {
+			return false
+		}
+	}
+	return true
 }

@@ -1791,12 +1791,17 @@ test "standalone numeric result ABI retains native rows until response destructi
 }
 
 pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server) !void {
+    return linkedInferenceRegisterRoutesOnExcept(handle, server, &.{});
+}
+
+pub fn linkedInferenceRegisterRoutesOnExcept(handle: *anyopaque, server: *httpx.Server, excluded: []const []const u8) !void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     if (state.worker != null) {
         var entries: ?[*]const inference_bridge.RouteManifestEntry = null;
         var length: usize = 0;
         try linkedInferenceRouteManifest(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .out_entries = &entries, .out_len = &length });
         for (state.route_manifest.items) |entry| {
+            if (excludedRoute(entry.path.slice(), excluded)) continue;
             try server.routeWithData(switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
@@ -1807,7 +1812,7 @@ pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server
         }
         return;
     }
-    var registrar = DirectServer{ .owner = state, .server = server };
+    var registrar = DirectServer{ .owner = state, .server = server, .excluded = excluded };
     try state.node.registerRoutesOn(inference.server.public_api_prefix, &registrar);
     try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, &registrar);
 }
@@ -1969,11 +1974,18 @@ test "route templates match registered path-parameter patterns" {
     try std.testing.expectEqual(http_abi.RequestBodyMode.none, status.request_body);
 }
 
+fn excludedRoute(path: []const u8, excluded: []const []const u8) bool {
+    for (excluded) |entry| if (std.mem.eql(u8, path, entry)) return true;
+    return false;
+}
+
 const DirectServer = struct {
+    excluded: []const []const u8 = &.{},
     owner: *LinkedInferenceState,
     server: *httpx.Server,
 
     fn register(self: *const DirectServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        if (excludedRoute(path, self.excluded)) return;
         const route = try self.owner.alloc.create(RouteState);
         errdefer self.owner.alloc.destroy(route);
         route.* = .{ .owner = self.owner, .handler = handler };

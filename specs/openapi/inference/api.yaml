@@ -5,6 +5,37 @@ info:
   description: |
     Antfly inference is a local inference server for ONNX-based ML models.
 
+    ## Named inference gateway
+
+    Database nodes also serve a gateway at `/ai/v1` independently of local model
+    availability. Select configured targets explicitly with canonical names such
+    as `generators/support`, `deciders/triage`, `embedders/dense`, and `readers/ocr`.
+    Bare names resolve within the endpoint task; a collision with a local model
+    fails explicitly. Use `local/owner/model` for an explicit local artifact or
+    `connections/name/models/owner/model` for an Antfly runtime connection.
+
+    Named targets cover generation and chains, typed decisions, embeddings,
+    reranking, chunking, OCR, extraction, rewriting, transcription, speech
+    synthesis and traditional ML. Existing task envelopes and feature schemas
+    are preserved. OpenAI-compatible chat adapters forward tool history,
+    supported structured output, usage and genuine incremental SSE.
+
+    Backend feature declarations in `inference_capabilities` are intersected
+    with adapter support. Unknown support cannot qualify a required feature.
+    Chains validate every candidate before execution, use at most eight total
+    attempts and share one deadline/cancellation chain. Fallback requires an
+    explicit condition on the failed link and is restricted to transient
+    upstream responses. Timeouts require `on_timeout`; refusals, invalid input,
+    authentication failures and committed responses never switch models.
+    Embedding and decision cross-model failover are disabled.
+
+    Session handles are credential-bound and pinned to a physical connection.
+    Multi-replica deployments must preserve gateway/proxy affinity using the
+    returned `X-Antfly-Inference-Affinity` handle. Unknown sessions fail closed.
+    Task capabilities are independent of catalog freshness and availability;
+    offline upstreams do not remove configured aliases. Request IDs and
+    per-attempt telemetry contain target identities and actual usage only.
+
     ## What is Antfly inference
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
@@ -2525,6 +2556,9 @@ components:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
         diarization:
           type: boolean
           description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
@@ -2617,6 +2651,9 @@ components:
           type: string
           description: Force the transcript language (ISO 639-1). Omit for automatic detection.
           example: en
+        timestamps:
+          type: boolean
+          description: Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
         cleanup_model:
           type: string
           description: Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.

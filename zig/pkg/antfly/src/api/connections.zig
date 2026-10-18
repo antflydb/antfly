@@ -65,6 +65,10 @@ pub const ConnectedModel = struct {
     display_name: ?[]const u8 = null,
     dimensions: ?u32 = null,
     configured: ?bool = null,
+    /// Canonical public gateway identity, independent of physical transport.
+    id: ?[]const u8 = null,
+    availability: []const u8 = "unknown",
+    freshness: []const u8 = "cached",
 };
 
 pub const InferenceConnection = struct {
@@ -236,6 +240,23 @@ pub fn invokeInferenceConnection(
     deadline_ns: u64,
     stream: runtime_http_abi.StreamSink,
 ) !InvokeResult {
+    return invokeInferenceConnectionWithMethod(alloc, http, node_config, local_target, secret_store, connection_id, operation, body, cancellation, deadline_ns, stream, .post);
+}
+
+pub fn invokeInferenceConnectionWithMethod(
+    alloc: Allocator,
+    http: ?*httpx.Client,
+    node_config: ?*const common_config.Config,
+    local_target: ?LocalInferenceConnectionTarget,
+    secret_store: ?*common_secrets.FileStore,
+    connection_id: []const u8,
+    operation: []const u8,
+    body: []const u8,
+    cancellation: ?httpx.CancellationToken,
+    deadline_ns: u64,
+    stream: runtime_http_abi.StreamSink,
+    method: runtime_http_abi.HttpMethod,
+) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
     if (resolved == .local) {
         const target = resolved.local;
@@ -263,6 +284,7 @@ pub fn invokeInferenceConnection(
             .deadline_ns = deadline_ns,
             .stream = stream,
             .out_response = &response,
+            .method = method,
         });
         if (!status.isOk()) {
             response.deinit(&abi_alloc);
@@ -287,24 +309,57 @@ pub fn invokeInferenceConnection(
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
     defer if (prefix.ptr != base.ptr) alloc.free(prefix);
-    const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    const url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
     defer alloc.free(url);
 
     const resolved_key = try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
+    const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
+    const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms});
+    defer alloc.free(timeout_header);
     const headers = if (auth) |value| &[_][2][]const u8{
         .{ "Authorization", value },
         .{ "Content-Type", "application/json" },
-    } else &[_][2][]const u8{.{ "Content-Type", "application/json" }};
-
-    const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
-    var response = try (http orelse return error.InferenceTransportUnavailable).request(.POST, url, .{
+        .{ "X-Antfly-Inference-Attempts-Remaining", "1" },
+        .{ "X-Antfly-Inference-Timeout-Ms", timeout_header },
+    } else &[_][2][]const u8{ .{ "Content-Type", "application/json" }, .{ "X-Antfly-Inference-Attempts-Remaining", "1" }, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header } };
+    if (stream.start != null and stream.write != null and stream.close != null) {
+        var writer = @import("antfly_local_sources").common_provider_registry.tasks.StreamWriter{ .sink = stream };
+        var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .delete => .DELETE,
+            .patch => .PATCH,
+        }, url, .{
+            .headers = headers,
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        }, &writer, null, null);
+        defer response.deinit();
+        try writer.close();
+        return .{ .status = response.status.code, .body = try alloc.dupe(u8, "") };
+    }
+    var response = try (http orelse return error.InferenceTransportUnavailable).request(switch (method) {
+        .get => .GET,
+        .post => .POST,
+        .put => .PUT,
+        .delete => .DELETE,
+        .patch => .PATCH,
+    }, url, .{
         .headers = headers,
         .body = body,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
     });
     defer response.deinit();
     const response_body = try alloc.dupe(u8, response.body orelse "");
@@ -349,6 +404,22 @@ fn resolveInferenceConnection(
     }
 
     const config = node_config orelse return error.ConnectionNotFound;
+    if (std.mem.startsWith(u8, connection_id, "transcribers/")) {
+        const cfg = config.transcribers.getConfig(connection_id["transcribers/".len..]) catch return error.ConnectionNotFound;
+        if (cfg.provider != .antfly) return error.ProviderNotAntflyCompatible;
+        // Preserve the alias identity even when it inherits the runtime URL.
+        // Only the actual process-local target delegates admission locally.
+        const uses_default = cfg.resolvedUrl() == null;
+        if (uses_default) if (local_target) |target| return .{ .local = target };
+        const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
+        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+        return .{ .remote = .{ .url = url, .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null) } };
+    }
+    if (std.mem.eql(u8, connection_id, common_config.default_inference_connection_id)) {
+        const url = config.inference.api_url orelse return error.ConnectionNotFound;
+        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+        return .{ .remote = .{ .url = url, .api_key = config.inference.api_key } };
+    }
     const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
     if (connection.kind != .inference) return error.ConnectionNotInference;
     try requireInferenceCapability(connection.capabilities, required_capability);
@@ -369,8 +440,13 @@ fn resolveInferenceConnection(
 }
 
 fn inferenceCapability(operation: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, operation, "transcription/sessions")) return "models.transcribe";
+    if (std.mem.startsWith(u8, operation, "ml/")) return "models.predict";
     inline for (&.{
         .{ "embed", "models.embed" },
+        .{ "embeddings", "models.embed" },
+        .{ "chat/completions", "models.generate" },
+        .{ "decisions", "models.decide" },
         .{ "generate", "models.generate" },
         .{ "rerank", "models.rerank" },
         .{ "chunk", "models.chunk" },
@@ -378,6 +454,9 @@ fn inferenceCapability(operation: []const u8) ?[]const u8 {
         .{ "rewrite", "models.rewrite" },
         .{ "read", "models.read" },
         .{ "transcribe", "models.transcribe" },
+        .{ "dictate", "models.transcribe" },
+        .{ "synthesize", "models.synthesize" },
+        .{ "predict", "models.predict" },
     }) |mapping| {
         if (std.mem.eql(u8, operation, mapping[0])) return mapping[1];
     }
@@ -392,7 +471,7 @@ fn resolveInferenceApiKey(
     return if (raw) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
 }
 
-fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
+pub fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
     if (!containsString(capabilities, required)) return error.ConnectionCapabilityMissing;
 }
 
@@ -660,6 +739,34 @@ pub fn buildConnectionsResponse(
         }
     }
 
+    if (kinds.contains(.inference)) if (sources.node_config) |config| {
+        const registry = @import("antfly_local_sources").common_provider_registry;
+        const view = registry.gateway.View{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
+        const targets = try view.catalog(arena);
+        if (targets.len > 0) {
+            var models = std.json.ArrayHashMap([]const ConnectedModel){};
+            if (opts.include_models) {
+                inline for (std.meta.tags(registry.gateway.Task)) |task| {
+                    var items: std.ArrayList(ConnectedModel) = .empty;
+                    for (targets) |target| {
+                        if (target.configured.task != task) continue;
+                        const id = try target.idAlloc(arena);
+                        try items.append(arena, .{ .name = id, .id = id, .display_name = target.configured.name, .configured = true, .freshness = "configured" });
+                    }
+                    if (items.items.len > 0) try models.map.put(arena, task.namespace(), items.items);
+                }
+            }
+            try connections.append(arena, .{
+                .id = "named-inference",
+                .name = "named-inference",
+                .display_name = "Configured inference",
+                .kind = .inference,
+                .status = .configured,
+                .sources = &.{"config:registry"},
+                .inference = .{ .provider = .antfly, .models = if (opts.include_models) models else null },
+            });
+        }
+    };
     return .{ .connections = connections.items };
 }
 
@@ -808,7 +915,7 @@ fn appendConfiguredInferenceConnection(
         .sources = try sourcesSlice(arena, "config:connections/{s}", id),
         .inference = .{
             .provider = provider,
-            .url = inference_cfg.url,
+            .url = null,
             .region = inference_cfg.region,
             .project_id = inference_cfg.project_id,
             .location = inference_cfg.location,

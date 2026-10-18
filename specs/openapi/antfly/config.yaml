@@ -6,6 +6,44 @@ info:
 
 components:
   schemas:
+    InferenceTaskCapabilities:
+      type: object
+      additionalProperties: false
+      properties:
+        streaming:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        tools:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        structured_output:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        images:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+        audio:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
+    RuntimeTaskBinding:
+      type: object
+      additionalProperties: false
+      required: [model]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: Backend model identity, including any owner prefix.
+        connection:
+          type: string
+          minLength: 1
+          default: local-inference
+          description: Existing inference connection identity; credentials remain on the connection.
     DeciderConfig:
       type: object
       additionalProperties: false
@@ -506,6 +544,26 @@ components:
               - generator_config:
                   provider: openai
                   model: gpt-4.1
+        inference_capabilities:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/InferenceTaskCapabilities"
+          description: Backend capability declarations keyed by canonical target ID. Unknown support never qualifies a feature; declarations are intersected with the adapter contract.
+        predictors:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RuntimeTaskBinding"
+          description: Named traditional ML predictors bound to an inference connection, preserving its feature schema.
+        extractors:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RuntimeTaskBinding"
+          description: Named extraction targets served by existing inference connections.
+        rewriters:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RuntimeTaskBinding"
+          description: Named rewriting targets served by existing inference connections.
         deciders:
           type: object
           additionalProperties:

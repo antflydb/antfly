@@ -805,6 +805,8 @@ pub const DictateRequest = struct {
     audio: []const u8,
     /// Force the transcript language (ISO 639-1). Omit for automatic detection.
     language: ?[]const u8 = null,
+    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+    timestamps: ?bool = null,
     /// Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
     cleanup_model: ?[]const u8 = null,
     style: ?DictationStyle = null,
@@ -828,6 +830,7 @@ pub const DictateRequest = struct {
         .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
+        .{ "timestamps", "timestamps", true },
         .{ "cleanup_model", "cleanup_model", true },
         .{ "style", "style", true },
         .{ "dictionary", "dictionary", true },
@@ -856,6 +859,10 @@ pub const DictateRequest = struct {
         try jw.write(self.audio);
         if (self.language) |value| {
             try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
             try jw.write(value);
         }
         if (self.cleanup_model) |value| {
@@ -3913,6 +3920,8 @@ pub const TranscribeRequest = struct {
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
     language: ?[]const u8 = null,
+    /// Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate).
+    timestamps: ?bool = null,
     /// Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
     diarization: ?bool = null,
 
@@ -3921,6 +3930,7 @@ pub const TranscribeRequest = struct {
         .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
+        .{ "timestamps", "timestamps", true },
         .{ "diarization", "diarization", true },
     };
 
@@ -3940,6 +3950,10 @@ pub const TranscribeRequest = struct {
         try jw.write(self.audio);
         if (self.language) |value| {
             try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
             try jw.write(value);
         }
         if (self.diarization) |value| {

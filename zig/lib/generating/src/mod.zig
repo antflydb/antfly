@@ -409,7 +409,7 @@ pub const RetryConfig = struct {
     pub fn validate(self: RetryConfig) !void {
         if (self.max_attempts == 0) return error.InvalidRetryConfig;
         if (self.initial_backoff_ms == 0 and self.max_attempts > 1) return error.InvalidRetryConfig;
-        if (self.backoff_multiplier < 1.0) return error.InvalidRetryConfig;
+        if (!std.math.isFinite(self.backoff_multiplier) or self.backoff_multiplier < 1.0) return error.InvalidRetryConfig;
         if (self.max_backoff_ms < self.initial_backoff_ms) return error.InvalidRetryConfig;
     }
 };
@@ -622,6 +622,34 @@ pub fn getDefaultChain(alloc: std.mem.Allocator) ![]ChainLink {
     return try cloneChainAlloc(alloc, chain);
 }
 
+/// Rich generation retains the validated wire options and genuine stream
+/// callbacks. Completed-only adapters leave this entrypoint absent explicitly.
+pub const ChatRequest = struct {
+    messages: []const ChatMessage,
+    body_json: []const u8,
+    stream: ?ChatStream = null,
+};
+pub const ChatStream = struct {
+    context: *anyopaque,
+    start: *const fn (*anyopaque, u16, []const u8, ?[]const u8, ?[]const u8) anyerror!void,
+    write: *const fn (*anyopaque, []const u8) anyerror!void,
+    close: *const fn (*anyopaque) anyerror!void,
+};
+pub const ChatResponse = struct {
+    allocator: std.mem.Allocator,
+    status: u16,
+    body: []u8,
+    content_type: ?[]u8 = null,
+    retry_after: ?[]u8 = null,
+    request_id: ?[]u8 = null,
+    pub fn deinit(self: *ChatResponse) void {
+        self.allocator.free(self.body);
+        if (self.content_type) |value| self.allocator.free(value);
+        if (self.retry_after) |value| self.allocator.free(value);
+        if (self.request_id) |value| self.allocator.free(value);
+    }
+};
+
 pub const Generator = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -629,7 +657,12 @@ pub const Generator = struct {
     pub const VTable = struct {
         generate: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) anyerror!GenerateResult,
         deinit: ?*const fn (ptr: *anyopaque) void = null,
+        chat: ?*const fn (*anyopaque, std.mem.Allocator, ChatRequest) anyerror!ChatResponse = null,
     };
+
+    pub fn chat(self: Generator, alloc: std.mem.Allocator, request: ChatRequest) !ChatResponse {
+        return (self.vtable.chat orelse return error.UnsupportedInferenceFeature)(self.ptr, alloc, request);
+    }
 
     pub fn generate(self: Generator, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         return try self.vtable.generate(self.ptr, alloc, model, messages);
@@ -659,7 +692,7 @@ pub fn executeChain(
     factory: GeneratorFactory,
     messages: []const ChatMessage,
 ) !GenerateResult {
-    return executeChainInternal(alloc, null, chain, factory, messages);
+    return executeChainInternal(alloc, null, chain, factory, messages, .{});
 }
 
 /// Executes retry backoff through a caller-owned runtime. Production and VOPR
@@ -672,7 +705,19 @@ pub fn executeChainWithIo(
     factory: GeneratorFactory,
     messages: []const ChatMessage,
 ) !GenerateResult {
-    return executeChainInternal(alloc, io, chain, factory, messages);
+    return executeChainInternal(alloc, io, chain, factory, messages, .{});
+}
+
+pub const ChainControl = struct {
+    context: ?*const anyopaque = null,
+    check_fn: ?*const fn (*const anyopaque) anyerror!void = null,
+    pub fn check(self: ChainControl) !void {
+        if (self.check_fn) |callback| try callback(self.context.?);
+    }
+};
+
+pub fn executeChainWithControl(alloc: std.mem.Allocator, io: std.Io, chain: []const ChainLink, factory: GeneratorFactory, messages: []const ChatMessage, control: ChainControl) !GenerateResult {
+    return executeChainInternal(alloc, io, chain, factory, messages, control);
 }
 
 fn executeChainInternal(
@@ -681,23 +726,26 @@ fn executeChainInternal(
     chain: []const ChainLink,
     factory: GeneratorFactory,
     messages: []const ChatMessage,
+    control: ChainControl,
 ) !GenerateResult {
-    if (chain.len == 0) return error.EmptyGeneratorChain;
+    if (chain.len == 0 or chain.len > 8) return error.EmptyGeneratorChain;
+    for (chain) |link| try link.validate();
+    var remaining: u8 = 8;
     for (chain) |link| if (link.generator.provider == .chatgpt and (chain.len != 1 or link.retry != null)) return error.ChatGPTBillingFallbackForbidden;
 
     var last_err: anyerror = error.EmptyGeneratorChain;
     for (chain, 0..) |link, i| {
-        try link.validate();
+        try control.check();
         var generator = factory.create(alloc, link.generator) catch |err| {
             last_err = err;
-            if (i + 1 < chain.len and shouldTryNext(link.condition orelse .on_error, err)) continue;
+            if (i + 1 < chain.len and fallbackAllowed(link.condition, err)) continue;
             return err;
         };
         defer generator.deinit();
 
-        const result = executeWithRetry(alloc, io, generator, link.generator.model, messages, link.retry) catch |err| {
+        const result = executeWithRetry(alloc, io, generator, link.generator.model, messages, link.retry, link.condition, &remaining, control) catch |err| {
             last_err = err;
-            if (i + 1 < chain.len and shouldTryNext(link.condition orelse .on_error, err)) continue;
+            if (i + 1 < chain.len and fallbackAllowed(link.condition, err)) continue;
             return err;
         };
         return result;
@@ -712,20 +760,29 @@ fn executeWithRetry(
     model: []const u8,
     messages: []const ChatMessage,
     retry_cfg: ?RetryConfig,
+    condition: ?ChainCondition,
+    remaining: *u8,
+    control: ChainControl,
 ) !GenerateResult {
-    const retry = retry_cfg orelse return try generator.generate(alloc, model, messages);
+    const retry = retry_cfg orelse RetryConfig{};
     try retry.validate();
 
     var attempt: u32 = 0;
     var backoff_ms = retry.initial_backoff_ms;
     while (true) : (attempt += 1) {
+        try control.check();
+        if (remaining.* == 0) return error.AttemptLimitExceeded;
+        remaining.* -= 1;
         const result = generator.generate(alloc, model, messages) catch |err| {
-            if (attempt + 1 >= retry.max_attempts) return err;
+            if (attempt + 1 >= retry.max_attempts or !(fallbackAllowed(.on_error, err) or (condition == .on_timeout and isTimeoutError(err)))) return err;
             if (backoff_ms > 0) {
-                if (io) |runtime_io|
-                    try runtime_io.sleep(.fromMilliseconds(backoff_ms), .awake)
-                else
-                    sleepMs(backoff_ms);
+                var wait_ms = backoff_ms;
+                while (wait_ms > 0) {
+                    try control.check();
+                    const slice_ms = @min(@as(u32, 50), wait_ms);
+                    if (io) |runtime_io| try runtime_io.sleep(.fromMilliseconds(slice_ms), .awake) else sleepMs(slice_ms);
+                    wait_ms -= slice_ms;
+                }
             }
             backoff_ms = if (backoff_ms == 0)
                 retry.max_backoff_ms
@@ -755,12 +812,14 @@ fn sleepMs(ms: u32) void {
     }
 }
 
-fn shouldTryNext(condition: ChainCondition, err: anyerror) bool {
-    return switch (condition) {
-        .always => true,
-        .on_error => true,
+pub fn fallbackAllowed(condition: ?ChainCondition, err: anyerror) bool {
+    const policy = condition orelse return false;
+    const rate_limited = isRateLimitError(err) or err == error.InferenceUpstreamRateLimited;
+    const unavailable = err == error.ServiceUnavailable or err == error.InferenceUpstreamUnavailable;
+    return switch (policy) {
+        .always, .on_error => rate_limited or unavailable,
         .on_timeout => isTimeoutError(err),
-        .on_rate_limit => isRateLimitError(err),
+        .on_rate_limit => rate_limited,
     };
 }
 
@@ -1011,6 +1070,7 @@ test "executeChain falls back on timeout and retries within a link" {
     const retry_chain = [_]ChainLink{
         .{
             .generator = GeneratorConfig.fromOpenAI(.{ .model = "gpt-4.1" }),
+            .condition = .on_timeout,
             .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 1 },
         },
     };

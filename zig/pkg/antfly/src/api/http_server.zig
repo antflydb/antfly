@@ -3956,6 +3956,7 @@ pub const ApiHttpServer = struct {
     backup_cohort_recovery_cursor_len: usize = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
+    inference_sessions: @import("antfly_local_sources").common_provider_registry.gateway.Sessions = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -4715,6 +4716,7 @@ pub const ApiHttpServer = struct {
             registry.deinit(self.owner_alloc);
             self.owner_alloc.destroy(registry);
         }
+        self.inference_sessions.deinit(self.owner_alloc);
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
@@ -27244,6 +27246,14 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
+    // Public gateway execution uses the same inference authority as physical
+    // connection invocation. Inventory is read-only; sessions require write
+    // authority even for GET event streams or status requests.
+    if (@import("inference_gateway.zig").ownsPath(path)) return .{
+        .resource_type = .inference,
+        .resource = "*",
+        .permission_type = if (@import("inference_gateway.zig").isDiscoveryPath(path)) .read else .write,
+    };
     if (method == .POST and routes.Routes.matchInferenceConnectionInvocation(path) != null) return .{
         .resource_type = .inference,
         .resource = "*",

@@ -8755,7 +8755,8 @@ pub const Node = struct {
         else
             return error.InvalidWhisperDecoderConfig;
         var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
-        const forced_ids = try prompt_cache.resolve(&prompt_scratch, request.language);
+        const timestamps = request.timestamps orelse false;
+        const forced_ids = try prompt_cache.resolveWithTimestamps(&prompt_scratch, request.language, timestamps);
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
             model.session,
@@ -8771,6 +8772,8 @@ pub const Node = struct {
                 .forced_decoder_ids = forced_ids,
                 .max_decode_working_bytes = audio_admission.max_decode_working_bytes,
                 .language_tokens = prompt_cache.language_tokens,
+                .no_timestamps_id = prompt_cache.no_timestamps_id,
+                .timestamps = timestamps,
             },
         );
         pipeline.execution_control = control;
@@ -17777,7 +17780,7 @@ pub const Node = struct {
             execution_control,
             &stage,
         ) catch |err| return whisperRuntimeFailureResponse(ctx, stage, err);
-        var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, false, .full) catch |err|
+        var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, body.timestamps orelse false, .full) catch |err|
             return whisperRuntimeFailureResponse(ctx, .language, err);
         var result = long_transcription.transcribeLong(
             ctx.allocator,
@@ -18292,7 +18295,7 @@ pub const Node = struct {
                 execution_control,
                 &stage,
             ) catch |err| return whisperRuntimeFailureResponse(ctx, stage, err);
-            var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, true, audioContextFromRequest(body.audio_context, .full)) catch |err|
+            var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, body.timestamps orelse true, audioContextFromRequest(body.audio_context, .full)) catch |err|
                 return whisperRuntimeFailureResponse(ctx, .language, err);
             break :blk long_transcription.transcribeLong(
                 ctx.allocator,
@@ -20414,7 +20417,27 @@ pub const Node = struct {
         try buf.appendSlice(a, openai_data.items);
         try buf.appendSlice(a, "],");
         try buf.appendSlice(a, body.items);
-        try buf.append(a, '}');
+        // Keep ML schemas in their own group while allowing task-aware pool
+        // discovery to find predictors through the same bounded catalog.
+        _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
+        const predictors = try self.tabular_registry.list(a);
+        defer a.free(predictors);
+        try buf.appendSlice(a, ",\"predictors\":{");
+        for (predictors, 0..) |info, index| {
+            if (index > 0) try buf.append(a, ',');
+            try jsonEncodeString(&buf, a, info.name);
+            try buf.append(a, ':');
+            const encoded = try std.json.Stringify.valueAlloc(a, api.PredictorInfo{
+                .task = predictorTaskFromTabular(info.task),
+                .num_features = @intCast(info.num_features),
+                .num_outputs = @intCast(info.num_outputs),
+                .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
+                .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
+            }, .{});
+            defer a.free(encoded);
+            try buf.appendSlice(a, encoded);
+        }
+        try buf.appendSlice(a, "}}");
 
         return try buf.toOwnedSlice(a);
     }

@@ -9,7 +9,10 @@ export type ModelType =
   | "rewriter"
   | "generator"
   | "reader"
-  | "transcriber";
+  | "transcriber"
+  | "decider"
+  | "synthesizer"
+  | "predictor";
 
 export type ExtractorCapability = "labels" | "zeroshot" | "relations" | "answers";
 
@@ -159,6 +162,8 @@ export interface InferenceModel {
   architecture?: string;
   size?: string;
   inRegistry: boolean;
+  availability?: string;
+  freshness?: string;
 }
 
 export interface ModelTypeInfo {
@@ -263,6 +268,27 @@ export interface ModelTypeDetail {
 }
 
 export const MODEL_TYPE_DETAILS: Record<ModelType, ModelTypeDetail> = {
+  decider: {
+    type: "decider",
+    tagline: "Evaluate typed decisions",
+    description: "Evaluate predicates and selections with explicit probability or score semantics.",
+    useCases: [],
+    pipelineNote: "Uses the configured inference gateway target.",
+  },
+  synthesizer: {
+    type: "synthesizer",
+    tagline: "Convert text into speech",
+    description: "Synthesize audio with a named voice and provider.",
+    useCases: [],
+    pipelineNote: "Uses the configured inference gateway target.",
+  },
+  predictor: {
+    type: "predictor",
+    tagline: "Run feature-based predictions",
+    description: "Predict using the model feature schema.",
+    useCases: [],
+    pipelineNote: "Uses the configured inference gateway target.",
+  },
   embedder: {
     type: "embedder",
     tagline: "Convert text into dense vector representations",

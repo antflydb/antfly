@@ -101,6 +101,7 @@ pub const Inputs = struct {
 };
 
 pub const Config = struct {
+    sparse: ?bool = null,
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     model: []const u8 = "",
@@ -129,6 +130,7 @@ pub const Config = struct {
     pub fn clone(self: Config, alloc: Allocator) !Config {
         return .{
             .rate_limit = self.rate_limit,
+            .sparse = self.sparse,
             .provider = self.provider,
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
             .model_identity = if (self.model_identity.len > 0) try alloc.dupe(u8, self.model_identity) else "",
@@ -258,6 +260,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
     );
     var cfg = Config{
         .rate_limit = generated.rate_limit,
+        .sparse = generated.sparse,
         .provider = std.meta.stringToEnum(Provider, provider_name) orelse return error.InvalidEmbedderConfig,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .model_identity = if (generated.model_identity) |identity| try alloc.dupe(u8, identity) else "",
@@ -301,6 +304,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
 pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
     return .{
         .rate_limit = cfg.rate_limit,
+        .sparse = cfg.sparse,
         .provider = @tagName(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .request_format = if (cfg.request_format.len > 0) cfg.request_format else null,

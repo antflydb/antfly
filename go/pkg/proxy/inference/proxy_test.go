@@ -6084,3 +6084,97 @@ func (r *errReadCloser) Read(p []byte) (int, error) {
 func (r *errReadCloser) Close() error {
 	return r.closeErr
 }
+
+func TestDecisionCanonicalAndLegacyPathsUseSameScopedOperation(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"/ai/v1/decisions", "/ai/v1/decide"} {
+		t.Run(path, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/ai/v1/decisions" {
+					t.Fatalf("upstream path = %q", req.URL.Path)
+				}
+				if req.Header.Get("Authorization") != "Bearer tenant-key" {
+					t.Fatal("credential scope lost")
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"answers":[]}`)), Request: req}, nil
+			})}
+			p.RegisterEndpoint("http://inference.internal", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://inference.internal", "decide", "triage")
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"triage","input":"hello","questions":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer tenant-key")
+			recorder := httptest.NewRecorder()
+			p.handleDecide(recorder, req)
+			if recorder.Code != 200 {
+				t.Fatalf("status %d: %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestChainCatalogSupportsScopedLeasesAndExecution(t *testing.T) {
+	const catalog = `{"data":[{"id":"chains/fallback"}],"chains":{"chains/fallback":{"task":"generate","executor":"chain"}},"generators":{"unrelated":{}},"readers":{"unrelated-reader":{}}}`
+	operations, err := extractModelOperations(strings.NewReader(catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []OperationType{"generate", "generate.batch", "chat.completions"} {
+		if !operations["chains/fallback"][operation] {
+			t.Fatalf("chain missing operation %s: %#v", operation, operations)
+		}
+	}
+	snapshot, _, err := parseCanonicalModelCatalog([]byte(catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := catalogTaskScopeForOperation("generate", "chat.completions")
+	if err != nil || !canonicalCatalogContainsTaskModel(snapshot, scope, "chains/fallback") {
+		t.Fatalf("chain missing from canonical scoped catalog: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(catalog), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if !catalogContainsTaskModel(raw, scope, "chains/fallback") || catalogContainsTaskModel(raw, catalogTaskScopes["read"], "chains/fallback") {
+		t.Fatal("chain task qualification changed")
+	}
+	merged := make(map[string]map[string]json.RawMessage)
+	mergeScopedModelCatalog(merged, raw, scope, "chains/fallback", make(map[string]bool))
+	if len(merged) != 1 || len(merged["chains"]) != 1 {
+		t.Fatalf("scoped catalog contains unrelated targets: %#v", merged)
+	}
+
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
+	var invocations atomic.Int32
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := catalog
+		if req.Method == http.MethodPost {
+			invocations.Add(1)
+			if req.URL.Path != "/ai/v1/chat/completions" {
+				t.Errorf("unexpected execution path: %s", req.URL.Path)
+			}
+			body = `{"choices":[{"message":{"content":"ok"}}]}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+	p.RegisterEndpoint("http://runtime.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://runtime.internal", operations)
+	listed := httptest.NewRecorder()
+	p.handleModels(listed, httptest.NewRequest(http.MethodGet, "/ai/v1/models?task=generate&operation=chat.completions&model=chains%2Ffallback", nil))
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"chains/fallback"`) || strings.Contains(listed.Body.String(), `"unrelated"`) {
+		t.Fatalf("scoped discovery: %d %s", listed.Code, listed.Body.String())
+	}
+	if listed.Header().Get(capabilityTokenHeader) == "" {
+		t.Fatal("scoped chain discovery did not issue a lease")
+	}
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/chat/completions", strings.NewReader(`{"model":"chains/fallback","messages":[{"role":"user","content":"hello"}]}`))
+	for _, header := range []string{capabilityTokenHeader, capabilityRevisionHeader} {
+		request.Header.Set(header, listed.Header().Get(header))
+	}
+	response := httptest.NewRecorder()
+	p.handleChatCompletions(response, request)
+	if response.Code != http.StatusOK || invocations.Load() != 1 {
+		t.Fatalf("leased chain execution: %d %s (%d invocations)", response.Code, response.Body.String(), invocations.Load())
+	}
+}

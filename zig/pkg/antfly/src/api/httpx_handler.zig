@@ -87,6 +87,7 @@ const research_jobs = @import("research_jobs.zig");
 const web_search = @import("web_search.zig");
 const web_fetch = @import("web_fetch.zig");
 const scraping = @import("antfly_scraping");
+const inference_gateway = @import("inference_gateway.zig");
 const generating_runtime = @import("antfly_local_sources").generating_mod;
 const query_api = @import("antfly_local_sources").api_query;
 const query_contract = @import("antfly_local_sources").api_query_contract;
@@ -1316,6 +1317,31 @@ pub const AntflyApiHandler = struct {
         include_contextual: bool,
         include_probes: bool,
     ) !void {
+        try root_server.get("/ai/v1/models", httpx.Handler.bind(self, gatewayModels));
+        try root_server.postResponseStreaming("/ai/v1/chat/completions", httpx.Handler.bind(self, gatewayChat));
+        try root_server.postResponseStreaming("/ai/v1/embeddings", httpx.Handler.bind(self, gatewayEmbeddings));
+        try root_server.postResponseStreaming("/ai/v1/decisions", httpx.Handler.bind(self, gatewayDecisions));
+        try root_server.postResponseStreaming("/ai/v1/read", httpx.Handler.bind(self, gatewayRead));
+        try root_server.postResponseStreaming("/ai/v1/extract", httpx.Handler.bind(self, gatewayExtract));
+        try root_server.postResponseStreaming("/ai/v1/rewrite", httpx.Handler.bind(self, gatewayRewrite));
+        try root_server.postResponseStreaming("/ai/v1/transcribe", httpx.Handler.bind(self, gatewayTranscribe));
+        try root_server.postResponseStreaming("/ai/v1/synthesize", httpx.Handler.bind(self, gatewaySynthesize));
+        try root_server.postResponseStreaming("/ai/v1/rerank", httpx.Handler.bind(self, gatewayRerank));
+        try root_server.postResponseStreaming("/ai/v1/chunk", httpx.Handler.bind(self, gatewayChunk));
+        try root_server.postResponseStreaming("/ml/v1/predict", httpx.Handler.bind(self, gatewayPredict));
+        try root_server.postResponseStreaming("/ai/v1/dictate", httpx.Handler.bind(self, gatewayDictate));
+        try root_server.postResponseStreaming("/ai/v1/embed", httpx.Handler.bind(self, gatewayEmbed));
+        try root_server.postResponseStreaming("/ai/v1/generate", httpx.Handler.bind(self, gatewayGenerate));
+        try root_server.postResponseStreaming("/ai/v1/generate/batch", httpx.Handler.bind(self, gatewayBatch));
+        try root_server.get("/ml/v1/models", httpx.Handler.bind(self, gatewayModels));
+        try root_server.get("/ml/v1/predictors", httpx.Handler.bind(self, gatewayModels));
+        try root_server.postResponseStreaming("/ai/v1/transcription/sessions", httpx.Handler.bind(self, gatewaySessionCreate));
+        try root_server.get("/ai/v1/transcription/sessions/:session_id", httpx.Handler.bind(self, gatewaySessionGet));
+        try root_server.delete("/ai/v1/transcription/sessions/:session_id", httpx.Handler.bind(self, gatewaySessionDelete));
+        try root_server.postResponseStreaming("/ai/v1/transcription/sessions/:session_id/audio", httpx.Handler.bind(self, gatewaySessionAudio));
+        try root_server.get("/ai/v1/transcription/sessions/:session_id/events", httpx.Handler.bind(self, gatewaySessionEvents));
+        try root_server.postResponseStreaming("/ai/v1/transcription/sessions/:session_id/stream", httpx.Handler.bind(self, gatewaySessionStream));
+
         const metadata_router = metadata_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try metadata_router.register(public_server);
         try public_server.get("/tables/:table_name/sources/managed", httpx.Handler.bind(self, managedSourceStatus));
@@ -4108,10 +4134,134 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn gatewayModels(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, null);
+    }
+    fn gatewayChat(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequestOperation(ctx, .generate, "chat/completions");
+    }
+    fn gatewayGenerate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequestOperation(ctx, .generate, "generate");
+    }
+    fn gatewayEmbed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequestOperation(ctx, .embed, "embed");
+    }
+    fn gatewayDictate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequestOperation(ctx, .transcribe, "dictate");
+    }
+    fn gatewayEmbeddings(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .embed);
+    }
+    fn gatewayDecisions(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .decide);
+    }
+    fn gatewayExtract(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .extract);
+    }
+    fn gatewayRewrite(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .rewrite);
+    }
+    fn gatewayRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .read);
+    }
+    fn gatewayTranscribe(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .transcribe);
+    }
+    fn gatewaySynthesize(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .synthesize);
+    }
+    fn gatewayRerank(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .rerank);
+    }
+    fn gatewayChunk(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .chunk);
+    }
+    fn gatewayPredict(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewayRequest(ctx, .predict);
+    }
+    fn gatewaySessionCreate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewaySessionRequest(ctx, .post, "");
+    }
+    fn gatewaySessionGet(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewaySessionRequest(ctx, .get, "");
+    }
+    fn gatewaySessionDelete(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewaySessionRequest(ctx, .delete, "");
+    }
+    fn gatewaySessionAudio(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewaySessionRequest(ctx, .post, "/audio");
+    }
+    fn gatewaySessionEvents(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewaySessionRequest(ctx, .get, "/events");
+    }
+    fn gatewaySessionStream(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.gatewaySessionRequest(ctx, .post, "/stream");
+    }
+    fn gatewaySessionRequest(self: *AntflyApiHandler, ctx: *httpx.Context, method: @import("antfly_runtime_abi").http_abi.HttpMethod, action: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const response = blk: {
+            inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
+            break :blk inference_gateway.session(self.api_server, ctx, if (identity) |value| value.credential_principal else "anonymous", method, action);
+        };
+        return response catch |err| gatewayFailure(ctx, err);
+    }
+
+    fn gatewayBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const response = blk: {
+            inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
+            break :blk inference_gateway.batch(self.api_server, ctx);
+        };
+        return response catch |err| gatewayFailure(ctx, err);
+    }
+
+    fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task) !httpx.Response {
+        return self.gatewayRequestOperation(ctx, task, null);
+    }
+
+    fn gatewayRequestOperation(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task, operation: ?[]const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const response = blk: {
+            inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
+            break :blk if (task) |selected| inference_gateway.executeOperation(self.api_server, ctx, selected, operation) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
+        };
+        return response catch |err| gatewayFailure(ctx, err);
+    }
+    fn gatewayFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (ctx.h1_stream_sent or ctx.h2_stream_sent or err == error.InferenceResponseCommitted) return err;
+        // Stream errors propagate through the boundary once committed.
+        const status: u16 = switch (err) {
+            error.InferenceRequestTooLarge => 413,
+            error.ConnectionCapabilityMissing => 403,
+            error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
+            error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.AttemptLimitExceeded => 429,
+            error.InferenceUpstreamUnavailable => 503,
+            error.DecisionRefused => 422,
+            error.Timeout => 504,
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.UnknownField, error.MissingField, error.InvalidGeneratorConfig, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.SyntaxError, error.UnexpectedToken => 400,
+            else => 502,
+        };
+        _ = ctx.status(status);
+        if (status == 429 or status == 503) try ctx.setHeader("retry-after", "1");
+        return ctx.json(.{ .@"error" = .{ .message = @errorName(err), .type = if (status == 400) "invalid_request_error" else if (err == error.DecisionRefused) "refusal_error" else "inference_error", .code = @errorName(err) } });
+    }
+
     pub fn invokeInferenceConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (std.mem.eql(u8, connection_id, common_config.named_inference_connection_id)) {
+            const task = inference_gateway.taskForOperation(operation) orelse return gatewayFailure(ctx, error.UnsupportedInferenceFeature);
+            inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
+            return inference_gateway.executeOperation(self.api_server, ctx, task, operation) catch |err| gatewayFailure(ctx, err);
+        }
         comptime std.debug.assert(request_admission_policy.publicOperationClass("invokeInferenceConnection").? == .inference);
         const admission_owner = self.api_server.inferenceConnectionAdmissionOwner(connection_id, operation) catch |err| switch (err) {
             error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
@@ -12260,7 +12410,7 @@ test "httpx inference connection propagates failures after stream commit" {
 
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/local-inference/inference/generate");
     defer request.deinit();
-    request.body = "{\"stream\":true}";
+    request.body = "{\"stream_options\":{}}";
     var ctx = httpx.Context.init(alloc, std.testing.io, &request);
     defer ctx.deinit();
     var stream = Stream{};
@@ -15922,4 +16072,368 @@ test "httpx retrieval read failures preserve retryable JSON and conflict status"
         try std.testing.expectEqual(@as(u32, 1000), parsed.value.retry_after_ms);
         try std.testing.expect(try AntflyApiHandler.respondRetrievalReadError(&ctx, error.InvalidRetrievalAgentRequest) == null);
     }
+}
+
+test "httpx inference gateway remote-only discovery and explicit qualification" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var config = try common_config.Config.parseFromSlice(alloc,
+        \\{"inference":{"api_url":"http://127.0.0.1:9"},"generators":{"support":{"provider":"openai","model":"backend-model","api_key":"never-expose","url":"https://example.com/v1"}}}
+    );
+    defer config.deinit();
+    var api_server = ApiHttpServer.init(alloc, .{ .node_config = &config }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var list = try httpx.Request.init(alloc, .GET, "http://localhost/ai/v1/models");
+    defer list.deinit();
+    var list_ctx = httpx.Context.init(alloc, std.testing.io, &list);
+    defer list_ctx.deinit();
+    var catalog = try handler.gatewayModels(&list_ctx);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(u16, 200), catalog.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body.?, "generators/support") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body.?, "never-expose") == null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body.?, "example.com") == null);
+    var typed_catalog = try std.json.parseFromSlice(@import("inference_api").ModelsResponse, alloc, catalog.body.?, .{ .ignore_unknown_fields = true });
+    defer typed_catalog.deinit();
+    try std.testing.expect(!typed_catalog.value.allow_downloads);
+    try std.testing.expectEqual(@as(usize, 0), typed_catalog.value.chunkers.map.count());
+    inline for (.{
+        .{ "{\"messages\":[]}", "ModelRequired" },
+        .{ "{\"model\":\"deciders/support\",\"messages\":[]}", "ModelTaskMismatch" },
+        .{ "{\"model\":\"generators/support\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream_options\":{}}", "UnsupportedInferenceFeature" },
+        .{ "{\"model\":\"generators/support\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"response_format\":{}}", "UnsupportedInferenceFeature" },
+    }) |case| {
+        var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/chat/completions");
+        defer request.deinit();
+        request.body = case[0];
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayChat(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case[1]) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway remote-only named tasks reuse configured credentials and SQL decider" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer gateway-test-key", req.header("Authorization").?);
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("backend", parsed.value.object.get("model").?.string);
+        }
+    };
+    var upstream = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/ai/v1/chat/completions", .assert_request = Check.request, .respond = .{ .body = "{\"id\":\"upstream-id\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}" } },
+        .{ .method = .POST, .path = "/ai/v1/decisions", .assert_request = Check.request, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
+        .{ .method = .POST, .path = "/ai/v1/read", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"recognized\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}" } },
+        .{ .method = .POST, .path = "/v1/embeddings", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}" } },
+    });
+    defer upstream.deinit();
+    var config = try common_config.Config.parseFromSlice(alloc, "{}");
+    defer config.deinit();
+    config.inference.api_url = try alloc.dupe(u8, upstream.baseUrl());
+    config.inference.api_key = try alloc.dupe(u8, "gateway-test-key");
+    try config.registry.registerGeneratorConfig("support", .{ .provider = .antfly, .model = "backend", .url = "" });
+    try config.registry.registerDeciderConfig("triage", .{ .provider = .antfly, .model = "backend" });
+    try config.readers.registerConfig("ocr", .{ .provider = .antfly, .model = "backend" });
+    try config.registry.registerEmbedderConfig("dense", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "gateway-test-key", .dimensions = 2 });
+    // SQL and HTTP names borrow the very same configuration object.
+    const sql_decider = try config.registry.getDeciderConfig("deciders/triage");
+    try std.testing.expectEqualStrings("backend", sql_decider.model);
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .node_config = &config, .imported_runtime_io = .{ .api = io, .api_network = io } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler, failure: *?anyerror) void {
+            execute(a, test_io, h) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(a: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler) !void {
+            const requests = .{
+                .{ "{\"model\":\"generators/support\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", "upstream-id" },
+                .{ "{\"model\":\"deciders/triage\",\"input\":\"refund\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]}", "0.9" },
+                .{ "{\"model\":\"readers/ocr\",\"images\":[\"data:image/png;base64,aGk=\"]}", "recognized" },
+                .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\"}", "embedding" },
+                .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\",\"encoding_format\":\"base64\"}", "zczMPc3MTD4=" },
+            };
+            inline for (requests, 0..) |item, i| {
+                var req = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/test");
+                defer req.deinit();
+                req.body = item[0];
+                var ctx = httpx.Context.init(a, test_io, &req);
+                defer ctx.deinit();
+                var response = try h.gatewayRequest(&ctx, switch (i) {
+                    0 => .generate,
+                    1 => .decide,
+                    2 => .read,
+                    else => .embed,
+                });
+                defer response.deinit();
+                if (response.status.code != 200) std.debug.print("gateway response: {s}\n", .{response.body orelse ""});
+                try std.testing.expectEqual(@as(u16, 200), response.status.code);
+                try std.testing.expect(std.mem.indexOf(u8, response.body.?, item[1]) != null);
+            }
+        }
+    };
+    var group = std.Io.Group.init;
+    var failure: ?anyerror = null;
+    try group.concurrent(io, Fiber.run, .{ alloc, io, &handler, &failure });
+    defer group.cancel(io);
+    for (0..5) |_| try upstream.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway streams upstream tool deltas and never synthesizes after commitment" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const payload = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\"}}]}}]}\n\ndata: [DONE]\n\n";
+    var upstream = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/chat/completions", .respond = .{ .content_type = "text/event-stream", .body = payload } },
+    });
+    defer upstream.deinit();
+    var config = try common_config.Config.parseFromSlice(alloc, "{}");
+    defer config.deinit();
+    try config.registry.registerGeneratorConfig("stream", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "test" });
+    try config.registry.inference_capabilities.put(alloc, try alloc.dupe(u8, "generators/stream"), .{ .streaming = .supported, .tools = .supported });
+    try config.registry.registerChain("stream-chain", &.{ .{ .generator_name = "stream", .condition = .on_error }, .{ .generator_name = "stream" } });
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &config, .imported_runtime_io = .{ .api = io, .api_network = io } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Capture = struct {
+        started: bool = false,
+        closed: bool = false,
+        reject: bool = false,
+        bytes: usize = 0,
+        fn start(raw: ?*anyopaque, status: u16, content_type: []const u8, _: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.started);
+            try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expectEqualStrings("text/event-stream", content_type);
+            self.started = true;
+        }
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.started);
+            if (self.reject) return error.Canceled;
+            self.bytes += bytes.len;
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closed = true;
+        }
+    };
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler, capture: *Capture, failure: *?anyerror) void {
+            execute(a, test_io, h, capture) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(a: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler, capture: *Capture) !void {
+            var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/chat/completions");
+            defer request.deinit();
+            request.body = "{\"model\":\"chains/stream-chain\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}";
+            var ctx = httpx.Context.init(a, test_io, &request);
+            defer ctx.deinit();
+            ctx.stream_delegate = .{ .ptr = capture, .start = Capture.start, .write = Capture.write, .close = Capture.close };
+            if (capture.reject) {
+                try std.testing.expectError(error.InferenceResponseCommitted, h.gatewayChat(&ctx));
+            } else {
+                var response = try h.gatewayChat(&ctx);
+                defer response.deinit();
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |reject| {
+        var capture = Capture{ .reject = reject };
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        try group.concurrent(io, Fiber.run, .{ alloc, io, &handler, &capture, &failure });
+        defer group.cancel(io);
+        try upstream.handleOne();
+        try group.await(io);
+        if (failure) |err| return err;
+        try std.testing.expect(capture.started);
+        if (!reject) {
+            try std.testing.expect(capture.closed);
+            try std.testing.expectEqual(payload.len, capture.bytes);
+        }
+    }
+}
+
+test "httpx inference gateway named local chat leaves admission with the runtime" {
+    const Target = struct {
+        gate: RequestAdmission = RequestAdmission.init(1),
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.gate.tryAcquire();
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.gate.release();
+        }
+        fn stats(raw: *anyopaque) RequestAdmission.Stats {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.gate.stats();
+        }
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            if (!self.gate.tryAcquire()) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            defer self.gate.release();
+            const a = context.allocator.asStd();
+            const parsed = std.json.parseFromSlice(std.json.Value, a, context.body.slice(), .{}) catch return inference_connection_abi.statusFromError(error.InvalidArgument);
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, context.operation.slice(), "chat/completions") or !std.mem.eql(u8, parsed.value.object.get("model").?.string, "backend")) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            const body = a.dupe(u8, "{\"ok\":true}") catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    try config.registry.registerGeneratorConfig("local-chat", .{ .provider = .antfly, .model = "backend", .url = "" });
+    try config.registry.inference_capabilities.put(a, try a.dupe(u8, "generators/local-chat"), .{ .streaming = .supported });
+    var source = AuthStatusSource{};
+    var target: Target = .{};
+    var server = ApiHttpServer.init(a, .{
+        .node_config = &config,
+        .inference_request_admission_source = .{ .ptr = &target, .try_acquire_fn = Target.acquire, .release_fn = Target.release, .stats_fn = Target.stats },
+        .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    server.antfly_provider = .{ .ptr = &target, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .owns_invocation_admission = true };
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/chat/completions");
+    defer request.deinit();
+    request.body = "{\"model\":\"generators/local-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":true}";
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.gatewayChat(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), target.gate.stats().peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), target.gate.stats().rejected_total);
+    try std.testing.expectEqual(@as(usize, 0), target.gate.stats().in_flight);
+}
+
+test "httpx inference gateway authorization covers inventory execution and sessions" {
+    const alloc = std.testing.allocator;
+    for (inference_gateway.public_paths) |path| {
+        const permission = (try http_server_mod.requiredPermissionForRequest(alloc, if (inference_gateway.isDiscoveryPath(path)) .GET else .POST, path)).?;
+        defer permission.deinit(alloc);
+        try std.testing.expectEqual(usermgr.ResourceType.inference, permission.resource_type);
+        try std.testing.expectEqualStrings("*", permission.resource);
+        try std.testing.expectEqual(if (inference_gateway.isDiscoveryPath(path)) usermgr.PermissionType.read else usermgr.PermissionType.write, permission.permission_type);
+    }
+    const Target = struct {
+        calls: usize = 0,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            const body = context.allocator.asStd().dupe(u8, "{}") catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var table_read = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer table_read.deinit(alloc);
+    var user = try auth.manager.createUser("gateway-reader", "reader", &.{table_read});
+    defer user.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "gateway-reader", "reader");
+    defer alloc.free(authorization);
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const Cases = struct {
+        fn request(a: std.mem.Allocator, h: *AntflyApiHandler, auth_header: []const u8, path: []const u8, expected: u16) !void {
+            var req = try httpx.Request.init(a, if (inference_gateway.isDiscoveryPath(path)) .GET else .POST, path);
+            defer req.deinit();
+            try req.headers.append("authorization", auth_header);
+            req.body = "{\"model\":\"raw-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}";
+            var ctx = httpx.Context.init(a, std.testing.io, &req);
+            defer ctx.deinit();
+            var response = if (std.mem.eql(u8, path, "/ai/v1/generate/batch")) try h.gatewayBatch(&ctx) else if (std.mem.startsWith(u8, path, "/ai/v1/transcription/sessions")) try h.gatewaySessionRequest(&ctx, .post, "") else try h.gatewayRequest(&ctx, if (inference_gateway.isDiscoveryPath(path)) null else .generate);
+            defer response.deinit();
+            try std.testing.expectEqual(expected, response.status.code);
+        }
+    };
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/models", "/ai/v1/chat/completions", "/ai//v1/chat/completions/", "/ml/v1/predict", "/ai/v1/generate/batch", "/ai/v1/transcription/sessions", "/ai/v1/transcription//sessions/" }) |path| try Cases.request(alloc, &handler, authorization, path, 403);
+    try std.testing.expectEqual(@as(usize, 0), target.calls);
+    var inference_read = try usermgr.Permission.initOwned(alloc, .inference, "*", .read);
+    defer inference_read.deinit(alloc);
+    try auth.manager.addPermissionToUser("gateway-reader", inference_read);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/models", 200);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/chat/completions", 403);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/transcription/sessions", 403);
+    var inference_write = try usermgr.Permission.initOwned(alloc, .inference, "*", .write);
+    defer inference_write.deinit(alloc);
+    try auth.manager.addPermissionToUser("gateway-reader", inference_write);
+    target.calls = 0;
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/chat/completions", 200);
+    try std.testing.expectEqual(@as(usize, 1), target.calls);
+}
+
+test "httpx inference gateway batches buffer in-process targets without a socket" {
+    const Target = struct {
+        calls: usize = 0,
+        saw_stream: bool = false,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            self.saw_stream = self.saw_stream or context.stream.start != null;
+            const body = context.allocator.asStd().dupe(u8,
+                \\{"id":"local","object":"chat.completion","created":1,"model":"raw","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+            ) catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var api_server = ApiHttpServer.init(alloc, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/generate/batch");
+    defer request.deinit();
+    request.body =
+        \\{"requests":[{"custom_id":"raw","body":{"model":"raw","messages":[{"role":"user","content":"hello"}]}},{"custom_id":"qualified","body":{"model":"connections/local-inference/models/raw","messages":[{"role":"user","content":"hello"}]}}]}
+    ;
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.gatewayBatch(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("summary").?.object.get("succeeded").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+    try std.testing.expect(!target.saw_stream);
+    try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);
 }
