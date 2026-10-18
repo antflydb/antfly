@@ -8439,14 +8439,20 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
+    pub fn applyCommittedRaftIndexInstallation(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedInstall, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.command.validation.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
     fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         const PreparedType = @typeInfo(@TypeOf(prepared)).pointer.child;
         const command = if (comptime @hasField(PreparedType, "command")) prepared.command else if (comptime @hasField(PreparedType, "batch")) prepared.batch.command else prepared.page.command;
         try command.validate();
-        if (owner_group == 0 or owner_group != command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
-        if (!command.binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const binding = if (comptime @hasField(@TypeOf(command), "binding")) command.binding else command.validation.command.binding;
+        if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         // Until the ordered standby envelope carries this control, fail closed
         // for configured mirrors instead of committing an unmirrored effect.
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -8459,6 +8465,27 @@ pub const DB = struct {
         defer replay_mutation.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (comptime @hasDecl(PreparedType, "requiresSchemaCommit")) {
+            if (prepared.requiresSchemaCommit()) {
+                {
+                    var read = try self.core.store.beginReadTxn();
+                    defer read.abort();
+                    if (try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(&read), entry) == .already_applied) return;
+                }
+                const SchemaParticipant = struct {
+                    entry: OrderedApplyReceipt,
+                    pub fn stage(participant: @This(), txn: anytype, installed: @import("relational_index_validation.zig").Installed) !void {
+                        if (installed.position != .raft or installed.position.raft.term != participant.entry.term or installed.position.raft.index != participant.entry.index) return error.InvalidControlReceiptPosition;
+                        if (try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(txn), participant.entry) != .apply) return error.InvalidControlReceiptPosition;
+                        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+                        const marker_write = orderedApplyReceiptWrite(participant.entry, &marker_bytes);
+                        try txn.put(marker_write.key, marker_write.value);
+                    }
+                };
+                _ = try prepared.commitSchemaAt(self.core, .{ .raft = .{ .term = entry.term, .index = entry.index } }, SchemaParticipant{ .entry = entry });
+                return;
+            }
+        }
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         const prior = try apply_receipts.readOrderedApplyReceiptTxn(&txn);
@@ -9453,7 +9480,7 @@ pub const DB = struct {
                         mirrored: bool,
                         pub fn validateBefore(_: @This(), _: anytype) !void {}
                         pub fn stage(participant: @This(), txn: anytype, installed: if (@hasDecl(@TypeOf(prepared.*), "SchemaRecord")) @TypeOf(prepared.*).SchemaRecord else @import("relational_index_validation.zig").Installed) !void {
-                            const position = if (comptime metadata_control) installed.updated.native else installed.position;
+                            const position = if (comptime metadata_control) installed.updated.native else installed.position.native;
                             if (participant.replay) |value| {
                                 if (!std.meta.eql(position, value.position)) return error.InvalidControlReceiptPosition;
                                 var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;

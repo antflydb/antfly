@@ -39,7 +39,8 @@ pub const Intent = struct {
 
     pub fn validate(self: @This()) !void {
         if (std.mem.allEqual(u8, &self.metadata_decision, 0)) return error.InvalidPrivateIndexNativeReceipt;
-        _ = try self.installed.command.receipt(self.installed.position);
+        if (self.installed.position != .native) return error.InvalidControlReceiptPosition;
+        _ = try self.installed.command.receipt(self.installed.position.native);
     }
 
     pub fn requireInstalled(self: @This(), alloc: std.mem.Allocator, txn: anytype) !void {
@@ -54,7 +55,7 @@ pub const Intent = struct {
         var state = std.crypto.hash.Blake3.init(.{});
         state.update("antfly/private-index-release-intent/v1");
         state.update(&try self.installed.command.evidenceDigest());
-        state.update(&try (positions.Position{ .native = self.installed.position }).encode());
+        state.update(&try self.installed.position.encode());
         state.update(&self.metadata_decision);
         var result: Digest = undefined;
         state.final(&result);
@@ -64,8 +65,8 @@ pub const Intent = struct {
     pub fn receipt(self: @This(), position: positions.Native) !publication.Receipt {
         try self.validate();
         try position.validate();
-        if (!position.namespace.eql(self.installed.position.namespace) or position.sequence <= self.installed.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
-        var result = try self.installed.command.receipt(self.installed.position);
+        if (!position.namespace.eql(self.installed.position.native.namespace) or position.sequence <= self.installed.position.native.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        var result = try self.installed.command.receipt(self.installed.position.native);
         result.action = .released;
         result.position = .{ .native = position };
         result.evidence_digest = try self.evidenceDigest();
@@ -547,7 +548,7 @@ fn testIntent() !Intent {
     const binding: owner.Binding = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .authority = .native, .phase = .reserved, .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .admission_epoch = 7, .owner_group_id = 11, .peer_group_id = 11, .namespace = namespace, .catalog_digest = @splat(4) }, .integrity_before = @splat(4), .integrity_reserved = @splat(5), .integrity_candidate = @splat(6), .schema_before = @splat(7), .physical_before = null, .physical_reserved = .{ .revision = 2, .schema_version = 1, .blob_digest = @splat(8) }, .physical_candidate = .{ .revision = 2, .schema_version = 2, .blob_digest = @splat(9) }, .index = .{ .generation = 2, .slot = 0 }, .inputs_digest = @splat(10) };
     const expected: @import("relational_index_private_claims.zig").TargetExpectation = .{ .metadata_incarnation = @splat('1'), .binding_digest = hash(&try binding.encode()), .generation = @splat(2), .completion_revision = 1, .source_consumption_digest = @splat(3), .source_progress_digest = @splat(4), .table_name_digest = hash("items"), .rows = 0, .inventory_xor = @splat(0), .provenance = @splat(0) };
     const seal: validation.Seal = .{ .command = .{ .binding = binding, .expected = expected, .generation_digest = @splat(5), .inventory_digest = @splat(6), .source_members = 0, .generation_position = .{ .native = .{ .namespace = namespace, .sequence = 1 } } }, .position = .{ .native = .{ .namespace = namespace, .sequence = 2 } } };
-    return .{ .installed = .{ .command = .{ .validation = seal, .metadata_decision = @splat(7), .schema_digest = @splat(8), .activation_digest = @splat(9) }, .position = .{ .namespace = namespace, .sequence = 3 } }, .metadata_decision = @splat(10) };
+    return .{ .installed = .{ .command = .{ .validation = seal, .metadata_decision = @splat(7), .schema_digest = @splat(8), .activation_digest = @splat(9) }, .position = .{ .native = .{ .namespace = namespace, .sequence = 3 } } }, .metadata_decision = @splat(10) };
 }
 
 fn testDecodeAllocations(alloc: std.mem.Allocator, bytes: []const u8) !void {
@@ -556,7 +557,7 @@ fn testDecodeAllocations(alloc: std.mem.Allocator, bytes: []const u8) !void {
 
 test "relational index release receipt binds installed cut decision and later native position" {
     const intent = try testIntent();
-    var position = intent.installed.position;
+    var position = intent.installed.position.native;
     try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, intent.receipt(position));
     position.sequence += 1;
     const receipt = try intent.receipt(position);
@@ -599,7 +600,7 @@ test "relational index release terminal codec is bounded canonical and allocatio
     var parsed_raft = try std.json.parseFromSlice(validation.Seal, std.testing.allocator, raft_json, .{});
     defer parsed_raft.deinit();
     try std.testing.expectEqualDeep(raft_seal, parsed_raft.value);
-    const record: Record = .{ .intent = intent, .position = .{ .namespace = intent.installed.position.namespace, .sequence = 4 } };
+    const record: Record = .{ .intent = intent, .position = .{ .namespace = intent.installed.position.native.namespace, .sequence = 4 } };
     const encoded = try record.encode();
     try std.testing.expectEqualDeep(record, try Record.decode(std.testing.allocator, encoded.slice()));
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testDecodeAllocations, .{encoded.slice()});

@@ -377,8 +377,7 @@ pub const InstallIntent = struct {
     metadata_decision: Digest,
 
     pub fn validate(self: @This()) !void {
-        if (self.validation.position != .native) return error.InvalidControlReceiptPosition;
-        _ = try self.validation.command.receipt(self.validation.position.native);
+        _ = try self.validation.command.receiptAt(self.validation.position);
         if (!nonzero(self.metadata_decision)) return error.InvalidPrivateIndexNativeReceipt;
     }
 
@@ -424,12 +423,16 @@ pub const InstallCommand = struct {
     }
 
     pub fn receipt(self: @This(), position: Native) !@import("relational_index_publication_progress.zig").Receipt {
+        if (self.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return self.receiptAt(.{ .native = position });
+    }
+    pub fn receiptAt(self: @This(), position: Position) !@import("relational_index_publication_progress.zig").Receipt {
         try self.validate();
         try position.validate();
-        if (!position.namespace.eql(self.validation.position.native.namespace) or position.sequence <= self.validation.position.native.sequence) return error.InvalidPrivateIndexNativeReceipt;
-        var result = try self.validation.command.receipt(self.validation.position.native);
+        if (!cutAfter(position, self.validation.position)) return if (position == .native and self.validation.position == .native) error.InvalidPrivateIndexNativeReceipt else error.InvalidControlReceiptPosition;
+        var result = try self.validation.command.receiptAt(self.validation.position);
         result.action = .installed;
-        result.position = .{ .native = position };
+        result.position = position;
         result.evidence_digest = try self.evidenceDigest();
         _ = try result.digest();
         return result;
@@ -443,7 +446,7 @@ pub const Installed = struct {
     pub const key = owner.key ++ ":installed";
     pub const max_wire_bytes = 32 * 1024;
     command: InstallCommand,
-    position: Native,
+    position: Position,
 
     fn reserved(binding: owner.Binding) owner.Binding {
         var before = binding;
@@ -453,18 +456,23 @@ pub const Installed = struct {
 
     pub fn load(alloc: Allocator, txn: anytype, binding: owner.Binding) !?@This() {
         const bytes = (try optional(txn, Installed.key)) orelse return null;
-        if (bytes.len < 40 or bytes.len > Installed.max_wire_bytes or !std.mem.eql(u8, bytes[0..8], "AIIS\x01\x00\x00\x00") or
+        if (bytes.len < 40 or bytes.len > Installed.max_wire_bytes or !std.mem.eql(u8, bytes[0..8], "AIIS\x02\x00\x00\x00") or
             !equal(bytes[bytes.len - 32 ..][0..32].*, hash(bytes[0 .. bytes.len - 32]))) return error.InvalidPrivateIndexNativeReceipt;
         var parsed = try std.json.parseFromSlice(@This(), alloc, bytes[8 .. bytes.len - 32], .{ .ignore_unknown_fields = false, .max_value_len = 128 });
         defer parsed.deinit();
         const result = parsed.value;
-        _ = try result.command.receipt(result.position);
+        _ = try result.command.receiptAt(result.position);
         const canonical = try std.json.Stringify.valueAlloc(alloc, result, .{});
         defer alloc.free(canonical);
         if (!std.mem.eql(u8, canonical, bytes[8 .. bytes.len - 32])) return error.InvalidPrivateIndexNativeReceipt;
         if (!std.meta.eql(result.command.validation.command.binding, reserved(binding))) return null;
-        const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        if (result.position.sequence > current.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        const source = try authority.require(txn, if (binding.authority == .native) .native else .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        if (result.position == .native) {
+            if (result.position.native.sequence > source.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        } else {
+            const current = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+            if (result.position.raft.index > current.index or result.position.raft.term > current.term or (result.position.raft.index == current.index and result.position.raft.term != current.term)) return error.InvalidControlReceiptPosition;
+        }
         return result;
     }
 
@@ -496,24 +504,37 @@ pub const Installed = struct {
     /// Called AFTER the exact successor schema/catalog/activation are staged.
     /// The caller also stages its replay marker and durable outbox, then aborts
     /// on every error. This neither commits nor publishes runtime objects.
-    pub fn stage(alloc: Allocator, txn: anytype, command: InstallCommand, candidate_catalog: @import("relational_integrity_catalog.zig").Catalog, replay: ?Native) !struct { record: Installed, duplicate: bool } {
+    pub const Outcome = struct { record: Installed, duplicate: bool };
+    pub fn stage(alloc: Allocator, txn: anytype, command: InstallCommand, candidate_catalog: @import("relational_integrity_catalog.zig").Catalog, replay: ?Native) !Outcome {
+        if (command.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return stageAt(alloc, txn, command, candidate_catalog, if (replay) |cut| .{ .native = cut } else null);
+    }
+    pub fn stageAt(alloc: Allocator, txn: anytype, command: InstallCommand, candidate_catalog: @import("relational_integrity_catalog.zig").Catalog, replay: ?Position) !Outcome {
         try command.validate();
         const binding = command.validation.command.binding;
-        if (replay) |position| _ = try command.receipt(position);
+        if (binding.authority == .raft and replay == null) return error.InvalidControlReceiptPosition;
+        if (replay) |position| _ = try command.receiptAt(position);
         const current = (try owner.load(txn)) orelse return error.PrivateIndexJobRequired;
         if (!std.meta.eql(reserved(current), binding)) return error.PrivateIndexOwnerJobChanged;
         if (try Installed.load(alloc, txn, binding)) |previous| {
             if (current.phase != .installed or !std.meta.eql(previous.command, command)) return error.InvalidPrivateIndexNativeReceipt;
-            if (replay) |position| if (!std.meta.eql(position, previous.position)) return error.InvalidPrivateIndexNativeReceipt;
+            if (replay) |position| {
+                if (position == .native and !std.meta.eql(position, previous.position)) return error.InvalidPrivateIndexNativeReceipt;
+                if (!std.meta.eql(position, previous.position) and !cutAfter(position, previous.position)) return error.InvalidControlReceiptPosition;
+            }
             try previous.requireSuccessor(alloc, txn);
             return .{ .record = previous, .duplicate = true };
         }
         if (current.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
         const namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace);
-        const source = try authority.require(txn, .native, namespace);
-        const position: Native = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition };
+        const source = try authority.require(txn, if (binding.authority == .native) .native else .raft, namespace);
+        const position: Position = if (binding.authority == .raft) replay.? else .{ .native = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition } };
+        if (position == .raft) {
+            const current_marker = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+            if (position.raft.index <= current_marker.index or position.raft.term < current_marker.term) return error.InvalidControlReceiptPosition;
+        }
         const record: @This() = .{ .command = command, .position = position };
-        _ = try command.receipt(position);
+        _ = try command.receiptAt(position);
         try record.requireSuccessor(alloc, txn);
         const activation = @import("relational_integrity_activation.zig");
         const progress = try activation.Progress.decode(try txn.get(activation.key));
@@ -525,13 +546,15 @@ pub const Installed = struct {
         if (json.len + 40 > Installed.max_wire_bytes) return error.InvalidPrivateIndexNativeReceipt;
         const bytes = try alloc.alloc(u8, json.len + 40);
         defer alloc.free(bytes);
-        @memcpy(bytes[0..8], "AIIS\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], "AIIS\x02\x00\x00\x00");
         @memcpy(bytes[8..][0..json.len], json);
         @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
         var installed = binding;
         installed.phase = .installed;
-        const sequence = try authority.advance(txn, namespace, if (replay) |value| value.sequence else null);
-        std.debug.assert(sequence == position.sequence);
+        if (position == .native) {
+            const sequence = try authority.advance(txn, namespace, if (replay) |value| value.native.sequence else null);
+            std.debug.assert(sequence == position.native.sequence);
+        }
         try txn.put(owner.key, &try installed.encode());
         try txn.put(Installed.key, bytes);
         return .{ .record = record, .duplicate = false };

@@ -863,7 +863,8 @@ pub const NativeReleaseGrant = struct {
 
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
         try (NativeInstallGrant{ .validation = self.installed.command.validation, .decision_digest = self.installed.command.metadata_decision }).validateFor(group, incarnation, head, owner);
-        const receipt = try self.installed.command.receipt(self.installed.position);
+        if (self.installed.position != .native) return error.InvalidCatalogRecord;
+        const receipt = try self.installed.command.receipt(self.installed.position.native);
         const signed: SignedReceipt = .{ .receipt = receipt, .proof = self.installation_proof };
         signed.verifySignature() catch return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, &self.decision_digest, &try decisionDigest(group, incarnation, head)) or
@@ -880,7 +881,7 @@ pub const NativeReleaseGrant = struct {
 pub fn requireNativeReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, installed: StoredProof.Decoded, signed: SignedReceipt) !void {
     const witness = installed.installation orelse return error.InvalidCatalogRecord;
     const grant: NativeReleaseGrant = .{
-        .installed = .{ .command = witness.command, .position = installed.signed.receipt.position.native },
+        .installed = .{ .command = witness.command, .position = installed.signed.receipt.position },
         .decision_digest = try NativeReleaseGrant.decisionDigest(group, incarnation, head),
         .installation_proof = installed.signed.proof,
     };

@@ -62,6 +62,13 @@ the actual Raft apply watermark. Later-entry retries retain the original seal
 cut, and cold recovery checks its authority, term/index and frozen generation.
 Both authorities use AIVS v2; no custom legacy JSON projection or parser is needed.
 The seal proves verification, not metadata permission to install or publish.
+Replicated installation now uses the existing shared schema writer: schema,
+catalogs, activation, the installed job and the actual Raft apply marker commit
+together. Runtime publication follows commit; an aborted participant publishes
+nothing. Native and Raft installed records share AIIS v2 with tagged positions.
+Exact and later-entry retries retain the original install cut without repeating
+schema publication. Cold recovery verifies the real successor and its retained
+predecessor; the write fence stays held until the separately authorized release.
 This does not yet wire replicated claim delivery, validation seals,
 installation, cancellation or publication release through the public receiver.
 
@@ -79,6 +86,9 @@ bidirectional one-record pages, deterministic replay, cold READY and canonical
 tagged positions, including exact 64-bit cuts and every allocation-failure boundary.
 Seal controls cover aborted apply, allocation failures, expired preparation,
 foreign groups, retained retry cuts, cold recovery and checksummed future cuts.
+Installation controls cover preparation allocation failures, abort after marker
+staging, pinned old schema views, atomic durable/runtime publication, same-entry
+and later-entry retries, cold installed recovery and unchanged fence ownership.
 
 ## Document conflict delivery (2026-10-17)
 

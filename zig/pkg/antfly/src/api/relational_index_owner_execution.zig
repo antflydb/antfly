@@ -1712,7 +1712,7 @@ const TestDriver = struct {
             value.native_release = null;
         } else if (request.operation == .release) {
             const installed = self.installation_response.?.installed.logical;
-            value.native_release = .{ .installed = .{ .command = installed.command, .position = installed.position }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(value.metadata_group_id, value.metadata_incarnation, value.head), .installation_proof = self.installation_proof orelse value.native_release.?.installation_proof };
+            value.native_release = .{ .installed = .{ .command = installed.command, .position = .{ .native = installed.position } }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(value.metadata_group_id, value.metadata_incarnation, value.head), .installation_proof = self.installation_proof orelse value.native_release.?.installation_proof };
         } else if (self.installation_acks != 0 and request.operation == .install) {
             value.disposition = .acknowledged;
             value.dispatch = null;
@@ -1826,7 +1826,7 @@ const TestDriver = struct {
         if (expected_root_generation == 0 or expected_root_generation != self.root_generation or self.value.native_signing.?.identity.root_incarnation != root_incarnation) return error.PrivateIndexRootRecoveryRequired;
         const duplicate = self.release_outcome != null;
         if (!duplicate) {
-            var position = intent.installed.position;
+            var position = intent.installed.position.native;
             position.sequence += 1;
             self.release_outcome = .{ .intent = intent, .position = position, .duplicate = false, .receipt = try intent.receipt(position) };
             self.release_effects += 1;
@@ -2924,7 +2924,7 @@ fn testReleaseReceiverAndScheduler(alloc: std.mem.Allocator, permission: publica
     active.owner.attestations[@backingInt(progress.Action.installed)] = try installed_ack.signed.commitment();
     active.native_install = null;
     const logical = installed.installed.logical;
-    active.native_release = .{ .installed = .{ .command = logical.command, .position = logical.position }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(active.metadata_group_id, active.metadata_incarnation, active.head), .installation_proof = installed_ack.signed.proof };
+    active.native_release = .{ .installed = .{ .command = logical.command, .position = .{ .native = logical.position } }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(active.metadata_group_id, active.metadata_incarnation, active.head), .installation_proof = installed_ack.signed.proof };
     const request: Request = .{ .table_id = active.head.table_id, .group_id = active.owner.owner.group_id, .id = active.head.plan_id, .operation = .release };
     var driver: TestDriver = .{ .value = active, .installation_response = installed, .root_generation = installed_ack.signed.proof.root_generation };
     driver.root_generation += 1;

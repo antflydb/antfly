@@ -1707,11 +1707,23 @@ pub const DBCore = struct {
         replay: ?@import("receipt_position.zig").Native,
         participant: anytype,
     ) !@import("relational_index_validation.zig").Installed {
+        if (command.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return self.commitPreparedSchemaMetadataReservedIndexAt(prepared, metadata_writes, command, if (replay) |cut| .{ .native = cut } else null, participant);
+    }
+
+    pub fn commitPreparedSchemaMetadataReservedIndexAt(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        command: @import("relational_index_validation.zig").InstallCommand,
+        replay: ?@import("receipt_position.zig").Position,
+        participant: anytype,
+    ) !@import("relational_index_validation.zig").Installed {
         const verification = @import("relational_index_validation.zig");
         const IndexInstallState = struct {
             alloc: Allocator,
             command: verification.InstallCommand,
-            replay: ?@import("receipt_position.zig").Native,
+            replay: ?@import("receipt_position.zig").Position,
             participant: if (@TypeOf(participant) == @TypeOf(null)) void else @TypeOf(participant),
             record: ?verification.Installed = null,
 
@@ -1719,7 +1731,7 @@ pub const DBCore = struct {
                 try state.command.validateBefore(state.alloc, txn);
             }
             pub fn stage(state: *@This(), txn: anytype, candidate: integrity_catalog_mod.Catalog) !void {
-                const staged = try verification.Installed.stage(state.alloc, txn, state.command, candidate, state.replay);
+                const staged = try verification.Installed.stageAt(state.alloc, txn, state.command, candidate, state.replay);
                 state.record = staged.record;
                 if (comptime @TypeOf(participant) != @TypeOf(null)) try state.participant.stage(txn, staged.record);
             }

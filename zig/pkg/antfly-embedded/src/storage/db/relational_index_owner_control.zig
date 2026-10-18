@@ -315,7 +315,7 @@ pub const Effect = union(enum) {
             .generation_validation => |value| value.binding.fence.namespace,
             .validation_seal => |value| value.binding.fence.namespace,
             .install => |value| value.validation.command.binding.fence.namespace,
-            .release => |value| value.installed.position.namespace,
+            .release => |value| value.installed.command.validation.command.binding.fence.namespace,
             .cancel_release => |value| value.canceled.position.namespace,
             .release_gc => |value| value.record.position.namespace,
             .build => |value| value.binding.fence.namespace,
@@ -347,7 +347,10 @@ pub const Effect = union(enum) {
                 try value.validate();
                 if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
             },
-            .install => |value| try value.validate(),
+            .install => |value| {
+                try value.validate();
+                if (value.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            },
             .release => |value| try value.validate(),
             .cancel_release => |value| try value.validate(),
             .release_gc => |value| try value.validate(),
@@ -1280,7 +1283,7 @@ pub const PreparedRelease = struct {
         try self.intent.validate();
     }
     pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
-        return self.intent.installed.position.namespace;
+        return self.intent.installed.command.validation.command.binding.fence.namespace;
     }
     pub fn validateReplay(self: *const @This(), position: Native) !void {
         try (Frame{ .effect = .{ .release = self.intent }, .position = position }).validate();
@@ -1522,23 +1525,41 @@ pub const PreparedInstall = struct {
         return if (self.schema_data) |data| data.prepared.publication != null else false;
     }
     pub fn commitSchema(self: *@This(), core: *@import("core.zig").DBCore, position: ?Native, participant: anytype) !InstallOutcome {
+        if (self.command.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        const installed = try self.commitSchemaAt(core, if (position) |cut| .{ .native = cut } else null, participant);
+        return .{ .command = self.command, .position = installed.position.native, .duplicate = false };
+    }
+    pub fn commitSchemaAt(self: *@This(), core: *@import("core.zig").DBCore, position: ?@import("receipt_position.zig").Position, participant: anytype) !validation.Installed {
         try self.validate();
         const data = if (self.schema_data) |*value| value else return error.PrivateIndexPublicationRequired;
         const metadata = [_]@import("../docstore.zig").KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = data.json }, .{ .key = data.version_key, .value = data.json } };
-        const installed = try core.commitPreparedSchemaMetadataReservedIndex(&data.prepared, &metadata, self.command, position, participant);
-        return .{ .command = self.command, .position = installed.position, .duplicate = false };
+        return core.commitPreparedSchemaMetadataReservedIndexAt(&data.prepared, &metadata, self.command, position, participant);
     }
     /// Only exact installed retries use the ordinary transaction branch. New
     /// installation must use the shared schema writer above, never a second
     /// independent schema/catalog transaction.
     pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !InstallOutcome {
+        if (self.command.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try self.validate();
         if (self.requiresSchemaCommit()) return error.PrivateIndexPublicationRequired;
         const installed = (try validation.Installed.load(self.alloc, txn, self.command.validation.command.binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
         try installed.requireCurrent(self.alloc, txn);
         if (!std.meta.eql(installed.command, self.command)) return error.InvalidPrivateIndexNativeReceipt;
-        if (position) |expected| if (!std.meta.eql(expected, installed.position)) return error.InvalidPrivateIndexNativeReceipt;
-        return self.replayDuplicateOutcome(installed.position);
+        if (position) |expected| if (!std.meta.eql(expected, installed.position.native)) return error.InvalidPrivateIndexNativeReceipt;
+        return self.replayDuplicateOutcome(installed.position.native);
+    }
+    pub fn stageRaft(self: *@This(), _: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.validate();
+        const binding = self.command.validation.command.binding;
+        if (binding.authority != .raft or owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        if (self.requiresSchemaCommit()) return error.PrivateIndexPublicationRequired;
+        const installed = (try validation.Installed.load(self.alloc, txn, binding)) orelse return error.InvalidControlReceiptPosition;
+        try installed.requireCurrent(self.alloc, txn);
+        if (!std.meta.eql(installed.command, self.command)) return error.InvalidControlReceiptPosition;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        if (installed.position != .raft or entry.index <= installed.position.raft.index or entry.term < installed.position.raft.term) return error.InvalidControlReceiptPosition;
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return true;
@@ -1546,10 +1567,11 @@ pub const PreparedInstall = struct {
     pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *InstallOutcome) !void {
         const installed = (try validation.Installed.load(self.alloc, txn, self.command.validation.command.binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
         try installed.requireCurrent(self.alloc, txn);
-        if (!std.meta.eql(installed.command, self.command) or !std.meta.eql(installed.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
-        outcome.receipt = try self.command.receipt(installed.position);
+        if (installed.position != .native or !std.meta.eql(installed.command, self.command) or !std.meta.eql(installed.position.native, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        outcome.receipt = try self.command.receipt(installed.position.native);
     }
     pub fn preparePayload(self: *@This()) !void {
+        if (self.command.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "install", self.command, validation.Installed.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {

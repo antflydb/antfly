@@ -2428,7 +2428,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectEqual(.raft, receipt.owner.authority);
         try std.testing.expectEqualDeep(sealed.position, receipt.position);
         try std.testing.expectError(error.InvalidControlReceiptPosition, sealed.command.receipt(.{ .namespace = reserved_binding.fence.namespace, .sequence = 1 }));
-        try std.testing.expectError(error.InvalidControlReceiptPosition, (physical.InstallIntent{ .validation = sealed, .metadata_decision = @splat(1) }).validate());
+        try (physical.InstallIntent{ .validation = sealed, .metadata_decision = @splat(1) }).validate();
         try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
         try std.testing.expectEqual(seal_entry.index + 1, (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
     }
@@ -2454,6 +2454,90 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try txn.put(physical.Seal.key, encoded);
         try std.testing.expectError(error.InvalidRelationalIndexValidation, physical.Seal.load(alloc, &txn, reserved_binding));
     }
+    const installation_intent: physical.InstallIntent = intent: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :intent .{ .validation = (try physical.Seal.load(alloc, &read, reserved_binding)).?, .metadata_decision = @splat(9) };
+    };
+    const PrepareInstallationFaults = struct {
+        fn run(a: std.mem.Allocator, database: *db_mod.DB, intent: physical.InstallIntent) !void {
+            var prepared = try owner_control.PreparedInstall.initIntent(a, database.core, intent, .{});
+            defer prepared.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PrepareInstallationFaults.run, .{ &db, installation_intent });
+    var installation = try owner_control.PreparedInstall.initIntent(alloc, db.core, installation_intent, .{});
+    defer installation.deinit();
+    try std.testing.expect(installation.requiresSchemaCommit());
+    try std.testing.expectError(error.InvalidControlReceiptPosition, installation.preparePayload());
+    try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .install = installation.command }).validate());
+    const install_entry: receipts.OrderedApplyReceipt = .{ .term = 14, .index = seal_entry.index + 2 };
+    const AbortInstallation = struct {
+        entry: receipts.OrderedApplyReceipt,
+        pub fn stage(self: @This(), txn: anytype, record: physical.Installed) !void {
+            try std.testing.expectEqual(self.entry.index, record.position.raft.index);
+            var buffer: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+            const marker_write = receipts.orderedApplyReceiptWrite(self.entry, &buffer);
+            try txn.put(marker_write.key, marker_write.value);
+            return error.InjectedIndexInstallationCommitFailure;
+        }
+    };
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expectError(error.InjectedIndexInstallationCommitFailure, installation.commitSchemaAt(db.core, .{ .raft = .{ .term = install_entry.term, .index = install_entry.index } }, AbortInstallation{ .entry = install_entry }));
+    }
+    try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+    try std.testing.expect(installation.requiresSchemaCommit());
+    try std.testing.expectEqual(seal_entry.index + 1, (try db.orderedApplyReceipt()).?.index);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try physical.Installed.load(alloc, &read, reserved_binding) == null);
+        try std.testing.expectEqualDeep(reserved_binding, (try jobs.load(&read)).?);
+        try std.testing.expectEqualSlices(u8, before, try read.get("\x00\x00__metadata__:schema_json"));
+    }
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexInstallation(&installation, 99, install_entry));
+    {
+        var before_view = db.core.acquireSchemaView().?;
+        defer before_view.release();
+        try db.applyCommittedRaftIndexInstallation(&installation, 11, install_entry);
+        try std.testing.expectEqual(@as(u32, 1), before_view.version());
+        try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+    }
+    try std.testing.expect(!installation.requiresSchemaCommit());
+    try db.applyCommittedRaftIndexInstallation(&installation, 11, install_entry);
+    try db.applyCommittedRaftIndexInstallation(&installation, 11, .{ .term = 15, .index = install_entry.index + 1 });
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const installed = (try physical.Installed.load(alloc, &read, reserved_binding)).?;
+        try installed.requireCurrent(alloc, &read);
+        try std.testing.expectEqual(install_entry.index, installed.position.raft.index);
+        try std.testing.expectEqual(install_entry.term, installed.position.raft.term);
+        try std.testing.expectEqual(install_entry.index + 1, (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+        try std.testing.expectEqual(@as(u32, 2), db.core.table_catalog.active_schema_version);
+        try std.testing.expectEqualSlices(u8, after, try read.get("\x00\x00__metadata__:schema_json"));
+        try std.testing.expectEqualSlices(u8, "AIIS\x02\x00\x00\x00", (try read.get(physical.Installed.key))[0..8]);
+        try std.testing.expectEqual(.installed, (try jobs.load(&read)).?.phase);
+        try std.testing.expect((try @import("relational_integrity_topology.zig").current(&read)).?.eql(reserved_binding.fence));
+        try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+        const receipt = try installed.command.receiptAt(installed.position);
+        try std.testing.expectEqual(.installed, receipt.action);
+        try std.testing.expectEqual(.raft, receipt.owner.authority);
+        try std.testing.expectError(error.InvalidControlReceiptPosition, (@import("relational_index_release.zig").Intent{ .installed = installed, .metadata_decision = @splat(10) }).validate());
+    }
+    var recovered_installation = try owner_control.PreparedInstall.initIntent(alloc, db.core, installation_intent, .{});
+    defer recovered_installation.deinit();
+    try std.testing.expect(!recovered_installation.requiresSchemaCommit());
+    const schema_generation = db.core.table_catalog.generation;
+    try db.applyCommittedRaftIndexInstallation(&recovered_installation, 11, .{ .term = 16, .index = install_entry.index + 2 });
+    try std.testing.expectEqual(schema_generation, db.core.table_catalog.generation);
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 
@@ -3785,7 +3869,7 @@ fn testNativeIndexRelease(source: *db_mod.DB, installed: @import("relational_ind
         defer read.abort();
         try intent.requireInstalled(alloc, &read);
         try std.testing.expect(try release_mod.Record.load(alloc, &read, intent) == null);
-        try std.testing.expectEqual(installed.position.sequence, (try authority.load(&read)).?.sequence);
+        try std.testing.expectEqual(installed.position.native.sequence, (try authority.load(&read)).?.sequence);
     };
     var barrier: @import("antfly_runtime_abi").mutation_barrier.MutationBarrier = .{};
     var publisher: TestNativeIndexPublisher = .{ .barrier = &barrier, .lsn = 7 };
@@ -3803,7 +3887,7 @@ fn testNativeIndexRelease(source: *db_mod.DB, installed: @import("relational_ind
     try std.testing.expect(!pending.duplicate and pending.replication_pending and pending.receipt == null);
     try std.testing.expectEqualStrings("TestPublicationUnavailable", pending.error_name.?);
     try std.testing.expectEqual(@as(usize, 1), publisher.attempts);
-    try std.testing.expectEqual(installed.position.sequence + 1, pending.position.sequence);
+    try std.testing.expectEqual(installed.position.native.sequence + 1, pending.position.sequence);
     {
         var read = try primary.core.store.beginReadTxn();
         defer read.abort();
@@ -4198,7 +4282,7 @@ fn testInstalledIndexPhysicalAudit(database: *db_mod.DB) !void {
         try std.testing.expectEqual(verification.Failure.invalid_row, failed.progress.summary.fields.failure);
     }
     try std.testing.expectEqual(owner.Phase.installed, (try owner.load(&read)).?.phase);
-    try std.testing.expectEqual(history.record.position.sequence, (try @import("../source_authority.zig").load(&read)).?.sequence);
+    try std.testing.expectEqual(history.record.position.native.sequence, (try @import("../source_authority.zig").load(&read)).?.sequence);
 }
 
 fn testNativeIndexActivationAllocations(allocator: std.mem.Allocator, txn: *docstore.DocStore.Txn, binding: @import("relational_index_owner_job.zig").Binding, candidate: *const @import("relational_index_candidate.zig").Candidate) !void {
@@ -5446,18 +5530,18 @@ test "relational index build pages identity dispatch caches immutable candidates
                     try activated.stage(&txn);
                     const staged = try Verification.Installed.stage(alloc, &txn, install_command, schema_prepared.integrity_catalog.?.catalog, null);
                     try std.testing.expect(!staged.duplicate);
-                    try std.testing.expectEqual(sequence + 2, staged.record.position.sequence);
+                    try std.testing.expectEqual(sequence + 2, staged.record.position.native.sequence);
                     const owner_job = @import("relational_index_owner_job.zig");
                     try std.testing.expectEqual(owner_job.Phase.installed, (try owner_job.load(&txn)).?.phase);
                     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owner_job.requireReserved(&txn, binding));
-                    const retried = try Verification.Installed.stage(alloc, &txn, install_command, schema_prepared.integrity_catalog.?.catalog, staged.record.position);
+                    const retried = try Verification.Installed.stage(alloc, &txn, install_command, schema_prepared.integrity_catalog.?.catalog, staged.record.position.native);
                     try std.testing.expect(retried.duplicate);
                     try std.testing.expectEqualDeep(staged.record, retried.record);
                     const PhysicalCatalog = @import("relational_index_catalog.zig");
                     var installed_catalog = try PhysicalCatalog.decode(alloc, binding.physical_candidate, try txn.get(&PhysicalCatalog.blobKey(binding.physical_candidate.blob_digest)));
                     defer installed_catalog.deinit();
                     try owner_job.verifyRecovery(alloc, &txn, &installed_catalog);
-                    var wrong_cut = staged.record.position;
+                    var wrong_cut = staged.record.position.native;
                     wrong_cut.sequence += 1;
                     try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, Verification.Installed.stage(alloc, &txn, install_command, schema_prepared.integrity_catalog.?.catalog, wrong_cut));
                     try txn.delete(Verification.Installed.key);
@@ -5599,7 +5683,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                         fail: bool,
                         pub fn stage(hook: @This(), txn: anytype, installed_record: Verification.Installed) !void {
                             var bytes: [8]u8 = undefined;
-                            std.mem.writeInt(u64, &bytes, installed_record.position.sequence, .little);
+                            std.mem.writeInt(u64, &bytes, installed_record.position.native.sequence, .little);
                             try txn.put(marker, &bytes);
                             if (hook.fail) return error.TestInstallCommitFailed;
                         }
@@ -5692,7 +5776,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                         defer primary_read.abort();
                         const primary_installed = (try Verification.Installed.load(alloc, &primary_read, binding)).?;
                         try primary_installed.requireCurrent(alloc, &primary_read);
-                        try std.testing.expectEqual(pending_install.position, primary_installed.position);
+                        try std.testing.expectEqual(pending_install.position, primary_installed.position.native);
                     }
                     install_primary.local_execution.replication_async_batch_mirror = null;
                     install_primary.close();
@@ -5742,11 +5826,11 @@ test "relational index build pages identity dispatch caches immutable candidates
                         try replication_ingress.applyRecord(&installed_db, install_record);
                         try std.testing.expectEqual(@as(u32, 1), pinned_before.version());
                     }
-                    const committed: Verification.Installed = .{ .command = install_command, .position = installed_position };
+                    const committed: Verification.Installed = .{ .command = install_command, .position = .{ .native = installed_position } };
                     try std.testing.expectEqual(@as(u64, 5), try installed_db.replicationAppliedSequence());
                     try std.testing.expectEqual(@as(u32, 2), installed_db.core.schema.?.version);
                     try std.testing.expectEqual(@as(u32, 2), installed_db.core.table_catalog.active_schema_version);
-                    try std.testing.expectEqual(sequence + 2, committed.position.sequence);
+                    try std.testing.expectEqual(sequence + 2, committed.position.native.sequence);
                     installed_db.close();
                     installed_db_open = false;
                     installed_db = try db_mod.DB.open(alloc, install_directory.path(), options);
