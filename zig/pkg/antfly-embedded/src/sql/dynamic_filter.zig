@@ -33,7 +33,7 @@ pub const Column = struct {
             value.* = number.value;
             return Datum.typedNumeric(value);
         }
-        return .{ .value = try @import("describe.zig").coerceAlloc(a, raw.value, self.type), .sql_null = false };
+        return @import("describe.zig").coerceDatum(a, raw, self.type, self.element_type);
     }
 };
 pub const Domain = struct {
@@ -299,7 +299,21 @@ pub const Filter = struct {
                             continue;
                         }
                     }
-                    const value = if (dictionary) values.values[id] else values[row];
+                    // Filters consume the declared SQL value, including REAL rounding.
+                    const value = normalized: {
+                        const raw_value = if (dictionary) values.values[id] else values[row];
+                        break :normalized switch (tag) {
+                            .f64, .dictionary_f64 => if (definition.element_type == .float32)
+                                try @import("builtin_cast.zig").floatValue(f32, .{ .float = raw_value })
+                            else
+                                raw_value,
+                            .i64, .dictionary_i64 => if (definition.element_type) |element|
+                                if (@import("builtin_cast.zig").integral(element)) try @import("builtin_cast.zig").checkedInteger(raw_value, element) else raw_value
+                            else
+                                raw_value,
+                            else => raw_value,
+                        };
+                    };
                     const datum = Datum.json(switch (tag) {
                         .i64, .dictionary_i64 => .{ .integer = value },
                         .f64, .dictionary_f64 => .{ .float = value },
@@ -310,7 +324,7 @@ pub const Filter = struct {
                     const allowed = switch (tag) {
                         .i64, .dictionary_i64 => value >= lower.value.integer and value <= upper.value.integer,
                         .f64, .dictionary_f64 => blk: {
-                            if (!std.math.isFinite(value)) return error.SqlTypeMismatch;
+                            if (definition.element_type == null and !std.math.isFinite(value)) return error.SqlTypeMismatch;
                             break :blk value >= lower.value.float and value <= upper.value.float;
                         },
                         .bytes, .dictionary_bytes => std.mem.order(u8, value, lower.value.string) != .lt and std.mem.order(u8, value, upper.value.string) != .gt,
@@ -466,4 +480,25 @@ test "lake SQL native dynamic filter masks use bounded allocation-free primitive
     var selected: [4096]bool = @splat(true);
     try filter.applyBatch(std.testing.failing_allocator, batch, &selected);
     for (selected, 0..) |keep, i| try std.testing.expectEqual(i != 2048 and i != 2049, keep);
+}
+
+test "lake SQL dynamic filters normalize REAL dictionary and flat values before ranges and hashes" {
+    const a = std.testing.allocator;
+    const filter = try Filter.create(a, &.{.{ .name = "n", .type = .number, .element_type = .float32 }}, 256);
+    defer filter.close();
+    const expected = try @import("builtin_cast.zig").floatValue(f32, .{ .float = 0.1 });
+    try filter.add(&.{Datum.json(.{ .float = expected })});
+    filter.sealed = true;
+    const types = @import("../storage/rowsource/types.zig");
+    for ([_]@FieldType(types.ColumnVector, "values"){
+        .{ .f64 = &.{ 0.1, 0.2, 0.1 } },
+        .{ .dictionary_f64 = .{ .values = &.{ 0.1, 0.2 }, .indices = &.{ 0, 1, 0 } } },
+    }) |values| {
+        const batch: types.ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .external_span = .{ .first = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 3 }, .columns = &.{.{ .name = "n", .values = values }} };
+        var selected = [_]bool{ true, true, true };
+        try filter.applyBatch(std.testing.failing_allocator, batch, &selected);
+        try std.testing.expectEqualSlices(bool, &.{ true, false, true }, &selected);
+    }
+    const normalized = try filter.columns[0].datum(a, Datum.json(.{ .float = 0.1 }));
+    try std.testing.expectEqual(expected, normalized.value.float);
 }

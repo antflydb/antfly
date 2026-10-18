@@ -5817,3 +5817,26 @@ passed 13 tests. Formatting, Python lint, source/error catalogs, whitespace,
 license headers and the Apache boundary (2,286 sources) passed. Focused emitted
 test binaries were removed; required `make gc` completed, with the busy uv cache
 left alone after its bounded lock timeout.
+
+### Source identity, normalized filters, and committed Parquet discovery
+
+The follow-up fixes REAL dynamic-filter false negatives and makes row identity
+a durable source-binding property. Both dictionary and flat native lanes use
+SQL width normalization before range/Bloom checks. New source bindings select
+identity version 2 once; older bindings retain version 1 through index lifecycle
+changes. Scalar binding now prepares immutable decimal execution templates, and
+decimal precision limits use precomputed constants.
+
+Explicit `.parquet-manifest.json` source heads provide fresh, small commit
+selection and immutable checksummed file-list chunks. Matching published native
+navigation defers chunks completely for selected serving. Persistent chunk
+catalogs provide lineage for incremental native proof preparation for both
+Parquet commits and Iceberg. The proof census reuses unchanged hashes, path-copies
+changed branches and supplies range summaries without per-refresh proof sorting
+or prefix arrays. Changed delete evidence conservatively rebuilds the census.
+Canonical coverage also reuses ordered file inventories.
+
+Flat builder arrays, inventory serialization and the canonical coverage hash
+remain linear in file count. Raw uncommitted prefixes still require complete
+listing for freshness. These residual costs and live-provider/archive-scale
+qualification are not hidden by the new preparation caches.

@@ -149,6 +149,11 @@ pub const Ordering = struct {
     }
 };
 pub const Index = struct {
+    census_mu: std.atomic.Mutex = .unlocked,
+    census: ?*@import("lake_file_census.zig").Census = null,
+    prior_census: ?*@import("lake_file_census.zig").Census = null,
+    removed_ids: std.ArrayList([]const u8) = .empty,
+    added_ids: std.ArrayList([]const u8) = .empty,
     a: A,
     cache_owner: ?*Cache = null,
     refs: std.atomic.Value(usize) = .init(1),
@@ -169,11 +174,42 @@ pub const Index = struct {
         const a = self.a;
         if (self.ordering.load(.acquire)) |order| order.destroy();
         if (self.ordering2.load(.acquire)) |order| order.destroy();
+        if (self.census) |value| value.release();
+        if (self.prior_census) |value| value.release();
+        for (self.removed_ids.items) |id| a.free(id);
+        self.removed_ids.deinit(a);
+        self.added_ids.deinit(a);
         Node.release(self.root);
         for (self.chunks[0..self.initialized_chunks]) |chunk| chunk.lease.release();
         a.free(self.chunks);
         self.by_key.deinit(a);
         a.destroy(self);
+    }
+    pub fn acquireCensus(self: *Index, context: Context) !?*@import("lake_file_census.zig").Census {
+        while (!self.census_mu.tryLock()) {
+            try context.ensureActive();
+            if (context.io) |io| try io.sleep(.fromMilliseconds(1), .awake) else std.atomic.spinLoopHint();
+        }
+        defer self.census_mu.unlock();
+        return if (self.census) |value| value.retain() else null;
+    }
+    /// Domain includes source interpretation, store and complete delete evidence.
+    /// The catalog's credential-scoped immutable chunk lineage supplies deltas.
+    pub fn prepareCensus(self: *Index, domain: [32]u8, all: []const external.FileEntry, fingerprint: @import("lake_file_census.zig").Fingerprint, context: Context) !*@import("lake_file_census.zig").Census {
+        while (!self.census_mu.tryLock()) {
+            try context.ensureActive();
+            if (context.io) |io| try io.sleep(.fromMilliseconds(1), .awake) else std.atomic.spinLoopHint();
+        }
+        defer self.census_mu.unlock();
+        if (self.census) |value| if (std.mem.eql(u8, &domain, &value.domain)) return value.retain();
+        const value = try @import("lake_file_census.zig").Census.build(self.a, domain, self.prior_census, self.removed_ids.items, self.added_ids.items, all, fingerprint, context);
+        if (value.summary()) |summary| if (summary.count != self.count()) {
+            value.release();
+            return error.InvalidExternalSourceInventory;
+        };
+        if (self.census) |old| old.release();
+        self.census = value;
+        return value.retain();
     }
     pub fn count(self: *const Index) usize {
         return if (self.root) |root| root.count else 0;
@@ -209,7 +245,11 @@ pub const Index = struct {
     /// the immutable catalog pinned by the source's snapshot lease.
     pub fn qualify(a: A, file: external.FileEntry, snapshot: []const u8) !external.FileEntry {
         const marker = "iceberg:v1:snapshot=manifest-chunk";
-        if (!std.mem.startsWith(u8, file.version_id, marker)) return error.InvalidIcebergInventory;
+        if (!std.mem.startsWith(u8, file.version_id, marker)) {
+            var out = file;
+            out.version_id = try a.dupe(u8, file.version_id);
+            return out;
+        }
         var out = file;
         out.version_id = try std.fmt.allocPrint(a, "iceberg:v1:snapshot={s}{s}", .{ snapshot, file.version_id[marker.len..] });
         return out;
@@ -309,9 +349,17 @@ pub const Index = struct {
             return index;
         }
         index.root = Node.retain(if (prior) |old| old.root else null);
+        if (prior) |old| index.prior_census = try @constCast(old).acquireCensus(context);
         if (prior) |old| for (old.chunks) |part| if (!index.by_key.contains(part.key)) {
             for (part.lease.item.payload.iceberg_chunk.files) |file| {
                 try context.ensureActive();
+                if (index.prior_census != null) {
+                    const id = try a.dupe(u8, file.file_id);
+                    index.removed_ids.append(a, id) catch |err| {
+                        a.free(id);
+                        return err;
+                    };
+                }
                 const next = try Node.remove(a, index.root, file.file_id, 0);
                 Node.release(index.root);
                 index.root = next;
@@ -325,6 +373,7 @@ pub const Index = struct {
                 Node.release(index.root);
                 index.root = next;
                 index.new_files += 1;
+                if (index.prior_census != null) try index.added_ids.append(a, file.file_id);
             }
         };
         return index;

@@ -148,7 +148,7 @@ const Factory = struct {
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table_id, self.store.identity, self.publication.namespace);
         if (root.coverage == null or root.coverage.?.plan == null or (!std.mem.eql(u8, &root.coverage.?.plan.?, &plans.requested) and !std.mem.eql(u8, &root.coverage.?.plan.?, &plans.current) and !std.mem.eql(u8, &root.coverage.?.plan.?, &plans.selected)) or
             !std.mem.eql(u8, &root.domain, &domain) or !std.mem.eql(u8, root.source, header.source_id) or
-            !std.mem.eql(u8, root.snapshot, header.snapshot_id) or !std.mem.eql(u8, root.schema, header.schema_fingerprint)) return null;
+            !std.mem.eql(u8, root.snapshot, header.snapshot_id) or !std.mem.eql(u8, root.schema, header.schema_fingerprint) or root.public_identity_version != header.row_identity_version) return null;
         if (root.delete_proof) |proof| if (!std.mem.eql(u8, &proof.source, &self.publication.signature.source)) return error.InvalidExternalLakeIndexCoverage;
         const owner = try a.create(Owner);
         errdefer a.destroy(owner);
@@ -195,7 +195,7 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
     if ((binding.format != .iceberg or binding.object_mutability != .immutable) and publication.source_navigation.?.metadata_version < 3)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     var source_options: @import("antfly_local_sources").serverless_lake_host.OpenOptions = options;
-    source_options.row_identity_version = if (publication.source_navigation.?.metadata_version >= 4) 2 else 1;
+    source_options.row_identity_version = binding.row_identity_version;
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     var store = Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir) catch |err| {
         try optionalAdmission(context, reader != null, err);
@@ -210,7 +210,7 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
     };
     defer if (reader == null) lease.deinit();
     var factory: Factory = .{ .store = &store, .publication = publication, .lease = lease, .cache = &server.lake_read_cache, .table_id = table_id, .required = reader != null };
-    if (binding.format != .iceberg or binding.object_mutability != .immutable) {
+    if ((binding.format != .iceberg and !local.serverless_query_lake_parquet_manifest.isManifest(binding.source_uri)) or binding.object_mutability != .immutable) {
         var source = try Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
         errdefer source.deinit();
         attachStatistics(a, &factory, &source, context) catch |err| {

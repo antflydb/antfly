@@ -15,14 +15,18 @@
 
 //! Fixed decimal128 coefficient validation and boundary formatting.
 const std = @import("std");
+const coefficient_limits = blk: {
+    var out: [39]u128 = undefined;
+    out[0] = 1;
+    for (1..out.len) |i| out[i] = out[i - 1] * 10;
+    break :blk out;
+};
 pub fn validate(precision: i32, scale: i32) !void {
     if (precision < 1 or precision > 38 or scale < 0 or scale > precision) return error.UnsupportedDecimal128;
 }
 pub fn coefficientLimit(precision: i32, scale: i32) !u128 {
     try validate(precision, scale);
-    var maximum: u128 = 1;
-    for (0..@intCast(precision)) |_| maximum *= 10;
-    return maximum;
+    return coefficient_limits[@intCast(precision)];
 }
 pub fn validateCoefficient(value: i128, precision: i32, scale: i32) !void {
     if (@abs(value) >= try coefficientLimit(precision, scale)) return error.InvalidDecimal128;

@@ -5906,3 +5906,267 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
         if failed and server.log_path.exists():
             print(server.debug_logs())
         server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("dictionary", [False, True])
+def test_real_join_filters_and_source_ids_survive_index_lifecycle(tmp_path, dictionary):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "input.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": range(75),
+                "n": pa.array([0.1 if i % 2 == 0 else 0.2 for i in range(75)]),
+                "label": ["quasar"] * 75,
+            }
+        ),
+        path,
+        use_dictionary=dictionary,
+        row_group_size=19,
+        write_page_index=True,
+    )
+    data = path.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(data), 0)
+        + hashlib.sha256(data).hexdigest().encode()
+        + data
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = _request_with_idle_ddl_retry(
+                server, method, path, body, retry_ddl=True
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        def sql(statement):
+            return call("POST", "/sql", {"statement": statement})["rows"]
+
+        schema = {
+            "storage_mode": "relational",
+            "base_source": {
+                "kind": "external",
+                "table_id": "real_identity",
+                "format": "parquet",
+                "uri": root.as_uri(),
+                "object_mutability": "immutable",
+            },
+            "default_type": "row",
+            "document_schemas": {
+                "row": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "n": {"type": "number", "x-antfly-sql-type": "float32"},
+                            "label": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    }
+                }
+            },
+        }
+        created = call("POST", "/tables/real_identity", {"schema": schema})
+        assert created["schema"]["base_source"]["row_identity_version"] == 2
+        original = sql("SELECT id, _id FROM real_identity ORDER BY id")
+        assert len(original) == 75
+        assert all(row[1].startswith("lake3:") for row in original)
+
+        def verify():
+            assert sql("SELECT id, _id FROM real_identity ORDER BY id") == original
+            expected = sql(
+                "SELECT t.id, t.n FROM real_identity t "
+                "JOIN (VALUES (0.1::real)) v(k) ON t.n + 0 = v.k ORDER BY t.id"
+            )
+            assert len(expected) == 38
+            for source in ["real_identity", "(SELECT id, n FROM real_identity)"]:
+                assert (
+                    sql(
+                        f"SELECT t.id, t.n FROM {source} t "
+                        "JOIN (VALUES (0.1::real)) v(k) ON t.n = v.k ORDER BY t.id"
+                    )
+                    == expected
+                )
+            assert sql(
+                "SELECT id FROM real_identity WHERE _id = '" + original[0][1] + "'"
+            ) == [["0"]]
+
+        verify()
+        call(
+            "POST",
+            "/tables/real_identity/indexes/text",
+            {"type": "full_text", "field": "label"},
+        )
+        deadline = time.monotonic() + 45
+        while True:
+            resource = call("GET", "/tables/real_identity/indexes/text")
+            if resource["status"].get("published_revision") is not None:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        verify()
+        call("DELETE", "/tables/real_identity/indexes/text")
+        verify()
+        server.restart()
+        verify()
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_parquet_snapshot_manifest_refresh_and_cold_native_navigation(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "committed"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+
+    def put(name, payload):
+        digest = hashlib.sha256(payload).hexdigest()
+        (objects / name).write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + digest.encode()
+            + payload
+        )
+        return digest
+
+    def chunk(number, ids):
+        path = tmp_path / f"part{number}.parquet"
+        pq.write_table(pa.table({"id": ids, "body": ["quasar"] * len(ids)}), path)
+        data = path.read_bytes()
+        name = f"part{number}.parquet"
+        etag = put(name, data)
+        payload = json.dumps(
+            [
+                {
+                    "file_id": name,
+                    "object_uri": f"object://antfly/{name}",
+                    "byte_len": len(data),
+                    "row_count": len(ids),
+                    "etag": etag,
+                }
+            ],
+            separators=(",", ":"),
+        ).encode()
+        name = hashlib.sha256(payload).hexdigest() + ".json"
+        digest = put(name, payload)
+        return {
+            "uri": f"object://antfly/{name}",
+            "sha256": digest,
+            "byte_len": len(payload),
+            "file_count": 1,
+        }, objects / name
+
+    first, first_path = chunk(1, list(range(75)))
+    head = "snapshot.parquet-manifest.json"
+
+    def commit(chunks):
+        put(
+            head,
+            json.dumps(
+                {
+                    "version": 1,
+                    "source_id": "committed",
+                    "chunks": chunks,
+                    "file_count": len(chunks),
+                },
+                separators=(",", ":"),
+            ).encode(),
+        )
+
+    commit([first])
+    # A prefix listing would admit this invalid object. Commits name membership.
+    put("uncommitted.parquet", b"not parquet")
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    held = first_path.with_suffix(".held")
+    try:
+
+        def call(method, path, body=None):
+            response = _request_with_idle_ddl_retry(
+                server, method, path, body, retry_ddl=True
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        def sql(statement):
+            return call("POST", "/sql", {"statement": statement})["rows"]
+
+        created = call(
+            "POST",
+            "/tables/committed",
+            {
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "committed",
+                        "format": "parquet",
+                        "object_mutability": "immutable",
+                        "uri": (root / head).as_uri(),
+                    },
+                }
+            },
+        )
+        assert created["schema"]["base_source"]["row_identity_version"] == 2
+        assert sql("SELECT count(*) FROM committed") == [["75"]]
+        call(
+            "POST",
+            "/tables/committed/indexes/text",
+            {"type": "full_text", "field": "body"},
+        )
+
+        def published(after=None):
+            deadline = time.monotonic() + 60
+            while True:
+                status = call("GET", "/tables/committed/indexes/text")["status"]
+                revision = status.get("published_revision")
+                if revision is not None and revision != after:
+                    return revision
+                assert time.monotonic() < deadline, str(status) + server.debug_logs()
+                time.sleep(0.1)
+
+        generation = published()
+        second, _ = chunk(2, [1000])
+        commit([first, second])
+        assert sql("SELECT id FROM committed WHERE id = 1000") == [["1000"]]
+        published(generation)
+        expected = call(
+            "POST",
+            "/tables/committed/query",
+            {"full_text_search": {"match": "quasar", "field": "body"}, "limit": 5},
+        )["hits"]["hits"]
+        first_path.rename(held)
+        server.restart()
+        actual = call(
+            "POST",
+            "/tables/committed/query",
+            {"full_text_search": {"match": "quasar", "field": "body"}, "limit": 5},
+        )["hits"]["hits"]
+        assert [(h["_id"], h["_source"]) for h in actual] == [
+            (h["_id"], h["_source"]) for h in expected
+        ]
+        assert sql("SELECT count(*) FROM committed") == [["76"]]
+        held.rename(first_path)
+        failed = False
+    finally:
+        if held.exists():
+            held.rename(first_path)
+        server.stop(test_failed=failed)

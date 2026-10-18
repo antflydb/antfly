@@ -275,7 +275,7 @@ const Batch = struct {
         self.changes = .empty;
     }
 };
-pub const BuildStats = struct { prior_pages: usize = 0, prior_records: usize = 0, skipped_subtrees: usize = 0 };
+pub const BuildStats = struct { prior_pages: usize = 0, prior_records: usize = 0, skipped_subtrees: usize = 0, rehashed_files: usize = 0, cached_census: bool = false };
 pub const Built = struct { ref: Ref, delta: Delta, stats: BuildStats };
 pub fn build(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, prior: ?Root, token: Token) !Built {
     return buildProven(a, out, store, provider, prior, token, null);
@@ -310,9 +310,59 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     const current = try out.alloc(native.File, inv.files.len);
     const changed = try out.alloc(bool, inv.files.len);
     @memset(changed, true);
-    const proofs = try a.alloc(Proof, inv.files.len);
+    try native_by_id.ensureTotalCapacity(out, @intCast(inv.files.len));
+    for (inv.files, current, 0..) |file, *state, i| {
+        state.* = .{ .id = file.file_id, .digest = undefined };
+        native_by_id.putAssumeCapacity(file.file_id, i);
+    }
+    var stats: BuildStats = .{};
+    const Census = local.serverless_query_lake_file_census;
+    var census: ?*Census.Census = null;
+    defer if (census) |value| value.release();
+    if (provider.source.immutable_objects) if (provider.source.catalog()) |catalog| {
+        var domain_hash = std.crypto.hash.Blake3.init(.{});
+        domain_hash.update("native-census-domain-v1");
+        domain_hash.update(&root.domain);
+        for ([_][]const u8{ inv.source_id, inv.schema_fingerprint }) |part| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, part.len, .little);
+            domain_hash.update(&length);
+            domain_hash.update(part);
+        }
+        const deletes = try std.json.Stringify.valueAlloc(a, .{ .groups = inv.deleted_row_groups, .plan = provider.source.scanner.iceberg_delete_plan, .versions = if (provider.source.prepared_deletes) |prepared| prepared.object_versions else null }, .{});
+        defer a.free(deletes);
+        domain_hash.update(deletes);
+        const Fingerprints = struct {
+            a: A,
+            provider: *Provider,
+            positions: *std.StringHashMapUnmanaged(usize),
+            calls: usize = 0,
+            fn get(raw: *anyopaque, id: []const u8) ![32]u8 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                const position = self.positions.get(id) orelse return error.InvalidNativeLakeFileState;
+                var arena = std.heap.ArenaAllocator.init(self.a);
+                defer arena.deinit();
+                return native.identity(arena.allocator(), self.provider, self.provider.source.inventory.files[position]);
+            }
+        };
+        var fingerprints: Fingerprints = .{ .a = a, .provider = provider, .positions = &native_by_id };
+        var census_domain: [32]u8 = undefined;
+        domain_hash.final(&census_domain);
+        census = catalog.prepareCensus(census_domain, inv.files, .{ .ptr = &fingerprints, .get = Fingerprints.get }, provider.context) catch |err| switch (err) {
+            error.OutOfMemory, error.SqlMemoryLimitExceeded => null,
+            else => return err,
+        };
+        if (census) |value| {
+            stats.cached_census = true;
+            stats.rehashed_files = fingerprints.calls;
+            var iterator = value.iterator();
+            while (try iterator.next()) |entry| current[native_by_id.get(entry.id) orelse return error.InvalidNativeLakeFileState].digest = entry.digest;
+        }
+    };
+    const proofs = try a.alloc(Proof, if (census == null) inv.files.len else 0);
     defer a.free(proofs);
-    const prefix = try a.alloc([32]u8, inv.files.len + 1);
+    const prefix = try a.alloc([32]u8, if (census == null) inv.files.len + 1 else 1);
     defer a.free(prefix);
     prefix[0] = @splat(0);
     var scratch = std.heap.ArenaAllocator.init(a);
@@ -322,15 +372,17 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
         try token.check();
         _ = scratch.reset(.retain_capacity);
         const sa = scratch.allocator();
-        const digest = try native.identity(sa, provider, file);
-        const deletes = if (provider.source.prepared_deletes) |prepared| try prepared.fileFingerprint(file.file_id) else local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
-        state.* = .{ .id = file.file_id, .digest = digest };
-        proofs[i] = .{ .id = key(file.file_id), .digest = digest, .index = i };
-        try native_by_id.put(out, file.file_id, i);
-        const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = digest, .deletes = deletes }, .{});
-        // Defer stable file/private mutations until the old paged census proves
-        // which records changed. Public IDs separately fence each snapshot.
+        const digest = if (census != null) state.digest else try native.identity(sa, provider, file);
+        state.digest = digest;
+        if (census == null) {
+            stats.rehashed_files += 1;
+            proofs[i] = .{ .id = key(file.file_id), .digest = digest, .index = i };
+        }
+        // No descriptor serialization or delete fingerprinting is owed for an
+        // unchanged compatible subtree. Only mutations need full records.
         if (!compatible) {
+            const deletes = if (provider.source.prepared_deletes) |prepared| try prepared.fileFingerprint(file.file_id) else local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
+            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = digest, .deletes = deletes }, .{});
             try files.add(&key(file.file_id), bytes);
             try private.add(&digest, file.file_id);
             if (files.changes.items.len >= 64) {
@@ -340,7 +392,6 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
         }
     }
     var prior_changed: std.ArrayList(native.File) = .empty;
-    var stats: BuildStats = .{};
     std.mem.sort(Proof, proofs, {}, struct {
         fn less(_: void, l: Proof, r: Proof) bool {
             return std.mem.order(u8, &l.id, &r.id) == .lt;
@@ -351,7 +402,9 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
         const digest = proofHash(proof.id, proof.digest);
         for (&prefix[i + 1], digest) |*byte, other| byte.* ^= other;
     }
-    root.file_summary = if (proofs.len != 0) .{ .first = proofs[0].id, .last = proofs[proofs.len - 1].id, .count = proofs.len, .digest = prefix[proofs.len] } else null;
+    if (census) |value| {
+        root.file_summary = if (value.summary()) |summary| .{ .first = summary.first, .last = summary.last, .count = summary.count, .digest = summary.digest } else null;
+    } else root.file_summary = if (proofs.len != 0) .{ .first = proofs[0].id, .last = proofs[proofs.len - 1].id, .count = proofs.len, .digest = prefix[proofs.len] } else null;
     if (compatible) {
         const Diff = struct {
             a: A,
@@ -359,6 +412,8 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             storage: tree.Store,
             file_storage: tree.Store,
             provider: *Provider,
+            census: ?*Census.Census,
+            by_id: *const std.StringHashMapUnmanaged(usize),
             proofs: []const Proof,
             prefix: []const [32]u8,
             current: []const native.File,
@@ -370,6 +425,17 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             token: Token,
             stats: *BuildStats,
             fn unchanged(self: *@This(), summary: Summary) bool {
+                if (self.census) |value| {
+                    const found = value.range(summary.first, summary.last);
+                    if (found.count != summary.count or !std.mem.eql(u8, &found.digest, &summary.digest)) return false;
+                    var it = value.iteratorFrom(summary.first);
+                    while (it.next() catch return false) |entry| {
+                        if (std.mem.order(u8, &entry.key, &summary.last) == .gt) break;
+                        self.changed[self.by_id.get(entry.id) orelse return false] = false;
+                    }
+                    self.stats.skipped_subtrees += 1;
+                    return true;
+                }
                 const lower = proofLower(self.proofs, summary.first, false);
                 const upper = proofLower(self.proofs, summary.last, true);
                 if (upper - lower != summary.count) return false;
@@ -395,6 +461,14 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                 const old = try std.json.parseFromSliceLeaky(Record, sa, bytes, .{});
                 const old_id = key(old.file.file_id);
                 if (!std.mem.eql(u8, id, &old_id)) return error.InvalidNativeLakeFileState;
+                if (self.census) |value| {
+                    if (value.find(old_id)) |entry| {
+                        const i = self.by_id.get(entry.id) orelse return error.InvalidNativeLakeFileState;
+                        if (!std.mem.eql(u8, old.file.file_id, self.current[i].id)) return error.InvalidNativeLakeFileState;
+                        self.changed[i] = !std.mem.eql(u8, &old.digest, &self.current[i].digest);
+                        if (!self.changed[i]) return;
+                    }
+                }
                 const index = proofLower(self.proofs, old_id, false);
                 if (index < self.proofs.len and std.mem.eql(u8, &self.proofs[index].id, &old_id)) {
                     const i = self.proofs[index].index;
@@ -411,7 +485,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                 }
             }
         };
-        var diff: Diff = .{ .a = a, .out = out, .storage = pages.store(), .file_storage = file_storage, .provider = provider, .proofs = proofs, .prefix = prefix, .current = current, .changed = changed, .prior_changed = &prior_changed, .files = &files, .private = &private, .root = &root, .token = token, .stats = &stats };
+        var diff: Diff = .{ .a = a, .out = out, .storage = pages.store(), .file_storage = file_storage, .provider = provider, .census = census, .by_id = &native_by_id, .proofs = proofs, .prefix = prefix, .current = current, .changed = changed, .prior_changed = &prior_changed, .files = &files, .private = &private, .root = &root, .token = token, .stats = &stats };
         if (prior.?.files) |ref| {
             if (prior.?.file_summary == null or !diff.unchanged(prior.?.file_summary.?)) {
                 stats.prior_pages += 1;

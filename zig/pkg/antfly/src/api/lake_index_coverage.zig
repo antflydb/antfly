@@ -165,17 +165,21 @@ pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_ex
     var hash = Hash.init(.{});
     hash.update("native-lake-source-coverage-v1");
     try jsonPart(a, &hash, .{ .format = source.inventory.format, .source_id = source.inventory.source_id, .source_uri = source.inventory.source_uri, .snapshot_id = source.inventory.snapshot_id, .schema = source.inventory.schema_fingerprint });
-    const order = try a.alloc(usize, source.inventory.files.len);
+    const files = source.inventory.files;
+    const sorted = for (files, 0..) |file, i| {
+        if (i != 0 and std.mem.order(u8, files[i - 1].file_id, file.file_id) != .lt) break false;
+    } else true;
+    const order: []usize = if (sorted) &.{} else try a.alloc(usize, files.len);
     defer a.free(order);
     for (order, 0..) |*index, i| index.* = i;
-    std.mem.sort(usize, order, source.inventory, struct {
+    if (!sorted) std.mem.sort(usize, order, source.inventory, struct {
         fn less(inventory: local.serverless_external_source_types.Inventory, left: usize, right: usize) bool {
             return std.mem.order(u8, inventory.files[left].file_id, inventory.files[right].file_id) == .lt;
         }
     }.less);
-    word(&hash, order.len);
-    for (order) |index| {
-        const file = source.inventory.files[index];
+    word(&hash, files.len);
+    for (0..files.len) |position| {
+        const file = files[if (sorted) position else order[position]];
         part(&hash, file.file_id);
         part(&hash, file.object_uri);
         part(&hash, file.etag);

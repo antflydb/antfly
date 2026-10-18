@@ -517,7 +517,7 @@ const FusedDecimal = struct {
         index: u32,
         operation: union(enum) {
             constant: Lane,
-            decimal: @import("execution_batch.zig").DecimalColumn,
+            decimal: struct { column: @import("execution_batch.zig").DecimalColumn, limit: u128 },
             integer: @import("execution_batch.zig").PhysicalColumn,
             sign: struct { child: u16, negative: bool },
             binary: struct { left: u16, right: u16, op: Binary },
@@ -546,7 +546,7 @@ const FusedDecimal = struct {
             break :blk .{ .constant = .{ .coefficient = coefficient, .scale = scale } };
         } else switch (instruction.operation) {
             .column => |ordinal| blk: {
-                if (try self.source.decimalColumnSelected(self.a, ordinal, null)) |decimal| break :blk .{ .decimal = decimal };
+                if (try self.source.decimalColumnSelected(self.a, ordinal, null)) |decimal| break :blk .{ .decimal = .{ .column = decimal, .limit = try @import("../common/decimal128.zig").coefficientLimit(decimal.physical.vector.values.decimal128.precision, decimal.physical.vector.values.decimal128.scale) } };
                 const physical = (try self.source.physicalColumn(self.a, ordinal)) orelse return null;
                 if (physical.kind != .integer) return null;
                 try physical.validate();
@@ -582,9 +582,28 @@ const FusedDecimal = struct {
         for (programs, visited, self.roots) |program, done, *root| {
             if (done or program.output_type.element_type != .numeric or program.required_columns.len == 0 or program.output_type.numeric_modifier != null) continue;
             const begin = self.nodes.items.len;
-            root.* = try self.add(program, program.root, 0);
+            if (program.decimal_plan) |template| {
+                if (template.root == program.root and template.instructions.ptr == program.instructions.ptr and template.instructions.len == program.instructions.len) {
+                    var slots: [512]?u16 = @splat(null);
+                    for (template.steps, 0..) |step, i| slots[i] = try self.bindStep(program, step, &slots);
+                    root.* = slots[template.output];
+                } else root.* = try self.add(program, program.root, 0);
+            } else root.* = try self.add(program, program.root, 0);
             if (root.* == null) self.nodes.shrinkRetainingCapacity(begin);
         }
+    }
+    fn bindStep(self: *@This(), program: *const scalar.Program, step: @import("decimal_program.zig").Step, slots: []const ?u16) !?u16 {
+        if (self.nodes.items.len >= 512) return null;
+        for (self.nodes.items, 0..) |node, slot| if (DecimalArithmetic.same(program, step.index, node.program, node.index, 0)) return @intCast(slot);
+        const operation: @FieldType(Node, "operation") = switch (step.operation) {
+            .constant, .column => return self.add(program, step.index, 0),
+            .alias => |child| .{ .alias = slots[child] orelse return null },
+            .sign => |v| .{ .sign = .{ .child = slots[v.child] orelse return null, .negative = v.negative } },
+            .binary => |v| .{ .binary = .{ .left = slots[v.left] orelse return null, .right = slots[v.right] orelse return null, .op = v.op } },
+        };
+        const slot: u16 = @intCast(self.nodes.items.len);
+        try self.nodes.append(self.a, .{ .program = program, .index = step.index, .operation = operation });
+        return slot;
     }
     fn binary(left: Lane, right: Lane, op: Binary) !Lane {
         if (!left.valid or !right.valid) return .{ .valid = false };
@@ -614,12 +633,13 @@ const FusedDecimal = struct {
     fn evaluate(self: *@This(), row: usize, registers: []Lane) !void {
         for (self.nodes.items, registers) |node, *out| out.* = switch (node.operation) {
             .constant => |value| value,
-            .decimal => |decimal| blk: {
+            .decimal => |input| blk: {
+                const decimal = input.column;
                 const physical = decimal.physical.rowAt(row);
                 if (decimal.physical.vector.nulls.isNull(physical)) break :blk .{ .null = true };
                 const values = decimal.physical.vector.values.decimal128;
                 const scale = try decimal.scaleAt(row);
-                try @import("../common/decimal128.zig").validateCoefficient(values.values[physical], values.precision, scale);
+                if (scale > values.precision or @abs(values.values[physical]) >= input.limit) return error.InvalidDecimal128;
                 break :blk .{ .coefficient = values.values[physical], .scale = scale };
             },
             .integer => |physical| blk: {

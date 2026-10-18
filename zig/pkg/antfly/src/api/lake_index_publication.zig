@@ -241,8 +241,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         writer.deinit();
     };
     // The descriptor and source navigation negotiate the same identity epoch.
-    source.inventory.row_identity_version = 2;
-    source.scanner.inventory.row_identity_version = 2;
+    // Identity belongs to the pinned source binding, never the index build.
     try source.ensureCanonicalPlan(context);
     var inventory_view = source.inventory;
     var qualified_files: ?[]local.serverless_external_source_types.FileEntry = null;

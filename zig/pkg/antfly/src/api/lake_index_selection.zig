@@ -94,7 +94,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             break :loaded root_pin.?.value.*;
         } else try navigation.load(root_arena.allocator(), artifacts, ref, normalized, null);
         const expected_domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, store.identity, published.namespace);
-        if (!std.mem.eql(u8, &root.domain, &expected_domain) or root.count != source.fileCount() or
+        if (root.public_identity_version != source.inventory.row_identity_version or !std.mem.eql(u8, &root.domain, &expected_domain) or root.count != source.fileCount() or
             !std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.schema, source.inventory.schema_fingerprint) or
             !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id)) return error.InvalidExternalLakeIndexCoverage;
         try local.serverless_query_lake_scan_plan.validateBindingInventoryIdentity(binding, source.inventory);

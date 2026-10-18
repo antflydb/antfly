@@ -1862,3 +1862,84 @@ DECIMAL statistics and cold restart), 1,030 SQL checks, 468/151 lake checks,
 runtime I/O ABI, and 13 merged-main packaging tests. Latest merged main is
 `408644a861`. Archive-scale benchmarks and real-provider retention qualification
 remain deferred.
+
+### Stable identities and explicit Parquet snapshot commits
+
+The source binding owns `row_identity_version`. New attachments persist version
+2 before their first query; schema updates preserve the stored value, including
+when clients omit the read-only response field. Older bindings default to version
+1. Index creation, rebuild, removal, automatic fallback and restart do not select
+an identity epoch. Publication/navigation must agree with the pinned source's
+epoch before native access is admitted.
+
+Raw Parquet prefixes retain fresh object discovery. A reader cannot establish
+that an arbitrary prefix has not gained files by checking one cached listing or
+one existing object's ETag. Writers that need constant-size snapshot discovery
+can instead attach a URI ending in `.parquet-manifest.json`. This is an explicit
+commit protocol: the writer publishes immutable file-list chunks first, then
+atomically replaces the small head. Antfly does not modify the source.
+
+```json
+{
+  "version": 1,
+  "source_id": "events",
+  "file_count": 1,
+  "chunks": [{
+    "uri": "gs://lake/events/commits/chunk-<sha256>.json",
+    "sha256": "<64 lowercase hex digits>",
+    "byte_len": 2048,
+    "file_count": 1
+  }]
+}
+```
+
+Each chunk is a JSON array of file records with `file_id`, `object_uri`,
+`byte_len`, `row_count`, and `etag` and/or `version_id`. These must describe
+actual immutable object versions; footers and data reads still enforce their
+source/type contracts. A head admits at most 4,096 chunks/1,000,000 files and
+1 MiB of JSON. Each chunk admits at most 4,096 files and 8 MiB of JSON. Duplicate
+chunk locations, duplicate files, invalid counts and checksum mismatches fail
+closed. Chunk hashes, source interpretation and credential scope key shared
+metadata caches. A changed head's complete byte digest determines the source
+snapshot, so reusing a human snapshot label cannot conceal membership changes.
+
+Every open reads the head afresh. An exact publication-bound navigation proof
+can then provide selected file records without opening file-list chunks. Other
+reads prepare a persistent catalog, sharing unchanged chunks and path-copying
+changed file membership. Writers retain old chunks/data for active readers; an
+Antfly reader lease governs Antfly artifacts, not externally owned source GC.
+Filesystem fixtures use `file:///namespace/head.parquet-manifest.json`, with the
+head and chunks stored in the existing filesystem object-store namespace.
+
+### Incremental proof preparation
+
+Immutable Parquet manifest and Iceberg catalogs retain a bounded persistent
+file-proof census alongside their immutable chunk lineage. Refresh removes old
+chunk members and fingerprints added/replaced members, path-copying the affected
+proof-tree branches. Cached subtree count/XOR summaries answer prior publication
+range checks without constructing and sorting a new proof array or prefix-XOR
+array. The domain binds source/schema, artifact namespace and complete delete
+recipes/object versions. Changed delete evidence invalidates reuse and requires
+fresh fingerprints. Optional cache admission failure retains ordinary preparation.
+Unchanged compatible records are not reserialized while checking the delta.
+
+This reduces repeated proof hashing/sorting and temporary census storage. The
+legacy builders' flat file/changed arrays, inventory artifact serialization and
+canonical coverage hash still require linear work over the file inventory.
+Coverage can consume already ordered catalogs without another sort/index array.
+These refinements do not make every publication operation proportional to the
+delta, and do not treat cached proofs as authority over a fresh source commit.
+
+### Typed filter and decimal execution boundaries
+
+Runtime join filters normalize values to the declared SQL type before testing
+ranges or Bloom membership. In particular, Parquet DOUBLE storage exposed as
+REAL rounds before both operations, including dictionary lanes. Computed probes
+and identity probes share the same equality domain.
+
+Decimal scalar binding compiles immutable execution templates once. Templates
+own instruction ordinals and register topology, and retain no source columns,
+parameter values or request callbacks. Each batch binds its current views and
+parameters, preserving selection/null/overflow fallback semantics. Coefficient
+precision limits use a constant lookup table and are bound once per decimal
+input; no row loop recomputes powers of ten.

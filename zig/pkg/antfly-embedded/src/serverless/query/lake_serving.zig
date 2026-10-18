@@ -517,6 +517,7 @@ pub const ServingSource = struct {
     fn openCachedMode(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, lazy: bool, navigation: ?SnapshotNavigation) !ServingSource {
         try context.ensureActive();
         const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
+        const identity_version = options.row_identity_version orelse binding.row_identity_version;
         var store = try options.open(alloc, binding);
         errdefer store.deinit();
         const context_store = try alloc.create(@import("lake_read_context.zig").Store);
@@ -545,15 +546,56 @@ pub const ServingSource = struct {
         errdefer if (plan_lease == null) if (deletes) |*value| value.deinit(alloc);
         errdefer if (plan_lease) |lease| lease.release();
         var inventory = switch (binding.format) {
-            .parquet => try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
-                .client = client,
-                .bucket = store.bucket,
-                .prefix = store.prefix,
-                .source_id = binding.table_id,
-                .source_uri = binding.source_uri,
-                .object_uri_base = base,
-                .schema_fingerprint = binding.schema_fingerprint,
-            }),
+            .parquet => blk: {
+                if (!@import("lake_parquet_manifest.zig").isManifest(binding.source_uri)) break :blk try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
+                    .client = client,
+                    .bucket = store.bucket,
+                    .prefix = store.prefix,
+                    .source_id = binding.table_id,
+                    .source_uri = binding.source_uri,
+                    .object_uri_base = base,
+                    .schema_fingerprint = binding.schema_fingerprint,
+                });
+                const manifest_api = @import("lake_parquet_manifest.zig");
+                const manifest_uri = base orelse binding.source_uri;
+                const bytes = try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, manifest_uri, .iceberg_metadata, null, 1024 * 1024);
+                defer alloc.free(bytes);
+                var snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan = undefined;
+                if (cache) |shared| {
+                    const scope = try cacheScope(alloc, store, binding);
+                    const key = snapshotPlanKey(scope, manifest_uri, bytes, binding.snapshot_mode.pinnedSnapshotId());
+                    plan_identity = key;
+                    var loader: SnapshotPlanLoader = .{ .identity_version = identity_version, .client = client, .source = binding.table_id, .uri = manifest_uri, .attachment = binding.source_uri, .schema = binding.schema_fingerprint, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = bytes, .chunks = &shared.inventory_chunks, .catalogs = &shared.inventory_catalogs, .scope = scope, .context = context };
+                    if (navigation != null and binding.object_mutability == .immutable) {
+                        var header = try manifest_api.header(alloc, binding.table_id, binding.source_uri, binding.schema_fingerprint, bytes);
+                        header.row_identity_version = identity_version;
+                        var adopted = false;
+                        defer if (!adopted) header.deinit(alloc);
+                        file_navigation = try navigation.?.resolve(navigation.?.ptr, alloc, .{ .requested = key, .current = key, .selected = key }, header, context);
+                        if (file_navigation != null) {
+                            const metadata_copy = try alloc.dupe(u8, bytes);
+                            errdefer alloc.free(metadata_copy);
+                            const uri_copy = try alloc.dupe(u8, manifest_uri);
+                            errdefer alloc.free(uri_copy);
+                            const snapshot_copy = if (binding.snapshot_mode.pinnedSnapshotId()) |value| try alloc.dupe(u8, value) else null;
+                            deferred_snapshot = .{ .metadata = metadata_copy, .uri = uri_copy, .snapshot = snapshot_copy, .cache = shared, .key = key, .scope = scope };
+                            snapshot = .{ .inventory = header };
+                            adopted = true;
+                        }
+                    }
+                    if (file_navigation == null) {
+                        var identity_hash = std.crypto.hash.Blake3.init(.{});
+                        identity_hash.update(&key);
+                        identity_hash.update(&.{identity_version});
+                        var cache_key: [32]u8 = undefined;
+                        identity_hash.final(&cache_key);
+                        const lease = try shared.decoded.acquire(cache_key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load });
+                        plan_lease = lease;
+                        snapshot = lease.item.payload.snapshot;
+                    }
+                } else snapshot = try manifest_api.plan(alloc, .{ .client = client, .source = binding.table_id, .uri = binding.source_uri, .schema = binding.schema_fingerprint, .context = context }, bytes);
+                break :blk snapshot.inventory;
+            },
             .iceberg => blk: {
                 var catalog_table = if (binding.catalog != null) try options.resolveCatalog(alloc, binding, store, context) else null;
                 defer if (catalog_table) |*table| table.deinit(alloc);
@@ -584,12 +626,13 @@ pub const ServingSource = struct {
                     @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
                     const key = hash.finalResult();
                     plan_identity = key;
-                    var loader: SnapshotPlanLoader = .{ .identity_version = options.row_identity_version, .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .chunks = if (binding.object_mutability == .immutable) &shared.inventory_chunks else null, .catalogs = if (binding.object_mutability == .immutable) &shared.inventory_catalogs else null, .scope = scope, .context = context };
+                    var loader: SnapshotPlanLoader = .{ .identity_version = identity_version, .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .chunks = if (binding.object_mutability == .immutable) &shared.inventory_chunks else null, .catalogs = if (binding.object_mutability == .immutable) &shared.inventory_catalogs else null, .scope = scope, .context = context };
                     // Coalesce cold manifest discovery as well as warm residency.
                     // Waiters retain their own authority, cancellation and lease;
                     // the cache owns only the immutable inventory/delete plan.
                     if (navigation != null and binding.object_mutability == .immutable) {
                         var header = try @import("lake_iceberg_snapshot.zig").snapshotHeaderAlloc(alloc, .{ .client = client, .source_id = binding.table_id, .metadata_uri = uri, .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() }, metadata_bytes);
+                        header.row_identity_version = identity_version;
                         var adopted = false;
                         defer if (!adopted) header.deinit(alloc);
                         file_navigation = try navigation.?.resolve(navigation.?.ptr, alloc, .{ .requested = key, .current = snapshotPlanKey(scope, uri, metadata_bytes, null), .selected = snapshotPlanKey(scope, uri, metadata_bytes, header.snapshot_id) }, header, context);
@@ -609,7 +652,7 @@ pub const ServingSource = struct {
                     if (file_navigation == null) {
                         var identity_hash = std.crypto.hash.Blake3.init(.{});
                         identity_hash.update(&key);
-                        identity_hash.update(&.{options.row_identity_version});
+                        identity_hash.update(&.{identity_version});
                         var cache_key: [32]u8 = undefined;
                         identity_hash.final(&cache_key);
                         const lease = try shared.decoded.acquire(cache_key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load });
@@ -662,7 +705,7 @@ pub const ServingSource = struct {
         };
         errdefer if (plan_lease == null) inventory.deinit(alloc);
         if (plan_lease != null or file_navigation != null) try @import("lake_scan_plan.zig").validateBindingInventoryIdentity(binding, inventory) else try serverless_query.validateLakeBindingInventory(binding, inventory);
-        inventory.row_identity_version = options.row_identity_version;
+        inventory.row_identity_version = identity_version;
         var scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client);
         scanner.iceberg_delete_plan = deletes;
         const lazy_versions = cache != null and binding.format == .iceberg;
@@ -699,6 +742,8 @@ pub const ServingSource = struct {
         client: @import("../../storage/object_storage.zig").ObjectStorage,
         source: []const u8,
         uri: []const u8,
+        attachment: ?[]const u8 = null,
+        schema: []const u8 = "auto",
         snapshot: ?[]const u8,
         metadata: []const u8,
         manifests: ?*@import("lake_decoded_cache.zig").Cache = null,
@@ -708,7 +753,10 @@ pub const ServingSource = struct {
         context: @import("lake_read_context.zig").Context = .{},
         fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const decoded = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .inventory_chunks = self.chunks, .catalogs = self.catalogs, .manifest_scope = self.scope, .context = self.context }, self.metadata);
+            const decoded = if (@import("lake_parquet_manifest.zig").isManifest(self.uri))
+                try @import("lake_parquet_manifest.zig").plan(item.budget.allocator(), .{ .client = self.client, .source = self.source, .uri = self.attachment orelse self.uri, .schema = self.schema, .chunks = self.chunks, .catalogs = self.catalogs, .scope = self.scope, .context = self.context }, self.metadata)
+            else
+                try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .inventory_chunks = self.chunks, .catalogs = self.catalogs, .manifest_scope = self.scope, .context = self.context }, self.metadata);
             item.payload = .{ .snapshot = decoded };
             item.payload.snapshot.inventory.row_identity_version = self.identity_version;
             if (item.payload.snapshot.catalog) |index| item.foreign_bytes +|= index.footprint();
@@ -762,7 +810,7 @@ pub const ServingSource = struct {
             hash.update("iceberg-full-scan-plan-v1");
             hash.update(&frozen.key);
             hash.update(&.{self.inventory.row_identity_version});
-            var loader: SnapshotPlanLoader = .{ .identity_version = self.inventory.row_identity_version, .client = self.scanner.object_reader.client, .source = self.inventory.source_id, .uri = frozen.uri, .snapshot = frozen.snapshot, .metadata = frozen.metadata, .manifests = &frozen.cache.manifests, .chunks = &frozen.cache.inventory_chunks, .scope = frozen.scope, .context = context };
+            var loader: SnapshotPlanLoader = .{ .identity_version = self.inventory.row_identity_version, .client = self.scanner.object_reader.client, .source = self.inventory.source_id, .uri = frozen.uri, .attachment = self.inventory.source_uri, .schema = self.inventory.schema_fingerprint, .snapshot = frozen.snapshot, .metadata = frozen.metadata, .manifests = &frozen.cache.manifests, .chunks = &frozen.cache.inventory_chunks, .scope = frozen.scope, .context = context };
             const lease = frozen.cache.decoded.acquire(hash.finalResult(), 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load }) catch |err| switch (err) {
                 error.OutOfMemory, error.SqlMemoryLimitExceeded => return self.privateFrozenInventory(frozen, context),
                 else => return err,
@@ -796,7 +844,10 @@ pub const ServingSource = struct {
         const identity_version = self.inventory.row_identity_version;
         const snapshot = try self.alloc.create(@import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan);
         errdefer self.alloc.destroy(snapshot);
-        snapshot.* = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(self.alloc, .{ .client = self.scanner.object_reader.client, .source_id = self.inventory.source_id, .metadata_uri = frozen.uri, .requested_snapshot_id = frozen.snapshot, .manifests = &frozen.cache.manifests, .inventory_chunks = &frozen.cache.inventory_chunks, .manifest_scope = frozen.scope, .context = context }, frozen.metadata);
+        snapshot.* = if (@import("lake_parquet_manifest.zig").isManifest(frozen.uri))
+            try @import("lake_parquet_manifest.zig").plan(self.alloc, .{ .client = self.scanner.object_reader.client, .source = self.inventory.source_id, .uri = self.inventory.source_uri, .schema = self.inventory.schema_fingerprint, .chunks = &frozen.cache.inventory_chunks, .scope = frozen.scope, .context = context }, frozen.metadata)
+        else
+            try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(self.alloc, .{ .client = self.scanner.object_reader.client, .source_id = self.inventory.source_id, .metadata_uri = frozen.uri, .requested_snapshot_id = frozen.snapshot, .manifests = &frozen.cache.manifests, .inventory_chunks = &frozen.cache.inventory_chunks, .manifest_scope = frozen.scope, .context = context }, frozen.metadata);
         errdefer snapshot.deinit(self.alloc);
         const uri = try self.alloc.dupe(u8, self.inventory.source_uri);
         errdefer self.alloc.free(uri);

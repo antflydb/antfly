@@ -16538,8 +16538,7 @@ pub const ApiHttpServer = struct {
         };
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = config, .secret_store = self.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
         try self.prepareLakeCache();
-        var source_options = options.lakeOptions();
-        source_options.row_identity_version = 2;
+        const source_options = options.lakeOptions();
         var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema.external_base_source }, source_options, context, &self.lake_read_cache);
         defer source.deinit();
         try source.attachCache(&self.lake_read_cache, schema.external_base_source.?.binding, context);
@@ -16911,9 +16910,12 @@ pub const ApiHttpServer = struct {
     /// an FK and drop/recreate cannot silently attach it to a different table.
     pub fn bindForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed_json: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
         const normalized = try context.platformDeadline();
-        const inferred = if (before.len == 0) try @import("lake_schema_detection.zig").prepare(alloc, proposed_json, .{ .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store }, .{ .io = self.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }) else null;
+        const bound_identity = try @import("lake_schema_detection.zig").bindIdentity(alloc, proposed_json, before);
+        defer if (bound_identity) |bytes| alloc.free(bytes);
+        const identity_proposed = bound_identity orelse proposed_json;
+        const inferred = if (before.len == 0) try @import("lake_schema_detection.zig").prepare(alloc, identity_proposed, .{ .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store }, .{ .io = self.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }) else null;
         defer if (inferred) |bytes| alloc.free(bytes);
-        const proposed = inferred orelse proposed_json;
+        const proposed = inferred orelse identity_proposed;
         if (self.source.vtable.system_catalog == null) {
             if (!try foreignKeyParentsAllowed(alloc, identity, proposed)) return error.Forbidden;
             return alloc.dupe(u8, proposed);
