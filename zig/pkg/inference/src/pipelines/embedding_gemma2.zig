@@ -1804,8 +1804,6 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         return .{ .vectors = vectors, .input_tokens = token_counts, .execution = .serial };
     }
     if (clips.len == 0) return .{ .vectors = vectors, .input_tokens = token_counts, .execution = .serial };
-    if (lock) |gate| try control.lock(gate);
-    defer if (lock) |gate| gate.unlock();
     var slots: [2]prep.Wave = undefined;
     var live: [2]bool = @splat(false);
     defer for (&slots, live) |*slot, exists| if (exists) slot.deinit();
@@ -1834,7 +1832,11 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             }
         }
         if (options.timings) |t| t.max_prepared_audio = @max(t.max_prepared_audio, slot.clips.len + if (options.prepare_ahead) next_count else 0);
-        try consumePreparedAudios(out, slot, tokenizer, cfg, options, vectors[offset..][0..slot.consumed], token_counts[offset..][0..slot.consumed], &observation, if (next_count > 0 and options.prepare_ahead) &slots[next] else null);
+        if (slot.retained > 0) {
+            if (lock) |gate| try control.lock(gate);
+            defer if (lock) |gate| gate.unlock();
+            try consumePreparedAudios(out, slot, tokenizer, cfg, options, vectors[offset..][0..slot.consumed], token_counts[offset..][0..slot.consumed], &observation, if (next_count > 0 and options.prepare_ahead) &slots[next] else null);
+        }
         slot.deinit();
         live[current] = false;
         offset = next_offset;

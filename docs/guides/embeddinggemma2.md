@@ -1332,11 +1332,16 @@ and coefficient buffers. They retain no request tensors, allocators, or weight
 pins. Sixteen admitted geometry/range entries cover singleton execution and all
 twelve possible cohort frame groups; recurrent shapes receive priority over
 one-off requests. Model pressure releases schedules before their model entries.
-Small coefficients share a packed buffer (at most 4 MiB per plan). Non-escaping
-linear outputs share a lifetime-planned private arena (at most 64 MiB per plan);
-view ancestors extend lifetimes and returned storage remains independently owned.
+Capture uses request-local scratch; retained instruction/constant arrays are
+sized to the actual capture. Small coefficients share a packed buffer (at most
+4 MiB per plan). Non-escaping linear and nonlinear outputs share a lifetime-planned
+private arena (at most 64 MiB per plan), with model-owned tensor descriptors reused
+on replay. View ancestors extend lifetimes; returned storage remains independently
+owned. Oversized geometries retain ordinary output allocation.
 Host metadata and physical device allocations are admitted before retention,
-including driver padding. Denied optional preparation preserves eager results.
+including driver padding. Denied optional preparation preserves eager results
+and retries with bounded backoff, so a transient denial cannot permanently lose
+prepared bindings or the arena.
 
 Replay checks current request control at every instruction and uses shared
 compute encoders within each existing command frame. Cohorts keep their bounded
@@ -1349,6 +1354,20 @@ Commands are still encoded per execution; this is not a GPU command graph.
 Transposed depthwise coefficients use the model preparation cache across weight
 sources. `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
 
+The Metal backbone uses model-owned indexed coefficient bindings and projection
+slots across text and media requests. Norm coefficients share one admitted
+buffer; layer scalars remain validated host values. Model pressure drops these
+bindings before releasing language projection slots. A two-entry LRU retains
+full-mask attention ranges, positions and aligned device metadata, keyed by
+batch, sequence length and window. Warm reuse allocates no request descriptors
+or upload buffers; padded or sparse masks retain dynamic preparation. Geometry
+storage shares model admission and pressure cleanup. Optional preparation can
+retry after admission pressure clears. CPU audio waves prepare and wait outside
+the execution gate; each ready wave acquires it for device execution and releases
+it before waiting for the next wave. Invalid CPU inputs require no execution
+lease. Preparation leases, cancellation checks and ordered output ownership
+remain in force.
+
 The optional `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN=1` ordered-media oracle
 run repeats singleton and cohort audio embeddings, checks every vector against the pinned
 checkpoint oracle, and rejects unsupported schedule capture. Route counters
@@ -1356,12 +1375,29 @@ must demonstrate replay before treating the run as replay qualification.
 
 Pretrained Metal qualification covers a 492-instruction singleton schedule
 with 96 prepared linear slots, 132 retained coefficient bindings and zero named
-lookups during replay. Its linear arena is 400 KiB. Three four-layer cohort
-schedules each prepare 32 slots and 44 coefficient bindings, with zero named
-lookups and an 800 KiB arena. Repeated singleton and cohort vectors must pass
-the same pinned checkpoint oracle. Encoding diagnostics report actual compute
-encoder counts; completed embedding latency includes the backbone. A local
-M4 Max Debug run reduced singleton compute encoders from 372 to 109 and cohort
-encoders from 124 to 37 per group. Interleaved eager/replay completed medians
-were 34.5/27.9 ms for singleton and 32.1/29.1 ms for two clips. Debug qualification
-timings do not establish production throughput or PyTorch parity.
+lookups during replay. The full output arena is 1,200 KiB; retained host bytes
+including descriptors are about 782 KiB. Three four-layer cohort schedules each
+prepare 32 slots and 44 coefficient bindings, with zero named lookups, a
+2,400 KiB arena and about 264 KiB retained host bytes. Repeated singleton,
+cohort and two-wave public audio calls pass the pinned checkpoint oracle.
+The backbone shares 170 norm coefficient bindings in one 304 KiB allocation,
+with validated scalars and 144 indexed projection hits per warmed forward pass
+for the pinned model. Bindings survive request wrappers and yield to model pressure.
+
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION=1` adds an offline, completed
+comparison to the ordered-media oracle. It alternates phase order across two
+rounds, warms each route, collects twelve samples per route and validates every
+vector. Use a ReleaseFast test binary. The baseline disables prepared backbone
+bindings and selects the earlier linear-only arena policy; the optimized route
+uses indexed backbone bindings and reusable descriptors for nonlinear outputs.
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PREPARED_BACKBONE=1` and
+`ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA=1` select those diagnostic
+policies independently. Audio arena policy participates in the schedule key.
+
+Two local M4 Max ReleaseFast comparisons passed every reference vector. Completed
+singleton medians were 28.53 → 27.37 ms and 25.22 → 23.05 ms; two-clip cohort
+medians were 34.50 → 28.44 ms and 26.38 → 25.09 ms. Each comparison used twelve
+samples per route after warmup, with phase order reversed between rounds.
+The measured gains vary with host load: about 4–9% for singleton audio and 5–18%
+for this cohort fixture. These measurements compare native execution policies;
+they do not establish a speed comparison against PyTorch.

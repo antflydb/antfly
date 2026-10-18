@@ -49524,7 +49524,7 @@ pub fn decoderRuntimeNormClamped(self: anytype, input: MetalTensor, weight: Meta
     errdefer output.deinit();
     return finishDeviceOutput(&output, antfly_metal_norm_clamp(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), &p, output.deviceHandle(), output.deviceByteOffset()));
 }
-extern fn antfly_metal_norm_clamp(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, params: *const @import("../ops/ops.zig").NormClampParams, output: ?*anyopaque, output_offset: usize) c_int;
+pub extern fn antfly_metal_norm_clamp(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, params: *const @import("../ops/ops.zig").NormClampParams, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn antfly_metal_audio_norm_clamp_launches(runtime: ?*RawMetalDecodeRuntime) u64;
 
 pub extern fn antfly_metal_audio_storage_admission(runtime: ?*RawMetalDecodeRuntime, context: ?*anyopaque, admit: ?*const fn (?*anyopaque, usize) callconv(.c) c_int, release: ?*const fn (?*anyopaque, usize) callconv(.c) void) void;

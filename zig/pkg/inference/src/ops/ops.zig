@@ -2056,6 +2056,12 @@ pub const ComputeBackend = struct {
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        embeddingModelVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingModelVisibility = null,
+        embeddingModelPrepare: ?*const fn (ctx: *anyopaque, layers: usize) anyerror!void = null,
+        embeddingModelWeight: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight) ?CT = null,
+        embeddingModelScalar: ?*const fn (ctx: *anyopaque, layer: usize) ?f32 = null,
+        embeddingModelLinear: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelProjection, input: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
+        audioNodeInto: ?*const fn (ctx: *anyopaque, node: *const anyopaque, values: []const ?CT, output: CT) anyerror!bool = null,
         audioPreparedLinear: ?*const fn (ctx: *anyopaque, input: CT, slot: usize, rows: usize, in_dim: usize, out_dim: usize, clip: ?ClippedLinearParams, output: ?CT) anyerror!?CT = null,
         audioArenaView: ?*const fn (ctx: *anyopaque, arena: CT, offset: usize, rows: usize, dim: usize) anyerror!CT = null,
         audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
@@ -6402,4 +6408,97 @@ pub const AudioPadParams = extern struct {
     width: u32,
     output_rows: u32,
     valid_rows: [4]u32,
+};
+
+/// Immutable EmbeddingGemma2 bindings, indexed independently of request shapes.
+pub const EmbeddingModelWeight = enum {
+    input_norm,
+    post_attention_norm,
+    pre_ffn_norm,
+    post_ffn_norm,
+    post_ple_norm,
+    q_norm,
+    k_norm,
+    final_norm,
+    ple_norm,
+    pub fn suffix(self: @This()) []const u8 {
+        return switch (self) {
+            .input_norm => "input_layernorm.weight",
+            .post_attention_norm => "post_attention_layernorm.weight",
+            .pre_ffn_norm => "pre_feedforward_layernorm.weight",
+            .post_ffn_norm => "post_feedforward_layernorm.weight",
+            .post_ple_norm => "ple_block.post_per_layer_input_norm.weight",
+            .q_norm => "self_attn.q_norm.weight",
+            .k_norm => "self_attn.k_norm.weight",
+            .final_norm => "language_model.norm.weight",
+            .ple_norm => "language_model.ple.per_layer_projection_norm.weight",
+        };
+    }
+    pub fn fromSuffix(comptime name: []const u8) ?@This() {
+        inline for (comptime std.meta.tags(@This()).*) |tag| {
+            if (std.mem.eql(u8, name, tag.suffix())) return tag;
+        }
+        return null;
+    }
+    pub fn index(self: @This(), layer: usize) usize {
+        const id: usize = @backingInt(self);
+        return if (id < 7) layer * 7 + id else 24 * 7 + id - 7;
+    }
+};
+pub const EmbeddingModelProjection = enum {
+    q,
+    k,
+    v,
+    attention_out,
+    gate,
+    up,
+    down,
+    ple_gate,
+    ple_out,
+    packed_qkv,
+    packed_ffn,
+    pub fn suffix(self: @This()) []const u8 {
+        return switch (self) {
+            .q => "self_attn.q_proj.weight",
+            .k => "self_attn.k_proj.weight",
+            .v => "self_attn.v_proj.weight",
+            .attention_out => "self_attn.o_proj.weight",
+            .gate => "mlp.gate_proj.weight",
+            .up => "mlp.up_proj.weight",
+            .down => "mlp.down_proj.weight",
+            .ple_gate => "ple_block.per_layer_input_gate.weight",
+            .ple_out => "ple_block.per_layer_projection.weight",
+            .packed_qkv, .packed_ffn => "",
+        };
+    }
+    pub fn fromSuffix(comptime name: []const u8) ?@This() {
+        inline for (comptime std.meta.tags(@This()).*) |tag| {
+            if (std.mem.eql(u8, name, tag.suffix())) return tag;
+        }
+        return null;
+    }
+};
+
+test "embeddinggemma2 indexed model bindings cover distinct layers and global coefficients" {
+    try std.testing.expectEqual(EmbeddingModelWeight.q_norm, EmbeddingModelWeight.fromSuffix("self_attn.q_norm.weight").?);
+    try std.testing.expectEqual(EmbeddingModelProjection.ple_out, EmbeddingModelProjection.fromSuffix("ple_block.per_layer_projection.weight").?);
+    var seen: [170]bool = @splat(false);
+    for (std.meta.tags(EmbeddingModelWeight)) |kind| {
+        const count: usize = if (@backingInt(kind) < 7) 24 else 1;
+        for (0..count) |layer| {
+            const index = kind.index(layer);
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+        }
+    }
+    for (seen) |value| try std.testing.expect(value);
+}
+
+pub const EmbeddingModelVisibility = struct {
+    ranges: []u32,
+    windowed: []u32,
+    positions: []i32,
+    gather: []i64,
+    global_metadata: CT,
+    window_metadata: CT,
 };

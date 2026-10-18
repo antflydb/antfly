@@ -539,11 +539,16 @@ and coefficient buffers. They retain no request tensors, allocators, or weight
 pins. Sixteen admitted geometry/range entries cover singleton execution and all
 twelve possible cohort frame groups; recurrent shapes receive priority over
 one-off requests. Model pressure releases schedules before their model entries.
-Small coefficients share a packed buffer (at most 4 MiB per plan). Non-escaping
-linear outputs share a lifetime-planned private arena (at most 64 MiB per plan);
-view ancestors extend lifetimes and returned storage remains independently owned.
+Capture uses request-local scratch; retained instruction/constant arrays are
+sized to the actual capture. Small coefficients share a packed buffer (at most
+4 MiB per plan). Non-escaping linear and nonlinear outputs share a lifetime-planned
+private arena (at most 64 MiB per plan), with model-owned tensor descriptors reused
+on replay. View ancestors extend lifetimes; returned storage remains independently
+owned. Oversized geometries retain ordinary output allocation.
 Host metadata and physical device allocations are admitted before retention,
-including driver padding. Denied optional preparation preserves eager results.
+including driver padding. Denied optional preparation preserves eager results
+and retries with bounded backoff, so a transient denial cannot permanently lose
+prepared bindings or the arena.
 
 Replay checks current request control at every instruction and uses shared
 compute encoders within each existing command frame. Cohorts keep their bounded
@@ -555,3 +560,17 @@ down for eight visits before retrying; a winning plan resamples after 64 visits.
 Commands are still encoded per execution; this is not a GPU command graph.
 Transposed depthwise coefficients use the model preparation cache across weight
 sources. `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
+
+The Metal backbone uses model-owned indexed coefficient bindings and projection
+slots across text and media requests. Norm coefficients share one admitted
+buffer; layer scalars remain validated host values. Model pressure drops these
+bindings before releasing language projection slots. A two-entry LRU retains
+full-mask attention ranges, positions and aligned device metadata, keyed by
+batch, sequence length and window. Warm reuse allocates no request descriptors
+or upload buffers; padded or sparse masks retain dynamic preparation. Geometry
+storage shares model admission and pressure cleanup. Optional preparation can
+retry after admission pressure clears. CPU audio waves prepare and wait outside
+the execution gate; each ready wave acquires it for device execution and releases
+it before waiting for the next wave. Invalid CPU inputs require no execution
+lease. Preparation leases, cancellation checks and ordered output ownership
+remain in force.

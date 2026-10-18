@@ -32,23 +32,41 @@ pub const Plan = struct {
     replay_ns: u64 = 0,
     selection: Selection = .{},
     host_bytes: usize = @sizeOf(Plan),
+    metadata_bytes: usize = @sizeOf(Plan),
+    metadata_owned: bool = false,
+    retry_after: u64 = 0,
+    retry_delay: u8 = 1,
+    outputs: []?CT = &.{},
     backend_bytes: usize = 0,
     arena: ?CT = null,
     arena_size: usize = 0,
     drop_ct: ?*const fn (CT) void = null,
     prepared: bool = false,
-    nodes: [1024]Node = undefined,
+    linear_only: bool = false,
+    nodes: []Node = &.{},
     count: usize = 0,
-    constants: [512]Constant = undefined,
+    constants: []Constant = &.{},
     constant_count: usize = 0,
     last_use: [capacity]u16 = @splat(0),
     next_id: u16 = 0,
     output: u16 = 0,
     pub fn deinit(self: *Plan) void {
+        self.dropPrepared();
+        if (self.metadata_owned) {
+            std.heap.c_allocator.free(self.nodes);
+            std.heap.c_allocator.free(self.constants);
+            std.heap.c_allocator.free(self.outputs);
+        }
+    }
+    pub fn dropPrepared(self: *Plan) void {
         if (self.drop_ct) |drop| {
             for (self.constants[0..self.constant_count]) |*c| if (c.bound) |ct| {
                 drop(ct);
                 c.bound = null;
+            };
+            for (self.outputs) |*output| if (output.*) |ct| {
+                drop(ct);
+                output.* = null;
             };
             if (self.arena) |ct| drop(ct);
         }
@@ -78,8 +96,8 @@ pub const Plan = struct {
         var peak: usize = 0;
         for (self.nodes[0..self.count], 0..) |*node, i| {
             node.arena_offset = null;
-            if (node.prepared_slot == null or escaping[node.output]) continue;
-            const d = node.linearDimensions() orelse continue;
+            if (escaping[node.output] or (self.linear_only and node.prepared_slot == null)) continue;
+            const d = node.outputDimensions() orelse continue;
             const bytes = try std.math.mul(usize, try std.math.mul(usize, d.rows, d.out_dim), 4);
             const size = std.mem.alignForward(usize, bytes, 4096);
             var best: ?usize = null;
@@ -117,20 +135,21 @@ pub const Plan = struct {
         }
         for (self.nodes[0..self.count], 0..) |*node, i| {
             try cb.checkExecutionControl();
-            var hint: ?CT = null;
-            if (self.arena) |arena| if (node.arena_offset) |offset| {
-                const d = node.linearDimensions().?;
+            const persistent = self.outputs.len > i and self.outputs[i] != null;
+            var hint: ?CT = if (persistent) self.outputs[i] else null;
+            if (!persistent) if (self.arena) |arena| if (node.arena_offset) |offset| {
+                const d = node.outputDimensions().?;
                 if (cb.vtable.audioArenaView) |view| hint = try view(cb.ptr, arena, offset, d.rows, d.out_dim);
             };
             const result = node.run(cb, &values, hint) catch |err| {
-                if (hint) |ct| cb.free(ct);
+                if (!persistent) if (hint) |ct| cb.free(ct);
                 return err;
             };
-            if (hint) |ct| if (result != ct) {
+            if (!persistent) if (hint) |ct| if (result != ct) {
                 cb.free(ct);
             };
             values[node.output] = result;
-            owned[node.output] = true;
+            owned[node.output] = !persistent or result != hint.?;
             for (node.inputs[0..node.input_count]) |id| {
                 if (id != self.output and self.last_use[id] == i and owned[id]) {
                     cb.free(values[id].?);
@@ -148,7 +167,11 @@ pub const Capture = struct {
     plan: *Plan,
     failed: bool = false,
     handles: [capacity]?CT = @splat(null),
+    nodes: [1024]Node = undefined,
+    constants: [512]Constant = undefined,
     pub fn init(plan: *Plan, inputs: []const CT) Capture {
+        std.debug.assert(!plan.metadata_owned);
+        plan.last_use = @splat(0);
         plan.count = 0;
         plan.constant_count = 0;
         plan.next_id = @intCast(inputs.len);
@@ -171,6 +194,7 @@ pub const Capture = struct {
         self.plan.next_id += 1;
         var c = Constant{ .id = id, .model = model, .name = undefined, .len = @intCast(name.len) };
         @memcpy(c.name[0..name.len], name);
+        self.plan.constants = &self.constants;
         self.plan.constants[self.plan.constant_count] = c;
         self.plan.constant_count += 1;
         self.handles[id] = ct;
@@ -187,6 +211,7 @@ pub const Capture = struct {
         self.plan.next_id += 1;
         for (n.inputs[0..n.input_count]) |id| self.plan.last_use[id] = @intCast(self.plan.count);
         self.handles[n.output] = ct;
+        self.plan.nodes = &self.nodes;
         self.plan.nodes[self.plan.count] = n;
         self.plan.count += 1;
     }
@@ -204,6 +229,8 @@ pub const Capture = struct {
 pub const LinearDimensions = struct { rows: usize, in_dim: usize, out_dim: usize };
 pub const Node = struct {
     prepared_slot: ?usize = null,
+    output_rows: usize = 0,
+    output_dim: usize = 0,
     arena_offset: ?usize = null,
     output: u16 = 0,
     inputs: [8]u16 = @splat(0),
@@ -225,6 +252,15 @@ pub const Node = struct {
         sliceLastDim: struct { tensor: u16, start: usize, stop: usize },
         linearPackedNamed: struct { input: u16, names_storage: [3][192]u8, names_lengths: [3]u16, name_count: u8, widths: [3]usize, rows: usize, in_dim: usize },
     },
+    pub fn outputDimensions(self: *const Node) ?LinearDimensions {
+        switch (self.args) {
+            .linearNoBias, .clippedLinear, .linearPackedNamed => if (self.prepared_slot == null) return null,
+            else => {},
+        }
+        if (self.output_rows != 0 and self.output_dim != 0) return .{ .rows = self.output_rows, .in_dim = 0, .out_dim = self.output_dim };
+        if (self.prepared_slot != null) return self.linearDimensions();
+        return null;
+    }
     pub fn linearDimensions(self: *const Node) ?LinearDimensions {
         return switch (self.args) {
             .linearNoBias => |a| .{ .rows = a.rows, .in_dim = a.in_dim, .out_dim = a.out_dim },
@@ -251,6 +287,9 @@ pub const Node = struct {
                 else => null,
             };
             return (try linear(cb.ptr, values[id].?, slot, d.rows, d.in_dim, d.out_dim, p, hint)) orelse error.AudioSchedulePreparedSlotMissing;
+        };
+        if (hint) |output| if (cb.vtable.audioNodeInto) |into| {
+            if (try into(cb.ptr, self, values, output)) return output;
         };
         switch (self.args) {
             .rmsNorm => |a| {
@@ -450,7 +489,8 @@ test "embeddinggemma2 audio selection rejects isolated outliers and retries afte
 test "embeddinggemma2 audio arena extends view lifetimes and excludes escaping storage" {
     const plan = try std.testing.allocator.create(Plan);
     defer std.testing.allocator.destroy(plan);
-    plan.* = .{ .count = 4, .output = 5 };
+    var nodes: [4]Node = undefined;
+    plan.* = .{ .nodes = &nodes, .count = 4, .output = 5 };
     plan.nodes[0] = .{ .output = 2, .prepared_slot = 0, .args = .{ .linearNoBias = .{ .input = 0, .weight = 1, .rows = 1, .in_dim = 2, .out_dim = 2 } } };
     plan.nodes[1] = .{ .output = 3, .args = .{ .sliceLastDim = .{ .tensor = 2, .start = 0, .stop = 1 } } };
     plan.nodes[2] = .{ .output = 4, .prepared_slot = 1, .args = .{ .linearNoBias = .{ .input = 0, .weight = 1, .rows = 1, .in_dim = 2, .out_dim = 2 } } };
