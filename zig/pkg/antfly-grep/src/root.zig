@@ -124,6 +124,7 @@ fn retainedClone(comptime T: type, a: Allocator, value: T, depth: usize) error{ 
 const Region = @import("regions.zig").Region;
 const ExternalDictionary = @import("external_dictionary.zig").Shared;
 pub const Search = struct {
+    coalescer: decision.Coalescer = .{},
     spill: ?*Spill = null,
     owns_spill: bool = false,
     discovery_stream: bool = false,
@@ -132,6 +133,7 @@ pub const Search = struct {
     inventory_bytes: u64 = 0,
     inventory_reserved: usize = 0,
     inventory_count: usize = 0,
+    discovery_decider: ?*decision.Client = null,
     source_views: ?*@import("source_views.zig").Store = null,
     ranking: ?*Ranking = null,
     owns_ranking: bool = false,
@@ -203,12 +205,17 @@ pub const Search = struct {
         const matcher = try root.matcher.clone(root.a);
         var result: Search = .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
         result.decider.shareCache(&root.decider);
+        result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
         result.spill = root.spill;
         result.source_cache_state.views = root.source_cache_state.views;
         return result;
     }
     pub fn deinit(self: *Search) void {
+        if (self.discovery_decider) |client| {
+            client.deinit();
+            self.a.destroy(client);
+        }
         if (self.input_buffer) |buffer| self.a.free(buffer);
         if (self.index_worker) |worker| {
             worker.deinit();
@@ -227,7 +234,7 @@ pub const Search = struct {
         _ = self.limits.spill_bytes.fetchSub(self.inventory_reserved, .monotonic);
         if (self.dictionary) |dictionary| dictionary.release();
         if (self.source_views) |views| {
-            views.deinit();
+            views.deinit(self.io);
             self.a.destroy(views);
         }
         self.output_buffer.deinit(self.a);
@@ -361,6 +368,12 @@ pub const Search = struct {
             self.summary.complete = false;
             try self.reportError("<search>", error.Canceled);
         }
+        if (self.discovery_decider) |client| {
+            self.decider.requests += client.requests;
+            self.decider.cache_hits += client.cache_hits;
+            self.decider.input_tokens += client.input_tokens;
+            self.decider.output_tokens += client.output_tokens;
+        }
         const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0;
         const human = try std.fmt.allocPrint(self.a, "{d:.6}s", .{seconds});
@@ -482,6 +495,7 @@ pub const Search = struct {
         }
         try spill.visit(self, struct {
             fn row(search: *Search, entry: @import("spill.zig").Entry) !void {
+                try search.rankedBoundary(search.options.filename orelse true);
                 if (entry.length > search.options.max_output_bytes - search.output_bytes) return error.OutputBudgetExceeded;
                 try search.spill.?.stream(entry, search, Search.write);
             }
@@ -612,6 +626,7 @@ pub const Search = struct {
         growth_failed: bool = false,
         fn start(root: *Search) !*Pipeline {
             const jobs = if (root.single_source or root.options.max_regions != std.math.maxInt(usize)) 1 else root.fileJobs();
+            if (jobs > 1 and root.options.ask != null) root.decider.coalescer = &root.coalescer;
             const self = try root.a.create(Pipeline);
             errdefer root.a.destroy(self);
             const slots = try root.a.alloc(Task, @min(256, jobs *| 4));
@@ -786,17 +801,10 @@ pub const Search = struct {
                 local.result_ordinal = task.ordinal;
                 const reserved_before = local.reserved_output;
                 local.file(task.path, task.display) catch |err| {
-                    local.reportError(task.display, err) catch |failure| {
-                        if (root.spill != null and err == error.OutputBudgetExceeded and (failure == error.OutputBudgetExceeded or failure == error.PendingOutputBudgetExceeded)) {
-                            // reportError already marks the search partial and
-                            // cancels producers. Keep its complete record prefix.
-                            local.retaining_output = false;
-                            if (!root.options.no_messages) std.debug.print("antfly-grep: {s}: {s}\n", .{ task.display, @errorName(err) });
-                        } else {
-                            streaming.release();
-                            ctx.fail(failure);
-                            return;
-                        }
+                    local.reportStagedError(task.display, err) catch |failure| {
+                        streaming.release();
+                        ctx.fail(failure);
+                        return;
                     };
                 };
                 task.score = local.best_probability;
@@ -876,8 +884,18 @@ pub const Search = struct {
     };
     pub fn directoryAllowed(self: *Search, path_name: []const u8) !bool {
         if ((!self.options.triage and !self.options.jev_mode) or self.options.ask == null or self.options.broad) return true;
-        if (self.pipeline) |pool| pool.context.mutex.lockUncancelable(self.io);
-        defer if (self.pipeline) |pool| pool.context.mutex.unlock(self.io);
+        // Discovery owns its client. Provider latency must never hold the
+        // result/publication mutex; counters merge only after workers join.
+        const client = self.discovery_decider orelse blk: {
+            const c = try self.a.create(decision.Client);
+            c.* = decision.Client.init(self.a, self.io, self.options);
+            c.shareCache(&self.decider);
+            c.shared_local = self.decider.local;
+            c.limits = &self.limits;
+            c.stage = .directory;
+            self.discovery_decider = c;
+            break :blk c;
+        };
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
@@ -893,11 +911,8 @@ pub const Search = struct {
             n += 1;
             if (n == 200) break;
         }
-        const old = self.decider.stage;
-        defer self.decider.stage = old;
-        self.decider.stage = .directory;
         var scores: [1]f64 = undefined;
-        try self.decider.search(&.{.{ .id = "directory", .input = listing.written() }}, &scores);
+        try client.search(&.{.{ .id = "directory", .input = listing.written() }}, &scores);
         return scores[0] >= @min(self.options.threshold, 0.25);
     }
     fn searchPath(self: *Search, name: []const u8) !void {
@@ -1009,6 +1024,24 @@ pub const Search = struct {
         try self.jsonEnd(display, before);
         if (self.deferred_candidate) |c| c.elapsed_ns = if (self.file_started) |start| @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)) else 0;
     }
+    fn reportStagedError(self: *Search, path: []const u8, err: anyerror) !void {
+        self.reportError(path, err) catch |failure| {
+            if ((err == error.OutputBudgetExceeded or err == error.PendingOutputBudgetExceeded) and
+                (failure == error.OutputBudgetExceeded or failure == error.PendingOutputBudgetExceeded))
+            {
+                // Already-complete JSON records remain owned by the staging
+                // writer, even when the error/end record cannot fit.
+                self.retaining_output = false;
+                return;
+            }
+            return failure;
+        };
+    }
+    fn rankedBoundary(self: *Search, filename: bool) !void {
+        if (filename and (self.options.heading orelse false) and !self.options.json and
+            !self.options.count and !self.options.count_matches and !self.options.files_with_matches and
+            !self.options.files_without_match and self.output_bytes > 0) try self.write("\n");
+    }
     pub fn indexDocument(self: *Search, doc: @import("document.zig").Document) !void {
         if (doc.content.len > self.options.max_file_bytes) {
             if (self.options.skip_oversize) {
@@ -1027,6 +1060,7 @@ pub const Search = struct {
             const worker = try self.a.create(Search);
             errdefer self.a.destroy(worker);
             worker.* = try Search.initShared(self);
+            worker.decider.coalescer = null;
             self.index_worker = worker;
             break :blk worker;
         };
@@ -1094,9 +1128,9 @@ pub const Search = struct {
             local.summary.matches += 1;
         } else {
             if (self.options.ask == null and !self.options.multiline and !Limits.reserve(&self.limits.source_bytes, doc.content.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
-            local.processBytes(doc.path, doc.content) catch |err| try local.reportError(doc.path, err);
-            if (local.matcher.failure) |err| try local.reportError(doc.path, err);
-            try local.jsonEnd(doc.path, .{});
+            local.processBytes(doc.path, doc.content) catch |err| try local.reportStagedError(doc.path, err);
+            if (local.matcher.failure) |err| try local.reportStagedError(doc.path, err);
+            local.jsonEnd(doc.path, .{}) catch |err| try local.reportStagedError(doc.path, err);
         }
         if (self.ranking) |ranking| {
             _ = self.limits.pending_output.fetchSub(local.reserved_output - reserved_before, .monotonic);
@@ -2036,6 +2070,7 @@ pub const Search = struct {
         forward.started = true;
         renderer.sink = &forward.writer;
         for (ranking.items.items) |c| {
+            try self.rankedBoundary(c.filename);
             const render_started = std.Io.Clock.awake.now(self.io);
             render_options.max_output_bytes = self.options.max_output_bytes - self.output_bytes;
             renderer.summary = c.summary;

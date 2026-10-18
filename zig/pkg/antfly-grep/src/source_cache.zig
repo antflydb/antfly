@@ -46,12 +46,12 @@ pub fn get(a: A, io: std.Io, o: *const @import("options.zig").Options, path: []c
     const enabled = !o.no_cache and o.cache_dir != null;
     const key = if (enabled) identity(path, bytes, delimiter, o.crlf, scope) else @as([32]u8, @splat(0));
     hit.* = false;
-    if (enabled) if (load(a, io, o.cache_dir.?, key, bytes, delimiter, o.crlf, !o.cached_only, state)) |prepared| {
+    if (enabled) if (load(a, io, o, key, bytes, delimiter, o.crlf, !o.cached_only, state)) |prepared| {
         hit.* = true;
         return prepared;
     };
     const prepared = Prepared{ .lines = try lines(a, bytes, delimiter, o.crlf), .index = try source.parse(a, path, bytes) };
-    if (enabled and !o.cached_only) store(a, io, o.cache_dir.?, key, prepared);
+    if (enabled and !o.cached_only) store(a, io, o, key, prepared, state);
     return prepared;
 }
 pub fn lines(a: A, bytes: []const u8, delimiter: u8, crlf: bool) ![]Line {
@@ -65,9 +65,14 @@ pub fn lines(a: A, bytes: []const u8, delimiter: u8, crlf: bool) ![]Line {
     if (start < bytes.len) try out.append(a, .{ .start = start, .end = bytes.len });
     return out.toOwnedSlice(a);
 }
-fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8, delimiter: u8, crlf: bool, migrate: bool, state: *State) ?Prepared {
+fn load(a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8, bytes: []const u8, delimiter: u8, crlf: bool, migrate: bool, state: *State) ?Prepared {
+    const directory = o.cache_dir.?;
     var legacy = false;
-    const record = (if (state.views) |views| views.load(a, io, cache(directory), key) else cache(directory).load(a, io, key)) orelse blk: {
+    var promote = false;
+    const record = (if (state.views) |views| views.loadPrepared(a, io, o, key) else null) orelse blk4: {
+        promote = true;
+        break :blk4 (if (state.views) |views| views.load(a, io, cache(directory), key) else cache(directory).load(a, io, key));
+    } orelse blk: {
         if (state.legacy == null) state.legacy = @import("artifact_cache.zig").LegacyPresence.scan(io, directory).sources;
         if (!state.legacy.?) return null;
         const old: @import("artifact_cache.zig").Legacy = .{ .directory = directory, .namespace = "source-v2", .buckets = 1024, .limit = limit };
@@ -98,13 +103,16 @@ fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8,
         if (decl.parent) |parent| if (parent >= value.index.declarations.len or parent == i) return null;
     }
     for (value.index.calls) |call| if (call.line < 1 or call.line > value.lines.len or call.column < 1 or call.start_byte > call.end_byte or call.end_byte > bytes.len) return null;
-    if (legacy and migrate) store(a, io, directory, key, value);
+    // Large V3 entries already occupy their final tier. Promotion must not
+    // rewrite an unchanged bucket on every warm read.
+    if (migrate and (legacy or (promote and state.views != null and record.len <= @import("source_views.zig").Store.prepared_body_limit))) store(a, io, o, key, value, state);
     return value;
 }
-fn store(a: A, io: std.Io, directory: []const u8, key: [32]u8, value: Prepared) void {
+fn store(a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8, value: Prepared, state: *State) void {
     var budget = @import("antfly_regex").Budget{ .backing = a, .limit = limit };
     const ba = budget.allocator();
     const body = @import("cache_codec.zig").encode(ba, value) catch return;
     defer ba.free(body);
-    cache(directory).store(a, io, key, body);
+    if (state.views) |views| if (views.storePrepared(a, io, o, key, body)) return;
+    cache(o.cache_dir.?).store(a, io, key, body);
 }

@@ -1539,3 +1539,83 @@ establish orchestration and output contracts, not live-model relevance or billin
 Linux runs in a two-CPU VM on this Mac; independent Linux hardware/cold-cache
 performance, Windows runtime and full upstream PCRE2/JIT/CLI parity remain
 unqualified. Existing real-server scenarios were not rerun in this follow-up.
+
+### Sharded preparations and cross-file decision microbatches
+
+Indexed ranked search now preserves complete staged JSON records when a later
+record, error or end event exceeds the output budget. Version 1 and compact JSON
+share this behavior. Ranked text inserts file-heading separators at replay time,
+respecting `--no-filename` in finite and unlimited modes.
+
+Preparations up to 4,016 encoded bytes use source V4 packed shards: 16 persistent
+handles, 1,024 eight-way buckets and 4 KiB slots. Pages are allocated only for
+occupied buckets, with a maximum logical allocation of 32 MiB plus 64 KiB of
+shard directories. Pages serialize contiguous headers and live payloads;
+unused slots are not written. Filesystem block allocation is measured separately.
+Reads fetch headers and only the selected payload through
+shared handles, avoiding per-file open/stat/close calls. Writes use the existing
+best-effort process locks, packed page directory and checksum validation. Torn
+records remain disposable misses. Eight-way retention reduces collision reparses
+without increasing the RAM snapshot cap. Larger preparations still use bounded
+source V3 buckets and the existing 4 MiB shared views. Retained V2/V3 files and
+filesystem allocation overhead are additional to the new tier's disk cap.
+Large V3 entries remain unchanged on normal warm reads, including bytes and mtime.
+Validated old entries promote during normal searches; cached-only searches do
+not promote, repair or write. Complete source bytes, parser generation, document
+revision and authorization scope remain part of identity; this is not a
+metadata-only shortcut around content validation. Score V10 is unchanged.
+
+Directory exploration owns a separate decision client and HTTP pool. It borrows
+the shared cache, model runtime and request limits, then merges its counters only
+after file workers join. Directory I/O and provider latency no longer hold the
+result-publication mutex. A blocked-directory fixture checks that queued file
+work continues to drain and that request totals include both clients.
+
+With multiple file workers and `--max-requests=unlimited`, underfilled region,
+line and target requests can share a provider call. `--decision-batch-wait-ms`
+sets a bounded gather window (default 1 ms; 0 disables; maximum 1,000 ms). Full
+batches, single-file searches, serial indexed scans and finite request/region
+budgets retain their existing paths. Each caller lends at most one request and
+waits for completion; the oldest caller gathers compatible jobs and uses its
+existing connection pool. Detached groups can execute concurrently. Pending
+memory is bounded by file-worker admission, and each merged request respects
+`--batch-size` (at most 128 inputs). No extra service thread or repository-sized
+request queue is introduced.
+
+Only clients sharing options, stage, question and global limits combine. Cache
+lookup and persistence stay with each originating client and document scope.
+Temporary unique wire IDs route answers back to the original inputs; shared
+context remains borrowed. HTTP request/token totals count each provider call
+once, including split/retry calls. Cancellation wakes through the bounded gather
+window and existing HTTP cancellation. Completed scores survive a later split
+failure under the existing partial-evidence rules. Tests compare scores and
+ordering, change batch shapes for cached-only reuse, split rejected groups,
+and exercise cancellation while jobs are waiting.
+
+Cross-file batching reduces requests for underfilled work; it cannot reduce the
+request count of a workload already filling every configured batch. Gathering
+can add latency when provider calls are cheap. The opt-out permits direct
+measurement for each provider rather than assuming request savings imply a
+throughput or billed-token improvement.
+
+Final paired warm-cache measurements against PR head `3f9bf90f2a40`:
+
+| Workload | Median elapsed, before → after | Median peak RSS, before → after |
+|---|---:|---:|
+| Top 15, one worker / 2,048 files | 234.67 → 122.21 ms | 10.38 → 4.59 MiB |
+| Top 15, four workers / 2,048 files | 103.23 → 61.55 ms | 12.19 → 5.12 MiB |
+| Unlimited ranking / 2,048 files | 331.46 → 216.27 ms | 10.78 → 5.03 MiB |
+| Single small file | 7.87 → 8.34 ms | 4.25 → 4.28 MiB |
+| 9,000-line overview | 15.00 → 14.26 ms | 8.28 → 8.31 MiB |
+
+One-worker system CPU falls 171.18 → 82.14 ms; preparation parses 294 → 0, and cache files 904 → 33. Allocated cache disk changes 25.53 → 45.27 MiB. Measured warm provider calls remain zero.
+
+The bounded tier trades more allocated disk on this filesystem for fewer inodes/syscalls, lower RAM and better retention. Packing reduces writes and small-cache allocation; the filesystem still allocates much of the page address span in larger caches. Single-file startup remains slightly slower; see controls above. These measurements do not justify claiming every workload is faster or that allocated disk is smaller.
+
+The 128-file HTTP fixture uses eight file workers, two provider lanes, 20 ms per request, no cache and the default 1 ms gather window. Median requests fall 128 → 16 and elapsed time 1986.21 → 555.40 ms. Each run sends the same 128 targets and reconstructs equivalent ordered evidence. Already-full batches retain their request count.
+
+These are synthetic, warm-cache measurements on one shared macOS host. The provider fixture models request overhead and concurrency limits; it does not establish billed-token savings or live-model relevance.
+
+Evidence: [one-worker search](bench/results/coalesced-topk-macos.json), [four-worker search](bench/results/coalesced-parallel-macos.json), [unlimited ranking](bench/results/coalesced-unlimited-macos.json), [single-file control](bench/results/coalesced-small-macos.json), [overview control](bench/results/coalesced-overview-macos.json), [provider microbatches](bench/results/coalesced-decisions-macos.json), [generated comparisons](bench/results/coalesced-differential.json), and [source/binary hashes and validation](bench/results/coalesced-validation.json). Reports retain per-run timing, CPU, memory, cache allocation and/or request counts.
+
+Qualification: 180 CLI tests each on macOS and Linux ARM64 (two/one skips), native unit/hardening/tooling checks, four focused ReleaseSafe artifact tests, six Linux hardening tests, 1,000 generated comparisons without mismatches or timeouts, Windows cross-compilation, packaging, Apache boundaries, staged license checks and formatting. Linux correctness uses a two-CPU VM on this Mac. Independent Linux hardware/cold-cache performance, Windows runtime, live providers and full upstream PCRE2/JIT/CLI parity remain unqualified; existing real-server scenarios were not rerun in this follow-up.

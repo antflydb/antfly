@@ -51,6 +51,7 @@ Use '-' for stdin; '--' ends option parsing.
       --table NAME         Select a configured table (repeatable)
       --table-filter JSON  Server-side structured filter
       --max-index-documents N  Exact scan document budget (default 100000)
+      --decision-batch-wait-ms N  Cross-file gather window (default 1ms; 0 disables)
       --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)
       --max-pending-output N  Ranked output memory cap (default 64MiB)
       --dictionary-format FORMAT  auto/raw/brotli/brotli-google
@@ -180,6 +181,9 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --debug
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --decision-batch-wait-ms
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --decision-context

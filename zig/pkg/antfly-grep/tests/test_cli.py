@@ -43,14 +43,16 @@ def read_batch(path):
     data = path.read_bytes()
     if path.suffix == ".bin":
         slot_size, ways = (
-            (256, 16)
+            (4096, 8)
+            if path.name.startswith("source-v4-")
+            else (256, 16)
             if "small" in path.name
             else (1024, 8)
             if "medium" in path.name
             else (4096, 8)
         )
         scores, written, records = [], [], []
-        if path.name.startswith("batch-v10-"):
+        if path.name.startswith(("batch-v10-", "source-v4-")):
             assert data[:8] == b"AGSHD001"
             page_size, count = struct.unpack_from("<II", data, 8)
             pages = [
@@ -64,12 +66,26 @@ def read_batch(path):
             for way in range(ways):
                 header = page + way * 80
                 h = data[header : header + 80]
-                if len(h) != 80 or h[76:80] != b"AGB1":
+                if len(h) != 80 or h[76:80] not in (b"AGB1", b"AGP1"):
                     continue
                 size = struct.unpack_from("<I", h, 64)[0]
-                offset = page + ways * 80 + way * (slot_size - 80)
+                offset = (
+                    page
+                    + ways * 80
+                    + (
+                        sum(
+                            struct.unpack_from("<I", data, page + prior * 80 + 64)[0]
+                            for prior in range(way)
+                        )
+                        if h[76:80] == b"AGP1"
+                        else way * (slot_size - 80)
+                    )
+                )
                 body = data[offset : offset + size]
                 if hashlib.sha256(h[:32] + h[64:] + body).digest() != h[32:64]:
+                    continue
+                if path.name.startswith("source-v4-"):
+                    records.append((header, offset, 0, 0))
                     continue
                 count = struct.unpack_from("<I", body)[0]
                 values = [
@@ -144,6 +160,9 @@ class DecisionHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        gate = getattr(self.server, "provider_lanes", None)
+        if gate is not None:
+            gate.acquire()
         with self.server.lock:
             self.server.active += 1
             self.server.peak = max(self.server.peak, self.server.active)
@@ -161,6 +180,8 @@ class DecisionHandler(BaseHTTPRequestHandler):
         finally:
             with self.server.lock:
                 self.server.active -= 1
+            if gate is not None:
+                gate.release()
 
     def index_query(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -323,6 +344,12 @@ class DecisionHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(encoded)
             return
+        if getattr(self.server, "hold_directory", False) and any(
+            item["id"] == "directory" and "blocked" in item["input"]
+            for item in body.get("inputs", [])
+        ):
+            self.server.directory_blocked.set()
+            self.server.directory_release.wait(5)
         if self.server.mode == "http_error" or (
             self.server.mode == "fail_second" and len(self.server.requests) == 2
         ):
@@ -777,7 +804,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
         )
-        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v3-*"))
+        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v4-*"))
         self.assertEqual(len(records), 1)
         if os.name != "nt":
             self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
@@ -793,6 +820,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(changed.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 0
         )
+
+    def test_source_v3_promotes_only_after_validated_normal_reads(self):
+        self.write("a.py", "def retry():\n    STOP()\n")
+        args = [*self.decision_args(), "--json", "--threads=1", "a.py"]
+        self.raw_cli(*args)
+        directory = self.root / ".cache/antfly-grep/decisions"
+        shard = next(directory.glob("source-v4-*"))
+        data = shard.read_bytes()
+        header, offset, _, _ = read_batch(shard)["_records"][0]
+        h = bytearray(data[header : header + 80])
+        size = struct.unpack_from("<I", h, 64)[0]
+        body = data[offset : offset + size]
+        old = directory / f"source-v3-{int.from_bytes(h[:2], 'little') % 1024:03x}.bin"
+        old.write_bytes(h + bytes(3 * 80) + body)
+        shard.unlink()
+        warm = self.raw_cli(*args, "--cached-only", "--max-requests=0")
+        self.assertEqual(
+            json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
+        )
+        self.assertFalse(list(directory.glob("source-v4-*")))
+        normal = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(normal.stdout.splitlines()[-1])["stats"]["source_parses"], 0
+        )
+        self.assertTrue(list(directory.glob("source-v4-*")))
+        self.assertEqual(old.read_bytes(), h + bytes(3 * 80) + body)
+        self.write("large.txt", "STOP\n" * 600)
+        large_args = [
+            *self.decision_args(),
+            "--json",
+            "--no-refine",
+            "--threads=1",
+            "large.txt",
+        ]
+        self.raw_cli(*large_args)
+        large_cache = max(directory.glob("source-v3-*"), key=lambda p: p.stat().st_size)
+        before_bytes = large_cache.read_bytes()
+        before_mtime = large_cache.stat().st_mtime_ns
+        warm_large = self.raw_cli(*large_args)
+        self.assertEqual(
+            json.loads(warm_large.stdout.splitlines()[-1])["stats"][
+                "source_cache_hits"
+            ],
+            1,
+        )
+        self.assertEqual(large_cache.read_bytes(), before_bytes)
+        self.assertEqual(large_cache.stat().st_mtime_ns, before_mtime)
 
     def test_rebatching_preserves_each_scores_original_expiry(self):
         self.write("a", "STOP\nnoise\n" * 8)
@@ -881,7 +955,7 @@ class CliTests(unittest.TestCase):
                 path.unlink()
                 continue
             data = path.read_bytes()
-            is_source = path.name.startswith("source-v3-")
+            is_source = path.name.startswith(("source-v3-", "source-v4-"))
             size, ways, buckets = (
                 (262144, 4, 1024)
                 if is_source
@@ -893,7 +967,7 @@ class CliTests(unittest.TestCase):
             )
             entries = (
                 [(way * 80, None) for way in range(ways)]
-                if is_source
+                if path.name.startswith("source-v3-")
                 else [
                     (header, offset)
                     for header, offset, _, _ in read_batch(path)["_records"]
@@ -940,7 +1014,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(result.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
         )
-        self.assertTrue(list(directory.glob("source-v3-*")))
+        self.assertTrue(list(directory.glob("source-v4-*")))
         new_times = [
             stamp
             for path in directory.glob("batch-v10-*")
@@ -4651,6 +4725,192 @@ class CliTests(unittest.TestCase):
         elapsed = end["data"]["stats"]["elapsed"]
         self.assertLess(elapsed["secs"] + elapsed["nanos"] / 1e9, 1.1)
         self.assertGreater(rows[-1]["data"]["elapsed_total"]["secs"], 1)
+
+    def test_indexed_ranked_output_preserves_completed_prefix(self):
+        content = "STOP small\nSTOP " + "x" * 20000 + "\n"
+        config = self.table_config([self.indexed_doc("large.py", content)])
+        for flag in ("--json", "--json-compact"):
+            for sort in ([], ["--sort=path"]):
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    flag,
+                    "--no-refine",
+                    "--unit=line",
+                    "--threads=1",
+                    "--max-result-files=0",
+                    "--max-output-bytes=1500",
+                    *sort,
+                    "--table-config",
+                    config,
+                    code=2,
+                )
+                rows = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertTrue(any(r["type"] == "begin" for r in rows))
+                self.assertTrue(
+                    any(
+                        r["type"] == "match"
+                        and r["data"]["lines"]["text"] == "STOP small\n"
+                        for r in rows
+                    )
+                )
+                self.assertLessEqual(len(result.stdout), 1500)
+
+    def test_ranked_headings_separate_files(self):
+        self.write("a.py", "STOP a\n")
+        self.write("b.py", "STOP b\n")
+        for k in (0, 2):
+            for indexed in (False, True):
+                paths = (
+                    [
+                        "--table-config",
+                        self.table_config(
+                            [
+                                self.indexed_doc("a.py", "STOP a\n"),
+                                self.indexed_doc("b.py", "STOP b\n"),
+                            ]
+                        ),
+                    ]
+                    if indexed
+                    else ["a.py", "b.py"]
+                )
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    "--no-refine",
+                    "--heading",
+                    f"--max-result-files={k}",
+                    *paths,
+                )
+                self.assertIn(b"STOP a\n\nb.py\n", result.stdout)
+                no_names = self.raw_cli(
+                    *self.decision_args(),
+                    "--no-refine",
+                    "--heading",
+                    "--no-filename",
+                    f"--max-result-files={k}",
+                    *paths,
+                )
+                self.assertNotIn(b"\n\n", no_names.stdout)
+
+    def test_directory_decisions_do_not_block_file_publication(self):
+        for i in range(12):
+            self.write(f"src/STOP_{i}.txt", "STOP ready\n")
+        self.write("blocked/STOP.txt", "STOP last\n")
+        self.server.hold_directory = True
+        self.server.directory_blocked = threading.Event()
+        self.server.directory_release = threading.Event()
+        self.server.delay = 0.02
+        command = [
+            BINARY,
+            *self.decision_args(),
+            "--json",
+            "--triage",
+            "--no-cache",
+            "--no-refine",
+            "--threads=2",
+            "src",
+            "blocked",
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=self.root,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertTrue(self.server.directory_blocked.wait(3))
+            deadline = time.monotonic() + 2
+
+            def regions():
+                return sum(
+                    item["id"].startswith("region-")
+                    for _, _, body in self.server.requests
+                    for item in body.get("inputs", [])
+                )
+
+            while regions() < 8 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(
+                regions(),
+                8,
+                "file workers must publish and drain while discovery waits",
+            )
+        finally:
+            self.server.directory_release.set()
+            stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        summary = json.loads(stdout.splitlines()[-1])
+        self.assertTrue(summary["stats"]["complete"])
+        self.assertEqual(summary["stats"]["files"], 13)
+        self.assertEqual(summary["requests"], len(self.server.requests))
+
+    def test_cross_file_microbatches_route_results_and_reuse_cache(self):
+        for i in range(64):
+            self.write(f"src/f{i:03}.txt", "STOP HIGH\n" if i % 2 else "STOP LOW\n")
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--no-refine",
+            "--threads=8",
+            "--max-files=0",
+            "--batch-size=8",
+            "--max-requests=unlimited",
+            "src",
+        ]
+        self.server.delay = 0.01
+        baseline = self.raw_cli(*args, "--no-cache", "--decision-batch-wait-ms=0")
+        calls = len(self.server.requests)
+        self.server.requests.clear()
+        batched = self.raw_cli(*args, "--decision-batch-wait-ms=10")
+        self.assertLess(len(self.server.requests), calls)
+        self.assertTrue(
+            any(len(body["inputs"]) > 1 for _, _, body in self.server.requests)
+        )
+
+        def matches(result):
+            return [
+                (r["data"]["path"], r["data"]["lines"], r["probability"])
+                for r in map(json.loads, result.stdout.splitlines())
+                if r["type"] == "match"
+            ]
+
+        self.assertEqual(matches(baseline), matches(batched))
+        summary = json.loads(batched.stdout.splitlines()[-1])
+        self.assertEqual(summary["requests"], len(self.server.requests))
+        self.server.requests.clear()
+        warm = self.raw_cli(
+            *args, "--decision-batch-wait-ms=0", "--cached-only", "--max-requests=0"
+        )
+        self.assertEqual(matches(batched), matches(warm))
+        self.assertEqual(len(self.server.requests), 0)
+        # Finite request budgets retain existing, uncombined admission.
+        result = self.raw_cli(*args, "--no-cache", "--max-requests=1", code=2)
+        self.assertLessEqual(len(self.server.requests), 1)
+        if self.server.requests:
+            self.assertEqual(len(self.server.requests[0][2]["inputs"]), 1)
+        self.assertFalse(
+            json.loads(result.stdout.splitlines()[-1])["stats"]["complete"]
+        )
+        # Oversized groups split through the existing retry path.
+        self.server.requests.clear()
+        self.server.mode = "split"
+        split = self.raw_cli(*args, "--no-cache", "--decision-batch-wait-ms=10")
+        self.assertEqual(matches(split), matches(baseline))
+        self.assertEqual(
+            json.loads(split.stdout.splitlines()[-1])["requests"],
+            len(self.server.requests),
+        )
+        self.server.mode = "ok"
+        canceled = self.raw_cli(
+            *args,
+            "--no-cache",
+            "--decision-batch-wait-ms=10",
+            "--max-source-bytes=100",
+            code=2,
+        )
+        self.assertFalse(
+            json.loads(canceled.stdout.splitlines()[-1])["stats"]["complete"]
+        )
 
     def test_prepared_source_is_not_reparsed_on_warm_block_search(self):
         self.write("a.py", "class Retry:\n    def run(self):\n        STOP()\n")

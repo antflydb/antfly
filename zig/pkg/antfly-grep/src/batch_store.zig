@@ -33,6 +33,9 @@ const Class = struct {
         const size = 84 + count * 16;
         return if (size <= 256) .{ .id = 0, .name = "small", .buckets = 4096, .ways = 16, .slot = 256 } else if (size <= 1024) .{ .id = 1, .name = "medium", .buckets = 2048, .ways = 8, .slot = 1024 } else .{ .id = 2, .name = "large", .buckets = 512, .ways = 8, .slot = 4096 };
     }
+    fn preparation() Class {
+        return .{ .id = 0, .name = "prepared", .buckets = 1024, .ways = 8, .slot = 4096 };
+    }
     fn bytes(self: Class) usize {
         return self.ways * self.slot;
     }
@@ -46,9 +49,9 @@ const Shard = struct {
     writable: bool = false,
     valid: bool = false,
     mapping: [256]u32 = @splat(0),
-    fn open(self: *Shard, a: A, io: std.Io, o: *const Options, class: Class, number: usize, write: bool) ?std.Io.File {
+    fn open(self: *Shard, a: A, io: std.Io, o: *const Options, class: Class, number: usize, write: bool, preparations: bool) ?std.Io.File {
         if (self.file != null and (!write or self.writable)) return self.file;
-        const path = std.fmt.allocPrint(a, "{s}/batch-v10-{s}-{x:0>2}.bin", .{ o.cache_dir.?, class.name, number }) catch return null;
+        const path = std.fmt.allocPrint(a, "{s}/{s}-{s}-{x:0>2}.bin", .{ o.cache_dir.?, if (preparations) "source-v4" else "batch-v10", class.name, number }) catch return null;
         defer a.free(path);
         const f = if (write) blk: {
             std.Io.Dir.cwd().createDirPath(io, o.cache_dir.?) catch return null;
@@ -73,6 +76,7 @@ fn validDirectory(bytes: *const [prefix]u8, class: Class) bool {
     return std.mem.eql(u8, bytes[0..8], magic) and std.mem.readInt(u32, bytes[8..12], .little) == class.bytes() and std.mem.readInt(u32, bytes[12..16], .little) == class.buckets / shards;
 }
 pub const Store = struct {
+    preparations: bool = false,
     handles: [3][shards]Shard = @splat(@splat(.{})),
     pub const max_handles = 3 * shards;
     pub const max_bytes = 48 * 1024 * 1024 + max_handles * prefix;
@@ -80,13 +84,13 @@ pub const Store = struct {
         for (&self.handles) |*group| for (group) |*shard| if (shard.file) |file| file.close(io);
     }
     pub fn load(self: *Store, a: A, io: std.Io, o: *const Options, count: usize, key: [32]u8) ?[]const u8 {
-        const class = Class.select(count);
+        const class = if (self.preparations) Class.preparation() else Class.select(count);
         const bucket = std.mem.readInt(u16, key[0..2], .little) % class.buckets;
         const local = bucket / shards;
         const shard = &self.handles[class.id][bucket % shards];
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
-        const file = shard.open(a, io, o, class, bucket % shards, false) orelse return null;
+        const file = shard.open(a, io, o, class, bucket % shards, false, self.preparations) orelse return null;
         if (!shard.valid) {
             var directory: [prefix]u8 = undefined;
             shard.valid = (file.readPositionalAll(io, &directory, 0) catch 0) == prefix and validDirectory(&directory, class);
@@ -103,20 +107,21 @@ pub const Store = struct {
             if (value == 0 or value > class.buckets / shards) return null;
             shard.mapping[local] = value;
         }
-        var page: [32768]u8 = undefined;
         const offset = prefix + @as(u64, shard.mapping[local] - 1) * class.bytes();
+        if (self.preparations) return class.codec().loadAt(a, io, file, key, offset);
+        var page: [32768]u8 = undefined;
         const n = file.readPositionalAll(io, page[0..class.bytes()], offset) catch return null;
         return class.codec().fixedGet(a, key, page[0..n]);
     }
     pub fn store(self: *Store, a: A, io: std.Io, o: *const Options, count: usize, key: [32]u8, body: []const u8) void {
-        const class = Class.select(count);
+        const class = if (self.preparations) Class.preparation() else Class.select(count);
         if (body.len > class.slot - 80) return;
         const bucket = std.mem.readInt(u16, key[0..2], .little) % class.buckets;
         const local = bucket / shards;
         const shard = &self.handles[class.id][bucket % shards];
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
-        const file = shard.open(a, io, o, class, bucket % shards, true) orelse return;
+        const file = shard.open(a, io, o, class, bucket % shards, true, self.preparations) orelse return;
         // Best-effort cache writes never wait behind another process.
         if (!(file.tryLock(io, .exclusive) catch false)) return;
         defer file.unlock(io);
@@ -143,11 +148,23 @@ pub const Store = struct {
             const free = std.mem.indexOfScalar(bool, used[0 .. class.buckets / shards], false) orelse return;
             index = @intCast(free + 1);
         }
-        var page: [32768]u8 = @splat(0);
+        // Both score and preparation pages fit this bounded stack buffer;
+        // preparation reads fetch only headers and the selected payload.
+        var storage: [32768]u8 = undefined;
+        const page = storage[0..class.bytes()];
+        @memset(page, 0);
         const offset = prefix + @as(u64, index - 1) * class.bytes();
         if (existing) _ = file.readPositionalAll(io, page[0..class.bytes()], offset) catch 0;
-        class.codec().fixedPut(io, key, body, page[0..class.bytes()]);
-        file.writePositionalAll(io, page[0..class.bytes()], offset) catch return;
+        if (self.preparations) {
+            // Keep the bounded logical page address while writing only live
+            // headers/payloads. Empty ways do not allocate filesystem blocks.
+            const encoded_page = class.codec().packedPut(a, io, key, body, if (existing) page else null) orelse return;
+            defer a.free(encoded_page);
+            file.writePositionalAll(io, encoded_page, offset) catch return;
+        } else {
+            class.codec().fixedPut(io, key, body, page[0..class.bytes()]);
+            file.writePositionalAll(io, page[0..class.bytes()], offset) catch return;
+        }
         if (!existing) {
             var entry: [4]u8 = undefined;
             std.mem.writeInt(u32, &entry, index, .little);
@@ -239,4 +256,46 @@ test "independent shard writers cannot return a torn identity" {
     for (threads[0..started]) |thread| thread.join();
     started = 0;
     try std.testing.expect(!failed.load(.monotonic));
+}
+
+test "prepared shard handles retain eight colliding revisions and bound pages" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const o: Options = .{ .cache_dir = directory };
+    var writer: Store = .{ .preparations = true };
+    defer writer.deinit(io);
+    var reader: Store = .{ .preparations = true };
+    defer reader.deinit(io);
+    var key: [32]u8 = @splat(0);
+    const body: [3000]u8 = @splat('s');
+    for (0..8) |i| {
+        key[31] = @intCast(i);
+        writer.store(a, io, &o, 0, key, &body);
+    }
+    for (0..8) |i| {
+        key[31] = @intCast(i);
+        const value = reader.load(a, io, &o, 0, key).?;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, &body, value);
+    }
+    const path = try std.fmt.allocPrint(a, "{s}/source-v4-prepared-00.bin", .{directory});
+    defer a.free(path);
+    try std.testing.expectEqual(@as(u64, prefix + 8 * 80 + 8 * body.len), (try std.Io.Dir.cwd().statFile(io, path, .{})).size);
+    const handle = reader.handles[0][0].file.?.handle;
+    key[31] = 9;
+    writer.store(a, io, &o, 0, key, "ninth");
+    const value = reader.load(a, io, &o, 0, key).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("ninth", value);
+    try std.testing.expectEqual(handle, reader.handles[0][0].file.?.handle);
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    // Deliberately tear every candidate payload. No torn record is evidence.
+    const broken: [8 * 3000]u8 = @splat('!');
+    try file.writePositionalAll(io, &broken, prefix + 8 * 80);
+    try std.testing.expect(reader.load(a, io, &o, 0, key) == null);
 }

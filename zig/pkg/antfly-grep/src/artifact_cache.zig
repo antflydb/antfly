@@ -150,14 +150,17 @@ pub const Cache = struct {
     }
     /// Caller owns the descriptor; read just the headers and selected payload.
     pub fn loadFile(self: Cache, a: A, io: std.Io, file: std.Io.File, key: [32]u8) ?[]const u8 {
+        return self.loadAt(a, io, file, key, 0);
+    }
+    pub fn loadAt(self: Cache, a: A, io: std.Io, file: std.Io.File, key: [32]u8, base: u64) ?[]const u8 {
         var headers: [header_size * max_ways]u8 = @splat(0);
-        const n = file.readPositionalAll(io, headers[0 .. self.ways * header_size], 0) catch return null;
+        const n = file.readPositionalAll(io, headers[0 .. self.ways * header_size], base) catch return null;
         for (0..n / header_size) |way| {
             const header = headers[way * header_size ..][0..header_size];
             if (!self.validHeader(header) or !std.mem.eql(u8, header[0..32], &key)) continue;
             const len = std.mem.readInt(u32, header[64..68], .little);
             const body = a.alloc(u8, len) catch return null;
-            if ((file.readPositionalAll(io, body, self.payloadOffset(&headers, way)) catch 0) == len and std.mem.eql(u8, header[32..64], &digest(header, body))) return body;
+            if ((file.readPositionalAll(io, body, base + self.payloadOffset(&headers, way)) catch 0) == len and std.mem.eql(u8, header[32..64], &digest(header, body))) return body;
             a.free(body);
         }
         return null;
@@ -202,6 +205,24 @@ pub const Cache = struct {
         defer a.free(name);
         const previous = std.Io.Dir.cwd().readFileAlloc(io, name, a, .limited(self.ways * self.limit)) catch null;
         defer if (previous) |bytes| a.free(bytes);
+        const encoded = self.packedPut(a, io, key, body, previous) orelse return;
+        defer a.free(encoded);
+        var nonce: [12]u8 = undefined;
+        io.random(&nonce);
+        const temporary = std.fmt.allocPrint(a, "{s}.{s}.tmp", .{ name, std.fmt.bytesToHex(nonce, .lower) }) catch return;
+        defer a.free(temporary);
+        const file = std.Io.Dir.cwd().createFile(io, temporary, .{ .exclusive = true, .permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600) }) catch return;
+        defer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
+        {
+            defer file.close(io);
+            file.writeStreamingAll(io, encoded) catch return;
+        }
+        std.Io.Dir.cwd().rename(temporary, .cwd(), name, io) catch {};
+    }
+    /// Encode a compact bucket. The returned bytes own every retained payload;
+    /// callers may place the bucket inside a bounded larger shard page.
+    pub fn packedPut(self: Cache, a: A, io: std.Io, key: [32]u8, body: []const u8, previous: ?[]const u8) ?[]u8 {
+        if (body.len > self.limit - header_size) return null;
         var headers: [header_size * max_ways]u8 = @splat(0);
         var records: [max_ways]?[]const u8 = @splat(null);
         if (previous) |bytes| if (bytes.len >= self.ways * header_size) {
@@ -239,8 +260,7 @@ pub const Cache = struct {
         for (records[0..self.ways]) |record| if (record) |payload| {
             size += payload.len;
         };
-        const encoded = a.alloc(u8, size) catch return;
-        defer a.free(encoded);
+        const encoded = a.alloc(u8, size) catch return null;
         @memset(encoded[0 .. self.ways * header_size], 0);
         var offset = self.ways * header_size;
         for (records[0..self.ways], 0..) |record, way| if (record) |payload| {
@@ -251,17 +271,7 @@ pub const Cache = struct {
             @memcpy(encoded[offset..][0..payload.len], payload);
             offset += payload.len;
         };
-        var nonce: [12]u8 = undefined;
-        io.random(&nonce);
-        const temporary = std.fmt.allocPrint(a, "{s}.{s}.tmp", .{ name, std.fmt.bytesToHex(nonce, .lower) }) catch return;
-        defer a.free(temporary);
-        const file = std.Io.Dir.cwd().createFile(io, temporary, .{ .exclusive = true, .permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600) }) catch return;
-        defer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
-        {
-            defer file.close(io);
-            file.writeStreamingAll(io, encoded) catch return;
-        }
-        std.Io.Dir.cwd().rename(temporary, .cwd(), name, io) catch {};
+        return encoded;
     }
 };
 

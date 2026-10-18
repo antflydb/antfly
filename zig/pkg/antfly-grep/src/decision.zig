@@ -66,6 +66,7 @@ pub const Client = struct {
     retry_after_ms: u64 = 0,
     input_tokens: usize = 0,
     output_tokens: usize = 0,
+    coalescer: ?*Coalescer = null,
     pool: ?*Pool = null,
     score_store: @import("score_store.zig").Store = .{},
     pub fn init(a: Allocator, io: std.Io, options: *const Options) Client {
@@ -318,6 +319,7 @@ pub const Client = struct {
             local.query = parent.query;
             local.stage = parent.stage;
             local.cache_scope = parent.cache_scope;
+            local.coalescer = parent.coalescer;
             local.cache_checked = parent.cache_checked;
             local.shared_local = parent.shared_local orelse if (parent.local) |provider| provider else null;
             while (true) {
@@ -591,7 +593,15 @@ pub const Client = struct {
         self.prepareCache();
         if (self.batch_store) |store| store.store(a, self.io, self.options, scores.len, digestKey(key_hex), bytes);
     }
-    fn request(self: *Client, inputs: []const Input, probabilities: []f64) !void {
+    fn request(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
+        if (self.coalescer) |coalescer| {
+            if (inputs.len > 0 and inputs.len < self.options.batch_size and self.options.decision_batch_wait_ms > 0 and
+                self.options.max_requests == std.math.maxInt(usize) and self.options.max_regions == std.math.maxInt(usize) and
+                (self.stage == .region or self.stage == .line or self.stage == .target)) return coalescer.submit(self, inputs, probabilities);
+        }
+        return self.requestDirect(inputs, probabilities);
+    }
+    fn requestDirect(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
         if (self.options.cached_only) return error.DecisionCacheMiss;
         var attempt: usize = 0;
         while (true) {
@@ -605,18 +615,18 @@ pub const Client = struct {
                         const left = Input{ .id = input.id, .input = input.input[0..split], .context = input.context, .context_hash = input.context_hash };
                         const right = Input{ .id = input.id, .input = input.input[split..], .context = input.context, .context_hash = input.context_hash };
                         var scores: [2]f64 = @splat(std.math.nan(f64));
-                        self.request(&.{left}, scores[0..1]) catch |failure| {
+                        self.requestDirect(&.{left}, scores[0..1]) catch |failure| {
                             return failure;
                         };
                         // A subdivision is not evidence for the whole input.
                         // Publish only after every half has completed.
-                        try self.request(&.{right}, scores[1..2]);
+                        try self.requestDirect(&.{right}, scores[1..2]);
                         probabilities[0] = @max(scores[0], scores[1]);
                         return;
                     }
                     const half = inputs.len / 2;
-                    try self.request(inputs[0..half], probabilities[0..half]);
-                    try self.request(inputs[half..], probabilities[half..]);
+                    try self.requestDirect(inputs[0..half], probabilities[0..half]);
+                    try self.requestDirect(inputs[half..], probabilities[half..]);
                     return;
                 }
                 const transient = self.last_status == 429 or self.last_status == 408 or self.last_status >= 500 or (self.last_status == 0 and self.options.backend != .local and err != error.RequestBudgetExceeded and err != error.Canceled and err != error.OutOfMemory);
@@ -722,6 +732,115 @@ pub const Client = struct {
         if (field(parsed.value, "usage")) |usage| {
             self.input_tokens += integer(field(usage, "input_tokens"));
             self.output_tokens += integer(field(usage, "output_tokens"));
+        }
+    }
+};
+/// Synchronous callers lend one bounded job until completion. The oldest caller
+/// leads a short gather window, detaches compatible jobs and performs HTTP using
+/// its existing connection pool. Other groups can progress concurrently. No
+/// repository-sized queue, background thread or source copy is needed.
+pub const Coalescer = struct {
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
+    head: ?*Job = null,
+    tail: ?*Job = null,
+    const Job = struct {
+        client: *Client,
+        inputs: []const Input,
+        scores: []f64,
+        next: ?*Job = null,
+        done: bool = false,
+        failure: ?anyerror = null,
+    };
+    fn compatible(a: *Client, b: *Client) bool {
+        return a.options == b.options and a.limits == b.limits and a.stage == b.stage and
+            ((a.query == null and b.query == null) or (a.query != null and b.query != null and std.mem.eql(u8, a.query.?, b.query.?)));
+    }
+    fn ready(self: *Coalescer, first: *Job) usize {
+        var count: usize = 0;
+        var cursor = self.head;
+        while (cursor) |job| : (cursor = job.next) {
+            if (compatible(first.client, job.client) and count + job.inputs.len <= first.client.options.batch_size) count += job.inputs.len;
+        }
+        return count;
+    }
+    fn submit(self: *Coalescer, client: *Client, inputs: []const Input, scores: []f64) !void {
+        const io = client.io;
+        var job: Job = .{ .client = client, .inputs = inputs, .scores = scores };
+        self.mutex.lockUncancelable(io);
+        if (self.tail) |tail| tail.next = &job else self.head = &job;
+        self.tail = &job;
+        self.changed.broadcast(io);
+        while (!job.done) {
+            if (self.head != &job) {
+                self.changed.waitUncancelable(io, &self.mutex);
+                continue;
+            }
+            const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(@intCast(client.options.decision_batch_wait_ms)), .clock = .awake });
+            while (self.ready(&job) < client.options.batch_size) {
+                if (client.limits) |limits| if (limits.cancel.load(.monotonic)) break;
+                self.changed.waitTimeout(io, &self.mutex, .{ .deadline = deadline }) catch break;
+            }
+            var selected: [128]*Job = undefined;
+            var count: usize = 0;
+            var total: usize = 0;
+            var link = &self.head;
+            var previous: ?*Job = null;
+            while (link.*) |item| {
+                if (compatible(client, item.client) and total + item.inputs.len <= client.options.batch_size) {
+                    selected[count] = item;
+                    count += 1;
+                    total += item.inputs.len;
+                    link.* = item.next;
+                    if (self.tail == item) self.tail = previous;
+                } else {
+                    previous = item;
+                    link = &item.next;
+                }
+            }
+            self.changed.broadcast(io);
+            self.mutex.unlock(io);
+            self.perform(client, selected[0..count], total);
+            self.mutex.lockUncancelable(io);
+            for (selected[0..count]) |item| item.done = true;
+            self.changed.broadcast(io);
+        }
+        const failure = job.failure;
+        self.mutex.unlock(io);
+        if (failure) |err| return err;
+    }
+    fn perform(_: *Coalescer, client: *Client, jobs: []const *Job, total: usize) void {
+        if (jobs.len == 1) {
+            client.requestDirect(jobs[0].inputs, jobs[0].scores) catch |err| {
+                jobs[0].failure = err;
+            };
+            return;
+        }
+        var arena = std.heap.ArenaAllocator.init(client.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var merged: [128]Input = undefined;
+        var scores: [128]f64 = @splat(std.math.nan(f64));
+        var offset: usize = 0;
+        for (jobs) |job| for (job.inputs) |input| {
+            merged[offset] = input;
+            // Original IDs are only file-local. Preserve their diagnostic
+            // prefix while making answer routing unambiguous across files.
+            merged[offset].id = std.fmt.allocPrint(a, "{s}@{d}", .{ input.id, offset }) catch |err| {
+                for (jobs) |item| item.failure = err;
+                return;
+            };
+            offset += 1;
+        };
+        var failure: ?anyerror = null;
+        client.requestDirect(merged[0..total], scores[0..total]) catch |err| {
+            failure = err;
+        };
+        offset = 0;
+        for (jobs) |job| {
+            @memcpy(job.scores, scores[offset..][0..job.scores.len]);
+            job.failure = failure;
+            offset += job.scores.len;
         }
     }
 };

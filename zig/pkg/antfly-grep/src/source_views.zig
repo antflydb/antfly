@@ -26,9 +26,21 @@ const Shard = struct {
 };
 pub const Store = struct {
     a: A,
+    prepared: @import("batch_store.zig").Store = .{ .preparations = true },
     shards: [16]Shard = @splat(.{}),
+    pub const prepared_body_limit = 4096 - 80;
+    pub const prepared_disk_limit = 32 * 1024 * 1024 + 16 * 4096;
+    pub fn loadPrepared(self: *Store, a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8) ?[]const u8 {
+        return self.prepared.load(a, io, o, 0, key);
+    }
+    pub fn storePrepared(self: *Store, a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8, body: []const u8) bool {
+        if (body.len > prepared_body_limit or o.cached_only) return false;
+        self.prepared.store(a, io, o, 0, key, body);
+        return true;
+    }
     pub const memory_limit = 4 * 1024 * 1024;
-    pub fn deinit(self: *Store) void {
+    pub fn deinit(self: *Store, io: std.Io) void {
+        self.prepared.deinit(io);
         for (self.shards) |shard| for (shard.pages) |page| if (page) |bytes| self.a.free(bytes);
     }
     pub fn load(self: *Store, a: A, io: std.Io, cache: Cache, key: [32]u8) ?[]const u8 {
@@ -87,7 +99,7 @@ test "immutable source views refresh missing generations and own returned bodies
     defer a.free(directory);
     const cache: Cache = .{ .directory = directory, .namespace = "source-v3", .buckets = 1024, .limit = 256 * 1024 };
     var views: Store = .{ .a = a };
-    defer views.deinit();
+    defer views.deinit(io);
     var key: [32]u8 = @splat(0);
     cache.store(a, io, key, "first revision");
     const first = views.load(a, io, cache, key).?;

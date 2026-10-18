@@ -178,6 +178,7 @@ pub const Options = struct {
     threshold: f64 = 0.5,
     chunk_lines: usize = 80,
     context_lines: usize = 8,
+    decision_batch_wait_ms: u64 = 1,
     batch_size: usize = 8,
     max_regions: usize = std.math.maxInt(usize),
     timeout_ms: u64 = 60_000,
@@ -588,7 +589,7 @@ pub const Options = struct {
                 } else if (std.mem.eql(u8, name, "--ask")) {
                     if (self.ask != null or value.len == 0) return error.InvalidQuestion;
                     self.ask = value;
-                } else if (std.mem.eql(u8, name, "--endpoint")) self.endpoint = value else if (std.mem.eql(u8, name, "--model")) self.model = value else if (std.mem.eql(u8, name, "--threshold")) self.threshold = std.fmt.parseFloat(f64, value) catch return error.InvalidNumber else if (std.mem.eql(u8, name, "--chunk-lines")) self.chunk_lines = try number(value) else if (std.mem.eql(u8, name, "--context-lines")) self.context_lines = try number(value) else if (std.mem.eql(u8, name, "--batch-size")) self.batch_size = try number(value) else if (std.mem.eql(u8, name, "--max-regions")) {
+                } else if (std.mem.eql(u8, name, "--endpoint")) self.endpoint = value else if (std.mem.eql(u8, name, "--model")) self.model = value else if (std.mem.eql(u8, name, "--threshold")) self.threshold = std.fmt.parseFloat(f64, value) catch return error.InvalidNumber else if (std.mem.eql(u8, name, "--chunk-lines")) self.chunk_lines = try number(value) else if (std.mem.eql(u8, name, "--context-lines")) self.context_lines = try number(value) else if (std.mem.eql(u8, name, "--decision-batch-wait-ms")) self.decision_batch_wait_ms = try number(value) else if (std.mem.eql(u8, name, "--batch-size")) self.batch_size = try number(value) else if (std.mem.eql(u8, name, "--max-regions")) {
                     if (self.jev_mode) self.max_regions_per_file = try number(value) else self.max_regions = try number(value);
                 } else if (std.mem.eql(u8, name, "--max-file-size")) self.max_file_bytes = try number(value) else if (std.mem.eql(u8, name, "--timeout-ms")) self.timeout_ms = try number(value) else if (std.mem.eql(u8, name, "--max-count")) self.max_count = try number(value) else if (std.mem.eql(u8, name, "--before-context")) self.before = try number(value) else if (std.mem.eql(u8, name, "--after-context")) self.after = try number(value) else if (std.mem.eql(u8, name, "--context")) {
                     self.before = try number(value);
@@ -716,7 +717,7 @@ pub const Options = struct {
         if (self.help or self.version or self.generate != null or self.pcre2_version) return;
         if (self.backend == .typesafe and self.model == null) self.model = "jev-latest";
         if (self.ask != null and self.model == null) return error.DecisionModelRequired;
-        if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;
+        if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.decision_batch_wait_ms > 1000 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;
         if (self.cached_only and (self.ask == null or self.no_cache or self.cache_ttl_seconds == 0 or self.table_config != null or self.pre != null or self.hostname_bin != null)) return error.ConflictingCachedOnlyFlags;
         if (self.files and (self.patterns.items.len > 0 or self.ask != null)) return error.ConflictingFlags;
         if (self.tables.items.len > 0 and self.table_config == null) return error.TableConfigRequired;

@@ -28,6 +28,7 @@ _arguments -s \
  '--count-matches[count-matches]' \
  '--crlf[crlf]' \
  '--debug[debug]' \
+ '--decision-batch-wait-ms[decision-batch-wait-ms]:value:' \
  '--decision-context[decision-context]:value:(legacy shared-v1)' \
  '--dfa-size-limit[dfa-size-limit]:value:' \
  '--dictionary[dictionary]:value:_files' \
