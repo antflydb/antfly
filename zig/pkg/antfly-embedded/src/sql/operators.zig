@@ -4425,11 +4425,11 @@ test "SQL native hash join shares producer body preparation across physical page
 test "SQL promoted exact bags retain reducer states through partials spill and allocation failures" {
     const Probe = struct {
         fn checkpoint(_: *anyopaque) !void {}
-        fn run(a: Allocator, disk: bool) !void {
+        fn run(a: Allocator, disk: bool, promoted: bool) !void {
             var count_arena = std.heap.ArenaAllocator.init(a);
             defer count_arena.deinit();
             const Count = @import("catalog.zig").Count;
-            const count = try Count.init(@as(u64, 1) << 63).multiply(count_arena.allocator(), Count.init(1 << 20));
+            const count = if (promoted) try Count.init(@as(u64, 1) << 63).multiply(count_arena.allocator(), Count.init(1 << 20)) else Count.init(1 << 62);
             var dummy: u8 = 0;
             var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = checkpoint, .async_writes = false };
             defer manager.deinit();
@@ -4444,7 +4444,10 @@ test "SQL promoted exact bags retain reducer states through partials spill and a
             try std.testing.expectEqual(@as(i64, 0), result.aggregates[1].value.integer);
         }
     };
-    try Probe.run(std.testing.allocator, false);
-    try Probe.run(std.testing.allocator, true);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{false});
+    // Two individually compact contributions can still overflow the old
+    // aggregate counter. Promotion must also happen at the merge boundary.
+    for ([_]bool{ false, true }) |promoted| {
+        for ([_]bool{ false, true }) |disk| try Probe.run(std.testing.allocator, disk, promoted);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{ false, promoted });
+    }
 }
