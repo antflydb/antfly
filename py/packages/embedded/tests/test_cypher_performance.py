@@ -1669,6 +1669,9 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
             [str(2 * total), str(2 * paths)],
         ),
         (f"SELECT sum(q.e),count(*) FROM {mixed_relation} CROSS JOIN (SELECT 1 AS x) d", [str(total), str(paths)]),
+        # SQL demand pruning drops unused derived outputs, including errors;
+        # the singleton still contributes its row to the cross product.
+        (f"SELECT sum(q.e) FROM {mixed_relation} CROSS JOIN (SELECT 1/0 AS x) d", [str(total)]),
         (
             f"SELECT sum(q.e*d.x),count(*) FROM (SELECT 2 AS x) d CROSS JOIN {mixed_relation}",
             [str(2 * total), str(paths)],
@@ -1684,7 +1687,6 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
         assert time.monotonic() - started < 5
     for statement in (
         f"SELECT sum(d.e) FROM (SELECT q.e FROM {mixed_relation} ORDER BY 1/(q.e-q.e)) d",
-        f"SELECT sum(q.e) FROM {mixed_relation} CROSS JOIN (SELECT 1/0 AS x) d",
         f"SELECT sum(d.e) FROM (SELECT CAST(q.e AS BIGINT) AS e FROM {mixed_relation} UNION ALL SELECT CAST(1/0 AS BIGINT) AS e) d",
     ):
         with pytest.raises(SQLStateError, match="22012"):
