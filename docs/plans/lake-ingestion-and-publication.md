@@ -1831,3 +1831,34 @@ scales remain native. Wide/special values and unsupported expressions retain
 exact scalar behavior. Attachment syntax, query results and wire formats remain
 unchanged. Archive-scale benchmarks and live-provider retention qualification are
 separate, deferred qualification work.
+
+### Stable public navigation and typed execution
+
+New source navigation v4 (reader protocol 51, inventory v20) separates snapshot
+identity from file navigation. `lake3:` public IDs contain full snapshot and
+stable-file SHA-256 digests plus row coordinates. The file directory keys exclude
+the snapshot, so refreshes path-copy membership changes while replacements and
+snapshot-only changes reuse the public tree. Public lookups and continuations
+validate the snapshot proof. Legacy publications and `lake1:` IDs remain readable;
+private posting identities retain their existing format. Query ordering, search,
+ordered indexes and retained readers use the publication's identity version.
+The complete inventory proof census remains necessary and is not delta-sized.
+Ordering cache provenance is explicit and independent of the payload variant.
+Builders select the identity version before preparing file order; legacy flat
+callers refresh order once before parallel views are created.
+
+Signed DECIMAL statistics are validated after applying Parquet logical types.
+Decimal and timestamp predicates use exact typed comparisons for row-group,
+page-index and Iceberg bounds, including join-derived ranges. Unknown metadata
+cannot exclude rows. Native decimal COUNT/MIN/MAX retain compact coefficients,
+and pure arithmetic forests evaluate through bounded registers with only final
+output vectors. Scalar execution remains the authority for unsupported precision,
+scale, wide values and fallible expressions. Real-writer Parquet/Iceberg tests
+compare native results with scalar SQL both before and after process restart.
+
+Qualification includes 58 real-writer Parquet/Iceberg E2Es (including signed
+DECIMAL statistics and cold restart), 1,030 SQL checks, 468/151 lake checks,
+217/301 shared/server native API checks, final publication/order regressions,
+runtime I/O ABI, and 13 merged-main packaging tests. Latest merged main is
+`408644a861`. Archive-scale benchmarks and real-provider retention qualification
+remain deferred.

@@ -936,13 +936,16 @@ pub const Reader = struct {
         }
         return null;
     }
+    pub fn identityVersion(self: *const Reader) u8 {
+        return if (self.root.file_dictionary) |dictionary| dictionary.public_identity_version else 1;
+    }
     pub fn publicDigest(self: *Reader, a: A, slot: u32) ![32]u8 {
         if (self.root.public_digests.len != 0) {
             if (slot >= self.root.public_digests.len) return error.InvalidNativeLakeRowIndex;
             return self.root.public_digests[slot];
         }
         const file = try self.fileAtAlloc(a, slot);
-        return local.storage_rowsource_identity.fileDigest(self.root.source, self.root.snapshot, file);
+        return local.storage_rowsource_identity.navigationDigest(self.identityVersion(), self.root.source, self.root.snapshot, file);
     }
     pub fn nextPredicateBlocks(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) ![]const predicate_blocks.Block {
         if (self.exhausted) return &.{};
@@ -1045,7 +1048,7 @@ pub const Reader = struct {
         const physical: *const [16]u8 = @ptrCast(record.value.ptr);
         const file = std.mem.readInt(u32, physical[0..4], .big);
         if (file >= self.root.fileCount()) return error.InvalidNativeLakeRowIndex;
-        return .{ .external = .{ .source_id = self.root.source, .snapshot_id = self.root.snapshot, .file_id = try self.fileAtAlloc(a, file), .row_group_ordinal = std.mem.readInt(u32, physical[4..8], .big), .row_ordinal = std.mem.readInt(u64, physical[8..16], .big) } };
+        return .{ .external = .{ .source_id = self.root.source, .snapshot_id = self.root.snapshot, .identity_version = self.identityVersion(), .file_id = try self.fileAtAlloc(a, file), .row_group_ordinal = std.mem.readInt(u32, physical[4..8], .big), .row_ordinal = std.mem.readInt(u64, physical[8..16], .big) } };
     }
     pub fn next(self: *Reader, a: A, max_rows: usize) ![]const rows.RowRef {
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;

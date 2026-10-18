@@ -508,6 +508,203 @@ fn decimalArithmeticWith(workspace: *DecimalWorkspace, a: std.mem.Allocator, pro
     return try Batch.fromDecimalScales(a, values, nulls, result.scale, scales);
 }
 
+/// Pure decimal forests execute one bounded register frame per lane. Sources
+/// and constants are shared; only final projections own full coefficient vectors.
+const FusedDecimal = struct {
+    const Lane = struct { coefficient: i128 = 0, scale: u16 = 0, null: bool = false, valid: bool = true };
+    const Node = struct {
+        program: *const scalar.Program,
+        index: u32,
+        operation: union(enum) {
+            constant: Lane,
+            decimal: @import("execution_batch.zig").DecimalColumn,
+            integer: @import("execution_batch.zig").PhysicalColumn,
+            sign: struct { child: u16, negative: bool },
+            binary: struct { left: u16, right: u16, op: Binary },
+            alias: u16,
+        },
+    };
+    nodes: std.ArrayList(Node) = .empty,
+    roots: []?u16,
+    a: std.mem.Allocator,
+    source: @import("execution_batch.zig").Batch,
+    parameters: []const std.json.Value,
+    fn add(self: *@This(), program: *const scalar.Program, index: u32, depth: usize) anyerror!?u16 {
+        if (depth >= 32 or self.nodes.items.len >= 512) return null;
+        for (self.nodes.items, 0..) |node, slot| if (DecimalArithmetic.same(program, index, node.program, node.index, 0)) return @intCast(slot);
+        const instruction = program.instructions[index];
+        const Operation = @FieldType(Node, "operation");
+        const operation: Operation = if (constantOperand(program, index, 0)) blk: {
+            var constant = program.*;
+            constant.root = index;
+            const datum = try constant.evaluate(self.a, &.{}, self.parameters, .{});
+            if (datum.sql_null) break :blk .{ .constant = .{ .null = true } };
+            const scale: u16 = if (datum.numeric) |value| value.scale else 0;
+            if (scale > 38) return null;
+            const coefficient = if (datum.numeric) |value| @import("numeric_value.zig").coefficientAtScale(value.*, scale) orelse return null else if (datum.value == .integer) @as(i128, datum.value.integer) else return null;
+            @import("../common/decimal128.zig").validateCoefficient(coefficient, 38, scale) catch return null;
+            break :blk .{ .constant = .{ .coefficient = coefficient, .scale = scale } };
+        } else switch (instruction.operation) {
+            .column => |ordinal| blk: {
+                if (try self.source.decimalColumnSelected(self.a, ordinal, null)) |decimal| break :blk .{ .decimal = decimal };
+                const physical = (try self.source.physicalColumn(self.a, ordinal)) orelse return null;
+                if (physical.kind != .integer) return null;
+                try physical.validate();
+                break :blk .{ .integer = physical };
+            },
+            .cast => |cast| blk: {
+                if (cast.type != .number or cast.element_type != .numeric or cast.numeric_modifier != null) return null;
+                break :blk .{ .alias = (try self.add(program, cast.operand, depth + 1)) orelse return null };
+            },
+            .unary => |part| blk: {
+                if (instruction.type.element_type != .numeric or (part.op != .positive and part.op != .negative)) return null;
+                break :blk .{ .sign = .{ .child = (try self.add(program, part.operand, depth + 1)) orelse return null, .negative = part.op == .negative } };
+            },
+            .binary => |part| blk: {
+                if (instruction.type.element_type != .numeric) return null;
+                switch (part.op) {
+                    .add, .subtract, .multiply, .divide, .modulo => {},
+                    else => return null,
+                }
+                const left = (try self.add(program, part.left, depth + 1)) orelse return null;
+                const right = (try self.add(program, part.right, depth + 1)) orelse return null;
+                break :blk .{ .binary = .{ .left = left, .right = right, .op = part.op } };
+            },
+            else => return null,
+        };
+        if (self.nodes.items.len >= 512) return null;
+        const slot: u16 = @intCast(self.nodes.items.len);
+        try self.nodes.append(self.a, .{ .program = program, .index = index, .operation = operation });
+        return slot;
+    }
+    fn prepare(self: *@This(), programs: []const *const scalar.Program, visited: []const bool) !void {
+        @memset(self.roots, null);
+        for (programs, visited, self.roots) |program, done, *root| {
+            if (done or program.output_type.element_type != .numeric or program.required_columns.len == 0 or program.output_type.numeric_modifier != null) continue;
+            const begin = self.nodes.items.len;
+            root.* = try self.add(program, program.root, 0);
+            if (root.* == null) self.nodes.shrinkRetainingCapacity(begin);
+        }
+    }
+    fn binary(left: Lane, right: Lane, op: Binary) !Lane {
+        if (!left.valid or !right.valid) return .{ .valid = false };
+        if (left.null or right.null) return .{ .null = true };
+        var scale = if (op == .multiply) left.scale + right.scale else @max(left.scale, right.scale);
+        if (op == .divide) {
+            if (right.coefficient == 0) return error.SqlDivisionByZero;
+            const numeric = @import("numeric_value.zig");
+            const l = try numeric.ScaledInteger.init(left.coefficient, left.scale);
+            const r = try numeric.ScaledInteger.init(right.coefficient, right.scale);
+            scale = numeric.divisionScale(l.view(), r.view());
+        }
+        if (scale > 38) return .{ .valid = false };
+        const l = if (op == .multiply or op == .divide) left.coefficient else DecimalArithmetic.scaled(left.coefficient, left.scale, scale) orelse return .{ .valid = false };
+        const r = if (op == .multiply or op == .divide) right.coefficient else DecimalArithmetic.scaled(right.coefficient, right.scale, scale) orelse return .{ .valid = false };
+        const coefficient = switch (op) {
+            .add => std.math.add(i128, l, r) catch return .{ .valid = false },
+            .subtract => std.math.sub(i128, l, r) catch return .{ .valid = false },
+            .multiply => std.math.mul(i128, l, r) catch return .{ .valid = false },
+            .divide => DecimalArithmetic.quotient(l, r, @as(i32, scale) + right.scale - left.scale) orelse return .{ .valid = false },
+            .modulo => if (r == 0) return error.SqlDivisionByZero else @rem(l, r),
+            else => unreachable,
+        };
+        if (@abs(coefficient) >= 100000000000000000000000000000000000000) return .{ .valid = false };
+        return .{ .coefficient = coefficient, .scale = scale };
+    }
+    fn evaluate(self: *@This(), row: usize, registers: []Lane) !void {
+        for (self.nodes.items, registers) |node, *out| out.* = switch (node.operation) {
+            .constant => |value| value,
+            .decimal => |decimal| blk: {
+                const physical = decimal.physical.rowAt(row);
+                if (decimal.physical.vector.nulls.isNull(physical)) break :blk .{ .null = true };
+                const values = decimal.physical.vector.values.decimal128;
+                const scale = try decimal.scaleAt(row);
+                try @import("../common/decimal128.zig").validateCoefficient(values.values[physical], values.precision, scale);
+                break :blk .{ .coefficient = values.values[physical], .scale = scale };
+            },
+            .integer => |physical| blk: {
+                const value = try physical.cell(row);
+                break :blk if (value.sql_null) .{ .null = true } else .{ .coefficient = value.value.integer };
+            },
+            .alias => |slot| registers[slot],
+            .sign => |part| blk: {
+                var value = registers[part.child];
+                if (part.negative and value.valid and !value.null) value.coefficient = -value.coefficient;
+                break :blk value;
+            },
+            .binary => |part| try FusedDecimal.binary(registers[part.left], registers[part.right], part.op),
+        };
+    }
+};
+fn fusedDecimals(a: std.mem.Allocator, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, outputs: []?@import("execution_batch.zig").Batch, visited: []bool) !void {
+    if (page.selection.len == 0 or programs.len > 512) return;
+    var workspace: DecimalWorkspace = undefined;
+    workspace.init(a);
+    defer workspace.arena.deinit();
+    const sa = workspace.arena.allocator();
+    var roots: [512]?u16 = undefined;
+    var plan: FusedDecimal = .{ .a = sa, .roots = roots[0..programs.len], .source = .{ .columns = .{ .page = page, .definitions = columns } }, .parameters = parameters };
+    plan.prepare(programs, visited) catch |err| {
+        if (err == error.OutOfMemory and workspace.budget.isLocallyExhausted()) return;
+        return err;
+    };
+    if (for (plan.roots) |root| {
+        if (root != null) break false;
+    } else true) return;
+    const Output = struct {
+        values: []i128,
+        nulls: []u8,
+        scales: []u16,
+        failed: bool = false,
+        first: ?u16 = null,
+        mixed: bool = false,
+        fn free(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.values);
+            alloc.free(self.nulls);
+            alloc.free(self.scales);
+        }
+    };
+    var results: [512]?Output = @splat(null);
+    defer for (results[0..programs.len]) |result| if (result) |value| value.free(a);
+    for (plan.roots, results[0..programs.len]) |root, *result| {
+        if (root == null) continue;
+        const values = try a.alloc(i128, page.selection.len);
+        errdefer a.free(values);
+        const nulls = try a.alloc(u8, page.selection.len);
+        errdefer a.free(nulls);
+        const scales = try a.alloc(u16, page.selection.len);
+        result.* = .{ .values = values, .nulls = nulls, .scales = scales };
+    }
+    var registers: [512]FusedDecimal.Lane = undefined;
+    for (0..page.selection.len) |row| {
+        try plan.evaluate(row, registers[0..plan.nodes.items.len]);
+        for (plan.roots, results[0..programs.len]) |root, *result| if (root) |slot| {
+            const value = registers[slot];
+            const out = &result.*.?;
+            if (!value.valid) out.failed = true;
+            out.values[row] = value.coefficient;
+            out.nulls[row] = @intFromBool(value.null);
+            out.scales[row] = value.scale;
+            if (!value.null and value.valid) {
+                if (out.first) |scale| if (scale != value.scale) {
+                    out.mixed = true;
+                };
+                out.first = value.scale;
+            }
+        };
+    }
+    for (results[0..programs.len], outputs, visited) |*result, *output, *done| if (result.*) |*value| {
+        if (value.failed) continue;
+        if (!value.mixed) {
+            a.free(value.scales);
+            value.scales = &.{};
+        }
+        output.* = try @import("execution_batch.zig").Batch.fromDecimalScales(a, value.values, value.nulls, value.first orelse 0, value.scales);
+        result.* = null;
+        done.* = true;
+    };
+}
+
 /// Retain expression dictionaries across projection instead of expanding them
 /// into per-row Datum vectors. Ordinary expressions still share fused gathers.
 pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, io: ?std.Io) ![]const ?@import("execution_batch.zig").Batch {
@@ -540,6 +737,7 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
         visited[index] = true;
         published = true;
     }
+    try fusedDecimals(a, programs, page, columns, parameters, outputs, visited);
     var decimal_workspace: DecimalWorkspace = undefined;
     decimal_workspace.init(a);
     defer decimal_workspace.arena.deinit();
@@ -1772,4 +1970,44 @@ fn mixedDecimalScenario(a: std.mem.Allocator) !void {
 test "lake SQL fused decimal forest preserves mixed division display scales and declines optional workspace limits" {
     try mixedDecimalScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, mixedDecimalScenario, .{});
+}
+
+test "lake SQL fused decimal loops fit final vector admission without intermediate vectors" {
+    try fusedDecimalScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, fusedDecimalScenario, .{});
+}
+fn fusedDecimalScenario(a: std.mem.Allocator) !void {
+    var compiled = try @import("compiler.zig").compileScalar(a, "((n+m)*(n-m)+(n+m)*(n-m))/m", .{});
+    defer compiled.deinit();
+    const columns = [_]scalar.Column{ .{ .name = "n", .type = .number, .element_type = .numeric }, .{ .name = "m", .type = .number, .element_type = .numeric } };
+    var program = try scalar.bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    const n = try a.alloc(i128, 1024);
+    defer a.free(n);
+    const m = try a.alloc(i128, 1024);
+    defer a.free(m);
+    const selected = try a.alloc(usize, 1024);
+    defer a.free(selected);
+    for (n, m, selected, 0..) |*left, *right, *row, i| {
+        left.* = @as(i128, @intCast(i % 101)) - 50;
+        right.* = 3;
+        row.* = i;
+    }
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .external_span = .{ .first = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 1024 }, .columns = &.{ .{ .name = "n", .values = .{ .decimal128 = .{ .values = n, .precision = 38, .scale = 0 } } }, .{ .name = "m", .values = .{ .decimal128 = .{ .values = m, .precision = 38, .scale = 0 } } } } }, .selection = selected };
+    var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 };
+    var outputs = [_]?@import("execution_batch.zig").Batch{null};
+    var visited = [_]bool{false};
+    try fusedDecimals(budget.allocator(), &.{&program}, page, &columns, &.{}, &outputs, &visited);
+    try std.testing.expect(visited[0]);
+    defer outputs[0].?.reader.free_owned.?(outputs[0].?.reader.ptr, budget.allocator());
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..1024) |row| {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        const expected = try program.evaluate(sa, &.{ try page.typedCell(sa, row, "n", true), try page.typedCell(sa, row, "m", true) }, &.{}, .{});
+        const actual = try outputs[0].?.cell(sa, row, 0);
+        var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
+        try std.testing.expectEqualStrings(try @import("numeric_value.zig").format(&context, expected.numeric.?.*), try @import("numeric_value.zig").format(&context, actual.numeric.?.*));
+    }
 }

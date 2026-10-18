@@ -297,6 +297,7 @@ pub fn enrichInventoryFilesWithFootersAlloc(
     errdefer deinitDeletedRowGroups(alloc, deleted_row_groups);
 
     var out = external_source.Inventory{
+        .row_identity_version = inventory.row_identity_version,
         .format = inventory.format,
         .source_id = source_id,
         .source_uri = source_uri,
@@ -352,6 +353,7 @@ pub fn enrichInventoryFileWithFooterAlloc(
     errdefer deinitDeletedRowGroups(alloc, deleted_row_groups);
 
     var out = external_source.Inventory{
+        .row_identity_version = inventory.row_identity_version,
         .format = inventory.format,
         .source_id = source_id,
         .source_uri = source_uri,
@@ -624,6 +626,7 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
 
     var total_rows: u64 = 0;
     for (got_row_groups) |group| {
+        group.validate(file_len) catch return error.InvalidParquetMetadata;
         total_rows = std.math.add(u64, total_rows, group.row_count) catch return error.InvalidParquetMetadata;
     }
     if (total_rows != got_row_count) return error.InvalidParquetMetadata;
@@ -951,7 +954,7 @@ fn parseRowGroup(
         .total_byte_len = total_byte_len,
         .column_chunks = got_chunks,
     };
-    group.validate(file_len) catch return error.InvalidParquetMetadata;
+    group.validateRanges(file_len) catch return error.InvalidParquetMetadata;
     column_chunks = null;
     return group;
 }
@@ -1030,7 +1033,7 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .column_index_offset = column_index_offset,
         .column_index_length = column_index_length,
     };
-    chunk.validate(file_len) catch return error.InvalidParquetMetadata;
+    chunk.validateRanges(file_len) catch return error.InvalidParquetMetadata;
     meta.disown();
     return chunk;
 }
@@ -1211,7 +1214,7 @@ fn decodeColumnStatsAlloc(alloc: Allocator, raw: RawColumnStatistics, physical_t
         return .{ .min_i64 = min_i64, .max_i64 = max_i64 };
     }
     if (std.ascii.eqlIgnoreCase(physical_type, "byte_array") or std.ascii.eqlIgnoreCase(physical_type, "fixed_len_byte_array")) {
-        if (std.mem.order(u8, min, max) == .gt) return error.InvalidParquetMetadata;
+        // Signed DECIMAL order is known only after applying schema annotations.
         const min_bytes = try alloc.dupe(u8, min);
         errdefer alloc.free(min_bytes);
         const max_bytes = try alloc.dupe(u8, max);

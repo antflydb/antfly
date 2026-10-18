@@ -16538,7 +16538,9 @@ pub const ApiHttpServer = struct {
         };
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = config, .secret_store = self.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
         try self.prepareLakeCache();
-        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema.external_base_source }, options.lakeOptions(), context, &self.lake_read_cache);
+        var source_options = options.lakeOptions();
+        source_options.row_identity_version = 2;
+        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema.external_base_source }, source_options, context, &self.lake_read_cache);
         defer source.deinit();
         try source.attachCache(&self.lake_read_cache, schema.external_base_source.?.binding, context);
         var reader_lease: ?*@import("lake_index_reader_lease.zig").Handle = null;

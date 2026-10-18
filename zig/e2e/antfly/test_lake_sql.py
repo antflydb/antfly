@@ -1365,7 +1365,7 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             "row-129",
         ], ordered
         assert ordered["profile"]["sort"]["plan"] == "native_doc_values_top_n", ordered
-        assert all(h["_id"].startswith("lake1:") for h in ordered["hits"]["hits"]), (
+        assert all(h["_id"].startswith("lake3:") for h in ordered["hits"]["hits"]), (
             ordered
         )
         next_ordered = call(
@@ -2135,7 +2135,7 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 assert {hit["_source"]["amount"] for hit in hits} == set(expected), (
                     result
                 )
-                assert all(hit["_id"].startswith("lake1:") for hit in hits), result
+                assert all(hit["_id"].startswith("lake3:") for hit in hits), result
             assert (
                 {hit["_id"] for hit in results[0]["hits"]["hits"]}
                 == {hit["_id"] for hit in results[1]["hits"]["hits"]}

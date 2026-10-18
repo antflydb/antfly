@@ -34,10 +34,7 @@ pub fn formatAlloc(a: std.mem.Allocator, value: i128, precision: i32, scale: i32
     return decimal.formatAlloc(a, value, precision, scale) catch |err| return mapError(err);
 }
 pub fn signedBigEndian(bytes: []const u8) !i128 {
-    if (bytes.len == 0 or bytes.len > 16) return error.UnsupportedParquetPage;
-    var raw: u128 = if (bytes[0] & 0x80 != 0) std.math.maxInt(u128) else 0;
-    for (bytes) |byte| raw = (raw << 8) | byte;
-    return @bitCast(raw);
+    return decimal.signedBigEndian(bytes) catch |err| return mapError(err);
 }
 test "external lake exact decimal128 preserves precision scale sign and validates values" {
     const a = std.testing.allocator;

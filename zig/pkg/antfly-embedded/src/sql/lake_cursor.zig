@@ -76,6 +76,30 @@ fn numericPruning(a: std.mem.Allocator, column: []const u8, op: catalog.Conditio
     return .{ .column = column, .op = operator, .value = .{ .integer = integer } };
 }
 
+/// Typed bounds retain units and scale; their residual remains authoritative.
+fn typedPruning(a: Allocator, column: catalog.Column, op: catalog.Condition.Op, raw: scalar.Datum) !?@import("../serverless/query/lake_stream.zig").Predicate {
+    const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
+    const operator = std.meta.stringToEnum(Predicate.Op, @tagName(op)) orelse return null;
+    if (raw.sql_null) return null;
+    if (column.element_type == .numeric) {
+        if (column.numeric_modifier) |modifier| if (modifier.scale < 0) return null;
+        const datum = try @import("lake_values.zig").comparisonDatum(a, raw, column);
+        const number = datum.numeric orelse return null;
+        if (number.kind != .finite or number.scale > 38) return null;
+        const coefficient = @import("numeric_value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
+        return .{ .column = column.path, .op = operator, .value = .{ .decimal = .{ .coefficient = coefficient, .scale = number.scale, .max_physical_scale = if (column.numeric_modifier) |modifier| std.math.cast(u16, modifier.scale) else null } } };
+    }
+    if (column.type == .datetime) {
+        const value = try @import("lake_values.zig").comparisonValue(a, raw.value, .datetime);
+        const ns: i128 = switch (value) {
+            .integer => |n| n,
+            .number_string => |text| std.fmt.parseInt(i128, text, 10) catch return null,
+            else => return null,
+        };
+        return .{ .column = column.path, .op = operator, .value = .{ .timestamp = ns } };
+    }
+    return null;
+}
 pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
     const normalized = try context.platformDeadline();
     var inherited: @import("../serverless/query/lake_read_context.zig").Context = if (source.context_store) |store| store.context else .{};
@@ -136,7 +160,12 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         const column = try table.column(condition.column);
         out.value = try @import("lake_values.zig").conditionValue(owned, out.value, column);
         const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
-        if (column.element_type == .numeric) {
+        if (column.element_type == .numeric or column.type == .datetime) {
+            if (try typedPruning(owned, column, condition.op, out.datum())) |predicate| {
+                try pruning.append(owned, predicate);
+                continue;
+            }
+            if (column.type == .datetime) continue;
             // Raw integer metadata can prune exact NUMERIC comparisons. A
             // negative typmod scale rounds physical integers, so it cannot use
             // their uncoerced bounds. Text-backed decimals remain residual.
@@ -520,6 +549,11 @@ const Owner = struct {
         for (filter.columns, filter.domains) |key, domain| {
             const column = try self.table.column(key.name);
             if (domain.minimum == null) continue;
+            if (column.element_type == .numeric or column.type == .datetime) {
+                if (try typedPruning(a, column, .gte, domain.minimum.?)) |predicate| try predicates.append(a, predicate);
+                if (try typedPruning(a, column, .lte, domain.maximum.?)) |predicate| try predicates.append(a, predicate);
+                continue;
+            }
             for ([_]bool{ true, false }) |lower| {
                 const value = if (lower) domain.minimum.?.value else domain.maximum.?.value;
                 const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
@@ -685,8 +719,8 @@ const Owner = struct {
             fn less(inventory: @import("../serverless/external_source/types.zig").Inventory, left: @import("../serverless/query/lake_stream.zig").ScanWork.Unit, right: @import("../serverless/query/lake_stream.zig").ScanWork.Unit) bool {
                 if (left.file == right.file) return left.ordinal < right.ordinal;
                 const identities = @import("../storage/rowsource/identity.zig");
-                const l = identities.fileDigest(inventory.source_id, inventory.snapshot_id, inventory.files[left.file].file_id);
-                const r = identities.fileDigest(inventory.source_id, inventory.snapshot_id, inventory.files[right.file].file_id);
+                const l = identities.navigationDigest(inventory.row_identity_version, inventory.source_id, inventory.snapshot_id, inventory.files[left.file].file_id);
+                const r = identities.navigationDigest(inventory.row_identity_version, inventory.source_id, inventory.snapshot_id, inventory.files[right.file].file_id);
                 return std.mem.order(u8, &l, &r) == .lt;
             }
         }.less);

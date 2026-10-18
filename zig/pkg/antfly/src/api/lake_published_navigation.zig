@@ -67,7 +67,7 @@ const Owner = struct {
             var file = try self.resolver.inventoryFileForScan(a, record.value);
             errdefer file.deinit(a);
             try context.ensureActive();
-            const digest = local.storage_rowsource_identity.fileDigest(self.owner.resolver.root.source, self.owner.resolver.root.snapshot, file.file_id);
+            const digest = local.storage_rowsource_identity.navigationDigest(self.owner.resolver.root.public_identity_version, self.owner.resolver.root.source, self.owner.resolver.root.snapshot, file.file_id);
             if (!std.mem.eql(u8, record.key, &digest) or self.seen >= self.owner.resolver.root.count) return error.InvalidNativeLakeFileState;
             self.seen += 1;
             return file;
@@ -194,22 +194,24 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     if ((binding.format != .iceberg or binding.object_mutability != .immutable) and publication.source_navigation.?.metadata_version < 3)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
-    const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+    var source_options: @import("antfly_local_sources").serverless_lake_host.OpenOptions = options;
+    source_options.row_identity_version = if (publication.source_navigation.?.metadata_version >= 4) 2 else 1;
+    const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     var store = Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir) catch |err| {
         try optionalAdmission(context, reader != null, err);
-        return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+        return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     };
     defer store.deinit();
-    if (!std.mem.eql(u8, &store.identity, &publication.signature.store)) return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+    if (!std.mem.eql(u8, &store.identity, &publication.signature.store)) return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     store.implementation.cloud_io = context.io;
     const lease = reader orelse server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table_id, publication.generation, context, null) catch |err| {
         try optionalAdmission(context, false, err);
-        return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+        return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     };
     defer if (reader == null) lease.deinit();
     var factory: Factory = .{ .store = &store, .publication = publication, .lease = lease, .cache = &server.lake_read_cache, .table_id = table_id, .required = reader != null };
     if (binding.format != .iceberg or binding.object_mutability != .immutable) {
-        var source = try Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+        var source = try Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
         errdefer source.deinit();
         attachStatistics(a, &factory, &source, context) catch |err| {
             try context.ensureActive();
@@ -218,7 +220,7 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
         };
         return source;
     }
-    return Source.openLazyNavigated(a, schema, options, context, &server.lake_read_cache, .{ .ptr = &factory, .resolve = Factory.resolve });
+    return Source.openLazyNavigated(a, schema, source_options, context, &server.lake_read_cache, .{ .ptr = &factory, .resolve = Factory.resolve });
 }
 
 /// The pin contains immutable costing data only. It performs no future reads

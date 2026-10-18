@@ -1302,6 +1302,7 @@ fn rebindRowRefToInventory(inventory: external_source.Inventory, row_ref: rowsou
     return .{ .external = .{
         .source_id = inventory.source_id,
         .snapshot_id = inventory.snapshot_id,
+        .identity_version = inventory.row_identity_version,
         .file_id = file.file_id,
         .row_group_ordinal = external.row_group_ordinal,
         .row_ordinal = external.row_ordinal,

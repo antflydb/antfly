@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 50;
+pub const native_reader_protocol: u16 = 51;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -161,8 +161,9 @@ pub const Publication = struct {
             else => return error.InvalidLakeIndexCatalog,
         }
         if (self.source_navigation) |navigation| {
-            if (self.reader_protocol < 46 or navigation.kind != .doc_values or (navigation.metadata_version != 1 and navigation.metadata_version != 2 and navigation.metadata_version != 3)) return error.InvalidLakeIndexCatalog;
+            if (self.reader_protocol < 46 or navigation.kind != .doc_values or (navigation.metadata_version != 1 and navigation.metadata_version != 2 and navigation.metadata_version != 3 and navigation.metadata_version != 4)) return error.InvalidLakeIndexCatalog;
             if (navigation.metadata_version == 2 and self.reader_protocol < 47) return error.InvalidLakeIndexCatalog;
+            if (navigation.metadata_version == 4 and self.reader_protocol < 51) return error.InvalidLakeIndexCatalog;
             if (navigation.metadata_version == 3 and self.reader_protocol < 50) return error.InvalidLakeIndexCatalog;
             try artifactValid(navigation);
         }

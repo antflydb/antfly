@@ -5761,3 +5761,59 @@ regressions (2 E2Es, 25.48 seconds), with an unchanged executable hash. Source
 and error catalogs, formatting, licenses and the Apache boundary (2,286 sources)
 also passed after the merge. Repository cache cleanup completed; uv pruning
 skipped a shared cache lock rather than interrupting its owner.
+
+### Signed statistics, fused decimal execution, and stable public navigation
+
+Mixed-sign DECIMAL footer bounds are validated after logical annotations are
+known, using signed two's-complement coefficients. Exact scale-aware comparisons
+also drive decimal row-group, page-index and Iceberg file pruning. Timestamp
+bounds use signed nanoseconds; missing, malformed or incompatible bounds remain
+conservative. Declared scale rounding keeps raw decimal bounds residual when
+the physical scale exceeds the declared scale. Static conditions and runtime
+join ranges share these typed
+predicates, while existing exact row filters retain result authority.
+
+NUMERIC COUNT/MIN/MAX consume coefficient/validity vectors directly. Extrema keep
+one coefficient and display scale per group and materialize canonical numeric
+storage only at scalar delivery; wider or special values promote to the exact
+state. Merges preserve the same representation. Pure decimal expression forests
+execute through bounded, shared registers, allocating coefficient vectors only
+for final outputs. Unsupported or overflowing lanes retain scalar semantics.
+
+New publications use source navigation v4, reader protocol 51 and inventory v20.
+The public file tree names files with SHA-256(source, empty snapshot, file), while
+public `lake3:` row IDs carry separate full SHA-256 snapshot and file digests,
+followed by fixed-width group/row coordinates. Changing snapshots therefore
+changes every public ID's authority without rewriting every public file key.
+Membership deltas path-copy added/removed keys; replacements reuse the same key.
+Readers continue to support legacy inventories, navigation and `lake1:` IDs.
+Private `lake2:` posting identities remain unchanged. Search hydration, ordered
+pagination, highlight attachment and lazy/full-scan ordering negotiate the same
+identity version, with separate cache entries for legacy and current ordering.
+Snapshot proofs are checked before a public lookup or continuation is accepted.
+Ordering cache entries carry explicit identity-version provenance independently
+of their payload variant, preserving legacy coverage-proof leases. Builders
+select the version before initial source planning; legacy flat callers rebuild
+once before lending parallel views, avoiding a full sort per changed-file scan.
+
+This removes the public-directory sort and rebuild from compatible refreshes.
+The current inventory proof census and its sort still cover all source files;
+this change does not claim total publication CPU or memory is proportional to
+only the delta. Source-native incremental proof construction remains a separate
+opportunity requiring trustworthy manifest lineage and delete coverage.
+
+Qualification with merged `origin/main` at `408644a861` (merge `58b87ea765`):
+1,030 SQL checks passed (804 shared, 226 server; three opt-in benchmarks skipped),
+with 468/151 lake checks and 217/301 shared/server API checks passing without
+failures or leaks. Final ordering refinements passed four focused publication,
+legacy-coverage, navigation and costing regressions and the 300 other API cases;
+the unchanged spilled-pack proof case passed in the full 301-case owner. Runtime
+I/O ABI and the 63-step installed CLI build passed. All 58 real Parquet/Iceberg
+E2Es passed in 356.40 seconds with two isolated workers and unchanged executable
+SHA-256 `434ecd856ba6c02b8ea664676522faa338feafb528e50dc83f5b29914cc0a51d`.
+The new mixed-sign statistics cases cover scalar/native arithmetic, extrema,
+filters, join ranges and cold restarts for both independent writers. Packaging
+passed 13 tests. Formatting, Python lint, source/error catalogs, whitespace,
+license headers and the Apache boundary (2,286 sources) passed. Focused emitted
+test binaries were removed; required `make gc` completed, with the busy uv cache
+left alone after its bounded lock timeout.

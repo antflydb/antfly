@@ -43,6 +43,7 @@ fn exactVersion(version: []const u8) bool {
 }
 pub const Root = struct {
     version: u8 = 2,
+    public_identity_version: u8 = 1,
     coverage: ?struct { version: u8 = 1, plan: ?[32]u8, data: [32]u8 } = null,
     domain: [32]u8,
     source: []const u8,
@@ -158,12 +159,13 @@ fn key(bytes: []const u8) [32]u8 {
     return result;
 }
 pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != 2 and ref.metadata_version != 3) or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
+    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != 2 and ref.metadata_version != 3 and ref.metadata_version != 4) or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeFileState;
     if (root.version != ref.metadata_version or !std.mem.eql(u8, &scope.domain, &root.domain) or root.source.len == 0 or root.schema.len == 0 or root.snapshot.len == 0) return error.InvalidNativeLakeFileState;
+    if ((root.public_identity_version != 1 and root.public_identity_version != 2) or (root.public_identity_version == 2 and root.version < 4)) return error.InvalidNativeLakeFileState;
     if (root.delete_proof) |proof| {
         try proof.versions.validate();
         if (proof.count == 0 or proof.versions.records != proof.count or root.coverage == null or !std.mem.eql(u8, &proof.data, &root.coverage.?.data)) return error.InvalidNativeLakeFileState;
@@ -281,7 +283,7 @@ pub fn build(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, pr
 pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, prior: ?Root, token: Token, data: ?[32]u8) !Built {
     const inv = provider.source.inventory;
     const compatible = if (prior) |old| std.mem.eql(u8, old.source, inv.source_id) and std.mem.eql(u8, old.schema, inv.schema_fingerprint) and std.mem.eql(u8, &old.domain, &store.upload_scope.?.domain) else false;
-    var root: Root = .{ .domain = store.upload_scope.?.domain, .source = inv.source_id, .schema = inv.schema_fingerprint, .snapshot = inv.snapshot_id, .count = @intCast(inv.files.len) };
+    var root: Root = .{ .version = if (inv.row_identity_version == 2) 4 else 2, .public_identity_version = inv.row_identity_version, .domain = store.upload_scope.?.domain, .source = inv.source_id, .schema = inv.schema_fingerprint, .snapshot = inv.snapshot_id, .count = @intCast(inv.files.len) };
     root.rows = 0;
     root.bytes = 0;
     for (inv.files) |file| {
@@ -327,7 +329,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
         try native_by_id.put(out, file.file_id, i);
         const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = digest, .deletes = deletes }, .{});
         // Defer stable file/private mutations until the old paged census proves
-        // which records changed. Public IDs intentionally fence each snapshot.
+        // which records changed. Public IDs separately fence each snapshot.
         if (!compatible) {
             try files.add(&key(file.file_id), bytes);
             try private.add(&digest, file.file_id);
@@ -434,38 +436,62 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     }
     try files.flush(file_storage, &root.files);
     try private.flush(pages.store(), &root.private);
-    const same_membership = membership: {
-        if (!compatible or prior.?.count != inv.files.len or !std.mem.eql(u8, prior.?.snapshot, inv.snapshot_id)) break :membership false;
-        for (prior_changed.items) |old| if (!native_by_id.contains(old.id)) break :membership false;
-        break :membership true;
-    };
-    if (same_membership) root.public = prior.?.public else {
-        const public_entries = try a.alloc(PublicEntry, inv.files.len);
-        defer a.free(public_entries);
-        for (inv.files, public_entries) |file, *entry| entry.* = .{ .digest = local.storage_rowsource_identity.fileDigest(inv.source_id, inv.snapshot_id, file.file_id), .file = file.file_id };
-        std.mem.sort(PublicEntry, public_entries, {}, struct {
-            fn less(_: void, l: PublicEntry, r: PublicEntry) bool {
-                return std.mem.order(u8, &l.digest, &r.digest) == .lt;
+    if (compatible and inv.row_identity_version == 2 and prior.?.public_identity_version == 2) {
+        // Public keys name immutable files independently of the snapshot. Only
+        // true membership changes touch this tree; replacements retain a key.
+        root.public = prior.?.public;
+        var mutations: Batch = .{ .arena = .init(a) };
+        defer mutations.arena.deinit();
+        var replaced: std.StringHashMapUnmanaged(void) = .empty;
+        defer replaced.deinit(a);
+        for (prior_changed.items) |old| {
+            if (native_by_id.contains(old.id)) {
+                try replaced.put(a, old.id, {});
+                continue;
             }
-        }.less);
-        const PublicSource = struct {
-            entries: []const PublicEntry,
-            position: usize = 0,
-            pub fn next(self: *@This()) !?tree.Cursor.Record {
-                if (self.position == self.entries.len) return null;
-                const entry = &self.entries[self.position];
-                self.position += 1;
-                return .{ .key = &entry.digest, .value = entry.file };
-            }
+            try mutations.add(&local.storage_rowsource_identity.navigationDigest(2, inv.source_id, inv.snapshot_id, old.id), null);
+            if (mutations.changes.items.len >= 64) try mutations.flush(pages.store(), &root.public);
+        }
+        for (current, changed) |file, is_changed| {
+            if (!is_changed or replaced.contains(file.id)) continue;
+            try mutations.add(&local.storage_rowsource_identity.navigationDigest(2, inv.source_id, inv.snapshot_id, file.id), file.id);
+            if (mutations.changes.items.len >= 64) try mutations.flush(pages.store(), &root.public);
+        }
+        try mutations.flush(pages.store(), &root.public);
+    } else {
+        const same_membership = membership: {
+            if (!compatible or prior.?.public_identity_version != inv.row_identity_version or prior.?.count != inv.files.len or !std.mem.eql(u8, prior.?.snapshot, inv.snapshot_id)) break :membership false;
+            for (prior_changed.items) |old| if (!native_by_id.contains(old.id)) break :membership false;
+            break :membership true;
         };
-        var public_source: PublicSource = .{ .entries = public_entries };
-        root.public = try tree.buildSorted(a, pages.store(), &public_source);
+        if (same_membership) root.public = prior.?.public else {
+            const public_entries = try a.alloc(PublicEntry, inv.files.len);
+            defer a.free(public_entries);
+            for (inv.files, public_entries) |file, *entry| entry.* = .{ .digest = local.storage_rowsource_identity.navigationDigest(inv.row_identity_version, inv.source_id, inv.snapshot_id, file.file_id), .file = file.file_id };
+            std.mem.sort(PublicEntry, public_entries, {}, struct {
+                fn less(_: void, l: PublicEntry, r: PublicEntry) bool {
+                    return std.mem.order(u8, &l.digest, &r.digest) == .lt;
+                }
+            }.less);
+            const PublicSource = struct {
+                entries: []const PublicEntry,
+                position: usize = 0,
+                pub fn next(self: *@This()) !?tree.Cursor.Record {
+                    if (self.position == self.entries.len) return null;
+                    const entry = &self.entries[self.position];
+                    self.position += 1;
+                    return .{ .key = &entry.digest, .value = entry.file };
+                }
+            };
+            var public_source: PublicSource = .{ .entries = public_entries };
+            root.public = try tree.buildSorted(a, pages.store(), &public_source);
+        }
     }
     const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
     defer a.free(bytes);
     var uploaded = try store.putWithCancellation(bytes, token);
     defer uploaded.deinit(store.allocator);
-    return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .public_navigation = .{ .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
+    return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .public_navigation = .{ .identity_version = root.public_identity_version, .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
 }
 /// Incremental per-column, per-file sketches piggyback on native replay.
 /// Each changed leaf replaces its previous sketch; HLLs are never subtracted.
@@ -589,13 +615,13 @@ pub const CostingBuilder = struct {
         const columns = try a.alloc(Costing, self.costing.len);
         for (self.costing, columns) |column, *saved| saved.* = .{ .name = column.name, .files = column.files, .statistics = .{ .name = column.name }, .complete = false };
         var root = self.root;
-        root.version = 3;
+        root.version = @max(root.version, 3);
         root.costing = columns;
         const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
         if (bytes.len > 64 * 1024) return self.current;
         var uploaded = try self.store.putWithCancellation(bytes, self.token);
         defer uploaded.deinit(self.store.allocator);
-        return .{ .kind = .doc_values, .metadata_version = 3, .artifact_id = try self.out.dupe(u8, uploaded.artifact_id), .checksum = try self.out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+        return .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = try self.out.dupe(u8, uploaded.artifact_id), .checksum = try self.out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
     }
     pub fn finish(self: *@This()) !Ref {
         if (self.columns.len == 0) return self.current;
@@ -655,13 +681,13 @@ pub const CostingBuilder = struct {
             try complete.append(ca, column.*);
         }
         if (complete.items.len == 0) return self.current;
-        self.root.version = 3;
+        self.root.version = @max(self.root.version, 3);
         self.root.costing = complete.items;
         const bytes = try std.json.Stringify.valueAlloc(ca, self.root, .{});
         if (bytes.len > 64 * 1024) return self.current;
         var uploaded = try self.store.putWithCancellation(bytes, self.token);
         defer uploaded.deinit(self.store.allocator);
-        return .{ .kind = .doc_values, .metadata_version = 3, .artifact_id = try self.out.dupe(u8, uploaded.artifact_id), .checksum = try self.out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+        return .{ .kind = .doc_values, .metadata_version = self.root.version, .artifact_id = try self.out.dupe(u8, uploaded.artifact_id), .checksum = try self.out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
     }
 };
 /// The resolver borrows fresh publication authority. Only immutable root/page
@@ -787,9 +813,14 @@ pub const Resolver = struct {
         try self.token.check();
         const map = if (public) &self.public_memo else &self.private_memo;
         if (map.get(hex)) |found| return found;
-        if (hex.len != 64) return error.ExternalLakeSnapshotMismatch;
+        var digest_hex = hex;
+        if (public and self.root.public_identity_version == 2) {
+            if (hex.len != 129 or hex[64] != ':' or !std.mem.eql(u8, hex[0..64], &std.fmt.bytesToHex(local.storage_rowsource_identity.fileDigest(self.root.source, self.root.snapshot, ""), .lower))) return error.ExternalLakeSnapshotMismatch;
+            digest_hex = hex[65..];
+        }
+        if (digest_hex.len != 64) return error.ExternalLakeSnapshotMismatch;
         var id: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&id, hex) catch return error.ExternalLakeSnapshotMismatch;
+        _ = std.fmt.hexToBytes(&id, digest_hex) catch return error.ExternalLakeSnapshotMismatch;
         var scratch_budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 };
         var scratch = std.heap.ArenaAllocator.init(scratch_budget.allocator());
         defer scratch.deinit();
@@ -906,6 +937,10 @@ pub fn walk(a: A, store: *stores.ArtifactStore, ref: Ref, token: Token, visitor:
 }
 
 test "external lake bounded WAL paged source navigation resolves only reached identities and reconciles per-file deletes" {
+    try navigationRefreshScenario(1);
+    try navigationRefreshScenario(2);
+}
+fn navigationRefreshScenario(identity_version: u8) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -919,7 +954,7 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     const entries = try ca.alloc(local.serverless_external_source_types.FileEntry, 256);
     for (entries, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = try std.fmt.allocPrint(ca, "file:///source-{d}.parquet", .{i}), .etag = @constCast("exact"), .byte_len = 128, .row_count = 0, .row_groups = &.{} };
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
-    source.inventory = .{ .format = .iceberg, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("before"), .schema_fingerprint = @constCast("schema"), .files = entries };
+    source.inventory = .{ .format = .iceberg, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("before"), .row_identity_version = identity_version, .schema_fingerprint = @constCast("schema"), .files = entries };
     source.verified_files = null;
     source.prepared_deletes = null;
     source.scanner.iceberg_delete_plan = null;
@@ -970,21 +1005,20 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     wrong_file = entries[255];
     wrong_file.etag = @constCast("changed");
     try std.testing.expectError(error.ExternalLakeIndexSourceChanged, resolver.selectors(a, wrong_file));
-    const public_id = local.storage_rowsource_identity.fileDigest("source", "before", "file-255");
-    const public_hex = std.fmt.bytesToHex(public_id, .lower);
-    try std.testing.expectEqualStrings("file-255", (try resolver.file(ca, &public_hex, true)).?);
+    const public_hex = try local.storage_rowsource_identity.publicFileAlloc(ca, identity_version, "source", "before", "file-255");
+    try std.testing.expectEqualStrings("file-255", (try resolver.file(ca, public_hex, true)).?);
     const private_hex = try resolver.digest(ca, "file-255");
     try std.testing.expectEqualStrings("file-255", (try resolver.file(ca, private_hex, false)).?);
     // One query resolves one file, not the inventory. Repeated hits perform no
     // more metadata I/O; cache ownership stays independent of result arenas.
     const read_bytes = resolver.reads;
-    try std.testing.expectEqualStrings("file-255", (try resolver.file(ca, &public_hex, true)).?);
+    try std.testing.expectEqualStrings("file-255", (try resolver.file(ca, public_hex, true)).?);
     try std.testing.expectEqual(read_bytes, resolver.reads);
     try std.testing.expectEqual(@as(u32, 1), resolver.public_memo.count());
     var peer: Resolver = .{ .root = old, .store = store, .cached = cached, .token = .none };
     defer peer.deinit();
     const allowance = peer.reads;
-    try std.testing.expectEqualStrings("file-255", (try peer.file(ca, &public_hex, true)).?);
+    try std.testing.expectEqualStrings("file-255", (try peer.file(ca, public_hex, true)).?);
     try std.testing.expectEqual(allowance, peer.reads);
     try std.testing.expect(resolver.memo_budget.peak < 64 * 1024);
     var prepared: local.serverless_query_lake_prepared_deletes.Prepared = .{ .arena = .init(a), .delete_files = &.{}, .equality = &.{}, .columns = &.{} };
@@ -1006,7 +1040,13 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     try std.testing.expect(!std.mem.eql(u8, old_digest, new_digest));
     try std.testing.expect(try newer.file(ca, old_digest, false) == null);
     try std.testing.expectEqualStrings("file-0", (try resolver.file(ca, old_digest, false)).?);
-    try std.testing.expect(try newer.file(ca, &public_hex, true) == null);
+    if (identity_version == 2) {
+        try std.testing.expectEqual(@as(u16, 4), next.ref.metadata_version);
+        try std.testing.expectEqualDeep(old.public, root.public);
+        try std.testing.expectError(error.ExternalLakeSnapshotMismatch, newer.file(ca, public_hex, true));
+        const fresh_hex = try local.storage_rowsource_identity.publicFileAlloc(ca, 2, "source", "after", "file-255");
+        try std.testing.expectEqualStrings("file-255", (try newer.file(ca, fresh_hex, true)).?);
+    } else try std.testing.expect(try newer.file(ca, public_hex, true) == null);
     provider.native_delta = next.delta;
     const exact = try native.identity(ca, &provider, entries[0]);
     try std.testing.expectEqualStrings(new_digest, &std.fmt.bytesToHex(exact, .lower));
@@ -1017,6 +1057,26 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     try std.testing.expectEqual(@as(usize, 0), unchanged.stats.prior_pages);
     try std.testing.expectEqual(@as(usize, 0), unchanged.stats.prior_records);
     try std.testing.expectEqual(@as(usize, 0), unchanged.delta.prior_changed.len);
+    if (identity_version == 2) {
+        // A membership delta edits only the affected public path; retained roots
+        // and changed-file replacements keep their original authority.
+        const same = try load(ca, store, unchanged.ref, .none, null);
+        source.inventory.files = entries[0 .. entries.len - 1];
+        const removal = try build(a, ca, &store, &provider, same, .none);
+        const removed = try load(ca, store, removal.ref, .none, null);
+        try std.testing.expectEqual(@as(u64, 255), removed.public.?.records);
+        var removal_reader: Resolver = .{ .root = removed, .store = store, .cached = cached, .token = .none };
+        defer removal_reader.deinit();
+        const removed_hex = try local.storage_rowsource_identity.publicFileAlloc(ca, 2, "source", "after", "file-255");
+        try std.testing.expect(try removal_reader.file(ca, removed_hex, true) == null);
+        source.inventory.files = entries;
+        const addition = try build(a, ca, &store, &provider, removed, .none);
+        const added = try load(ca, store, addition.ref, .none, null);
+        try std.testing.expectEqual(@as(u64, 256), added.public.?.records);
+        var addition_reader: Resolver = .{ .root = added, .store = store, .cached = cached, .token = .none };
+        defer addition_reader.deinit();
+        try std.testing.expectEqualStrings("file-255", (try addition_reader.file(ca, removed_hex, true)).?);
+    }
     // Wrong authority cannot turn a cached page into a capability.
     newer.cached.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, newer.file(ca, new_digest, false));

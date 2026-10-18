@@ -43,6 +43,8 @@ pub const Item = struct {
     extension_deinit: ?*const fn (*anyopaque) void = null,
     // Snapshot-local canonical row-ID ordering and totals, computed once.
     file_order: ?[]usize = null,
+    /// Ordering provenance is independent of the immutable payload variant.
+    file_order_identity_version: u8 = 1,
     file_rank: ?[]usize = null,
     file_by_id: std.StringHashMapUnmanaged(usize) = .empty,
     estimated_rows: u64 = 0,

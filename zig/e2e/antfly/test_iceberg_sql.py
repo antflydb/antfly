@@ -1833,3 +1833,178 @@ def test_cold_indexed_iceberg_queries_use_publication_file_navigation(
         if failed:
             print(server.debug_logs())
         server.stop()
+
+
+@pytest.mark.parametrize("file_format", ["parquet", "iceberg"])
+def test_signed_decimal_statistics_kernels_and_typed_pruning(tmp_path, file_format):
+    """Independent writers exercise signed bounds, native kernels and restart."""
+    import random
+    from decimal import Decimal
+
+    if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
+        pytest.importorskip("pyarrow")
+        if file_format == "iceberg":
+            pytest.importorskip("pyiceberg")
+            pytest.importorskip("fastavro")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = random.Random(1112)
+    values = [
+        (
+            i,
+            None if i % 7 == 0 else Decimal(rng.randrange(-999999, 999999)).scaleb(-4),
+            None
+            if i % 11 == 0
+            else Decimal(rng.choice([1, 3, 7, 10000001, -11])).scaleb(-2),
+        )
+        for i in range(75)
+    ]
+    arrow = pa.table(
+        {
+            "id": pa.array([v[0] for v in values], type=pa.int64()),
+            "n": pa.array([v[1] for v in values], type=pa.decimal128(38, 4)),
+            "m": pa.array([v[2] for v in values], type=pa.decimal128(38, 2)),
+        }
+    )
+    root = tmp_path / "lake"
+    if file_format == "parquet":
+        raw = tmp_path / "data.parquet"
+        pq.write_table(
+            arrow,
+            raw,
+            use_dictionary=False,
+            row_group_size=19,
+            write_statistics=True,
+            write_page_index=True,
+        )
+        payload = raw.read_bytes()
+        objects = root / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        (objects / "data.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
+        )
+    else:
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import DecimalType, LongType, NestedField
+
+        catalog = SqlCatalog(
+            "e2e",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("e2e")
+        table = catalog.create_table(
+            "e2e.decimals",
+            schema=Schema(
+                NestedField(1, "id", LongType(), required=False),
+                NestedField(2, "n", DecimalType(38, 4), required=False),
+                NestedField(3, "m", DecimalType(38, 2), required=False),
+            ),
+        )
+        table.append(arrow)
+        _export_table(table, root)
+
+    def literal(value):
+        return (
+            "CAST(NULL AS NUMERIC)" if value is None else f"CAST('{value}' AS NUMERIC)"
+        )
+
+    rows = ",".join(f"({i},{literal(n)},{literal(m)})" for i, n, m in values)
+    reference = f"(VALUES {rows}) v(id,n,m)"
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def request(path, body):
+            response = requests.post(
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, (
+                str(body) + "\n" + response.text + "\n" + server.debug_logs()
+            )
+            return response.json()
+
+        request(
+            "/tables/native_decimals",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "native-decimals",
+                        "format": file_format,
+                        "object_mutability": "immutable",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "integer"},
+                                    "n": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    },
+                                    "m": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+            },
+        )
+
+        def sql(statement):
+            return request("/sql", {"statement": statement})["rows"]
+
+        join_values = [n for _, n, _ in values if n is not None][:3]
+        statements = [
+            f"SELECT {expression} FROM {{table}} ORDER BY id"
+            for expression in (
+                "n+m",
+                "n-m",
+                "n*m",
+                "n/m",
+                "n%m",
+                "-(n/m)",
+                "(n/m)+m",
+                "(n+m)*(n+m)",
+                "n/m-(n+m)*(n+m)",
+                "(n/m)/m",
+                "(n/m) = m",
+                "(n/m) < m",
+                "((n+m)*(n-m)+(n+m)*(n-m))/m",
+            )
+        ] + [
+            "SELECT COUNT(n), MIN(n), MAX(n), SUM(n) FROM {table}",
+            "SELECT id,n FROM {table} WHERE n >= -17.25 AND n < 30.001 ORDER BY id",
+            "SELECT id,n FROM {table} WHERE n < 0 ORDER BY id",
+            "SELECT id FROM {table} JOIN (VALUES "
+            + ",".join(f"({literal(n)})" for n in join_values)
+            + ") AS b(bound) ON n = b.bound ORDER BY id",
+        ]
+        expected = [sql(query.format(table=reference)) for query in statements]
+        for cold in (False, True):
+            if cold:
+                server.restart()
+            for query, result in zip(statements, expected):
+                assert sql(query.format(table="native_decimals")) == result, query
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

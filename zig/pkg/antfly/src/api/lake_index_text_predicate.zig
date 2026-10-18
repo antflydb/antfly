@@ -720,7 +720,7 @@ fn PredicateResolver(comptime Set: type) type {
                                     exhausted = true;
                                     break :outer;
                                 }
-                                const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.resolver.source.inventory.source_id, .snapshot_id = self.resolver.source.inventory.snapshot_id, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
+                                const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.resolver.source.inventory.source_id, .snapshot_id = self.resolver.source.inventory.snapshot_id, .identity_version = self.resolver.source.inventory.row_identity_version, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
                                 if (try predicate.contains(ref)) try selected.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
                             }
                         }

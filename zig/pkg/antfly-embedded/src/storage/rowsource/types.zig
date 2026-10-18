@@ -71,6 +71,7 @@ pub const ServerlessRowRef = struct {
 };
 
 pub const ExternalRowRef = struct {
+    identity_version: u8 = 1,
     source_id: []const u8,
     snapshot_id: []const u8,
     file_id: []const u8,

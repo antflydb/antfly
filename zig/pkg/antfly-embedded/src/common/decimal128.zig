@@ -55,3 +55,43 @@ pub fn formatAlloc(a: std.mem.Allocator, unscaled: i128, precision: i32, scale: 
     }
     return result;
 }
+
+/// Parquet and Iceberg decimal metrics use signed big-endian two's complement.
+pub fn signedBigEndian(bytes: []const u8) !i128 {
+    if (bytes.len == 0 or bytes.len > 16) return error.InvalidDecimal128;
+    var raw: u128 = if (bytes[0] & 0x80 != 0) std.math.maxInt(u128) else 0;
+    for (bytes) |byte| raw = (raw << 8) | byte;
+    return @bitCast(raw);
+}
+pub fn validateBounds(min: []const u8, max: []const u8, precision: i32, scale: i32) !void {
+    const low = try signedBigEndian(min);
+    const high = try signedBigEndian(max);
+    try validateCoefficient(low, precision, scale);
+    try validateCoefficient(high, precision, scale);
+    if (low > high) return error.InvalidDecimal128;
+}
+
+/// Scale alignment in i256 is exact for every finite decimal128 coefficient.
+pub fn order(left: i128, ls: u16, right: i128, rs: u16) std.math.Order {
+    std.debug.assert(ls <= 38 and rs <= 38);
+    const powers = comptime blk: {
+        var out: [39]i256 = undefined;
+        out[0] = 1;
+        for (1..out.len) |i| out[i] = out[i - 1] * 10;
+        break :blk out;
+    };
+    const scale = @max(ls, rs);
+    return std.math.order(@as(i256, left) * powers[scale - ls], @as(i256, right) * powers[scale - rs]);
+}
+
+test "decimal128 metric bounds compare signed values and exact mixed scales" {
+    var low: [16]u8 = undefined;
+    var high: [16]u8 = undefined;
+    std.mem.writeInt(i128, &low, -12345, .big);
+    std.mem.writeInt(i128, &high, 98765, .big);
+    try validateBounds(&low, &high, 10, 3);
+    try std.testing.expectError(error.InvalidDecimal128, validateBounds(&high, &low, 10, 3));
+    try std.testing.expectEqual(std.math.Order.eq, order(-123, 2, -12300, 4));
+    try std.testing.expectEqual(std.math.Order.lt, order(-1, 38, 0, 0));
+    try std.testing.expectEqual(std.math.Order.gt, order(std.math.maxInt(i128), 0, 1, 38));
+}

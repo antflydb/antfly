@@ -240,6 +240,10 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         cloud_object.?.cloud_writer = previous_writer;
         writer.deinit();
     };
+    // The descriptor and source navigation negotiate the same identity epoch.
+    source.inventory.row_identity_version = 2;
+    source.scanner.inventory.row_identity_version = 2;
+    try source.ensureCanonicalPlan(context);
     var inventory_view = source.inventory;
     var qualified_files: ?[]local.serverless_external_source_types.FileEntry = null;
     defer if (qualified_files) |files| a.free(files);
@@ -554,7 +558,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         var statistics_arena = std.heap.ArenaAllocator.init(a);
         defer statistics_arena.deinit();
         const navigation_root = try @import("lake_source_navigation.zig").load(statistics_arena.allocator(), artifact_store, publication.source_navigation.?, .none, null);
-        try std.testing.expectEqual(@as(u8, 3), navigation_root.version);
+        try std.testing.expectEqual(@as(u8, 4), navigation_root.version);
         try std.testing.expectEqual(@as(usize, 1), navigation_root.costing.len);
         try std.testing.expectEqualStrings("body", navigation_root.costing[0].name);
         try std.testing.expectEqual(@as(?u64, 2), navigation_root.costing[0].statistics.population_rows);

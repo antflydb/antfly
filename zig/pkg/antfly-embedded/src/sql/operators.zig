@@ -1333,7 +1333,7 @@ pub const Grouped = struct {
         for (self.specs, self.state_columns) |spec, column| {
             if (!partial.fixedEligible(spec)) return false;
             switch (column.values) {
-                .counts, .integers, .booleans, .bytes, .exact => {},
+                .counts, .integers, .booleans, .bytes, .exact, .fixed => {},
                 else => return false,
             }
         }
@@ -1833,7 +1833,7 @@ pub const Grouped = struct {
             // admission and merge borrowed typed state directly.
             var fixed = self.external == null;
             for (source.state_columns) |column| switch (column.values) {
-                .counts, .integers, .booleans => {},
+                .counts, .integers, .booleans, .fixed => {},
                 else => fixed = false,
             };
             const rows = try a.alloc([]const Datum, count);

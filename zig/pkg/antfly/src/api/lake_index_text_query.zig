@@ -603,7 +603,7 @@ const Execution = struct {
         const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
         const file = (try self.fileFor(key[6..70], false)) orelse return error.ExternalLakeSnapshotMismatch;
         if (self.overlay) |pending_overlay| if (pending_overlay.physical) |*mask| if (mask.contains(file, coordinate.group, coordinate.row)) return false;
-        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } };
+        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } };
         if (self.vector_include_provider) |*provider| if (!try provider.allows(ref)) return false;
         if (self.vector_exclude_provider) |*provider| if (try provider.allows(ref)) return false;
         if (self.vector_include) |*include| if (!include.contains(file, coordinate.group, coordinate.row)) return false;
@@ -635,7 +635,8 @@ const Execution = struct {
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         if (identities.spans.len == 0) return null;
         self.ordinal_live_rows.backing = self.result_allocator;
-        const row = try identities.physicalRow(a, &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        var row = try identities.physicalRow(a, &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        row.external.identity_version = self.source.inventory.row_identity_version;
         return try local.storage_rowsource_identity.allocId(a, row);
     }
     fn publicKey(raw: ?*anyopaque, a: A, member_key: []const u8) ![]u8 {
@@ -653,12 +654,12 @@ const Execution = struct {
         }
         if (self.overlay) |overlay| if (overlay.row(key) != null) return a.dupe(u8, key);
         const position = try @import("lake_index_native_state.zig").coordinates(key);
-        if (std.mem.startsWith(u8, key, "lake1:")) {
-            if ((try self.fileFor(key[6..70], true)) == null) return error.ExternalLakeSnapshotMismatch;
+        if (local.storage_rowsource_identity.isPublic(key)) {
+            if ((try self.fileFor(try local.storage_rowsource_identity.publicFile(key), true)) == null) return error.ExternalLakeSnapshotMismatch;
             return units.rebind(a, member_key, key);
         }
         const file = (try self.fileFor(key[6..70], false)) orelse return error.ExternalLakeSnapshotMismatch;
-        const parent_key = try local.storage_rowsource_identity.allocId(a, .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } });
+        const parent_key = try local.storage_rowsource_identity.allocId(a, .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } });
         defer a.free(parent_key);
         return units.rebind(a, member_key, parent_key);
     }
@@ -673,9 +674,9 @@ const Execution = struct {
         }
         const key = try units.parent(member_key);
         const self = from(raw);
-        if (!std.mem.startsWith(u8, key, "lake1:")) return a.dupe(u8, member_key);
+        if (!local.storage_rowsource_identity.isPublic(key)) return a.dupe(u8, member_key);
         const position = try @import("lake_index_native_state.zig").coordinates(key);
-        const file = (try self.fileFor(key[6..70], true)) orelse return a.dupe(u8, key);
+        const file = (try self.fileFor(try local.storage_rowsource_identity.publicFile(key), true)) orelse return a.dupe(u8, key);
         const digest = try self.privateDigest(file);
         const parent_key = try std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, position.group, position.row });
         defer a.free(parent_key);
@@ -913,8 +914,8 @@ const Execution = struct {
             const ia = input.allocator();
             const key = try publicKey(self, ia, hit.id);
             const position = try @import("lake_index_native_state.zig").coordinates(key);
-            const file = (try self.fileFor(key[6..70], true)) orelse return error.ExternalLakeSnapshotMismatch;
-            const row: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
+            const file = (try self.fileFor(try local.storage_rowsource_identity.publicFile(key), true)) orelse return error.ExternalLakeSnapshotMismatch;
+            const row: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .identity_version = self.source.inventory.row_identity_version, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
             winner.* = .{ .index = index, .ordinal = (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) orelse return error.InvalidNativeLakeTextCorpus };
         }
         std.mem.sort(Winner, winners, {}, struct {
@@ -1155,7 +1156,7 @@ const Execution = struct {
             for (page.rows) |row| {
                 if (self.overlay) |overlay| {
                     const position = try @import("lake_index_native_state.zig").coordinates(row.id);
-                    const file = (try self.fileFor(row.id[6..70], true)) orelse return error.ExternalLakeSnapshotMismatch;
+                    const file = (try self.fileFor(try local.storage_rowsource_identity.publicFile(row.id), true)) orelse return error.ExternalLakeSnapshotMismatch;
                     if (overlay.physical.?.contains(file, position.group, position.row)) continue;
                 }
                 if (options.primary_key_reverse or self.overlay != null) {
@@ -2673,9 +2674,12 @@ const Execution = struct {
                     position.* = if (sorted) |row| @intCast(row.ordinal) else input_position;
                     const key = if (sorted) |row| row.keys[0].value.string else try publicKey(raw, ca, keys[input_position]);
                     mapped.* = key;
-                    if (key.len != 96 or !std.mem.startsWith(u8, key, "lake1:") or key[70] != ':' or key[79] != ':') return error.ExternalLakeSnapshotMismatch;
-                    const file = (try self.fileFor(key[6..70], true)) orelse return error.ExternalLakeSnapshotMismatch;
-                    ref.* = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = std.fmt.parseUnsigned(u32, key[71..79], 16) catch return error.ExternalLakeSnapshotMismatch, .row_ordinal = std.fmt.parseUnsigned(u64, key[80..96], 16) catch return error.ExternalLakeSnapshotMismatch } };
+                    if (!local.storage_rowsource_identity.isPublic(key)) return error.ExternalLakeSnapshotMismatch;
+                    const parts = try local.storage_rowsource_identity.parse(key);
+                    try local.storage_rowsource_identity.validateSnapshot(parts, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+                    if (parts.version != self.source.inventory.row_identity_version) return error.ExternalLakeSnapshotMismatch;
+                    const file = (try self.fileFor(try local.storage_rowsource_identity.publicFile(key), true)) orelse return error.ExternalLakeSnapshotMismatch;
+                    ref.* = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .identity_version = parts.version, .file_id = file, .row_group_ordinal = parts.group, .row_ordinal = parts.row } };
                 }
                 var by_key: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
                 for (canonical, window_positions) |key, position| {

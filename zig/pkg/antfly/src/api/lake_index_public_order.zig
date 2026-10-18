@@ -98,12 +98,15 @@ pub const Cursor = struct {
         result.digests = digests;
         if (boundary) |prefix| {
             const value = id orelse return error.InvalidRelationalIndexBound;
-            if (value.len != 96 or !std.mem.startsWith(u8, value, "lake1:") or value[70] != ':' or value[79] != ':') return error.InvalidRelationalIndexBound;
-            for (value, 0..) |byte, i| if (i >= 6 and i != 70 and i != 79 and !((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidRelationalIndexBound;
-            const group = std.fmt.parseUnsigned(u32, value[71..79], 16) catch return error.InvalidRelationalIndexBound;
-            const row = std.fmt.parseUnsigned(u64, value[80..96], 16) catch return error.InvalidRelationalIndexBound;
+            const identity = local.storage_rowsource_identity;
+            if (!identity.isPublic(value)) return error.InvalidRelationalIndexBound;
+            const parts = identity.parse(value) catch return error.InvalidRelationalIndexBound;
+            identity.validateSnapshot(parts, reader.root.source, reader.root.snapshot) catch return error.InvalidRelationalIndexBound;
+            if (parts.version != reader.identityVersion()) return error.InvalidRelationalIndexBound;
+            const group = parts.group;
+            const row = parts.row;
             var digest_bytes: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&digest_bytes, value[6..70]) catch return error.InvalidRelationalIndexBound;
+            _ = std.fmt.hexToBytes(&digest_bytes, parts.digest) catch return error.InvalidRelationalIndexBound;
             result.boundary_file = try reader.publicSlot(ca, digest_bytes);
             result.boundary_digest = digest_bytes;
             if (result.boundary_file == null) return error.InvalidRelationalIndexBound;

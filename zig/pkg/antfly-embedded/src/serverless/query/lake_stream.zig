@@ -32,7 +32,7 @@ pub const Predicate = struct {
     pub const Op = enum { eq, neq, lt, lte, gt, gte };
     column: []const u8,
     op: Op,
-    value: union(enum) { integer: i64, bytes: []const u8, boolean: bool },
+    value: union(enum) { integer: i64, bytes: []const u8, boolean: bool, decimal: struct { coefficient: i128, scale: u16, max_physical_scale: ?u16 = null }, timestamp: i128 },
 };
 pub const Limits = struct {
     max_examined_rows: u64 = 100_000_000,
@@ -388,6 +388,10 @@ pub const Stream = struct {
         for (self.groupPredicates()) |predicate| {
             if (!std.mem.eql(u8, predicate.column, chunk.column_id)) continue;
             if (page.all_null) return false;
+            if (predicate.value == .decimal or predicate.value == .timestamp) {
+                if (!typedBoundsMayMatch(chunk, page.min, page.max, predicate)) return false;
+                continue;
+            }
             if (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string") and !std.mem.startsWith(u8, chunk.logical_type, "int")) continue;
             const min = page.min orelse continue;
             const max = page.max orelse continue;
@@ -405,6 +409,7 @@ pub const Stream = struct {
                     if (std.mem.order(u8, min, max) == .gt) continue;
                     break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
                 },
+                .decimal, .timestamp => unreachable,
                 .boolean => |value| blk: {
                     if (min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
                     break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
@@ -1159,7 +1164,7 @@ pub const Stream = struct {
         if (self.selection != null and self.source.scanner.shared_reader != null) {
             const reader = self.source.scanner.shared_reader.?;
             const file = self.source.fileAt(index);
-            const interpretation = try std.json.Stringify.valueAlloc(self.alloc, .{ .version = "hydration-file-plan-v1", .file = file.file_id, .format = self.source.inventory.format, .source = self.source.inventory.source_id, .source_uri = self.source.inventory.source_uri, .snapshot = self.source.inventory.snapshot_id, .schema = self.source.inventory.schema_fingerprint, .columns = self.columns, .contract = self.schema_contract, .predicates = self.predicates, .limits = self.limits }, .{});
+            const interpretation = try std.json.Stringify.valueAlloc(self.alloc, .{ .version = "hydration-file-plan-v1", .row_identity_version = self.source.inventory.row_identity_version, .file = file.file_id, .format = self.source.inventory.format, .source = self.source.inventory.source_id, .source_uri = self.source.inventory.source_uri, .snapshot = self.source.inventory.snapshot_id, .schema = self.source.inventory.schema_fingerprint, .columns = self.columns, .contract = self.schema_contract, .predicates = self.predicates, .limits = self.limits }, .{});
             defer self.alloc.free(interpretation);
             const key = try reader.objectKey(self.alloc, .{ .object = try @import("lake_range_io.zig").objectRefForExternalFileUri(file), .range = .{ .offset = 0, .len = file.byte_len }, .purpose = .parquet_footer }, interpretation);
             const ready_plan = reader.cache.decoded.lookup(key);
@@ -1461,15 +1466,76 @@ fn rangeMayMatch(comptime T: type, min: T, max: T, value: T, op: Predicate.Op) b
         .gte => high != .lt,
     };
 }
+fn orderMayMatch(low: std.math.Order, high: std.math.Order, op: Predicate.Op) bool {
+    return switch (op) {
+        .eq => low != .gt and high != .lt,
+        .neq => low != .eq or high != .eq,
+        .lt => low == .lt,
+        .lte => low != .gt,
+        .gt => high == .gt,
+        .gte => high != .lt,
+    };
+}
+fn typedBoundsMayMatch(chunk: external.ColumnChunk, minimum: ?[]const u8, maximum: ?[]const u8, predicate: Predicate) bool {
+    const min = minimum orelse return true;
+    const max = maximum orelse return true;
+    const decimal = @import("../../common/decimal128.zig");
+    const is_decimal = std.mem.eql(u8, chunk.logical_type, "decimal");
+    const is_integer = chunk.logical_type.len == 0 or std.mem.startsWith(u8, chunk.logical_type, "int");
+    if (predicate.value == .decimal) {
+        if (!is_decimal and !is_integer) return true;
+        const scale: u16 = if (is_decimal) std.math.cast(u16, chunk.decimal_scale) orelse return true else 0;
+        if (scale > 38 or predicate.value.decimal.scale > 38) return true;
+        const bytes = std.mem.eql(u8, chunk.physical_type, "byte_array") or std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array");
+        const integers = std.mem.eql(u8, chunk.physical_type, "int32") or std.mem.eql(u8, chunk.physical_type, "int64");
+        if ((!is_decimal and bytes) or (!bytes and !integers)) return true;
+        const low: i128 = if (bytes) decimal.signedBigEndian(min) catch return true else metricInteger(min) orelse return true;
+        const high: i128 = if (bytes) decimal.signedBigEndian(max) catch return true else metricInteger(max) orelse return true;
+        if (low > high) return true;
+        if (is_decimal) {
+            decimal.validateCoefficient(low, chunk.decimal_precision, scale) catch return true;
+            decimal.validateCoefficient(high, chunk.decimal_precision, scale) catch return true;
+        }
+        const bound = predicate.value.decimal;
+        // A declared NUMERIC scale may round physical values. Only use raw
+        // extrema when every value remains exact under the declared scale.
+        if (bound.max_physical_scale) |limit| if (scale > limit) return true;
+        return orderMayMatch(decimal.order(low, scale, bound.coefficient, bound.scale), decimal.order(high, scale, bound.coefficient, bound.scale), predicate.op);
+    }
+    if (predicate.value == .timestamp) {
+        if (!std.mem.eql(u8, chunk.physical_type, "int64")) return true;
+        const multiplier: i128 = if (std.mem.eql(u8, chunk.logical_type, "timestamp_millis")) 1000000 else if (std.mem.eql(u8, chunk.logical_type, "timestamp_micros")) 1000 else if (std.mem.eql(u8, chunk.logical_type, "timestamp_nanos")) 1 else return true;
+        const low: i128 = metricInteger(min) orelse return true;
+        const high: i128 = metricInteger(max) orelse return true;
+        if (low > high) return true;
+        return rangeMayMatch(i128, low * multiplier, high * multiplier, predicate.value.timestamp, predicate.op);
+    }
+    return true;
+}
 pub fn groupMayMatch(group: external.RowGroup, predicates: []const Predicate) bool {
     for (predicates) |predicate| for (group.column_chunks) |chunk| {
         if (!std.mem.eql(u8, chunk.column_id, predicate.column)) continue;
+        if (predicate.value == .decimal or predicate.value == .timestamp) {
+            var low: [8]u8 = undefined;
+            var high: [8]u8 = undefined;
+            const min: ?[]const u8 = if (chunk.stats_min_i64) |n| blk: {
+                std.mem.writeInt(i64, &low, n, .little);
+                break :blk &low;
+            } else chunk.stats_min_bytes;
+            const max: ?[]const u8 = if (chunk.stats_max_i64) |n| blk: {
+                std.mem.writeInt(i64, &high, n, .little);
+                break :blk &high;
+            } else chunk.stats_max_bytes;
+            if (!typedBoundsMayMatch(chunk, min, max, predicate)) return false;
+            continue;
+        }
         // Decimal/timestamp annotations change comparison semantics relative
         // to their physical statistics. Keep those predicates residual.
         if (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string")) continue;
         const matches = switch (predicate.value) {
             .integer => |value| if (chunk.stats_min_i64) |min| if (chunk.stats_max_i64) |max| rangeMayMatch(i64, min, max, value, predicate.op) else true else true,
             .bytes => |value| if (chunk.stats_min_bytes) |min| if (chunk.stats_max_bytes) |max| rangeMayMatch([]const u8, min, max, value, predicate.op) else true else true,
+            .decimal, .timestamp => unreachable,
             .boolean => |value| if (chunk.stats_min_bool) |min| if (chunk.stats_max_bool) |max| rangeMayMatch(u8, @intFromBool(min), @intFromBool(max), @intFromBool(value), predicate.op) else true else true,
         };
         if (!matches) return false;
@@ -1495,6 +1561,20 @@ pub fn icebergFileMayMatch(file: external.FileEntry, schema: []const @import("la
         const id = column.field_id orelse continue;
         const min = metricValue(file.lower_bounds, id) orelse continue;
         const max = metricValue(file.upper_bounds, id) orelse continue;
+        if (predicate.value == .decimal or predicate.value == .timestamp) {
+            var chunk: external.ColumnChunk = .{ .column_id = @constCast(predicate.column), .file_offset = 0, .compressed_len = 1, .physical_type = @constCast("int64") };
+            const kind = column.iceberg_type;
+            if (std.mem.startsWith(u8, kind, "decimal(") and std.mem.endsWith(u8, kind, ")")) {
+                var parts = std.mem.splitScalar(u8, kind[8 .. kind.len - 1], ',');
+                chunk.decimal_precision = std.fmt.parseInt(i32, std.mem.trim(u8, parts.next() orelse continue, " "), 10) catch continue;
+                chunk.decimal_scale = std.fmt.parseInt(i32, std.mem.trim(u8, parts.next() orelse continue, " "), 10) catch continue;
+                if (parts.next() != null) continue;
+                chunk.logical_type = @constCast("decimal");
+                chunk.physical_type = @constCast("byte_array");
+            } else if (std.mem.eql(u8, kind, "timestamp") or std.mem.eql(u8, kind, "timestamptz")) chunk.logical_type = @constCast("timestamp_micros") else if (!std.mem.eql(u8, column.kind, "integer")) continue;
+            if (!typedBoundsMayMatch(chunk, min, max, predicate)) return false;
+            continue;
+        }
         const matches = switch (predicate.value) {
             .integer => |value| blk: {
                 // Timestamp and decimal bounds require their original Iceberg
@@ -1509,6 +1589,7 @@ pub fn icebergFileMayMatch(file: external.FileEntry, schema: []const @import("la
                 if (!std.mem.eql(u8, column.iceberg_type, "string") or std.mem.order(u8, min, max) == .gt) continue;
                 break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
             },
+            .decimal, .timestamp => unreachable,
             .boolean => |value| blk: {
                 if (!std.mem.eql(u8, column.kind, "boolean") or min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
                 break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
@@ -1597,7 +1678,7 @@ fn bloomProbeUseful(chunk: external.ColumnChunk, predicate: Predicate) bool {
         .bytes => |value| std.mem.eql(u8, chunk.physical_type, "byte_array") and
             (chunk.logical_type.len == 0 or std.mem.eql(u8, chunk.logical_type, "string")) and
             !(chunk.stats_min_bytes != null and chunk.stats_max_bytes != null and std.mem.eql(u8, chunk.stats_min_bytes.?, value) and std.mem.eql(u8, chunk.stats_max_bytes.?, value)),
-        .boolean => false,
+        .boolean, .decimal, .timestamp => false,
     };
 }
 
@@ -1628,7 +1709,7 @@ fn bloomGroupMayMatch(alloc: Allocator, reader: parquet.ObjectRangeReader, file:
                         (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string"))) continue;
                     break :text value;
                 },
-                .boolean => continue,
+                .boolean, .decimal, .timestamp => continue,
             };
             if (offset >= file.byte_len) continue;
             const available = if (chunk.bloom_filter_length) |len| @min(file.byte_len - offset, len) else file.byte_len - offset;
@@ -1725,4 +1806,25 @@ test "external lake Bloom pruning reads only metadata and one block with legacy 
     chunk.logical_type = @constCast("");
     fake.bytes[8] = 0x2c;
     try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &absent, .{}, &stats));
+}
+
+test "lake SQL typed decimal and timestamp metrics prune only semantically compatible bounds" {
+    var low: [16]u8 = undefined;
+    var high: [16]u8 = undefined;
+    std.mem.writeInt(i128, &low, -100, .big);
+    std.mem.writeInt(i128, &high, 100, .big);
+    const chunk: external.ColumnChunk = .{ .column_id = @constCast("v"), .file_offset = 0, .compressed_len = 16, .physical_type = @constCast("fixed_len_byte_array"), .logical_type = @constCast("decimal"), .decimal_precision = 38, .decimal_scale = 2, .stats_min_bytes = &low, .stats_max_bytes = &high };
+    var chunks = [_]external.ColumnChunk{chunk};
+    const group: external.RowGroup = .{ .ordinal = 0, .row_count = 2, .column_chunks = &chunks };
+    try chunks[0].validate(16);
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .eq, .value = .{ .decimal = .{ .coefficient = -1000, .scale = 3 } } }}));
+    try std.testing.expect(!groupMayMatch(group, &.{.{ .column = "v", .op = .gte, .value = .{ .decimal = .{ .coefficient = 1001, .scale = 3 } } }}));
+    // Declared scale rounding can make a raw out-of-range value match.
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .gte, .value = .{ .decimal = .{ .coefficient = 1001, .scale = 3, .max_physical_scale = 1 } } }}));
+    // The same bytes cannot prove a numeric predicate over a string column.
+    chunks[0].logical_type = @constCast("string");
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .gte, .value = .{ .decimal = .{ .coefficient = 1001, .scale = 3 } } }}));
+    chunks[0] = .{ .column_id = @constCast("v"), .file_offset = 0, .compressed_len = 16, .physical_type = @constCast("int64"), .logical_type = @constCast("timestamp_micros"), .stats_min_i64 = -1, .stats_max_i64 = 1 };
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .eq, .value = .{ .timestamp = -1 } }}));
+    try std.testing.expect(!groupMayMatch(group, &.{.{ .column = "v", .op = .gt, .value = .{ .timestamp = 1000 } }}));
 }

@@ -158,6 +158,7 @@ pub const Index = struct {
     initialized_chunks: usize = 0,
     new_files: usize = 0,
     ordering: std.atomic.Value(?*Ordering) = .init(null),
+    ordering2: std.atomic.Value(?*Ordering) = .init(null),
     ordering_mu: std.atomic.Mutex = .unlocked,
     pub fn retain(self: *Index) *Index {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -167,6 +168,7 @@ pub const Index = struct {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const a = self.a;
         if (self.ordering.load(.acquire)) |order| order.destroy();
+        if (self.ordering2.load(.acquire)) |order| order.destroy();
         Node.release(self.root);
         for (self.chunks[0..self.initialized_chunks]) |chunk| chunk.lease.release();
         a.free(self.chunks);
@@ -227,9 +229,15 @@ pub const Index = struct {
         }
         return files;
     }
+    pub fn orderingFor(self: *Index, version: u8) *std.atomic.Value(?*Ordering) {
+        return if (version == 2) &self.ordering2 else &self.ordering;
+    }
     pub fn ensureOrdering(self: *Index, source: []const u8, snapshot: []const u8, context: Context) !*const Ordering {
+        return self.ensureOrderingVersion(source, snapshot, 1, context);
+    }
+    pub fn ensureOrderingVersion(self: *Index, source: []const u8, snapshot: []const u8, version: u8, context: Context) !*const Ordering {
         const identity = @import("../../storage/rowsource/identity.zig").fileDigest(source, snapshot, "");
-        if (self.ordering.load(.acquire)) |order| {
+        if (self.orderingFor(version).load(.acquire)) |order| {
             if (!std.mem.eql(u8, &identity, &order.identity)) return error.ExternalLakeSnapshotMismatch;
             return order;
         }
@@ -238,12 +246,12 @@ pub const Index = struct {
             if (context.io) |io| try io.sleep(.fromMilliseconds(1), .awake) else std.atomic.spinLoopHint();
         }
         defer self.ordering_mu.unlock();
-        if (self.ordering.load(.acquire)) |order| {
+        if (self.orderingFor(version).load(.acquire)) |order| {
             if (!std.mem.eql(u8, &identity, &order.identity)) return error.ExternalLakeSnapshotMismatch;
             return order;
         }
         const order = while (true) {
-            break self.buildOrdering(source, snapshot, identity, context) catch |err| {
+            break self.buildOrdering(source, snapshot, identity, version, context) catch |err| {
                 if (err != error.OutOfMemory) return err;
                 const cache = self.cache_owner orelse return err;
                 if (!cache.evictOne()) return err;
@@ -251,10 +259,10 @@ pub const Index = struct {
                 continue;
             };
         };
-        self.ordering.store(order, .release);
+        self.orderingFor(version).store(order, .release);
         return order;
     }
-    fn buildOrdering(self: *Index, source: []const u8, snapshot: []const u8, identity: [32]u8, context: Context) !*Ordering {
+    fn buildOrdering(self: *Index, source: []const u8, snapshot: []const u8, identity: [32]u8, version: u8, context: Context) !*Ordering {
         const a = self.a;
         const order = try a.create(Ordering);
         errdefer a.destroy(order);
@@ -270,7 +278,7 @@ pub const Index = struct {
         for (hashes, order.order, 0..) |*hash, *position, i| {
             try context.ensureActive();
             const file = (try it.next()).?;
-            hash.* = @import("../../storage/rowsource/identity.zig").fileDigest(source, snapshot, file.file_id);
+            hash.* = @import("../../storage/rowsource/identity.zig").navigationDigest(version, source, snapshot, file.file_id);
             position.* = i;
             order.by_id.putAssumeCapacity(file.file_id, i);
         }

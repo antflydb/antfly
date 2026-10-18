@@ -402,7 +402,7 @@ pub const Replay = struct {
                 if (block.keyWidth() != 3) return error.InvalidSqlSpill;
                 const file = std.math.cast(usize, (try block.keyCell(index, 0)).value.integer) orelse return error.InvalidSqlSpill;
                 if (file >= inventory.files.len) return error.InvalidSqlSpill;
-                ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = inventory.files[file].file_id, .row_group_ordinal = std.math.cast(u32, (try block.keyCell(index, 1)).value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = @bitCast((try block.keyCell(index, 2)).value.integer) } };
+                ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .identity_version = inventory.row_identity_version, .file_id = inventory.files[file].file_id, .row_group_ordinal = std.math.cast(u32, (try block.keyCell(index, 1)).value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = @bitCast((try block.keyCell(index, 2)).value.integer) } };
             }
             const columns = try a.alloc(rows.ColumnVector, self.columns.len);
             for (self.columns, columns) |name, *column| {

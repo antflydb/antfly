@@ -19,7 +19,7 @@ const std = @import("std");
 const local = @import("antfly_local_sources");
 const tree = @import("../serverless/graph_segment/page_tree.zig");
 const A = std.mem.Allocator;
-pub const Public = struct { root: ?tree.Ref, count: u32, source: []const u8, snapshot: []const u8 };
+pub const Public = struct { identity_version: u8 = 1, root: ?tree.Ref, count: u32, source: []const u8, snapshot: []const u8 };
 pub const Roots = struct {
     slots: ?tree.Ref = null,
     names: ?tree.Ref = null,
@@ -29,6 +29,7 @@ pub const Roots = struct {
     // of each index's stable slots and retired-slot history.
     public_names: bool = false,
     public_count: u32 = 0,
+    public_identity_version: u8 = 1,
 };
 pub const Options = struct { shared: ?Public = null, manager: ?*local.sql_spill.Manager = null };
 pub const Record = struct { file: []const u8, fingerprint: [32]u8 };
@@ -43,6 +44,7 @@ fn nameKey(name: []const u8) [32]u8 {
     return digest;
 }
 pub fn validate(roots: Roots) !void {
+    if ((roots.public_identity_version != 1 and roots.public_identity_version != 2) or (roots.public_identity_version == 2 and !roots.public_names)) return error.InvalidNativeLakeRowIndex;
     for ([_]?tree.Ref{ roots.slots, roots.names, roots.public }, 0..) |ref, index| {
         const count = if (index == 2 and roots.public_names) roots.public_count else roots.count;
         if ((ref == null) != (count == 0)) return error.InvalidNativeLakeRowIndex;
@@ -196,6 +198,7 @@ pub fn publishWithOptions(a: A, store: tree.Store, source: []const u8, snapshot:
     try names.flush(store, &result.names);
     try public.flush(store, &result.public);
     if (options.shared) |shared| {
+        result.public_identity_version = shared.identity_version;
         result.public = shared.root;
         result.public_names = true;
         result.public_count = shared.count;
@@ -218,6 +221,7 @@ fn bulk(a: A, store: tree.Store, source: []const u8, snapshot: []const u8, files
     result.slots = try slots.finish();
     result.names = try bulkHashes(a, store, source, snapshot, files, false, options.manager);
     if (options.shared) |shared| {
+        result.public_identity_version = shared.identity_version;
         result.public = shared.root;
         result.public_names = true;
         result.public_count = shared.count;

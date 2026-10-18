@@ -36,6 +36,7 @@ pub const Format = enum(u8) {
 };
 
 pub const Binding = struct {
+    identity_version: u8 = 1,
     format: Format,
     source_id: []const u8,
     source_uri: []const u8,
@@ -130,6 +131,7 @@ pub fn makeRowRef(
     try binding.validate();
     if (file_id.len == 0) return error.InvalidExternalRowSource;
     return .{ .external = .{
+        .identity_version = binding.identity_version,
         .source_id = binding.source_id,
         .snapshot_id = binding.snapshot_id,
         .file_id = file_id,

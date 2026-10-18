@@ -122,9 +122,8 @@ pub fn validate(files: []const File, domain: [32]u8) !void {
 }
 pub fn coordinates(input_key: []const u8) !struct { group: u32, row: u64 } {
     const key = try @import("lake_enrichment_units.zig").parent(input_key);
-    if (key.len != 96 or (!std.mem.startsWith(u8, key, "lake1:") and !std.mem.startsWith(u8, key, "lake2:")) or key[70] != ':' or key[79] != ':') return error.ExternalLakeSnapshotMismatch;
-    for (key[6..], 6..) |byte, offset| if (offset != 70 and offset != 79 and !((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.ExternalLakeSnapshotMismatch;
-    return .{ .group = try std.fmt.parseUnsigned(u32, key[71..79], 16), .row = try std.fmt.parseUnsigned(u64, key[80..96], 16) };
+    const parts = try local.storage_rowsource_identity.parse(key);
+    return .{ .group = parts.group, .row = parts.row };
 }
 pub const Plan = struct {
     a: A,

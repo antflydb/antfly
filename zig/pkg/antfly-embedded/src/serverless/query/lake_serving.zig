@@ -584,7 +584,7 @@ pub const ServingSource = struct {
                     @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
                     const key = hash.finalResult();
                     plan_identity = key;
-                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .chunks = if (binding.object_mutability == .immutable) &shared.inventory_chunks else null, .catalogs = if (binding.object_mutability == .immutable) &shared.inventory_catalogs else null, .scope = scope, .context = context };
+                    var loader: SnapshotPlanLoader = .{ .identity_version = options.row_identity_version, .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .chunks = if (binding.object_mutability == .immutable) &shared.inventory_chunks else null, .catalogs = if (binding.object_mutability == .immutable) &shared.inventory_catalogs else null, .scope = scope, .context = context };
                     // Coalesce cold manifest discovery as well as warm residency.
                     // Waiters retain their own authority, cancellation and lease;
                     // the cache owns only the immutable inventory/delete plan.
@@ -607,7 +607,12 @@ pub const ServingSource = struct {
                         }
                     }
                     if (file_navigation == null) {
-                        const lease = try shared.decoded.acquire(key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load });
+                        var identity_hash = std.crypto.hash.Blake3.init(.{});
+                        identity_hash.update(&key);
+                        identity_hash.update(&.{options.row_identity_version});
+                        var cache_key: [32]u8 = undefined;
+                        identity_hash.final(&cache_key);
+                        const lease = try shared.decoded.acquire(cache_key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load });
                         plan_lease = lease;
                         snapshot = lease.item.payload.snapshot;
                     }
@@ -657,6 +662,7 @@ pub const ServingSource = struct {
         };
         errdefer if (plan_lease == null) inventory.deinit(alloc);
         if (plan_lease != null or file_navigation != null) try @import("lake_scan_plan.zig").validateBindingInventoryIdentity(binding, inventory) else try serverless_query.validateLakeBindingInventory(binding, inventory);
+        inventory.row_identity_version = options.row_identity_version;
         var scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client);
         scanner.iceberg_delete_plan = deletes;
         const lazy_versions = cache != null and binding.format == .iceberg;
@@ -689,6 +695,7 @@ pub const ServingSource = struct {
         return hash.finalResult();
     }
     const SnapshotPlanLoader = struct {
+        identity_version: u8 = 1,
         client: @import("../../storage/object_storage.zig").ObjectStorage,
         source: []const u8,
         uri: []const u8,
@@ -703,6 +710,7 @@ pub const ServingSource = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const decoded = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .inventory_chunks = self.chunks, .catalogs = self.catalogs, .manifest_scope = self.scope, .context = self.context }, self.metadata);
             item.payload = .{ .snapshot = decoded };
+            item.payload.snapshot.inventory.row_identity_version = self.identity_version;
             if (item.payload.snapshot.catalog) |index| item.foreign_bytes +|= index.footprint();
             for (item.payload.snapshot.file_leases) |lease| item.foreign_bytes +|= lease.item.budget.live;
             try prepareCachedPlan(item);
@@ -753,7 +761,8 @@ pub const ServingSource = struct {
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
             hash.update("iceberg-full-scan-plan-v1");
             hash.update(&frozen.key);
-            var loader: SnapshotPlanLoader = .{ .client = self.scanner.object_reader.client, .source = self.inventory.source_id, .uri = frozen.uri, .snapshot = frozen.snapshot, .metadata = frozen.metadata, .manifests = &frozen.cache.manifests, .chunks = &frozen.cache.inventory_chunks, .scope = frozen.scope, .context = context };
+            hash.update(&.{self.inventory.row_identity_version});
+            var loader: SnapshotPlanLoader = .{ .identity_version = self.inventory.row_identity_version, .client = self.scanner.object_reader.client, .source = self.inventory.source_id, .uri = frozen.uri, .snapshot = frozen.snapshot, .metadata = frozen.metadata, .manifests = &frozen.cache.manifests, .chunks = &frozen.cache.inventory_chunks, .scope = frozen.scope, .context = context };
             const lease = frozen.cache.decoded.acquire(hash.finalResult(), 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load }) catch |err| switch (err) {
                 error.OutOfMemory, error.SqlMemoryLimitExceeded => return self.privateFrozenInventory(frozen, context),
                 else => return err,
@@ -784,6 +793,7 @@ pub const ServingSource = struct {
     }
     fn privateFrozenInventory(self: *ServingSource, frozen: DeferredSnapshot, context: @import("lake_read_context.zig").Context) !void {
         try context.ensureActive();
+        const identity_version = self.inventory.row_identity_version;
         const snapshot = try self.alloc.create(@import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan);
         errdefer self.alloc.destroy(snapshot);
         snapshot.* = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(self.alloc, .{ .client = self.scanner.object_reader.client, .source_id = self.inventory.source_id, .metadata_uri = frozen.uri, .requested_snapshot_id = frozen.snapshot, .manifests = &frozen.cache.manifests, .inventory_chunks = &frozen.cache.inventory_chunks, .manifest_scope = frozen.scope, .context = context }, frozen.metadata);
@@ -801,6 +811,7 @@ pub const ServingSource = struct {
         self.attachment_uri = uri;
         self.private_snapshot = snapshot;
         self.private_snapshot_owned = true;
+        snapshot.inventory.row_identity_version = identity_version;
         self.inventory = snapshot.inventory;
         self.inventory.source_uri = uri;
         self.inventory_owned = false;
@@ -811,10 +822,22 @@ pub const ServingSource = struct {
         // while payloads remain borrowed from individually bounded chunks.
     }
     pub fn ensureCanonicalPlan(self: *ServingSource, context: @import("lake_read_context.zig").Context) !void {
-        if (self.catalog()) |index| _ = index.ensureOrdering(self.inventory.source_id, self.inventory.snapshot_id, context) catch |err| switch (err) {
-            error.OutOfMemory => return, // ordinary scan-local ordering remains valid
-            else => return err,
+        if (self.catalog()) |index| {
+            _ = index.ensureOrderingVersion(self.inventory.source_id, self.inventory.snapshot_id, self.inventory.row_identity_version, context) catch |err| switch (err) {
+                error.OutOfMemory => return, // ordinary scan-local ordering remains valid
+                else => return err,
+            };
+            return;
+        }
+        if (self.selected_catalog_view or self.canonicalOrder() != null) return;
+        // Publication selects its identity version before lending parallel
+        // views. Legacy flat callers rebuild once, never once per file cursor.
+        const plan = PreparedPlan.init(self.alloc, self.inventory) catch |err| switch (err) {
+            error.OutOfMemory => return,
         };
+        if (self.local_plan_owned) if (self.local_plan) |*old| old.deinit(self.alloc);
+        self.local_plan = plan;
+        self.local_plan_owned = true;
     }
     /// A bounded selection owns just its flat view/version strings. The parent
     /// pins immutable chunk pages, provider selectors and reader authority.
@@ -938,6 +961,7 @@ pub const ServingSource = struct {
         self.inventory_owned = true;
     }
     const PreparedPlan = struct {
+        identity_version: u8,
         file_order: []usize,
         file_rank: []usize,
         file_by_id: std.StringHashMapUnmanaged(usize) = .empty,
@@ -948,7 +972,7 @@ pub const ServingSource = struct {
             errdefer a.free(order);
             const rank = try a.alloc(usize, inventory.files.len);
             errdefer a.free(rank);
-            var plan: PreparedPlan = .{ .file_order = order, .file_rank = rank };
+            var plan: PreparedPlan = .{ .identity_version = inventory.row_identity_version, .file_order = order, .file_rank = rank };
             errdefer plan.file_by_id.deinit(a);
             try plan.file_by_id.ensureTotalCapacity(a, @intCast(inventory.files.len));
             for (inventory.files, 0..) |file, index| {
@@ -967,19 +991,19 @@ pub const ServingSource = struct {
     };
     pub fn canonicalOrder(self: *const ServingSource) ?[]usize {
         if (self.selected_catalog_view) return null;
-        if (self.catalog()) |index| if (index.ordering.load(.acquire)) |order| return order.order;
-        if (self.plan_lease) |lease| if (lease.item.file_order) |order| return order;
-        return if (self.local_plan) |plan| plan.file_order else null;
+        if (self.catalog()) |index| if (index.orderingFor(self.inventory.row_identity_version).load(.acquire)) |order| return order.order;
+        if (self.plan_lease) |lease| if (lease.item.file_order_identity_version == self.inventory.row_identity_version) if (lease.item.file_order) |order| return order;
+        return if (self.local_plan) |plan| if (plan.identity_version == self.inventory.row_identity_version) plan.file_order else null else null;
     }
     pub fn fileRanks(self: *const ServingSource) ?[]usize {
         if (self.selected_catalog_view) return null;
-        if (self.catalog()) |index| if (index.ordering.load(.acquire)) |order| return order.ranks;
-        if (self.plan_lease) |lease| if (lease.item.file_rank) |rank| return rank;
-        return if (self.local_plan) |plan| plan.file_rank else null;
+        if (self.catalog()) |index| if (index.orderingFor(self.inventory.row_identity_version).load(.acquire)) |order| return order.ranks;
+        if (self.plan_lease) |lease| if (lease.item.file_order_identity_version == self.inventory.row_identity_version) if (lease.item.file_rank) |rank| return rank;
+        return if (self.local_plan) |plan| if (plan.identity_version == self.inventory.row_identity_version) plan.file_rank else null else null;
     }
     pub fn fileMap(self: *const ServingSource) ?*const std.StringHashMapUnmanaged(usize) {
         if (self.selected_catalog_view) return null;
-        if (self.catalog()) |index| if (index.ordering.load(.acquire)) |order| return &order.by_id;
+        if (self.catalog()) |index| if (index.orderingFor(self.inventory.row_identity_version).load(.acquire)) |order| return &order.by_id;
         if (self.plan_lease) |lease| if (lease.item.file_rank != null) return &lease.item.file_by_id;
         return if (self.local_plan) |*plan| &plan.file_by_id else null;
     }
@@ -993,6 +1017,7 @@ pub const ServingSource = struct {
         if (item.payload.snapshot.catalog != null) return;
         const plan = try PreparedPlan.init(item.budget.allocator(), item.payload.snapshot.inventory);
         item.file_order = plan.file_order;
+        item.file_order_identity_version = plan.identity_version;
         item.file_rank = plan.file_rank;
         item.file_by_id = plan.file_by_id;
         item.estimated_rows = plan.estimated_rows;
@@ -1004,7 +1029,7 @@ pub const ServingSource = struct {
         defer alloc.free(digests);
         const order = try alloc.alloc(usize, inventory.files.len);
         for (inventory.files, digests, order, 0..) |file, *digest, *index, i| {
-            digest.* = identities.fileDigest(inventory.source_id, inventory.snapshot_id, file.file_id);
+            digest.* = identities.navigationDigest(inventory.row_identity_version, inventory.source_id, inventory.snapshot_id, file.file_id);
             index.* = i;
         }
         std.mem.sort(usize, order, digests, struct {

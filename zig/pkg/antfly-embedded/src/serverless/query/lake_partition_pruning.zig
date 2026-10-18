@@ -121,6 +121,7 @@ pub fn mayMatch(rules: []const Rule, file: external.FileEntry, predicates: []con
         const bucket = parameter(rule.transform, "bucket[");
         if (bucket != null and predicate.op != .eq) continue;
         switch (predicate.value) {
+            .decimal, .timestamp => continue,
             .integer => |value| {
                 const transformed = numeric(rule, value) orelse continue;
                 const partition = std.fmt.parseInt(i64, stored, 10) catch continue;

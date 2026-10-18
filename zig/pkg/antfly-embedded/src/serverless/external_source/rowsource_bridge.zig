@@ -36,6 +36,7 @@ pub fn bindingFromValidatedInventory(inventory: external_source.Inventory) rowso
             .iceberg => .iceberg,
             .lance => .lance,
         },
+        .identity_version = inventory.row_identity_version,
         .source_id = inventory.source_id,
         .source_uri = inventory.source_uri,
         .snapshot_id = inventory.snapshot_id,
