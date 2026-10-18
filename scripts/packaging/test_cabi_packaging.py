@@ -514,7 +514,9 @@ class CAbiPackagingTests(unittest.TestCase):
             release_gc_workflow.index("group: antfly-release-storage"),
         )
         environments = environment_policy["environments"]
-        self.assertEqual(set(environments), {"container-publish", "release-promotion"})
+        self.assertEqual(
+            set(environments), {"container-publish", "release-promotion", "crates-io"}
+        )
         container_refs = {
             (policy["name"], policy["type"])
             for policy in environments["container-publish"]["branch_policies"]
@@ -527,6 +529,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertTrue(container_refs)
         self.assertTrue(all(policy_type == "tag" for _, policy_type in container_refs))
         self.assertEqual(release_refs, {("main", "branch")})
+        self.assertEqual(environments["crates-io"], environments["release-promotion"])
         sdk_npm_workflow = (
             REPO_ROOT / ".github" / "workflows" / "ts-npm-publish.yml"
         ).read_text()
