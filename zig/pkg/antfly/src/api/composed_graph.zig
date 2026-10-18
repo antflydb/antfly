@@ -35,7 +35,7 @@ const View = struct {
     keys: []const []const u8,
     kinds: []const keys_mod.Kind,
     tombstone: []const u8,
-    visibility: ?V,
+    read_options: ?V,
     calls: usize = 0,
     fn call(self: *View, leaf: usize, input: V) !V {
         try self.checkpoint(self.ptr);
@@ -43,7 +43,10 @@ const View = struct {
         self.calls += 1;
         var request = input;
         try request.object.put(self.a, "remote_snapshot", .{ .string = self.leaves[leaf].token });
-        if (self.visibility) |selected| try request.object.put(self.a, "lake_visibility", selected);
+        if (self.read_options) |options| {
+            if (options.object.get("read_requirements")) |selected| try request.object.put(self.a, "read_requirements", selected);
+            if (options.object.get("lake_read")) |selected| try request.object.put(self.a, "lake_read", selected);
+        }
         var response = try self.run(self.ptr, self.a, self.leaves[leaf].table, try std.json.Stringify.valueAlloc(self.a, request, .{}));
         defer response.deinit(self.a);
         if (response.status != 200) return switch (response.status) {
@@ -145,8 +148,8 @@ fn starts(view: *View, selector: query.NodeSelector, hits: []const V, complete_h
     }
     return nodes.items;
 }
-pub fn execute(a: A, specification: V, leaves: []const Leaf, overlay_keys: []const []const u8, kinds: []const keys_mod.Kind, tombstone: []const u8, visibility: ?V, hits: []const V, complete_hits: bool, executor: anytype) !V {
-    var view: View = .{ .a = a, .ptr = executor.ptr, .run = executor.execute, .checkpoint = executor.checkpoint, .leaves = leaves, .keys = overlay_keys, .kinds = kinds, .tombstone = tombstone, .visibility = visibility };
+pub fn execute(a: A, specification: V, leaves: []const Leaf, overlay_keys: []const []const u8, kinds: []const keys_mod.Kind, tombstone: []const u8, read_options: ?V, hits: []const V, complete_hits: bool, executor: anytype) !V {
+    var view: View = .{ .a = a, .ptr = executor.ptr, .run = executor.execute, .checkpoint = executor.checkpoint, .leaves = leaves, .keys = overlay_keys, .kinds = kinds, .tombstone = tombstone, .read_options = read_options };
     var parsed = try @import("antfly-json").parseFromSlice(@import("antfly_metadata_openapi").QueryRequest, a, try std.json.Stringify.valueAlloc(a, .{ .graph_queries = specification }, .{}), .{});
     defer parsed.deinit();
     const named = try @import("public_graph_query.zig").parseCanonicalGraphQueriesAlloc(a, parsed.value);
@@ -242,12 +245,18 @@ const Fixture = struct {
     external: bool = false,
     changed: bool = false,
     calls: usize = 0,
+    expect_requirements: bool = false,
     fn checkpoint(_: *anyopaque) !void {}
     fn run(raw: *anyopaque, a: A, table: []const u8, body: []const u8) !Response {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         self.calls += 1;
         const request = try std.json.parseFromSliceLeaky(V, a, body, .{});
         try std.testing.expectEqualStrings(table, request.object.get("remote_snapshot").?.string);
+        if (self.expect_requirements) {
+            const read = request.object.get("read_requirements") orelse return error.TestExpectedReadRequirements;
+            try std.testing.expectEqualStrings("published", read.object.get("visibility").?.string);
+            try std.testing.expectEqual(@as(i64, 0), read.object.get("wait_ms").?.integer);
+        }
         // Validate real public DSL spelling; mocks must not accept malformed
         // empty predicates that production admission rejects.
         var admission = try value(a, request);
@@ -279,29 +288,30 @@ test "external lake composed graph crosses pinned sources and rejects hidden fac
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var fixture: Fixture = .{};
+    var fixture: Fixture = .{ .expect_requirements = true };
+    const options = try value(a, .{ .read_requirements = .{ .visibility = "published", .wait_ms = @as(u32, 0) } });
     const executor = @import("composed_query.zig").Executor{ .ptr = &fixture, .execute = Fixture.run, .checkpoint = Fixture.checkpoint };
     const leaves: []const Leaf = &.{ .{ .table = "history", .physical = "physical-history", .token = "history", .identity = "\"stable\"" }, .{ .table = "current", .physical = "physical-current", .token = "current", .identity = "\"stable\"" } };
     const spec = try std.json.parseFromSliceLeaky(V, a, "{\"walk\":{\"index\":\"relations\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"max_depth\":2,\"limit\":10,\"include_paths\":true,\"include_documents\":true}}}", .{});
-    const result = try execute(a, spec, leaves, &.{}, &.{}, "_deleted", null, &.{}, true, executor);
+    const result = try execute(a, spec, leaves, &.{}, &.{}, "_deleted", options, &.{}, true, executor);
     const nodes = result.object.get("walk").?.object.get("nodes").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), nodes.len);
     try std.testing.expectEqualStrings("current", nodes[1].object.get("table").?.string);
     try std.testing.expectEqualStrings("c", nodes[1].object.get("key").?.string);
     try std.testing.expectEqual(@as(usize, 3), nodes[1].object.get("path").?.array.items.len);
     fixture.external = true;
-    const external = try execute(a, spec, leaves, &.{}, &.{}, "_deleted", null, &.{}, true, executor);
+    const external = try execute(a, spec, leaves, &.{}, &.{}, "_deleted", options, &.{}, true, executor);
     const external_nodes = external.object.get("walk").?.object.get("nodes").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), external_nodes.len);
     try std.testing.expect(external_nodes[1].object.get("document").? == .null);
     fixture.external = false;
     fixture.hidden = true;
-    const hidden = try execute(a, spec, leaves, &.{}, &.{}, "_deleted", null, &.{}, true, executor);
+    const hidden = try execute(a, spec, leaves, &.{}, &.{}, "_deleted", options, &.{}, true, executor);
     try std.testing.expectEqual(@as(usize, 0), hidden.object.get("walk").?.object.get("nodes").?.array.items.len);
     fixture.hidden = false;
     fixture.replacement = true;
-    const overridden = try execute(a, spec, leaves, &.{"id"}, &.{}, "_deleted", null, &.{}, true, executor);
+    const overridden = try execute(a, spec, leaves, &.{"id"}, &.{}, "_deleted", options, &.{}, true, executor);
     try std.testing.expectEqual(@as(usize, 0), overridden.object.get("walk").?.object.get("nodes").?.array.items.len);
     fixture.changed = true;
-    try std.testing.expectError(error.CatalogGenerationChanged, execute(a, spec, leaves, &.{}, &.{}, "_deleted", null, &.{}, true, executor));
+    try std.testing.expectError(error.CatalogGenerationChanged, execute(a, spec, leaves, &.{}, &.{}, "_deleted", options, &.{}, true, executor));
 }

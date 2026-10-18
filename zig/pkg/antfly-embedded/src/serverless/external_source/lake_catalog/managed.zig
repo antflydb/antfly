@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! An object-store authoritative Iceberg catalog. Immutable metadata and commit
 //! records precede one conditional HEAD replacement. Worker memory is no authority.
@@ -30,6 +42,14 @@ pub const Managed = struct {
     context: types.Context = .{},
     max_history_records: usize = 4096,
 
+    // Public table locations stay file://, while the filesystem bucket adapter
+    // publishes row artifacts in the object:// namespace.
+    fn artifactUri(self: Managed, a: A) ![]const u8 {
+        return if (std.mem.startsWith(u8, self.source_uri, "file://"))
+            std.fmt.allocPrint(a, "object://{s}/{s}", .{ self.bucket, self.prefix })
+        else
+            self.source_uri;
+    }
     fn key(self: Managed, a: A, suffix: []const u8) ![]u8 {
         const prefix = std.mem.trim(u8, self.prefix, "/");
         return if (prefix.len == 0) a.dupe(u8, suffix) else std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, suffix });
@@ -195,7 +215,7 @@ pub const Managed = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         var selected: std.StringHashMapUnmanaged(void) = .empty;
-        const allowed = try std.fmt.allocPrint(scratch, "{s}/", .{std.mem.trimEnd(u8, self.source_uri, "/")});
+        const allowed = try std.fmt.allocPrint(scratch, "{s}/", .{std.mem.trimEnd(u8, try self.artifactUri(scratch), "/")});
         for (request.objects) |uri| {
             if (uri.len > 4096 or !std.mem.startsWith(u8, uri, allowed) or std.mem.indexOf(u8, uri[allowed.len..], "..") != null) return error.InvalidLakeRetirement;
             try selected.put(scratch, uri, {});
@@ -245,7 +265,7 @@ pub const Managed = struct {
         if (try index.contains(root, uri)) return error.LakeObjectRetired;
     }
     fn checkReferences(self: *const Managed, a: A, candidate: []const u8, parent: ?[]const u8, index: *retired.Index, root: ?retired.Digest, selected: ?*std.StringHashMapUnmanaged(void)) !void {
-        const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = self.source_uri, .context = self.context };
+        const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = try self.artifactUri(a), .context = self.context };
         const next = try metadata.parse(a, candidate);
         const before = if (parent) |bytes_| try metadata.parse(a, bytes_) else null;
         // Statistics files are metadata roots too. Unlike immutable snapshot

@@ -33,6 +33,18 @@ const io_abi = @import("antfly_runtime_abi").io_abi;
 const Mac = std.crypto.auth.hmac.sha2.HmacSha256;
 const credential_domain = "antfly.pgwire.password-session.v1";
 
+test "SQL NUMERIC public result descriptors parse through generated OpenAPI contracts" {
+    const a = std.testing.allocator;
+    for ([_]ast.ColumnType{ .number, .array }) |kind| {
+        const encoded = try std.json.Stringify.valueAlloc(a, describe_sql.Column{ .name = "n", .type = kind, .element_type = .numeric, .numeric_modifier = .{ .precision = 2, .scale = -3 } }, .{});
+        defer a.free(encoded);
+        const parsed = try std.json.parseFromSlice(@import("antfly_metadata_openapi").SQLColumn, a, encoded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 2), parsed.value.numeric_modifier.?.precision);
+        try std.testing.expectEqual(@as(i64, -3), parsed.value.numeric_modifier.?.scale);
+    }
+}
+
 /// Stable API-owned callback and listener storage. Shutdown joins all native
 /// work before releasing the adapter, user manager, or backend runtime.
 pub const Listener = struct {
@@ -136,7 +148,7 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
     }
 
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -171,11 +183,18 @@ pub const Adapter = struct {
         return evaluateScalarParameters(alloc, request, expressions);
     }
 
-    fn evaluateScalarParameters(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
+    fn evaluateParameterCells(_: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, expressions: []const []const u8) ![]const @import("antfly_local_sources").sql_scalar.Datum {
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        try credential.validate();
+        return evaluateScalarCells(alloc, request, expressions);
+    }
+
+    fn evaluateScalarCells(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const @import("antfly_local_sources").sql_scalar.Datum {
         if (expressions.len != request.parameter_types.len) return error.InvalidSqlParameters;
         const scalar = @import("antfly_local_sources").sql_scalar;
-        const result = try alloc.alloc(std.json.Value, expressions.len);
-        for (expressions, request.parameter_types, result) |expression, kind, *value| {
+        const result = try alloc.alloc(scalar.Datum, expressions.len);
+        if (request.parameter_descriptors.len != 0 and request.parameter_descriptors.len != expressions.len) return error.InvalidSqlParameters;
+        for (expressions, request.parameter_types, result, 0..) |expression, kind, *value, index| {
             try request.check();
             var compiled = try compiler.compileScalar(alloc, expression, .{});
             defer compiled.deinit();
@@ -186,10 +205,29 @@ pub const Adapter = struct {
             };
             // Empty binding environment forbids table reads/correlated names;
             // the scalar compiler rejects subqueries and statement commands.
-            var program = try scalar.bindExpected(alloc, compiled.expression, &.{}, &.{}, expected, .{});
+            const descriptor: ?scalar.Type = if (request.parameter_descriptors.len != 0) request.parameter_descriptors[index] else if (expected) |type_| .{ .kind = type_ } else null;
+            var program = try scalar.bindTypedExpectedWithSettings(alloc, compiled.expression, &.{}, &.{}, descriptor, .{}, null);
             defer program.deinit();
             const evaluated = try program.evaluate(alloc, &.{}, &.{}, .{});
-            value.* = if (kind == .json and !evaluated.sql_null)
+            var retained = evaluated;
+            retained.patterns = null;
+            value.* = try @import("antfly_local_sources").sql_operators.cloneDatum(alloc, retained);
+        }
+        try request.check();
+        return result;
+    }
+
+    fn evaluateScalarParameters(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
+        const cells = try evaluateScalarCells(alloc, request, expressions);
+        const result = try alloc.alloc(std.json.Value, cells.len);
+        for (cells, request.parameter_types, result) |evaluated, kind, *value| {
+            value.* = if (evaluated.array) |array|
+                try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{})
+            else if (evaluated.numeric) |number| numeric: {
+                const exact = @import("antfly_local_sources").sql_numeric_value;
+                var context: exact.Context = .{ .alloc = alloc };
+                break :numeric .{ .number_string = try exact.format(&context, number.*) };
+            } else if (kind == .json and !evaluated.sql_null)
                 .{ .string = try std.json.Stringify.valueAlloc(alloc, evaluated.value, .{}) }
             else
                 try native.clone(alloc, evaluated.value);
@@ -288,6 +326,33 @@ fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("antfl
     return result;
 }
 
+test "pgwire native array page delivery preserves dimensions NULLs and exact integers" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const sources = @import("antfly_local_sources");
+            const array = (try sources.sql_array_text.decodeLeaky(alloc, .int64, "[-1:1]={9007199254740993,NULL,7}", .{})).value;
+            const values = [_]sources.sql_scalar.Datum{.{ .array = &array, .sql_null = false }};
+            var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+                .arena = std.heap.ArenaAllocator.init(a),
+                .columns = &.{.{ .name = "a", .type = .array, .element_type = .int64 }},
+                .values = .{ .rows = &.{&values} },
+                .exhausted = true,
+            } };
+            defer owner.page.deinit();
+            const cell = try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0);
+            try std.testing.expect(!cell.sql_null);
+            try std.testing.expectEqual(std.json.Value.null, cell.value);
+            try std.testing.expect(cell.array != null);
+            var work: sources.sql_array_value.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try array.compare(cell.array.?.*, &work));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
 /// identity, authority, schema binding or temporary request context.
 const OwnedRead = struct {
@@ -350,7 +415,8 @@ const OwnedRead = struct {
         self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .lake_visibility = @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        try request.read_requirements.validate(.sql);
+        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
@@ -362,7 +428,10 @@ const OwnedRead = struct {
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
             if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
             self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
-            if (state.metadata.accepted_lake_reads) self.native_adapter.lake_visibility = .accepted;
+            if (state.metadata.accepted_lake_reads) {
+                if (request.read_requirements.visibility == .committed) return error.ReadSnapshotTooOld;
+                self.native_adapter.lake_visibility = .accepted;
+            }
             self.native_adapter.accepted_lake_repeatable = self.native_adapter.lake_visibility == .accepted and (state.metadata.isolation != .serializable or state.metadata.mode == .read_only);
             self.native_adapter.active_transaction = id;
             self.native_adapter.staged = &self.staged;
@@ -371,12 +440,13 @@ const OwnedRead = struct {
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
-        const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
+        const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
+        stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
+        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
@@ -386,6 +456,11 @@ const OwnedRead = struct {
             alloc.destroy(self);
             return null;
         }
+        // Capture the admission budget before this owner outlives the request.
+        // A later statement can then reset its connection-owned budget safely.
+        if (request.read_receipt_budget) |budget| self.native_adapter.receipt_wait_budget = budget.*;
+        self.native_adapter.shared_receipt_wait_budget = null;
+        self.authority.request.read_receipt_budget = null;
         self.stream = opened.?;
         errdefer self.stream.close();
         if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
@@ -409,7 +484,7 @@ const OwnedRead = struct {
         }
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
-        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = wireType(column.type) };
+        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
@@ -509,7 +584,25 @@ const OwnedRead = struct {
         page: Pull.BatchPage,
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (try self.page.values.frozenJson(row, column)) |value| {
+                if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
+                return .{ .frozen_json = value, .sql_null = false };
+            }
+            if (try self.page.values.encodedJson(row, column)) |bytes| {
+                if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
+                return .{ .json_bytes = bytes, .sql_null = false };
+            }
             const value = try self.page.values.cell(alloc, row, column);
+            if (value.array) |array| {
+                const definition = self.page.columns[column];
+                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
+                return .{ .array = array, .sql_null = false };
+            }
+            if (value.numeric) |number| {
+                const definition = self.page.columns[column];
+                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
+                return .{ .numeric = number, .sql_null = false };
+            }
             return .{ .value = if (!value.sql_null and self.page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
         }
     };
@@ -751,7 +844,10 @@ const Job = struct {
             .context = context,
             .database = self.request.database orelse "default",
             .namespace = self.request.namespace orelse "public",
+            .read_requirements = self.request.read_requirements,
+            .shared_receipt_wait_budget = self.request.read_receipt_budget,
             .lake_visibility = @fromBackingInt(@intCast(@backingInt(self.request.lake_visibility))),
+            .ddl_search_path = if (self.request.search_path) |*path| path else null,
             .session_id = self.request.session_id,
             .session_namespace = self.request.session_namespace,
             .setting_overlay = self.request.setting_overlay,
@@ -782,23 +878,27 @@ const Job = struct {
                 inline else => |tag| @field(ast.ColumnType, @tagName(tag)),
             };
             var describe_backend = guarded.backend();
+            describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
             if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
-            var description = try describe_sql.describe(self.alloc, describe_backend, compiled, hints);
+            var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
-            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = wireType(column.type) };
+            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
-            for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| wireType(value) else .unknown;
+            for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
                 .columns = columns,
                 .parameter_types = parameter_types,
+                .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
                 .binding_guard = try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
                 .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
             return;
         }
-        const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
-        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, guarded.backend()) catch |err| {
+        const parameters = if (self.request.parameter_cells != null) self.request.parameters else try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
+        var execution_backend = guarded.backend();
+        execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
+        var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .native_result = true, .parameter_cells = self.request.parameter_cells, .parameter_owner = self.request.parameter_owner }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);
@@ -827,13 +927,16 @@ const Job = struct {
             }
         };
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
-        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = wireType(column.type) };
+        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+        const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
+        if (native_owner) |owner| owner.* = .{ .result = result };
         self.result = .{
             .columns = columns,
+            .cells = if (native_owner) |owner| .{ .context = owner, .count = result.output.rowCount(), .width = columns.len, .read = NativeResultCells.read } else null,
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,
             .rows_affected = result.output.rows_affected,
-            .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.rows.len, result.output.rows_affected),
+            .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.rowCount(), result.output.rows_affected),
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
                 inline else => |kind| @field(wire.MutationOutcome, @tagName(kind)),
             } else null,
@@ -893,7 +996,7 @@ test "SQL pgwire dispatch preserves imported executor authority including unavai
     }
 }
 
-test "SQL pgwire execute arguments use bounded scalar semantics without table access" {
+test "SQL pgwire native execute arguments use bounded scalar semantics without table access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var canceled: std.atomic.Value(bool) = .init(false);
@@ -909,6 +1012,20 @@ test "SQL pgwire execute arguments use bounded scalar semantics without table ac
     try std.testing.expectEqualStrings("\"text\"", json_values[1].string);
     const null_values = try Adapter.evaluateScalarParameters(arena.allocator(), json_request, &.{ "NULL", "NULL::json" });
     try std.testing.expect(null_values[0] == .null and null_values[1] == .null);
+    var array_request = request;
+    array_request.parameter_types = &.{ .array, .integer };
+    array_request.parameter_descriptors = &.{ .{ .kind = .array, .element_type = .int64 }, .{ .kind = .integer, .element_type = .int32 } };
+    const array_values = try Adapter.evaluateScalarParameters(arena.allocator(), array_request, &.{ "'[-1:1]={9007199254740993,NULL,2}'::bigint[]", "42" });
+    var decoded = try @import("antfly_local_sources").sql_array_wire.decode(std.testing.allocator, .int64, array_values[0], .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
+    try std.testing.expect(decoded.value.elements[1].sql_null);
+    const native_array = try Adapter.evaluateScalarCells(arena.allocator(), array_request, &.{ "'[-1:1]={9007199254740993,NULL,2}'::bigint[]", "42" });
+    try std.testing.expectEqual(@as(i64, 9007199254740993), native_array[0].array.?.flatCell(0).value.integer);
+    try std.testing.expect(native_array[0].array.?.flatCell(1).sql_null);
+    const native_json = try Adapter.evaluateScalarCells(arena.allocator(), json_request, &.{ "'null'::json", "NULL::json" });
+    try std.testing.expect(!native_json[0].sql_null and native_json[1].sql_null);
     canceled.store(true, .release);
     try std.testing.expectError(error.QueryCanceled, Adapter.evaluateScalarParameters(arena.allocator(), request, &.{ "1", "'x'" }));
 }
@@ -933,7 +1050,7 @@ fn datetimeResult(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Val
     return wire_values.timestampValue(alloc, nanos);
 }
 
-fn wireType(kind: ast.ColumnType) wire.Type {
+fn wireType(kind: ast.ColumnType) !wire.Type {
     return switch (kind) {
         inline else => |tag| @field(wire.Type, @tagName(tag)),
     };
@@ -954,6 +1071,53 @@ test "SQL pgwire MERGE completion reports committed affected rows" {
     defer std.testing.allocator.free(tag);
     try std.testing.expectEqualStrings("MERGE 3", tag);
 }
+
+test "SQL pgwire native materialized cells match public text and binary encodings" {
+    const Probe = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator) !void {
+            var marker: u8 = 0;
+            const backend: catalog.Backend = .{ .ptr = &marker, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = checkpoint } };
+            var compiled = try compiler.compile(a, "SELECT ARRAY[9007199254740993::bigint,NULL::bigint,-7::bigint] AS a, '9007199254740993.1200'::numeric AS n, 'null'::jsonb AS j, NULL::numeric AS z", .{});
+            defer compiled.deinit();
+            var result = try native.execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+            defer result.deinit();
+            var baseline = try native.execute(a, backend, &compiled, &.{}, .{});
+            defer baseline.deinit();
+            var owner: NativeResultCells = .{ .result = result };
+            var columns: [4]wire.Column = undefined;
+            for (&columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type };
+            const published: wire.Result = .{ .columns = &columns, .cells = .{ .context = &owner, .count = result.output.rowCount(), .width = columns.len, .read = NativeResultCells.read }, .command_tag = "SELECT 1" };
+            const view = try published.view(0, 1);
+            for ([_]u16{ 0, 1 }) |format| for (columns, 0..) |column, index| {
+                const cell = try view.cell(a, 0, index);
+                const expected_null = baseline.output.sql_nulls.?[0][index];
+                try std.testing.expectEqual(expected_null, cell.sql_null);
+                if (cell.sql_null) continue;
+                var bytes: std.Io.Writer.Allocating = .init(a);
+                defer bytes.deinit();
+                var expected: std.Io.Writer.Allocating = .init(a);
+                defer expected.deinit();
+                wire_values.encodeCellInto(a, &bytes.writer, column, format, cell, 1 << 20) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+                wire_values.encodeColumnInto(a, &expected.writer, column, format, baseline.output.rows[0][index], 1 << 20) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+                try std.testing.expectEqualSlices(u8, expected.written(), bytes.written());
+            };
+            try std.testing.expectError(error.InvalidResult, published.cell(a, 1, 0));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+const NativeResultCells = struct {
+    result: native.Result,
+    fn read(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) !wire.Cell {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const rows = self.result.output.native_rows orelse return error.InvalidSqlBackendResponse;
+        if (row >= rows.len or column >= self.result.output.columns.len or rows[row].len != self.result.output.columns.len) return error.InvalidSqlBackendResponse;
+        const datum = rows[row][column];
+        return .{ .value = if (!datum.sql_null and self.result.output.columns[column].type == .datetime) try datetimeResult(alloc, datum.value) else datum.value, .sql_null = datum.sql_null, .array = datum.array, .numeric = datum.numeric };
+    }
+};
 
 fn releaseResult(raw: *anyopaque) void {
     var result = native.Result{ .state = @ptrCast(@alignCast(raw)), .output = undefined };
@@ -1017,12 +1181,12 @@ const GuardedCatalog = struct {
         const generate = self.native.vtable.generate_row_id orelse return error.UnsupportedSqlExecution;
         return generate(self.native.ptr, alloc);
     }
-    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, arbiter_conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkRead(table.physical_name);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const resolve_owners = self.native.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlShape;
-        return resolve_owners(self.native.ptr, alloc, table, columns, expressions, arbiter_conditions, mutations);
+        return resolve_owners(self.native.ptr, alloc, scratch_alloc, table, target, mutations);
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1068,6 +1232,11 @@ const GuardedCatalog = struct {
             try self.guard.checkRead(self.table);
             return self.inner.count_rows.?(self.inner.ptr);
         }
+        fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.guard.checkRead(self.table);
+            return self.inner.wants_exact_filter.?(self.inner.ptr, columns);
+        }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.guard.checkRead(self.table);
@@ -1110,6 +1279,7 @@ const GuardedCatalog = struct {
                 .next_columns = if (self.inner.next_columns != null) nextColumns else null,
                 .count_rows = if (self.inner.count_rows != null) countRows else null,
                 .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
+                .wants_exact_filter = if (self.inner.wants_exact_filter != null) wantsExactFilter else null,
                 .split_scan = if (self.inner.split_scan != null) splitScan else null,
                 .split_ordered = if (self.inner.split_ordered != null) splitOrdered else null,
             };
@@ -1135,19 +1305,19 @@ const GuardedCatalog = struct {
         // retains the heap-owned guard and authority in its OwnedRead capsule.
         return cursor.cursor(ReadCursor.close);
     }
-    fn mutate(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
-        return self.native.vtable.mutate(self.native.ptr, alloc, table, input);
+        return self.native.vtable.mutate(self.native.ptr, alloc, scratch_alloc, table, input);
     }
 
-    fn mutatePrepared(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutatePrepared(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const commit = self.native.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution;
-        return commit(self.native.ptr, alloc, table, input);
+        return commit(self.native.ptr, alloc, scratch_alloc, table, input);
     }
 
     fn prepareMutations(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
@@ -1198,18 +1368,18 @@ const GuardedCatalog = struct {
         return .{ .ptr = owner, .cursors = cursors, .close = StatementRead.close };
     }
 
-    fn ddl(raw: *anyopaque, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
+    fn ddl(raw: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         const dispatch_ddl = self.native.vtable.ddl orelse return error.UnsupportedSqlExecution;
         // Refresh current grants before native DDL authorizes resource, rename
         // destination and tablespace. Prepared metadata never grants authority.
-        var current = try self.authority.credential.identity(alloc);
-        defer current.deinit(alloc);
+        var current = try self.authority.credential.identity(allocators.scratch);
+        defer current.deinit(allocators.scratch);
         const prior = self.authority.identity.*;
         self.authority.identity.* = current;
         defer self.authority.identity.* = prior;
-        return dispatch_ddl(self.native.ptr, alloc, input);
+        return dispatch_ddl(self.native.ptr, allocators, input);
     }
 };
 
@@ -1606,4 +1776,55 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 1, too_precise));
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 0, too_precise));
     try std.testing.expectError(error.InvalidSqlBackendResponse, datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" }));
+}
+
+test "SQL pgwire native frozen JSON renders exact numbers without scalar delivery" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const sources = @import("antfly_local_sources");
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            for ([_]bool{ false, true }) |parse_numbers| {
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"x\":[9007199254740993,1.25],\"s\":\"a\\nb\"}", .{ .parse_numbers = parse_numbers });
+                const rows = [_]sources.sql_operators.Row{.{ .values = &.{sources.sql_scalar.Datum.json(root)}, .keys = &.{}, .ordinal = 0 }};
+                for ([_]sources.sql_spill.ColumnarVersion{ .v1, .v2 }) |version| {
+                    const bytes = try sources.sql_spill.encodeColumnarBlockVersionAlloc(alloc, &rows, 1 << 20, version);
+                    const block = try sources.sql_spill.decodeColumnarBlockWithCache(alloc, a, bytes, 1 << 20);
+                    defer block.deinit();
+                    const Reader = struct {
+                        value: sources.sql_execution_batch.FrozenJson,
+                        fn cell(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !sources.sql_scalar.Datum {
+                            return error.UnexpectedScalarMaterialization;
+                        }
+                        fn frozen(raw: *anyopaque, _: usize, _: usize) !?sources.sql_execution_batch.FrozenJson {
+                            return @as(*@This(), @ptrCast(@alignCast(raw))).value;
+                        }
+                    };
+                    var reader: Reader = .{ .value = (try block.frozenJson(0, 0, false)).? };
+                    var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+                        .arena = .init(a),
+                        .columns = &.{.{ .name = "j", .type = .json }},
+                        .values = .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 1, .width = 1 } },
+                        .exhausted = true,
+                    } };
+                    defer owner.page.deinit();
+                    var scratch = std.heap.FixedBufferAllocator.init(&.{});
+                    const cell = try OwnedRead.PageOwner.cell(&owner, scratch.allocator(), 0, 0);
+                    try std.testing.expect(!cell.sql_null and cell.value == .null and cell.json_bytes == null and cell.frozen_json != null);
+                    const expected = try std.json.Stringify.valueAlloc(alloc, root, .{});
+                    for ([_]u16{ 0, 1 }) |format| {
+                        var buffer: [256]u8 = undefined;
+                        var output: std.Io.Writer = .fixed(&buffer);
+                        try wire_values.encodeCellInto(scratch.allocator(), &output, .{ .name = "j", .type = .json }, format, cell, buffer.len);
+                        const prefix: usize = @intFromBool(format == 1);
+                        if (prefix != 0) try std.testing.expectEqual(@as(u8, 1), output.buffered()[0]);
+                        try std.testing.expectEqualStrings(expected, output.buffered()[prefix..]);
+                    }
+                }
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

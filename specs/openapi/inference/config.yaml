@@ -3,13 +3,14 @@ info:
   version: v1alpha1
   title: Antfly Inference Configuration Schema
   description: |
-    Antfly inference is a local inference server for ONNX-based ML models.
+    Antfly inference is a local inference server for GGUF, safetensors, and ONNX models (ONNX graphs are
+    parsed natively, without ONNX Runtime), running on CPU, Metal, or CUDA.
 
     ## What is Antfly inference
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
     - **Embedding Generation**: Text and multimodal (CLIP) embedding models
-    - **Text Chunking**: Semantic chunking with ONNX models or fixed-size fallback
+    - **Text Chunking**: Fixed token-count chunking for text, with fixed time windows for audio
     - **Reranking**: Relevance re-scoring for search results
     - **Named Entity Recognition**: Extract persons, organizations, locations from text
     - **Text Rewriting**: Transform text using Seq2Seq models (question generation, query generation, etc.)
@@ -19,9 +20,9 @@ info:
     ## When to Use Antfly inference
 
     Antfly inference can run standalone or as part of an Antfly cluster:
-    - Local ONNX model inference without external API dependencies
+    - Local model inference without external API dependencies
     - Ollama-compatible `/ai/v1/embed` endpoint for embeddings
-    - Semantic text chunking for RAG pipelines
+    - Text chunking for RAG pipelines
     - Relevance reranking for improved search quality
     - Centralized model serving across distributed nodes
     - Privacy-preserving ML inference (data never leaves your infrastructure)
@@ -29,7 +30,7 @@ info:
     ## Features
 
     ### Embedding Generation
-    - **Models**: ONNX models auto-discovered from `{models_dir}/embedders/`
+    - **Models**: Embedding models auto-discovered from `{models_dir}`
     - **API**: Ollama-compatible `/ai/v1/embed` endpoint
     - **Response Formats**: Binary (default), JSON
 
@@ -40,13 +41,10 @@ info:
     - **Use Cases**: Image search, cross-modal retrieval, visual similarity
 
     ### Text Chunking
-    - **Models**: Fixed-size chunking (always available) + ONNX models
-    - **Model Discovery**: Auto-discovers models from `{models_dir}/chunkers/`
-    - **Caching**: 2-minute TTL memory cache
-    - **Fallback**: Falls back to fixed chunking if model fails
+    - **Models**: Built-in `fixed` chunker (token count for text, time windows for audio); no model download needed
 
     ### Reranking
-    - **Model Discovery**: Auto-discovers ONNX models from `{models_dir}/rerankers/`
+    - **Model Discovery**: Auto-discovers reranker models from `{models_dir}`
     - **Quantization**: Automatically uses quantized models if available
     - **Input**: Pre-rendered text prompts (client handles field extraction)
 
@@ -528,6 +526,14 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        qualified_limits:
+          type: object
+          additionalProperties: true
+          description: |
+            Pull-time qualified request profiles for this exact artifact,
+            including backend, supported features and min/max geometry.
+            Runtime admission revalidates artifact identity and resource limits.
+            Omitted for artifacts without a qualification receipt.
         capabilities:
           type: array
           items:
@@ -621,10 +627,6 @@ components:
           type: boolean
           description: Whether the native CPU backend is built into this runtime
           example: true
-        onnx:
-          type: boolean
-          description: Whether the ONNX Runtime backend is built into this runtime
-          example: false
         metal:
           type: boolean
           description: Whether the Metal backend is built into this runtime
@@ -1102,7 +1104,7 @@ components:
         `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
         `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
         `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
-      enum: [auto, native, onnx, metal, cuda, xla, webgpu, wasm]
+      enum: [auto, native, metal, cuda, xla, webgpu, wasm]
 
     ModelFormat:
       type: string
@@ -1338,13 +1340,15 @@ components:
           type: string
           description: |
             Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-            - `{models_dir}/embedders/` - Embedding models (ONNX)
-            - `{models_dir}/chunkers/` - Chunking models (ONNX)
-            - `{models_dir}/rerankers/` - Reranking models (ONNX)
+            - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+            - `{models_dir}/embedders/` - Embedding models
+            - `{models_dir}/rerankers/` - Reranking models
             - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-            - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+            - `{models_dir}/rewriters/` - Seq2Seq rewriter models
 
-            Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+            Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+            (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+            chunker needs no models.
           example: "~/.antfly/inference/models"
         ml_dir:
           type: string
@@ -1476,7 +1480,7 @@ paths:
     post:
       summary: Generate embeddings
       description: |
-        Generates vector embeddings for input content using local ONNX models.
+        Generates vector embeddings for input content using local models.
         This endpoint is compatible with Ollama's `/api/embed` format for text,
         and extends it with OpenAI-compatible multimodal support for CLIP models.
 
@@ -1547,23 +1551,15 @@ paths:
     post:
       summary: Chunk text into smaller segments
       description: |
-        Splits text into smaller chunks using semantic or fixed-size chunking models.
+        Splits text into smaller chunks with the built-in fixed chunker.
 
         ## Models
 
-        ### Fixed Chunking (always available)
-        - Simple token-based splitting with overlap
-        - Use model="fixed"
+        ### Fixed Chunking
+        - Token-count splitting with overlap for text; fixed time windows for audio
+        - Use model="fixed" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
         - Fast and deterministic
-
-        ### ONNX Models
-        - Semantic chunking based on content similarity
-        - Models auto-discovered from `models_dir/chunkers/`
-        - Falls back to fixed chunking if model fails
-
-        ## Caching
-
-        Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+        - Other model names are rejected as unsupported
       operationId: chunkText
       requestBody:
         required: true
@@ -2065,17 +2061,16 @@ paths:
 
         ## Embedders
 
-        - ONNX models from `models_dir/embedders/`
+        - Embedding models from `models_dir`
         - Quantized variants have `-i8` suffix
 
         ## Chunkers
 
-        - Always includes "fixed" (built-in)
-        - Plus any ONNX models from `models_dir/chunkers/`
+        - Always "fixed" (built-in); chunking does not load models from `models_dir`
 
         ## Rerankers
 
-        - ONNX models from `models_dir/rerankers/`
+        - Reranking models from `models_dir`
         - Empty if no models configured
 
         ## Generators

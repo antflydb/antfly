@@ -105,7 +105,7 @@ pub const Context = struct {
             } else false;
             if (consumes) try entries.append(self.owned, .{ .config = config, .artifact_sources = parsed.artifact_sources, .max_edges_per_document = parsed.max_edges_per_document, .ttl_duration_ns = parsed.ttl_duration_ns });
         }
-        self.catalog = .{ .entries = entries.items, .resolvers = .{ .items = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeCatalog(self.owned, catalogs.resolvers) } };
+        self.catalog = .{ .entries = entries.items, .resolvers = .{ .items = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeActiveCatalog(self.owned, catalogs.resolvers) } };
         self.index_manager = &self.catalog;
         var guards: std.ArrayList(publication.ArtifactSource) = .empty;
         for (proof.artifact_sources) |input| if (!std.mem.eql(u8, input.key, proof_key)) try guards.append(self.owned, input);
@@ -126,6 +126,25 @@ pub const Context = struct {
         var fork = try self.read.forkRead();
         defer fork.abort();
         return self.alloc.dupe(u8, try fork.get(key));
+    }
+
+    /// Resolution input participates in the publication receipt and CAS guard.
+    pub fn getResolutionAlloc(self: *Context, key: []const u8) !?[]u8 {
+        for (self.base.artifact_sources) |source| if (std.mem.eql(u8, source.key, key)) {
+            return self.getAlloc(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        };
+        const sources = try self.owned.alloc(publication.ArtifactSource, self.base.artifact_sources.len + 1);
+        @memcpy(sources[0..self.base.artifact_sources.len], self.base.artifact_sources);
+        sources[sources.len - 1] = try self.guard(key);
+        std.mem.sort(publication.ArtifactSource, sources, {}, guardLess);
+        self.base.artifact_sources = sources;
+        return self.getAlloc(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
     }
 
     fn guard(self: *Context, key: []const u8) !publication.ArtifactSource {

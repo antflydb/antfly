@@ -37,6 +37,9 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
 const embedding_trace = @import("../embedding_trace.zig");
+const qwen_batch = @import("qwen_embedding_batch.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
+const memory_admission = @import("../runtime/tier/memory.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 const qwen3_embedding_resident_override_level = 4;
@@ -126,6 +129,8 @@ pub const EmbeddingConfig = struct {
     ensure_trailing_eos_id: ?i32 = null,
     /// Keep a supported text encoder, pooling, and normalization on the GPU.
     resident_text_encoder: bool = false,
+    /// EmbeddingGemma 2 trims before normalization, including device readback.
+    embedding_gemma2_dimensions: usize = 768,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// Model-selected image preprocessing contract.
@@ -138,6 +143,9 @@ pub const EmbeddingConfig = struct {
     /// CLAP preprocessing, and duplicated backend input tensors. The field
     /// retains its decode-specific name for source compatibility.
     max_audio_decode_working_bytes: usize = audio.default_decode_working_bytes,
+    audio_prepare_ahead: bool = true,
+    audio_prepared_batches: bool = true,
+    gemma4_audio_batching: bool = true,
 };
 
 /// CLAP preprocessing handles clips sequentially, but its peak includes the
@@ -182,21 +190,28 @@ fn ensureClapWorkingSet(retained_pcm_bytes: usize, feature_reserve_bytes: usize,
     if (peak > max_working_bytes) return error.AudioTooLarge;
 }
 
-const ClapBatchPlan = struct {
+pub const ClapBatchPlan = struct {
     channels: usize,
     frames: usize,
     mels: usize,
     feature_elements: usize,
     feature_reserve_bytes: usize,
     fusion_enabled: bool,
+    force_short_singleton: bool,
 };
 
-fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
-    var channels: usize = 1;
-    const fusion_enabled = if (session_factory.getClapConfig(session)) |clap_cfg| blk: {
-        channels = if (clap_cfg.audio_config.enable_fusion and batch == 1) 4 else 1;
-        break :blk clap_cfg.audio_config.enable_fusion;
-    } else false;
+pub fn clapPreprocessingPolicy(session: backends.Session, logical_batch: usize) @import("audio_preparation.zig").ClapPreprocessingPolicy {
+    const fusion_enabled = if (session_factory.getClapConfig(session)) |cfg| cfg.audio_config.enable_fusion else false;
+    return @import("audio_preparation.zig").ClapPreprocessingPolicy.init(fusion_enabled, logical_batch);
+}
+
+pub fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
+    return clapBatchPlanWithPolicy(session, batch, clapPreprocessingPolicy(session, batch));
+}
+
+/// Reserve physical-batch storage while preserving the caller's feature policy.
+pub fn clapBatchPlanWithPolicy(session: backends.Session, batch: usize, policy: @import("audio_preparation.zig").ClapPreprocessingPolicy) !ClapBatchPlan {
+    const channels = policy.channels;
     const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
     const frames = clapInputFeatureFrames(session, default_frames);
     const mels = audio.CLAP_CONFIG.n_mels;
@@ -208,7 +223,8 @@ fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
         .mels = mels,
         .feature_elements = working.elements,
         .feature_reserve_bytes = working.reserve_bytes,
-        .fusion_enabled = fusion_enabled,
+        .fusion_enabled = policy.fusion_enabled,
+        .force_short_singleton = policy.force_short_singleton,
     };
 }
 
@@ -276,10 +292,7 @@ pub const AtomicResidentProjectionStats = struct {
     }
 };
 
-pub const EncodedAudioClip = struct {
-    bytes: []const u8,
-    decode_options: audio.DecodeOptions = .{},
-};
+pub const EncodedAudioClip = @import("audio_preparation.zig").Clip;
 
 pub const EmbeddingPipeline = struct {
     batch_observation: ?*@import("batch_execution.zig").Observation = null,
@@ -303,6 +316,7 @@ pub const EmbeddingPipeline = struct {
     /// from the same loaded model. Tokenization and tensor preparation remain
     /// parallel; only device/session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
+    execution_gate_held: bool = false,
     trace: ?*embedding_trace.Trace = null,
     /// Request lifetime propagated from ingress through model execution.
     execution_control: ?InferenceExecutionControl = null,
@@ -313,6 +327,7 @@ pub const EmbeddingPipeline = struct {
     /// resident encoder request. This is intentionally request-scoped because
     /// architecture sessions create and own their resident backend per run.
     last_resident_backend_timing: ?ops_mod.BackendDebugTimingSnapshot = null,
+    audio_timings: ?*@import("embedding_gemma2.zig").MediaTimings = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -357,10 +372,8 @@ pub const EmbeddingPipeline = struct {
             defer std.debug.assert(bounded.live == 0);
             var scoped = self.*;
             scoped.allocator = bounded.allocator();
-            // The managed family contract advertises serial compatibility.
-            // Each row can use the full 8192-token workspace without a second
-            // valid row multiplying it beyond the request's allocation cap.
-            const temporary = scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false }) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
+            // Length buckets retain the admitted physical allocation ceiling.
+            const temporary = (if (self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
             defer {
                 for (temporary) |vector| scoped.allocator.free(vector);
                 scoped.allocator.free(temporary);
@@ -380,6 +393,81 @@ pub const EmbeddingPipeline = struct {
         return self.embedUnscoped(texts);
     }
 
+    /// Tokenize once, retain real lengths, and execute bounded length buckets.
+    /// The outer Gemma2 owner accounts all tokenizer/packing storage physically.
+    fn embedGemma2Texts(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        const a = self.allocator;
+        const max_len = textSequenceLengthForInputs(self.textEncodingSession().inputInfo(), self.config.max_length);
+        const encoded = try a.alloc(EncodeResult, texts.len);
+        defer a.free(encoded);
+        var initialized: usize = 0;
+        defer for (encoded[0..initialized]) |*row| row.deinit();
+        const lengths = try a.alloc(usize, texts.len);
+        defer a.free(lengths);
+        const started = if (self.trace != null) embedding_trace.now() else 0;
+        for (texts, 0..) |text, i| {
+            if (self.execution_control) |control| try control.check();
+            const rendered = try std.fmt.allocPrint(a, "{s}{s}", .{ self.config.text_prefix, text });
+            defer a.free(rendered);
+            encoded[i] = try self.tok.encodeForModel(a, rendered, max_len + 1);
+            initialized += 1;
+            lengths[i] = activeTokenLength(encoded[i].attention_mask);
+            if (lengths[i] > max_len) return error.EmbeddingInputTooLong;
+        }
+        if (self.trace) |trace| trace.tokenize_ns += embedding_trace.now() -| started;
+        const order = try qwen_batch.order(a, lengths);
+        defer a.free(order);
+        std.mem.sort(usize, order, lengths, struct {
+            fn less(rows: []const usize, lhs: usize, rhs: usize) bool {
+                return if (rows[lhs] == rows[rhs]) lhs < rhs else rows[lhs] < rows[rhs];
+            }
+        }.less);
+        const vectors = try a.alloc([]f32, texts.len);
+        errdefer a.free(vectors);
+        var cursor: usize = 0;
+        errdefer for (order[0..cursor]) |i| a.free(vectors[i]);
+        while (cursor < order.len) {
+            var sorted_lengths: [4]usize = undefined;
+            const candidates = @min(@as(usize, 4), order.len - cursor);
+            for (order[cursor..][0..candidates], sorted_lengths[0..candidates]) |i, *length| length.* = lengths[i];
+            var count = @import("embedding_gemma2.zig").preparedCohortCount(sorted_lengths[0..candidates], candidates);
+            while (true) {
+                const seq = lengths[order[cursor + count - 1]];
+                const request = session_mod.RunRequest{ .batch = count, .sequence = seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = 256 * 1024 * 1024 + count * seq * 192 * 1024, .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
+                if (count > 1 and !try self.session.fitsRun(request)) {
+                    count -= 1;
+                    continue;
+                }
+                const ids = try a.alloc(i64, count * seq);
+                defer a.free(ids);
+                const mask = try a.alloc(i64, count * seq);
+                defer a.free(mask);
+                @memset(ids, 0);
+                @memset(mask, 0);
+                for (order[cursor..][0..count], 0..) |i, row| {
+                    for (encoded[i].ids[0..lengths[i]], encoded[i].attention_mask[0..lengths[i]], 0..) |id, active, col| {
+                        ids[row * seq + col] = id;
+                        mask[row * seq + col] = active;
+                    }
+                }
+                const result = self.embedTokenized(ids, mask, count, seq) catch |err| {
+                    if (count > 1 and (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable)) {
+                        count = (count + 1) / 2;
+                        continue;
+                    }
+                    return err;
+                };
+                defer a.free(result);
+                for (order[cursor..][0..count], result) |i, vector| vectors[i] = vector;
+                if (self.trace) |trace| trace.shape(sorted_lengths[0..count], count, seq);
+                if (self.batch_observation) |observation| observation.record(count);
+                cursor += count;
+                break;
+            }
+        }
+        return vectors;
+    }
+
     fn embedUnscoped(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (self.execution_control) |control| try control.update(.tokenizing, 0, @intCast(texts.len));
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
@@ -387,6 +475,8 @@ pub const EmbeddingPipeline = struct {
         if (textSessionBatchPlan(text_session, texts.len)) |plan| {
             return try self.embedWithBatchPlan(texts, plan);
         }
+
+        if (self.boundedQwenBatchingEnabled()) return self.embedBoundedQwen(texts);
 
         return embedTextBatchAdaptive(
             self.allocator,
@@ -399,6 +489,207 @@ pub const EmbeddingPipeline = struct {
     fn runDirectTextBatch(ctx: *anyopaque, texts: []const []const u8) anyerror![][]f32 {
         const self: *EmbeddingPipeline = @ptrCast(@alignCast(ctx));
         return self.embedDirect(texts, texts.len);
+    }
+
+    fn boundedQwenBatchingEnabled(self: *const EmbeddingPipeline) bool {
+        if (!metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true) or
+            self.text_projection != null) return false;
+        const cfg = session_factory.getGptConfig(self.textEncodingSession()) orelse return false;
+        return residentQwen3EmbeddingEligible(self.textEncodingSession(), cfg, self.config) and
+            self.tok.vtable.encodeForModelUnpadded != null and
+            !hasFixedTextSequenceLength(self.textEncodingSession().inputInfo());
+    }
+
+    fn embedBoundedQwen(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        const tokenize_started = if (self.trace != null) embedding_trace.now() else 0;
+        const alloc = self.allocator;
+        const session = self.textEncodingSession();
+        const max_len = textSequenceLengthForInputs(session.inputInfo(), self.config.max_length);
+        const Row = struct { encoded: EncodeResult, permit: session_mod.RunPermit };
+        // Completed chunk vectors remain live while later chunks execute.
+        // Keep their full batch storage admitted until pipeline return.
+        const result_row_bytes = try std.math.mul(usize, self.configOutputWidth(), @sizeOf(f32));
+        var metadata_permit = try session.admitHostPreprocess(try std.math.mul(usize, texts.len, try std.math.add(usize, @sizeOf(Row) + 4 * @sizeOf(usize) + @sizeOf([]f32), result_row_bytes)));
+        defer metadata_permit.deinit();
+        const rows = try alloc.alloc(Row, texts.len);
+        defer alloc.free(rows);
+        var initialized: usize = 0;
+        defer for (rows[0..initialized]) |*row| {
+            row.encoded.deinit();
+            row.permit.deinit();
+        };
+        const lengths = try alloc.alloc(usize, texts.len);
+        defer alloc.free(lengths);
+        for (texts, 0..) |text, index| {
+            if (self.execution_control) |control| try control.update(.tokenizing, @intCast(index), @intCast(texts.len));
+            const rendered_bytes = try std.math.add(usize, self.config.text_prefix.len, text.len);
+            // A fixed allocator bounds every BPE temporary, including raw IDs
+            // before truncation. Retain only actual rows after the slab drains.
+            const slab_bytes = @max(@as(usize, 64 * 1024), try std.math.mul(usize, try std.math.add(usize, rendered_bytes, 1), 128));
+            var permit = try session.admitHostPreprocess(try std.math.add(usize, slab_bytes, try std.math.add(usize, rendered_bytes, try std.math.mul(usize, @min(max_len, try std.math.add(usize, rendered_bytes, 2)), 8))));
+            errdefer permit.deinit();
+            const row_encoded: EncodeResult = blk: {
+                const slab = try alloc.alloc(u8, slab_bytes);
+                defer alloc.free(slab);
+                var bounded = std.heap.FixedBufferAllocator.init(slab);
+                const rendered = if (self.config.text_prefix.len > 0) try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.config.text_prefix, text }) else text;
+                defer if (self.config.text_prefix.len > 0) alloc.free(rendered);
+                var encoded = self.tok.encodeForModelUnpadded(bounded.allocator(), rendered, max_len) catch |err| switch (err) {
+                    error.OutOfMemory => return error.ResourceLimitExceeded,
+                    else => return err,
+                };
+                defer encoded.deinit();
+                if (self.config.ensure_trailing_eos_id) |eos| ensureTrailingEos(&encoded, eos);
+                const length = activeTokenLength(encoded.attention_mask);
+                const ids = try alloc.dupe(i32, encoded.ids[0..length]);
+                errdefer alloc.free(ids);
+                const mask = try alloc.dupe(i32, encoded.attention_mask[0..length]);
+                errdefer alloc.free(mask);
+                break :blk .{ .ids = ids, .attention_mask = mask, .allocator = alloc };
+            };
+            errdefer {
+                alloc.free(row_encoded.ids);
+                alloc.free(row_encoded.attention_mask);
+            }
+            if (permit.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = row_encoded.ids.len * 8 });
+            rows[index] = .{ .encoded = row_encoded, .permit = permit };
+            initialized += 1;
+            lengths[index] = row_encoded.ids.len;
+        }
+        const indices = try qwen_batch.order(alloc, lengths);
+        defer alloc.free(indices);
+        if (self.trace) |trace| trace.tokenize_ns += embedding_trace.now() -| tokenize_started;
+        const vectors = try alloc.alloc([]f32, texts.len);
+        errdefer alloc.free(vectors);
+        var completed: usize = 0;
+        errdefer for (indices[0..completed]) |index| alloc.free(vectors[index]);
+        var cursor: usize = 0;
+        while (cursor < indices.len) {
+            if (self.execution_control) |control| try control.check();
+            var count = qwen_batch.chunkLength(lengths, indices[cursor..], self.config.batch_size);
+            while (true) {
+                var pressure: ?memory_admission.AdmissionPressure = null;
+                var admission_denied = false;
+                const result = self.runBoundedQwenChunk(Row, rows, indices[cursor..][0..count], &pressure, &admission_denied) catch |err| {
+                    const splittable = admission_denied and (err == error.ResourceLimitExceeded or
+                        (err == error.ResourceTemporarilyUnavailable and pressure != null and std.meta.activeTag(pressure.?) != .external_budget));
+                    if (!splittable or count == 1) return err;
+                    count = (count + 1) / 2;
+                    continue;
+                };
+                defer alloc.free(result);
+                if (result.len != count) {
+                    for (result) |vector| alloc.free(vector);
+                    return error.UnexpectedOutputShape;
+                }
+                for (indices[cursor..][0..count], result) |index, vector| vectors[index] = vector;
+                completed += count;
+                cursor += count;
+                if (self.batch_observation) |observation| observation.record(count);
+                break;
+            }
+        }
+        return vectors;
+    }
+
+    fn runBoundedQwenChunk(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, pressure: *?memory_admission.AdmissionPressure, admission_denied: *bool) ![][]f32 {
+        const alloc = self.allocator;
+        const session = self.textEncodingSession();
+        var seq_len: usize = 1;
+        for (indices) |index| seq_len = @max(seq_len, rows[index].encoded.ids.len);
+        // The resident dense frame requires at least two physical rows.
+        // Empty documents contain only EOS; an inactive padding row preserves
+        // its causal output and last-active-token pooling without fallback.
+        if (indices.len == 1 and seq_len == 1) seq_len = 2;
+        const total = try std.math.mul(usize, indices.len, seq_len);
+        const lock_started = if (self.trace != null) embedding_trace.now() else 0;
+        if (self.execution_control) |control| try control.check();
+        if (self.execution_lock) |gate| {
+            if (self.execution_control) |control| try control.lock(gate) else platform.sync.lockYielding(gate);
+        }
+        defer if (self.execution_lock) |gate| gate.unlock();
+        if (self.trace) |trace| {
+            trace.execution_lock_ns += embedding_trace.now() -| lock_started;
+            var lengths: [32]usize = undefined;
+            if (indices.len <= lengths.len) {
+                for (indices, 0..) |index, i| lengths[i] = rows[index].encoded.ids.len;
+                trace.shape(lengths[0..indices.len], indices.len, seq_len);
+            } else trace.shapes_truncated = true;
+        }
+        self.execution_gate_held = true;
+        defer self.execution_gate_held = false;
+        const workspace_credit = try session_factory.qwenMetalWorkspaceCredit(session, alloc, self.execution_control);
+        const fresh_workspace = if (session.run_admission) |admission|
+            try admission.qwenTransientWorkspaceBytes(total)
+        else
+            try std.math.add(usize, 16 * 1024 * 1024, try std.math.mul(usize, total, self.configOutputWidth() * 16));
+        const request: session_mod.RunRequest = .{
+            .batch = indices.len,
+            .sequence = seq_len,
+            .input_bytes = try std.math.mul(usize, total, 12),
+            .output_bytes = try std.math.mul(usize, indices.len, self.configOutputWidth() * @sizeOf(f32)),
+            .retained_backend_workspace_bytes = workspace_credit,
+            // A smaller shape still needs fresh uploads and pooling tensors;
+            // retained large slots cannot be spent as credit for those buffers.
+            .workspace_bytes = try std.math.add(usize, workspace_credit, fresh_workspace),
+        };
+        var permit = session.admitWithPressure(request, pressure) catch |err| {
+            admission_denied.* = true;
+            if (platform.env.getenvSlice("TERMITE_EMBED_CAPACITY_DIAGNOSTICS")) |value| if (envFlagEnabled(value)) {
+                std.log.warn("qwen embedding admission denied batch={d} sequence={d} padded_tokens={d} constraint={s} error={s}", .{ indices.len, seq_len, total, if (pressure.*) |p| @tagName(std.meta.activeTag(p)) else "request_limit", @errorName(err) });
+                if (session.run_admission) |admission| {
+                    const requested = try admission.estimateRequest(request, session.outputInfo());
+                    const current = admission.controller.snapshotBackend(admission.backend_class);
+                    std.log.warn("qwen embedding capacity requested_host_bytes={d} requested_backend_bytes={d} current_host_bytes={d} current_backend_bytes={d} retained_workspace_bytes={d} host_limit_bytes={d} backend_limit_bytes={d} combined_limit_bytes={d} scratch_limit_bytes={d}", .{ requested.hostTotalBytes(), requested.backendTotalBytes(), current.hostTotalBytes(), current.backendTotalBytes(), workspace_credit, admission.limits.host_limit_bytes, admission.limits.backend_limit_bytes, admission.limits.combined_limit_bytes, admission.limits.scratch_limit_bytes });
+                }
+            };
+            return err;
+        };
+        defer permit.deinit();
+        try session_factory.beginQwenMetalWorkspace(session, if (permit.lease) |lease| lease.amounts.backend_scratch_bytes else std.math.maxInt(usize));
+        var workspace_finished = false;
+        defer if (!workspace_finished) {
+            // Backend cleanup in the resident route drains GPU work first.
+            session_factory.trimQwenMetalWorkspace(session) catch platform.inference_process_supervisor.restartWorker();
+        };
+        const execute_started = if (self.trace != null) embedding_trace.now() else 0;
+        defer if (self.trace) |trace| {
+            trace.execute_pool_normalize_ns += embedding_trace.now() -| execute_started;
+        };
+        const vectors = (self.embedBoundedQwenPacked(Row, rows, indices, seq_len) catch |err| {
+            session_factory.finishQwenMetalWorkspace(session, &permit.lease) catch |capacity_err| return capacity_err;
+            workspace_finished = true;
+            return err;
+        }) orelse return error.UnsupportedResidentTextEncoder;
+        errdefer freeEmbeddingSlices(alloc, vectors);
+        try session_factory.finishQwenMetalWorkspace(session, &permit.lease);
+        workspace_finished = true;
+        if (platform.env.getenvBool("TERMITE_EMBED_CAPACITY_DIAGNOSTICS")) {
+            const retained = try session_factory.qwenMetalWorkspaceCredit(session, alloc, self.execution_control);
+            std.log.info("qwen embedding chunk batch={d} sequence={d} padded_tokens={d} retained_workspace_bytes={d}", .{ indices.len, seq_len, total, retained });
+        }
+        return vectors;
+    }
+
+    fn embedBoundedQwenPacked(self: *EmbeddingPipeline, comptime Row: type, rows: []const Row, indices: []const usize, seq_len: usize) !?[][]f32 {
+        const alloc = self.allocator;
+        const total = try std.math.mul(usize, indices.len, seq_len);
+        const ids = try alloc.alloc(i64, total);
+        defer alloc.free(ids);
+        const mask = try alloc.alloc(i32, total);
+        defer alloc.free(mask);
+        @memset(ids, self.tok.specialTokens().pad_id);
+        @memset(mask, 0);
+        for (indices, 0..) |index, row| for (rows[index].encoded.ids, rows[index].encoded.attention_mask, 0..) |id, active, col| {
+            ids[row * seq_len + col] = id;
+            mask[row * seq_len + col] = active;
+        };
+        return self.tryEmbedTextResidentQwen3(mask, ids, indices.len, seq_len);
+    }
+
+    fn configOutputWidth(self: *const EmbeddingPipeline) usize {
+        const cfg = session_factory.getGptConfig(self.textEncodingSession()) orelse unreachable;
+        return cfg.hidden_size;
     }
 
     /// Execute one backend batch. `texts` contains only caller-provided rows;
@@ -493,7 +784,7 @@ pub const EmbeddingPipeline = struct {
             @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], all_mask[(texts.len - 1) * effective_len .. texts.len * effective_len]);
         }
 
-        // Convert i32 token IDs to i64 for ONNX Runtime (expects int64 tensors)
+        // Convert i32 token IDs to i64 (ONNX graphs expect int64 tensors)
         const ids_i64 = try alloc.alloc(i64, batch * effective_len);
         defer alloc.free(ids_i64);
         const mask_i64 = try alloc.alloc(i64, batch * effective_len);
@@ -561,6 +852,10 @@ pub const EmbeddingPipeline = struct {
                 return error.ResourceLimitExceeded,
             .host_preprocess_bytes = std.math.mul(usize, total, 32) catch
                 return error.ResourceLimitExceeded,
+            .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
+                try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, total, 192 * 1024))
+            else
+                0,
         });
         defer run_permit.deinit();
         if (self.execution_control) |control| try control.check();
@@ -585,19 +880,50 @@ pub const EmbeddingPipeline = struct {
         const alloc = self.allocator;
         const lock_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.execution_control) |control| try control.update(.executing, 0, 0);
-        if (self.execution_lock) |lock| {
+        if (!self.execution_gate_held) if (self.execution_lock) |lock| {
             if (self.execution_control) |control|
                 try control.lock(lock)
             else
                 platform.sync.lockYielding(lock);
-        }
-        defer if (self.execution_lock) |lock| lock.unlock();
+        };
+        defer if (!self.execution_gate_held) if (self.execution_lock) |lock| lock.unlock();
         const execute_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.trace) |trace| trace.execution_lock_ns += execute_started -| lock_started;
         defer if (self.trace) |trace| {
             trace.execute_pool_normalize_ns += embedding_trace.now() -| execute_started;
         };
         if (self.execution_control) |control| try control.check();
+
+        if (self.config.resident_text_encoder and (self.session.backend() == .metal or self.session.backend() == .native) and self.config.normalize and self.config.pooling == .mean and self.text_projection == null) {
+            if (session_factory.getEmbeddingGemma2Config(self.session)) |cfg| {
+                const dimensions = self.config.embedding_gemma2_dimensions;
+                if (!@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
+                var managed = try session_factory.getManagedComputeBackend(self.session, alloc, null, self.execution_control);
+                defer managed.deinit();
+                const mask = try alloc.alloc(i64, all_mask.len);
+                defer alloc.free(mask);
+                for (mask, all_mask) |*dest, source| dest.* = source;
+                const embeddings = if (batch * effective_len <= 8192)
+                    try @import("embedding_gemma2.zig").preparedTexts(&managed.backend, alloc, cfg, ids_i64, mask, batch, effective_len, dimensions)
+                else blk: {
+                    const vectors = try alloc.alloc([]f32, batch);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (vectors[0..initialized]) |vector| alloc.free(vector);
+                        alloc.free(vectors);
+                    }
+                    for (vectors, 0..) |*vector, index| {
+                        if (self.execution_control) |control| try control.check();
+                        vector.* = try @import("embedding_gemma2.zig").preparedText(&managed.backend, alloc, cfg, ids_i64[index * effective_len ..][0..effective_len], mask[index * effective_len ..][0..effective_len], dimensions);
+                        initialized += 1;
+                    }
+                    break :blk vectors;
+                };
+                self.last_resident_backend_timing = managed.backend.debugTimingSnapshot();
+                self.recordResidentProjection(.text, .success, "text.embeddinggemma2.pool_normalize.resident", batch, null);
+                return embeddings;
+            }
+        }
 
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(
@@ -873,7 +1199,10 @@ pub const EmbeddingPipeline = struct {
     };
 
     pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Media(images, true, null), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{}, self.execution_lock, self.execution_control, null);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         // The batch primitive acquires the execution gate only after bounded
         // preprocessing. Fallback reuses that primitive for each item, so
@@ -896,7 +1225,10 @@ pub const EmbeddingPipeline = struct {
     /// and never enters the encoder. Healthy rows retain their original order.
     pub fn embedImagesIndexed(self: *EmbeddingPipeline, images: []const []const u8, errors: []?anyerror) !ImageBatchResult {
         if (errors.len != images.len) return error.InvalidInputShape;
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Media(images, true, errors), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{}, self.execution_lock, self.execution_control, errors);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         const vectors = self.embedImagesBatchIndexed(images, errors) catch |err| {
             if (images.len <= 1 or !shouldFallbackBatchedImageError(err)) return err;
@@ -1122,7 +1454,7 @@ pub const EmbeddingPipeline = struct {
     pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
         if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
-            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{}, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{ .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
         const vectors = self.embedBorrowedRastersBatch(rasters) catch |err| {
@@ -1311,7 +1643,12 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of supported encoded audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudio(self: *EmbeddingPipeline, audio_clips: []const []const u8) ![][]f32 {
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return self.embedGemma2Media(audio_clips, false, null);
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const clips = try self.allocator.alloc(EncodedAudioClip, audio_clips.len);
+            defer self.allocator.free(clips);
+            for (clips, audio_clips) |*clip, bytes| clip.* = .{ .bytes = bytes };
+            return self.embedEncodedAudio(clips);
+        }
         if (audio_clips.len > 0) {
             const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
             const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
@@ -1333,12 +1670,20 @@ pub const EmbeddingPipeline = struct {
         audio_clips: []const EncodedAudioClip,
     ) ![][]f32 {
         if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            if (self.config.gemma4_audio_batching) {
+                const grouped = @import("embedding_gemma2.zig");
+                const result = try grouped.embedAudios(self.allocator, self.session, self.tok, audio_clips, .{ .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, null);
+                self.allocator.free(result.input_tokens);
+                return result.vectors;
+            }
             const bytes = try self.allocator.alloc([]const u8, audio_clips.len);
             defer self.allocator.free(bytes);
             for (bytes, audio_clips) |*dest, clip| dest.* = clip.bytes;
             return self.embedGemma2Media(bytes, false, null);
         }
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        if (self.config.audio_prepared_batches and (prepared_session.backend() == .metal or prepared_session.backend() == .cuda)) return (try self.embedClapAudioPrepared(audio_clips, null)).vectors;
 
         const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
         const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
@@ -1385,12 +1730,19 @@ pub const EmbeddingPipeline = struct {
     pub fn embedEncodedAudioIndexed(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: []?anyerror) !ImageBatchResult {
         if (clips.len != errors.len) return error.InvalidInputShape;
         if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            if (self.config.gemma4_audio_batching) {
+                const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, clips, .{ .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, errors);
+                self.allocator.free(result.input_tokens);
+                return .{ .vectors = result.vectors, .execution = result.execution };
+            }
             const bytes = try self.allocator.alloc([]const u8, clips.len);
             defer self.allocator.free(bytes);
             for (bytes, clips) |*dest, clip| dest.* = clip.bytes;
             return .{ .vectors = try self.embedGemma2Media(bytes, false, errors), .execution = .serial };
         }
         @memset(errors, null);
+        const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        if (self.config.audio_prepared_batches and (prepared_session.backend() == .metal or prepared_session.backend() == .cuda)) return self.embedClapAudioPrepared(clips, errors);
         const alloc = self.allocator;
         const vectors = try alloc.alloc([]f32, clips.len);
         @memset(vectors, &.{});
@@ -1466,6 +1818,124 @@ pub const EmbeddingPipeline = struct {
         return .{ .vectors = vectors, .execution = if (fallback) .fallback else observation.execution(observation.native_items + observation.serial_items) };
     }
 
+    fn embedClapAudioPrepared(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: ?[]?anyerror) anyerror!ImageBatchResult {
+        const prep = @import("audio_preparation.zig");
+        const session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const out = self.allocator;
+        const vectors = try out.alloc([]f32, clips.len);
+        @memset(vectors, &.{});
+        errdefer {
+            for (vectors) |vector| out.free(vector);
+            out.free(vectors);
+        }
+        if (errors) |items| {
+            if (items.len != clips.len) return error.InvalidInputShape;
+            @memset(items, null);
+        }
+        if (clips.len == 0) return .{ .vectors = vectors, .execution = .serial };
+        try self.lockExecution();
+        defer self.unlockExecution();
+        var slots: [2]prep.Wave = undefined;
+        var live: [2]bool = @splat(false);
+        defer for (&slots, live) |*slot, exists| if (exists) slot.deinit();
+        const control = self.execution_control orelse InferenceExecutionControl{};
+        const budget = self.config.max_audio_decode_working_bytes;
+        const preprocessing = clapPreprocessingPolicy(session, clips.len);
+        var current: usize = 0;
+        var offset: usize = 0;
+        const first = @min(prep.max_batch, clips.len);
+        slots[0] = prep.Wave.initClap(session, clips[0..first], if (errors) |e| e[0..first] else null, control, budget, preprocessing);
+        live[0] = true;
+        slots[0].run();
+        var observation = @import("batch_execution.zig").Observation{};
+        var fallback = false;
+        while (offset < clips.len) {
+            try control.check();
+            const slot = &slots[current];
+            slot.join();
+            if (slot.failure) |err| return err;
+            if (self.audio_timings) |t| t.preprocess_ns += slot.prepare_ns;
+            const next = 1 - current;
+            const next_offset = offset + slot.consumed;
+            const next_count = @min(prep.max_batch, clips.len - next_offset);
+            if (next_count > 0) {
+                slots[next] = prep.Wave.initClap(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, budget, preprocessing);
+                live[next] = true;
+                if (self.config.audio_prepare_ahead) {
+                    const spawned = slots[next].start();
+                    if (self.audio_timings) |t| t.preparation_jobs += @intFromBool(spawned);
+                }
+            }
+            if (self.audio_timings) |t| t.max_prepared_audio = @max(t.max_prepared_audio, slot.clips.len + if (self.config.audio_prepare_ahead) next_count else 0);
+            if (slot.retained > 0) {
+                var scoped = self.*;
+                scoped.allocator = slot.allocator();
+                scoped.execution_lock = null;
+                scoped.execution_gate_held = true;
+                const plan = try slot.clapPlan(slot.retained);
+                const request = @import("../backends/session.zig").RunRequest{ .batch = slot.retained, .sequence = plan.frames, .input_bytes = slot.mels.len * 4, .pre_admitted_host_bytes = slot.mels.len * 4, .host_preprocess_bytes = plan.feature_reserve_bytes };
+                var permit = session.admit(request) catch |err| blk: {
+                    if (next_count == 0 or !self.config.audio_prepare_ahead or !prep.pressure(err)) return err;
+                    slots[next].deinit();
+                    slots[next].failure = err;
+                    break :blk try session.admit(request);
+                };
+                defer permit.deinit();
+                const begun = platform.time.monotonicNs();
+                const result = scoped.embedClapPreparedFeatures(session, plan, slot.retained, slot.mels, slot.flags[0..slot.retained], &permit) catch |err| blk: {
+                    if (err != error.BatchedAudioOutputCollapsed or slot.retained == 1) return err;
+                    permit.deinit();
+                    // Preserve singleton fusion/layout when an exported graph
+                    // collapses its batch. The feature producer stays bounded.
+                    scoped.config.audio_prepared_batches = false;
+                    const rows = try scoped.allocator.alloc([]f32, slot.retained);
+                    var copied: usize = 0;
+                    errdefer {
+                        for (rows[0..copied]) |row| scoped.allocator.free(row);
+                        scoped.allocator.free(rows);
+                    }
+                    for (slot.indexes[0..slot.retained], rows) |index, *row| {
+                        const clip = slot.clips[index];
+                        const one = if (clip.pcm) |pcm| try scoped.embedAudioPcm(&.{pcm}) else try scoped.embedEncodedAudio(&.{clip});
+                        row.* = one[0];
+                        scoped.allocator.free(one);
+                        copied += 1;
+                    }
+                    fallback = true;
+                    break :blk rows;
+                };
+                defer {
+                    for (result) |row| scoped.allocator.free(row);
+                    scoped.allocator.free(result);
+                }
+                if (result.len != slot.retained) return error.InvalidEmbeddingResultCount;
+                self.last_resident_backend_timing = scoped.last_resident_backend_timing;
+                if (self.audio_timings) |t| {
+                    t.audio_ns += platform.time.monotonicNs() - begun;
+                    t.resident_cohorts += 1;
+                }
+                for (slot.indexes[0..slot.retained], result) |index, row| vectors[offset + index] = try out.dupe(f32, row);
+                observation.record(slot.retained);
+            }
+            slot.deinit();
+            live[current] = false;
+            offset = next_offset;
+            if (next_count > 0) {
+                if (!self.config.audio_prepare_ahead) slots[next].run();
+                slots[next].join();
+                if (slots[next].failure) |err| if (prep.pressure(err)) {
+                    slots[next].deinit();
+                    slots[next] = prep.Wave.initClap(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, budget, preprocessing);
+                    if (self.audio_timings) |t| t.preparation_backpressure_retries += 1;
+                    slots[next].run();
+                };
+                current = next;
+            }
+        }
+        try control.check();
+        return .{ .vectors = vectors, .execution = if (fallback) .fallback else observation.execution(observation.native_items + observation.serial_items) };
+    }
+
     fn embedGemma2Media(self: *EmbeddingPipeline, media: []const []const u8, images: bool, item_errors: ?[]?anyerror) ![][]f32 {
         const grouped = @import("embedding_gemma2.zig");
         const out = try self.allocator.alloc([]f32, media.len);
@@ -1477,7 +1947,7 @@ pub const EmbeddingPipeline = struct {
         for (media, 0..) |bytes, index| {
             if (item_errors) |errors| errors[index] = null;
             const part: grouped.Part = if (images) .{ .image = bytes } else .{ .audio = bytes };
-            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{}, self.execution_lock, self.execution_control) catch |err| {
+            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{ .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control) catch |err| {
                 if (item_errors) |errors| {
                     if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded) return err;
                     errors[index] = err;
@@ -1552,8 +2022,15 @@ pub const EmbeddingPipeline = struct {
     }
 
     pub fn embedAudioPcmReported(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror!ImageBatchResult {
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Pcm(audio_clips), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return self.embedGemma2PcmReported(audio_clips);
         if (audio_clips.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        if (self.config.audio_prepared_batches and (prepared_session.backend() == .metal or prepared_session.backend() == .cuda)) {
+            const clips = try self.allocator.alloc(EncodedAudioClip, audio_clips.len);
+            defer self.allocator.free(clips);
+            for (clips, audio_clips) |*dst, pcm| dst.* = .{ .pcm = pcm };
+            return self.embedClapAudioPrepared(clips, null);
+        }
         try self.lockExecution();
         defer self.unlockExecution();
         const vectors = self.embedAudioPcmBatch(audio_clips) catch |err| {
@@ -1566,6 +2043,10 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn embedGemma2Pcm(self: *EmbeddingPipeline, clips: anytype) ![][]f32 {
+        return (try self.embedGemma2PcmReported(clips)).vectors;
+    }
+
+    fn embedGemma2PcmReported(self: *EmbeddingPipeline, clips: anytype) !ImageBatchResult {
         if (clips.len > 128) return error.ResourceLimitExceeded;
         var bytes: usize = 0;
         for (clips) |clip| {
@@ -1576,6 +2057,41 @@ pub const EmbeddingPipeline = struct {
             for (clip.samples) |sample| if (!std.math.isFinite(sample)) return error.UnsupportedAudioFormat;
         }
         if (bytes > 64 * 1024 * 1024) return error.AudioTooLarge;
+        if (self.config.gemma4_audio_batching and (self.session.backend() == .metal or self.session.backend() == .cuda)) {
+            try self.lockExecution();
+            defer self.unlockExecution();
+            var host = try self.session.admitHostPreprocess(bytes);
+            defer host.deinit();
+            const prepared = try self.allocator.alloc(EncodedAudioClip, clips.len);
+            defer self.allocator.free(prepared);
+            var mono = std.ArrayList([]f32).empty;
+            defer {
+                for (mono.items) |samples| self.allocator.free(samples);
+                mono.deinit(self.allocator);
+            }
+            for (prepared, clips) |*dst, clip| {
+                if (self.execution_control) |control| try control.check();
+                const channels = if (@hasField(@TypeOf(clip), "channels")) clip.channels else 1;
+                var samples: []const f32 = clip.samples;
+                if (channels > 1) {
+                    const downmixed = try self.allocator.alloc(f32, samples.len / channels);
+                    mono.append(self.allocator, downmixed) catch |err| {
+                        self.allocator.free(downmixed);
+                        return err;
+                    };
+                    for (downmixed, 0..) |*value, frame| {
+                        var sum: f32 = 0;
+                        for (samples[frame * channels ..][0..channels]) |sample| sum += sample;
+                        value.* = sum / @as(f32, @floatFromInt(channels));
+                    }
+                    samples = downmixed;
+                }
+                dst.* = .{ .pcm = .{ .samples = samples, .sample_rate = clip.sample_rate } };
+            }
+            const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, prepared, .{ .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, null, self.execution_control, null);
+            self.allocator.free(result.input_tokens);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         var permit = try self.session.admit(.{ .batch = 1, .sequence = 1, .host_preprocess_bytes = 64 * 1024 * 1024 });
         defer permit.deinit();
         const output = try self.allocator.alloc([]f32, clips.len);
@@ -1591,11 +2107,11 @@ pub const EmbeddingPipeline = struct {
             // bounded decoder, downmix, resample and HF processor as HTTP.
             const encoded = try audio.wav.encodeInterleaved(std.heap.smp_allocator, clip.samples, channels, .{ .audio_format = 3, .sample_rate = clip.sample_rate, .bits_per_sample = 32 });
             defer std.heap.smp_allocator.free(encoded);
-            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{}, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{ .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
             vector.* = result.vector;
             initialized += 1;
         }
-        return output;
+        return .{ .vectors = output, .execution = .serial };
     }
 
     fn lockExecution(self: *EmbeddingPipeline) !void {
@@ -1694,6 +2210,11 @@ pub const EmbeddingPipeline = struct {
             }
         }
 
+        return self.embedClapPreparedFeatures(as, feature_plan, batch, all_mels, is_longer, &run_permit);
+    }
+
+    fn embedClapPreparedFeatures(self: *EmbeddingPipeline, as: backends.Session, feature_plan: ClapBatchPlan, batch: usize, all_mels: []const f32, is_longer: []const u8, permit: *@import("../backends/session.zig").RunPermit) ![][]f32 {
+        const alloc = self.allocator;
         // Build input tensor: [batch, channels, n_frames, n_mels]
         const mel_shape = [_]i64{ @intCast(batch), @intCast(feature_plan.channels), @intCast(feature_plan.frames), @intCast(feature_plan.mels) };
         var mel_tensor = try Tensor.initFloat32(alloc, "input_features", &mel_shape, all_mels);
@@ -1716,12 +2237,12 @@ pub const EmbeddingPipeline = struct {
                 batch,
                 "audio.encoder.resident",
                 "audio.projection.resident",
-                &run_permit,
+                permit,
             )) |embeddings| return embeddings;
         }
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try run_permit.runWithControl(run_inputs, alloc, self.execution_control);
+        var outputs = try permit.runWithControl(run_inputs, alloc, self.execution_control);
         logEmbedTiming("audio.encoder", batch, encoder_start);
         logEmbedTensorShapes(self.print_timing, "audio.outputs", outputs);
         defer {
@@ -2022,9 +2543,13 @@ pub const EmbeddingPipeline = struct {
         else
             null;
         defer if (selected_rows) |rows| self.allocator.free(rows);
+        const disable_frame_normalize = if (platform.env.getenvSlice("TERMITE_METAL_DISABLE_QWEN3_FRAME_NORMALIZE")) |value| envFlagEnabled(value) else false;
+        const normalize_in_frame = self.config.normalize and selected_rows != null and
+            self.boundedQwenBatchingEnabled() and !disable_frame_normalize;
         const encoder_start = embedTimingStart(self.print_timing);
         const output = (try gpt_arch.tryDenseQwen3Prefill(cb, self.allocator, cfg, input_ids, mask, batch, seq_len, .{
             .output_rows = selected_rows,
+            .normalize_selected_rows = normalize_in_frame,
             .profile = embedTimingEnabled(self.print_timing),
         })) orelse return null;
         defer cb.free(output);
@@ -2060,7 +2585,7 @@ pub const EmbeddingPipeline = struct {
             .backend = pooled.backend,
             .allocator = self.allocator,
         };
-        const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
+        const embeddings = try self.resident2DToEmbeddingsWithNormalization(&pooled_outputs, batch, self.config.normalize and !normalize_in_frame);
         self.recordResidentProjection(.text, .success, "text.encoder.qwen3.graph", batch, null);
         return embeddings;
     }
@@ -2662,12 +3187,6 @@ test "embedding text plans backend and fixed-shape batches" {
         textSessionBatchPlan(fixed_two, 3).?,
     );
 
-    const external_onnx = fakeTextSession(.onnx, &.{ -1, 77 });
-    try std.testing.expectEqual(
-        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
-        textSessionBatchPlan(external_onnx, 2).?,
-    );
-
     const dynamic_info = [_]backends.TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 77 } },
     };
@@ -2720,9 +3239,6 @@ fn textSessionBatchPlanForRuntime(
         break;
     }
     if (requested_batch <= 1) return null;
-    if (backend == .onnx) {
-        return .{ .batch_size = 1, .pad_final_batch = false };
-    }
     if (imported and backend != .native and backend != .metal) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }
@@ -3934,4 +4450,41 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "CLAP prepared accelerator waves preserve indexed errors and collapsed-batch fallback" {
+    const a = std.testing.allocator;
+    var fake = FakeCollapsingAudioSession{};
+    var vtable = fake.session().vtable.*;
+    const Mock = struct {
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .metal;
+        }
+    };
+    vtable.backend = Mock.backend;
+    const session = backends.Session{ .ptr = &fake, .vtable = &vtable };
+    var pipeline = EmbeddingPipeline{ .allocator = a, .session = session, .audio_session = session, .tok = undefined, .config = .{ .normalize = false } };
+    const samples: [1024]f32 = @splat(0);
+    const wav = try audio.wav.encodeMono(a, &samples, .{ .sample_rate = audio.CLAP_CONFIG.sample_rate, .audio_format = 1, .bits_per_sample = 16 });
+    defer a.free(wav);
+    var clips: [10]EncodedAudioClip = undefined;
+    for (&clips) |*clip| clip.* = .{ .bytes = wav };
+    clips[1].bytes = "invalid audio";
+    var errors: [10]?anyerror = undefined;
+    const result = try pipeline.embedEncodedAudioIndexed(&clips, &errors);
+    defer freeEmbeddingSlices(a, result.vectors);
+    try std.testing.expectEqual(.fallback, result.execution);
+    try std.testing.expect(errors[1] != null);
+    try std.testing.expectEqual(@as(usize, 10), result.vectors.len);
+    for (result.vectors, errors, 0..) |row, failure, index| {
+        if (index == 1) {
+            try std.testing.expectEqual(@as(usize, 0), row.len);
+        } else {
+            try std.testing.expect(failure == null);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row);
+        }
+    }
+    try std.testing.expect(fake.collapsed_batch_attempts > 1);
+    // Two attempted batch forwards plus nine valid singleton fallbacks.
+    try std.testing.expectEqual(@as(usize, 11), fake.run_count);
 }

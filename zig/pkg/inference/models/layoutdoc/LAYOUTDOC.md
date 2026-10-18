@@ -6,7 +6,7 @@ This document covers the native (non-ONNX) model runtime implementations in antf
 
 ## LayoutDoc Runtime
 
-The native LayoutDoc runtime loads `gopeft-zig` `layoutdoc_sequence_head.safetensors` and `layoutdoc_token_head.safetensors` artifacts and serves document classification over HTTP.
+The native LayoutDoc runtime loads `gopeft-zig` `layoutdoc_sequence_head.safetensors` and `layoutdoc_token_head.safetensors` artifacts for document classification. It is reachable through the probe CLIs; it is not exposed over HTTP (see [HTTP handlers](#http-handlers-not-routed)).
 
 ### What Is Implemented
 
@@ -17,46 +17,29 @@ The native LayoutDoc runtime loads `gopeft-zig` `layoutdoc_sequence_head.safeten
 - OCR-token bbox feature reconstruction for the token head
 - JPEG and PNG image-path support
 
-### HTTP API
+### HTTP handlers (not routed)
 
-**Sequence classification:**
+`Node.classifyDocument` and `Node.classifyDocumentTokens` in
+`src/server/server.zig` implement sequence and token classification, and
+`specs/openapi/inference/api.yaml` defines their request schemas
+(`DocumentClassificationRequest`, `DocumentTokenClassificationRequest`).
+Neither handler is registered on any route, so there is
+no `/api/classify/document` or `/api/classify/document_tokens` endpoint and no
+HTTP way to run LayoutDoc today. Exposing them (or removing them) is open work
+below.
 
-`POST /api/classify/document`
+What the handlers accept, for when they are wired:
 
-Request:
-```json
-{
-  "model": "acme/layoutdoc-invoice-sequence",
-  "image_path": "/tmp/page.png",
-  "num_tokens": 42,
-  "labels": ["invoice", "form", "email"]
-}
-```
-
-Response includes: resolved checkpoint path, extracted document classification features, best label, full score list.
-
-**Token classification:**
-
-`POST /api/classify/document_tokens`
-
-Request:
-```json
-{
-  "model": "acme/layoutdoc-token-tags",
-  "labels": ["O", "B-KEY", "I-KEY"],
-  "tokens": [
-    { "text": "Invoice", "bbox": [0, 0, 120, 24] },
-    { "text": "Total", "bbox": [0, 40, 80, 64] }
-  ]
-}
-```
-
-Response includes: resolved checkpoint path, one prediction block per token, reconstructed token features, best label and full score list per token.
-
-**Current endpoint constraints:**
-- Labels are caller-provided (the `gopeft-zig` checkpoint does not store the label vocabulary)
-- The sequence endpoint accepts a local `image_path`, not uploaded bytes
-- Token classification requires caller-provided OCR tokens and boxes
+- **Sequence:** `model`, a local `image_path`, `num_tokens`, caller-provided
+  `labels`, and an optional checkpoint `prefix`; they resolve
+  `layoutdoc_sequence_head.safetensors` under the model directory and return
+  the resolved checkpoint path, extracted features, best label, and full
+  score list.
+- **Token:** `model`, `labels`, and caller-provided OCR `tokens` with `bbox`
+  boxes; they return one prediction block per token with reconstructed
+  features, best label, and scores.
+- Labels are caller-provided because the `gopeft-zig` checkpoint does not
+  store the label vocabulary.
 
 ### Probe CLIs
 
@@ -110,9 +93,13 @@ Generated files:
 
 ### Remaining Work
 
-1. Add parity fixtures using real `gopeft-zig` checkpoints and example pages
-2. Decide whether to keep the path-based sequence endpoint or add image-byte/content-part input
-3. Add OCR extraction / bbox-producing flow that can feed `classify_tokens` directly
+1. Register or remove the document classification handlers: route
+   `Node.classifyDocument`/`Node.classifyDocumentTokens` (the likely target is
+   a document task on `/extract`, per the [inference roadmap](../../ROADMAP.md))
+   or delete them and their request schemas
+2. Add parity fixtures using real `gopeft-zig` checkpoints and example pages
+3. Decide whether to keep path-based `image_path` input or add image-byte/content-part input
+4. Add OCR extraction / bbox-producing flow that can feed `classify_tokens` directly
 ```
 
 ---

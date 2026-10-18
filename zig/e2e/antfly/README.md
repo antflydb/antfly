@@ -2,8 +2,9 @@
 
 This directory holds portable end-to-end tests for Antfly Zig.
 
-See [FLAKES.md](../FLAKES.md) for intermittent failures, CI evidence, fix commits,
-and regression-soak commands and results.
+See [FLAKES.md](../FLAKES.md) for the table of known E2E flakes, where they were
+seen, and whether they are open or closed. Investigation details live in git
+history and the linked PRs.
 
 Use product-area names for test files. Do not use migration labels like `*_parity.py`.
 
@@ -280,3 +281,7 @@ Compared with `../antfly/e2e`, the biggest missing areas are:
 2. Expand broader stateful retrieval-generation depth beyond pipeline-only retrieval.
 3. Broaden backup/restore coverage beyond the current local + remote matrix.
 4. Decide whether provider/auth/secrets tests belong in this portable suite or a separate integration suite with external dependencies.
+
+For standalone CLI qualification, `ANTFLY_CLI_BIN` can select a focused
+`antfly-cli` artifact while `ANTFLY_BIN` selects the server. This allows a Debug
+CLI to exercise an optimized inference server without rebuilding the model runtime.

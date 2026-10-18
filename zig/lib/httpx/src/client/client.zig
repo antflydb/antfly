@@ -6254,12 +6254,14 @@ test "request redirects share a deadline for buffered streaming and cancellable 
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
     const io = std.testing.io;
+    // Leave enough time to reach the final hop under concurrent build load.
+    // Resetting the budget at each redirect still exceeds the elapsed bound.
     for ([_]bool{ false, true }) |to_writer| {
         for ([_]bool{ false, true }) |coordinated| {
             var server = try TestServer.start(alloc, io, &.{
-                .{ .path = "/first", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/second" }}, .delay_ns = 80 * std.time.ns_per_ms } },
-                .{ .path = "/second", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 80 * std.time.ns_per_ms } },
-                .{ .path = "/final", .respond = .{ .body = "ready", .delay_ns = 500 * std.time.ns_per_ms } },
+                .{ .path = "/first", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/second" }}, .delay_ns = 400 * std.time.ns_per_ms } },
+                .{ .path = "/second", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 400 * std.time.ns_per_ms } },
+                .{ .path = "/final", .respond = .{ .body = "ready", .delay_ns = 3000 * std.time.ns_per_ms } },
             });
             defer server.deinit();
             const Task = struct {
@@ -6274,7 +6276,7 @@ test "request redirects share a deadline for buffered streaming and cancellable 
                 .keep_alive = false,
                 .cancel_in_flight_on_shutdown = coordinated,
                 .retry_policy = .{ .max_retries = 0 },
-                .timeouts = .{ .request_ms = 250 },
+                .timeouts = .{ .request_ms = 1500 },
             });
             defer client.deinit();
             const url = try std.fmt.allocPrint(alloc, "{s}/first", .{server.baseUrl()});
@@ -6283,14 +6285,14 @@ test "request redirects share a deadline for buffered streaming and cancellable 
             defer output.deinit(alloc);
             const start = common.milliTimestamp(io);
             // Exercise both default and per-request budgets.
-            const opts: RequestOptions = .{ .timeout_ms = if (coordinated) 250 else null };
+            const opts: RequestOptions = .{ .timeout_ms = if (coordinated) 1500 else null };
             if (to_writer) {
                 try std.testing.expectError(error.Timeout, client.getToWriter(url, opts, arrayListWriter(&output, alloc), null, null));
                 try std.testing.expectEqual(@as(usize, 0), output.items.len);
             } else {
                 try std.testing.expectError(error.Timeout, client.get(url, opts));
             }
-            try std.testing.expect(common.milliTimestamp(io) - start < 350);
+            try std.testing.expect(common.milliTimestamp(io) - start < 2000);
             try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1 }, server.route_hits);
             try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
         }
@@ -6478,4 +6480,122 @@ test "client body replay preserves method safety after truncation" {
             try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, server.route_hits);
         }
     }
+}
+
+test "HTTPS client uploads large immutable packs without truncation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    const script =
+        \\import os, socket, ssl, sys
+        \\context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        \\context.load_cert_chain('cert.pem', 'key.pem')
+        \\listener = socket.socket()
+        \\listener.bind(('127.0.0.1', int(sys.argv[1])))
+        \\listener.listen()
+        \\versions = [ssl.TLSVersion.TLSv1_2]
+        \\if ssl.HAS_TLSv1_3:
+        \\    versions.append(ssl.TLSVersion.TLSv1_3)
+        \\with open('versions.tmp', 'w') as ready:
+        \\    ready.write(str(len(versions)))
+        \\os.replace('versions.tmp', 'versions.txt')
+        \\for version in versions:
+        \\    context.minimum_version = version
+        \\    context.maximum_version = version
+        \\    raw, _ = listener.accept()
+        \\    with context.wrap_socket(raw, server_side=True) as connection:
+        \\        connection.settimeout(30)
+        \\        for _ in range(4):
+        \\            data = b''
+        \\            while b'\r\n\r\n' not in data:
+        \\                chunk = connection.recv(4096)
+        \\                if not chunk:
+        \\                    raise RuntimeError('Truncated request headers')
+        \\                data += chunk
+        \\            headers, body = data.split(b'\r\n\r\n', 1)
+        \\            length = int(next(line.split(b':', 1)[1] for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')))
+        \\            received = len(body)
+        \\            assert received <= length and body == b'*' * received
+        \\            while received < length:
+        \\                chunk = connection.recv(min(65536, length-received))
+        \\                if not chunk:
+        \\                    raise RuntimeError('Truncated request body')
+        \\                assert chunk == b'*' * len(chunk)
+        \\                received += len(chunk)
+        \\            connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok')
+        \\listener.close()
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    const ready_deadline = common.milliTimestamp(io) + 30_000;
+    const version_bytes = while (true) {
+        break tmp.dir.readFileAlloc(io, "versions.txt", allocator, .limited(8)) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (common.milliTimestamp(io) >= ready_deadline) return error.TlsFixtureStartupTimeout;
+                try io.sleep(Io.Duration.fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer allocator.free(version_bytes);
+    const version_count = try std.fmt.parseInt(usize, version_bytes, 10);
+    try std.testing.expect(version_count >= 1 and version_count <= 2);
+    for (0..version_count) |_| {
+        var client = Client.initWithConfig(allocator, io, .{
+            .keep_alive = true,
+            .verify_ssl = false,
+            .retry_policy = .{ .max_retries = 0 },
+            // This is a multi-MiB integrity campaign, including Debug crypto
+            // and allocator instrumentation. Short deadline/cancellation
+            // behavior is covered by the dedicated watchdog regressions.
+            .timeouts = .{ .request_ms = 30_000, .read_ms = 30_000, .write_ms = 30_000 },
+        });
+        defer client.deinit();
+        for ([_]usize{ 24 * 1024, 1024 * 1024, 8 * 1024 * 1024 }) |size| {
+            errdefer std.debug.print("TLS upload failed size={d}\n", .{size});
+            const body = try allocator.alloc(u8, size);
+            defer allocator.free(body);
+            @memset(body, '*');
+            var response = try client.post(url, .{ .body = body });
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expectEqualStrings("ok", response.body orelse "");
+        }
+        // Fill the TLS plaintext buffer exactly. Ciphertext framing needs extra
+        // space, so one encryption pass cannot necessarily consume all of it.
+        const capacity = @import("../tls/client_compat.zig").min_buffer_len;
+        const body = try allocator.alloc(u8, capacity);
+        defer allocator.free(body);
+        @memset(body, '*');
+        var request = try Request.init(allocator, .POST, url);
+        defer request.deinit();
+        try request.setBorrowedBody(body);
+        const head = try serializeRequestHeadAlloc(allocator, &request);
+        defer allocator.free(head);
+        try request.setBorrowedBody(body[0 .. capacity - head.len]);
+        const exact_head = try serializeRequestHeadAlloc(allocator, &request);
+        defer allocator.free(exact_head);
+        try std.testing.expectEqual(capacity, exact_head.len + request.bodyLen());
+        var response = try client.executeRequest(&request, null, null, null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings("ok", response.body orelse "");
+    }
+    std.debug.print("TLS buffer boundary verified protocol_versions={d}\n", .{version_count});
 }

@@ -31,6 +31,24 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const row_preparation_filters = [_][]const u8{
+        "prepared relational",
+        "relational durable preparation",
+        "relational direct intents",
+        "relational cumulative prepares",
+        "relational preparation budget",
+        "relational transform preparation releases",
+        "db transaction recovery",
+    };
+    const row_preparation_tests = b.addTest(.{
+        .name = "row-preparation-tests",
+        .root_module = antfly_test_mod,
+        .filters = &row_preparation_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-storage-row-preparation-test", "Run resident and recovery row preparation, admission and ownership contracts")
+        .dependOn(&addCuratedTestRunArtifact(b, row_preparation_tests, &row_preparation_filters).step);
     const producer_receipt_filters = [_][]const u8{
         "producer readiness",
         "derived coverage outcome transitions are exclusive and idempotent",
@@ -149,6 +167,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
+        "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
         "db generic artifact repair queue",
         "db shared repair completion",
@@ -377,12 +396,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub makes progress when byte window is smaller than utf8 scalar",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub preserves utf8 boundaries across default byte windows",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub replaces invalid utf8 before storing chunk text",
+        "storage.db.enrichment.chunker_stub.test.chunker stub model-aware input retains validation without byte chunk fallback",
         "storage.db.enrichment.embedder.test.enrichment dense embedder replaces invalid utf8 before provider call",
         "storage.db.enrichment.embedder.test.enrichment dense parts embedder replaces invalid text part utf8 before provider call",
         "storage.db.enrichment.embedder.test.enrichment sparse batch embedder replaces invalid utf8 before provider call",
         "storage.db.enrichment.enrichment_runtime.test.enrichment applied checkpoint stays degraded until runtime status clears",
         "storage.db.enrichment.enrichment_runtime.test.enrichment batch retry identity covers every work item",
         "storage.db.enrichment.enrichment_runtime.test.enrichment distinguishes transient capacity from permanent resource limits",
+        "PDF decode operator budgets",
+        "parallel dense inference preserves order",
+        "forced dense generations recompute cached vectors",
         "storage.db.enrichment.enrichment_runtime.test.enrichment extractSourceText with template error directive fails instead of returning text",
         "storage.db.enrichment.enrichment_runtime.test.enrichment foreground catch up reconciles retry state after checkpoint apply",
         "storage.db.enrichment.enrichment_runtime.test.enrichment generated preparation window bounds time to first publication",
@@ -546,6 +569,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_db_enrichment_step.dependOn(&run_lib_db_enrichment_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "(#1095)",
         "db query drops full text hits whose stored document row was deleted directly from the store",
         "db native document filters preserve paged totals across representations",
         "db text totals require presence proof beyond the requested page",
@@ -569,6 +593,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db schema-present infer_types opt-in recursively infers nested fields after reopen",
         "storage.db.db.test.db document _edges",
         "storage.db.db.test.db document _embeddings",
+        "db dense and sparse field-backed vector indexes strip vector fields and persist embedding artifacts",
+        "document mapper explicit null embeddings",
         "sort execution plan dimension names are stable for profiles",
         "sort cursor contract classifies arity separately from type",
         "json sort values reject non-replayable numeric values at API boundaries",
@@ -652,6 +678,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
     addRuntimeTestFilters(b, run_lib_db_query_tests, &lib_db_query_default_filters);
+    const parent_match_all_filters = [_][]const u8{
+        "(#1095)",
+        "match_all supports id-only sort",
+        "match_all id seek",
+        "db multi-source full text unions chunk",
+        "db match_all consumes resolved ordinal filter",
+        "db native document filters preserve paged totals",
+        "db search filters expired documents when ttl schema",
+        "db full text match_all applies",
+        "docstore runtime point get does not clone mutable snapshot",
+        "storage.db.doc_identity",
+    };
+    const parent_match_all_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &parent_match_all_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-storage-db-parent-match-all-test", "Run parent match_all chunk population regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, parent_match_all_tests, &parent_match_all_filters).step);
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
 

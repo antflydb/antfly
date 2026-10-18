@@ -16,6 +16,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub const SparseOrdinalSelection = @import("../../sparse/ordinal_lookup.zig").Selection;
+pub const SparseOrdinalWorkBudget = @import("../../sparse/ordinal_lookup.zig").WorkBudget;
+pub const SparseOrdinalKeyFilter = @import("../../sparse/ordinal_lookup.zig").KeyFilter;
 pub const SparseOrdinalLookup = @import("../../sparse/ordinal_lookup.zig").Lookup;
 const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -1391,6 +1393,9 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Local output allocation policy; never parsed from public requests.
+    /// Raw copies and flat native projections already allocate exact bodies.
+    output_exact: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     /// Private metadata-coordinator probe. Public HTTP lookup parsing must
@@ -1588,6 +1593,7 @@ pub const ScanHash = struct {
 
 /// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
 /// duration of the callback; consumers that retain them must copy them.
+pub const BorrowedScanDocument = @import("../scan_document.zig").Borrowed;
 pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
@@ -1596,11 +1602,23 @@ pub const ScanVisitEntry = struct {
     relational_cursor: ?[]const u8 = null,
     json_null_fields: []const []const u8 = &.{},
     document_json: ?[]const u8 = null,
+    document_stream: ?BorrowedScanDocument = null,
 };
 
 pub const ScanVisitor = struct {
+    /// Opt in only when the callback consumes document_stream synchronously.
+    /// Ordinary collectors retain their existing document_json contract.
+    borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
+    const NativeCallbacks = struct { visit: @FieldType(ScanVisitor, "visit") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+
+    pub fn visitEntry(self: ScanVisitor, entry: ScanVisitEntry) anyerror!void {
+        return NativeBoundary.call("visit", self.callback_dispatch, self.visit, .{ self.context, entry });
+    }
 };
 
 pub const ScanResult = struct {
@@ -1812,11 +1830,65 @@ pub const GraphQueryTransport = struct {
     }
 };
 
+pub const document_authority = @import("query/document_authority.zig");
+pub const NativeKeyPredicate = struct {
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
+    ptr: *anyopaque,
+    allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    /// Changes only when exact query-owned constraints become materialized.
+    constraint_revision: ?*const fn (*anyopaque) u64 = null,
+    select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
+    select_range: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup, u32, u32) anyerror!?SparseOrdinalSelection = null,
+    select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
+    const NativeCallbacks = struct { allows: @FieldType(NativeKeyPredicate, "allows"), select_constraints: @FieldType(NativeKeyPredicate, "select_constraints"), select_range: @FieldType(NativeKeyPredicate, "select_range"), select_ordinals: @FieldType(NativeKeyPredicate, "select_ordinals") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    /// The proxy is synchronous and must never escape the storage call.
+    pub fn receiver(self: *const NativeKeyPredicate) NativeKeyPredicate {
+        return .{ .ptr = @ptrCast(@constCast(self)), .allows = receivedAllows, .constraint_revision = if (self.constraint_revision != null) receivedRevision else null, .select_constraints = if (self.select_constraints != null) receivedConstraints else null, .select_range = if (self.select_range != null) receivedRange else null, .select_ordinals = if (self.select_ordinals != null) receivedOrdinals else null };
+    }
+    fn source(ptr: *anyopaque) *const NativeKeyPredicate {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn receivedAllows(ptr: *anyopaque, key: []const u8) anyerror!bool {
+        const self = source(ptr);
+        return NativeBoundary.call("allows", self.callback_dispatch, self.allows, .{ self.ptr, key });
+    }
+    fn receivedRevision(ptr: *anyopaque) u64 {
+        const self = source(ptr);
+        return self.constraint_revision.?(self.ptr);
+    }
+    fn receivedConstraints(ptr: *anyopaque, alloc: Allocator, lookup: SparseOrdinalLookup) anyerror!?SparseOrdinalSelection {
+        const self = source(ptr);
+        return NativeBoundary.call("select_constraints", self.callback_dispatch, self.select_constraints.?, .{ self.ptr, alloc, lookup });
+    }
+    fn receivedRange(ptr: *anyopaque, alloc: Allocator, lookup: SparseOrdinalLookup, first: u32, last: u32) anyerror!?SparseOrdinalSelection {
+        const self = source(ptr);
+        return NativeBoundary.call("select_range", self.callback_dispatch, self.select_range.?, .{ self.ptr, alloc, lookup, first, last });
+    }
+    fn receivedOrdinals(ptr: *anyopaque, alloc: Allocator, lookup: SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap {
+        const self = source(ptr);
+        return NativeBoundary.call("select_ordinals", self.callback_dispatch, self.select_ordinals.?, .{ self.ptr, alloc, lookup });
+    }
+};
+
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Authenticated internal two-phase hydration, never set by public parsing.
+    document_authority_mode: document_authority.Mode = .none,
+    document_authority_group: u64 = 0,
+    /// Synchronous native hydration output owner. Never serialized or parsed.
+    /// Keep it alive until the returned bodies are moved or the result retires.
+    document_output_allocator: ?Allocator = null,
+    /// Allocation policy captured before synchronization obscures the owner.
+    /// Exact bodies use reclaimable encoding scratch; never serialized.
+    document_output_exact: bool = false,
+    /// Immutable local projection borrowed until synchronous search completion.
+    /// Never serialized or populated by a public request.
+    document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -1852,6 +1924,10 @@ pub const SearchRequest = struct {
     remote_snapshot: ?[]const u8 = null,
     /// Borrowed, trusted coordinator control; never accepted from public JSON.
     native_query_cut: ?@import("native_query_cut_contract.zig").Request = null,
+    /// Trusted lower bound from already retained publication-wide winners.
+    /// Strict score pruning only: equal scores retain their global tie chance.
+    /// Never populated from public JSON or forwarded to count-only execution.
+    minimum_competitive_score: ?f32 = null,
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -1945,12 +2021,7 @@ pub const SearchRequest = struct {
     // avoid converting text-native doc nums through shard ordinals and back.
     resolved_text_doc_filter: ?*const anyopaque = null,
     /// Request-local native metadata membership, never serialized to workers.
-    native_key_predicate: ?struct {
-        ptr: *anyopaque,
-        allows: *const fn (*anyopaque, []const u8) anyerror!bool,
-        select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
-        select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
-    } = null,
+    native_key_predicate: ?NativeKeyPredicate = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     /// Request-local authorization hook used only by the distributed graph
@@ -1996,9 +2067,16 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "document_authority_mode",
+    "document_authority_group",
+    "document_output_allocator",
+    "document_output_exact",
+    "document_projection_plan",
     "response_table_name",
     "prepared_read_table_id",
     "native_query_cut",
+    // The public retained capability accompanies the authenticated physical cut.
+    "remote_snapshot",
     "document_lookup_groups",
     "filter_query_json",
     "exclusion_query_json",
@@ -2029,7 +2107,6 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "query",
     "index_name",
     "primary_text_index_name",
-    "remote_snapshot",
     "lake_read",
     "aggregations_json",
     "count_only",
@@ -2076,6 +2153,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "graph_table_read_authorizer",
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
+    "minimum_competitive_score",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {
@@ -2226,6 +2304,10 @@ pub const GraphTableReadAuthorization = struct {
 };
 
 pub const GraphTableReadAuthorizer = struct {
+    const NativeCallbacks = struct { authorize_table: @FieldType(GraphTableReadAuthorizer, "authorize_table") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ctx: ?*const anyopaque,
     authorize_table: *const fn (
         ctx: ?*const anyopaque,
@@ -2238,7 +2320,7 @@ pub const GraphTableReadAuthorizer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !GraphTableReadAuthorization {
-        return try self.authorize_table(self.ctx, alloc, table_name);
+        return try NativeBoundary.call("authorize_table", self.callback_dispatch, self.authorize_table, .{ self.ctx, alloc, table_name });
     }
 };
 
@@ -2297,6 +2379,8 @@ pub const GraphMetricFreshness = enum {
     fresh,
 };
 
+pub const GraphMetricDirection = enum { out, in, both };
+
 pub const GraphMetricQuery = struct {
     index_name: []const u8,
     metric_name: []const u8,
@@ -2310,6 +2394,7 @@ pub const GraphMetricQuery = struct {
     /// Damping override for personalized reads. Null keeps the metric's
     /// configured damping. Only valid together with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const NamedGraphMetricQuery = struct {
@@ -2331,6 +2416,7 @@ pub const GraphMetricRerank = struct {
     seed_nodes: []const []const u8 = &.{},
     /// Damping override for personalized blends. Only valid with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const graph_metric_rerank_max_candidates: u32 = 10_000;
@@ -2499,6 +2585,8 @@ pub const ColumnSource = @import("column_source.zig").Row;
 pub const ColumnSourcePage = @import("column_source.zig").Page;
 
 pub const SearchHit = struct {
+    /// Owned internal selection proof; absent on ordinary/public results.
+    document_authority: ?*const @import("query/document_authority.zig").Authority = null,
     computed_json: ?[]u8 = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
@@ -2534,6 +2622,7 @@ pub const SearchHit = struct {
         var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.document_authority) |proof| alloc.destroy(proof);
             if (cloned.computed_json) |data| alloc.free(data);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
@@ -2546,6 +2635,11 @@ pub const SearchHit = struct {
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             freeHighlights(alloc, cloned.highlights);
+        }
+        if (self.document_authority) |proof| {
+            const owned = try alloc.create(@import("query/document_authority.zig").Authority);
+            owned.* = proof.*;
+            cloned.document_authority = owned;
         }
         cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
@@ -2582,6 +2676,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.document_authority) |proof| alloc.destroy(proof);
         if (self.computed_json) |data| alloc.free(data);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
@@ -2841,6 +2936,10 @@ pub const ShardIdentityReadGeneration = struct {
 };
 
 pub const SearchResult = struct {
+    /// Only private hydration results may split body ownership from metadata.
+    /// Move bodies into the destination before retiring worker scratch.
+    stored_data_allocator: ?Allocator = null,
+    document_authority_version: u32 = 0,
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,
@@ -2887,7 +2986,13 @@ pub const SearchResult = struct {
 
     pub fn deinit(self: *SearchResult) void {
         if (self.sort_profile_storage) |storage| self.alloc.free(storage);
-        for (self.hits) |*hit| hit.deinit(self.alloc);
+        for (self.hits) |*hit| {
+            if (self.stored_data_allocator) |body_allocator| {
+                if (hit.stored_data) |body| body_allocator.free(body);
+                hit.stored_data = null;
+            }
+            hit.deinit(self.alloc);
+        }
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
@@ -2930,8 +3035,10 @@ pub const GraphMetricResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
     metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
     metric_value_names: [][]u8 = &.{},
+    metric_owners: []graph_query_mod.GraphMetricOwner = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
@@ -2972,9 +3079,12 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_columns) |columns| columns.deinit(alloc);
         if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
         for (self.metric_value_names) |name| alloc.free(name);
         if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
+        for (self.metric_owners) |*owner| owner.deinit(alloc);
+        alloc.free(self.metric_owners);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
@@ -3222,6 +3332,7 @@ pub const EnrichmentActiveModel = InlineStatusText(256);
 pub const EnrichmentActiveBackend = InlineStatusText(32);
 
 pub const EnrichmentStats = struct {
+    last_error_code: RuntimeErrorName = .{},
     enabled: bool = false,
     lease_owned: bool = true,
     has_lease: bool = false,
@@ -3984,11 +4095,15 @@ pub const RepairYieldCheck = struct {
 };
 
 pub const RepairActivationCheck = struct {
+    const NativeCallbacks = struct { is_current_owner: @FieldType(RepairActivationCheck, "is_current_owner") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     is_current_owner: *const fn (ptr: *anyopaque) anyerror!bool,
 
     pub fn current(self: RepairActivationCheck) !bool {
-        return try self.is_current_owner(self.ptr);
+        return try NativeBoundary.call("is_current_owner", self.callback_dispatch, self.is_current_owner, .{self.ptr});
     }
 };
 
@@ -4000,26 +4115,30 @@ pub const RepairCapacityObservation = resource_manager_mod.CapacityObservation;
 pub const RepairCapacitySource = resource_manager_mod.CapacitySource;
 
 pub const RepairCapacityCheck = struct {
+    const NativeCallbacks = struct { reconcile: @FieldType(RepairCapacityCheck, "reconcile"), revalidate: @FieldType(RepairCapacityCheck, "revalidate"), bind_candidate_root: @FieldType(RepairCapacityCheck, "bind_candidate_root") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     reconcile: *const fn (ptr: *anyopaque, candidate_bytes: u64) anyerror!void,
     revalidate: *const fn (ptr: *anyopaque) anyerror!void,
     bind_candidate_root: ?*const fn (ptr: *anyopaque, candidate_root: []const u8) anyerror!void = null,
 
     pub fn current(self: @This(), candidate_bytes: u64) !void {
-        return try self.reconcile(self.ptr, candidate_bytes);
+        return try NativeBoundary.call("reconcile", self.callback_dispatch, self.reconcile, .{ self.ptr, candidate_bytes });
     }
 
     /// Re-check the live capacity domain before another bounded build batch.
     /// Implementations keep the successful path O(1), but may reconcile exact
     /// candidate usage before returning an otherwise-conservative denial.
     pub fn boundary(self: @This()) !void {
-        return try self.revalidate(self.ptr);
+        return try NativeBoundary.call("revalidate", self.callback_dispatch, self.revalidate, .{self.ptr});
     }
 
     /// Binds the exact shadow-generation root whose materialized bytes consume
     /// this reservation. The path is borrowed for the synchronous repair run.
     pub fn bindCandidateRoot(self: @This(), candidate_root: []const u8) !void {
-        if (self.bind_candidate_root) |bind| try bind(self.ptr, candidate_root);
+        if (self.bind_candidate_root) |bind| try NativeBoundary.call("bind_candidate_root", self.callback_dispatch, bind, .{ self.ptr, candidate_root });
     }
 };
 
@@ -4849,6 +4968,7 @@ pub const AsyncIndexingStats = struct {
 
 pub const DerivedWorkerStats = struct {
     workers: u64 = 0,
+    failed_workers: u64 = 0,
     workers_with_replay_debt: u64 = 0,
     max_replay_lag_sequences: u64 = 0,
     recoverable_retries: u64 = 0,
@@ -5006,6 +5126,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.derived_workers.workers += src.derived_workers.workers;
     dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
     dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.failed_workers += src.derived_workers.failed_workers;
     dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
     dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
     dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;

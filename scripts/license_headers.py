@@ -141,6 +141,11 @@ def parse_args() -> argparse.Namespace:
         help="check files without modifying them",
     )
     parser.add_argument(
+        "--staged",
+        action="store_true",
+        help="check changed source blobs in the Git index (requires --check)",
+    )
+    parser.add_argument(
         "--group",
         choices=("all", "elv2", "apache"),
         default="all",
@@ -157,7 +162,10 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         help="optional source paths to normalize (relative to the current directory)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.staged and (not args.check or args.paths):
+        parser.error("--staged requires --check and does not accept paths")
+    return args
 
 
 def read_header(name: str) -> Header:
@@ -354,12 +362,56 @@ def check_preserved_notices(selected_group: str) -> list[str]:
     return sorted(set(errors))
 
 
+def check_staged_headers(selected_group: str) -> list[str]:
+    """Validate committed blobs, respecting partial staging and alternate indexes."""
+    names = subprocess.check_output(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"],
+        cwd=ROOT,
+    )
+    headers = {name: read_header(name) for name in ("apache", "elv2")}
+    errors = []
+    for raw_name in names.split(b"\0"):
+        if not raw_name:
+            continue
+        name = raw_name.decode("utf-8", errors="surrogateescape")
+        path = ROOT / name
+        group = group_for(name, selected_group)
+        if group is None or excluded(name) or path.suffix not in SOURCE_EXTS:
+            continue
+        entry = subprocess.check_output(
+            ["git", "--literal-pathspecs", "ls-files", "--stage", "-z", "--", name],
+            cwd=ROOT,
+        ).split(b"\0")[0]
+        mode, blob, stage = entry.split(b"\t", 1)[0].split()
+        if stage != b"0":
+            errors.append(f"unmerged source file: {name}")
+            continue
+        if mode not in (b"100644", b"100755"):
+            continue
+        original = subprocess.check_output(
+            ["git", "cat-file", "blob", blob.decode()], cwd=ROOT
+        ).decode("utf-8")
+        if apply_header(original, path, headers[group]) != original:
+            errors.append(f"missing or stale license header in staged file: {name}")
+    return errors
+
+
 def main() -> int:
     args = parse_args()
     headers = {
         "apache": read_header("apache"),
         "elv2": read_header("elv2"),
     }
+    if getattr(args, "staged", False):
+        errors = check_staged_headers(args.group)
+        for error in errors:
+            print(error, file=sys.stderr)
+        if errors:
+            print(
+                "Run python3 scripts/license_headers.py <paths>, then stage the corrected headers.",
+                file=sys.stderr,
+            )
+        return int(bool(errors))
     errors = check_preserved_notices(args.group)
     if args.group in ("all", "apache"):
         errors.extend(check_frozen_helpers(ROOT))

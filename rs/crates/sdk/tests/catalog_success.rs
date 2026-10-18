@@ -30,6 +30,7 @@ fn catalog_success_unions_preserve_pending_visibility() {
     pending!(CreateDatabaseSuccess);
     pending!(CreateNamespaceSuccess);
     pending!(CreateTablespaceSuccess);
+    pending!(CreateQuerySourceSuccess);
     pending!(SetDatabaseTablespaceSuccess);
     pending!(ClearDatabaseTablespaceSuccess);
     pending!(SetNamespaceTablespaceSuccess);
@@ -45,5 +46,17 @@ fn created_resource_remains_a_typed_success() {
             assert_eq!(record.name, "analytics");
         }
         _ => panic!("created database must retain its resource payload"),
+    }
+}
+
+#[test]
+fn created_query_source_remains_a_typed_success() {
+    let body = r#"{"source_id":7,"name":"combined","source":{"saved":"base"}}"#;
+    match serde_json::from_str::<CreateQuerySourceSuccess>(body).unwrap() {
+        CreateQuerySourceSuccess::SavedQuerySource(record) => {
+            assert_eq!(record.source_id, 7);
+            assert_eq!(record.name, "combined");
+        }
+        _ => panic!("created query source must retain its resource payload"),
     }
 }

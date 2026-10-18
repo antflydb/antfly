@@ -202,10 +202,13 @@ test "system catalog committed mutations retain success when projection fails" {
         }
     };
     for ([_]?[]const u8{ null, "invalid JSON", "{}" }) |snapshot| {
-        var result = try execute(Source{ .snapshot = snapshot }, std.testing.allocator, .{}, .{ .kind = .database, .name = "created" }, .create, "{}");
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expectEqual(@as(u16, 202), result.status);
-        try std.testing.expectEqualStrings("{\"status\":\"committed_visibility_pending\"}", result.body);
+        for ([_]domain.Kind{ .database, .query_source }) |kind| {
+            const body = if (kind == .query_source) "{\"source\":{\"saved\":\"base\"}}" else "{}";
+            var result = try execute(Source{ .snapshot = snapshot }, std.testing.allocator, .{}, .{ .kind = kind, .name = "created" }, .create, body);
+            defer result.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u16, 202), result.status);
+            try std.testing.expectEqualStrings("{\"status\":\"committed_visibility_pending\"}", result.body);
+        }
     }
     var result = try execute(Source{ .snapshot = "invalid JSON" }, std.testing.allocator, .{}, .{ .kind = .database, .name = "created" }, null, "");
     defer result.deinit(std.testing.allocator);

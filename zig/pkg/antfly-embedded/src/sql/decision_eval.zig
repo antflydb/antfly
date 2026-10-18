@@ -18,6 +18,11 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const decisions = @import("../functions/decisions.zig");
+pub fn limitsFor(backend: @import("catalog.zig").Backend) scalar.EvalLimits {
+    const checkpoint = if (backend.scalar_control) |control| control.checkpoint else null;
+    const context = if (backend.scalar_control) |control| control.ptr else null;
+    return .{ .regex_execution = backend.regex_execution, .regex_checkpoint = checkpoint, .regex_context = context, .checkpoint = checkpoint, .checkpoint_context = context };
+}
 /// Single-source reads route by their bound physical identity. Mutations route
 /// by the target. Multi-source reads use the provider's general routing policy;
 /// synthetic relation tables inherit the enclosing query's selected scope.
@@ -73,6 +78,7 @@ pub fn validateStatement(a: std.mem.Allocator, provider: ?decisions.DecisionProv
     }
     if (bound.aggregate) |aggregate| {
         try aggregate.input.validateDecisions(a, parameters, provider);
+        for (aggregate.ordered) |plan| if (plan.direct) |*program| try validate(a, provider, program, parameters);
         for (aggregate.outputs) |*program| try validate(a, provider, program, parameters);
         for (aggregate.orders) |*program| try validate(a, provider, program, parameters);
         if (aggregate.having) |*program| try validate(a, provider, program, parameters);
@@ -96,6 +102,12 @@ fn validateRelation(a: std.mem.Allocator, provider: ?decisions.DecisionProvider,
             for (part.left_keys) |*program| try validate(a, provider, program, parameters);
             for (part.right_keys) |*program| try validate(a, provider, program, parameters);
         },
+        .apply => |part| {
+            try validateRelation(a, provider, part.left, parameters);
+            try validateRelation(a, provider, part.right, parameters);
+            if (part.condition) |*program| try validate(a, provider, program, parameters);
+            if (part.demand) |*program| try validate(a, provider, program, parameters);
+        },
         .set => |part| {
             try validateRelation(a, provider, part.left, parameters);
             try validateRelation(a, provider, part.right, parameters);
@@ -105,6 +117,14 @@ fn validateRelation(a: std.mem.Allocator, provider: ?decisions.DecisionProvider,
     }
 }
 pub fn validate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, parameters: []const std.json.Value) !void {
+    return validateCore(a, provider, program, parameters, null);
+}
+
+pub fn validatePrepared(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, prepared: scalar.PreparedEvaluation) !void {
+    return validateCore(a, provider, prepared.program, &.{}, prepared);
+}
+
+fn validateCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, parameters: []const std.json.Value, prepared: ?scalar.PreparedEvaluation) !void {
     for (program.instructions) |instruction| {
         if (instruction.operation != .call) continue;
         const call = instruction.operation.call;
@@ -113,7 +133,7 @@ pub fn validate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, pro
         args[0] = .null;
         var nullable = false;
         for (call.args[1..], args[1..]) |index, *arg| {
-            const value = try program.evaluateInstruction(a, index, parameters);
+            const value = if (prepared) |bound| try bound.evaluateInstruction(a, index) else try program.evaluateInstruction(a, index, parameters);
             arg.* = value.value;
             nullable = nullable or value.sql_null;
         }
@@ -126,21 +146,31 @@ pub fn validate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, pro
 }
 
 pub fn evaluateBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
+    return evaluateBatchWithLimits(a, provider, program, rows, parameters, .{});
+}
+pub fn evaluateBatchWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) ![]const scalar.Datum {
     if (!hasExternal(program)) {
         if (try @import("vector_eval.zig").evaluate(a, program, rows, parameters)) |output| return output;
         const output = try a.alloc(scalar.Datum, rows.len);
-        for (rows, output) |cells, *value| value.* = try program.evaluate(a, cells, parameters, .{});
+        for (rows, output) |cells, *value| value.* = try program.evaluate(a, cells, parameters, limits);
         return output;
     }
     const programs = try a.alloc(*const scalar.Program, rows.len);
     @memset(programs, program);
-    return evaluateInvocations(a, provider, programs, rows, parameters);
+    return evaluateInvocationsWithLimits(a, provider, programs, rows, parameters, limits);
 }
 
 /// A VALUES page can contain different programs/configurations for every cell.
 /// Resolve its conditional decision demands together without retaining provider
 /// payloads in the owned mutation arena.
 pub fn evaluateInvocations(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
+    return evaluateInvocationsWithLimits(a, provider, programs, rows, parameters, .{});
+}
+pub fn evaluateInvocationsWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) ![]const scalar.Datum {
+    return evaluateInvocationsCore(a, provider, programs, rows, parameters, null, limits);
+}
+
+fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, prepared: ?[]const scalar.PreparedEvaluation, base_limits: scalar.EvalLimits) ![]const scalar.Datum {
     if (programs.len != rows.len) return error.InvalidSqlProgram;
     const output = try a.alloc(scalar.Datum, rows.len);
     const ready = try a.alloc(bool, rows.len);
@@ -157,7 +187,11 @@ pub fn evaluateInvocations(a: std.mem.Allocator, provider: ?decisions.DecisionPr
         for (rows, programs, 0..) |cells, program, i| {
             if (ready[i]) continue;
             var demand: ?scalar.DecisionDemand = null;
-            const value = program.evaluate(a, cells, parameters, .{ .decision_values = values[i], .decision_demand = &demand }) catch |err| {
+            var limits = base_limits;
+            limits.decision_values = values[i];
+            limits.decision_demand = &demand;
+            const evaluated = if (prepared) |bound| bound[i].evaluate(a, cells, limits) else program.evaluate(a, cells, parameters, limits);
+            const value = evaluated catch |err| {
                 if (err != error.DecisionNotEvaluated) return err;
                 const pending = demand orelse return error.InvalidSqlProgram;
                 const questions = try decisions.questionsFor(a, pending.function, pending.args);
@@ -198,8 +232,21 @@ pub fn hasExternalPrograms(programs: []const scalar.Program) bool {
 }
 
 pub fn evaluate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, cells: []const scalar.Datum, parameters: []const std.json.Value) !scalar.Datum {
-    if (!hasExternal(program)) return program.evaluate(a, cells, parameters, .{});
-    return (try evaluateBatch(a, provider, program, &.{cells}, parameters))[0];
+    return evaluateWithLimits(a, provider, program, cells, parameters, .{});
+}
+pub fn evaluateWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, cells: []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) !scalar.Datum {
+    if (!hasExternal(program)) return program.evaluate(a, cells, parameters, limits);
+    return (try evaluateBatchWithLimits(a, provider, program, &.{cells}, parameters, limits))[0];
+}
+
+/// Prepared invocations use the same lazy demand/provider machinery as legacy
+/// execution. Pure scalar calls neither allocate provider state nor rebind.
+pub fn evaluatePrepared(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, prepared: scalar.PreparedEvaluation, cells: []const scalar.Datum) !scalar.Datum {
+    return evaluatePreparedWithLimits(a, provider, prepared, cells, .{});
+}
+pub fn evaluatePreparedWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, prepared: scalar.PreparedEvaluation, cells: []const scalar.Datum, limits: scalar.EvalLimits) !scalar.Datum {
+    if (!hasExternal(prepared.program)) return prepared.evaluate(a, cells, limits);
+    return (try evaluateInvocationsCore(a, provider, &.{prepared.program}, &.{cells}, &.{}, &.{prepared}, limits))[0];
 }
 
 pub fn hasExternal(program: *const scalar.Program) bool {
@@ -243,6 +290,41 @@ const Mock = struct {
 pub const testing = if (@import("builtin").is_test) struct {
     pub const Provider = Mock;
 } else struct {};
+
+test "SQL ordered-set direct arguments validate providers before input execution" {
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "SELECT percentile_cont(ai_probability('refund','Refund?','local')) WITHIN GROUP(ORDER BY 1)", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aggregate = try @import("aggregate_binding.zig").bind(arena.allocator(), null, compiled.statement.select, &.{});
+    const bound: @import("describe.zig").BoundStatement = .{ .table = null, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty, .aggregate = &aggregate, .scalars = aggregate.input };
+    try std.testing.expectError(error.DecisionProviderUnavailable, validateStatement(arena.allocator(), null, bound, &.{}));
+    var mock: Mock = .{};
+    try validateStatement(arena.allocator(), mock.provider(), bound, &.{});
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
+}
+
+test "SQL prepared statement frames preserve provider validation and lazy decisions" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compile(a, "SELECT CASE WHEN $1 THEN ai_probability('refund', $2, $3) ELSE 0 END", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var types: [3]scalar.Type = .{ .{}, .{}, .{} };
+    const bound = try @import("bound_scalars.zig").bindTyped(arena.allocator(), null, compiled.statement, &types, null, &.{});
+    var prepared = try bound.prepareParameters(a, &.{ .{ .text = "true" }, .{ .text = "Refund?" }, .{ .text = "local" } }, .{});
+    defer prepared.deinit();
+    var mock: Mock = .{};
+    try std.testing.expectError(error.DecisionProviderUnavailable, prepared.validateDecisions(arena.allocator(), null));
+    try prepared.validateDecisions(arena.allocator(), mock.provider());
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), (try evaluatePrepared(arena.allocator(), mock.provider(), prepared.projections[0].?, &.{})).value.float, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+    var inactive = try bound.prepareParameters(a, &.{ .{ .text = "false" }, .{ .text = "Refund?" }, .{ .text = "local" } }, .{});
+    defer inactive.deinit();
+    try std.testing.expectEqual(@as(f64, 0), (try evaluatePrepared(arena.allocator(), null, inactive.projections[0].?, &.{})).value.float);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+}
 
 test "SQL decisions batch requested rows and preserve NULL and conditional evaluation" {
     const compiler = @import("compiler.zig");
@@ -356,7 +438,7 @@ pub const SortedProjection = struct {
             if (self.has_deferred) @memcpy(row.*[self.outputs.len..], input);
         }
         for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (!deferred) {
-            const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs, context.parameters);
+            const output = try evaluateBatchWithLimits(a, context.backend.decision_provider, program, inputs, context.parameters, limitsFor(context.backend));
             for (values, output) |row, value| row[column] = value;
         };
         const keys = try a.alloc([]scalar.Datum, inputs.len);
@@ -365,7 +447,7 @@ pub const SortedProjection = struct {
             if (column < self.order_outputs.len and self.order_outputs[column] != null) {
                 for (keys, values) |row, value| row[column] = value[self.order_outputs[column].?];
             } else {
-                const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs, context.parameters);
+                const output = try evaluateBatchWithLimits(a, context.backend.decision_provider, program, inputs, context.parameters, limitsFor(context.backend));
                 for (keys, output) |row, value| row[column] = value;
             }
         }
@@ -377,8 +459,8 @@ pub const SortedProjection = struct {
         if (implicit_limit and remaining > limit) return error.SqlResultTooLarge;
         const start = top.released;
         const selected = ordered[0..@min(remaining, limit)];
-        const rows = try context.arena.alloc([]const std.json.Value, selected.len);
-        const flags = try context.arena.alloc([]const bool, selected.len);
+        const rows = try context.arena.alloc([]const std.json.Value, if (context.sink == null) selected.len else 0);
+        const flags = try context.arena.alloc([]const bool, if (context.sink == null) selected.len else 0);
         var first: usize = 0;
         while (first < selected.len) {
             try context.checkpoint();
@@ -395,14 +477,19 @@ pub const SortedProjection = struct {
             const values = try a.alloc([]scalar.Datum, inputs.items.len);
             for (selected[first..][0..inputs.items.len], values) |row, *out| out.* = try a.dupe(scalar.Datum, row.values[0..self.outputs.len]);
             for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (deferred) {
-                const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs.items, context.parameters);
+                const output = try evaluateBatchWithLimits(a, context.backend.decision_provider, program, inputs.items, context.parameters, limitsFor(context.backend));
                 for (values, output) |row, value| row[column] = value;
             };
             for (values, first..) |row, index| {
+                if (context.sink) |sink| {
+                    try sink.append(sink.ptr, row);
+                    top.releaseFinishedRow(start + index);
+                    continue;
+                }
                 const output = try context.arena.alloc(std.json.Value, self.outputs.len);
                 const nulls = try context.arena.alloc(bool, self.outputs.len);
-                for (row, output, nulls) |value, *out, *flag| {
-                    out.* = try context.outputValue(value.value);
+                for (row, output, nulls, self.outputs) |value, *out, *flag, program| {
+                    out.* = try context.outputDatum(value, program.output_type.kind, program.output_type.element_type);
                     flag.* = value.sql_null;
                 }
                 rows[index] = output;

@@ -59,6 +59,9 @@ const run_memory = runtime.tier.memory;
 const DenseDequantCacheEntry = struct {
     data: []f32,
     bytes: usize,
+    prepared_shape: ?[]i64 = null,
+    projection_widths: [3]usize = @splat(0),
+    in_dim: usize = 0,
 };
 const embeddinggemma2_weight_cache = @import("../models/embedding_gemma2_weight_cache.zig");
 
@@ -856,13 +859,25 @@ pub const LazyWeightEntry = struct {
     active_tier: ResidencyTier = .disk,
 };
 
+const PreparedPanelKey = struct { address: usize, n: usize, k: usize };
+const PreparedPanelEntry = struct { panels: linalg.prepared_gemm.Panels, class: embeddinggemma2_weight_cache.MetalClass };
+
 pub const WeightStore = struct {
+    scalar_bounds: @import("../models/embedding_gemma2_weight_cache.zig").ScalarBoundsCache = .{},
     allocator: std.mem.Allocator,
     resident_weights: std.StringHashMapUnmanaged(LoadedWeight),
     lazy_weights: std.StringHashMapUnmanaged(LazyWeightEntry),
     quantized_prepare_lock: std.atomic.Mutex = .unlocked,
+    embeddinggemma2_panel_class_bytes: [3]usize = @splat(0),
+    embeddinggemma2_dense_floor: ?[3]usize = null,
+    embeddinggemma2_canonical_panels: std.StringHashMapUnmanaged(PreparedPanelEntry) = .empty,
+    embeddinggemma2_panels: std.AutoHashMapUnmanaged(PreparedPanelKey, PreparedPanelEntry) = .empty,
     embeddinggemma2_f32_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .empty,
     embeddinggemma2_f32_cache_bytes: usize = 0,
+    embeddinggemma2_constant_bytes: usize = 0,
+    embeddinggemma2_constant_count: usize = 0,
+    embeddinggemma2_f32_class_bytes: [3]usize = @splat(0),
+    embeddinggemma2_f32_readers: usize = 0,
     embeddinggemma2_f32_cache_lock: std.atomic.Mutex = .unlocked,
     prefetch: PrefetchQueue = undefined,
     prefetch_initialized: bool = false,
@@ -924,6 +939,9 @@ const Buf = struct {
     data: []f32,
     allocator: std.mem.Allocator,
     owned: bool,
+    retained_parent: ?CT = null,
+    tensor_refs: usize = 1,
+    source_row: usize = 0,
     weight_handle_name: ?[]const u8 = null,
     weight_handle_refs: usize = 0,
     shared_data_refcount: ?*usize = null,
@@ -1191,7 +1209,7 @@ fn ownedDenseBufWithMaxSharedRefs(ct: CT, max_shared_refs: usize) ?*Buf {
     const buf = toBuf(ct);
     // Named weights and their views remain immutable even if the dense
     // conversion itself is allocator-owned and has only one host reference.
-    if (buf.name.len != 0) return null;
+    if (buf.name.len != 0 or buf.tensor_refs != 1) return null;
     if (!buf.owned or buf.shared_data_refcount == null) return null;
     if (buf.shared_data_refcount.?.* == 0 or buf.shared_data_refcount.?.* > max_shared_refs) return null;
     if (buf.view_strides != null) return null;
@@ -1225,6 +1243,7 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
             .view_base_offset = 0,
             .declared_dtype = source.declared_dtype,
             .name = source.name,
+            .source_row = source.source_row,
             .lazy_entry = null,
             .quantized_storage = null,
             .owned_quantized_storage = null,
@@ -1247,6 +1266,7 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
         .view_base_offset = 0,
         .declared_dtype = source.declared_dtype,
         .name = source.name,
+        .source_row = source.source_row,
         .lazy_entry = null,
         .quantized_storage = null,
         .owned_quantized_storage = null,
@@ -1254,6 +1274,8 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
         .owned_source_tensor = null,
         .reservation = null,
     };
+    source.tensor_refs += 1;
+    alias.retained_parent = input;
     return alias;
 }
 
@@ -1296,6 +1318,7 @@ fn makeDenseViewAlias(
         .view_base_offset = base_offset,
         .declared_dtype = source.declared_dtype,
         .name = source.name,
+        .source_row = source.source_row,
         .lazy_entry = null,
         .quantized_storage = null,
         .owned_quantized_storage = null,
@@ -1303,6 +1326,10 @@ fn makeDenseViewAlias(
         .owned_source_tensor = null,
         .reservation = null,
     };
+    if (shared == null) {
+        source.tensor_refs += 1;
+        alias.retained_parent = input;
+    }
     return alias;
 }
 
@@ -3968,11 +3995,18 @@ fn convertTensorRowsToF32(
 fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
     return std.mem.eql(u8, name, "model.embed_tokens.weight") or
         std.mem.eql(u8, name, "language_model.embed_tokens.weight") or
+        std.mem.eql(u8, name, "vision_tower.patch_embedder.position_embedding_table") or
         std.mem.eql(u8, name, "wte.weight");
 }
 
 fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
     if (shouldBorrowEmbeddingTensor(name)) return true;
+    if (self.cache_embeddinggemma2_bf16_weights and !native.useBlas() and
+        embeddinggemma2_weight_cache.nativeClass(name) != null and tensor.shape.len == 2 and
+        tensor.shape[0] >= 64 and tensor.shape[1] >= 64 and
+        (tensor.dtype == .bf16 or tensor.dtype == .f16)) return true;
+    if (self.borrow_typed_matrix_weights and tensor.shape.len == 2 and
+        (tensor.dtype == .f16 or tensor.dtype == .bf16)) return true;
     if (!self.borrow_bf16_linear_weights) return false;
     if (tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
     if (std.mem.eql(u8, name, "lm_head.weight") or std.mem.eql(u8, name, "cls.output.weight")) return true;
@@ -4024,6 +4058,10 @@ fn tensorF32View(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !Weight
     return .{ .data = converted, .owned = converted };
 }
 
+/// Row count from which f16 source-tensor linears convert weight blocks to
+/// f32 and use system BLAS instead of the direct f16 kernel.
+const f16_direct_gemm_max_rows_with_blas: usize = 32;
+
 fn linearNoBiasSourceTensorChunked(
     self: *NativeCompute,
     input: []const f32,
@@ -4048,7 +4086,9 @@ fn linearNoBiasSourceTensorChunked(
     // Fast path: f16 weights, naturally aligned, can be consumed directly by
     // sgemmTransBF16Weights without materializing an f32 copy.  This halves
     // the weight bandwidth -- the dominant cost for transformer linear ops.
-    if (tensor.dtype == .f16) {
+    // Prefill-sized inputs are compute-bound instead; with system BLAS the
+    // blocked f32 conversion below is several times faster there.
+    if (tensor.dtype == .f16 and (rows < f16_direct_gemm_max_rows_with_blas or !native.useBlas())) {
         if (tensor.asFloat16IfAligned()) |weight_f16| {
             try self.dispatchSgemmTransBF16Weights(
                 rows,
@@ -4235,9 +4275,14 @@ pub const NativeCompute = struct {
     /// Opt in only for qualified model families whose projection consumers
     /// accept typed weights. Other native/PJRT callers keep their load policy.
     borrow_bf16_linear_weights: bool = false,
+    /// Borrow every resident 2-D f16/bf16 weight for typed GEMM. Only for
+    /// sessions whose 2-D weights are consumed exclusively by linear ops
+    /// (native Moondream reads its embedding table on the host).
+    borrow_typed_matrix_weights: bool = false,
     /// Granted only to immutable EmbeddingGemma2 inference sessions. The
     /// WeightStore owns admitted mirrors; request contexts only borrow them.
     cache_embeddinggemma2_bf16_weights: bool = false,
+    embeddinggemma2_cache_reader: bool = false,
     weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
     /// Optional Io for parallel GEMM dispatch.  When non-null, sgemm calls
     /// route through linalg's Io-aware variants and parallel work is
@@ -4266,6 +4311,12 @@ pub const NativeCompute = struct {
     /// and before tearing down the borrowed weight store or run budget.
     pub fn deinit(self: *NativeCompute) void {
         deinitWeightHandles(self);
+        if (self.embeddinggemma2_cache_reader) {
+            platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+            self.data.embeddinggemma2_f32_readers -= 1;
+            self.data.embeddinggemma2_f32_cache_lock.unlock();
+            self.embeddinggemma2_cache_reader = false;
+        }
         var it = self.weight_reservations.iterator();
         while (it.next()) |entry| {
             if (self.run_budget) |budget| budget.release(entry.value_ptr.reservation);
@@ -4565,6 +4616,7 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
 /// Stops the worker and retires borrowed guards. Call before destroying
 /// lazy_weights, whose entries still refer to this queue's Io and mutex.
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
+    data.scalar_bounds.deinit(data.allocator);
     // Stop before releasing any cache state the worker can access.
     if (data.prefetch_initialized) data.prefetch.stop();
     deinitEmbeddingGemma2F32Cache(data);
@@ -4579,32 +4631,181 @@ pub fn deinitPrefetchQueue(data: *WeightStore) void {
 fn deinitEmbeddingGemma2F32Cache(data: *WeightStore) void {
     platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
     defer data.embeddinggemma2_f32_cache_lock.unlock();
+    var canonical = data.embeddinggemma2_canonical_panels.iterator();
+    while (canonical.next()) |entry| {
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.value_ptr.panels.data.len * @sizeOf(f32));
+        entry.value_ptr.panels.deinit(data.allocator);
+        data.allocator.free(entry.key_ptr.*);
+    }
+    data.embeddinggemma2_canonical_panels.deinit(data.allocator);
+    data.embeddinggemma2_canonical_panels = .empty;
+    var panels = data.embeddinggemma2_panels.valueIterator();
+    while (panels.next()) |entry| {
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.panels.data.len * @sizeOf(f32));
+        entry.panels.deinit(data.allocator);
+    }
+    data.embeddinggemma2_panels.deinit(data.allocator);
+    data.embeddinggemma2_panels = .empty;
     var it = data.embeddinggemma2_f32_cache.iterator();
     while (it.next()) |entry| {
         data.allocator.free(entry.key_ptr.*);
         data.allocator.free(entry.value_ptr.data);
+        if (entry.value_ptr.prepared_shape) |shape| data.allocator.free(shape);
         if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.value_ptr.bytes);
     }
     data.embeddinggemma2_f32_cache.deinit(data.allocator);
     data.embeddinggemma2_f32_cache = .empty;
     data.embeddinggemma2_f32_cache_bytes = 0;
+    data.embeddinggemma2_constant_bytes = 0;
+    data.embeddinggemma2_constant_count = 0;
+    data.embeddinggemma2_f32_class_bytes = @splat(0);
+    data.embeddinggemma2_panel_class_bytes = @splat(0);
+}
+
+/// A compute context pins all immutable mirrors it can borrow until teardown.
+/// Reclamation never invalidates a live tensor, even across concurrent requests.
+pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, class: embeddinggemma2_weight_cache.MetalClass) usize {
+    data.prefetch.lock();
+    defer data.prefetch.unlock();
+    platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+    defer data.embeddinggemma2_f32_cache_lock.unlock();
+    if (data.embeddinggemma2_f32_readers != 0) return 0;
+    var released: usize = 0;
+    while (true) {
+        var it = data.embeddinggemma2_canonical_panels.iterator();
+        const key = blk: {
+            while (it.next()) |entry| if (entry.value_ptr.class == class) break :blk entry.key_ptr.*;
+            break :blk null;
+        } orelse break;
+        const entry = data.embeddinggemma2_canonical_panels.fetchRemove(key).?;
+        const bytes = entry.value.panels.data.len * @sizeOf(f32);
+        entry.value.panels.deinit(data.allocator);
+        data.allocator.free(entry.key);
+        data.embeddinggemma2_f32_cache_bytes -= bytes;
+        data.embeddinggemma2_f32_class_bytes[@backingInt(class)] -= bytes;
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, bytes);
+        released += bytes;
+    }
+    while (true) {
+        var panels = data.embeddinggemma2_panels.iterator();
+        const key = blk: {
+            while (panels.next()) |entry| if (entry.value_ptr.class == class) break :blk entry.key_ptr.*;
+            break :blk null;
+        } orelse break;
+        const entry = data.embeddinggemma2_panels.fetchRemove(key).?.value;
+        const bytes = entry.panels.data.len * @sizeOf(f32);
+        entry.panels.deinit(data.allocator);
+        data.embeddinggemma2_f32_cache_bytes -= bytes;
+        data.embeddinggemma2_f32_class_bytes[@backingInt(class)] -= bytes;
+        data.embeddinggemma2_panel_class_bytes[@backingInt(class)] -= bytes;
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, bytes);
+        released += bytes;
+    }
+
+    while (true) {
+        var it = data.embeddinggemma2_f32_cache.iterator();
+        const name = blk: {
+            while (it.next()) |entry| if (embeddinggemma2_weight_cache.nativeClass(std.mem.sliceTo(entry.key_ptr.*, '|')) == class) break :blk entry.key_ptr.*;
+            break :blk null;
+        } orelse break;
+        const entry = data.embeddinggemma2_f32_cache.fetchRemove(name).?;
+        data.allocator.free(entry.value.data);
+        if (entry.value.prepared_shape) |shape| {
+            data.allocator.free(shape);
+            data.embeddinggemma2_constant_bytes -= entry.value.bytes;
+            data.embeddinggemma2_constant_count -= 1;
+        }
+        data.allocator.free(entry.key);
+        data.embeddinggemma2_f32_cache_bytes -= entry.value.bytes;
+        data.embeddinggemma2_f32_class_bytes[@backingInt(class)] -= entry.value.bytes;
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.value.bytes);
+        released += entry.value.bytes;
+    }
+    return released;
+}
+
+fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const policy = embeddinggemma2_weight_cache;
+    if (!self.cache_embeddinggemma2_bf16_weights or !std.mem.startsWith(u8, key, "audio_tower.prepared.")) return null;
+    const cache = if (self.data.tier_cache) |*cache| cache else return null;
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
+    platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+    defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+    if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+        if (!self.embeddinggemma2_cache_reader) {
+            self.data.embeddinggemma2_f32_readers += 1;
+            self.embeddinggemma2_cache_reader = true;
+        }
+        const tensor = try self.makeBuf(entry.data, false);
+        errdefer freeTensor(self, tensor);
+        return self.withLogicalShape(tensor, entry.prepared_shape orelse return error.InvalidTensorShape);
+    }
+    const input = value orelse return null;
+    const data = toBuf(input).data;
+    const bytes = try std.math.mul(usize, data.len, @sizeOf(f32));
+    const used = self.data.embeddinggemma2_f32_class_bytes[@backingInt(policy.MetalClass.audio)];
+    if (bytes == 0 or bytes > policy.prepared_max_bytes - self.data.embeddinggemma2_constant_bytes or self.data.embeddinggemma2_constant_count >= policy.prepared_max_entries or used > policy.audio_max_bytes or bytes > policy.audio_max_bytes - used or self.data.embeddinggemma2_f32_cache.count() >= policy.max_entries) return null;
+    cache.reserve(.host, bytes) catch {
+        cache.noteDenied(.host, bytes);
+        return null;
+    };
+    var committed = false;
+    errdefer if (!committed) cache.noteRelease(.host, bytes);
+    const shape = try tensorShapeOp(self, input, self.data.allocator);
+    errdefer if (!committed) self.data.allocator.free(shape);
+    const name = try self.data.allocator.dupe(u8, key);
+    errdefer if (!committed) self.data.allocator.free(name);
+    const snapshot = try self.data.allocator.dupe(f32, data);
+    errdefer if (!committed) self.data.allocator.free(snapshot);
+    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, name, .{ .data = snapshot, .bytes = bytes, .prepared_shape = shape });
+    self.data.embeddinggemma2_f32_cache_bytes += bytes;
+    self.data.embeddinggemma2_constant_bytes += bytes;
+    self.data.embeddinggemma2_constant_count += 1;
+    committed = true;
+    self.data.embeddinggemma2_f32_class_bytes[@backingInt(policy.MetalClass.audio)] += bytes;
+    // Insertion has committed. A failed request handle cannot unwind the
+    // model-owned allocation; publication must remain reusable on retry.
+    if (!self.embeddinggemma2_cache_reader) {
+        self.data.embeddinggemma2_f32_readers += 1;
+        self.embeddinggemma2_cache_reader = true;
+    }
+    const tensor = try self.makeBuf(snapshot, false);
+    errdefer freeTensor(self, tensor);
+    return self.withLogicalShape(tensor, shape);
 }
 
 fn cachedEmbeddingGemma2F32Weight(self: *NativeCompute, name: []const u8, source: *const tensor_mod.Tensor) !?[]f32 {
-    if (!self.cache_embeddinggemma2_bf16_weights or source.dtype != .bf16 or
-        !embeddinggemma2_weight_cache.eligibleName(name)) return null;
+    if (!self.cache_embeddinggemma2_bf16_weights or source.dtype != .bf16) return null;
+    const class = embeddinggemma2_weight_cache.nativeClass(name) orelse return null;
+    if (embeddinggemma2_weight_cache.projectionGroup(name)) |group| {
+        var storage: [3][256]u8 = undefined;
+        var names: [3][]const u8 = undefined;
+        const siblings = try group.names(&storage, &names);
+        var complete = true;
+        for (siblings) |sibling| complete = complete and (self.data.resident_weights.contains(sibling) or self.data.lazy_weights.contains(sibling));
+        if (complete) return null;
+    }
+    const class_index = @backingInt(class);
+    const limit = embeddinggemma2_weight_cache.classLimit(class);
     const cache = if (self.data.tier_cache) |*cache| cache else return null;
     if (source.data.len % 2 != 0) return error.InvalidTensorShape;
     const bytes = std.math.mul(usize, source.data.len, 2) catch return null;
-    if (bytes == 0 or bytes > embeddinggemma2_weight_cache.max_bytes) return null;
+    if (bytes == 0 or bytes > limit) return null;
     platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
     defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+    if (!self.embeddinggemma2_cache_reader) {
+        self.data.embeddinggemma2_f32_readers += 1;
+        self.embeddinggemma2_cache_reader = true;
+    }
     if (self.data.embeddinggemma2_f32_cache.get(name)) |entry| {
         if (entry.bytes != bytes) return error.InvalidTensorShape;
         return entry.data;
     }
     if (self.data.embeddinggemma2_f32_cache.count() >= embeddinggemma2_weight_cache.max_entries or
-        bytes > embeddinggemma2_weight_cache.max_bytes - self.data.embeddinggemma2_f32_cache_bytes) return null;
+        self.data.embeddinggemma2_f32_class_bytes[class_index] > limit or
+        bytes > limit - self.data.embeddinggemma2_f32_class_bytes[class_index]) return null;
     cache.reserve(.host, bytes) catch {
         cache.noteDenied(.host, bytes);
         return null;
@@ -4616,6 +4817,7 @@ fn cachedEmbeddingGemma2F32Weight(self: *NativeCompute, name: []const u8, source
     errdefer self.data.allocator.free(dense);
     try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, owned_name, .{ .data = dense, .bytes = bytes });
     self.data.embeddinggemma2_f32_cache_bytes += bytes;
+    self.data.embeddinggemma2_f32_class_bytes[class_index] += bytes;
     return dense;
 }
 
@@ -4680,6 +4882,7 @@ test "embeddinggemma2 native mirror denials and allocation failures preserve fal
         var store = WeightStore{ .allocator = failing.allocator(), .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 64 }) };
         defer deinitEmbeddingGemma2F32Cache(&store);
         var compute = NativeCompute{ .allocator = a, .data = &store, .cache_embeddinggemma2_bf16_weights = true };
+        defer compute.deinit();
         try std.testing.expect((try embeddingGemma2F32WeightOrFallback(&compute, name, &source)) == null);
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_f32_cache.count());
@@ -4701,8 +4904,8 @@ test "embeddinggemma2 native mirror denials and allocation failures preserve fal
     try std.testing.expectEqualSlices(f32, &.{ 1, -2 }, toBuf(weight).data);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_f32_cache.count());
-    store.embeddinggemma2_f32_cache_bytes = embeddinggemma2_weight_cache.max_bytes;
-    defer store.embeddinggemma2_f32_cache_bytes = 0;
+    store.embeddinggemma2_f32_class_bytes[0] = embeddinggemma2_weight_cache.max_bytes;
+    defer store.embeddinggemma2_f32_class_bytes[0] = 0;
     try std.testing.expect((try embeddingGemma2F32WeightOrFallback(&compute, name, &source)) == null);
     try std.testing.expect((try embeddingGemma2F32WeightOrFallback(&compute, "language_model.embed_tokens.weight", &source)) == null);
 }
@@ -4905,10 +5108,16 @@ pub const vtable_impl = ComputeBackend.VTable{
     .linearNoBiasPair = &linearNoBiasPairOp,
     .linearPair = &linearPairOp,
     .linearTriple = &linearTripleOp,
+    .linearTripleNoBias = &linearTripleNoBiasOp,
+    .linearTripleNoBiasNamed = &linearTripleNoBiasNamedOp,
+    .modelConstant = &modelConstantOp,
+    .linearPackedNamed = &linearPackedNamedOp,
     .zeroTensor = null,
     .linearLoRA = &linearLoRAOp,
     .splitLastDim3 = &splitLastDim3Op,
     .reshape2D = null,
+    .allocUninitF32Shape = &allocUninitF32ShapeOp,
+    .copyRows2D = &copyRows2DOp,
     .concatRows2D = &concatRows2DOp,
     .sliceRows2D = &sliceRows2DOp,
     .mulMatId = &mulMatIdOp,
@@ -4919,11 +5128,21 @@ pub const vtable_impl = ComputeBackend.VTable{
     .layerNorm = &layerNormOp,
     .layerNormConsumeInput = &layerNormConsumeInputOp,
     .layerNormBackward = &layerNormBackwardOp,
+    .ropeTable = &ropeTableOp,
+    .qkvRopeTable = &qkvRopeTableOp,
+    .dropoutMask = &dropoutMaskOp,
+    .geglu = &gegluOp,
+    .gegluBackward = &gegluBackwardOp,
     .rmsNorm = &rmsNormOp,
+    .rmsNormResidual = &rmsNormResidualOp,
+    .modelScalarBounds = &modelScalarBoundsOp,
+    .clampSilu = &clampSiluOp,
     .multiplyScalar = &multiplyScalarOp,
     .reshape2d = &reshape2dOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
+    .activationMultiply = &activationMultiplyOp,
+    .packedGeluMultiply = &packedGeluMultiplyOp,
     .geluExact = &geluExactOp,
     .packedGegluExact = &packedGegluExactOp,
     .geluNew = &geluNewOp,
@@ -4945,6 +5164,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .whereSelectConsumeTrue = &whereSelectConsumeTrueOp,
     .whereSelectConsumeFalse = &whereSelectConsumeFalseOp,
     .scaledDotProductAttention = &sdpaOp,
+    .scaledDotProductAttentionEmbeddingGemma2Vision = &embeddingGemma2VisionAttentionOp,
     .causalSelfAttention = &causalSelfAttentionOp,
     .crossAttention = &crossAttentionOp,
     .relativePositionBias = &relativePositionBiasOp,
@@ -4963,12 +5183,15 @@ pub const vtable_impl = ComputeBackend.VTable{
     .multiply = &multiplyOp,
     .conv1d = &conv1dOp,
     .conv2d = &conv2dOp,
+    .gemma4AudioLocalAttention = &gemma4AudioLocalAttentionOp,
     .convTranspose = &convTransposeOp,
     .averagePool = &averagePoolOp,
 
     .rope = &ropeOp,
     .mrope = &mropeOp,
     .visionRope = &visionRopeOp,
+    .embeddingHeadPrepare = &embeddingHeadPrepareOp,
+    .visionNormRope = &visionNormRopeOp,
     .ropePerItem = &ropePerItemOp,
     .gqaCausalAttention = &gqaCausalAttentionOp,
     .gqaPagedAttention = &gqaPagedAttentionOp,
@@ -4980,6 +5203,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .cumulativeSum = &cumulativeSumOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .segmentAttention = &segmentAttentionOp,
+    .segmentAttentionGrouped = &segmentAttentionGroupedOp,
     .toFloat32 = &toFloat32Op,
     .exportTensorData = &exportTensorDataOp,
     .tensorDType = &tensorDTypeOp,
@@ -5038,6 +5262,10 @@ fn deinitBackend(ctx: *anyopaque) void {
 fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const b = toBuf(tensor);
+    if (b.tensor_refs > 1) {
+        b.tensor_refs -= 1;
+        return;
+    }
     const handle_name = b.weight_handle_name;
     if (handle_name) |name| {
         std.debug.assert(b.weight_handle_refs > 0);
@@ -5069,7 +5297,9 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
         source.deinit();
         self.allocator.destroy(source);
     }
+    const parent = b.retained_parent;
     b.allocator.destroy(b);
+    if (parent) |value| freeTensor(ctx, value);
 }
 
 /// Release a borrower while holding the entry's residency guard (when one is
@@ -5289,18 +5519,82 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     // key, whose lifetime also covers views after an early handle release.
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    const tensor = try loadWeight(self, stable_name, true);
+    const tensor = (try canonicalProjectionWeight(self, stable_name)) orelse try loadWeight(self, stable_name, true);
     toBuf(tensor).weight_handle_name = owned_name;
     toBuf(tensor).weight_handle_refs = 1;
     self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
     return tensor;
 }
 
+/// Resolve individual language projections through the same packed allocation
+/// used by batched linears. Source acquisition temporarily disables mirrors,
+/// so neither warm-up order can insert a second F32 representation.
+fn canonicalProjectionWeight(self: *NativeCompute, name: []const u8) !?CT {
+    if (!self.cache_embeddinggemma2_bf16_weights or !native.useBlas()) return null;
+    const group = embeddinggemma2_weight_cache.projectionGroup(name) orelse return null;
+    var storage: [3][256]u8 = undefined;
+    var names: [3][]const u8 = undefined;
+    const siblings = try group.names(&storage, &names);
+    for (siblings) |sibling| if (!self.data.resident_weights.contains(sibling) and !self.data.lazy_weights.contains(sibling)) return null;
+    // A hot row view needs no checkpoint handle, conversion or staging.
+    const joined = try std.mem.join(self.allocator, "|", siblings);
+    defer self.allocator.free(joined);
+    const key = try std.mem.concat(self.allocator, u8, &.{ joined, ".qkv" });
+    defer self.allocator.free(key);
+    {
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+            if (!self.embeddinggemma2_cache_reader) {
+                self.data.embeddinggemma2_f32_readers += 1;
+                self.embeddinggemma2_cache_reader = true;
+            }
+            var offset: usize = 0;
+            for (entry.projection_widths[0..group.index]) |width| offset += width * entry.in_dim;
+            const width = entry.projection_widths[group.index];
+            if (width == 0 or entry.in_dim == 0) return error.InvalidTensorShape;
+            const view = try self.makeBufWithEntry(entry.data[offset..][0 .. width * entry.in_dim], false, self.data.resident_weights.getKey(name) orelse self.data.lazy_weights.getKey(name) orelse name, null, null, null);
+            errdefer freeTensor(self, view);
+            return self.withLogicalShape(view, &.{ @intCast(width), @intCast(entry.in_dim) });
+        }
+    }
+    var weights: [3]CT = undefined;
+    var widths: [3]usize = undefined;
+    var count: usize = 0;
+    defer for (weights[0..count]) |weight| freeTensor(self, weight);
+    var in_dim: usize = 0;
+    // Get shapes from the normal typed source path; these handles are released
+    // before returning and never become independent model mirrors.
+    self.cache_embeddinggemma2_bf16_weights = false;
+    const previous_borrow = self.borrow_typed_matrix_weights;
+    self.borrow_typed_matrix_weights = true;
+    {
+        defer self.cache_embeddinggemma2_bf16_weights = true;
+        defer self.borrow_typed_matrix_weights = previous_borrow;
+        for (siblings, 0..) |sibling, i| {
+            weights[i] = try getWeight(self, sibling);
+            count += 1;
+            const shape = try tensorShapeOp(self, weights[i], self.allocator);
+            defer self.allocator.free(shape);
+            if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0 or (i > 0 and shape[1] != in_dim) or toBuf(weights[i]).quantized_storage != null) return null;
+            widths[i] = @intCast(shape[0]);
+            in_dim = @intCast(shape[1]);
+        }
+    }
+    const packed_weight = (try packedMediaLinears(self, weights[0..count], in_dim, widths[0..count])) orelse return null;
+    defer freeTensor(self, packed_weight);
+    var offset: usize = 0;
+    for (widths[0..group.index]) |width| offset += width * in_dim;
+    const view = try self.makeBufWithEntry(toBuf(packed_weight).data[offset..][0 .. widths[group.index] * in_dim], false, self.data.resident_weights.getKey(name) orelse self.data.lazy_weights.getKey(name) orelse name, null, null, null);
+    errdefer freeTensor(self, view);
+    return self.withLogicalShape(view, &.{ @intCast(widths[group.index]), @intCast(in_dim) });
+}
+
 fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const stable_name = self.data.resident_weights.getKey(name) orelse
         self.data.lazy_weights.getKey(name) orelse name;
-    return loadWeight(self, stable_name, true);
+    return (try canonicalProjectionWeight(self, stable_name)) orelse try loadWeight(self, stable_name, true);
 }
 
 fn getEmbeddingWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
@@ -6050,7 +6344,8 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const out_len = std.math.mul(usize, total, dim) catch return error.UnsupportedShape;
     const out = try self.allocator.alloc(f32, out_len);
-    errdefer self.allocator.free(out);
+    var raw_owned = true;
+    errdefer if (raw_owned) self.allocator.free(out);
     const weight_buf = toBuf(weight);
     if (weight_buf.quantized_storage) |storage| {
         const rows = try quantizedEmbeddingRows(storage, dim);
@@ -6061,11 +6356,12 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
             try quant_codec.dequantizeRow(storage.tensor_type, storage.raw_bytes, dim, idx, out[i * dim .. (i + 1) * dim]);
         }
     } else if (weight_buf.source_tensor) |tensor| {
-        if (tensor.shape.len != 2) return error.InvalidTensorShape;
-        if (tensor.shape[0] <= 0 or tensor.shape[1] <= 0) return error.InvalidTensorShape;
-        const rows: usize = @intCast(tensor.shape[0]);
-        const cols: usize = @intCast(tensor.shape[1]);
-        if (cols != dim) return error.InvalidTensorShape;
+        if (dim == 0 or tensor.shape.len < 2 or tensor.shape[tensor.shape.len - 1] != dim) return error.InvalidTensorShape;
+        var rows: usize = 1;
+        for (tensor.shape[0 .. tensor.shape.len - 1]) |extent| {
+            if (extent <= 0) return error.InvalidTensorShape;
+            rows = try std.math.mul(usize, rows, @intCast(extent));
+        }
         switch (tensor.dtype) {
             .f32 => {
                 if (tensor.asFloat32IfAligned()) |src| {
@@ -6171,7 +6467,11 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
             @memcpy(out[i * dim .. (i + 1) * dim], emb_table[idx * dim .. (idx + 1) * dim]);
         }
     }
-    return self.makeBuf(out, true);
+    const result = try self.makeBuf(out, true);
+    raw_owned = false;
+    errdefer freeTensor(self, result);
+    _ = try self.withLogicalShape(result, &.{ @intCast(total), @intCast(dim) });
+    return result;
 }
 
 const QuantLinearKind = enum {
@@ -6362,6 +6662,10 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
     const weight_buf = toBuf(weight);
+    if (try canonicalPanelLinear(self, input, weight, output, rows, in_dim, out_dim)) {
+        addLinearBiasRows(output, getData(bias), rows, out_dim);
+        return makeLinearNoBiasResult(self, output, rows, out_dim);
+    }
 
     if (weight_buf.quantized_storage) |storage| {
         if (try dispatchQuantizedLinear(.{
@@ -6406,12 +6710,16 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
         } else {
             const weight_view = try denseWeightView(self, weight);
             defer if (weight_view.owned) |owned| self.allocator.free(owned);
-            try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
+            if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
+                addLinearBiasRows(output, getData(bias), rows, out_dim);
+            } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
         }
     } else {
         const weight_view = try denseWeightView(self, weight);
         defer if (weight_view.owned) |owned| self.allocator.free(owned);
-        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
+        if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
+            addLinearBiasRows(output, getData(bias), rows, out_dim);
+        } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
     }
     const result = try self.makeBuf(output, true);
     return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(out_dim) });
@@ -6826,6 +7134,123 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
     @memcpy(packed_grads[rows * dim .. (rows + 1) * dim], grads.dgamma[0..dim]);
     @memcpy(packed_grads[(rows + 1) * dim .. (rows + 2) * dim], grads.dbeta[0..dim]);
     return self.makeBuf(packed_grads, true);
+}
+
+fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len);
+    errdefer self.allocator.free(output);
+    try ops.rope_table.apply(output, x, getData(cos), getData(sin), width, head_dim, inverse);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var count: usize = 1;
+    for (shape) |dim| count *= @intCast(dim);
+    const values = try self.allocator.alloc(f32, count);
+    defer self.allocator.free(values);
+    try ops.dropout_mask.fill(values, probability, seed);
+    return fromFloat32ShapeOp(ctx, values, shape);
+}
+
+fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len);
+    errdefer self.allocator.free(output);
+    try ops.rope_table.applyQkv(output, x, getData(cos), getData(sin), width, head_dim, inverse);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const rows: i64 = @intCast(x.len / (3 * width));
+    return if (inverse) self.withLogicalShape(result, &.{ rows, @intCast(3 * width) }) else self.withLogicalShape(result, &.{ 3 * rows, @intCast(width) });
+}
+
+fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len / 2);
+    errdefer self.allocator.free(output);
+    try ops.geglu.forward(output, x, width);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, &.{ @intCast(x.len / (2 * width)), @intCast(width) });
+}
+
+fn gegluBackwardOp(ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len);
+    errdefer self.allocator.free(output);
+    try ops.geglu.backward(output, x, getData(dout), width);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+fn packedGeluMultiplyOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const source = try getDataChecked(input);
+    if (source.len != try std.math.mul(usize, try std.math.mul(usize, rows, width), 2)) return error.InvalidTensorShape;
+    const data = try self.allocator.alloc(f32, rows * width);
+    var owns_data = true;
+    errdefer if (owns_data) self.allocator.free(data);
+    const Work = struct {
+        io: ?std.Io,
+        source: []const f32,
+        output: []f32,
+        width: usize,
+        first: usize,
+        last: usize,
+        failure: ?anyerror = null,
+        fn run(job: *@This()) void {
+            job.execute() catch |err| {
+                job.failure = err;
+            };
+        }
+        fn execute(job: *@This()) !void {
+            for (job.first..job.last) |row| {
+                if (job.io) |io| try io.checkCancel();
+                try activations_mod.geluMultiplyIo(null, job.source[row * job.width * 2 ..][0..job.width], job.source[row * job.width * 2 + job.width ..][0..job.width], job.output[row * job.width ..][0..job.width]);
+            }
+        }
+    };
+    const workers: usize = if (self.io != null and data.len >= 262144) 4 else 1;
+    var jobs: [4]Work = undefined;
+    for (jobs[0..workers], 0..) |*job, index| job.* = .{ .io = self.io, .source = source, .output = data, .width = width, .first = rows * index / workers, .last = rows * (index + 1) / workers };
+    if (workers == 1) jobs[0].run() else {
+        var group: std.Io.Group = .init;
+        defer group.cancel(self.io.?);
+        for (jobs[0..workers]) |*job| group.async(self.io.?, Work.run, .{job});
+        try group.await(self.io.?);
+    }
+    for (jobs[0..workers]) |job| if (job.failure) |err| return err;
+    const result = try self.makeBuf(data, true);
+    owns_data = false;
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(width) });
+}
+
+fn activationMultiplyOp(ctx: *anyopaque, gate: CT, up: CT, kind: ops.DecoderRuntimeActivationKind) anyerror!?CT {
+    if (kind != .gelu and kind != .gelu_new) return null;
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const values = getData(gate);
+    const output = try self.allocator.alloc(f32, values.len);
+    errdefer self.allocator.free(output);
+    try activations_mod.geluMultiplyIo(self.io, values, getData(up), output);
+    var tensor: ?CT = null;
+    errdefer if (tensor) |t| freeTensor(self, t);
+    tensor = try self.makeBuf(output, false);
+    _ = try self.withLogicalShape(tensor.?, toBuf(gate).logical_shape orelse &.{@intCast(values.len)});
+    // Shared ownership metadata must exist before ownership transfers.
+    const refcount = try self.allocator.create(usize);
+    refcount.* = 1;
+    toBuf(tensor.?).shared_data_refcount = refcount;
+    toBuf(tensor.?).owned = true;
+    return tensor.?;
 }
 
 fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -7457,6 +7882,97 @@ fn unpackHeadMajorTokens(allocator: std.mem.Allocator, src: []const f32, batch: 
     return out;
 }
 
+/// Vision shares the system-BLAS-aware F32 tiled attention implementation
+/// with bounded dense vision tiles. Legacy layouts retain their route.
+/// Fixed metadata only: no model tensors, allocations, or background work.
+/// Explore each same-footprint BLAS tile four times (discard one warm sample),
+/// then select its median completed duration for this geometry. Failures do not
+/// train the policy; concurrent tickets cannot overfill a calibration sample.
+const DenseVisionTiles = struct {
+    const Key = struct { batch: usize, sequence: usize, heads: usize, dim: usize };
+    const Entry = struct { key: ?Key = null, completed: [2]u8 = @splat(0), pending: [2]u8 = @splat(0), times: [2][3]u64 = @splat(@splat(0)) };
+    const Ticket = struct { slot: ?usize = null, policy: usize = 0 };
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: [64]Entry = @splat(.{}),
+    fn median(values: [3]u64) u64 {
+        return @max(@min(values[0], values[1]), @min(@max(values[0], values[1]), values[2]));
+    }
+    fn begin(self: *DenseVisionTiles, key: Key) Ticket {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        var free: ?usize = null;
+        var found: ?usize = null;
+        for (self.entries, 0..) |entry, i| {
+            if (entry.key) |old| {
+                if (std.meta.eql(old, key)) {
+                    found = i;
+                    break;
+                }
+            } else if (free == null) {
+                free = i;
+            }
+        }
+        const index = found orelse free orelse return .{};
+        const entry = &self.entries[index];
+        entry.key = key;
+        if (entry.completed[0] == 4 and entry.completed[1] == 4) return .{ .policy = if (median(entry.times[1]) < median(entry.times[0])) 1 else 0 };
+        const n0 = entry.completed[0] + entry.pending[0];
+        const n1 = entry.completed[1] + entry.pending[1];
+        if (n0 == 4 and n1 == 4) return .{};
+        const policy: usize = if (n0 <= n1) 0 else 1;
+        entry.pending[policy] += 1;
+        return .{ .slot = index, .policy = policy };
+    }
+    fn finish(self: *DenseVisionTiles, ticket: Ticket, duration: ?u64) void {
+        const index = ticket.slot orelse return;
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = &self.entries[index];
+        const policy = ticket.policy;
+        entry.pending[policy] -= 1;
+        if (duration) |ns| {
+            const count = entry.completed[policy];
+            if (count != 0) entry.times[policy][count - 1] = ns;
+            entry.completed[policy] += 1;
+        }
+    }
+};
+var dense_vision_tiles = DenseVisionTiles{};
+
+fn embeddingGemma2VisionAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch: usize, sequence: usize, heads: usize, dim: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (!self.cache_embeddinggemma2_bf16_weights or sequence < 32) return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
+    const rows = std.math.mul(usize, batch, sequence) catch return error.InvalidAttentionShape;
+    const hidden = std.math.mul(usize, heads, dim) catch return error.InvalidAttentionShape;
+    const shape = [_]i64{ std.math.cast(i64, rows) orelse return error.InvalidAttentionShape, std.math.cast(i64, hidden) orelse return error.InvalidAttentionShape };
+    for ([_]CT{ q, k, v }) |tensor| {
+        const stored = tensorStoredShape(tensor) orelse return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
+        if (!std.mem.eql(i64, stored, &shape)) return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
+    }
+    const WideKeys = struct {
+        pub const dense_query_block = 128;
+        pub const dense_key_block = 2048;
+        pub const sgemmTransBSync = native.sgemmTransBSync;
+        pub const sgemmSync = native.sgemmSync;
+    };
+    const calibrate = native.useBlas() and sequence >= 256 and heads == 12 and dim == 64 and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_ATTENTION_CALIBRATION");
+    const ticket = if (calibrate) dense_vision_tiles.begin(.{ .batch = batch, .sequence = sequence, .heads = heads, .dim = dim }) else DenseVisionTiles.Ticket{};
+    const started = if (ticket.slot != null) platform.time.monotonicNs() else 0;
+    var completed = false;
+    defer if (ticket.slot != null) dense_vision_tiles.finish(ticket, if (completed) platform.time.monotonicNs() - started else null);
+    const output = if (native.useBlas() and ticket.policy == 1)
+        try linalg.denseAttentionHostWithGemmIo(WideKeys, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim)
+    else if (native.useBlas())
+        try linalg.denseAttentionHostWithGemmIo(native.SegmentAttentionGemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim)
+    else
+        try linalg.denseAttentionPortableHostWithIo(self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim);
+    const tensor = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, tensor);
+    const result = try self.withLogicalShape(tensor, &shape);
+    completed = true;
+    return result;
+}
+
 fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const Q = getData(q_ct);
@@ -7543,16 +8059,16 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     // (1.13x at seq=32, 1.4x at seq=1500), so we apply it broadly.  Bench at
     // scratch/bench_thresholds.zig if you change this threshold.  Floor is
     // seq>=32 to leave room for sequences too short to amortize the
-    // streaming-softmax book-keeping (untested below 32).  Disabled when mask
-    // is fewer than batch*seq entries because the inputs would need synthetic
-    // per-batch masks that the materialized path currently silently
-    // broadcasts; safer to keep that case on the legacy path.
+    // streaming-softmax book-keeping (untested below 32). Empty masks mean
+    // every key is valid; avoid synthesizing a mask or falling through to the
+    // quadratic, serial implementation used for unsupported legacy layouts.
     const flash_eligible = effective_seq_len >= 32 and
-        mask.len >= effective_batch * effective_seq_len and
+        (mask.len == 0 or mask.len >= effective_batch * effective_seq_len) and
         (bias == null or bias.?.len == bias_seq_len or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
     if (flash_eligible) {
-        const flash_output = try linalg.flashAttentionHost(
+        const flash_output = try linalg.flashAttentionHostWithIo(
             self.allocator,
+            self.io,
             q_data,
             k_data,
             v_data,
@@ -7692,14 +8208,241 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     return self.withLogicalShape(result, &fallback_shape);
 }
 
+fn gemma4AudioLocalAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const out = try @import("native_audio_attention.zig").forward(self.allocator, self.io, params, getData(q), getData(k), getData(v), getData(rel), getData(scales), getData(valid));
+    const tensor = try self.makeOwnedBuf(out);
+    errdefer freeTensor(self, tensor);
+    return try self.withLogicalShape(tensor, &.{ @intCast(params.rows), @intCast(params.hidden) });
+}
+
+/// One model-owned panel representation, built directly from typed checkpoint
+/// rows. Names, rather than mapping addresses, survive lazy unload/reload.
+fn canonicalCpuPanels(self: *NativeCompute, names: []const []const u8, k: usize) !?linalg.prepared_gemm.Panels {
+    if (!self.cache_embeddinggemma2_bf16_weights or names.len == 0 or names.len > 3) return null;
+    const class = embeddinggemma2_weight_cache.nativeClass(names[0]) orelse return null;
+    for (names) |name| {
+        if (embeddinggemma2_weight_cache.nativeClass(name) != class) return null;
+        if (!self.data.resident_weights.contains(name) and !self.data.lazy_weights.contains(name)) return null;
+    }
+    const cache = if (self.data.tier_cache) |*cache| cache else return null;
+    const key = if (names.len == 1) names[0] else try std.mem.join(self.allocator, "|", names);
+    defer if (names.len != 1) self.allocator.free(key);
+    {
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (self.data.embeddinggemma2_canonical_panels.get(key)) |entry| {
+            if (entry.panels.k != k) return error.InvalidTensorShape;
+            if (!self.embeddinggemma2_cache_reader) {
+                self.data.embeddinggemma2_f32_readers += 1;
+                self.embeddinggemma2_cache_reader = true;
+            }
+            return entry.panels;
+        }
+    }
+    var weights: [3]CT = undefined;
+    var count: usize = 0;
+    defer for (weights[0..count]) |value| freeTensor(self, value);
+    var n: usize = 0;
+    {
+        const enabled = self.cache_embeddinggemma2_bf16_weights;
+        const borrow = self.borrow_typed_matrix_weights;
+        self.cache_embeddinggemma2_bf16_weights = false;
+        self.borrow_typed_matrix_weights = true;
+        defer self.cache_embeddinggemma2_bf16_weights = enabled;
+        defer self.borrow_typed_matrix_weights = borrow;
+        for (names, 0..) |name, i| {
+            weights[i] = try loadWeight(self, name, true);
+            count += 1;
+            const buf = toBuf(weights[i]);
+            const shape = buf.logical_shape orelse return error.InvalidTensorShape;
+            if (shape.len != 2 or shape[0] <= 0 or shape[1] != k or buf.quantized_storage != null) return null;
+            const elements = try std.math.mul(usize, @intCast(shape[0]), k);
+            if (buf.source_tensor) |source| {
+                if (source.dtype != .bf16 and source.dtype != .f16) return null;
+                if (source.data.len != try std.math.mul(usize, elements, @sizeOf(u16))) return error.InvalidTensorShape;
+            } else if (buf.data.len != elements) return error.InvalidTensorShape;
+            n = try std.math.add(usize, n, @intCast(shape[0]));
+        }
+    }
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
+    platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+    defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+    if (self.data.embeddinggemma2_canonical_panels.get(key)) |entry| {
+        if (!self.embeddinggemma2_cache_reader) {
+            self.data.embeddinggemma2_f32_readers += 1;
+            self.embeddinggemma2_cache_reader = true;
+        }
+        return entry.panels;
+    }
+    const bytes = try linalg.prepared_gemm.Panels.bytes(n, k);
+    const used = self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)];
+    const limit = embeddinggemma2_weight_cache.classLimit(class);
+    if (used > limit or bytes > limit - used or self.data.embeddinggemma2_canonical_panels.count() >= embeddinggemma2_weight_cache.max_entries) return null;
+    cache.reserve(.host, bytes) catch {
+        cache.noteDenied(.host, bytes);
+        return null;
+    };
+    errdefer cache.noteRelease(.host, bytes);
+    const data = try self.data.allocator.alloc(f32, bytes / @sizeOf(f32));
+    errdefer self.data.allocator.free(data);
+    @memset(data, 0);
+    var row: usize = 0;
+    for (weights[0..count]) |value| {
+        const buf = toBuf(value);
+        const rows: usize = @intCast(buf.logical_shape.?[0]);
+        for (0..rows) |r| for (0..k) |c| {
+            const src = r * k + c;
+            const v: f32 = if (buf.source_tensor) |source| blk: {
+                const bits = std.mem.readInt(u16, source.data[src * 2 ..][0..2], .little);
+                break :blk if (source.dtype == .bf16) @bitCast(@as(u32, bits) << 16) else @floatCast(@as(f16, @bitCast(bits)));
+            } else buf.data[src];
+            const dest = row + r;
+            data[dest / 64 * k * 64 + c * 64 + dest % 64] = v;
+        };
+        row += rows;
+    }
+    const owned_key = try self.data.allocator.dupe(u8, key);
+    errdefer self.data.allocator.free(owned_key);
+    const panels = linalg.prepared_gemm.Panels{ .data = data, .n = n, .k = k };
+    try self.data.embeddinggemma2_canonical_panels.put(self.data.allocator, owned_key, .{ .panels = panels, .class = class });
+    self.data.embeddinggemma2_f32_cache_bytes += bytes;
+    self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
+    if (!self.embeddinggemma2_cache_reader) {
+        self.data.embeddinggemma2_f32_readers += 1;
+        self.embeddinggemma2_cache_reader = true;
+    }
+    return panels;
+}
+
+fn canonicalPanelLinear(self: *NativeCompute, input: CT, weight: CT, output: []f32, rows: usize, k: usize, n: usize) !bool {
+    if (native.useBlas() or !self.cache_embeddinggemma2_bf16_weights or k < 64 or n < 64) return false;
+    const buf = toBuf(weight);
+    if (buf.name.len == 0 or buf.view_strides != null) return false;
+    var storage: [3][256]u8 = undefined;
+    var names_buf: [3][]const u8 = undefined;
+    var start = buf.source_row;
+    const names: []const []const u8 = if (embeddinggemma2_weight_cache.projectionGroup(buf.name)) |group| blk: {
+        const siblings = try group.names(&storage, &names_buf);
+        for (siblings[0..group.index]) |name| {
+            const sibling = try loadWeight(self, name, true);
+            defer freeTensor(self, sibling);
+            const shape = toBuf(sibling).logical_shape orelse return false;
+            if (shape.len != 2 or shape[0] <= 0) return false;
+            start += @intCast(shape[0]);
+        }
+        break :blk siblings;
+    } else &.{buf.name};
+    const panels = (canonicalCpuPanels(self, names, k) catch |err| switch (err) {
+        error.OutOfMemory, error.MemoryBudgetExceeded => return false,
+        else => return err,
+    }) orelse return false;
+    if (start % 64 != 0 or start > panels.n or n > panels.n - start) return false;
+    const view = linalg.prepared_gemm.Panels{ .data = panels.data[start / 64 * k * 64 ..][0 .. (try linalg.prepared_gemm.Panels.bytes(n, k)) / 4], .n = n, .k = k };
+    try linalg.sgemmPrepared(self.io, rows, view, getData(input), output);
+    return true;
+}
+
+/// Protect future dense mirrors before admitting optional panels. Otherwise a
+/// cold request could fill the class with early panels and repeatedly widen
+/// late-layer weights on every request. Lazy byte lengths conservatively allow
+/// the largest supported F32 widening, without loading any checkpoint pages.
+fn embeddingGemma2DenseFloor(data: *WeightStore) [3]usize {
+    if (data.embeddinggemma2_dense_floor) |floor| return floor;
+    var floor: [3]usize = @splat(0);
+    var resident = data.resident_weights.iterator();
+    while (resident.next()) |entry| {
+        if (shouldBorrowEmbeddingTensor(entry.key_ptr.*)) continue;
+        const class = embeddinggemma2_weight_cache.nativeClass(entry.key_ptr.*) orelse continue;
+        const source = &entry.value_ptr.tensor;
+        const bytes = if (source.dtype == .bf16) source.data.len *| 2 else if (embeddinggemma2_weight_cache.projectionGroup(entry.key_ptr.*) != null) source.data.len else 0;
+        floor[@backingInt(class)] +|= bytes;
+    }
+    var lazy = data.lazy_weights.iterator();
+    while (lazy.next()) |entry| {
+        if (data.resident_weights.contains(entry.key_ptr.*)) continue;
+        if (shouldBorrowEmbeddingTensor(entry.key_ptr.*)) continue;
+        const class = embeddinggemma2_weight_cache.nativeClass(entry.key_ptr.*) orelse continue;
+        const source = &entry.value_ptr.tensor_ref;
+        if (source.quantized) continue;
+        floor[@backingInt(class)] +|= if (source.byte_len == 0) embeddinggemma2_weight_cache.classLimit(class) else source.byte_len *| 2;
+    }
+    floor[@backingInt(embeddinggemma2_weight_cache.MetalClass.audio)] +|= embeddinggemma2_weight_cache.prepared_max_bytes;
+    data.embeddinggemma2_dense_floor = floor;
+    return floor;
+}
+
+/// Only model-owned immutable snapshots may publish panels. Pointer keys are
+/// valid while the existing model reader guard pins both caches together.
+fn preparedEmbeddingGemma2Panels(self: *NativeCompute, source: []const f32, n: usize, k: usize) !?linalg.prepared_gemm.Panels {
+    if (!self.cache_embeddinggemma2_bf16_weights or !self.embeddinggemma2_cache_reader or n < 64 or k < 64) return null;
+    const cache = if (self.data.tier_cache) |*cache| cache else return null;
+    const key = PreparedPanelKey{ .address = @intFromPtr(source.ptr), .n = n, .k = k };
+    {
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (self.data.embeddinggemma2_panels.get(key)) |entry| return entry.panels;
+    }
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
+    platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+    defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+    if (self.data.embeddinggemma2_panels.get(key)) |entry| return entry.panels;
+    const class = blk: {
+        var it = self.data.embeddinggemma2_f32_cache.iterator();
+        while (it.next()) |entry| {
+            const begin = @intFromPtr(entry.value_ptr.data.ptr);
+            const end = begin + entry.value_ptr.data.len * @sizeOf(f32);
+            if (key.address >= begin and key.address <= end and source.len * @sizeOf(f32) <= end - key.address)
+                break :blk embeddinggemma2_weight_cache.nativeClass(std.mem.sliceTo(entry.key_ptr.*, '|')) orelse continue;
+        }
+        return null;
+    };
+    const bytes = try linalg.prepared_gemm.Panels.bytes(n, k);
+    const used = self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)];
+    const limit = embeddinggemma2_weight_cache.classLimit(class);
+    const floor = embeddingGemma2DenseFloor(self.data);
+    const panel_limit = limit -| floor[@backingInt(class)];
+    const panel_used = self.data.embeddinggemma2_panel_class_bytes[@backingInt(class)];
+    if (panel_used > panel_limit or bytes > panel_limit - panel_used) return null;
+    if (used > limit or bytes > limit - used or self.data.embeddinggemma2_panels.count() >= embeddinggemma2_weight_cache.max_entries) return null;
+    cache.reserve(.host, bytes) catch {
+        cache.noteDenied(.host, bytes);
+        return null;
+    };
+    errdefer cache.noteRelease(.host, bytes);
+    const panels = try linalg.prepared_gemm.Panels.init(self.data.allocator, source, n, k);
+    errdefer panels.deinit(self.data.allocator);
+    try self.data.embeddinggemma2_panels.put(self.data.allocator, key, .{ .panels = panels, .class = class });
+    self.data.embeddinggemma2_f32_cache_bytes += bytes;
+    self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
+    self.data.embeddinggemma2_panel_class_bytes[@backingInt(class)] += bytes;
+    std.debug.assert(self.embeddinggemma2_cache_reader);
+    return panels;
+}
+fn preparedEmbeddingGemma2Linear(self: *NativeCompute, input: []const f32, source: []const f32, output: []f32, m: usize, n: usize, k: usize) !bool {
+    // Direct dot products remain preferable for tiny row counts.
+    if (m < 32 or native.useBlas()) return false;
+    const panels = (preparedEmbeddingGemma2Panels(self, source, n, k) catch |err| switch (err) {
+        error.OutOfMemory => return false,
+        else => return err,
+    }) orelse return false;
+    try linalg.sgemmPrepared(self.io, m, panels, input, output);
+    return true;
+}
+
 fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
-    @memset(output, 0.0);
     const weight_buf = toBuf(weight);
+    if (try canonicalPanelLinear(self, input, weight, output, rows, in_dim, out_dim)) {
+        return makeLinearNoBiasResult(self, output, rows, out_dim);
+    }
     if (weight_buf.quantized_storage) |storage| {
+        @memset(output, 0.0);
         if (try dispatchQuantizedLinear(.{
             .compute = self,
             .kind = .single_no_bias,
@@ -7733,7 +8476,8 @@ fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: u
     }
     const weight_view = try denseWeightView(self, weight);
     defer if (weight_view.owned) |owned| self.allocator.free(owned);
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 0.0, output);
+    if (!try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim))
+        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 0.0, output);
     return makeLinearNoBiasResult(self, output, rows, out_dim);
 }
 
@@ -8126,6 +8870,194 @@ fn linearPairOp(
     errdefer freeTensor(ctx, first);
     const second = try linearOp(ctx, input, weight_b, bias_b, rows, in_dim, out_dim);
     return .{ .first = first, .second = second };
+}
+
+fn linearTripleNoBiasNamedOp(ctx: *anyopaque, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (self.cache_embeddinggemma2_bf16_weights) {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}.qkv", .{ names[0], names[1], names[2] });
+        defer self.allocator.free(key);
+        var cached: ?CT = null;
+        {
+            platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+            defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+            if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+                if (entry.data.len != 3 * in_dim * out_dim) return error.InvalidTensorShape;
+                if (!self.embeddinggemma2_cache_reader) {
+                    self.data.embeddinggemma2_f32_readers += 1;
+                    self.embeddinggemma2_cache_reader = true;
+                }
+                cached = try self.makeBuf(entry.data, false);
+            }
+        }
+        if (cached) |weight| {
+            defer freeTensor(ctx, weight);
+            const combined = try linearNoBiasOp(ctx, input, weight, rows, in_dim, out_dim * 3);
+            defer freeTensor(ctx, combined);
+            const split = try splitLastDim3Op(ctx, combined, rows, out_dim);
+            return .{ .first = split.first, .second = split.second, .third = split.third };
+        }
+    }
+    var weights: [3]CT = undefined;
+    var count: usize = 0;
+    defer for (weights[0..count]) |weight| freeTensor(ctx, weight);
+    {
+        // The packed snapshot replaces individual mirrors rather than doubling
+        // the tower's model residency. Rejected packing retains bounded fallback.
+        const mirror = self.cache_embeddinggemma2_bf16_weights;
+        self.cache_embeddinggemma2_bf16_weights = false;
+        defer self.cache_embeddinggemma2_bf16_weights = mirror;
+        for (names, &weights) |name, *weight| {
+            weight.* = try getWeight(ctx, name);
+            count += 1;
+        }
+    }
+    return linearTripleNoBiasOp(ctx, input, weights[0], weights[1], weights[2], rows, in_dim, out_dim);
+}
+
+fn packedLinearKey(a: std.mem.Allocator, weights: []const CT, suffix: []const u8) ![]u8 {
+    var names: [3][]const u8 = undefined;
+    for (weights, names[0..weights.len]) |weight, *name| name.* = toBuf(weight).name;
+    const joined = try std.mem.join(a, "|", names[0..weights.len]);
+    defer a.free(joined);
+    return std.mem.concat(a, u8, &.{ joined, suffix });
+}
+fn linearPackedNamedOp(ctx: *anyopaque, input: CT, names: []const []const u8, widths: []const usize, rows: usize, in_dim: usize) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (!self.cache_embeddinggemma2_bf16_weights) return null;
+    if (!native.useBlas() and in_dim >= 64) {
+        var total: usize = 0;
+        for (widths) |width| total = try std.math.add(usize, total, width);
+        const panels = (canonicalCpuPanels(self, names, in_dim) catch |err| switch (err) {
+            error.OutOfMemory, error.MemoryBudgetExceeded => return null,
+            else => return err,
+        }) orelse return null;
+        if (panels.n != total) return error.InvalidTensorShape;
+        const output = try self.allocator.alloc(f32, rows * total);
+        errdefer self.allocator.free(output);
+        try linalg.sgemmPrepared(self.io, rows, panels, getData(input), output);
+        return makeLinearNoBiasResult(self, output, rows, total);
+    }
+    const joined = try std.mem.join(self.allocator, "|", names);
+    defer self.allocator.free(joined);
+    const key = try std.mem.concat(self.allocator, u8, &.{ joined, ".qkv" });
+    defer self.allocator.free(key);
+    var total: usize = 0;
+    for (widths) |width| total = try std.math.add(usize, total, width);
+    var cached: ?CT = null;
+    {
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+            if (entry.data.len != in_dim * total) return error.InvalidTensorShape;
+            if (!self.embeddinggemma2_cache_reader) {
+                self.data.embeddinggemma2_f32_readers += 1;
+                self.embeddinggemma2_cache_reader = true;
+            }
+            cached = try self.makeBuf(entry.data, false);
+        }
+    }
+    if (cached) |weight| {
+        defer freeTensor(ctx, weight);
+        return try linearNoBiasOp(ctx, input, weight, rows, in_dim, total);
+    }
+    var weights: [3]CT = undefined;
+    var count: usize = 0;
+    defer for (weights[0..count]) |weight| freeTensor(ctx, weight);
+    {
+        self.cache_embeddinggemma2_bf16_weights = false;
+        defer self.cache_embeddinggemma2_bf16_weights = true;
+        const previous_borrow = self.borrow_typed_matrix_weights;
+        self.borrow_typed_matrix_weights = true;
+        defer self.borrow_typed_matrix_weights = previous_borrow;
+        for (names, weights[0..names.len]) |name, *weight| {
+            weight.* = try getWeight(ctx, name);
+            count += 1;
+        }
+    }
+    const weight = (packedMediaLinears(self, weights[0..count], in_dim, widths) catch |err| switch (err) {
+        error.OutOfMemory => return null,
+        else => return err,
+    }) orelse return null;
+    defer freeTensor(ctx, weight);
+    return try linearNoBiasOp(ctx, input, weight, rows, in_dim, total);
+}
+
+fn packedMediaLinears(self: *NativeCompute, weights: []const CT, in_dim: usize, widths: []const usize) !?CT {
+    if (!self.cache_embeddinggemma2_bf16_weights) return null;
+    const class = embeddinggemma2_weight_cache.nativeClass(toBuf(weights[0]).name) orelse return null;
+    var out_dim: usize = 0;
+    for (weights, widths) |weight, width| {
+        const buf = toBuf(weight);
+        if (embeddinggemma2_weight_cache.nativeClass(buf.name) != class) return null;
+        if (buf.source_tensor) |source| {
+            if (source.dtype != .bf16 or source.data.len != in_dim * width * 2) return null;
+        } else if (buf.data.len != in_dim * width) return null;
+        out_dim = try std.math.add(usize, out_dim, width);
+    }
+    const key = try packedLinearKey(self.allocator, weights, ".qkv");
+    defer self.allocator.free(key);
+    const cache = if (self.data.tier_cache) |*cache| cache else return null;
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
+    platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+    defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+    if (!self.embeddinggemma2_cache_reader) {
+        self.data.embeddinggemma2_f32_readers += 1;
+        self.embeddinggemma2_cache_reader = true;
+    }
+    if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| return self.makeBuf(entry.data, false);
+    const bytes = in_dim * out_dim * @sizeOf(f32);
+    const used = self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)];
+    const limit = embeddinggemma2_weight_cache.classLimit(class);
+    if (used > limit or bytes > limit - used or self.data.embeddinggemma2_f32_cache.count() >= embeddinggemma2_weight_cache.max_entries) return null;
+    cache.reserve(.host, bytes) catch {
+        cache.noteDenied(.host, bytes);
+        return null;
+    };
+    errdefer cache.noteRelease(.host, bytes);
+    const name = try self.data.allocator.dupe(u8, key);
+    errdefer self.data.allocator.free(name);
+    const combined_weight = try self.data.allocator.alloc(f32, in_dim * out_dim);
+    errdefer self.data.allocator.free(combined_weight);
+    var offset: usize = 0;
+    for (weights, widths) |weight, width| {
+        const destination = combined_weight[offset..][0 .. in_dim * width];
+        const buf = toBuf(weight);
+        if (buf.source_tensor) |source| tensor_mod.widenBf16LittleEndian(source.data, destination) else @memcpy(destination, buf.data);
+        offset += in_dim * width;
+    }
+    var projection_widths: [3]usize = @splat(0);
+    @memcpy(projection_widths[0..widths.len], widths);
+    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, name, .{ .data = combined_weight, .bytes = bytes, .projection_widths = projection_widths, .in_dim = in_dim });
+    self.data.embeddinggemma2_f32_cache_bytes += bytes;
+    self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
+    // Ownership has transferred to the model before allocating the handle.
+    return self.makeBuf(combined_weight, false) catch return null;
+}
+fn linearTripleNoBiasOp(ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (!native.useBlas() and in_dim >= 64) {
+        if (try linearPackedNamedOp(ctx, input, &.{ toBuf(a).name, toBuf(b).name, toBuf(c).name }, &.{ out_dim, out_dim, out_dim }, rows, in_dim)) |combined| {
+            defer freeTensor(ctx, combined);
+            const split = try splitLastDim3Op(ctx, combined, rows, out_dim);
+            return .{ .first = split.first, .second = split.second, .third = split.third };
+        }
+    }
+    const combined_weight = if (!native.useBlas() and in_dim >= 64) null else packedMediaLinears(self, &.{ a, b, c }, in_dim, &.{ out_dim, out_dim, out_dim }) catch null;
+    if (combined_weight) |weight| {
+        defer freeTensor(ctx, weight);
+        const combined = try linearNoBiasOp(ctx, input, weight, rows, in_dim, out_dim * 3);
+        defer freeTensor(ctx, combined);
+        const split = try splitLastDim3Op(ctx, combined, rows, out_dim);
+        return .{ .first = split.first, .second = split.second, .third = split.third };
+    }
+    const first = try linearNoBiasOp(ctx, input, a, rows, in_dim, out_dim);
+    errdefer freeTensor(ctx, first);
+    const second = try linearNoBiasOp(ctx, input, b, rows, in_dim, out_dim);
+    errdefer freeTensor(ctx, second);
+    const third = try linearNoBiasOp(ctx, input, c, rows, in_dim, out_dim);
+    return .{ .first = first, .second = second, .third = third };
 }
 
 fn linearTripleOp(
@@ -35490,6 +36422,76 @@ fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT
     return try aliasDenseBufWithShape(self, input, &.{ @intCast(rows), @intCast(cols) });
 }
 
+fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, p: ops.EmbeddingHeadParams) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    try p.validate();
+    if ((p.gather != 0) != (gather != null) or (p.weighted != 0) != (weight != null)) return error.InvalidTensorShape;
+    const source = try getDataChecked(input);
+    if (source.len != @as(usize, p.source_rows) * p.stride) return error.InvalidTensorShape;
+    const ids = if (gather) |g| try getDataChecked(g) else null;
+    if (ids) |values| if (values.len != p.rows) return error.InvalidTensorShape;
+    const weights = if (weight) |w| try getDataChecked(w) else null;
+    if (weights) |values| if (values.len != p.dim) return error.InvalidTensorShape;
+    const out = try self.allocator.alloc(f32, @as(usize, p.rows) * p.heads * p.dim);
+    var owns_raw = true;
+    errdefer if (owns_raw) self.allocator.free(out);
+    const positions = try self.allocator.alloc(usize, if (p.rotate != 0) @as(usize, p.rows) * p.heads else 0);
+    defer self.allocator.free(positions);
+    for (0..p.rows) |row| {
+        if (self.io) |io| try io.checkCancel();
+        const src_row = if (ids) |values| blk: {
+            const value = values[row];
+            if (!std.math.isFinite(value) or value < 0 or value >= @as(f32, @floatFromInt(p.source_rows)) or @trunc(value) != value) return error.InvalidTensorShape;
+            break :blk @as(usize, @intFromFloat(value));
+        } else row;
+        if (src_row >= p.source_rows) return error.InvalidTensorShape;
+        for (0..p.heads) |h| {
+            const src = src_row * p.stride + p.start + h / (p.heads / p.source_heads) * p.dim;
+            @memcpy(out[(row * p.heads + h) * p.dim ..][0..p.dim], source[src..][0..p.dim]);
+            if (p.rotate != 0) positions[row * p.heads + h] = src_row % p.sequence;
+        }
+    }
+    const ones: [512]f32 = @splat(1);
+    activations_mod.rmsNorm(out, weights orelse ones[0..p.dim], p.dim, p.eps);
+    if (p.rotate != 0) linalg.ropeCore(out, positions, p.dim, p.dim, p.theta, 1, false);
+    if (p.scale != 1) for (out) |*value| {
+        value.* *= p.scale;
+    };
+    const tensor = try self.makeBuf(out, true);
+    owns_raw = false;
+    errdefer freeTensor(self, tensor);
+    return self.withLogicalShape(tensor, &.{ @intCast(p.rows * p.heads), @intCast(p.dim) });
+}
+
+fn modelScalarBoundsOp(ctx: *anyopaque, key: []const u8, value: ?[4]?f32) anyerror!?[4]?f32 {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (!self.cache_embeddinggemma2_bf16_weights) return null;
+    return self.data.scalar_bounds.access(self.data.allocator, key, value);
+}
+
+fn rmsNormResidualOp(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
+    const x = getData(input);
+    const w = getData(weight);
+    const res = getData(residual);
+    if (dim == 0 or x.len == 0 or x.len % dim != 0 or w.len != dim or res.len != x.len) return error.InvalidTensorShape;
+    const output = try self.allocator.alloc(f32, x.len);
+    activations_mod.rmsNormResidual(output, x, w, res, dim, eps, norm_scale, output_scale);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const output = try self.allocator.alloc(f32, getData(input).len);
+    activations_mod.clampSilu(output, getData(input), min_value, max_value);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
@@ -36738,6 +37740,16 @@ fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    // NCT/OIK is the height-one NCHW/OIHW layout. Share the accelerated,
+    // bounded convolution implementation and retain scalar execution when
+    // its optional im2col workspace cannot be admitted.
+    if (conv2dOp(ctx, input, weight, bias, batch, in_channels, out_channels, 1, time_steps, 1, kernel_size, 1, stride, 0, padding, 1)) |result| {
+        return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast((time_steps + 2 * padding - kernel_size) / stride + 1) });
+    } else |err| switch (err) {
+        error.OutOfMemory, error.UnsupportedShape => {},
+        else => return err,
+    }
+
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const in_data = getData(input);
     const w_data = getData(weight);
@@ -36827,6 +37839,19 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     }
     const output = try self.allocator.alloc(f32, output_elems);
     errdefer self.allocator.free(output);
+
+    if (groups == 1 and kernel_h == 1 and kernel_w == 1 and stride_h == 1 and stride_w == 1 and padding_h == 0 and padding_w == 0) {
+        // Pointwise convolution is already a matrix product in channel-major
+        // storage. No im2col buffer or output transpose is needed.
+        for (0..batch) |b| {
+            const batch_out = output[b * out_channels * output_area ..][0 .. out_channels * output_area];
+            for (0..out_channels) |oc| @memset(batch_out[oc * output_area ..][0..output_area], bias_data[oc]);
+            const batch_input = input_data[b * in_channels * output_area ..][0 .. in_channels * output_area];
+            try self.dispatchSgemm(out_channels, output_area, in_channels, 1.0, weight_data, batch_input, 1.0, batch_out);
+        }
+        const result = try self.makeBuf(output, true);
+        return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast(out_h), @intCast(out_w) });
+    }
 
     if (groups == 1) {
         const rows = output_area;
@@ -37367,6 +38392,59 @@ pub fn visionRopeCore(
             output[base + rotary_pairs + pair] = left * sine + right * cosine;
         }
     }
+}
+
+fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.VisionNormRopeParams) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const data = getData(input);
+    const w = getData(weight);
+    if (p.rows == 0 or p.head_dim == 0 or p.head_dim % 4 != 0 or p.hidden % p.head_dim != 0 or p.grid_x == 0 or p.grid_y == 0 or p.theta <= 0 or data.len != @as(usize, p.rows) * p.hidden or w.len != p.head_dim) return error.InvalidTensorShape;
+    const out = try self.allocator.alloc(f32, data.len);
+    var owns_output = true;
+    errdefer if (owns_output) self.allocator.free(out);
+    const quarter = p.head_dim / 4;
+    // The spatial angles are independent of head, batch and layer weights.
+    // Evaluate each axis/position once, rather than per head and output lane.
+    const positions = try std.math.add(usize, p.grid_x, p.grid_y);
+    const trig = try self.allocator.alloc(f32, try std.math.mul(usize, positions, quarter * 2));
+    defer self.allocator.free(trig);
+    for (0..quarter) |j| {
+        const freq = 1 / std.math.pow(f32, p.theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(p.head_dim / 2)));
+        for (0..2) |axis| {
+            const count = if (axis == 0) p.grid_x else p.grid_y;
+            const first: usize = if (axis == 0) 0 else p.grid_x;
+            for (0..count) |position| {
+                const angle = @as(f32, @floatFromInt(position)) * freq;
+                trig[((first + position) * quarter + j) * 2] = @cos(angle);
+                trig[((first + position) * quarter + j) * 2 + 1] = @sin(angle);
+            }
+        }
+    }
+    for (0..p.rows) |row| {
+        if (self.io) |io| try io.checkCancel();
+        for (0..p.hidden / p.head_dim) |head| {
+            const base = row * p.hidden + head * p.head_dim;
+            var sum: f32 = 0;
+            for (data[base..][0..p.head_dim]) |x| sum += x * x;
+            const inv = 1 / @sqrt(sum / @as(f32, @floatFromInt(p.head_dim)) + p.eps);
+            for (0..2) |axis| for (0..quarter) |j| {
+                const ai = axis * 2 * quarter + j;
+                const bi = ai + quarter;
+                const position = if (axis == 0) row % p.grid_x else (row / p.grid_x) % p.grid_y;
+                const offset = (((if (axis == 0) @as(usize, 0) else p.grid_x) + position) * quarter + j) * 2;
+                const cosine = trig[offset];
+                const sine = trig[offset + 1];
+                const x = data[base + ai] * inv * w[ai];
+                const y = data[base + bi] * inv * w[bi];
+                out[base + ai] = (x * cosine - y * sine) * p.scale;
+                out[base + bi] = (y * cosine + x * sine) * p.scale;
+            };
+        }
+    }
+    owns_output = false; // makeOwnedBuf releases the allocation on failure.
+    const tensor = try self.makeOwnedBuf(out);
+    errdefer freeTensor(self, tensor);
+    return try self.withLogicalShape(tensor, &.{ @intCast(p.rows), @intCast(p.hidden) });
 }
 
 fn visionRopeOp(
@@ -41124,6 +42202,40 @@ fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.
     return try self.withLogicalShape(result, &.{ @intCast(request.queries), @intCast(request.num_heads * request.head_dim) });
 }
 
+fn segmentAttentionGroupedOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const r = request.visibility;
+    if (request.control) |control| try control.check();
+    const hidden = try std.math.mul(usize, r.num_heads, r.head_dim);
+    const output_count = try std.math.mul(usize, r.queries, hidden);
+    const head_scratch = try std.math.mul(usize, try std.math.add(usize, r.queries, r.keys), try std.math.mul(usize, r.head_dim, 2));
+    const bytes = try std.math.mul(usize, try std.math.add(usize, try std.math.add(usize, output_count, head_scratch), 512 * 1024), @sizeOf(f32));
+    if (bytes > request.workspace_limit_bytes) return null;
+    const out = if (r.queries >= 256 and (r.queries <= 512 or r.head_dim == 512))
+        try groupedAttentionForSession(native.EmbeddingGemma2SegmentAttentionGemm(1024), self, q, k, v, request)
+    else
+        try groupedAttentionForSession(native.SegmentAttentionGemm, self, q, k, v, request);
+    const result = try self.makeOwnedBuf(out);
+    errdefer freeTensor(self, result);
+    if (request.control) |control| try control.check();
+    return try self.withLogicalShape(result, &.{ @intCast(r.queries), @intCast(hidden) });
+}
+fn groupedAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) ![]f32 {
+    const r = request.visibility;
+    // Portable head workers own parallelism. BLAS keeps its own GEMM scheduler.
+    const scratch = (r.queries * r.num_heads * r.head_dim * 3 + r.keys * request.num_kv_heads * r.head_dim * 2 + r.num_heads * 128 * 512) * @sizeOf(f32);
+    if (!native.useBlas() and self.io != null and r.queries >= 128 and r.num_heads <= 4 and scratch <= request.workspace_limit_bytes) {
+        const Portable = struct {
+            pub const query_block = 128;
+            pub const key_block = 512;
+            pub const sgemmSync = linalg.sgemmSequential;
+            pub const sgemmTransBSync = linalg.sgemmTransBSequential;
+        };
+        return linalg.segmentAttentionGroupedHostWithGemmParallelIo(Portable, self.allocator, self.io.?, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale);
+    }
+    return linalg.segmentAttentionGroupedHostWithGemmIo(Gemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale);
+}
+
 fn segmentAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: []const f32, k: []const f32, v: []const f32, request: *const ops.SegmentAttention) ![]f32 {
     // Parallel heads remain bounded to the qualified moderate embedding shapes.
     // Each job owns separate scratch; all allocation/accounting stays on this
@@ -41134,7 +42246,7 @@ fn segmentAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: []co
     {
         return linalg.segmentAttentionHostWithGemmParallelIo(Gemm, self.allocator, self.io.?, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
     }
-    return linalg.segmentAttentionHostWithGemm(Gemm, self.allocator, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
+    return linalg.segmentAttentionHostWithGemmSerialIo(Gemm, self.allocator, self.io, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
 }
 
 test "embeddinggemma2 CPU adaptive segment tiles preserve generic masks empty rows and independent attention" {
@@ -41380,6 +42492,38 @@ test "Florence native row gather preserves row identity and independent storage"
     }));
 }
 
+fn allocUninitF32ShapeOp(ctx: *anyopaque, shape: []const i32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (shape.len == 0 or shape.len > 8) return error.InvalidTensorShape;
+    var logical: [8]i64 = undefined;
+    var count: usize = 1;
+    for (shape, logical[0..shape.len]) |dim, *dest| {
+        if (dim < 0) return error.InvalidTensorShape;
+        dest.* = dim;
+        count = try std.math.mul(usize, count, @intCast(dim));
+    }
+    const data = try self.allocator.alloc(f32, count);
+    const tensor = try self.makeOwnedBuf(data);
+    errdefer freeTensor(self, tensor);
+    return self.withLogicalShape(tensor, logical[0..shape.len]);
+}
+fn copyRows2DOp(ctx: *anyopaque, dst: CT, dst_row: usize, src: CT, src_row: usize, rows: usize, cols: usize) anyerror!bool {
+    _ = ctx;
+    const target = toBuf(dst);
+    // Never mutate immutable weight storage, strided views or shared aliases.
+    if (!target.owned or target.source_tensor != null or target.view_strides != null or target.weight_handle_name != null or
+        (target.shared_data_refcount != null and target.shared_data_refcount.?.* != 1)) return error.InvalidTensorShape;
+    const source = try getDataChecked(src);
+    const begin = try std.math.mul(usize, dst_row, cols);
+    const from = try std.math.mul(usize, src_row, cols);
+    const count = try std.math.mul(usize, rows, cols);
+    if (cols == 0 or target.data.len % cols != 0 or source.len % cols != 0 or begin > target.data.len or count > target.data.len - begin or from > source.len or count > source.len - from) return error.InvalidTensorShape;
+    const output = target.data[begin..][0..count];
+    const input = source[from..][0..count];
+    if (@intFromPtr(output.ptr) > @intFromPtr(input.ptr)) std.mem.copyBackwards(f32, output, input) else std.mem.copyForwards(f32, output, input);
+    return true;
+}
+
 fn concatRows2DOp(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const a_data = getData(a);
@@ -41395,14 +42539,28 @@ fn concatRows2DOp(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, c
 
 fn sliceRows2DOp(ctx: *anyopaque, input: CT, start_row: usize, row_count: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const data = getData(input);
-    const total_rows = @divExact(data.len, cols);
-    if (total_rows * cols != data.len) return error.UnexpectedOutputShape;
-    if (start_row + row_count > total_rows) return error.UnexpectedOutputShape;
-    const out = try self.allocator.alloc(f32, row_count * cols);
-    errdefer self.allocator.free(out);
-    @memcpy(out, data[start_row * cols ..][0 .. row_count * cols]);
-    return self.makeBuf(out, true);
+    const parent = toBuf(input);
+    if (cols == 0) return error.UnexpectedOutputShape;
+    const total_rows = if (parent.source_tensor) |source| @as(usize, @intCast(source.shape[0])) else @divExact(getData(input).len, cols);
+    if (cols == 0 or start_row > total_rows or row_count > total_rows - start_row) return error.UnexpectedOutputShape;
+    const view = if (parent.source_tensor) |source| blk: {
+        if (source.shape.len != 2 or source.shape[1] != cols) return error.UnexpectedOutputShape;
+        var tensor = source.borrowedView(source.name);
+        const row_bytes = try std.math.mul(usize, cols, source.dtype.byteSize());
+        tensor.data = source.data[start_row * row_bytes ..][0 .. row_count * row_bytes];
+        tensor.shape = try self.allocator.dupe(i64, &.{ @intCast(row_count), @intCast(cols) });
+        tensor.allocator = self.allocator;
+        tensor.owns_data = false;
+        tensor.owns_shape = true;
+        break :blk try self.makeBufWithOwnedSourceTensor(tensor);
+    } else try self.makeBuf(getData(input)[start_row * cols ..][0 .. row_count * cols], false);
+    errdefer freeTensor(self, view);
+    _ = try self.withLogicalShape(view, &.{ @intCast(row_count), @intCast(cols) });
+    parent.tensor_refs += 1;
+    toBuf(view).retained_parent = input;
+    toBuf(view).name = parent.name;
+    toBuf(view).source_row = parent.source_row + start_row;
+    return view;
 }
 
 fn exportDenseTensorBytes(
@@ -41556,38 +42714,25 @@ fn tensorShapeMatchesOp(_: *anyopaque, tensor: CT, shape: []const i64) anyerror!
     return true;
 }
 
-fn sliceLastDimOp(_: *anyopaque, tensor: CT, start: usize, stop: usize) anyerror!CT {
+fn sliceLastDimOp(ctx: *anyopaque, tensor: CT, start: usize, stop: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const input = toBuf(tensor);
     const shape = input.logical_shape orelse return error.UnsupportedShape;
     if (shape.len != 2) return error.UnsupportedShape;
-    const input_data = getData(tensor);
-
-    const rows: usize = @intCast(shape[0]);
-    const cols: usize = @intCast(shape[1]);
+    const input_data = try getDataChecked(tensor);
+    const rows = std.math.cast(usize, shape[0]) orelse return error.InvalidTensorShape;
+    const cols = std.math.cast(usize, shape[1]) orelse return error.InvalidTensorShape;
     if (start > stop or stop > cols) return error.OutOfBounds;
-
     const out_cols = stop - start;
-    const out = try input.allocator.alloc(f32, rows * out_cols);
-    errdefer input.allocator.free(out);
-    for (0..rows) |row| {
-        const src = input_data[row * cols + start .. row * cols + stop];
-        const dst = out[row * out_cols ..][0..out_cols];
-        @memcpy(dst, src);
-    }
-
-    const out_shape = try input.allocator.alloc(i64, 2);
-    errdefer input.allocator.free(out_shape);
-    out_shape[0] = @intCast(rows);
-    out_shape[1] = @intCast(out_cols);
-
-    const out_buf = try input.allocator.create(Buf);
-    out_buf.* = .{
-        .data = out,
-        .allocator = input.allocator,
-        .owned = true,
-        .logical_shape = out_shape,
-    };
-    return out_buf;
+    var owned: ?[]f32 = try self.allocator.alloc(f32, try std.math.mul(usize, rows, out_cols));
+    errdefer if (owned) |data| self.allocator.free(data);
+    for (0..rows) |row| @memcpy(owned.?[row * out_cols ..][0..out_cols], input_data[row * cols + start .. row * cols + stop]);
+    // Reshape/last-use consumers must share ownership of these rows. A legacy
+    // owned Buf without a refcount turns reshape into a dangling borrowed view.
+    const result = try self.makeBuf(owned.?, true);
+    owned = null;
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(out_cols) });
 }
 
 fn evalTensorOp(_: *anyopaque, _: CT) anyerror!void {}
@@ -51076,6 +52221,23 @@ test "Qwen3-VL vision attention portable fallback treats an empty mask as unmask
     try std.testing.expectEqualSlices(f32, &.{ 3.0, 3.0 }, getData(output));
 }
 
+test "embeddinggemma2 video full F32 vision fallback preserves independent unmasked native cohorts" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+    var zeros = [_]f32{ 0, 0, 0, 0 };
+    var values = [_]f32{ 2, 4, 10, 14 };
+    const qk = try compute.makeBuf(&zeros, false);
+    defer freeTensor(&compute, qk);
+    const v = try compute.makeBuf(&values, false);
+    defer freeTensor(&compute, v);
+    const output = try cb.scaledDotProductAttentionEmbeddingGemma2Vision(qk, qk, v, 2, 2, 1, 1);
+    defer freeTensor(&compute, output);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 3, 12, 12 }, getData(output));
+}
+
 test "ComputeBackend causalSelfAttention call site matches naive reference" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -51722,6 +52884,71 @@ test "native conv ops preserve runtime logical shape" {
     try std.testing.expectEqualSlices(i64, &.{ 2, 1, 2, 2 }, conv2_shape);
 }
 
+test "native conv1d preserves channel order bias padding and stride" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var input_values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    var weights = [_]f32{ 1, 0, -1, 0.5, 1, 0, 0.5, 0.25, -0.5, 1, -1, 0.5 };
+    var pointwise_weights = [_]f32{ 2, 0.5, -1, 1 };
+    var biases = [_]f32{ 0.25, -0.25 };
+    const input = try compute.makeBuf(&input_values, false);
+    defer cb.free(input);
+    const weight = try compute.makeBuf(&weights, false);
+    defer cb.free(weight);
+    const pointwise_weight = try compute.makeBuf(&pointwise_weights, false);
+    defer cb.free(pointwise_weight);
+    const bias = try compute.makeBuf(&biases, false);
+    defer cb.free(bias);
+    const strided = try cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 2, 1);
+    defer cb.free(strided);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2 }, tensorStoredShape(strided).?);
+    try std.testing.expectEqualSlices(f32, &.{ 3.25, 8.25, -3, 2.5, 3.25, 20.25, -9, 8.5 }, getData(strided));
+    const pointwise = try cb.conv1d(input, pointwise_weight, bias, 2, 2, 2, 4, 1, 1, 0);
+    defer cb.free(pointwise);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 4 }, tensorStoredShape(pointwise).?);
+    try std.testing.expectEqualSlices(f32, &.{ 4.75, 7.25, 9.75, 12.25, 3.75, 3.75, 3.75, 3.75, 24.75, 27.25, 29.75, 32.25, 3.75, 3.75, 3.75, 3.75 }, getData(pointwise));
+    try std.testing.expectError(error.InvalidInputShape, cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 0, 1));
+    try std.testing.expectError(error.InvalidInputShape, cb.conv1d(input, weight, bias, 2, 2, 2, 3, 3, 1, 0));
+
+    const WorkspaceAdmission = struct {
+        backing: std.mem.Allocator,
+        rejected: bool = false,
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The general convolution's 2 x 6 im2col matrix is optional.
+            if (len == 12 * @sizeOf(f32) and !self.rejected) {
+                self.rejected = true;
+                return null;
+            }
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawResize(memory, alignment, len, ret_addr);
+        }
+        fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawRemap(memory, alignment, len, ret_addr);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(memory, alignment, ret_addr);
+        }
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    var admission: WorkspaceAdmission = .{ .backing = allocator };
+    compute.allocator = .{ .ptr = &admission, .vtable = &WorkspaceAdmission.vtable };
+    defer compute.allocator = allocator;
+    const bounded = try cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 2, 1);
+    defer cb.free(bounded);
+    try std.testing.expect(admission.rejected);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2 }, tensorStoredShape(bounded).?);
+    try std.testing.expectEqualSlices(f32, getData(strided), getData(bounded));
+}
+
 test "native rejects mismatched shaped buffers before conv2d" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -52315,4 +53542,804 @@ test "native integer numeric views retain exact bytes and propagate allocation f
     const exact = (try cb.exportTensorData(output, a)).?;
     defer a.free(exact.payload.bytes);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994 }), exact.payload.bytes);
+}
+
+test "native embedding rows preserve shape through Gemma PLE arithmetic and layer slicing" {
+    const allocator = std.testing.allocator;
+    var weights = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const weight = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
+    defer cb.free(weight);
+    const tokens = try cb.embeddingLookup(weight, &.{ 1, 0 }, 2, 4);
+    defer cb.free(tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, tensorStoredShape(tokens).?);
+    const scalar = try cb.fromFloat32Shape(&.{2}, &.{1});
+    defer cb.free(scalar);
+    const scaled = try cb.multiply(tokens, scalar);
+    defer cb.free(scaled);
+    const projection = try cb.fromFloat32Shape(&.{ 1, 1, 1, 1, 2, 2, 2, 2 }, &.{ 2, 4 });
+    defer cb.free(projection);
+    const combined = try cb.add(scaled, projection);
+    defer cb.free(combined);
+    const normalized = (try cb.multiplyScalar(combined, 0.5)).?;
+    defer cb.free(normalized);
+    const layer = try cb.sliceLastDim(normalized, 2, 4);
+    defer cb.free(layer);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, tensorStoredShape(layer).?);
+    try std.testing.expectEqualSlices(f32, &.{ 7.5, 8.5, 4, 5 }, getData(layer));
+}
+
+test "embeddinggemma2 video native unmasked tiled attention keeps batch and head identity" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+    const seq = 65;
+    const heads = 3;
+    const dim = 7;
+    var qk: [2 * heads * seq * dim]f32 = @splat(0);
+    var values: [qk.len]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @floatFromInt(1 + i / (seq * dim));
+    const q = try compute.makeBuf(&qk, false);
+    defer freeTensor(&compute, q);
+    const v = try compute.makeBuf(&values, false);
+    defer freeTensor(&compute, v);
+    const result = try cb.scaledDotProductAttentionEmbeddingGemma2Vision(q, q, v, 2, seq, heads, dim);
+    defer freeTensor(&compute, result);
+    for (getData(result), values) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+}
+
+test "embeddinggemma2 video native row assembly checks ownership bounds and overlapping copies" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const tensor = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer cb.free(tensor);
+    try std.testing.expect(try cb.copyRows2D(a, tensor, 1, tensor, 0, 2, 2));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 1, 2, 3, 4 }, getData(tensor));
+    try std.testing.expectError(error.InvalidTensorShape, cb.copyRows2D(a, tensor, 3, tensor, 0, 1, 2));
+    var borrowed = [_]f32{ 1, 2 };
+    const immutable = try compute.makeBuf(&borrowed, false);
+    defer cb.free(immutable);
+    try std.testing.expectError(error.InvalidTensorShape, cb.copyRows2D(a, immutable, 0, tensor, 0, 1, 2));
+}
+
+test "embeddinggemma2 native media mirrors cannot be reclaimed while compute borrowers are live" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 128 }) };
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer store.resident_weights.deinit(a);
+    var bits = [_]u16{ 0x3f80, 0x4000 };
+    for ([_][]const u8{ "vision_tower.encoder.layers.0.input_layernorm.weight", "audio_tower.layers.0.norm_out.weight" }) |name| {
+        var compute = NativeCompute.init(a, &store, null);
+        compute.cache_embeddinggemma2_bf16_weights = true;
+        const source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&bits), .dtype = .bf16, .shape = &.{2}, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+        const mirror = (try cachedEmbeddingGemma2F32Weight(&compute, name, &source)).?;
+        const class = embeddinggemma2_weight_cache.nativeClass(name).?;
+        try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&store, class));
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, mirror);
+        compute.deinit();
+        try std.testing.expectEqual(@as(usize, 8), reclaimEmbeddingGemma2Weights(&store, class));
+        try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+    }
+    deinitEmbeddingGemma2F32Cache(&store);
+}
+
+test "embeddinggemma2 native packed QKV reuses admitted snapshots and preserves independent outputs" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 }) };
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer store.resident_weights.deinit(a);
+    var compute = NativeCompute.init(a, &store, null);
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    var cb = compute.computeBackend();
+    var values = [_]f32{ 1, 2, 3, 4 };
+    const names = [_][]const u8{ "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight", "vision_tower.encoder.layers.0.self_attn.k_proj.linear.weight", "vision_tower.encoder.layers.0.self_attn.v_proj.linear.weight" };
+    var weights: [3]CT = undefined;
+    for (&weights, names) |*weight, name| {
+        try store.resident_weights.put(a, name, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&values), .shape = &.{ 2, 2 }, .dtype = .f32, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+        weight.* = try cb.getWeight(name);
+    }
+    const input = try cb.fromFloat32Shape(&.{ 2, 3, 5, 7 }, &.{ 2, 2 });
+    for (0..2) |_| {
+        const result = try cb.linearTripleNoBias(input, weights[0], weights[1], weights[2], 2, 2, 2);
+        defer {
+            cb.free(result.first);
+            cb.free(result.second);
+            cb.free(result.third);
+        }
+        for ([_]CT{ result.first, result.second, result.third }) |part| try std.testing.expectEqualSlices(f32, &.{ 8, 18, 19, 43 }, getData(part));
+        try std.testing.expectEqual(@as(usize, 1), store.embeddinggemma2_f32_cache.count());
+        try std.testing.expectEqual(@as(usize, 48), store.tier_cache.?.host_bytes);
+    }
+    cb.free(input);
+    for (weights) |weight| cb.free(weight);
+    compute.deinit();
+    try std.testing.expectEqual(@as(usize, 48), reclaimEmbeddingGemma2Weights(&store, .vision));
+    deinitEmbeddingGemma2F32Cache(&store);
+}
+
+test "embeddinggemma2 vision BLAS attention preserves independent rows and portable arithmetic" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    const batch = 2;
+    const seq = 35;
+    const heads = 3;
+    const dim = 8;
+    var values: [batch * seq * heads * dim]f32 = undefined;
+    for (&values, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173) * 0.4;
+    const input = try cb.fromFloat32Shape(&values, &.{ batch * seq, heads * dim });
+    defer cb.free(input);
+    const actual = try cb.scaledDotProductAttentionEmbeddingGemma2Vision(input, input, input, batch, seq, heads, dim);
+    defer cb.free(actual);
+    const expected = try sdpaOp(&compute, input, input, input, &.{}, null, batch, seq, heads, dim);
+    defer cb.free(expected);
+    for (getData(expected), getData(actual)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+}
+
+test "embeddinggemma2 fused vision allocation failures release output ownership once" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+            defer cb.free(input);
+            const weight = try cb.fromFloat32Shape(&.{ 1, 1, 1, 1 }, &.{4});
+            defer cb.free(weight);
+            const result = (try cb.visionNormRope(input, weight, .{ .rows = 1, .hidden = 4, .head_dim = 4, .grid_x = 1, .grid_y = 1, .eps = 1e-6, .theta = 10000, .scale = 1 })).?;
+            defer cb.free(result);
+            try std.testing.expectEqual(@as(usize, 4), getData(result).len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+// Paired diagnostic benchmark; opt-in so ordinary correctness runs do not
+// assert host-specific timing or contend with other test jobs.
+test "embeddinggemma2 dense vision tile benchmark" {
+    if (!platform.env.getenvBool("ANTFLY_BENCH_DENSE_VISION_TILES")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Old = struct {
+        pub const dense_query_block = 256;
+        pub const dense_key_block = 1024;
+        pub const sgemmTransBSync = native.sgemmTransBSync;
+        pub const sgemmSync = native.sgemmSync;
+    };
+    const New = struct {
+        pub const dense_query_block = 128;
+        pub const dense_key_block = 2048;
+        pub const sgemmTransBSync = native.sgemmTransBSync;
+        pub const sgemmSync = native.sgemmSync;
+    };
+    for ([_]usize{ 576, 1089, 2025 }) |sequence| {
+        const data = try a.alloc(f32, sequence * 12 * 64);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 257)) * 0.017);
+        var old_ns: u64 = 0;
+        var new_ns: u64 = 0;
+        var portable_ns: u64 = 0;
+        for (0..3) |iteration| {
+            var start = platform.time.monotonicNs();
+            const expected = try linalg.denseAttentionHostWithGemmIo(Old, a, std.testing.io, data, data, data, 1, sequence, 12, 64);
+            defer a.free(expected);
+            if (iteration != 0) old_ns += platform.time.monotonicNs() - start;
+            start = platform.time.monotonicNs();
+            const actual = try linalg.denseAttentionHostWithGemmIo(New, a, std.testing.io, data, data, data, 1, sequence, 12, 64);
+            defer a.free(actual);
+            if (iteration != 0) new_ns += platform.time.monotonicNs() - start;
+            for (expected, actual) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-5);
+            start = platform.time.monotonicNs();
+            const portable = try linalg.denseAttentionPortableHostWithIo(a, std.testing.io, data, data, data, 1, sequence, 12, 64);
+            defer a.free(portable);
+            if (iteration != 0) portable_ns += platform.time.monotonicNs() - start;
+            for (expected, portable) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-5);
+        }
+        std.debug.print("dense-vision-tile sequence={d} baseline_ns={d} candidate_ns={d} portable_ns={d}\n", .{ sequence, old_ns / 2, new_ns / 2, portable_ns / 2 });
+    }
+}
+
+test "embeddinggemma2 variable packed linears preserve unequal widths cache ownership and pressure fallback" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 }) };
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer store.resident_weights.deinit(a);
+    var compute = NativeCompute.init(a, &store, null);
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    var first_values = [_]f32{ 1, 2, 3, 4 };
+    var second_values = [_]f32{ -1, 2 };
+    const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+    try store.resident_weights.put(a, names[0], .{ .tensor = .{ .data = std.mem.sliceAsBytes(&first_values), .shape = &.{ 2, 2 }, .dtype = .f32, .name = names[0], .allocator = a, .owns_data = false, .owns_shape = false } });
+    try store.resident_weights.put(a, names[1], .{ .tensor = .{ .data = std.mem.sliceAsBytes(&second_values), .shape = &.{ 1, 2 }, .dtype = .f32, .name = names[1], .allocator = a, .owns_data = false, .owns_shape = false } });
+    const input = try cb.fromFloat32Shape(&.{ 2, 3, 5, 7 }, &.{ 2, 2 });
+    for (0..2) |_| {
+        const output = (try cb.linearPackedNamed(input, &names, &.{ 2, 1 }, 2, 2)).?;
+        defer cb.free(output);
+        try std.testing.expectEqualSlices(f32, &.{ 8, 18, 4, 19, 43, 9 }, getData(output));
+        try std.testing.expectEqual(@as(usize, 24), store.tier_cache.?.host_bytes);
+        try std.testing.expectEqual(@as(usize, 1), store.embeddinggemma2_f32_cache.count());
+    }
+    cb.free(input);
+    compute.deinit();
+    try std.testing.expectEqual(@as(usize, 24), reclaimEmbeddingGemma2Weights(&store, .language));
+    deinitEmbeddingGemma2F32Cache(&store);
+    store.tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1 });
+    var denied = NativeCompute.init(a, &store, null);
+    defer denied.deinit();
+    denied.cache_embeddinggemma2_bf16_weights = true;
+    const other = denied.computeBackend();
+    const data = try other.fromFloat32Shape(&.{ 2, 3 }, &.{ 1, 2 });
+    defer other.free(data);
+    try std.testing.expect(try other.linearPackedNamed(data, &names, &.{ 2, 1 }, 1, 2) == null);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+    try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_f32_cache.count());
+}
+
+test "embeddinggemma2 packed GELU product preserves tanh arithmetic and allocation ownership" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ -2, 1, 3, 4, 0.5, -0.25, 2, 3 }, &.{ 2, 4 });
+            defer cb.free(input);
+            const output = (try packedGeluMultiplyOp(&compute, input, 2, 2)).?;
+            defer cb.free(output);
+            const gate = try cb.fromFloat32Shape(&.{ -2, 1, 0.5, -0.25 }, &.{ 2, 2 });
+            defer cb.free(gate);
+            const up = try cb.fromFloat32Shape(&.{ 3, 4, 2, 3 }, &.{ 2, 2 });
+            defer cb.free(up);
+            const expected = (try cb.activationMultiply(gate, up, .gelu)).?;
+            defer cb.free(expected);
+            for (getData(expected), getData(output)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 dense vision calibration bounds exploration ignores failures and isolates geometry" {
+    var calibration = DenseVisionTiles{};
+    const key = DenseVisionTiles.Key{ .batch = 1, .sequence = 1089, .heads = 12, .dim = 64 };
+    const canceled = calibration.begin(key);
+    calibration.finish(canceled, null);
+    for (0..8) |_| {
+        const ticket = calibration.begin(key);
+        calibration.finish(ticket, if (ticket.policy == 0) 200 else 100);
+    }
+    const winner = calibration.begin(key);
+    try std.testing.expectEqual(@as(usize, 1), winner.policy);
+    try std.testing.expect(winner.slot == null);
+    var other = key;
+    other.sequence = 2025;
+    var pending: [8]DenseVisionTiles.Ticket = undefined;
+    for (&pending) |*ticket| ticket.* = calibration.begin(other);
+    try std.testing.expect(calibration.begin(other).slot == null);
+    for (pending) |ticket| calibration.finish(ticket, null);
+    const retry = calibration.begin(other);
+    try std.testing.expect(retry.slot != null);
+    calibration.finish(retry, null);
+    try std.testing.expectEqual(@as(usize, 1), calibration.begin(key).policy);
+}
+
+test "embeddinggemma2 sliced projection rows survive reshape producer release and allocation failures" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 2, 6 });
+            defer cb.free(source);
+            var slice: ?CT = try cb.sliceLastDim(source, 2, 6);
+            defer if (slice) |tensor| cb.free(tensor);
+            const reshaped = (try cb.reshape2d(slice.?, 4, 2)).?;
+            defer cb.free(reshaped);
+            cb.free(slice.?);
+            slice = null;
+            try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6, 9, 10, 11, 12 }, getData(reshaped));
+            const ones = try cb.fromFloat32Shape(&.{ 1, 1 }, &.{2});
+            defer cb.free(ones);
+            try std.testing.expectEqual(reshaped, (try cb.rmsNormConsumeInput(reshaped, ones, 2, 1e-6)).?);
+            for (getData(reshaped)) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 typed position lookup flattens axes without full F32 mirrors and survives OOM" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100 };
+            const name = "vision_tower.patch_embedder.position_embedding_table";
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.resident_weights.deinit(a);
+            try store.resident_weights.put(a, name, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&bits), .shape = &.{ 2, 2, 2 }, .dtype = .bf16, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            const cb = compute.computeBackend();
+            const table = try cb.getEmbeddingWeight(name);
+            defer cb.free(table);
+            try std.testing.expectEqual(@as(usize, 0), toBuf(table).data.len);
+            const rows = try cb.embeddingLookup(table, &.{ 3, 0, 2 }, 3, 2);
+            defer cb.free(rows);
+            try std.testing.expectEqualSlices(f32, &.{ 7, 8, 1, 2, 5, 6 }, try getDataChecked(rows));
+            try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_f32_cache.count());
+            const invalid = cb.embeddingLookup(table, &.{4}, 1, 2) catch |err| switch (err) {
+                error.InvalidTensorShape => return,
+                else => return err,
+            };
+            cb.free(invalid);
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 fused head preparation drains OOM invalid shape cancellation and retry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            var compute = NativeCompute.init(a, &store, null);
+            compute.io = io;
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 4, 3, 2, 1 }, &.{ 2, 4 });
+            defer cb.free(input);
+            const ids = (try cb.fromInt32Shape(&.{ 1, 0 }, &.{2})).?;
+            defer cb.free(ids);
+            const p = ops.EmbeddingHeadParams{ .source_rows = 2, .rows = 2, .source_heads = 1, .heads = 1, .dim = 4, .sequence = 2, .stride = 4, .start = 0, .rotate = 1, .gather = 1, .weighted = 0, .eps = 1e-6, .theta = 10000, .scale = 1 };
+            var bad = p;
+            bad.stride = 1;
+            try std.testing.expectError(error.InvalidTensorShape, embeddingHeadPrepareOp(&compute, input, null, ids, bad));
+            const result = try embeddingHeadPrepareOp(&compute, input, null, ids, p);
+            defer cb.free(result);
+            for (try getDataChecked(result)) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "embeddinggemma2 grouped portable shared KV scheduling benchmark" {
+    if (!platform.env.getenvBool("ANTFLY_BENCH_GROUPED_ATTENTION")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Portable = struct {
+        pub const query_block = 128;
+        pub const key_block = 512;
+        pub const sgemmSync = linalg.sgemmSequential;
+        pub const sgemmTransBSync = linalg.sgemmTransBSequential;
+    };
+    for ([_][3]usize{ .{ 128, 256, 2 }, .{ 512, 256, 2 }, .{ 2048, 512, 1 } }) |shape| {
+        const rows = shape[0];
+        const dim = shape[1];
+        const kv = shape[2];
+        const q = try a.alloc(f32, rows * 4 * dim);
+        defer a.free(q);
+        const k = try a.alloc(f32, rows * kv * dim);
+        defer a.free(k);
+        for (q, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
+        for (k, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.13) * 0.1;
+        const ranges = try a.alloc(u32, rows * 6);
+        defer a.free(ranges);
+        @memset(ranges, 0);
+        const positions = try a.alloc(i32, rows);
+        defer a.free(positions);
+        for (positions, 0..) |*position, row| {
+            position.* = @intCast(row);
+            ranges[row * 6] = @intCast(if (dim == 512) 0 else row -| 512);
+            ranges[row * 6 + 1] = @intCast(if (dim == 512) rows else @min(rows, row + 513));
+        }
+        var serial_ns: u64 = 0;
+        var workers_ns: u64 = 0;
+        for (0..4) |sample| {
+            const start = platform.time.monotonicNs();
+            const serial = if (rows >= 256 and (rows <= 512 or dim == 512))
+                try linalg.segmentAttentionGroupedHostWithGemmIo(native.EmbeddingGemma2SegmentAttentionGemm(1024), a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1)
+            else
+                try linalg.segmentAttentionGroupedHostWithGemmIo(native.SegmentAttentionGemm, a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1);
+            defer a.free(serial);
+            const middle = platform.time.monotonicNs();
+            const workers = try linalg.segmentAttentionGroupedHostWithGemmParallelIo(Portable, a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1);
+            defer a.free(workers);
+            const end = platform.time.monotonicNs();
+            for (serial, workers) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+            if (sample != 0) {
+                serial_ns += middle - start;
+                workers_ns += end - middle;
+            }
+        }
+        std.debug.print("grouped-portable rows={d} dim={d} kv={d} serial_ns={d} workers_ns={d}\n", .{ rows, dim, kv, serial_ns / 3, workers_ns / 3 });
+    }
+}
+
+test "embeddinggemma2 canonical projection views share one BF16 snapshot in either warmup order" {
+    if (!native.useBlas()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+    for ([_]bool{ false, true }) |packed_first| {
+        var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 24 }) };
+        initPrefetchQueue(&store, a);
+        defer deinitPrefetchQueue(&store);
+        defer store.resident_weights.deinit(a);
+        defer deinitEmbeddingGemma2F32Cache(&store);
+        var first = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+        var second = [_]u16{ 0xbf80, 0x4000 };
+        try store.resident_weights.put(a, names[0], .{ .tensor = .{ .data = std.mem.sliceAsBytes(&first), .shape = &.{ 2, 2 }, .dtype = .bf16, .name = names[0], .allocator = a, .owns_data = false, .owns_shape = false } });
+        try store.resident_weights.put(a, names[1], .{ .tensor = .{ .data = std.mem.sliceAsBytes(&second), .shape = &.{ 1, 2 }, .dtype = .bf16, .name = names[1], .allocator = a, .owns_data = false, .owns_shape = false } });
+        for (0..2) |request| {
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ 2, 3 }, &.{ 1, 2 });
+            defer cb.free(input);
+            if (!packed_first or request > 0) {
+                const up = try cb.getWeight(names[1]);
+                defer cb.free(up);
+                const result = try cb.linearNoBias(input, up, 1, 2, 1);
+                defer cb.free(result);
+                try std.testing.expectEqualSlices(f32, &.{4}, getData(result));
+            }
+            const result = (try cb.linearPackedNamed(input, &names, &.{ 2, 1 }, 1, 2)).?;
+            defer cb.free(result);
+            try std.testing.expectEqualSlices(f32, &.{ 8, 18, 4 }, getData(result));
+            const up = try cb.acquireWeight(names[1]);
+            defer cb.free(up);
+            var it = store.embeddinggemma2_f32_cache.valueIterator();
+            const entry = it.next().?;
+            try std.testing.expectEqual(entry.data.ptr + 4, toBuf(up).data.ptr);
+            try std.testing.expectEqual(@as(usize, 1), store.embeddinggemma2_f32_cache.count());
+            try std.testing.expectEqual(@as(usize, 24), store.tier_cache.?.host_bytes);
+            // Snapshot lifetime is independent of checkpoint staging and the
+            // next request's allocator/handles.
+            @memset(&first, 0);
+            @memset(&second, 0);
+        }
+        try std.testing.expectEqual(@as(usize, 24), reclaimEmbeddingGemma2Weights(&store, .language));
+    }
+}
+
+test "embeddinggemma2 prepared constants snapshot shape survive requests and yield under audio pressure" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 16 }) };
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitEmbeddingGemma2F32Cache(&store);
+    for (0..2) |request| {
+        var compute = NativeCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.cache_embeddinggemma2_bf16_weights = true;
+        const cb = compute.computeBackend();
+        const key = "audio_tower.prepared.test.v1";
+        if (request == 0) {
+            const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer cb.free(input);
+            const result = (try cb.modelConstant(key, input)).?;
+            defer cb.free(result);
+            @memset(toBuf(input).data, 0);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, getData(result));
+            try std.testing.expect(try cb.modelConstant("audio_tower.prepared.denied", input) == null);
+        }
+        const result = (try cb.modelConstant(key, null)).?;
+        defer cb.free(result);
+        try std.testing.expect((try cb.tensorShapeMatches(result, &.{ 2, 2 })).?);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, getData(result));
+        try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&store, .audio));
+        try std.testing.expectEqual(@as(usize, 16), store.embeddinggemma2_constant_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 16), reclaimEmbeddingGemma2Weights(&store, .audio));
+    try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_constant_count);
+}
+
+test "embeddinggemma2 prepared constants allocation failures never leave unowned snapshots" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 }) };
+            initPrefetchQueue(&store, a);
+            defer deinitPrefetchQueue(&store);
+            defer deinitEmbeddingGemma2F32Cache(&store);
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer cb.free(input);
+            if (try cb.modelConstant("audio_tower.prepared.test.v1", input)) |result| cb.free(result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 prepared constant cancellation releases consumers and permits snapshot retry" {
+    const Probe = struct {
+        checks: usize = 0,
+        fail_at: usize,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return error.Cancelled;
+        }
+    };
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 16 }) };
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitEmbeddingGemma2F32Cache(&store);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    var cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(input);
+    const key = "audio_tower.prepared.cancel.v1";
+    var before = Probe{ .fail_at = 1 };
+    cb.execution_control = .{ .ptr = &before, .check_fn = Probe.check };
+    try std.testing.expectError(error.Cancelled, cb.modelConstant(key, input));
+    try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_constant_count);
+    var after = Probe{ .fail_at = 2 };
+    cb.execution_control = .{ .ptr = &after, .check_fn = Probe.check };
+    try std.testing.expectError(error.Cancelled, cb.modelConstant(key, input));
+    try std.testing.expectEqual(@as(usize, 1), store.embeddinggemma2_constant_count);
+    cb.execution_control = null;
+    const result = (try cb.modelConstant(key, null)).?;
+    defer cb.free(result);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, getData(result));
+}
+
+test "embeddinggemma2 fused norm residual and clamp SiLU preserve tails scales and inputs" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer deinitPrefetchQueue(&store);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    for ([_]usize{ 7, 256, 513, 1536 }) |dim| {
+        const rows = 3;
+        const x = try a.alloc(f32, rows * dim);
+        defer a.free(x);
+        const res = try a.alloc(f32, x.len);
+        defer a.free(res);
+        const w = try a.alloc(f32, dim);
+        defer a.free(w);
+        for (x, res, 0..) |*v, *r, i| {
+            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+            r.* = @cos(@as(f32, @floatFromInt(i)) * 0.07);
+        }
+        for (w, 0..) |*v, i| v.* = 0.3 + @as(f32, @floatFromInt(i % 13)) * 0.05;
+        const xc = try cb.fromFloat32Shape(x, &.{ rows, @intCast(dim) });
+        defer cb.free(xc);
+        const rc = try cb.fromFloat32Shape(res, &.{ rows, @intCast(dim) });
+        defer cb.free(rc);
+        const wc = try cb.fromFloat32Shape(w, &.{@intCast(dim)});
+        defer cb.free(wc);
+        for ([_][2]f32{ .{ 1, 1 }, .{ 0.5, -0.7 }, .{ 0, 2 } }) |scales| {
+            const fused = (try cb.rmsNormResidual(xc, wc, rc, dim, 1e-6, scales[0], scales[1])).?;
+            defer cb.free(fused);
+            try std.testing.expect((try cb.tensorShapeMatches(fused, &.{ rows, @intCast(dim) })).?);
+            const actual = getData(fused);
+            for (0..rows) |r| {
+                var sum: f64 = 0;
+                for (x[r * dim ..][0..dim]) |v| sum += @as(f64, v) * v;
+                const inv = 1 / @sqrt(sum / @as(f64, @floatFromInt(dim)) + 1e-6);
+                for (0..dim) |c| {
+                    const i = r * dim + c;
+                    const expected: f32 = @floatCast((res[i] + @as(f64, x[i]) * inv * w[c] * scales[0]) * scales[1]);
+                    try std.testing.expectApproxEqAbs(expected, actual[i], 2e-6);
+                }
+            }
+        }
+        const clamped = (try cb.clampSilu(xc, -0.25, 0.6)).?;
+        defer cb.free(clamped);
+        for (getData(clamped), x) |v, src| {
+            const t: f64 = @min(@max(src, -0.25), 0.6);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(t / (1 + @exp(-t)))), v, 2e-6);
+        }
+        try std.testing.expectEqualSlices(f32, x, getData(xc));
+    }
+    const bounds: [4]?f32 = .{ -1, null, null, 2 };
+    try std.testing.expect(try cb.modelScalarBounds("audio.test", null) == null);
+    try std.testing.expectEqual(bounds, (try cb.modelScalarBounds("audio.test", bounds)).?);
+    // First publication wins; subsequent callers cannot change model constants.
+    try std.testing.expectEqual(bounds, (try cb.modelScalarBounds("audio.test", .{ 0, 0, 0, 0 })).?);
+}
+
+test "embeddinggemma2 fused epilogues unwind allocation failures" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            defer deinitPrefetchQueue(&store);
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const x = try cb.fromFloat32Shape(&.{ 1, 2, -1, -2 }, &.{ 2, 2 });
+            defer cb.free(x);
+            const w = try cb.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+            defer cb.free(w);
+            const out = (try cb.rmsNormResidual(x, w, x, 2, 1e-6, 0.5, -1)).?;
+            defer cb.free(out);
+            const activated = (try cb.clampSilu(out, -0.5, 0.5)).?;
+            defer cb.free(activated);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 prepared panels share admission pin readers and reclaim atomically" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 49152 }) };
+            initPrefetchQueue(&store, a);
+            defer deinitPrefetchQueue(&store);
+            var compute = NativeCompute.init(a, &store, null);
+            var live = true;
+            defer if (live) compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            var raw: [128 * 64 * 2]u8 = undefined;
+            for (0..128 * 64) |i| {
+                raw[i * 2] = 0x80;
+                raw[i * 2 + 1] = 0x3f;
+            }
+            var source = tensor_mod.Tensor{ .data = &raw, .shape = &.{ 128, 64 }, .dtype = .bf16, .name = "language_model.layers.0.self_attn.o_proj.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+            const dense = (try cachedEmbeddingGemma2F32Weight(&compute, source.name, &source)).?;
+            const panels = (try preparedEmbeddingGemma2Panels(&compute, dense[0..4096], 64, 64)).?;
+            const again = (try preparedEmbeddingGemma2Panels(&compute, dense[0..4096], 64, 64)).?;
+            try std.testing.expectEqual(panels.data.ptr, again.data.ptr);
+            try std.testing.expectEqual(@as(usize, 49152), store.tier_cache.?.host_bytes);
+            try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&store, .language));
+            // Unowned request memory cannot become a persistent weight plan.
+            var other: [4096]f32 = @splat(2);
+            try std.testing.expect(try preparedEmbeddingGemma2Panels(&compute, &other, 64, 64) == null);
+            // A second geometry cannot bypass the shared cap.
+            try std.testing.expect(try preparedEmbeddingGemma2Panels(&compute, dense[4096..8192], 64, 64) == null);
+            compute.deinit();
+            live = false;
+            try std.testing.expectEqual(@as(usize, 49152), reclaimEmbeddingGemma2Weights(&store, .language));
+            try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+            try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_panels.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 panel admission protects unwarmed dense weights" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.lazy_weights.deinit(a);
+    try store.lazy_weights.put(a, "language_model.layers.0.self_attn.o_proj.weight", .{ .tensor_ref = .{ .name = "weight", .byte_len = 1024 } });
+    try store.lazy_weights.put(a, "vision_tower.weight", .{ .tensor_ref = .{ .name = "vision", .byte_len = 2048 } });
+    try store.lazy_weights.put(a, "language_model.embed_tokens.weight", .{ .tensor_ref = .{ .name = "vocab", .byte_len = 1000000 } });
+    const floor = embeddingGemma2DenseFloor(&store);
+    try std.testing.expectEqual(@as(usize, 2048), floor[0]);
+    try std.testing.expectEqual(@as(usize, 4096), floor[1]);
+    try std.testing.expectEqual(embeddinggemma2_weight_cache.prepared_max_bytes, floor[2]);
+}
+
+test "embeddinggemma2 retained row slices survive parent release and nested reshape" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            for ([_]bool{ false, true }) |typed| {
+                const parent = if (typed) blk: {
+                    var source = try tensor_mod.Tensor.initInt16(a, "language_model.ple.per_layer_model_projection.weight", &.{ 3, 2 }, &.{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 });
+                    source.dtype = .bf16;
+                    break :blk try compute.makeBufWithOwnedSourceTensor(source);
+                } else try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+                const slice = sliceRows2DOp(&compute, parent, 1, 2, 2) catch |err| {
+                    cb.free(parent);
+                    return err;
+                };
+                try std.testing.expect(uniqueOwnedDenseBuf(parent) == null);
+                cb.free(parent);
+                defer cb.free(slice);
+                const inner = try sliceRows2DOp(&compute, slice, 1, 1, 2);
+                defer cb.free(inner);
+                const values = try cb.toFloat32(inner, a);
+                defer a.free(values);
+                try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, values);
+                if (!typed) {
+                    const alias = (try cb.reshape2d(inner, 2, 1)).?;
+                    defer cb.free(alias);
+                    try std.testing.expectEqual(getData(slice).ptr + 2, getData(alias).ptr);
+                    try std.testing.expectEqual(@as(usize, 2), toBuf(alias).source_row);
+                    try std.testing.expect(uniqueOwnedDenseBuf(slice) == null);
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 canonical CPU panels own typed grouped weights without dense mirrors" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, exercise_dispatch: bool) !void {
+            const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 32768 }) };
+            initPrefetchQueue(&store, a);
+            defer deinitPrefetchQueue(&store);
+            defer store.resident_weights.deinit(a);
+            var raw: [2][64 * 64]u16 = .{ @splat(0x3f80), @splat(0x4000) };
+            for (names, 0..) |name, i| try store.resident_weights.put(a, name, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&raw[i]), .shape = &.{ 64, 64 }, .dtype = .bf16, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+            var compute = NativeCompute.init(a, &store, null);
+            var live = true;
+            defer if (live) compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            const panels = (try canonicalCpuPanels(&compute, &names, 64)).?;
+            @memset(&raw[0], 0);
+            @memset(&raw[1], 0);
+            const warm = (try canonicalCpuPanels(&compute, &names, 64)).?;
+            try std.testing.expectEqual(panels.data.ptr, warm.data.ptr);
+            try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_f32_cache.count());
+            try std.testing.expectEqual(@as(usize, 32768), store.tier_cache.?.host_bytes);
+            var input: [2 * 64]f32 = @splat(1);
+            var output: [2 * 128]f32 = undefined;
+            try linalg.sgemmPrepared(null, 2, panels, &input, &output);
+            for (0..2) |r| {
+                for (output[r * 128 ..][0..64]) |v| try std.testing.expectEqual(@as(f32, 64), v);
+                for (output[r * 128 + 64 ..][0..64]) |v| try std.testing.expectEqual(@as(f32, 128), v);
+            }
+            if (exercise_dispatch and !native.useBlas()) {
+                const cb = compute.computeBackend();
+                const x = try cb.fromFloat32Shape(&input, &.{ 2, 64 });
+                defer cb.free(x);
+                const up = try cb.getWeight(names[1]);
+                defer cb.free(up);
+                const y = try cb.linearNoBias(x, up, 2, 64, 64);
+                defer cb.free(y);
+                for (getData(y)) |v| try std.testing.expectEqual(@as(f32, 128), v);
+                const grouped = (try cb.linearPackedNamed(x, &names, &.{ 64, 64 }, 2, 64)).?;
+                defer cb.free(grouped);
+                try std.testing.expectEqualSlices(f32, &output, getData(grouped));
+                try std.testing.expectEqual(@as(usize, 1), store.embeddinggemma2_canonical_panels.count());
+            }
+            try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&store, .language));
+            compute.deinit();
+            live = false;
+            try std.testing.expectEqual(@as(usize, 32768), reclaimEmbeddingGemma2Weights(&store, .language));
+            try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+            store.tier_cache.?.budget.host_limit_bytes = 32767;
+            var denied = NativeCompute.init(a, &store, null);
+            defer denied.deinit();
+            denied.cache_embeddinggemma2_bf16_weights = true;
+            try std.testing.expect(try canonicalCpuPanels(&denied, &names, 64) == null);
+            try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_canonical_panels.count());
+            try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_f32_readers);
+            try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+            if (exercise_dispatch) {
+                const source = &store.resident_weights.getPtr(names[0]).?.tensor;
+                source.data = source.data[0 .. source.data.len - 2];
+                try std.testing.expectError(error.InvalidTensorShape, canonicalCpuPanels(&denied, &names, 64));
+                try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_canonical_panels.count());
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{false});
+    try Case.run(std.testing.allocator, true);
 }

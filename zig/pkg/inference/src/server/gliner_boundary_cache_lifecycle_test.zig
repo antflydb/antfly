@@ -134,7 +134,7 @@ fn inspect(node: *Node, directory: []const u8, pins: pipeline.PublishedModelFile
             try std.testing.expectEqual(handles, loaded.active_handles);
             try std.testing.expect(!loaded.pinned and !loaded.retired);
             try std.testing.expectEqual(.metal, loaded.session.backend());
-            try std.testing.expectEqual(.process_required, loaded.session.interruption());
+            try std.testing.expectEqual(.uninterruptible, loaded.session.interruption());
             const gate = loaded.targetInferenceExecutionMutex() orelse return error.MissingMetalExecutionMutex;
             try active.lock(gate);
             defer gate.unlock();

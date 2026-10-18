@@ -33,6 +33,183 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
+// Defines values for ChunkCoordinatesKind.
+const (
+	ChunkCoordinatesKindAudio ChunkCoordinatesKind = "audio"
+	ChunkCoordinatesKindGif   ChunkCoordinatesKind = "gif"
+	ChunkCoordinatesKindImage ChunkCoordinatesKind = "image"
+	ChunkCoordinatesKindPdf   ChunkCoordinatesKind = "pdf"
+	ChunkCoordinatesKindText  ChunkCoordinatesKind = "text"
+	ChunkCoordinatesKindVideo ChunkCoordinatesKind = "video"
+)
+
+// Valid indicates whether the value is a known member of the ChunkCoordinatesKind enum.
+func (e ChunkCoordinatesKind) Valid() bool {
+	switch e {
+	case ChunkCoordinatesKindAudio:
+		return true
+	case ChunkCoordinatesKindGif:
+		return true
+	case ChunkCoordinatesKindImage:
+		return true
+	case ChunkCoordinatesKindPdf:
+		return true
+	case ChunkCoordinatesKindText:
+		return true
+	case ChunkCoordinatesKindVideo:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkCoordinatesPictureBasis.
+const (
+	ChunkCoordinatesPictureBasisLogical        ChunkCoordinatesPictureBasis = "logical"
+	ChunkCoordinatesPictureBasisPacketAssembly ChunkCoordinatesPictureBasis = "packet_assembly"
+)
+
+// Valid indicates whether the value is a known member of the ChunkCoordinatesPictureBasis enum.
+func (e ChunkCoordinatesPictureBasis) Valid() bool {
+	switch e {
+	case ChunkCoordinatesPictureBasisLogical:
+		return true
+	case ChunkCoordinatesPictureBasisPacketAssembly:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkEmbeddingEventObject.
+const (
+	ChunkEmbeddingEventObjectChunkEmbedding ChunkEmbeddingEventObject = "chunk.embedding"
+)
+
+// Valid indicates whether the value is a known member of the ChunkEmbeddingEventObject enum.
+func (e ChunkEmbeddingEventObject) Valid() bool {
+	switch e {
+	case ChunkEmbeddingEventObjectChunkEmbedding:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkEmbeddingInitializationErrorEventObject.
+const (
+	ChunkEmbeddingInitializationErrorEventObjectChunkEmbeddingError ChunkEmbeddingInitializationErrorEventObject = "chunk.embedding.error"
+)
+
+// Valid indicates whether the value is a known member of the ChunkEmbeddingInitializationErrorEventObject enum.
+func (e ChunkEmbeddingInitializationErrorEventObject) Valid() bool {
+	switch e {
+	case ChunkEmbeddingInitializationErrorEventObjectChunkEmbeddingError:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkEmbeddingResponseObject.
+const (
+	ChunkEmbeddingResponseObjectChunkEmbeddingList ChunkEmbeddingResponseObject = "chunk.embedding.list"
+)
+
+// Valid indicates whether the value is a known member of the ChunkEmbeddingResponseObject enum.
+func (e ChunkEmbeddingResponseObject) Valid() bool {
+	switch e {
+	case ChunkEmbeddingResponseObjectChunkEmbeddingList:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkEmbeddingResponseStatus.
+const (
+	ChunkEmbeddingResponseStatusComplete ChunkEmbeddingResponseStatus = "complete"
+	ChunkEmbeddingResponseStatusFailed   ChunkEmbeddingResponseStatus = "failed"
+	ChunkEmbeddingResponseStatusPartial  ChunkEmbeddingResponseStatus = "partial"
+)
+
+// Valid indicates whether the value is a known member of the ChunkEmbeddingResponseStatus enum.
+func (e ChunkEmbeddingResponseStatus) Valid() bool {
+	switch e {
+	case ChunkEmbeddingResponseStatusComplete:
+		return true
+	case ChunkEmbeddingResponseStatusFailed:
+		return true
+	case ChunkEmbeddingResponseStatusPartial:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkEmbeddingStartEventObject.
+const (
+	ChunkEmbeddingStartEventObjectChunkEmbeddingStart ChunkEmbeddingStartEventObject = "chunk.embedding.start"
+)
+
+// Valid indicates whether the value is a known member of the ChunkEmbeddingStartEventObject enum.
+func (e ChunkEmbeddingStartEventObject) Valid() bool {
+	switch e {
+	case ChunkEmbeddingStartEventObjectChunkEmbeddingStart:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkEmbeddingTerminalEventObject.
+const (
+	ChunkEmbeddingTerminalEventObjectChunkEmbeddingComplete ChunkEmbeddingTerminalEventObject = "chunk.embedding.complete"
+)
+
+// Valid indicates whether the value is a known member of the ChunkEmbeddingTerminalEventObject enum.
+func (e ChunkEmbeddingTerminalEventObject) Valid() bool {
+	switch e {
+	case ChunkEmbeddingTerminalEventObjectChunkEmbeddingComplete:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkSourceReferenceType.
+const (
+	ChunkSourceReferenceTypeSource ChunkSourceReferenceType = "source"
+)
+
+// Valid indicates whether the value is a known member of the ChunkSourceReferenceType enum.
+func (e ChunkSourceReferenceType) Valid() bool {
+	switch e {
+	case ChunkSourceReferenceTypeSource:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ChunkSourceReferenceVersionKind.
+const (
+	ChunkSourceReferenceVersionKindS3VersionId ChunkSourceReferenceVersionKind = "s3_version_id"
+	ChunkSourceReferenceVersionKindStrongEtag  ChunkSourceReferenceVersionKind = "strong_etag"
+)
+
+// Valid indicates whether the value is a known member of the ChunkSourceReferenceVersionKind enum.
+func (e ChunkSourceReferenceVersionKind) Valid() bool {
+	switch e {
+	case ChunkSourceReferenceVersionKindS3VersionId:
+		return true
+	case ChunkSourceReferenceVersionKindStrongEtag:
+		return true
+	default:
+		return false
+	}
+}
+
 // AudioChunkOptions Options specific to audio chunking.
 type AudioChunkOptions struct {
 	// OverlapDurationMs Overlap duration in milliseconds between audio chunks (default: 0).
@@ -70,13 +247,194 @@ type Chunk struct {
 	union    json.RawMessage
 }
 
+// ChunkCoordinates Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets.
+type ChunkCoordinates struct {
+	EndByte      int64                `json:"end_byte,omitempty,omitzero"`
+	EndNs        int64                `json:"end_ns,omitempty,omitzero"`
+	EndSample    int64                `json:"end_sample,omitempty,omitzero"`
+	EndTick      int64                `json:"end_tick,omitempty,omitzero"`
+	FirstPicture int64                `json:"first_picture,omitempty,omitzero"`
+	Kind         ChunkCoordinatesKind `json:"kind"`
+	Page         int                  `json:"page,omitempty,omitzero"`
+
+	// PageBox Original PDF page box in PDF user-space coordinates.
+	PageBox      []float64 `json:"page_box,omitempty,omitzero"`
+	PageRotation int64     `json:"page_rotation,omitempty,omitzero"`
+
+	// PictureBasis WebM logical presentation pictures or the first MP4 packet of a completed picture assembly.
+	PictureBasis ChunkCoordinatesPictureBasis `json:"picture_basis,omitempty,omitzero"`
+	PictureCount int                          `json:"picture_count,omitempty,omitzero"`
+
+	// RasterHeight Height of the complete source/prepared-page raster before tiling; map PDF regions through page_box and page_rotation.
+	RasterHeight int `json:"raster_height,omitempty,omitzero"`
+
+	// RasterWidth Width of the complete source/prepared-page raster before tiling, not the returned crop width.
+	RasterWidth int `json:"raster_width,omitempty,omitzero"`
+
+	// Region Full-raster coordinates [left, top, right, bottom], end exclusive; raster_width/height declare the basis, including adaptively rendered PDF pages.
+	Region     []int `json:"region,omitempty,omitzero"`
+	SampleRate int64 `json:"sample_rate,omitempty,omitzero"`
+
+	// SelectedPictures Ordered selectors in the immutable source index, including repeated cadence selections.
+	SelectedPictures []int64 `json:"selected_pictures,omitempty,omitzero"`
+	StartByte        int64   `json:"start_byte,omitempty,omitzero"`
+	StartNs          int64   `json:"start_ns,omitempty,omitzero"`
+	StartSample      int64   `json:"start_sample,omitempty,omitzero"`
+	StartTick        int64   `json:"start_tick,omitempty,omitzero"`
+	Timescale        int64   `json:"timescale,omitempty,omitzero"`
+}
+
+// ChunkCoordinatesKind defines model for ChunkCoordinates.Kind.
+type ChunkCoordinatesKind string
+
+// ChunkCoordinatesPictureBasis WebM logical presentation pictures or the first MP4 packet of a completed picture assembly.
+type ChunkCoordinatesPictureBasis string
+
+// ChunkDescriptor defines model for ChunkDescriptor.
+type ChunkDescriptor struct {
+	// Coordinates Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets.
+	Coordinates ChunkCoordinates `json:"coordinates"`
+
+	// Id Opaque source-plan-bound inference identity; not a database artifact ID.
+	Id          string `json:"id"`
+	InputTokens int    `json:"input_tokens"`
+	Ordinal     int64  `json:"ordinal"`
+}
+
+// ChunkEmbeddingContext defines model for ChunkEmbeddingContext.
+type ChunkEmbeddingContext struct {
+	// Dimensions Known vector width; may be absent before a planning-only or failed first item.
+	Dimensions    int    `json:"dimensions,omitempty,omitzero"`
+	Model         string `json:"model"`
+	ModelIdentity string `json:"model_identity"`
+	ModelRevision string `json:"model_revision"`
+	PlanId        string `json:"plan_id"`
+
+	// Policy Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
+	Policy            MediaChunkPolicy     `json:"policy"`
+	SourceFingerprint string               `json:"source_fingerprint"`
+	SourceId          string               `json:"source_id,omitempty,omitzero"`
+	SourceReference   ChunkSourceReference `json:"source_reference,omitempty,omitzero"`
+	SourceVersion     string               `json:"source_version"`
+	StartOrdinal      int64                `json:"start_ordinal"`
+	TaskType          string               `json:"task_type"`
+}
+
+// ChunkEmbeddingError defines model for ChunkEmbeddingError.
+type ChunkEmbeddingError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// ChunkEmbeddingEvent defines model for ChunkEmbeddingEvent.
+type ChunkEmbeddingEvent struct {
+	Data   ChunkEmbeddingObject      `json:"data"`
+	Object ChunkEmbeddingEventObject `json:"object"`
+}
+
+// ChunkEmbeddingEventObject defines model for ChunkEmbeddingEvent.Object.
+type ChunkEmbeddingEventObject string
+
+// ChunkEmbeddingInitializationErrorEvent defines model for ChunkEmbeddingInitializationErrorEvent.
+type ChunkEmbeddingInitializationErrorEvent struct {
+	Code   string                                       `json:"code"`
+	Object ChunkEmbeddingInitializationErrorEventObject `json:"object"`
+}
+
+// ChunkEmbeddingInitializationErrorEventObject defines model for ChunkEmbeddingInitializationErrorEvent.Object.
+type ChunkEmbeddingInitializationErrorEventObject string
+
+// ChunkEmbeddingObject defines model for ChunkEmbeddingObject.
+type ChunkEmbeddingObject struct {
+	// Data Optional base64 payload; source coordinates remain mandatory.
+	Data       []byte              `json:"data,omitempty,omitzero"`
+	Descriptor ChunkDescriptor     `json:"descriptor"`
+	Embedding  []float32           `json:"embedding,omitempty,omitzero"`
+	Error      ChunkEmbeddingError `json:"error,omitempty,omitzero"`
+	MimeType   string              `json:"mime_type"`
+	Text       string              `json:"text,omitempty,omitzero"`
+}
+
+// ChunkEmbeddingResponse defines model for ChunkEmbeddingResponse.
+type ChunkEmbeddingResponse struct {
+	// CoveredThroughOrdinal Exclusive end of acknowledged output ordinals; failed chunk coordinates are reported in gaps.
+	CoveredThroughOrdinal int64                  `json:"covered_through_ordinal"`
+	Data                  []ChunkEmbeddingObject `json:"data"`
+	Dimensions            int                    `json:"dimensions"`
+	Error                 ChunkEmbeddingError    `json:"error,omitempty,omitzero"`
+	Gaps                  []ChunkCoordinates     `json:"gaps"`
+	Model                 string                 `json:"model"`
+	ModelIdentity         string                 `json:"model_identity"`
+
+	// ModelRevision Model generation revision used by inference capability leases.
+	ModelRevision    string                       `json:"model_revision"`
+	NextContinuation string                       `json:"next_continuation,omitempty,omitzero"`
+	Object           ChunkEmbeddingResponseObject `json:"object"`
+	PlanId           string                       `json:"plan_id"`
+
+	// Policy Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
+	Policy            MediaChunkPolicy     `json:"policy"`
+	SourceFingerprint string               `json:"source_fingerprint"`
+	SourceId          string               `json:"source_id,omitempty,omitzero"`
+	SourceReference   ChunkSourceReference `json:"source_reference,omitempty,omitzero"`
+	SourceVersion     string               `json:"source_version"`
+	StartOrdinal      int64                `json:"start_ordinal"`
+
+	// Status Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
+	Status   ChunkEmbeddingResponseStatus `json:"status"`
+	TaskType string                       `json:"task_type"`
+}
+
+// ChunkEmbeddingResponseObject defines model for ChunkEmbeddingResponse.Object.
+type ChunkEmbeddingResponseObject string
+
+// ChunkEmbeddingResponseStatus Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
+type ChunkEmbeddingResponseStatus string
+
+// ChunkEmbeddingStartEvent defines model for ChunkEmbeddingStartEvent.
+type ChunkEmbeddingStartEvent struct {
+	Context ChunkEmbeddingContext          `json:"context"`
+	Object  ChunkEmbeddingStartEventObject `json:"object"`
+}
+
+// ChunkEmbeddingStartEventObject defines model for ChunkEmbeddingStartEvent.Object.
+type ChunkEmbeddingStartEventObject string
+
+// ChunkEmbeddingTarget defines model for ChunkEmbeddingTarget.
+type ChunkEmbeddingTarget struct {
+	// AllowPartial Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable embedding failure.
+	AllowPartial bool `json:"allow_partial,omitempty,omitzero"`
+	Dimensions   int  `json:"dimensions,omitempty,omitzero"`
+
+	// Execute False resolves model limits and plans descriptors without running embedding inference.
+	Execute *bool  `json:"execute,omitempty"`
+	Model   string `json:"model"`
+
+	// ModelIdentity Optional required embedding-weight/recipe identity; a changed model is rejected before delivery.
+	ModelIdentity string `json:"model_identity,omitempty,omitzero"`
+	TaskType      string `json:"task_type,omitempty,omitzero"`
+}
+
+// ChunkEmbeddingTerminalEvent defines model for ChunkEmbeddingTerminalEvent.
+type ChunkEmbeddingTerminalEvent struct {
+	Object   ChunkEmbeddingTerminalEventObject `json:"object"`
+	Response ChunkEmbeddingResponse            `json:"response"`
+}
+
+// ChunkEmbeddingTerminalEventObject defines model for ChunkEmbeddingTerminalEvent.Object.
+type ChunkEmbeddingTerminalEventObject string
+
 // ChunkOptions Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
 type ChunkOptions struct {
 	// Audio Options specific to audio chunking.
-	Audio AudioChunkOptions `json:"audio,omitempty,omitzero"`
+	Audio     AudioChunkOptions    `json:"audio,omitempty,omitzero"`
+	Embedding ChunkEmbeddingTarget `json:"embedding,omitempty,omitzero"`
 
 	// MaxChunks Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
 	MaxChunks int `json:"max_chunks,omitempty,omitzero"`
+
+	// Policy Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
+	Policy MediaChunkPolicy `json:"policy,omitempty,omitzero"`
 
 	// Text Options specific to text chunking.
 	Text TextChunkOptions `json:"text,omitempty,omitzero"`
@@ -84,6 +442,29 @@ type ChunkOptions struct {
 	// Threshold Confidence threshold for model-based chunking (0.0-1.0).
 	Threshold float32 `json:"threshold,omitempty,omitzero"`
 }
+
+// ChunkSourceReference defines model for ChunkSourceReference.
+type ChunkSourceReference struct {
+	// Length Exact immutable object length, verified against Content-Range.
+	Length   int64                    `json:"length"`
+	MimeType string                   `json:"mime_type"`
+	Type     ChunkSourceReferenceType `json:"type"`
+
+	// Uri HTTP(S) or S3 object URI resolved through configured content security and credentials.
+	Uri string `json:"uri"`
+
+	// Version Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
+	Version string `json:"version"`
+
+	// VersionKind Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+	VersionKind ChunkSourceReferenceVersionKind `json:"version_kind,omitempty,omitzero"`
+}
+
+// ChunkSourceReferenceType defines model for ChunkSourceReference.Type.
+type ChunkSourceReferenceType string
+
+// ChunkSourceReferenceVersionKind Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+type ChunkSourceReferenceVersionKind string
 
 // InferenceAudioChunkConfig Audio chunking configuration for inference, including VAD options.
 type InferenceAudioChunkConfig struct {
@@ -106,7 +487,7 @@ type InferenceChunkConfig struct {
 	// MaxChunks Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
 	MaxChunks int `json:"max_chunks,omitempty,omitzero"`
 
-	// Model The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+	// Model The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected.
 	//
 	// Example: fixed
 	Model string `json:"model,omitempty,omitzero"`
@@ -114,7 +495,7 @@ type InferenceChunkConfig struct {
 	// Text Options specific to text chunking.
 	Text TextChunkOptions `json:"text,omitempty,omitzero"`
 
-	// Threshold Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+	// Threshold Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker.
 	Threshold float32 `json:"threshold,omitempty,omitzero"`
 }
 
@@ -129,11 +510,30 @@ type InferenceChunkRequest struct {
 	// Combines shared text options with inference-specific audio/VAD options.
 	Config InferenceChunkConfig `json:"config,omitempty,omitzero"`
 
+	// Continuation Resume the exact source and semantic plan; changed inputs are rejected.
+	Continuation string               `json:"continuation,omitempty,omitzero"`
+	Embedding    ChunkEmbeddingTarget `json:"embedding,omitempty,omitzero"`
+
+	// IncludeContent In model-aware mode include chunk payloads in addition to mandatory descriptors.
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
 	// Input Input content to chunk. Supports two formats:
 	// - Text string: `"This is a long document..."`
 	// - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
 	// - ContentPart: `{"type": "text", "text": "..."}`
 	Input InferenceChunkRequest_Input `json:"input"`
+
+	// Policy Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
+	Policy MediaChunkPolicy `json:"policy,omitempty,omitzero"`
+
+	// SourceId Caller source identity; immutable content is independently fingerprinted.
+	SourceId string `json:"source_id,omitempty,omitzero"`
+
+	// SourceVersion Immutable caller version, included in continuation and plan identity.
+	SourceVersion string `json:"source_version,omitempty,omitzero"`
+
+	// Stream In model-aware mode return NDJSON chunk events followed by a terminal coverage response.
+	Stream bool `json:"stream,omitempty,omitzero"`
 }
 
 // InferenceChunkRequestInput0 Text to chunk
@@ -145,6 +545,31 @@ type InferenceChunkRequestInput0 = string
 // - ContentPart: `{"type": "text", "text": "..."}`
 type InferenceChunkRequest_Input struct {
 	union json.RawMessage
+}
+
+// MediaChunkPolicy Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
+type MediaChunkPolicy struct {
+	// AudioPauseNs Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
+	AudioPauseNs       int64 `json:"audio_pause_ns,omitempty,omitzero"`
+	AudioPauseSearchNs int64 `json:"audio_pause_search_ns,omitempty,omitzero"`
+
+	// AudioSilenceMilli Absolute normalized PCM amplitude threshold in thousandths.
+	AudioSilenceMilli *int `json:"audio_silence_milli,omitempty"`
+	MaxFrames         int  `json:"max_frames,omitempty,omitzero"`
+
+	// MaxTextBytes Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
+	MaxTextBytes  int   `json:"max_text_bytes,omitempty,omitzero"`
+	OverlapNs     int64 `json:"overlap_ns,omitempty,omitzero"`
+	OverlapTokens *int  `json:"overlap_tokens,omitempty"`
+	StepNs        int64 `json:"step_ns,omitempty,omitzero"`
+	TargetTokens  int   `json:"target_tokens,omitempty,omitzero"`
+	TileHeight    int   `json:"tile_height,omitempty,omitzero"`
+	TileOverlap   int   `json:"tile_overlap,omitempty,omitzero"`
+	TileWidth     int   `json:"tile_width,omitempty,omitzero"`
+
+	// VideoHold Select the displayed picture at each video cadence target, including VFR holds. Zero retains at-or-after timestamp sampling.
+	VideoHold *int  `json:"video_hold,omitempty"`
+	WindowNs  int64 `json:"window_ns,omitempty,omitzero"`
 }
 
 // TextChunkOptions Options specific to text chunking.
@@ -345,6 +770,32 @@ func (t *InferenceChunkContentPart) MergeExternalRef0MediaContentPart(v external
 	return err
 }
 
+// AsChunkSourceReference returns the union data inside the InferenceChunkContentPart as a ChunkSourceReference
+func (t InferenceChunkContentPart) AsChunkSourceReference() (ChunkSourceReference, error) {
+	var body ChunkSourceReference
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromChunkSourceReference overwrites any union data inside the InferenceChunkContentPart as the provided ChunkSourceReference
+func (t *InferenceChunkContentPart) FromChunkSourceReference(v ChunkSourceReference) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeChunkSourceReference performs a merge with any union data inside the InferenceChunkContentPart, using the provided ChunkSourceReference
+func (t *InferenceChunkContentPart) MergeChunkSourceReference(v ChunkSourceReference) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t InferenceChunkContentPart) MarshalJSON() ([]byte, error) {
 	b, err := t.union.MarshalJSON()
 	return b, err
@@ -422,40 +873,83 @@ func (t *InferenceChunkRequest_Input) UnmarshalJSON(b []byte) error {
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
-	"jMP9zLFM10qt/jMA",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

@@ -104,7 +104,10 @@ Named transcription defaults apply to language, timestamp-aware decoding and
 diarization. Request values take precedence, including explicit `false`.
 Native timestamp decoding retains its historical defaults when omitted: off for
 `transcribe`, on for `dictate`. The TypeScript transcription helper forwards the
-same options as the public request contract.
+same options as the public request contract. Named transcribers retain their
+credentials when inheriting the runtime URL: `bearer_token` takes precedence
+over `api_key`, followed by the default runtime credential. Sessions preserve
+the selected alias and its credential policy for every follow-up.
 
 Synthesis uses existing `text_to_speech` configs. OpenAI supports its configured
 speech formats; Vertex supports MP3, WAV and Ogg Opus; ElevenLabs currently
@@ -165,7 +168,9 @@ capacity remain independent.
 `/ai/v1/models` preserves native grouped fields and the OpenAI `data` list.
 Descriptors include task, executor, backend identity, limits, execution policy,
 `gateway_capabilities`, availability and freshness. The legacy capability-name
-array retains its existing shape. `/db/v1/connections?include=models` uses the
+array retains its existing shape. Chain execution policy reports the reachable
+attempt bound, capped at eight, and whether those attempts can select a
+different backend model. `/db/v1/connections?include=models` uses the
 same registry view and bounded connection-discovery cache. `named-inference` is
 a reserved virtual connection for configured aliases. Qualified vendor
 connections use their task adapters and connection-scoped credentials; a
@@ -186,7 +191,9 @@ A transcription session is bound to its authenticated credential, one gateway
 owner, one connection and one proxy endpoint incarnation. Public handles replace
 backend session IDs in ordinary responses and incremental session events.
 Sessions never fail over, including when an endpoint is replaced at the same
-address. Unknown or expired handles fail closed.
+address. JSON and framed audio requests use the same pinned identity; upload
+metadata cannot select another endpoint or model. Unknown or expired handles
+fail closed.
 
 With multiple gateway or proxy replicas, configure sticky routing to the owner
 that created the session, using the returned

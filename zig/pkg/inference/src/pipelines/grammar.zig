@@ -646,7 +646,8 @@ const ParsePosition = struct {
         elem_idx: u16,
         /// For literals: how many bytes of the literal we've consumed.
         literal_offset: u16,
-        /// For repetitions (+ and *): how many times we've matched so far.
+        /// For repetitions (+ and *): whether at least one match completed.
+        /// Exact counts do not change these quantifiers' continuation language.
         rep_count: u16,
     };
 
@@ -690,6 +691,13 @@ pub const GbnfGrammar = struct {
     positions: std.ArrayListUnmanaged(ParsePosition),
     /// All allocations that need to be freed on deinit.
     arena_slices: std.ArrayListUnmanaged(ArenaAllocation),
+    // A request owns one mask, bounded by vocabulary size. Repeated characters
+    // inside a schema string often leave the continuation state unchanged.
+    mask_cache: ?*MaskCache,
+    const MaskCache = struct {
+        key: ?[32]u8 = null,
+        mask: ?[]bool = null,
+    };
 
     pub fn parse(allocator: std.mem.Allocator, source: []const u8) !GbnfGrammar {
         var grammar = GbnfGrammar{
@@ -697,7 +705,9 @@ pub const GbnfGrammar = struct {
             .rules = .empty,
             .positions = .empty,
             .arena_slices = .empty,
+            .mask_cache = allocator.create(MaskCache) catch null,
         };
+        if (grammar.mask_cache) |cache| cache.* = .{};
         errdefer grammar.deinit();
 
         try parseGbnfSource(&grammar, source);
@@ -732,6 +742,10 @@ pub const GbnfGrammar = struct {
     }
 
     pub fn deinit(self: *GbnfGrammar) void {
+        if (self.mask_cache) |cache| {
+            if (cache.mask) |mask| self.allocator.free(mask);
+            self.allocator.destroy(cache);
+        }
         for (self.arena_slices.items) |allocation| {
             self.allocator.rawFree(allocation.bytes, allocation.alignment, @returnAddress());
         }
@@ -763,7 +777,7 @@ pub const GbnfGrammar = struct {
         self.positions = next;
 
         // Deduplicate positions to prevent exponential blowup.
-        self.dedup();
+        dedupPositions(&self.positions);
     }
 
     /// Check whether any active position has completed the root rule.
@@ -814,6 +828,7 @@ pub const GbnfGrammar = struct {
                 }
                 sim_positions.deinit(allocator);
                 sim_positions = next;
+                dedupPositions(&sim_positions);
 
                 if (sim_positions.items.len == 0) {
                     valid = false;
@@ -841,6 +856,29 @@ pub const GbnfGrammar = struct {
         token_table: *const TokenByteTable,
         vocab_size: usize,
     ) ![]bool {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("gbnf-token-mask-v1");
+        inline for (.{ token_table.token_offsets.len, token_table.token_lengths.len, token_table.byte_data.len, self.positions.items.len }) |length| hash.update(std.mem.asBytes(&length));
+        hash.update(std.mem.sliceAsBytes(token_table.token_offsets));
+        hash.update(std.mem.sliceAsBytes(token_table.token_lengths));
+        hash.update(token_table.byte_data);
+        hash.update(std.mem.asBytes(&vocab_size));
+        for (self.positions.items) |position| {
+            hash.update(std.mem.asBytes(&position.frame_count));
+            for (position.frames[0..position.frame_count]) |frame| {
+                const length = frame.rule_name.len;
+                hash.update(std.mem.asBytes(&length));
+                hash.update(frame.rule_name);
+                inline for (.{ frame.alt_idx, frame.elem_idx, frame.literal_offset, frame.rep_count }) |value| hash.update(std.mem.asBytes(&value));
+            }
+        }
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        if (self.mask_cache) |cache| {
+            if (cache.key) |previous| {
+                if (std.mem.eql(u8, &previous, &key)) return allocator.dupe(bool, cache.mask.?);
+            }
+        }
         const mask = try allocator.alloc(bool, vocab_size);
         @memset(mask, false);
 
@@ -862,6 +900,7 @@ pub const GbnfGrammar = struct {
                 }
                 sim_positions.deinit(allocator);
                 sim_positions = next;
+                dedupPositions(&sim_positions);
 
                 if (sim_positions.items.len == 0) {
                     valid = false;
@@ -879,6 +918,22 @@ pub const GbnfGrammar = struct {
             @memset(mask, true);
         }
 
+        // Cache admission is optional. An allocation failure must not discard
+        // an otherwise valid mask or reuse an earlier continuation's result.
+        if (self.mask_cache) |cache| {
+            cache.key = null;
+            if (cache.mask) |cached| {
+                if (cached.len != mask.len) {
+                    self.allocator.free(cached);
+                    cache.mask = null;
+                }
+            }
+            if (cache.mask == null) cache.mask = self.allocator.alloc(bool, mask.len) catch null;
+            if (cache.mask) |cached| {
+                @memcpy(cached, mask);
+                cache.key = key;
+            }
+        }
         return mask;
     }
 
@@ -942,7 +997,7 @@ pub const GbnfGrammar = struct {
                         parent.rep_count = 0;
                     },
                     .zero_or_more, .one_or_more => {
-                        parent.rep_count += 1;
+                        parent.rep_count = 1;
                     },
                 }
                 // Recursively expand the popped position.
@@ -1081,7 +1136,7 @@ pub const GbnfGrammar = struct {
                         .zero_or_more, .one_or_more => {
                             // Reset to start of this element for another repetition.
                             nf.literal_offset = 0;
-                            nf.rep_count += 1;
+                            nf.rep_count = 1;
                         },
                     }
                 } else {
@@ -1101,7 +1156,7 @@ pub const GbnfGrammar = struct {
                         nf.rep_count = 0;
                     },
                     .zero_or_more, .one_or_more => {
-                        nf.rep_count += 1;
+                        nf.rep_count = 1;
                     },
                 }
                 next.append(self.allocator, new_pos) catch return;
@@ -1138,28 +1193,28 @@ pub const GbnfGrammar = struct {
     }
 
     /// Remove duplicate positions to prevent exponential blowup.
-    fn dedup(self: *GbnfGrammar) void {
-        if (self.positions.items.len <= 1) return;
+    fn dedupPositions(positions: *std.ArrayListUnmanaged(ParsePosition)) void {
+        if (positions.items.len <= 1) return;
 
         var keep: usize = 0;
-        for (0..self.positions.items.len) |i| {
+        for (0..positions.items.len) |i| {
             var is_dup = false;
             for (0..keep) |j| {
-                if (positionsEqual(&self.positions.items[i], &self.positions.items[j])) {
+                if (positionsEqual(&positions.items[i], &positions.items[j])) {
                     is_dup = true;
                     break;
                 }
             }
             if (!is_dup) {
-                self.positions.items[keep] = self.positions.items[i];
+                positions.items[keep] = positions.items[i];
                 keep += 1;
             }
         }
-        self.positions.items.len = keep;
+        positions.items.len = keep;
 
         // Also cap at max_positions to prevent runaway state.
-        if (self.positions.items.len > max_positions) {
-            self.positions.items.len = max_positions;
+        if (positions.items.len > max_positions) {
+            positions.items.len = max_positions;
         }
     }
 
@@ -2307,4 +2362,49 @@ test "gbnf: repeated rule reference" {
 
     g.advance("abc");
     try std.testing.expect(g.isComplete());
+}
+
+test "gbnf token masks bound ambiguous repetition and preserve rejection" {
+    const a = std.testing.allocator;
+    var grammar = try GbnfGrammar.parse(a, "root ::= item+ \"b\"\nitem ::= \"a\" | \"a\"");
+    defer grammar.deinit();
+    var bytes: [302]u8 = undefined;
+    @memset(bytes[0..300], 'a');
+    bytes[300] = 'c';
+    bytes[301] = 'b';
+    const offsets = [_]u32{ 0, 0, 301, 0 };
+    const lengths = [_]u16{ 300, 301, 1, 0 };
+    const table = TokenByteTable{ .token_offsets = @constCast(&offsets), .token_lengths = @constCast(&lengths), .byte_data = @constCast(&bytes) };
+    const first = try grammar.allowedTokenMaskFast(a, &table, 4);
+    defer a.free(first);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false, false }, first);
+    const repeated = try grammar.allowedTokenMaskFast(a, &table, 4);
+    defer a.free(repeated);
+    try std.testing.expectEqualSlices(bool, first, repeated);
+    // Cache identity includes decoded bytes, not only table pointers or size.
+    bytes[300] = 'a';
+    const changed = try grammar.allowedTokenMaskFast(a, &table, 4);
+    defer a.free(changed);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false, false }, changed);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false, false }, first);
+    bytes[300] = 'c';
+    grammar.advance(bytes[0..300]);
+    try std.testing.expect(grammar.positions.items.len < 8);
+    const after = try grammar.allowedTokenMaskFast(a, &table, 4);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, false }, after);
+    grammar.advance("a");
+    const continued = try grammar.allowedTokenMaskFast(a, &table, 4);
+    defer a.free(continued);
+    try std.testing.expectEqualSlices(bool, after, continued);
+    {
+        const cache = grammar.mask_cache;
+        grammar.mask_cache = null;
+        defer grammar.mask_cache = cache;
+        const uncached = try grammar.allowedTokenMaskFast(a, &table, 4);
+        defer a.free(uncached);
+        try std.testing.expectEqualSlices(bool, continued, uncached);
+    }
+    grammar.advance("b");
+    try std.testing.expect(grammar.isComplete());
 }

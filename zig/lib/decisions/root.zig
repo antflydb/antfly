@@ -295,7 +295,7 @@ pub fn parse(a: A, bytes: []const u8) !Request {
     if (bytes.len > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
     const value = std.json.parseFromSliceLeaky(V, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecideRequest;
     const root = try object(value);
-    try keys(root, &.{ "model", "model_identity", "input", "inputs", "questions", "embedding_options" });
+    try keys(root, &.{ "model", "model_identity", "input", "inputs", "questions", "embedding_options", "long_document" });
     const model = try text(root.get("model") orelse return error.InvalidDecideRequest);
     const batched = root.contains("inputs");
     if (batched == root.contains("input")) return error.InvalidDecideRequest;
@@ -393,6 +393,7 @@ pub fn parse(a: A, bytes: []const u8) !Request {
     var inner = std.json.ObjectMap{};
     try inner.put(a, "model", str(model));
     if (root.get("model_identity")) |id| try inner.put(a, "model_identity", id);
+    if (root.get("long_document")) |windows| try inner.put(a, "long_document", windows);
     try inner.put(a, "state", str(items[0].input));
     try inner.put(a, "questions", .{ .object = lowered });
     const serialized = try std.json.Stringify.valueAlloc(a, V{ .object = inner }, .{});
@@ -520,6 +521,33 @@ test "decisions typed span presenter preserves public score labels predicate and
         try std.testing.expectEqualStrings("predicate", answers[1].object.get("type").?.string);
         try std.testing.expectApproxEqAbs(@as(f64, 0.9), answers[1].object.get("probability").?.float, 1e-6);
         try std.testing.expectEqual(@as(i64, 10), value.object.get("usage").?.object.get("input_tokens").?.integer);
+    }
+}
+
+test "decisions public boundary windowing preserves batches and rejects invalid geometry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prefix = "{\"model\":\"multi-decide\",\"inputs\":[{\"id\":\"first\",\"input\":\"one\"},{\"input\":\"two\"}],\"questions\":[{\"name\":\"act\",\"type\":\"predicate\",\"instructions\":\"Act?\"}],\"long_document\":";
+    const request = try parse(a, prefix ++ "{\"mode\":\"window\",\"window_words\":64,\"overlap_words\":8,\"max_windows\":4}}");
+    const envelope = try extractionValue(a, request, .boundary);
+    const inputs = envelope.value.object.get("inputs").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), inputs.len);
+    try std.testing.expectEqualStrings("first", inputs[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("two", inputs[1].object.get("content").?.string);
+    const windows = envelope.value.object.get("options").?.object.get("long_document").?;
+    try std.testing.expectEqualDeep(request.inner.long_document, try @import("windowing.zig").parse(windows));
+    try std.testing.expectEqualDeep(request.inner.long_document, request.forItem(1).long_document);
+    try std.testing.expectError(error.UnsupportedDecisionWindowing, extractionValue(a, request, .laya));
+    for ([_][]const u8{
+        "null",
+        "{\"mode\":\"window\",\"window_words\":32,\"overlap_words\":32}",
+        "{\"mode\":\"window\",\"max_windows\":129}",
+        "{\"mode\":\"reject\",\"window_words\":64}",
+        "{\"mode\":\"window\",\"record_identity\":\"occurrence\"}",
+    }) |invalid| {
+        const json = try std.fmt.allocPrint(a, "{s}{s}}}", .{ prefix, invalid });
+        try std.testing.expectError(error.InvalidDecideRequest, parse(a, json));
     }
 }
 

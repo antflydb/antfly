@@ -204,6 +204,7 @@ pub const LocalInferenceConnectionTarget = inference_connection_abi.Target;
 const RemoteInferenceConnection = struct {
     url: []const u8,
     api_key: ?[]const u8,
+    preserve_api_path: bool = false,
 };
 
 const ResolvedInferenceConnection = union(enum) {
@@ -307,8 +308,8 @@ pub fn invokeInferenceConnectionWithMethod(
     const remote = resolved.remote;
     const raw_url = remote.url;
     const base = std.mem.trimEnd(u8, raw_url, "/");
-    const prefix = if (std.mem.endsWith(u8, base, "/ai/v1")) base else try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
-    defer if (prefix.ptr != base.ptr) alloc.free(prefix);
+    const prefix = try inferenceApiBaseAlloc(alloc, remote);
+    defer alloc.free(prefix);
     const url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
     defer alloc.free(url);
 
@@ -413,7 +414,7 @@ fn resolveInferenceConnection(
         if (uses_default) if (local_target) |target| return .{ .local = target };
         const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
         if (!validInferenceURL(url)) return error.InvalidConnectionURL;
-        return .{ .remote = .{ .url = url, .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null) } };
+        return .{ .remote = .{ .url = url, .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null), .preserve_api_path = !uses_default } };
     }
     if (std.mem.eql(u8, connection_id, common_config.default_inference_connection_id)) {
         const url = config.inference.api_url orelse return error.ConnectionNotFound;
@@ -461,6 +462,15 @@ fn inferenceCapability(operation: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, operation, mapping[0])) return mapping[1];
     }
     return null;
+}
+
+// Named transcription URLs are API bases; a configured custom path must not
+// acquire another /ai/v1 suffix when sharing the connection transport.
+fn inferenceApiBaseAlloc(alloc: Allocator, remote: RemoteInferenceConnection) ![]u8 {
+    if (remote.preserve_api_path) return @import("antfly_local_sources").common_provider_registry.gateway.apiBaseAlloc(alloc, remote.url);
+    const base = std.mem.trimEnd(u8, remote.url, "/");
+    if (std.mem.endsWith(u8, base, "/ai/v1")) return alloc.dupe(u8, base);
+    return std.fmt.allocPrint(alloc, "{s}/ai/v1", .{base});
 }
 
 fn resolveInferenceApiKey(
@@ -2363,4 +2373,19 @@ test "include param parsing" {
     try std.testing.expect(includeHasStatus("models, status"));
     try std.testing.expect(!includeHasStatus(null));
     try std.testing.expect(!includeHasStatus("statuses"));
+}
+
+test "httpx inference gateway transcription API bases retain explicit mount paths" {
+    const a = std.testing.allocator;
+    const Case = struct { url: []const u8, preserve: bool, expected: []const u8 };
+    for ([_]Case{
+        .{ .url = "https://runtime", .preserve = true, .expected = "https://runtime/ai/v1" },
+        .{ .url = "https://runtime/ai/v1/", .preserve = true, .expected = "https://runtime/ai/v1" },
+        .{ .url = "https://runtime/custom/api/", .preserve = true, .expected = "https://runtime/custom/api" },
+        .{ .url = "https://runtime/custom", .preserve = false, .expected = "https://runtime/custom/ai/v1" },
+    }) |case| {
+        const base = try inferenceApiBaseAlloc(a, .{ .url = case.url, .api_key = null, .preserve_api_path = case.preserve });
+        defer a.free(base);
+        try std.testing.expectEqualStrings(case.expected, base);
+    }
 }

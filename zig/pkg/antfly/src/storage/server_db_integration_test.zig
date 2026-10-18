@@ -226,7 +226,7 @@ test "relational replicated admission is identical across local memory envelopes
         defer db.close();
         const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
         try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
-        db.core.table_catalog.transaction_admission_bytes = 12 * 1024;
+        db.core.table_catalog.transaction_admission_bytes = 6 * 1024;
         const catalog = db.core.table_catalog.encode();
         try db.core.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &catalog }}, &.{});
         const txn = try db.beginTransaction(100);
@@ -1171,7 +1171,7 @@ test "online direct vector Raft retention captures exact artifacts and rejects u
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
         doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
-        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try doc_identity.writeNamespaceTxn(&txn, db.core.identity_namespace);
         _ = try retention.admitWithDirectVectors(&txn, namespace, 1, @splat(9), retention.default_limit, true);
         try txn.commit();
     }

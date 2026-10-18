@@ -25,7 +25,7 @@ const iceberg = local.serverless_external_source_mod.iceberg_avro;
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Options = struct { operation_id: []const u8, dry_run: bool = true, exclusive_ownership: bool = false, retain_ms: u64 = 7 * 24 * 60 * 60 * 1000, keep_latest: usize = 2, max_deleted: usize = 4096 };
-pub const Result = struct { expired_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
+pub const Result = struct { expired_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, conflicted: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
 const Retired = struct { snapshot: []const u8, objects: []const []const u8 };
 const Job = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64, retired: []const Retired };
 const Marker = struct { uri: []const u8, sha256: []const u8, etag: ?[]const u8, owner: []const u8 };
@@ -116,7 +116,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     file_options.read_only = request.dry_run;
     var files = try configured.openBindingObjectStoreAlloc(a, binding, file_options);
     defer files.deinit();
-    const destination: catalog.row_commit.Files = .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = binding.source_uri, .context = context };
+    const destination = try ingestion.destinationFiles(scratch, files, binding.source_uri, context);
     var budget: u64 = 256 * 1024 * 1024;
     var job: Job = undefined;
     var result: Result = .{};
@@ -155,7 +155,13 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     // Snapshot removal precedes retirement. Concurrent refs/commits must win a
     // catalog CAS; a failed job never deletes files or blindly rebases its intent.
     if (!request.dry_run) {
-        var committed = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .commit = .{ .id = job.id, .expected_metadata_location = job.expected, .body = job.body, .timestamp_ms = job.timestamp_ms } });
+        var committed = configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .commit = .{ .id = job.id, .expected_metadata_location = job.expected, .body = job.body, .timestamp_ms = job.timestamp_ms } }) catch |err| switch (err) {
+            // Definitive rejection terminates this immutable plan. The next
+            // scheduled operation can plan from current authority; uncertain
+            // outcomes still retry the exact saved intent.
+            error.LakeCommitConflict => return .{ .complete = true, .conflicted = true },
+            else => return err,
+        };
         defer committed.deinit(a);
     }
     // Re-read authority after resolving the intent. A newer safe publication
@@ -268,7 +274,7 @@ fn collectOwned(a: A, files: catalog.row_commit.Files, uri: []const u8, dry_run:
     if (!std.mem.startsWith(u8, uri, table_prefix) or std.mem.indexOf(u8, uri[table_prefix.len..], "..") != null) {
         return .retained;
     }
-    const marker_key = try std.fmt.allocPrint(a, "{s}/.antfly-owned/{s}.json", .{ files.prefix, catalog.types.digestHex(uri) });
+    const marker_key = try std.fmt.allocPrint(a, "{s}{s}.antfly-owned/{s}.json", .{ files.prefix, if (files.prefix.len == 0) "" else "/", catalog.types.digestHex(uri) });
     var marker = client.getObject(files.bucket, marker_key, .{ .cancellation = catalog.types.contextCancellation(&files.context), .max_response_bytes = 4096 }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => {
             return .retained;
@@ -279,7 +285,7 @@ fn collectOwned(a: A, files: catalog.row_commit.Files, uri: []const u8, dry_run:
     const proof = try std.json.parseFromSliceLeaky(Marker, a, marker.body, .{});
     if (!std.mem.eql(u8, proof.owner, "antfly-native-lake-v1") or !std.mem.eql(u8, proof.uri, uri) or proof.etag == null or proof.sha256.len != 64) return error.LakeArtifactIdentityConflict;
     if (dry_run) return .eligible;
-    const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ files.prefix, uri[table_prefix.len..] });
+    const key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ files.prefix, if (files.prefix.len == 0) "" else "/", uri[table_prefix.len..] });
     client.deleteObject(files.bucket, key, .{ .if_match_etag = proof.etag, .cancellation = catalog.types.contextCancellation(&files.context) }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => {},
         else => return err,
@@ -321,4 +327,57 @@ test "external lake REST vacuum cannot delete using an exclusive ownership asser
     // No credentials or object I/O are needed: reject before any persisted
     // intent, catalog mutation, retirement marker, or file deletion.
     try std.testing.expectError(error.LakeVacuumCatalogCoordinationRequired, run(std.testing.allocator, binding, .{}, .{}, .{ .operation_id = "vacuum", .dry_run = false, .exclusive_ownership = true }, &.{}));
+}
+
+test "external lake vacuum deletes bucket root objects and ownership markers" {
+    const objectstore = @import("objectstore");
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files: catalog.row_commit.Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "", .uri = "s3://archive" };
+    const uri = try catalog.row_commit.upload(a, files, "data/owned.parquet", "native-content");
+    try std.testing.expectEqual(Collection.eligible, try collectOwned(a, files, uri, true));
+    var client = files.client;
+    var before = try client.getObject(files.bucket, "data/owned.parquet", .{});
+    before.deinit(alloc);
+    try std.testing.expectEqual(Collection.deleted, try collectOwned(a, files, uri, false));
+    try std.testing.expectError(error.FileNotFound, client.getObject(files.bucket, "data/owned.parquet", .{}));
+    const marker_key = try std.fmt.allocPrint(a, ".antfly-owned/{s}.json", .{catalog.types.digestHex(uri)});
+    try std.testing.expectError(error.FileNotFound, client.getObject(files.bucket, marker_key, .{}));
+    try std.testing.expectEqual(Collection.retained, try collectOwned(a, files, uri, false));
+}
+
+test "external lake vacuum definitive commit conflict completes its saved operation" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-vacuum-conflict");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 7 };
+    var initial = try configured.executeLakeCatalogAlloc(alloc, binding, options, .{}, .{ .create = .{ .id = "create", .expected_metadata_location = "", .body = "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", .timestamp_ms = 1 } });
+    defer initial.deinit(alloc);
+    var queue = try ingestion.openQueue(alloc, binding, options);
+    defer queue.deinit();
+    const base = try ingestion.prefix(a, queue.prefix, binding, options);
+    const key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum/{s}.json", .{ base, catalog.types.digestHex("scheduled-0-vacuum") });
+    const saved: Job = .{ .id = "saved-vacuum", .expected = initial.table.metadata_location, .body = "{\"requirements\":[],\"updates\":[]}", .timestamp_ms = 2, .retired = &.{} };
+    var client = queue.client;
+    var stored = try client.putObject(queue.bucket, key, try std.json.Stringify.valueAlloc(a, saved, .{}), .{});
+    stored.deinit(client.allocator);
+    var concurrent = try configured.executeLakeCatalogAlloc(alloc, binding, options, .{}, .{ .commit = .{ .id = "concurrent", .expected_metadata_location = initial.table.metadata_location, .body = "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"owner\":\"other\"}}]}", .timestamp_ms = 3 } });
+    defer concurrent.deinit(alloc);
+    for (0..2) |_| {
+        const result = try run(alloc, binding, options, .{}, .{ .operation_id = "scheduled-0-vacuum", .dry_run = false, .exclusive_ownership = true }, &.{});
+        try std.testing.expect(result.complete and result.conflicted);
+        try std.testing.expectEqual(@as(usize, 0), result.deleted_objects);
+        try std.testing.expectEqual(@as(usize, 0), result.expired_snapshots);
+    }
 }

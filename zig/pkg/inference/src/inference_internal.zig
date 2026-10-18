@@ -19,6 +19,7 @@ pub const gliner_span_v2_executor = @import("extractors/gliner_span_v2_executor.
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
+pub const hard_cancellation_watchdog = @import("hard_cancellation_watchdog.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -46,7 +47,11 @@ pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
 pub const pipelines = struct {
+    pub const image = @import("pipelines/image.zig");
+    pub const media_chunking = @import("pipelines/media_chunking.zig");
     pub const embedding_gemma2 = @import("pipelines/embedding_gemma2.zig");
+    pub const embedding_gemma2_video = @import("pipelines/embedding_gemma2_video.zig");
+    pub const audio = @import("pipelines/audio.zig");
     pub const embedding = @import("pipelines/embedding.zig");
     pub const gliner = @import("pipelines/gliner.zig");
     pub const extraction_schema = @import("pipelines/extraction_schema.zig");
@@ -99,7 +104,10 @@ pub const finetune = struct {
     pub const runners = @import("finetune/runners.zig");
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
+pub const RunPermit = @import("backends/session.zig").RunPermit;
+pub const antfly_image = @import("antfly_image");
 pub const architectures = struct {
+    pub const gemma4_projector = @import("architectures/gemma4_projector.zig");
     pub const gliner_boundary_engine = @import("architectures/gliner/boundary_engine.zig");
     pub const gliner_boundary_request_device = @import("architectures/gliner/boundary_request_device.zig");
     pub const gliner_boundary_head = @import("architectures/gliner/boundary_head.zig");
@@ -146,7 +154,24 @@ pub const gguf = struct {
     pub const tensor_types = @import("gguf/tensor_types.zig");
 };
 
+// This root also owns the focused test-video-model gate; external module tests
+// are not collected merely by importing a namespace from a separate test root.
+test "embeddinggemma2 video module declarations" {
+    _ = pipelines.embedding_gemma2;
+    _ = pipelines.embedding_gemma2_video;
+    if (build_options.enable_metal) _ = native_compute.metal;
+}
+
 test "GLiNER Decide artifact test reachability" {
     _ = models.gliner_decide_qualification;
     _ = models.tensor_store;
+}
+
+test "model aware media module declarations" {
+    _ = pipelines.media_chunking;
+    _ = @import("backends/admitted_allocator.zig");
+}
+
+test "model aware media audio projector declarations" {
+    _ = @import("architectures/gemma4_projector.zig");
 }

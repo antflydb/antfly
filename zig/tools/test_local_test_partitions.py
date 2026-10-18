@@ -29,6 +29,9 @@ class LocalTestPartitions(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="antfly-local-tests-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        # source_owner now attaches the shared decision contract. Copy its
+        # complete authored source closure so these remain real build fixtures.
+        shutil.copytree(ZIG / "lib/decisions", self.root / "lib/decisions")
         for relative in (
             "build_support/antfly/test_partitions.zig",
             "build_support/antfly/source_paths.zig",
@@ -145,7 +148,17 @@ pub fn build(b: *std.Build) void {
 
     def build(self, *args, succeeds=True, build_options=()):
         result = subprocess.run(
-            ["zig", "build", "test", "-j2", *build_options, "--", *args],
+            [
+                "zig",
+                "build",
+                "test",
+                "--cache-dir",
+                str(self.root / ".zig-cache"),
+                "-j2",
+                *build_options,
+                "--",
+                *args,
+            ],
             cwd=self.root,
             text=True,
             capture_output=True,

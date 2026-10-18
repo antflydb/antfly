@@ -105,7 +105,7 @@ fn buildEntityDocAlloc(alloc: std.mem.Allocator, e: resolver_lib.ResolvedEntity)
 fn promotedKeysStateKeyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8 {
     var key = std.ArrayListUnmanaged(u8).empty;
     defer key.deinit(alloc);
-    try key.appendSlice(alloc, &.{ internal_keys.replay_namespace, 0xff, internal_keys.promoted_keys_state_kind });
+    try key.appendSlice(alloc, &internal_keys.promoted_keys_state_prefix);
     try internal_keys.appendEncodedComponent(&key, alloc, resolution_key);
     return try key.toOwnedSlice(alloc);
 }
@@ -284,8 +284,14 @@ fn processResolutionArtifactWithCatalog(
         var current = false;
         for (resolvers) |cfg| {
             if (std.mem.eql(u8, cfg.resolution_artifact, key.artifact_name) and
-                cfg.config_generation == parsed.config_generation)
+                cfg.effectiveGeneration() == parsed.config_generation)
             {
+                // Resolve-only catalogs retain graph identities without creating
+                // entity documents. Previously admitted sink work is recovered above.
+                // Shadow decisions are private until the graph swap commits.
+                // Activation advances the revision and durably backfills them,
+                // so consuming their journal records here cannot lose work.
+                if (!cfg.promote or cfg.replacement_index.len > 0) return 0;
                 current = true;
                 break;
             }
@@ -563,6 +569,7 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn deinit(self: *PromotionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionDeinit", .{self}) catch @panic("incompatible storage owner");
         self.stop();
         self.store_handle.deinit();
         self.* = undefined;
@@ -633,6 +640,7 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn start(self: *PromotionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionStart", .{self});
         const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
@@ -644,6 +652,7 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn stop(self: *PromotionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionStop", .{self}) catch @panic("incompatible storage owner");
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.signalWorker(io);
@@ -702,6 +711,7 @@ pub const PromotionRuntime = struct {
     /// idempotent and safe to retry. `applied_sequence` is persisted only after
     /// durable upserts.
     pub fn catchUp(self: *PromotionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionCatchUp", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.catchUpLocked(false);

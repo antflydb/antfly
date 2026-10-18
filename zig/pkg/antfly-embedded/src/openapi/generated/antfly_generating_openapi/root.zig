@@ -31,3 +31,4 @@ pub const TextContentPart = types.TextContentPart;
 pub const ToolCall = types.ToolCall;
 pub const ToolCallFunction = types.ToolCallFunction;
 pub const VertexGeneratorConfig = types.VertexGeneratorConfig;
+pub const VideoSamplingPolicy = types.VideoSamplingPolicy;

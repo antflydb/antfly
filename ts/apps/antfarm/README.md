@@ -9,6 +9,20 @@ transcription, and evals, plus table, index, and connection management.
 See [ANTFARM.md](ANTFARM.md) for the information architecture and product
 direction.
 
+## Runtime profiles
+
+Models & Runtime includes a device card and a selectable model radar profile.
+Choose the runtime connection, then use **Set up device** to enter its name,
+chip, CPU cores, memory, and bandwidth. Hardware details are user-configured;
+the browser does not identify the inference host automatically.
+
+Use **Record measurements** for a model's quantization, evaluation score,
+decode/prefill throughput, peak memory, tested context, and measurement source.
+Unknown values remain empty. **Values & chart scales** explains the radar's
+fixed scales; memory headroom uses configured RAM and is not a serving admission
+check. Profiles stay in browser storage, isolated by endpoint and connection.
+Changing hardware clears that connection's model measurements.
+
 ## Development
 
 From the `ts/` workspace root:
@@ -27,5 +41,6 @@ The command palette index is generated from the page sources. Run
 
 ## Build into the server
 
-The repo-level `make build-antfarm` target builds the production assets that
-the Zig server embeds. `make build` runs it automatically.
+The repo-level `make generate` target builds the production assets into
+`zig/pkg/antfly/antfarm`, which the Zig server embeds. Run it after changing
+antfarm and commit the result; `make build` uses the committed copy.

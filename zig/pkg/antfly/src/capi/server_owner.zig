@@ -53,6 +53,7 @@ pub const asHandle = handles.asHandle;
 pub const HandleRegistryOf = handles.HandleRegistryOf;
 pub const HandleRegistry = handles.HandleRegistry;
 pub const handle_registry = &handles.handle_registry;
+pub const handleRegistry = handles.handleRegistry;
 pub const closeHandleId = handles.closeHandleId;
 pub const handleLockIo = handles.handleLockIo;
 pub const dupBytes = handles.dupBytes;
@@ -1435,6 +1436,35 @@ pub fn metadataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     if (context) |value| value.release();
 }
 
+pub fn metadataApplyStoreRelationPublication(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataRelationPublicationRequest,
+    out_result: *kernel_owner_abi.MetadataRelationPublicationResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    if (request.operation != .step and request.expected_state.len != 0) return .invalid_argument;
+    switch (request.operation) {
+        .step => {
+            const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+            if (request.expected_state.len != r.State.encoded_len or request.expected_state.ptr == null) return .invalid_argument;
+            const state = r.State.decode(request.expected_state.slice()) catch return .invalid_argument;
+            if (state.group_id != request.group_id) return .invalid_argument;
+            const proof = handle.store.stepRelationPublicationProof(state, request.now_ns) catch |err| return storageOwnerStatusFromError(err);
+            if (proof) |value| {
+                const root = if (value.root) |generation| generation.encode() catch |err| return storageOwnerStatusFromError(err) else @as([30]u8, @splat(0));
+                out_result.* = .{ .ready = 1, .has_root = @intFromBool(value.root != null), .applied_index = value.applied_index, .root = root };
+            }
+        },
+        .cancel => handle.store.cancelRelationPublicationProof(request.group_id) catch |err| return storageOwnerStatusFromError(err),
+        .close => handle.store.closeRelationPublicationProof(request.group_id),
+        .expire => handle.store.expireRelationPublicationProofs(request.now_ns) catch |err| return storageOwnerStatusFromError(err),
+        _ => return .invalid_argument,
+    }
+    return .ok;
+}
+
 pub fn metadataApplyStoreApplyBatch(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataApplyBatchRequest,
@@ -1807,7 +1837,12 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_resolve_many => |input| {
-                    const value = handle.store.resolveSystemCatalogIdentities(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
+                    const value = handle.store.resolveSystemCatalogIdentitiesWithContext(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_write_validation => |name| {
@@ -1820,6 +1855,14 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_query_definition => |input| {
                     const value = handle.store.queryTableDefinition(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relation_source_tracking => {
+                    const value = handle.store.relationSourceTrackingActive(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relation_reconciliation_work => {
+                    const value = handle.store.relationReconciliationWork(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .topology_activation => {
@@ -3403,7 +3446,7 @@ pub fn storageOwnerOpen(
     // the DB and release the borrowed context exactly once, as for every
     // earlier failure. (publishHandle's close-on-failure would release the
     // context a second time.)
-    const owner_id = handle_registry.register(handle) catch |err| return storageOwnerStatusFromError(err);
+    const owner_id = handleRegistry().register(handle) catch |err| return storageOwnerStatusFromError(err);
     success = true;
     out_owner.* = owner_id;
     context_borrowed = false;
@@ -5049,7 +5092,7 @@ pub const StorageRelationalRead = struct {
 
     pub fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
         errdefer page.deinit();
         const owned = page.arena.allocator();
         const rows = try owned.alloc(View.Row, page.rows.len);
@@ -5057,7 +5100,8 @@ pub const StorageRelationalRead = struct {
             .id = row.key,
             .version = row.version,
             .schema_version = session.reader.active.version(),
-            .value = row.typed orelse return error.InvalidResponse,
+            .value = row.typed orelse .null,
+            .typed_cells = row.typed_cells,
             .sql_nulls = row.sql_nulls,
             .expected_content_digest = row.expected_content_digest,
         };
@@ -5973,8 +6017,10 @@ pub fn searchStorageKernelQueryJson(
     table_reads_api.checkQueryDeadline(controls) catch |err|
         return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
     if (comptime capi_build_options.linked_storage) {
-        handle.prepareSearchRequest(controls) catch |err|
+        handle.prepareSearchRequest(controls) catch |err| {
+            if (err == error.CatalogGenerationChanged) std.log.warn("local query preparation conflict", .{});
             return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+        };
         const response = local_query_client.executeJsonAlloc(
             std.heap.c_allocator,
             @ptrCast(&handle.db),
@@ -5987,6 +6033,7 @@ pub fn searchStorageKernelQueryJson(
             request.control.cancellation_fn,
             out_failure,
         ) catch |err| {
+            if (err == error.CatalogGenerationChanged) std.log.warn("local query provider conflict operation={d} provider_error={s}", .{ out_failure.operation, out_failure.boundedErrorName() });
             // A valid provider failure already carries the exact envelope.
             // Consumer-side allocation/protocol failures originate in this
             // outer operation and receive their own identity.

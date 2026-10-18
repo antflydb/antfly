@@ -53,6 +53,9 @@ jobs:
           CHECK_ID: ${{ inputs.check_id }}
           COMMENT_ID: ${{ inputs.comment_id }}
         with:
+          # Status/check updates are safe to repeat after transient GitHub 5xx.
+          # Permission and validation failures retain the action's 4xx exclusions.
+          retries: 3
           script: |
             const {main} = require('./.github/scripts/pr-ci.cjs');
             await main({github, context, core, mode: 'admit',
@@ -149,9 +152,29 @@ jobs:
       base_sha: ${{ needs.approve.outputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
+  linux-release:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'linux-release')
+    uses: ./.github/workflows/qualify-linux-release.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+  apple-video:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'apple-video')
+    uses: ./.github/workflows/zig-apple-video.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
   result:
     name: PR CI result
-    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, vopr, darwin]
+    needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, vopr, darwin, linux-release, apple-video]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -197,6 +220,9 @@ jobs:
           COMMENT_ID: ${{ inputs.comment_id }}
           RESULT: ${{ needs.result.result }}
         with:
+          # Status/check updates are safe to repeat after transient GitHub 5xx.
+          # Permission and validation failures retain the action's 4xx exclusions.
+          retries: 3
           script: |
             const {main} = require('./.github/scripts/pr-ci.cjs');
             await main({github, context, core, mode: 'complete',

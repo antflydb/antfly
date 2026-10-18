@@ -29,6 +29,7 @@ const Block = struct {
     keys: Store,
     ordinals: std.ArrayList(u64) = .empty,
     bytes: usize = 0,
+    target: usize = 0,
     failed: bool = false,
     refs: std.atomic.Value(usize) = .init(1),
     fn create(a: A) !*Block {
@@ -38,23 +39,24 @@ const Block = struct {
         self.keys = .init(self.arena.allocator());
         return self;
     }
-    fn appendBatch(self: *Block, values: Batch, keys: Batch, ordinals: []const u64) !void {
+    fn appendBytes(self: *Block, values: Batch, keys: Batch, count: usize, value_memo: *Store.JsonLease, key_memo: *Store.JsonLease) !usize {
+        var bytes = count *| @sizeOf(u64);
+        if (!self.values.initialized) bytes +|= @import("typed_store.zig").columnMetadataBytes(values.width());
+        if (!self.keys.initialized) bytes +|= @import("typed_store.zig").columnMetadataBytes(keys.width());
+        bytes +|= self.values.dictionaryGrowthBytes(count) *| 2;
+        bytes +|= self.keys.dictionaryGrowthBytes(count) *| 2;
+        bytes +|= try self.values.batchAppendBytesLeased(self.a, values, std.math.maxInt(usize), value_memo);
+        bytes +|= try self.keys.batchAppendBytesLeased(self.a, keys, std.math.maxInt(usize), key_memo);
+        return bytes;
+    }
+    fn appendBatch(self: *Block, values: Batch, keys: Batch, ordinals: []const u64, bytes: usize, value_memo: *Store.JsonLease, key_memo: *Store.JsonLease) !void {
         if (self.failed or values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlBackendResponse;
         errdefer self.failed = true;
-        // Reserve structural metadata first. Never publish a partially updated
-        // column set after a failed allocation or normalization.
         try self.ordinals.ensureUnusedCapacity(self.arena.allocator(), ordinals.len);
-        try self.values.appendBatch(values);
-        try self.keys.appendBatch(keys);
+        try self.values.appendBatchLeased(values, value_memo);
+        try self.keys.appendBatchLeased(keys, key_memo);
         self.ordinals.appendSliceAssumeCapacity(ordinals);
-        var scratch = std.heap.ArenaAllocator.init(self.a);
-        defer scratch.deinit();
-        for (0..values.len()) |row| {
-            _ = scratch.reset(.retain_capacity);
-            self.bytes +|= @sizeOf(operators.Row);
-            for (0..values.width()) |column| self.bytes +|= try operators.datumBytes(try values.cell(scratch.allocator(), row, column));
-            for (0..keys.width()) |column| self.bytes +|= try operators.datumBytes(try keys.cell(scratch.allocator(), row, column));
-        }
+        self.bytes +|= bytes;
     }
     fn close(self: *Block) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -73,6 +75,7 @@ pub const Pipe = struct {
     current: ?*Block = null,
     index: usize = 0,
     block_bytes: usize,
+    json_hash_bytes: usize = 0,
     terminal_error: ?anyerror = null,
     pub fn create(manager: *spill.Manager, bytes: usize) !*Pipe {
         const self = try manager.allocator().create(Pipe);
@@ -104,10 +107,59 @@ pub const Pipe = struct {
         return self.appendBatch(.{ .rows = &.{row.values} }, .{ .rows = &.{row.keys} }, &.{row.ordinal});
     }
     pub fn appendBatch(self: *Pipe, values: Batch, keys: Batch, ordinals: []const u64) !void {
-        try self.manager.check();
-        if (self.pending == null) self.pending = try Block.create(self.manager.allocator());
-        try self.pending.?.appendBatch(values, keys, ordinals);
-        if (self.pending.?.bytes >= self.block_bytes or self.pending.?.ordinals.items.len >= 64) try self.flush();
+        if (values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlBackendResponse;
+        var begin: usize = 0;
+        while (begin < values.len()) {
+            try self.manager.check();
+            if (self.pending == null) {
+                self.pending = try Block.create(self.manager.allocator());
+                self.pending.?.target = self.block_bytes;
+            }
+            const count = try self.appendCohort(values, keys, ordinals, begin);
+            begin += count;
+            if (begin < values.len() or self.pending.?.bytes >= self.pending.?.target or self.pending.?.ordinals.items.len >= 64) try self.flush();
+        }
+    }
+    /// A memo is scoped to both this producer lease and destination block.
+    /// Counting generations are fresh for each fitting-prefix attempt, while
+    /// hash resolutions and accepted owned payloads survive within the cohort.
+    fn appendCohort(self: *Pipe, values: Batch, keys: Batch, ordinals: []const u64, begin: usize) !usize {
+        const block = self.pending.?;
+        var work = std.heap.ArenaAllocator.init(self.manager.allocator());
+        defer work.deinit();
+        var value_memo = Store.JsonLease.init(self.manager.allocator());
+        defer value_memo.deinit();
+        var key_memo = Store.JsonLease.init(self.manager.allocator());
+        defer key_memo.deinit();
+        defer self.json_hash_bytes +|= value_memo.hashed_bytes +| key_memo.hashed_bytes;
+        var consumed: usize = 0;
+        while (begin + consumed < values.len() and block.ordinals.items.len < 64) {
+            var count = @min(values.len() - begin - consumed, 64 - block.ordinals.items.len);
+            while (true) {
+                _ = work.reset(.retain_capacity);
+                const a = work.allocator();
+                const positions = try a.alloc(usize, count);
+                for (positions, begin + consumed..) |*position, row| position.* = row;
+                const selected = try values.select(a, positions);
+                const selected_keys = try keys.select(a, positions);
+                const bytes = try block.appendBytes(selected, selected_keys, count, &value_memo, &key_memo);
+                if (bytes > block.target -| block.bytes) {
+                    if (count > 1) {
+                        count = @max(1, count / 2);
+                        continue;
+                    }
+                    if (block.ordinals.items.len != 0) return consumed;
+                    // Permit one oversized row plus a bounded metadata window;
+                    // duplicates can share it, distinct payloads cannot grow it.
+                    block.target = bytes +| self.block_bytes;
+                }
+                try block.appendBatch(selected, selected_keys, ordinals[begin + consumed ..][0..count], bytes, &value_memo, &key_memo);
+                consumed += count;
+                break;
+            }
+            if (block.bytes >= block.target) break;
+        }
+        return consumed;
     }
     /// Join padding is written column by column; concatenated Datum rows are
     /// needed only when a residual expression actually evaluates them.
@@ -224,7 +276,7 @@ fn allocationScenario(a: A) !void {
     try std.testing.expect(pipe.terminal_error == null);
 }
 test "SQL typed output pipes reclaim partial blocks across allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }
 
 fn leaseScenario(a: A) !void {
@@ -255,4 +307,110 @@ fn leaseScenario(a: A) !void {
 }
 test "SQL worker column leases survive pipe teardown and allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, leaseScenario, .{});
+}
+
+test "SQL native output pipe accounts frozen bytes without scalar access" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: A) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"x\":[9007199254740993,1.25]}", .{});
+            const wire = try spill.encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{@import("scalar.zig").Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+            const block = try spill.decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+            defer block.deinit();
+            const Reader = struct {
+                value: @import("execution_batch.zig").FrozenJson,
+                fn cell(_: *anyopaque, _: A, _: usize, _: usize) !@import("scalar.zig").Datum {
+                    return error.UnexpectedScalarMaterialization;
+                }
+                fn frozen(raw: *anyopaque, _: usize, _: usize) !?@import("execution_batch.zig").FrozenJson {
+                    return @as(*@This(), @ptrCast(@alignCast(raw))).value;
+                }
+            };
+            var reader: Reader = .{ .value = (try block.frozenJson(0, 0, false)).? };
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check };
+            defer manager.deinit();
+            const pipe = try Pipe.create(&manager, 8192);
+            var live = true;
+            defer if (live) pipe.close();
+            try pipe.appendBatch(.{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 1, .width = 1 } }, .{ .rows = &.{&.{}} }, &.{0});
+            pipe.finish(null);
+            const view = (try pipe.nextBatch(1)).?;
+            defer view.deinit();
+            pipe.close();
+            live = false;
+            try std.testing.expectEqualSlices(u8, reader.value.bytes, (try view.values().frozenJson(0, 0)).?.bytes);
+            const replay = try spill.encodeColumnarBatchVersionAlloc(sa, view.values(), &.{0}, 1 << 20, .v2);
+            try std.testing.expectEqualSlices(u8, wire, replay);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL native worker cohorts share oversized payloads and bound distinct rows" {
+    const Fixture = struct {
+        text: []const u8,
+        distinct: ?[]const u8 = null,
+        fn check(_: *anyopaque) !void {}
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) !@import("scalar.zig").Datum {
+            return error.UnexpectedScalarMaterialization;
+        }
+        fn json(raw: *anyopaque, row: usize, _: usize) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (row != 0 and self.distinct != null) self.distinct.? else self.text;
+        }
+        fn run(a: A, distinct: bool) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const prefix = "{\"payload\":\"";
+            const text = try source.allocator().alloc(u8, prefix.len + 12000 + 2);
+            @memcpy(text[0..prefix.len], prefix);
+            @memset(text[prefix.len..][0..12000], 'x');
+            @memcpy(text[text.len - 2 ..], "\"}");
+            var fixture: @This() = .{ .text = text };
+            if (distinct) {
+                const second = try source.allocator().dupe(u8, fixture.text);
+                second[12] = 'y';
+                fixture.distinct = second;
+            }
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check };
+            defer manager.deinit();
+            const pipe = try Pipe.create(&manager, 8192);
+            defer pipe.close();
+            const values: Batch = .{ .reader = .{ .ptr = &fixture, .read = cell, .read_json = json, .count = 64, .width = 1 } };
+            const key_rows: [64][]const @import("scalar.zig").Datum = @splat(&.{});
+            const ordinals: [64]u64 = @splat(0);
+            if (distinct) {
+                pipe.pending = try Block.create(manager.allocator());
+                pipe.pending.?.target = pipe.block_bytes;
+                const consumed = try pipe.appendCohort(values, .{ .rows = &key_rows }, &ordinals, 0);
+                try std.testing.expectEqual(@as(usize, 1), consumed);
+                try std.testing.expectEqual(@as(usize, 1), pipe.pending.?.ordinals.items.len);
+                try std.testing.expect(pipe.pending.?.bytes <= pipe.pending.?.target);
+                pipe.finish(null);
+                const view = (try pipe.nextBatch(64)).?;
+                defer view.deinit();
+                try std.testing.expectEqual(@as(usize, 1), view.count);
+            } else {
+                try pipe.appendBatch(values, .{ .rows = &key_rows }, &ordinals);
+                pipe.finish(null);
+                const view = (try pipe.nextBatch(64)).?;
+                defer view.deinit();
+                try std.testing.expectEqual(@as(usize, 64), view.count);
+                try std.testing.expectEqual(fixture.text.len, pipe.json_hash_bytes);
+                for (0..64) |row| try std.testing.expectEqualStrings(fixture.text, (try view.values().encodedJson(row, 0)).?);
+                try std.testing.expect((try pipe.nextBatch(64)) == null);
+                if (a.ptr == std.testing.allocator.ptr) std.debug.print("NATIVE_WORKER_COHORT rows=64 payload={d} deliveries=1 hash_input={d}\n", .{ fixture.text.len, pipe.json_hash_bytes });
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |distinct| {
+        try Fixture.run(std.testing.allocator, distinct);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{distinct});
+    }
 }

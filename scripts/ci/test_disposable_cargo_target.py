@@ -39,7 +39,7 @@ class DisposableCargoTargetTests(unittest.TestCase):
             child,
         ]
 
-    def run_phase(self, status):
+    def run_phase(self, status, cache_volume=False):
         with tempfile.TemporaryDirectory(prefix="cargo phase ") as directory:
             root = Path(directory)
             shared = root / "shared-target"
@@ -47,6 +47,12 @@ class DisposableCargoTargetTests(unittest.TestCase):
             sentinel = shared / "published"
             sentinel.write_text("keep")
             env = dict(os.environ, RUNNER_TEMP=str(root), CARGO_TARGET_DIR=str(shared))
+            env.pop("ANTFLY_CARGO_TARGET_PARENT", None)
+            parent = root
+            if cache_volume:
+                parent = root / "cache-volume"
+                parent.mkdir()
+                env["ANTFLY_CARGO_TARGET_PARENT"] = str(parent)
             child = (
                 """import json, os
 from pathlib import Path
@@ -61,7 +67,7 @@ raise SystemExit(%d)
             )
             self.assertEqual(status, result.returncode, result.stderr)
             target = Path(json.loads(result.stdout))
-            self.assertEqual(root, target.parent)
+            self.assertEqual(parent, target.parent)
             self.assertNotEqual(shared, target)
             self.assertFalse(target.exists())
             self.assertEqual("keep", sentinel.read_text())
@@ -71,6 +77,11 @@ raise SystemExit(%d)
 
     def test_failure_preserves_exit_status_and_retires_outputs(self):
         self.run_phase(42)
+
+    def test_cache_volume_overrides_runner_ephemeral_storage_and_retires_outputs(self):
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.run_phase(status, cache_volume=True)
 
     @unittest.skipUnless(os.name == "posix", "Bash CI process groups require POSIX")
     def test_cancellation_joins_child_before_retiring_outputs(self):
@@ -91,6 +102,7 @@ marker.write_text(str(p))
 time.sleep(60)
 """
             env = dict(os.environ, RUNNER_TEMP=str(root), TEST_MARKER=str(marker))
+            env.pop("ANTFLY_CARGO_TARGET_PARENT", None)
             process = subprocess.Popen(
                 self.command(child),
                 env=env,

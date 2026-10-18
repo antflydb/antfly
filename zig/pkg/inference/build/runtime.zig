@@ -14,14 +14,11 @@
 // limitations under the License.
 
 const std = @import("std");
-const Translator = @import("translate_c").Translator;
 const onnx_build = @import("onnx_graph").support;
 pub const OnnxModules = onnx_build.Modules;
 const jit_identity = @import("jit_identity.zig");
 
 pub const BackendOptions = struct {
-    enable_onnx: bool = false,
-    onnx_root: []const u8 = "onnxruntime/unknown-unknown",
     enable_metal: bool = false,
     enable_cuda: bool = false,
     cuda_artifacts: []const u8 = "fatbin",
@@ -62,6 +59,7 @@ pub const SharedModules = struct {
     regex: ?*std.Build.Module = null,
     jsonschema: ?*std.Build.Module = null,
     image: ?*std.Build.Module = null,
+    pdf: ?*std.Build.Module = null,
     hash: ?*std.Build.Module = null,
     // Entrypoints choose these implementations explicitly; missing source
     // must fail its consumer rather than select a compatibility fallback.
@@ -97,7 +95,6 @@ pub const Config = struct {
 };
 
 pub const Graph = struct {
-    c_bindings: CBindings,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
     identities: jit_identity.Modules,
@@ -198,6 +195,7 @@ pub fn create(config: Config) Graph {
     };
     const regex_mod = shared.regex orelse blk: {
         const mod = createSharedModule(config, "lib/regex/src/mod.zig");
+        mod.addImport("antfly_capture_regex", createSharedModule(config, "lib/regex/src/captures.zig"));
         mod.addImport("antfly_fst", fst_mod);
         mod.addImport("antfly_platform", platform_mod);
         break :blk mod;
@@ -332,6 +330,8 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
 
+    @import("antfly_media").support.attach(b, inference_audio_mod, b.path(pathJoin(b, paths.shared_lib_root, "lib/media")));
+
     const inference_chunker_mod = addOrCreateModule(b, config.register_public_modules, "inference_chunker", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/chunker/src/mod.zig")),
         .target = target,
@@ -343,7 +343,6 @@ pub fn create(config: Config) Graph {
     inference_chunker_mod.addImport("antfly_image", image_mod);
     inference_chunker_mod.addImport("antfly_hash", hash_mod);
 
-    const c_bindings = createCBindings(b, target, backend, paths);
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
         .target = target,
@@ -356,7 +355,6 @@ pub fn create(config: Config) Graph {
     });
     inference_mod.addImport("antfly_decisions", decisions_mod);
     addInferenceRootImports(inference_mod, .{
-        .c_bindings = c_bindings,
         .build_info_mod = shared.build_info_mod,
         .identities = identities,
         .build_options_mod = build_options_mod,
@@ -384,6 +382,31 @@ pub fn create(config: Config) Graph {
         .reader_config_mod = reader_config_mod,
         .inference_client_mod = inference_client_mod,
     });
+    const pdf_mod = shared.pdf orelse blk: {
+        const files = b.addWriteFiles();
+        _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/fonts/roboto/Roboto-Regular.ttf")), "lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+        _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/fonts/roboto/Roboto-Bold.ttf")), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
+        _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/agl_lookup.zig")), "lib/pdf/src/agl_lookup.zig");
+        _ = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/agl_data.zig")), "lib/pdf/src/agl_data.zig");
+        const fonts = b.createModule(.{ .root_source_file = files.addCopyFile(b.path(pathJoin(b, paths.shared_lib_root, "pdf_standard_fonts.zig")), "pdf_standard_fonts.zig"), .target = target, .optimize = optimize });
+        const font = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/font/src/mod.zig")), .target = target, .optimize = optimize });
+        const pdf = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/mod.zig")), .target = target, .optimize = optimize });
+        pdf.addImport("antfly_image", image_mod);
+        pdf.addImport("antfly_hash", hash_mod);
+        pdf.addImport("antfly_font", font);
+        pdf.addImport("pdf_standard_fonts", fonts);
+        pdf.addImport("antfly_platform", platform_mod);
+        if (target.result.os.tag == .macos) {
+            @import("antfly_platform").addMacosSdkPaths(b, pdf, target);
+            pdf.linkFramework("CoreFoundation", .{});
+            pdf.linkFramework("CoreGraphics", .{});
+        }
+        break :blk pdf;
+    };
+    inference_mod.addImport("antfly_pdf", pdf_mod);
+    const media_mod = inference_audio_mod.import_table.get("antfly_media").?;
+    inference_mod.addImport("antfly_media", media_mod);
+    @import("antfly_video").support.attach(b, inference_mod, b.path(pathJoin(b, paths.shared_lib_root, "lib/video")), .{ .media = media_mod, .image = image_mod });
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
@@ -405,7 +428,11 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     inference_internal_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     inference_internal_mod.addImport("antfly_image", image_mod);
+    inference_internal_mod.addImport("antfly_pdf", pdf_mod);
+    inference_internal_mod.addImport("inference_chunker", inference_chunker_mod);
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
+    inference_internal_mod.addImport("antfly_media", media_mod);
+    inference_internal_mod.addImport("antfly_video", inference_mod.import_table.get("antfly_video").?);
     inference_internal_mod.addImport("ml", ml_mod);
     inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
     if (pjrt_mod) |pjrt| inference_internal_mod.addImport("pjrt", pjrt);
@@ -415,7 +442,6 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("onnx_graph", onnx.graph);
     inference_internal_mod.addImport("onnx_data", onnx.data);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
-    applyCBindings(inference_internal_mod, c_bindings);
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
@@ -465,59 +491,19 @@ pub fn create(config: Config) Graph {
         .reader_config_mod = reader_config_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
-        .c_bindings = c_bindings,
     };
 }
 
-pub const CBindings = struct {
-    onnx: *std.Build.Module,
-    ortgenai: *std.Build.Module,
-};
-
-fn createCBindings(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    backend: BackendOptions,
-    paths: Paths,
-) CBindings {
-    const empty = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/c_empty.zig")),
-        .target = target,
-    });
-    if (!backend.enable_onnx) return .{ .onnx = empty, .ortgenai = empty };
-
-    const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
-    const onnx = Translator.init(b.dependency("translate_c", .{}), .{
-        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
-        .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
-        .target = target,
-        .optimize = .debug,
-        .link_libc = true,
-    });
-    onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
-    const ortgenai = Translator.init(b.dependency("translate_c", .{}), .{
-        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
-        .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
-        .target = target,
-        .optimize = .debug,
-        .link_libc = true,
-    });
-    ortgenai.addIncludePath(b.graph.cwdRelativePath(include_dir));
-    return .{ .onnx = onnx.mod, .ortgenai = ortgenai.mod };
-}
-
-pub fn applyCBindings(module: *std.Build.Module, bindings: CBindings) void {
-    module.addImport("onnx_c", bindings.onnx);
-    module.addImport("ortgenai_c", bindings.ortgenai);
-}
-
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
+    const compile_memory_mb = b.option(usize, "inference-compile-memory-mb", "Declared standalone inference compiler memory bound in MiB") orelse
+        @as(usize, if (target.result.os.tag == .macos) 14 * 1024 else 7 * 1024);
+    if (compile_memory_mb == 0) @panic("inference compiler memory bound must be positive");
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
         // The F32 Metal ReleaseFast CLI measured 12.7 GiB during compilation.
         // Match the inference-test headroom so the scheduler admits this
         // measured build rather than rejecting its completed artifact.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = std.math.mul(usize, compile_memory_mb, 1024 * 1024) catch @panic("inference compiler memory bound overflows"),
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
@@ -534,7 +520,6 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
 }
 
 const InferenceRootImports = struct {
-    c_bindings: CBindings,
     build_info_mod: *std.Build.Module,
     identities: jit_identity.Modules,
     build_options_mod: *std.Build.Module,
@@ -564,7 +549,6 @@ const InferenceRootImports = struct {
 };
 
 pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRootImports) void {
-    applyCBindings(module, imports.c_bindings);
     module.addImport("build_info", imports.build_info_mod);
     imports.identities.addImports(module);
     module.addImport("build_options", imports.build_options_mod);
@@ -618,7 +602,6 @@ fn addExplicitBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.St
 }
 
 fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) void {
-    options.addOption(bool, "enable_onnx", backend.enable_onnx);
     options.addOption(bool, "enable_metal", backend.enable_metal);
     options.addOption(bool, "enable_cuda", backend.enable_cuda);
     options.addOption([]const u8, "cuda_artifacts", backend.cuda_artifacts);
@@ -784,7 +767,7 @@ fn addOrCreateModule(b: *std.Build, register_public_modules: bool, name: []const
     return b.createModule(options);
 }
 
-fn configureRuntimeLinks(
+pub fn configureRuntimeLinks(
     b: *std.Build,
     module: *std.Build.Module,
     target: std.Build.ResolvedTarget,
@@ -797,7 +780,6 @@ fn configureRuntimeLinks(
     if (backend.enable_system_blas) {
         configureSystemBlas(b, module, target, backend.blas_root);
     }
-    configureOnnxRuntime(b, module, backend.enable_onnx, backend.onnx_root);
     configureMetal(b, module, target, backend.enable_metal, paths);
 }
 
@@ -818,25 +800,6 @@ pub fn configureSystemBlas(
         module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
     }
     module.linkSystemLibrary("openblas", .{});
-}
-
-pub fn configureOnnxRuntime(
-    b: *std.Build,
-    module: *std.Build.Module,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-) void {
-    if (!enable_onnx) return;
-    // Declare dependencies on the consuming module. Missing installations fail
-    // its compile/link step without blocking configuration of unrelated targets.
-    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
-    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
-    if (std.mem.startsWith(u8, onnx_root, "pkg/")) {
-        module.addRPath(b.graph.cwdRelativePath(b.fmt("zig/{s}/lib", .{onnx_root})));
-    }
-    module.linkSystemLibrary("onnxruntime", .{});
-    module.linkSystemLibrary("onnxruntime-genai", .{});
 }
 
 pub fn configureMetal(

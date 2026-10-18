@@ -595,3 +595,561 @@ than five minutes before the retained restart-pagination check. Reports include
 the configured retention window.
 The first durable generation's transfer latency and automatic background warming
 must be qualified separately from ordinary unordered search latency.
+
+## Full-archive deployment qualification
+
+The merged engine is qualified separately from the public HN deployment. See
+[deployment gates](../../docs/plans/hackernews-deployment-qualification.md) for
+performance targets, source freshness and durable deployment requirements.
+
+Capture only authenticated Parquet footers, including immutable object versions:
+
+```sh
+python examples/hackernews/archive_inventory.py \
+  --prefix hn-poc/20261009-full-portability-2b1f7524d047/archive \
+  --output /private/tmp/hn-archive-inventory.json
+```
+
+Build merged main for Linux using `-Dtarget=x86_64-linux-musl -Doptimize=fast
+-Dmetal=false -Dstrip=true`. Print the bounded plan before executing:
+
+```sh
+python examples/hackernews/archive_qualification.py \
+  --inventory /private/tmp/hn-archive-inventory.json \
+  --binary /path/to/linux/antfly --revision FULL_SOURCE_REVISION \
+  --ledger /private/tmp/hn-archive-budget.json \
+  --output /private/tmp/hn-archive-attempt-01
+```
+
+Add `--execute` to verify the live inventory and start the temporary regional
+pod. Use the same ledger for retries; failed/interrupted runs consume their
+reservation. Results include the raw logs and a failing verdict when construction
+or latency gates fail. Never interpret an index-build failure as successful
+archive qualification. The configuration targets the pinned 47,717,307-row
+export; an expired or changed source requires a newly reviewed inventory/config.
+The temporary bucket is unsuitable for the public service's durable storage.
+
+### October 10 full-archive results
+
+[archive-results-20261010.json](archive-results-20261010.json) records the pinned
+47,717,307-row raw export and the merged-main Linux `fast` attempt. Registration
+took 49.6 seconds, then publication failed with `ParquetRowGroupTooLarge` before
+SQL counts or search timings could be measured. The temporary pod and its 36
+small derived objects were deleted; the source export was preserved.
+
+The follow-up decoder separates column-vector ownership from physical row
+references. Streaming cursors create references once per bounded output batch
+instead of retaining a complete reference array for each column page. Existing
+materialization limits remain in force. A 12-column, 145,186-row regression
+covers cached/uncached reads and correct references across 4,096-row batches;
+one column's measured allocation peak was 4,065,504 bytes within its combined
+5,592,404-byte payload/structure allowance. The 132 focused Parquet and 31 lake
+SQL tests passed.
+
+The fixed optimized rerun passed the original decoder failure but stopped during
+construction with `SqlProgramLimitExceeded` after 195.3 seconds, with 174 MiB
+peak RSS. Registration took 41.9 seconds. Static inspection points to the
+archive-wide replay capture inheriting SQL’s 1 GiB spill limit; the runtime
+error does not identify the exact limit site. The second pod and 78 derived
+objects were deleted. No search latency was measured in either attempt.
+
+The follow-up now bounds replay and metadata sorts by file, updates text
+statistics by file, and saves complete file contributions in a separate
+non-serving catalog checkpoint. Retries use a fresh lease and retain completed
+work; both vacuum paths protect checkpoint roots. The local replay optimization
+falls back to streaming for an oversized file. Per-file index admission remains
+enforced. Optimized archive construction and query benchmarks are being rerun.
+
+The original two attempts consumed $65 in conservative allowances including
+prior work. The follow-up now permits four additional attempts, up to $145 of
+allowances within the unchanged $150 ceiling. One is a separately labelled
+142,577-row raw-file search diagnostic; full-archive gates remain unchanged.
+`--extend-run-limit` records each extension in the existing ledger; it cannot
+reset failed reservations or change spend limits.
+
+The bounded archive attempt ran 841.6 seconds before another
+`SqlProgramLimitExceeded`, at 267.5 MiB peak RSS. A shared spill-capacity
+regression exposed the predicate builder retaining too many runs alongside
+fused sorts; that builder now retains four runs. Its synchronized admission
+diagnostics identify spill file and byte peaks on the next attempt. The
+142,577-row diagnostic stopped at its first `Timeout` after 640.2 seconds,
+before searches. The harness now records transient timeout observations and
+waits for queued checkpoint recovery under the original build deadline.
+Permanent admission errors still fail immediately. Neither result establishes
+archive latency.
+
+The fifth full-archive attempt used the predicate-capacity fix, but stopped at
+`Unauthorized` after 670.2 seconds (218.9 MiB peak RSS), before searches.
+Cached credential expiration is plausible; original expiry evidence is unavailable.
+The regional harness now forces one fresh token per pod, checks its lifetime
+against the remaining pod deadline, and reuses it across cycles. Only expiry
+metadata is persisted. All five pods and 22,946 failed derived objects are
+removed; $125 remains reserved in the shared ledger. The final reserved attempt
+is a separately labelled one-file search diagnostic, not archive qualification.
+
+The final raw-file diagnostic stopped at the original 45-minute build deadline,
+after 38 engine `Timeout` events, with 350 MiB peak process RSS. It reached
+generation 39 and reused all five metadata child-tree sets across retries; the
+text index stayed incomplete. SQL count and search timings were never reached.
+The six owned pods, 50,069 failed derived objects and temporary source copy are
+removed; the original full export is preserved. All six allowances total $145
+in reservations, not measured billing.
+
+Native-client probes in the same pod verified full GCS uploads and media reads
+up to 8 MiB, narrowing the failure investigation. Their traffic overlaps build
+network counters and does not qualify search latency. New publication/checkpoint
+and text-stage diagnostics preserve errors without logging source text or
+credentials. Those diagnostics were not in the measured binary. The timeout was subsequently reproduced and fixed as described below;
+reconcile actual cloud charges before further regional attempts. The 160 lake regressions,
+22 harness tests and keep-alive TLS upload regression pass.
+
+
+A focused production builder subsequently reproduced `Timeout` in
+`segment_statistics` while uploading a GCS page. The TLS writer discarded a
+plaintext tail when record framing filled the ciphertext buffer. Flush now
+consumes only encrypted bytes and repeats until empty, without increasing engine
+HTTP timeouts. An exact-buffer regression fails before the fix and passes after
+it with TLS 1.2 and TLS 1.3; all seven focused HTTPS tests pass.
+
+The fixed native optimized diagnostic reached 1,995 GCS artifacts (139,903,056
+bytes) without an engine timeout before its local 300-second bound. Those
+artifacts were generation-deleted after stopping the reader. This body-only,
+testing-allocator production-builder diagnostic uses unchanged raw Parquet and
+real GCS artifacts, but excludes the serving API and public search measurements.
+The shared ledger now reserves the complete $150 ceiling: $145 for earlier work
+and six pod attempts, plus $5 for local GCS diagnostics. Local diagnostic
+reservations count against the same harness budget. Billing exports are still
+too stale to release allowances. Full-archive and search latency remain
+unqualified.
+
+The subsequent 600-second completion check also hit its local bound before
+publication: 2,265 artifacts, 157,341,017 bytes, no engine timeout logged. A
+one-second stack sample placed remaining work in document-frequency statistics
+reading pages through GCS. Complete GCS publication remains unverified; this
+sample does not attribute all elapsed time or qualify regional performance.
+All 2,265 artifacts were generation-deleted after the builder stopped; the
+original archive source was preserved.
+
+
+### Reconciled follow-up admission
+
+Completed pod compute can be reconciled from a reviewed detailed billing export
+without erasing original reservations or failed attempts:
+
+```sh
+python examples/hackernews/archive_budget.py \
+  --ledger /private/tmp/hn-archive-budget.json \
+  --evidence examples/hackernews/archive-reconciliation-20261011.json
+```
+
+Evidence must identify a deleted pod, the matching ledger run, closure and export
+coverage timestamps, gross CPU/memory/ephemeral-storage charges, and the retained
+noncompute allowance. Promotion credits do not reduce exposure. Repeated evidence
+is idempotent, costs cannot decrease, and unsettled local diagnostics still count.
+The October 11 reconciliation releases $59.072894 in excess compute reservations,
+leaving $90.927106 held or recorded, including $60 for the six runs' unexported or
+shared noncompute costs, $25 for earlier work and $5 for local diagnostics.
+
+Use `archive-qualification-followup.json` with the same reconciled ledger and
+`--extend-run-limit` for two additional attempts within the original $150 ceiling.
+Its plan includes prior reconciled exposure; it must not be admitted against a
+fresh ledger. Original attempts and extension records remain auditable.
+The deep cursor workload uses `AI`, which the standard analyzer retains and
+which matches 4,110 rows in the qualification partition. This exceeds the
+4,097-hit gate; stopwords such as `the` cannot establish that coverage. Restart
+checks replay the last nonempty deep page.
+
+The follow-up also requires real public-API checks across historical and current
+tables: union visibility, suppression of a historical match by a nonmatching
+current replacement, saved-source visibility, and replay of a captured composed
+cursor after current rows change and the daemon restarts. These are separate
+correctness requirements; a successful single-table search cannot substitute
+for them. The current rows are synthetic qualification data, not a live HN feed.
+
+The stored-source and larger bulk-page run at engine revision `9663fe3bdc`
+completed two same-region cycles on the unchanged 142,577-row partition. Initial
+publication took 424.38 seconds; reopening the same publication took 0.2 seconds.
+Exact SQL counts, indexed/residual filter agreement, concurrent searches,
+historical/current replacement semantics, and restart/cursor correctness passed.
+Restart searches took 703–712 ms. Cold highlighted queries still took 15.9–18.0
+seconds, and early deep cursor pages exceeded the 2-second p95 gate. This is a
+**failed** one-file performance qualification; see
+`publication-stored-source-20261012.json`. The owned pod and all 7,429 derived
+objects were removed with generation conditions; source data was preserved.
+
+The harness exposes health metrics only on the daemon's loopback host at the
+query port plus one. For selected serial phases it waits for the existing
+five-second metrics refresh before and after each measured query, outside the
+reported latency, and records process-level phase/cache-counter deltas. Nested
+phase durations can overlap; background traffic and concurrent queries prevent
+these counters from being a per-query provider trace.
+
+The final optimized Linux binary also passed both native storage profiles through
+the public HTTP recovery tests. An incomplete local cut directory now validates
+as a cache miss and opens the same authenticated remote generation; loss of
+remote authority still fails closed. Malformed manifests, missing sealed files,
+and active-reader admission are covered by engine units. Exact validation layers
+and binary provenance are in `native-recovery-qualification-20261012.json`.
+
+New seekable text publications can bundle their opening metadata pages into one
+authenticated object per segment. The bundle stays below 1 MiB and below half of
+the original segment size; oversized or small segments keep the existing range
+layout. The physical owner charges retained bundle bytes to its publication
+allocator and reports them to residency accounting. Under memory pressure, reads
+fall back to verified range leases. Segment-native offsets, page CRC checks,
+scoring, legacy directories and cursor identities stay unchanged. This adds a
+bounded duplicate of opening pages to object storage in exchange for fewer cold
+GETs. Existing publications remain readable; rebuilding produces bundled layout.
+The native regression opens all declared field navigation with exactly two
+provider reads (directory and bundle), checks exact scores and the full byte
+round-trip, rejects a substituted range identity, and tests residency denial.
+Regional performance of this change must still pass the qualification gates.
+
+The metadata bundle binary at revision `89ccd33a2f` passed both public native
+recovery profiles and completed two regional cycles. Cold searches improved to
+12.1–13.9 seconds but still missed the 10-second gate; early cursor pages also
+missed their latency gate. Restart search took roughly half a second. See
+`publication-metadata-qualification-20261012.json`; this remains failed
+performance evidence. Phase counters placed most residual cold time in ranking
+and initial deep-page time in hydration.
+
+Lake text candidate identities can now come directly from the authenticated
+publication's ordinal-to-physical-row map. This avoids fetching stored-key pages
+for every matching candidate before final sorting and preserves canonical public
+IDs, delete-hole rank selection, scores and cursor ties. Legacy/recent/enriched
+paths retain stored-key projection. Final stored-source hydration advises a
+four-document lookahead through the current snapshot's existing bounded source
+queue; required reads retain their integrity and cancellation checks.
+
+Budget review can adjust future run deposits using
+`archive_budget.py --replan-future-reservation --ledger <ledger> --evidence <review>`
+with `kind: reviewed_future_run_reservation`, the same project, a new deposit and
+resource limits. The deposit must cover two whole hours at those resource limits
+plus the unchanged noncompute allowance, and fit the existing spend ceiling.
+The review is hash-audited, changes only future deposits, preserves original run
+reservations and costs, and constrains both planning and direct reservation.
+It does not establish actual billed spend.
+
+Regional benchmark jobs run under a detached, singleflight supervisor. Launches
+and status checks use short control-plane calls; a lost launch reply cannot start
+a duplicate job, and stdout disconnection cannot terminate the benchmark. The
+worker records terminal status and output on its owned ephemeral filesystem.
+Credential material is sent only through bounded stdin pipes and is absent from
+job descriptors, logs and completion records. Results are copied after confirmed
+completion, with bounded retries; the pod still has a hard lifetime and cleanup
+checks its ownership and incarnation.
+
+`archive_qualification.py --resume-from <failed-run>` admits at most one
+replacement of an unsettled attempt that failed specifically at the Kubernetes
+exec transport. It requires confirmed deletion, the same configuration, inventory
+and engine binary, and no recorded engine failure. Original run/deposit records
+stay intact; an append-only resume admission bounds the aggregate lifetime of
+both pods to two hours, including scheduling, copy and termination allowance.
+It cannot add another reservation, refund exposure, bypass a settled attempt or
+repeat a consumed replacement. The failed original evidence remains available.
+Repeated launch/poll failures also retain an atomic `*-transport-failure.json`
+record before the controller exits, even when it cannot copy the worker log.
+It contains classified reasons and pod/job identity, without raw stderr, command
+arguments or credentials. Resume verifies terminal transport evidence against
+the retained job descriptor and pod incarnation, and records its digest in the
+existing reservation audit. Recovered errors and unclassified failures cannot
+admit a replacement. Older attempts without structured records retain their
+original connection-reset log admission.
+
+The ordinal/lookahead binary completed local public recovery checks for both
+storage profiles. Its first regional cold search measured 7.0 seconds and early
+continuation pages roughly 0.8–1.3 seconds, but the control-plane stream reset
+while returning results. These partial observations are not a passing verdict.
+A complete supervised two-cycle run is required before readiness.
+
+The optimized ordinal/lookahead binary at revision `048692502a` completed both
+regional cycles against an unchanged 142,577-row BigQuery Parquet partition. Both
+cycles passed every configured correctness and performance gate with stored-source
+highlights and empty caches before the first search. Cold queries took 6.35–7.82
+seconds, warm p95 was 279–280 ms, restart search was 395–426 ms, and continuation
+cursor p95 was 1.20–1.22 seconds across all 4,110 matching rows. Filter p95 stayed
+below 484 ms; concurrent requests stayed below 527 ms. Historical/current union,
+replacement suppression, saved visibility and mutable composed cursor restart
+checks passed. Initial publication took 449.62 seconds plus 1.64 seconds of
+registration; reopening the same publication took 0.22 seconds.
+
+See `publication-ordinal-qualification-20261012.json` for binary and harness
+provenance, gate thresholds, sample summaries and retained-report hashes. The
+first attempt lost its Kubernetes output stream and supplied only partial evidence;
+the detached supervised replacement supplied the complete passing verdict. The
+owned worker was deleted and derived publication artifacts were retained. Initial
+128-hit cursor pages took 1.97–2.28 seconds; the cursor gate measures continuation
+p95 and restart. One first `postgres` request took 2.32 seconds, while its workload
+p95 passed at 292 ms. This qualifies one partition, not the full archive or an
+Antfly Cloud deployment. The same binary also passed both public filesystem native
+recovery profiles. Final PR CI still requires human approval of the final revision.
+
+## Local search comparison before cloud qualification
+
+Use the same unchanged Parquet partition for both engines, prebuild both text
+indexes, and measure after builds finish. Prefer native binaries of the same
+architecture on the same host. CPU translation, background test runs, thread
+limits and OS file-cache state materially affect cold measurements. Antfly's
+`--cold-cache` clears only the benchmark state's serving cache; it does not flush
+the OS cache. DuckDB's first sample starts in a fresh process with an uncontrolled
+OS cache. Subsequent terms follow the first term in that process.
+
+Install the optional pinned DuckDB dependency with `uv sync --group comparison`
+from this directory. Put one partition in `<work>/source/archive/part.parquet`.
+The following commands run from the repository root with the HN Python environment
+active; set `ANTFLY_BINARY` to an optimized native build for this host.
+
+```sh
+python examples/hackernews/search_comparison.py \
+  --source <work>/source/archive/part.parquet \
+  --database <work>/duckdb-fts.duckdb --output <work>/duckdb-fts.json \
+  --expected-rows 142577 --threads 4 --repeats 20 --cycles 2 --build
+
+python examples/hackernews/poc.py --binary "$ANTFLY_BINARY" \
+  --filesystem-source <work>/source --state <work>/antfly \
+  --expected-rows 142577 --store-source --require-filters --cold-cache \
+  --repeats 20 --workload-terms database postgres sqlite AI --no-highlights
+
+python examples/hackernews/search_comparison.py --mode scan \
+  --source <work>/source/archive/part.parquet \
+  --database <work>/unused.duckdb --output <work>/duckdb-scan.json \
+  --expected-rows 142577 --threads 4 --repeats 20 --cycles 2
+```
+
+Replace `<work>` with a real directory before executing. Run Antfly twice against
+the same state for reopening/restart coverage. Use a fresh state to measure a new
+publication layout: unchanged-file reuse preserves older sidecars. Omit
+`--no-highlights` for the public-search workload, and add `--profile` to capture
+execution diagnostics. `--query-term AI` changes the first query to a broader
+workload. Filesystem mode obtains no cloud credentials and publishes locally.
+
+Both ranked tests search `body`, return five hits and project the same metadata
+columns. DuckDB uses its default Porter stemmer and English stopwords; analyzer,
+field-length encoding and corpus semantics can produce different scores and
+orders, so it is a performance baseline, not an exact ranking oracle. DuckDB
+performs no HTTP response or highlighting work. Each engine's repeated ordered
+results are checked for stability. The DuckDB database records the source SHA-256
+and row count and rejects reuse with a different input. Installation, importing
+data and building/checkpointing the index are excluded from query timings.
+
+For matched x86 container runs, build `Dockerfile.search-comparison` with
+`--platform linux/amd64`, mount this script at `/comparison.py`, the Parquet
+partition read-only, and a writable result directory. Give the DuckDB container
+`--cpus 4 --memory 4g`; Antfly's `poc.py --docker` defaults to those limits and
+removes its uniquely named container when finished. Running x86 on ARM remains
+a translated-host diagnostic. The native-host comparison is preferable.
+
+`search_comparison.py --mode remote-scan` accepts an HTTPS Parquet URL and
+`--bearer-stdin`. It uses a temporary in-memory HTTP secret, bounds credentials
+on stdin, and excludes credentials/source URLs from the report. This workload
+performs an **unranked substring scan** and has no text index. Remote experiments
+need their own transfer/job bounds and budget admission; the local comparison
+requires no cloud resources.
+
+New native publications can compress opening navigation and batch small opening
+objects into authenticated cohorts. Original immutable identities remain the
+cache keys; required range reads remain available when memory admission is denied.
+The directory codec, decoded-size limits, per-member proofs and GC/reuse retention
+are described in `docs/plans/lake-ingestion-and-publication.md`. Compare provider
+request and byte counters as well as wall-clock latency. Shared-host timing alone
+is not a production latency guarantee.
+
+The native ARM64 local comparison on the verified 142,577-row partition measured:
+
+| Ranked `database`, five metadata hits, no highlights | First query | Warm p95 |
+|---|---:|---:|
+| Antfly, two reset-cache processes | 104.8–129.7 ms | 6.54–6.75 ms |
+| DuckDB 1.5.6, two fresh processes | 26.15–30.54 ms | 10.24–10.31 ms |
+
+Antfly restart searches took 56.5–78.5 ms. A separate highlighted native run
+measured 178.83 ms cold, 8.87 ms warm p95 and 18.53 ms after restart. Its 4,110-hit
+cursor continuation p95 was 38.85 ms, and history/current composition checks
+passed. The matched x86 old/new publication comparison preserved exact top HN
+IDs and scores while reducing provider reads from 397 to 314 (20.91%) and bytes
+from 53,487,307 to 46,458,677 (13.14%). These are provider counters, not an HTTP
+request trace. Native physical layouts can differ from the x86 layouts.
+
+See `local-search-comparison-20261012.json` for provenance, samples and limits.
+The host had unrelated concurrent work; these timings are diagnostic rather than
+a production guarantee. OS file caches were not flushed. Antfly cleared its
+serving cache before each restart; startup created one cache file, and measured
+cold queries recorded zero disk-cache hits. DuckDB uses four threads; Antfly uses
+its default server policy and includes HTTP overhead. Neither ranked comparison
+highlights text, and scoring/tokenization are not identical between engines.
+The local results isolate substantial remote-I/O overhead in the earlier GCS
+measurements; they do not establish the new layout's regional or full-archive
+latency. Antfly still reads roughly 43 MB locally for five hits, so reducing cold
+work further remains useful. `--build-only` can prebuild and verify a publication
+without taking query timing samples while builds are active.
+
+A small separate DuckDB HTTPS scan diagnostic on the same unchanged export took
+3.58 seconds for its first `database` substring query and 236 ms for its repeat;
+`AI` took 206–209 ms after that initial access. This was unranked, used a native
+ARM client outside the storage region and included only two samples per term.
+It is recorded separately in the evidence and is not an indexed BM25 comparison
+or a production latency qualification.
+
+### Qualification after #1063
+
+Rebuild publications with the merged routing/statistics formats before comparing
+against the earlier results. Use `--build-only` first, and run query measurements
+after the qualification compilers finish. Repeat each scenario twice on the same
+source. Keep `--profile` out of the timed matrix: profiled requests currently use
+the legacy planner, so enabling it changes the execution being measured. Process
+health metrics still report provider requests, bytes and nested query phases.
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/poc.py \
+  --binary /absolute/path/to/antfly \
+  --filesystem-source /absolute/path/to/source-root \
+  --state /private/tmp/hn-combined-state --expected-rows 142577 \
+  --store-source --require-filters --build-timeout 1200 --build-only
+
+# Empty serving caches: optional readiness planning prefetch is disabled.
+uv run --project examples/hackernews python examples/hackernews/poc.py \
+  --binary /absolute/path/to/antfly \
+  --filesystem-source /absolute/path/to/source-root \
+  --state /private/tmp/hn-combined-state --expected-rows 142577 \
+  --store-source --require-filters --cold-cache --disable-navigation-warming \
+  --no-highlights --repeats 20 --concurrency 4 \
+  --workload-terms database postgres sqlite AI
+
+# Default readiness warmup, highlights, deep cursors and historical/current reads.
+uv run --project examples/hackernews python examples/hackernews/poc.py \
+  --binary /absolute/path/to/antfly \
+  --filesystem-source /absolute/path/to/source-root \
+  --state /private/tmp/hn-combined-state --expected-rows 142577 \
+  --store-source --require-filters --cold-cache --repeats 20 \
+  --cursor-pages 40 --cursor-term AI \
+  --qualify-composed-sources --benchmark-composed --composed-current-rows 1000
+```
+
+`lake_indexes.navigation_warming.enabled` defaults to true. Disabling it skips
+only optional planning prefetch; source proofs, publication validation and required
+reads remain authoritative. A disabled run asserts that no warming attempt was
+recorded. Clearing disk entries before startup with warming enabled does not
+establish empty RAM planning caches. OS caches are not flushed in either scenario.
+
+Restart timing runs before cursor continuation, preventing a continuation from
+warming the historical search first. Union and saved-overlay benchmarks each use
+an independent cache-cleared restart, followed by repeated queries. Their native
+current fixture copies the sample's most recent rows; it is a bounded composition
+diagnostic, not a live feed or a full year of current HN. The existing two-row
+fixture separately checks nonmatching replacement suppression and mutable cursor
+retention. Process peak RSS covers the complete child lifetime, including any
+publication work, and must not be interpreted as query-only memory.
+
+Use common and selective terms plus a fragmented source containing more than 64
+segments to qualify bounded windows. Cross-source-file compaction and global
+best-first traversal remain separate changes. Select them based on measured
+navigation, segment-opening and posting work rather than treating the earlier
+43 MB cold-read figure as the combined implementation's result.
+
+Flat local `archive/*.parquet` inputs are staged under the qualification state's
+filesystem object-store layout with `AFOBJ001` envelopes. The envelopes contain
+payload length and SHA-256; Parquet payloads remain unchanged. Input files are not
+modified, and a reused state rejects changed or extra staged objects. An existing
+native filesystem bucket layout can be supplied directly. This setup happens
+before publication and timing.
+
+Local composition fixtures read the most recent sample rows directly from Parquet
+outside timed requests. The attempted SQL seed (`SELECT` including `body`, ordered
+by creation time with a 1,000-row limit) exceeded the statement work limit on this
+sample. That diagnostic remains a separate SQL qualification finding; successful
+composition does not imply that SQL shape has been qualified.
+
+The combined implementation is recorded in
+[`combined-main-search-qualification-20261012.json`](combined-main-search-qualification-20261012.json).
+On the raw 142,577-row sample, final empty-serving-cache searches took
+32.25–78.91 ms, warm p95 7.87–9.03 ms, and restart searches 29.61–38.56 ms.
+After default readiness warmup, first searches took 30.74–49.13 ms; 42 planning
+pages warmed before the query, with about 0.92 MB of cumulative setup reads.
+Empty-cache queries still performed 248 provider reads / 25.04 MB. This is less
+cold work than the earlier 295 reads / 43.31 MB, but remains a substantial target
+for further navigation/posting improvements.
+
+The matched DuckDB diagnostic ranged from 31.28 to 134.76 ms first-query latency
+and 11.42–21.23 ms warm p95 across its two processes. Shared-host and OS-cache
+variation prevents attributing every timing change to implementation changes.
+Both Antfly layouts preserve exact top IDs/scores through all measured cycles.
+The fragmented layout remains slower in some final runs; do not extrapolate these
+small fixtures to full-archive throughput or a service SLO.
+
+Small composed pages now fetch the requested page plus one lookahead, up to 128,
+and grow geometrically when an overlay batch is completely suppressed. This cuts
+historical leaf hydration from about 112 ms to 2.5 ms in the five-hit fixture and
+reduces its cold provider reads from 474 to 244. End-to-end composition remains
+roughly 0.6–0.9 seconds on the raw fixture, and the fragmented saved-overlay warm
+p95 reached 1.01 seconds. Remaining time lies outside the measured historical leaf
+query; native retained-snapshot capture and binding need separate profiling.
+
+A later controlled profile found foreground cursor collection and filesystem
+prefix listings traversing unrelated generations. Removing inline collection and
+confining listings to their prefix subtree cut retained-current warm requests
+from 739–1,151 ms to 53–56 ms, union requests from 742–808 ms to 64–95 ms, and
+saved-overlay requests from 743–813 ms to 68–89 ms. The fixture and exact result
+IDs/scores are unchanged. These are four warm repetitions on a shared native ARM64
+host, without an OS cache flush; the report includes every sample and labels the
+small-sample p95. They do not qualify full-archive throughput or a Cloud SLO.
+
+Expiry collection runs under the existing maintenance owner. Cursor creation
+persists discovery before the capability so interrupted physical captures remain
+collectible after restart or drop. WAL overlays use the pinned inventory owner's
+allocator and preserve sparse read capabilities and cancellation. Bounded
+composed pages can return a `gte` total; request `count: true` separately for exact
+overlay cardinality.
+No end-to-end composed speedup is claimed. Count, aggregation and graph consumers
+retain their larger streaming batches, and cursor identity/authority checks remain.
+
+The follow-up to #1081 removes the SQL sampling workaround: current-table fixture
+rows now come from Antfly SQL for both local and remote sources. The statement's
+`LIMIT` and the HTTP request's `limit` are separate budgets; the latter must admit
+the requested fixture size (default 1,000, maximum 4,096). Rows without timestamps
+are excluded before ordering. Earlier recorded SQLSTATE 54000 observations used
+the default 128-row HTTP budget and do not establish an ordered-projection scan
+limit.
+
+Native-text metadata 11/reader protocol 36 can retain a compacted serving root
+alongside the original per-file rebuild inventory. Small adjacent one-run files
+merge in bounded units without changing their source Parquet, row identities,
+delete-hole maps or retained generations. The 67-file development fixture serves
+9 native runs. Publication-wide score traversal uses authenticated term envelopes
+for supported descending-score terms; ties remain eligible and pruned totals are
+lower bounds. Exact counts and other query shapes keep the exact fallback. Upgrade
+readers before publishing this format. See the deployment qualification plan for
+bounds and separate correctness/performance evidence.
+
+
+The [October 13 optimized local comparison](lake-scalability-qualification-20261013.json)
+uses 1,024 source files and 128 serving runs. Two cycles preserve exact ranked
+IDs/scores and reduce first-search provider reads from 1,461 to 405 and bytes from
+50.85 MB to 24.33 MB. First highlighted search is 136–240 ms, warm p95 51–55 ms,
+and post-restart search 95–102 ms on this fixture. Filter/cursor results are mixed;
+these are local normalized-data checks, not archive/cloud SLO qualification.
+At PR #1117, the large cold composed-query count contract rejected lower-bound
+leaf totals on both the baseline and that follow-up. SQL fixture seeding itself passes with the
+explicit response budget. See the qualification plan for retained raw samples,
+provenance, query bounds and this remaining limitation.
+
+### Composed lower-bound totals
+
+The composed executor now consumes a full requested ordered leaf page even when
+its total is `gte`. Catalog/schema/policy binding stays pinned independently of
+the count. It never sums changing page-local lower bounds. Exact terminal pages
+prove exhaustion; short unknown-count pages and contradictory exact counts fail
+closed. Explicit counts and replacement lookups retain exactness checks. Version
+3 continuations remain compatible with retained version 2 cursors.
+
+The regional qualifier can run the same union and saved-overlay timing matrix
+with `benchmark_composed: true` and `composed_current_rows: 1000`. Its acceptance
+gate requires both cold and warm measurements with the configured fixture size;
+missing evidence fails. Warm comparisons include table, ID and score provenance.
+The full archive profile must explicitly match the existing shared budget ledger.
+Dry-run admission reports remaining run slots and headroom; it does not refund or
+reset previous reservations. New cloud billing/preflight evidence remains local.
+
+Local regressions pass: 401 lake tests (155 core and 246 API) without skips or
+leaks, including the thirteen composed-query regressions. Runtime HTTP timings
+are a separate qualification gate, followed by an immutable release and actual
+Antfly Cloud tenant recovery/credential checks. The standalone storage scaffold
+and its retained disk are not prerequisites for the managed deployment.

@@ -1,0 +1,430 @@
+{
+  "format": 1,
+  "profile": "unconstrained-point",
+  "schema": {
+    "version": 1,
+    "storage_mode": "relational",
+    "default_type": "row",
+    "document_schemas": {
+      "row": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "status": {
+              "type": "keyword"
+            },
+            "quantity": {
+              "type": "integer"
+            },
+            "email": {
+              "type": "keyword"
+            },
+            "tenant_id": {
+              "type": "keyword"
+            },
+            "amount": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "organization_id": {
+              "type": "keyword"
+            },
+            "priority": {
+              "type": "integer"
+            },
+            "expires_at": {
+              "type": "integer"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "metadata": {
+              "type": "json"
+            },
+            "tags": {
+              "type": "json"
+            },
+            "request_id": {
+              "type": "keyword"
+            },
+            "updated_at_ns": {
+              "type": "integer"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "seeds": [
+    {
+      "key": "a",
+      "value": {
+        "id": "u1",
+        "status": "active",
+        "quantity": 2,
+        "email": "a@example.test",
+        "tenant_id": "t1",
+        "amount": 5,
+        "name": "Ada",
+        "organization_id": "o1",
+        "priority": 8,
+        "expires_at": 100,
+        "enabled": true,
+        "metadata": {
+          "source": "api"
+        },
+        "tags": [
+          "hot"
+        ],
+        "request_id": "old",
+        "updated_at_ns": 10
+      }
+    },
+    {
+      "key": "b",
+      "value": {
+        "id": "u2",
+        "status": "closed",
+        "quantity": 7,
+        "email": "b@example.test",
+        "tenant_id": "t2",
+        "amount": 9,
+        "name": "Grace",
+        "organization_id": "o2",
+        "priority": 3,
+        "expires_at": 1100,
+        "enabled": false,
+        "metadata": {
+          "source": "internal"
+        },
+        "tags": [],
+        "request_id": "other",
+        "updated_at_ns": 20
+      }
+    }
+  ],
+  "storage_columns": [
+    "id",
+    "status",
+    "quantity",
+    "email",
+    "tenant_id",
+    "amount",
+    "name",
+    "organization_id",
+    "priority",
+    "expires_at",
+    "enabled",
+    "metadata",
+    "tags",
+    "request_id",
+    "updated_at_ns"
+  ],
+  "entries": [
+    {
+      "id": "sql-0571",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ]
+      ],
+      "affected": 1,
+      "final": [
+        [
+          "u1",
+          "archived",
+          2,
+          "a@example.test",
+          "t1",
+          5,
+          "Ada",
+          "o1",
+          8,
+          100,
+          1,
+          "{\"source\":\"api\"}",
+          "[\"hot\"]",
+          "old",
+          10
+        ],
+        [
+          "u2",
+          "closed",
+          7,
+          "b@example.test",
+          "t2",
+          9,
+          "Grace",
+          "o2",
+          3,
+          1100,
+          0,
+          "{\"source\":\"internal\"}",
+          "[]",
+          "other",
+          20
+        ]
+      ]
+    },
+    {
+      "id": "sql-0572",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u2"
+        ]
+      ],
+      "affected": 2,
+      "final": [
+        [
+          "u1",
+          "archived",
+          2,
+          "a@example.test",
+          "t1",
+          5,
+          "Ada",
+          "o1",
+          8,
+          100,
+          1,
+          "{\"source\":\"api\"}",
+          "[\"hot\"]",
+          "old",
+          10
+        ],
+        [
+          "u2",
+          "archived",
+          7,
+          "b@example.test",
+          "t2",
+          9,
+          "Grace",
+          "o2",
+          3,
+          1100,
+          0,
+          "{\"source\":\"internal\"}",
+          "[]",
+          "other",
+          20
+        ]
+      ]
+    },
+    {
+      "id": "sql-0606",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ]
+      ],
+      "affected": 1,
+      "final": [
+        [
+          "u2",
+          "closed",
+          7,
+          "b@example.test",
+          "t2",
+          9,
+          "Grace",
+          "o2",
+          3,
+          1100,
+          0,
+          "{\"source\":\"internal\"}",
+          "[]",
+          "other",
+          20
+        ]
+      ]
+    },
+    {
+      "id": "sql-0607",
+      "columns": [],
+      "rows": [],
+      "affected": 2,
+      "final": []
+    },
+    {
+      "id": "sql-1488",
+      "columns": [
+        "id",
+        "status",
+        "quantity",
+        "email",
+        "tenant_id",
+        "amount",
+        "name",
+        "organization_id",
+        "priority",
+        "expires_at",
+        "enabled",
+        "metadata",
+        "tags",
+        "request_id",
+        "updated_at_ns",
+        "status_key",
+        "source"
+      ],
+      "rows": [
+        [
+          "u3",
+          "open",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          "{\"source\":\"seed\"}",
+          null,
+          null,
+          null,
+          "open",
+          "seed"
+        ]
+      ],
+      "affected": 1,
+      "final": [
+        [
+          "u1",
+          "active",
+          2,
+          "a@example.test",
+          "t1",
+          5,
+          "Ada",
+          "o1",
+          8,
+          100,
+          1,
+          "{\"source\":\"api\"}",
+          "[\"hot\"]",
+          "old",
+          10
+        ],
+        [
+          "u2",
+          "closed",
+          7,
+          "b@example.test",
+          "t2",
+          9,
+          "Grace",
+          "o2",
+          3,
+          1100,
+          0,
+          "{\"source\":\"internal\"}",
+          "[]",
+          "other",
+          20
+        ],
+        [
+          "u3",
+          "open",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          "{\"source\":\"seed\"}",
+          null,
+          null,
+          null
+        ]
+      ]
+    },
+    {
+      "id": "sql-1493",
+      "columns": [
+        "metadata"
+      ],
+      "rows": [
+        [
+          "\"wrapped\""
+        ]
+      ],
+      "affected": 1,
+      "final": [
+        [
+          "u1",
+          "active",
+          2,
+          "a@example.test",
+          "t1",
+          5,
+          "Ada",
+          "o1",
+          8,
+          100,
+          1,
+          "{\"source\":\"api\"}",
+          "[\"hot\"]",
+          "old",
+          10
+        ],
+        [
+          "u2",
+          "closed",
+          7,
+          "b@example.test",
+          "t2",
+          9,
+          "Grace",
+          "o2",
+          3,
+          1100,
+          0,
+          "{\"source\":\"internal\"}",
+          "[]",
+          "other",
+          20
+        ],
+        [
+          "u_to_jsonb",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          "\"wrapped\"",
+          null,
+          null,
+          null
+        ]
+      ]
+    }
+  ]
+}

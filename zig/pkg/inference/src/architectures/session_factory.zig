@@ -58,6 +58,7 @@ const florence_arch = @import("florence.zig");
 const deberta_arch = @import("deberta.zig");
 const gliner_head = @import("gliner_head.zig");
 const gliner_decision_head = @import("gliner_decision_head.zig");
+const gliner_encoder = @import("../models/gliner_encoder.zig");
 const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const gliner_head_graph = @import("gliner_head_graph.zig");
@@ -72,7 +73,6 @@ const weight_source_mod = @import("../models/weight_source.zig");
 const SafetensorsSource = @import("../models/weight_source.zig").SafetensorsSource;
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 const tensor_store_mod = @import("../models/tensor_store.zig");
-const export_source_mod = @import("../models/export_source.zig");
 const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
@@ -90,6 +90,8 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     deberta_reranker,
     gliner2,
     gliner2_training,
+    gliner25_boundary,
+    gliner25_modern_bert,
     florence2,
     gemma4,
     gemma4_training,
@@ -304,7 +306,7 @@ pub fn estimateBackendWeightResidencyBytes(
     return switch (backend) {
         .cuda => cuda_load_plan.estimateEncodedArtifactDeviceBytes(encoded_bytes),
         .metal => encoded_bytes,
-        .native, .onnx, .wasm => 0,
+        .native, .wasm => 0,
         .pjrt => error.UnsupportedBackend,
     };
 }
@@ -395,6 +397,11 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
         weight = gliner_decide_qualification.Digest.of(reader.file_bytes);
     } else if (store.glinerGgufSnapshot()) |snapshot| {
         inventory = .{ .count = snapshot.tensor_count, .all_f32 = snapshot.all_f32 };
+        // GGUF stores start with random-access advice for sparse tensor loads.
+        // Authenticating both complete files is sequential; enable readahead
+        // rather than faulting each 4 KiB page independently.
+        c_file.MmapRegion.adviseBytesSequential(snapshot.encoder);
+        c_file.MmapRegion.adviseBytesSequential(snapshot.head);
         weight = gliner_decide_qualification.Digest.of(snapshot.encoder);
         companion = gliner_decide_qualification.Digest.of(snapshot.head);
     } else return null;
@@ -472,6 +479,7 @@ const ArchType = enum {
     clip,
     clap,
     gliner,
+    gliner_modern_bert,
     gliner_boundary,
     layoutlmv3,
 };
@@ -490,6 +498,7 @@ const ArchConfig = union(ArchType) {
     clip: clip_mod.Config,
     clap: clap_mod.Config,
     gliner: deberta_mod.Config,
+    gliner_modern_bert: modern_bert_arch.Config,
     gliner_boundary: gliner_boundary_model.Config,
     layoutlmv3: layoutlmv3_mod.Config,
 };
@@ -739,16 +748,20 @@ fn requiresModernBertSpanClassifier(manifest: manifest_mod.ModelManifest) bool {
         manifest.gliner_span_encoder_family == .modern_bert;
 }
 
-/// The declared ModernBERT span route currently borrows the CUDA Laya
-/// capability profile, whose kernels require every uploaded weight to be F32.
-/// Reject a packed GGUF before constructing the intermediate native session;
-/// native and Metal keep their existing device-native quantized execution.
+/// Admit Q8_0 encoder storage with F32 norms and heads. Other packed formats
+/// fail before device allocation. Exact split-artifact identity is checked
+/// from the open store before constructing resident weights.
 fn ensureCudaGlinerModernBertGgufEligible(
     manifest: manifest_mod.ModelManifest,
     report: GgufInspectionReport,
 ) !void {
-    if (requiresModernBertSpanClassifier(manifest) and ggufReportHasQuantizedTensors(report)) {
-        return error.UnsupportedCudaQuantizedModernBertSpan;
+    if (!requiresModernBertSpanClassifier(manifest)) return;
+    for (report.all_tensor_types) |entry| {
+        if (!entry.tensor_type.isQuantized()) continue;
+        switch (entry.tensor_type) {
+            .known => |kind| if (kind != .Q8_0) return error.UnsupportedCudaQuantizedModernBertSpan,
+            else => return error.UnsupportedCudaQuantizedModernBertSpan,
+        }
     }
 }
 
@@ -856,6 +869,12 @@ pub fn createNativeSession(allocator: std.mem.Allocator, model_path: []const u8)
 }
 
 pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
+    return createNativeSessionForCudaUpload(allocator, model_path, override, false);
+}
+
+// CUDA borrows packed encoder storage from this temporary session. Ordinary
+// CPU loading keeps its existing execution policy.
+fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, retain_gliner_q8: bool) !Session {
     var direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
@@ -869,12 +888,20 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     errdefer if (store_owned) store.deinit();
     if (arch_config == .modern_bert) {
         if (arch_config.modern_bert.laya) |config| try @import("../models/laya.zig").validateWeights(store, config, arch_config.modern_bert);
+        if (requiresModernBertSpanClassifier(mf) and store.singleSafetensorsReader() != null) {
+            try gliner_encoder.validateDecisionWeights(store, arch_config.modern_bert);
+            direct_quant_enabled = false;
+        }
     }
     if (arch_config == .embedding_gemma2) {
         direct_quant_enabled = false;
         try embedding_gemma2_arch.validateWeights(allocator, store, arch_config.embedding_gemma2);
     }
     const laya_q8 = try layaQuantizesWeights(arch_config);
+    if (arch_config == .gliner_modern_bert) {
+        try gliner_encoder.validateDecisionWeights(store, arch_config.gliner_modern_bert);
+        direct_quant_enabled = false;
+    }
     if (arch_config == .gliner_boundary) {
         try validateNativeBoundaryWeights(allocator, mf, arch_config.gliner_boundary, store);
         // Reduced bundles retain their declared quantized storage. FP32
@@ -886,6 +913,12 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     }
     const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     const gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, store);
+    const keep_gliner_q8 = retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
+    if (keep_gliner_q8) {
+        const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;
+        if (try gliner_decide_qualification.require(identity) != .decide_1b) return error.UnsupportedGlinerDecisionArtifact;
+        direct_quant_enabled = true;
+    }
     if (mf.usesGgufWeights()) {
         if (try buildGgufInspectionReport(allocator, arch_config, store, requiresModernBertSpanClassifier(mf))) |report| {
             defer {
@@ -901,6 +934,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     const prefix = switch (arch_config) {
         .bert => |cfg| cfg.effectivePrefix(),
         .modern_bert => if (is_gliner_span_modern) "encoder" else "",
+        .gliner_modern_bert => "",
         .nomic_bert, .embedding_gemma2 => "",
         .deberta => "deberta",
         .t5 => "", // T5 weights use full names (encoder.block.0.*, decoder.block.0.*)
@@ -1019,7 +1053,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
             continue;
         }
 
-        if (direct_quant_enabled and try shouldKeepResidentWeightQuantizedOnly(allocator, store, arch_config, key, full_name)) {
+        if (direct_quant_enabled and ((keep_gliner_q8 and try storeTensorIsQuantized(allocator, store, full_name)) or try shouldKeepResidentWeightQuantizedOnly(allocator, store, arch_config, key, full_name))) {
             const tensor_ref = try store.describeTensor(allocator, full_name);
             defer {
                 var ref = tensor_ref;
@@ -1199,6 +1233,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     const prefix = switch (arch_config) {
         .bert => |cfg| cfg.effectivePrefix(),
         .modern_bert => if (is_gliner_span_modern) "encoder" else "",
+        .gliner_modern_bert => "",
         .nomic_bert, .embedding_gemma2 => "",
         .deberta => "deberta",
         .t5 => "",
@@ -1532,6 +1567,42 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
     return createCudaSessionWithKernelJit(allocator, model_path, .{});
 }
 
+pub const GlinerCudaPrecision = enum { auto, fp32, fp16, bf16 };
+
+/// Explicit precision for qualification and model owners. Automatic selection
+/// remains FP32 until a measured artifact/profile is added to release policy.
+pub fn createGlinerCudaSessionWithPrecision(allocator: std.mem.Allocator, model_path: []const u8, precision: GlinerCudaPrecision) !Session {
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, .{}, .dynamic, null, null, precision);
+}
+
+/// Managed loads retain the release gate even when an explicit precision is
+/// requested. The diagnostic constructor above measures candidates without
+/// promoting them to serving policy.
+pub fn createCudaSessionWithGlinerPrecision(allocator: std.mem.Allocator, model_path: []const u8, config: kernel_jit.Config, load_context: kernel_jit.LoadContext, precision: GlinerCudaPrecision) !Session {
+    if (precision == .fp16 or precision == .bf16) return error.UnqualifiedGlinerCudaPrecision;
+    return createGlinerCudaSessionWithLoadPolicy(allocator, model_path, config, load_context, precision);
+}
+
+/// Qualification tests must exercise the managed admission/load path with the
+/// candidate precision. This entry point cannot be compiled into a server.
+pub fn createCudaSessionWithGlinerPrecisionForTest(allocator: std.mem.Allocator, model_path: []const u8, config: kernel_jit.Config, load_context: kernel_jit.LoadContext, precision: GlinerCudaPrecision) !Session {
+    if (!@import("builtin").is_test) @compileError("GLiNER precision qualification override is test-only");
+    return createGlinerCudaSessionWithLoadPolicy(allocator, model_path, config, load_context, precision);
+}
+
+fn createGlinerCudaSessionWithLoadPolicy(allocator: std.mem.Allocator, model_path: []const u8, config: kernel_jit.Config, load_context: kernel_jit.LoadContext, precision: GlinerCudaPrecision) !Session {
+    var manifest = try manifest_mod.loadListingFromDir(allocator, model_path);
+    defer manifest.deinit();
+    if (manifest.gliner_architecture != .boundary and manifest.gliner_classification_head != .label_marker_mlp) return error.UnsupportedGlinerCudaPrecision;
+    return createCudaSessionWithRequiredProfile(allocator, model_path, null, config, load_context, null, null, precision);
+}
+
+test "GLiNER CUDA managed reduced precision remains release gated" {
+    for ([_]GlinerCudaPrecision{ .fp16, .bf16 }) |precision| {
+        try std.testing.expectError(error.UnqualifiedGlinerCudaPrecision, createCudaSessionWithGlinerPrecision(std.testing.allocator, "/nonexistent-gliner-model", .{}, .dynamic, precision));
+    }
+}
+
 pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
     return createCudaSessionWithTaskOverrideAndKernelJit(allocator, model_path, override, .{});
 }
@@ -1718,6 +1789,7 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         load_context,
         a4b_request,
         null,
+        .fp32,
     );
 }
 
@@ -1736,6 +1808,7 @@ pub fn createGemma4CudaTrainingSession(
         .dynamic,
         null,
         .gemma4_training,
+        .fp32,
     );
 }
 
@@ -1747,6 +1820,7 @@ fn createCudaSessionWithRequiredProfile(
     load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     required_profile_override: ?CudaCapabilityProfile,
+    gliner_precision: GlinerCudaPrecision,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     try config.validate();
@@ -1757,7 +1831,12 @@ fn createCudaSessionWithRequiredProfile(
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();
-    if (model_manifest.gliner_architecture == .boundary) return error.UnsupportedGlinerBoundaryBackend;
+    if (model_manifest.gliner_boundary_bundle) |receipt| {
+        // This CUDA profile consumes canonical FP32 boundary weights. A
+        // reduced artifact needs its own qualified storage/compute profile;
+        // converting it silently would disagree with the executor identity.
+        if (receipt.value.precision != .fp32) return error.UnsupportedGlinerCudaPrecision;
+    }
     if (model_manifest.usesGgufWeights() and
         model_manifest.gliner_architecture == .span and
         model_manifest.gliner_span_encoder_family == .modern_bert)
@@ -1815,7 +1894,7 @@ fn createCudaSessionWithRequiredProfile(
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
-    var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, override);
+    var native_session = try createNativeSessionForCudaUpload(allocator, model_path, override, true);
     defer native_session.close();
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
@@ -1843,6 +1922,8 @@ fn createCudaSessionWithRequiredProfile(
         if (training_config.usesMoe()) return error.UnsupportedGemmaMoeTraining;
     }
     const cuda_profile = required_profile_override orelse architecture_profile;
+    if (gliner_precision != .auto and gliner_precision != .fp32 and cuda_profile != .gliner25_modern_bert)
+        return error.UnsupportedGlinerCudaPrecision;
     const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
         cuda_profile,
         &native_impl.backend_data.native.resident_weights,
@@ -1861,8 +1942,16 @@ fn createCudaSessionWithRequiredProfile(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya;
-    cuda_compute.laya_optimizations = cuda_profile == .laya and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
+    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert;
+    cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
+    cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
+    cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);
+    cuda_compute.gliner_q8_f16_mirrors = cuda_compute.gliner_encoder_attention and
+        native_impl.gliner_decision_identity != null and !native_impl.gliner_decision_identity.?.inventory.all_f32 and
+        platform.env.getenvBool("ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS");
+    cuda_compute.gliner_q8_f16_attention = cuda_compute.gliner_q8_f16_mirrors and
+        platform.env.getenvBoolDefault("ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION", true);
+    cuda_compute.laya_optimizations = (cuda_profile == .laya or cuda_profile == .gliner25_modern_bert) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
     cuda_compute.laya_fusion = cuda_compute.laya_optimizations and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_FUSION", true);
     if (a4b_inference != null and
         (cuda_compute.ctx.info.compute_major != 8 or cuda_compute.ctx.info.compute_minor != 9))
@@ -1903,7 +1992,7 @@ fn createCudaSessionWithRequiredProfile(
     for (resident_uploads.items) |upload| {
         if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
         const owned_key = try allocator.dupe(u8, upload.key);
-        cuda_compute.insertWeightFromLoaded(owned_key, upload.loaded) catch |err| {
+        uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision) catch |err| {
             allocator.free(owned_key);
             return err;
         };
@@ -1933,6 +2022,9 @@ fn createCudaSessionWithRequiredProfile(
         }
     }
     if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_uploads.items.len});
+    if (cuda_compute.gliner_q8_f16_mirrors) {
+        std.log.info("cuda: attached {d} decoded Q8 FP16 projection mirrors; raw Q8 and F32 heads retained; ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS=0 disables", .{cuda_compute.gliner_boundary_f16_mirrors.count()});
+    }
     const upload_stats = cuda_compute.snapshotStats();
     if (upload_stats.bf16_mirror_weight_count > 0) {
         // The default-on prefill mirrors trade device memory for cuBLASLt
@@ -1944,6 +2036,11 @@ fn createCudaSessionWithRequiredProfile(
         );
     }
 
+    const gliner_budget = if (native_impl.arch_config == .gliner_modern_bert or
+        (native_impl.arch_config == .modern_bert and native_impl.gliner_span_encoder_family == .modern_bert))
+        try glinerCudaBudgetFloor(native_impl.arch_config, try estimateNativeWeightBytes(allocator, model_manifest))
+    else
+        runtime.tier.memory.Limits{};
     const decision_identity_handoff = unsealedGlinerDecisionIdentityHandoff(native_impl);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
@@ -1956,9 +2053,61 @@ fn createCudaSessionWithRequiredProfile(
         .backend_type = .cuda,
         .kernel_jit_config = config,
         .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
+        .boundary_identity = native_impl.boundary_identity,
+        .budget_floor = gliner_budget,
     };
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision) !void {
+    // Packed-only weights have no dense tensor shape. Check the requested
+    // policy before the rank gate so explicit mixed precision cannot silently
+    // execute the default Q8 route or change only attention precision.
+    if (precision != .auto and precision != .fp32 and (loaded.quantized or loaded.quantized_storage != null))
+        return error.UnsupportedGlinerCudaPrecision;
+    // Preserve embeddings, normalization, biases and the decision head in FP32.
+    // Only encoder matrix products use lower precision; accumulation and all
+    // externally visible logits remain FP32.
+    if (precision == .auto or precision == .fp32 or loaded.tensor.shape.len != 2 or
+        !std.mem.startsWith(u8, name, "model.layers.") or !std.mem.endsWith(u8, name, ".weight"))
+        return compute.insertWeightFromLoaded(name, loaded);
+    if (loaded.quantized or loaded.quantized_storage != null or loaded.tensor.dtype != .f32)
+        return error.UnsupportedGlinerCudaPrecision;
+    if (precision == .bf16) return compute.insertBf16WeightFromF32Tensor(name, &loaded.tensor);
+    const values = loaded.tensor.asFloat32();
+    const half = try compute.allocator.alloc(f16, values.len);
+    defer compute.allocator.free(half);
+    for (values, half) |value, *dest| {
+        dest.* = @floatCast(value);
+        if (!std.math.isFinite(dest.*)) return error.UnsupportedGlinerCudaPrecision;
+    }
+    var tensor = loaded.tensor;
+    tensor.dtype = .f16;
+    tensor.data = std.mem.sliceAsBytes(half);
+    return compute.insertF16WeightFromTensor(name, &tensor);
+}
+
+test "GLiNER Decide CUDA mixed precision rejects packed-only weights before upload" {
+    const Compute = struct {
+        allocator: std.mem.Allocator,
+        fn insertWeightFromLoaded(_: *@This(), _: []const u8, _: *const LoadedWeight) !void {
+            return error.UnexpectedUpload;
+        }
+        fn insertBf16WeightFromF32Tensor(_: *@This(), _: []const u8, _: *const Tensor) !void {
+            return error.UnexpectedUpload;
+        }
+        fn insertF16WeightFromTensor(_: *@This(), _: []const u8, _: *const Tensor) !void {
+            return error.UnexpectedUpload;
+        }
+    };
+    var compute = Compute{ .allocator = std.testing.allocator };
+    var loaded = LoadedWeight{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+    };
+    for ([_]GlinerCudaPrecision{ .fp16, .bf16 }) |precision|
+        try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, uploadGlinerCudaWeight(&compute, "model.layers.0.attn.Wqkv.weight", &loaded, precision));
 }
 
 /// Materialize the immutable, pre-sharded expert payload consumed by the A4B
@@ -2045,14 +2194,22 @@ fn cudaProfileForArch(
     return switch (arch_config) {
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
-        .modern_bert => |cfg| if (cfg.num_attention_heads > 0 and cfg.hidden_size % cfg.num_attention_heads == 0 and cfg.hidden_size / cfg.num_attention_heads <= 128 and
-            ((cfg.laya != null and cfg.laya.?.format == .laya and !cfg.laya.?.packing.enabled() and cfg.laya.?.max_len <= 512) or
-                (task == .extractor and model_manifest.gliner_architecture == .span and model_manifest.gliner_span_encoder_family == .modern_bert)))
-            .laya
-        else
-            null,
+        .modern_bert => |cfg| blk: {
+            if (cfg.num_attention_heads == 0 or cfg.hidden_size % cfg.num_attention_heads != 0) break :blk null;
+            const head_dim = cfg.hidden_size / cfg.num_attention_heads;
+            if (task == .extractor and model_manifest.gliner_architecture == .span and
+                model_manifest.gliner_span_encoder_family == .modern_bert and
+                cfg.max_position_embeddings > 0 and cfg.max_position_embeddings <= 8192 and
+                (head_dim == 64 or head_dim == 128)) break :blk .gliner25_modern_bert;
+            if (head_dim <= 128 and cfg.laya != null and cfg.laya.?.format == .laya and
+                !cfg.laya.?.packing.enabled() and cfg.laya.?.max_len <= 512) break :blk .laya;
+            break :blk null;
+        },
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
+        .gliner_boundary => |cfg| if (cfg.encoder.family == .deberta) .gliner25_boundary else null,
+        .gliner_modern_bert => |cfg| if (cfg.num_attention_heads > 0 and cfg.max_position_embeddings <= 8192 and
+            (cfg.hidden_size / cfg.num_attention_heads == 64 or cfg.hidden_size / cfg.num_attention_heads == 128)) .gliner25_modern_bert else null,
         .florence => .florence2,
         .gpt => |cfg| switch (cfg.family) {
             .gemma => .gemma4,
@@ -2102,7 +2259,10 @@ test "cuda support gate admits only supported model roles" {
         .gliner_span_encoder_family = .modern_bert,
     };
     const decide_1b = ArchConfig{ .modern_bert = .{ .hidden_size = 1792, .num_attention_heads = 28, .num_hidden_layers = 28, .intermediate_size = 3840 } };
-    try std.testing.expect(cudaProfileForArch(decide_1b, .extractor, &span_modern_manifest) != null);
+    try std.testing.expectEqual(CudaCapabilityProfile.gliner25_modern_bert, cudaProfileForArch(decide_1b, .extractor, &span_modern_manifest).?);
+    var oversized_decide = decide_1b;
+    oversized_decide.modern_bert.max_position_embeddings = 8193;
+    try std.testing.expect(cudaProfileForArch(oversized_decide, .extractor, &span_modern_manifest) == null);
     try std.testing.expect(cudaProfileForArch(decide_1b, .generic, &span_modern_manifest) == null);
     if (comptime build_options.enable_cuda) {
         try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }, .generic, &generic_manifest).?);
@@ -2119,7 +2279,7 @@ test "cuda support gate admits only supported model roles" {
     }
 }
 
-test "CUDA ModernBERT span GGUF eligibility rejects packed weights before upload" {
+test "GLiNER Decide CUDA GGUF eligibility admits Q8 and rejects other packed formats" {
     const modern_span = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .extractor,
@@ -2149,10 +2309,11 @@ test "CUDA ModernBERT span GGUF eligibility rejects packed weights before upload
     };
 
     try ensureCudaGlinerModernBertGgufEligible(modern_span, dense_report);
-    try std.testing.expectError(
-        error.UnsupportedCudaQuantizedModernBertSpan,
-        ensureCudaGlinerModernBertGgufEligible(modern_span, quantized_report),
-    );
+    dense_types[0].tensor_type = .{ .known = .F16 };
+    try ensureCudaGlinerModernBertGgufEligible(modern_span, dense_report);
+    try ensureCudaGlinerModernBertGgufEligible(modern_span, quantized_report);
+    quantized_types[1].tensor_type = .{ .known = .Q4_0 };
+    try std.testing.expectError(error.UnsupportedCudaQuantizedModernBertSpan, ensureCudaGlinerModernBertGgufEligible(modern_span, quantized_report));
 
     var deberta_span = modern_span;
     deberta_span.gliner_span_encoder_family = .deberta;
@@ -2263,7 +2424,7 @@ fn loadSafetensorsIntoResident(
         try transposeGpt2Conv1dResidentGpuHostedWeights(allocator, resident_weights, stream);
     }
     return switch (arch_config) {
-        .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .nomic_bert, .embedding_gemma2 => "",
+        .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .gliner_modern_bert, .nomic_bert, .embedding_gemma2 => "",
         .gliner, .gliner_boundary => "encoder",
         .deberta => "deberta",
         .layoutlmv3 => "layoutlmv3",
@@ -2424,6 +2585,7 @@ fn createGpuHostedSessionWithTaskOverride(
             var detected_prefix: []const u8 = switch (arch_config) {
                 .bert => |cfg| cfg.effectivePrefix(),
                 .modern_bert => if (is_gliner_span_modern) "encoder" else "",
+                .gliner_modern_bert => "",
                 .nomic_bert, .embedding_gemma2 => "",
                 .deberta => "deberta",
                 else => "",
@@ -3952,7 +4114,7 @@ pub fn ggufTensorTypeSupportsBackend(
             metal_runtime.isMetalNativeSupported(tensor_type)
         else
             true,
-        .native, .cuda, .onnx, .wasm => true,
+        .native, .cuda, .wasm => true,
         .pjrt => false,
     };
 }
@@ -4002,12 +4164,17 @@ pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: Back
         return false;
     return switch (backend) {
         .metal => metalGgufIncompatibleTensorType(report) == null,
-        .native, .cuda, .onnx, .wasm => true,
+        .native, .cuda, .wasm => true,
         .pjrt => false,
     };
 }
 
 fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8, buf: *[256]u8) ![]const u8 {
+    if (arch_config == .gliner_modern_bert) {
+        if (std.mem.startsWith(u8, key, "encoder."))
+            return std.fmt.bufPrint(buf, "model.{s}", .{key["encoder.".len..]}) catch return error.NameTooLong;
+        return key;
+    }
     if (arch_config == .modern_bert) {
         if (std.mem.startsWith(u8, key, "encoder."))
             return std.fmt.bufPrint(buf, "model.{s}", .{key["encoder.".len..]}) catch return error.NameTooLong;
@@ -4553,6 +4720,18 @@ fn shouldLazyLoadWeight(store_kind: tensor_store_mod.StoreKind, arch_config: Arc
         .gpt => |cfg| cfg.usesMoe() and (std.mem.indexOf(u8, key, ".block_sparse_moe.experts.") != null or (cfg.family == .deepseek_v4 and std.mem.indexOf(u8, key, ".mlp.experts.") != null)),
         else => false,
     };
+}
+
+fn storeTensorIsQuantized(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStore, name: []const u8) !bool {
+    var ref = try store.describeTensor(allocator, name);
+    defer ref.deinit(allocator);
+    return ref.quantized;
+}
+
+fn ggufEncoderHasQuantizedTensors(store: tensor_store_mod.TensorStore) bool {
+    const file = store.ggufFile() orelse return false;
+    for (file.tensors) |tensor| if (tensor.tensor_type.isQuantized()) return true;
+    return false;
 }
 
 fn shouldKeepResidentWeightQuantizedOnly(
@@ -5332,6 +5511,42 @@ fn recommendedGpuHostedLargeDenseSafetensorsSharedCacheBudget(
     };
 }
 
+/// Ettin's FP32 checkpoint and full-context batches exceed the generic GPU
+/// workload envelope. Match the existing conservative CUDA load reservation
+/// and the bounded decision batch workspace; explicit node caps still win.
+fn glinerCudaBudgetFloor(arch_config: ArchConfig, encoded_bytes: u64) !runtime.tier.memory.Limits {
+    if (encoded_bytes == 0) return .{};
+    const cfg = switch (arch_config) {
+        .modern_bert, .gliner_modern_bert => |config| config,
+        else => return .{},
+    };
+    const weights = std.math.cast(usize, encoded_bytes) orelse return error.ResourceLimitExceeded;
+    const scratch = try layaCudaWorkspace(1, 16384, 16384, cfg.hidden_size, cfg.intermediate_size);
+    const host = try std.math.add(usize, weights, mib(256));
+    const backend = try std.math.add(usize, try estimateBackendWeightResidencyBytes(.cuda, weights), try std.math.add(usize, scratch, mib(64)));
+    return .{
+        .host_limit_bytes = host,
+        .backend_limit_bytes = backend,
+        .combined_limit_bytes = try std.math.add(usize, host, backend),
+        .scratch_limit_bytes = scratch,
+    };
+}
+
+test "GLiNER Ettin CUDA budget admits checkpoint and full decision batch workspace" {
+    const cfg = modern_bert_arch.Config{ .hidden_size = 1792, .intermediate_size = 3840, .num_hidden_layers = 28, .num_attention_heads = 28, .max_position_embeddings = 7999 };
+    const weights = 4755208228;
+    const floor = try glinerCudaBudgetFloor(.{ .gliner_modern_bert = cfg }, weights);
+    try std.testing.expectEqualDeep(floor, try glinerCudaBudgetFloor(.{ .modern_bert = cfg }, weights));
+    try std.testing.expect(floor.host_limit_bytes > weights);
+    const workspace = try layaCudaWorkspace(8, 2048, 3, cfg.hidden_size, cfg.intermediate_size);
+    try std.testing.expect(floor.scratch_limit_bytes >= workspace);
+    try std.testing.expect(floor.backend_limit_bytes > try estimateBackendWeightResidencyBytes(.cuda, weights) + workspace);
+    try std.testing.expectEqual(floor.host_limit_bytes + floor.backend_limit_bytes, floor.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), (try glinerCudaBudgetFloor(.{ .gliner = .{} }, weights)).host_limit_bytes);
+    const capped = runtime.tier.memory.applyLimitOverrides(floor, .{ .backend_limit_bytes = gib(2) });
+    try std.testing.expectEqual(gib(2), capped.backend_limit_bytes);
+}
+
 fn isBgeM3DenseEncoder(manifest: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
     if (!std.mem.eql(u8, manifest.config_model_arch, "xlm-roberta")) return false;
     return switch (arch_config) {
@@ -5769,8 +5984,11 @@ pub fn widenBudgetLimitsForModelPath(
 
     const arch_config = try detectArchitecture(allocator, model_path, mf);
     const policy = gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
-
-    return widenLimits(limits, policy.budget_floor);
+    const floor = if (backend_type == .cuda)
+        widenLimits(policy.budget_floor, try glinerCudaBudgetFloor(arch_config, model_weight_bytes))
+    else
+        policy.budget_floor;
+    return widenLimits(limits, floor);
 }
 
 fn shouldUseLargeGpuHostedLazyQuantBudgets(
@@ -7444,6 +7662,52 @@ pub fn attachGraphRuntimeStrategy(session: Session, strategy: graph_runtime.Stra
 
 pub const MetalWorkloadProfileExport = if (build_options.enable_metal) metal_runtime.WorkloadProfileExport else void;
 
+fn qwenWorkspaceProvider(session: Session) !*@import("../backends/metal_native_provider.zig").MetalNativeProvider {
+    if (comptime !build_options.enable_metal) return error.UnsupportedBackend;
+    if (session.vtable != &arch_vtable) return error.UnsupportedBackend;
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (arch.backend_type != .metal) return error.UnsupportedBackend;
+    return gpuBackendData(arch).shared_metal_native_provider orelse error.MissingMetalNativeProvider;
+}
+
+/// All workspace methods require the caller's model execution gate. The
+/// managed backend is retired before inspecting or reclaiming physical buffers.
+pub fn qwenMetalWorkspaceCredit(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !usize {
+    if (comptime !build_options.enable_metal) return 0;
+    var compute = try getComputeBackendWithControl(session, allocator, control);
+    compute.deinit();
+    const provider = try qwenWorkspaceProvider(session);
+    // A denied larger-shape probe must not discard reusable buffers. The
+    // profile includes replacement overlap, and the native guard limits every
+    // fresh allocation to the incremental permit after retained credit.
+    if (provider.embedding_workspace_lease_count == provider.embedding_workspace_leases.len or
+        (provider.embedding_workspace_bytes == 0 and metal_runtime.termite_metal_decode_runtime_embedding_workspace_bytes(provider.raw_decode_runtime) != 0))
+        try provider.trimEmbeddingWorkspace();
+    return provider.embedding_workspace_bytes;
+}
+
+pub fn trimQwenMetalWorkspace(session: Session) !void {
+    if (comptime !build_options.enable_metal) return;
+    try (try qwenWorkspaceProvider(session)).trimEmbeddingWorkspace();
+}
+
+pub fn beginQwenMetalWorkspace(session: Session, bytes: usize) !void {
+    if (comptime !build_options.enable_metal) return;
+    const provider = try qwenWorkspaceProvider(session);
+    if (metal_runtime.termite_metal_decode_runtime_begin_embedding_workspace(provider.raw_decode_runtime, bytes) != 0)
+        return error.MetalWorkspaceBusy;
+}
+
+pub fn finishQwenMetalWorkspace(session: Session, lease: *?runtime.tier.memory.AdmissionLease) !void {
+    if (comptime !build_options.enable_metal) return;
+    const provider = try qwenWorkspaceProvider(session);
+    errdefer provider.trimEmbeddingWorkspace() catch platform.inference_process_supervisor.restartWorker();
+    const result = metal_runtime.termite_metal_decode_runtime_end_embedding_workspace(provider.raw_decode_runtime);
+    if (result < 0) return error.MetalWorkspaceBusy;
+    if (result > 0) return error.ResourceLimitExceeded;
+    try provider.retainEmbeddingWorkspace(lease);
+}
+
 /// Starts an explicit pre-serving/benchmark census on an architecture session.
 /// Unsupported or non-Metal sessions return false; there is no backend-pointer
 /// downcast outside this factory.
@@ -7791,7 +8055,6 @@ fn makeComputeBackend(
                 });
             },
             .cuda => {},
-            .onnx => {},
             .wasm => {},
         }
     }
@@ -7834,7 +8097,6 @@ fn makeComputeBackend(
             }
             break :blk self.backend_data.cuda.compute.computeBackend();
         } else return error.CudaNotEnabled,
-        .onnx => return error.OnnxNotSupportedHere,
         .wasm => return error.WasmNotSupportedHere,
     };
 }
@@ -7918,15 +8180,6 @@ fn refineGptConfigFromManifestTensorMetadata(
     try refineGptConfigFromStore(allocator, store, all_names, config);
 }
 
-pub fn getWeightExportSource(session: Session) ?export_source_mod.Source {
-    if (session.vtable != &arch_vtable) return null;
-    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    return switch (self.backend_type) {
-        .native => export_source_mod.fromNativeWeightStore(&self.backend_data.native),
-        else => null,
-    };
-}
-
 pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
     if (comptime !build_options.enable_cuda) return null;
     if (session.vtable != &arch_vtable) return null;
@@ -7958,7 +8211,7 @@ pub fn formatCudaPrefillProfileLine(buf: []u8, stats: CudaRuntimeStats) []const 
     if (comptime build_options.enable_cuda) {
         return std.fmt.bufPrint(
             buf,
-            "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d} rope={d} kv_write={d} elementwise={d} embedding={d}",
+            "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} f16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d} rope={d} kv_write={d} elementwise={d} embedding={d}",
             .{
                 stats.prefill_profile_events,
                 stats.prefill_profile_q4_linear_us,
@@ -7966,6 +8219,7 @@ pub fn formatCudaPrefillProfileLine(buf: []u8, stats: CudaRuntimeStats) []const 
                 stats.prefill_profile_q4_pair_us,
                 stats.prefill_profile_q4_gated_down_us,
                 stats.prefill_profile_bf16_linear_us,
+                stats.prefill_profile_f16_linear_us,
                 stats.prefill_profile_bf16_qkv_us,
                 stats.prefill_profile_bf16_pair_us,
                 stats.prefill_profile_attention_us,
@@ -8197,6 +8451,47 @@ pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_arch.Config 
     if (session.vtable != &arch_vtable) return null;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return if (self.arch_config == .embedding_gemma2) self.arch_config.embedding_gemma2 else null;
+}
+
+/// Called only after a relevant admission denial. The model/session remains
+/// retained, and native destruction has the same interruption protection as
+/// compute construction. Busy providers keep their weights and return zero.
+pub fn reclaimEmbeddingGemma2VisionWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .vision);
+}
+
+pub fn reclaimEmbeddingGemma2AudioWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .audio);
+}
+
+pub fn reclaimEmbeddingGemma2LanguageWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .language);
+}
+
+fn reclaimEmbeddingGemma2Weights(session: Session, control: InferenceExecutionControl, cache_class: @import("../models/embedding_gemma2_weight_cache.zig").MetalClass) !usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.arch_config != .embedding_gemma2) return 0;
+    try control.check();
+    if (self.backend_type == .native) return native_mod.reclaimEmbeddingGemma2Weights(&self.backend_data.native, cache_class);
+    if (comptime !build_options.enable_metal) return 0;
+    if (self.backend_type != .metal) return 0;
+    try control.check();
+    var guard = try control.enterUninterruptible(session.interruption());
+    defer guard.deinit();
+    return @import("../ops/metal_compute.zig").reclaimEmbeddingGemma2Weights(gpuBackendData(self), self.io, cache_class);
+}
+
+/// Preparation owns its own queue and never borrows mutable provider execution
+/// state. The loaded session handle must remain alive through producer cleanup;
+/// callers guard native driver work before querying/retaining this device.
+pub fn videoPreparationContext(session: Session) !struct { io: ?std.Io, device: ?*anyopaque } {
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return .{ .io = self.io, .device = null };
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    const device = metal_runtime.termite_metal_video_preparation_device() orelse return error.MetalRuntimeUnavailable;
+    return .{ .io = self.io, .device = device };
 }
 
 /// Incremental native Whisper decoder bound to one session for the duration
@@ -8690,7 +8985,7 @@ test "managed direct compute guards construction and cleanup" {
     compute_vtable.deinitBackend = Probe.close;
     var managed = ManagedComputeBackend{
         .backend = .{ .ptr = &probe, .vtable = &compute_vtable },
-        .guard = try control.enterUninterruptible(.process_required),
+        .guard = try control.enterUninterruptible(.uninterruptible),
     };
     managed.deinit();
     managed.deinit();
@@ -8749,6 +9044,7 @@ pub fn getGlinerSpanConfig(session: Session) !GlinerSpanConfig {
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return switch (self.arch_config) {
         .gliner => |config| .{ .deberta = config },
+        .gliner_modern_bert => |config| .{ .modern_bert = config },
         .modern_bert => |config| if (self.task == .extractor and self.gliner_span_encoder_family == .modern_bert) .{ .modern_bert = config } else error.NotGlinerSpanSession,
         else => error.NotGlinerSpanSession,
     };
@@ -9153,7 +9449,7 @@ pub fn configureSharedCacheAdmissionForSession(
         else
             null,
         .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
-        .cuda, .onnx, .wasm => null,
+        .cuda, .wasm => null,
     };
     const cache = tier_cache orelse return;
     cache.configureHardBudget(hard_budget);
@@ -9182,7 +9478,7 @@ pub fn sharedCacheAdmissionAmounts(session: Session) runtime.tier.memory.Admissi
         else
             null,
         .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
-        .cuda, .onnx, .wasm => null,
+        .cuda, .wasm => null,
     };
     return if (tier_cache) |cache| cache.admissionAmounts() else .{};
 }
@@ -9198,7 +9494,7 @@ pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
     return switch (self.backend_type) {
         .native => native_mod.reclaimOneHostCacheEntry(&self.backend_data.native),
         .pjrt => native_mod.reclaimOneHostCacheEntry(&self.backend_data.pjrt.native),
-        .metal, .cuda, .onnx, .wasm => 0,
+        .metal, .cuda, .wasm => 0,
     };
 }
 
@@ -9228,7 +9524,6 @@ pub fn memoryBudgetExceededDetail(
         else
             std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .cuda => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
-        .onnx => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .wasm => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
     };
 }
@@ -9245,7 +9540,6 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
         },
         .pjrt => self.backend_data.pjrt.native.shared_prefetch = shared_prefetch,
         .cuda => {},
-        .onnx => {},
         .wasm => {},
     }
 }
@@ -9284,6 +9578,101 @@ pub fn layaResidentStats(session: Session) ?@import("../ops/laya_metal.zig").Sta
     if (self.backend_type != .metal) return null;
     const owner = gpuBackendData(self).laya_resident orelse return null;
     return owner.snapshot();
+}
+
+fn runGlinerDecision(cb: *ops.ComputeBackend, allocator: std.mem.Allocator, encoder: gliner_encoder.Config, inputs: []const Tensor) ![]Tensor {
+    var decision_positions_tensor: ?Tensor = null;
+    var decision_mask_tensor: ?Tensor = null;
+    for (inputs) |input| {
+        if (std.mem.eql(u8, input.name, "decision_marker_positions")) {
+            if (decision_positions_tensor != null) return error.DuplicateInputs;
+            decision_positions_tensor = input;
+        }
+        if (std.mem.eql(u8, input.name, "decision_marker_mask")) {
+            if (decision_mask_tensor != null) return error.DuplicateInputs;
+            decision_mask_tensor = input;
+        }
+    }
+    if ((decision_positions_tensor == null) != (decision_mask_tensor == null))
+        return error.MissingInputs;
+    if (decision_positions_tensor) |positions_tensor| {
+        const marker_mask_tensor = decision_mask_tensor.?;
+        var input_ids_tensor: ?Tensor = null;
+        var attention_mask_tensor: ?Tensor = null;
+        for (inputs) |input| {
+            if (std.mem.eql(u8, input.name, "input_ids")) {
+                if (input_ids_tensor != null) return error.DuplicateInputs;
+                input_ids_tensor = input;
+            }
+            if (std.mem.eql(u8, input.name, "attention_mask")) {
+                if (attention_mask_tensor != null) return error.DuplicateInputs;
+                attention_mask_tensor = input;
+            }
+        }
+        const ids_tensor = input_ids_tensor orelse return error.MissingInputs;
+        const mask_tensor = attention_mask_tensor orelse return error.MissingInputs;
+        if (ids_tensor.dtype != .i64 or mask_tensor.dtype != .i64 or
+            positions_tensor.dtype != .i64 or marker_mask_tensor.dtype != .i64 or
+            ids_tensor.shape.len != 2 or mask_tensor.shape.len != 2 or
+            positions_tensor.shape.len != 2 or marker_mask_tensor.shape.len != 2 or
+            !std.mem.eql(i64, ids_tensor.shape, mask_tensor.shape) or
+            !std.mem.eql(i64, positions_tensor.shape, marker_mask_tensor.shape) or
+            ids_tensor.shape[0] <= 0 or ids_tensor.shape[1] <= 0 or positions_tensor.shape[1] <= 0 or
+            positions_tensor.shape[0] != ids_tensor.shape[0])
+            return error.InvalidInputShape;
+        const batch: usize = @intCast(ids_tensor.shape[0]);
+        const seq_len: usize = @intCast(ids_tensor.shape[1]);
+        const labels: usize = @intCast(positions_tensor.shape[1]);
+        if (seq_len > @as(usize, encoder.geometry().max_position_embeddings)) return error.InvalidInputShape;
+        const token_count = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+        const marker_count = std.math.mul(usize, batch, labels) catch return error.InvalidInputShape;
+        const token_bytes = std.math.mul(usize, token_count, @sizeOf(i64)) catch return error.InvalidInputShape;
+        const marker_bytes = std.math.mul(usize, marker_count, @sizeOf(i64)) catch return error.InvalidInputShape;
+        if (ids_tensor.data.len != token_bytes or mask_tensor.data.len != token_bytes or
+            positions_tensor.data.len != marker_bytes or marker_mask_tensor.data.len != marker_bytes or
+            !ids_tensor.isAlignedFor(i64) or !mask_tensor.isAlignedFor(i64) or
+            !positions_tensor.isAlignedFor(i64) or !marker_mask_tensor.isAlignedFor(i64))
+            return error.InvalidInputShape;
+        const input_ids = ids_tensor.asInt64();
+        const attention_mask = mask_tensor.asInt64();
+        const marker_positions = positions_tensor.asInt64();
+        const marker_mask = marker_mask_tensor.asInt64();
+        for (marker_positions, marker_mask) |position, valid| {
+            if (valid != 0 and valid != 1) return error.InvalidGlinerDecisionMarkerMask;
+            if (valid == 1 and (position < 0 or position >= @as(i64, @intCast(seq_len)))) return error.InvalidGlinerDecisionMarkerPosition;
+        }
+
+        cb.preferEagerQuantMirrors(true);
+        const hidden = switch (encoder) {
+            .deberta => |cfg| try deberta_arch.forwardCt(cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, true),
+            .modern_bert => |cfg| try modern_bert_arch.forwardCT(cb, allocator, cfg, input_ids, attention_mask, batch, seq_len),
+        };
+        defer cb.free(hidden);
+        const decision = try gliner_decision_head.forwardCt(
+            cb,
+            allocator,
+            hidden,
+            marker_positions,
+            marker_mask,
+            batch,
+            seq_len,
+            labels,
+            encoder.geometry().hidden_size,
+        );
+        defer cb.free(decision.logits);
+        const logits = try cb.toFloat32(decision.logits, allocator);
+        defer allocator.free(logits);
+        for (marker_mask, logits) |valid, *logit| if (valid == 0) {
+            logit.* = -1.0e4;
+        };
+        const output_shape = [_]i64{ @intCast(batch), @intCast(labels) };
+        var output = try Tensor.initFloat32(allocator, "logits", &output_shape, logits);
+        errdefer output.deinit();
+        const result = try allocator.alloc(Tensor, 1);
+        result[0] = output;
+        return result;
+    }
+    return error.MissingInputs;
 }
 
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
@@ -9366,7 +9755,7 @@ fn runModernBertGlinerDecision(
     const seq_len: usize = @intCast(ids_tensor.shape[1]);
     const labels: usize = @intCast(marker_positions_tensor.shape[1]);
     if (seq_len > @as(usize, cfg.max_position_embeddings)) return error.InvalidInputShape;
-    if (cb.kind() == .cuda and seq_len > 512) return error.UnsupportedModernBertCudaSequenceLength;
+    if (cb.kind() == .cuda and seq_len > 8192) return error.UnsupportedModernBertCudaSequenceLength;
     const token_count = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
     const marker_count = std.math.mul(usize, batch, labels) catch return error.InvalidInputShape;
     const token_bytes = std.math.mul(usize, token_count, @sizeOf(i64)) catch return error.InvalidInputShape;
@@ -10048,6 +10437,7 @@ fn archRunImpl(
             return result;
         },
         .gliner_boundary => return error.BoundaryExtractionRequiresSchema,
+        .gliner_modern_bert => |cfg| return runGlinerDecision(&cb, allocator, .{ .modern_bert = cfg }, inputs),
         .gliner => |cfg| {
             var decision_positions_tensor: ?Tensor = null;
             var decision_mask_tensor: ?Tensor = null;
@@ -10063,80 +10453,9 @@ fn archRunImpl(
             }
             if ((decision_positions_tensor == null) != (decision_mask_tensor == null))
                 return error.MissingInputs;
-            if (decision_positions_tensor) |positions_tensor| {
+            if (decision_positions_tensor != null) {
                 if (!cfg.label_marker_decision_head) return error.UnsupportedGlinerDecisionHead;
-                const marker_mask_tensor = decision_mask_tensor.?;
-                var input_ids_tensor: ?Tensor = null;
-                var attention_mask_tensor: ?Tensor = null;
-                for (inputs) |input| {
-                    if (std.mem.eql(u8, input.name, "input_ids")) {
-                        if (input_ids_tensor != null) return error.DuplicateInputs;
-                        input_ids_tensor = input;
-                    }
-                    if (std.mem.eql(u8, input.name, "attention_mask")) {
-                        if (attention_mask_tensor != null) return error.DuplicateInputs;
-                        attention_mask_tensor = input;
-                    }
-                }
-                const ids_tensor = input_ids_tensor orelse return error.MissingInputs;
-                const mask_tensor = attention_mask_tensor orelse return error.MissingInputs;
-                if (ids_tensor.dtype != .i64 or mask_tensor.dtype != .i64 or
-                    positions_tensor.dtype != .i64 or marker_mask_tensor.dtype != .i64 or
-                    ids_tensor.shape.len != 2 or mask_tensor.shape.len != 2 or
-                    positions_tensor.shape.len != 2 or marker_mask_tensor.shape.len != 2 or
-                    !std.mem.eql(i64, ids_tensor.shape, mask_tensor.shape) or
-                    !std.mem.eql(i64, positions_tensor.shape, marker_mask_tensor.shape) or
-                    ids_tensor.shape[0] <= 0 or ids_tensor.shape[1] <= 0 or positions_tensor.shape[1] <= 0 or
-                    positions_tensor.shape[0] != ids_tensor.shape[0])
-                    return error.InvalidInputShape;
-                const batch: usize = @intCast(ids_tensor.shape[0]);
-                const seq_len: usize = @intCast(ids_tensor.shape[1]);
-                const labels: usize = @intCast(positions_tensor.shape[1]);
-                if (seq_len > @as(usize, cfg.max_position_embeddings)) return error.InvalidInputShape;
-                const token_count = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
-                const marker_count = std.math.mul(usize, batch, labels) catch return error.InvalidInputShape;
-                const token_bytes = std.math.mul(usize, token_count, @sizeOf(i64)) catch return error.InvalidInputShape;
-                const marker_bytes = std.math.mul(usize, marker_count, @sizeOf(i64)) catch return error.InvalidInputShape;
-                if (ids_tensor.data.len != token_bytes or mask_tensor.data.len != token_bytes or
-                    positions_tensor.data.len != marker_bytes or marker_mask_tensor.data.len != marker_bytes or
-                    !ids_tensor.isAlignedFor(i64) or !mask_tensor.isAlignedFor(i64) or
-                    !positions_tensor.isAlignedFor(i64) or !marker_mask_tensor.isAlignedFor(i64))
-                    return error.InvalidInputShape;
-                const input_ids = ids_tensor.asInt64();
-                const attention_mask = mask_tensor.asInt64();
-                const marker_positions = positions_tensor.asInt64();
-                const marker_mask = marker_mask_tensor.asInt64();
-                for (marker_positions, marker_mask) |position, valid| {
-                    if (valid != 0 and valid != 1) return error.InvalidGlinerDecisionMarkerMask;
-                    if (valid == 1 and (position < 0 or position >= @as(i64, @intCast(seq_len)))) return error.InvalidGlinerDecisionMarkerPosition;
-                }
-
-                cb.preferEagerQuantMirrors(true);
-                const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, true);
-                defer cb.free(hidden);
-                const decision = try gliner_decision_head.forwardCt(
-                    &cb,
-                    allocator,
-                    hidden,
-                    marker_positions,
-                    marker_mask,
-                    batch,
-                    seq_len,
-                    labels,
-                    cfg.hidden_size,
-                );
-                defer cb.free(decision.logits);
-                const logits = try cb.toFloat32(decision.logits, allocator);
-                defer allocator.free(logits);
-                for (marker_mask, logits) |valid, *logit| if (valid == 0) {
-                    logit.* = -1.0e4;
-                };
-                const output_shape = [_]i64{ @intCast(batch), @intCast(labels) };
-                var output = try Tensor.initFloat32(allocator, "logits", &output_shape, logits);
-                errdefer output.deinit();
-                const result = try allocator.alloc(Tensor, 1);
-                result[0] = output;
-                return result;
+                return runGlinerDecision(&cb, allocator, .{ .deberta = cfg }, inputs);
             }
             // GLiNER2: DeBERTa encoder + span classification head
             // Inputs: input_ids, attention_mask, words_mask, span_idx
@@ -10636,6 +10955,18 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             }
             break :blk cfg.hidden_size;
         },
+        .gliner_modern_bert => |cfg| blk: {
+            const markers = inputs.named("decision_marker_positions") orelse return error.MissingInputs;
+            if (inputs.len() != 4 or markers.shape.len != 2 or markers.shape[0] != first.shape[0] or
+                markers.shape[1] <= 0 or input_seq > cfg.max_position_embeddings) return error.InvalidInputShape;
+            const count: usize = @intCast(markers.shape[1]);
+            output_seq = 1;
+            workspace_bytes = if (self.backend_type == .cuda)
+                try layaCudaWorkspace(batch, input_seq, count, cfg.hidden_size, cfg.intermediate_size)
+            else
+                try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size * 2);
+            break :blk count;
+        },
         .embedding_gemma2 => |cfg| blk: {
             if (input_seq > embedding_gemma2_arch.max_tokens) return error.InvalidEmbeddingInputLength;
             // Live activations, expanded GQA, streamed PLE, and host/output
@@ -10877,7 +11208,6 @@ fn archClose(ptr: *anyopaque) void {
                 self.backend_data.cuda.compute.deinit();
             }
         },
-        .onnx => {},
         .wasm => {},
     }
     self.allocator.destroy(self);

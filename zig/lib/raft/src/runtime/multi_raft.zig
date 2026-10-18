@@ -3736,6 +3736,60 @@ test "synchronous snapshot submission emits an exact delivery completion" {
     try std.testing.expectEqual(snapshot_transport_iface.SnapshotCompletionStatus.delivered, completion.status);
 }
 
+test "multi raft queued preparation retry fences its group without stalling healthy reads" {
+    const Fixture = struct {
+        failure: ?anyerror = error.CatalogPublicationProofPending,
+        blocked_attempts: usize = 0,
+        applied: [2]u64 = .{ 0, 0 },
+        fn apply(ptr: *anyopaque, group: u64, _: ?core.types.Snapshot, _: []const core.Entry, reads: []const core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const index: usize = if (group == 7) 0 else 1;
+            if (group == 7) {
+                self.blocked_attempts += 1;
+                if (self.failure) |err| return err;
+            }
+            try std.testing.expectEqual(@as(usize, 1), reads.len);
+            try std.testing.expect(reads[0].index > self.applied[index]);
+            self.applied[index] = reads[0].index;
+        }
+        fn retry(_: *anyopaque, group: u64, err: anyerror) bool {
+            return group == 7 and err == error.CatalogPublicationProofPending;
+        }
+    };
+    var fixture: Fixture = .{};
+    var worker = @import("apply_worker.zig").QueuedApplyWorker.init(std.testing.allocator, .{
+        .ptr = &fixture,
+        .vtable = &.{ .apply_ready = Fixture.apply, .is_apply_retryable = Fixture.retry },
+    });
+    defer worker.deinit();
+    var runtime = MultiRaft.init(std.testing.allocator, .{ .applied_log_retained_entries = 0 }, .{ .apply_queue = worker.queue() });
+    defer runtime.deinit();
+    // Read-only retained tasks exercise the same per-group queue fence without
+    // manufacturing uncommitted log entries or early applied acknowledgments.
+    try runtime.enqueueApply(7, null, &.{}, &.{.{ .index = 1, .request_ctx = @constCast("first") }}, .{});
+    try runtime.enqueueApply(7, null, &.{}, &.{.{ .index = 2, .request_ctx = @constCast("later") }}, .{});
+    try runtime.enqueueApply(8, null, &.{}, &.{.{ .index = 10, .request_ctx = @constCast("healthy") }}, .{});
+    try runtime.flushPendingApply();
+    try std.testing.expectEqual([2]u64{ 0, 10 }, fixture.applied);
+    try std.testing.expectEqual(@as(usize, 1), fixture.blocked_attempts);
+    try std.testing.expectEqual(@as(usize, 2), runtime.pending_apply.items.len);
+    try std.testing.expectEqual(@as(usize, 0), worker.tasks.items.len);
+    fixture.failure = null;
+    try runtime.flushPendingApply();
+    try std.testing.expectEqual([2]u64{ 2, 10 }, fixture.applied);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending_apply.items.len);
+    fixture.failure = error.InvalidCatalogRecord;
+    try runtime.enqueueApply(7, null, &.{}, &.{.{ .index = 3, .request_ctx = @constCast("corrupt") }}, .{});
+    try runtime.enqueueApply(8, null, &.{}, &.{.{ .index = 11, .request_ctx = @constCast("healthy") }}, .{});
+    try std.testing.expectError(error.InvalidCatalogRecord, runtime.flushPendingApply());
+    try std.testing.expectEqual([2]u64{ 2, 10 }, fixture.applied);
+    try std.testing.expectEqual(@as(usize, 2), runtime.pending_apply.items.len);
+    try std.testing.expectEqual(@as(usize, 0), worker.tasks.items.len);
+    fixture.failure = null;
+    try runtime.flushPendingApply();
+    try std.testing.expectEqual([2]u64{ 3, 11 }, fixture.applied);
+}
+
 test "multi raft recovered snapshot precedes log replay and read states under retry" {
     const Fixture = struct {
         blocked: bool = true,

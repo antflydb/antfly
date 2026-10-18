@@ -76,6 +76,13 @@ func TestCatalogMutationVisibilityAndErrorResponses(t *testing.T) {
 	if pending.JSON202 == nil || string(pending.JSON202.Status) != "committed_visibility_pending" {
 		t.Fatalf("missing committed outcome: %#v", pending)
 	}
+	sourcePending, err := ParseCreateQuerySourceResponse(response(202, `{"status":"committed_visibility_pending"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourcePending.JSON202 == nil || string(sourcePending.JSON202.Status) != "committed_visibility_pending" {
+		t.Fatalf("missing query source committed outcome: %#v", sourcePending)
+	}
 	missing, err := ParseGetDatabaseResponse(response(404, `{"error":"CatalogNotFound","code":"CatalogNotFound"}`))
 	if err != nil {
 		t.Fatal(err)

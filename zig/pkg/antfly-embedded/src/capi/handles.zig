@@ -45,8 +45,10 @@ pub const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     db_live: bool = true,
-    /// Public Lite connections own a cached generation rather than a lifetime writer.
+    /// Public Lite connections borrow a persistent compatible storage owner.
     lite_connection: ?*@import("lite_connection.zig").Connection = null,
+    /// Active connection context while its private SQL state is attached.
+    lite_connection_context: ?*@import("lite_connection.zig").Connection = null,
     lease_snapshot: bool = false,
     selected_table_name: ?[]u8 = null,
     selected_table_id: u64 = 0,
@@ -56,10 +58,30 @@ pub const Handle = struct {
     parent_handle: ?*Handle = null,
     table_handles: std.ArrayList(*anyopaque) = .empty,
     sql_decision_uncertain: bool = false,
+    // New generations inspect durable recovery once. Every job producer dirties
+    // these flags before admission, including uncertain publication outcomes.
+    sql_commit_recovery_needed: bool = true,
+    sql_ddl_recovery_needed: bool = true,
+    sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    maintenance_references: usize = 0,
+    maintenance_publication: ?*@import("lite_connection.zig").PreparedPublication = null,
+    maintenance_owner: ?*@import("lite_connection.zig").Owner = null,
+    maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
+    maintenance_writer_references: usize = 0,
+    maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
     embedded_open_options: db_mod.OpenOptions = .{},
     embedded_tables: std.StringHashMapUnmanaged(*@import("tables.zig").Table) = .empty,
+    embedding_cache_mutex: std.atomic.Mutex = .unlocked,
+    embedding_cache_commit_mutex: std.atomic.Mutex = .unlocked,
+    embedding_cache_pending: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty,
+    embedding_cache_pending_bytes: usize = 0,
+    embedded_table_open_mutex: std.Io.Mutex = .init,
     embedded_catalog_loaded: bool = false,
+    embedded_tables_discovered: bool = false,
+    embedded_table_records: std.StringHashMapUnmanaged(u64) = .empty,
+    embedded_table_errors: std.StringHashMapUnmanaged([]const u8) = .empty,
     embedded_next_table_id: u64 = 2,
     sql_cursors: std.AutoHashMapUnmanaged(u64, *@import("sql_cursor.zig").Cursor) = .empty,
     next_sql_cursor_id: u64 = 1,
@@ -84,19 +106,21 @@ pub const Handle = struct {
     storage_owner_runtime_hooks: ?*anyopaque = null,
     server_cleanup: ?*const fn (*Handle) void = null,
     server_context_release: ?*const fn (*anyopaque) void = null,
-    // Present only for a Lite handle opened with the local-runtime-configured
-    // flag on a build that both advertises and actually links the local
-    // inference runtime (see capi_build_options.inference_enabled and
-    // pkg/antfly/build/runtime.zig's addCapiInferenceVariantUnits). Default
-    // libantfly and Lite handles opened without the flag leave these null,
-    // which keeps today's behavior unchanged.
-    lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
-    lite_inference_io: ?*std.Io.Threaded = null,
+    /// Retained independently of storage/catalog generations. Foreground,
+    /// maintenance and retired cursor snapshots share this service.
+    lite_inference: ?*SharedLiteInference = null,
     // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
     // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
     // this caller intent across its own reconfigure passes -- see its doc
     // comment.
     lite_generated_enrichment_replay: bool = false,
+    /// Lazy foreground producer for read-only text queries. The mutex covers
+    /// construction; each call uses a scoped invocation context.
+    query_producer: ?*@import("../asset_producer_runtime.zig").Runtime = null,
+    query_producer_mutex: std.Io.Mutex = .init,
+    /// Protected by the native path gate; pins provider and extractor lifetime.
+    query_borrows: usize = 0,
+
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads
     // and data writes and exclusively for schema/admin changes. Data writes
@@ -107,6 +131,7 @@ pub const Handle = struct {
     api_lock: std.Io.RwLock = .init,
     write_mutex: std.Io.Mutex = .init,
     maintenance_mutex: std.Io.Mutex = .init,
+    promotion_commit_mutex: std.Io.Mutex = .init,
 
     pub fn database(self: *Handle) *db_mod.DB {
         return self.selected_db orelse &self.db;
@@ -114,7 +139,7 @@ pub const Handle = struct {
 
     pub fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
         if (self.parent_handle) |parent| return parent.liteAntflyProvider();
-        const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
+        const lifetime = if (self.lite_inference) |service| &service.lifetime else return null;
         return inference_provider.inferenceBoundaryProvider(lifetime);
     }
 
@@ -159,20 +184,50 @@ pub const Handle = struct {
     }
 };
 
-pub fn stopLiteEmbeddedInference(handle: *Handle) void {
-    if (handle.lite_inference_lifetime) |*lifetime| {
-        lifetime.quiesce();
-        inference_provider.destroyEmbeddedInferenceNode(lifetime.handle, lifetime.resource_owner);
-        handle.lite_inference_lifetime = null;
+/// Service lifetime is independent of the database snapshot which first opened
+/// it. Final release follows DB/producer teardown, after every borrower drains.
+pub const SharedLiteInference = struct {
+    alloc: Allocator,
+    references: std.atomic.Value(usize) = .init(1),
+    lifetime: inference_provider.EmbeddedInferenceProviderLifetime,
+    io: *std.Io.Threaded,
+    models_dir: ?[]u8,
+
+    pub fn retain(self: *SharedLiteInference) void {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
     }
-    if (handle.lite_inference_io) |io_impl| {
-        io_impl.deinit();
-        handle.alloc.destroy(io_impl);
-        handle.lite_inference_io = null;
+
+    pub fn release(self: *SharedLiteInference) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        self.lifetime.quiesce();
+        inference_provider.destroyEmbeddedInferenceNode(self.lifetime.handle, self.lifetime.resource_owner);
+        if (self.models_dir) |directory| self.alloc.free(directory);
+        self.io.deinit();
+        self.alloc.destroy(self.io);
+        self.alloc.destroy(self);
+    }
+};
+
+pub fn stopLiteEmbeddedInference(handle: *Handle) void {
+    if (handle.lite_inference) |service| {
+        handle.lite_inference = null;
+        service.release();
+    }
+}
+
+pub fn invalidateQueryProducer(handle: *Handle) void {
+    if (handle.query_producer) |producer| {
+        producer.deinit();
+        handle.alloc.destroy(producer);
+        handle.query_producer = null;
     }
 }
 
 pub fn closeHandle(handle: *Handle) void {
+    invalidateQueryProducer(handle);
     if (handle.lite_connection) |connection| {
         connection.close();
         handle.alloc.destroy(handle);
@@ -203,6 +258,9 @@ pub fn closeHandle(handle: *Handle) void {
     if (handle.db_live) {
         if (handle.lease_snapshot) handle.db.closeImmutableSnapshot() else handle.db.close();
     }
+    var cached = handle.embedding_cache_pending.valueIterator();
+    while (cached.next()) |value| handle.alloc.free(value.*);
+    handle.embedding_cache_pending.deinit(handle.alloc);
     stopLiteEmbeddedInference(handle);
     if (handle.server_cleanup) |cleanup| cleanup(handle);
     if (handle.owned_lite_backend) |*backend| {
@@ -281,6 +339,9 @@ pub const ReadableLeaseHook = struct {
             .unsupported => return error.UnsupportedOperation,
             .stalled => return error.Stalled,
             .cancelled => return error.Canceled,
+            .replacement_failed => return error.IndexReplacementFailed,
+            .replacement_pending => return error.IndexReplacementPending,
+            .replacement_configuration_mismatch => return error.IndexReplacementConfigurationMismatch,
             .internal => return error.Internal,
         }
     }
@@ -290,8 +351,8 @@ pub const ReadableLeaseHook = struct {
 /// `enterHandle` instead; this is for close and for internal callers (the
 /// storage-owner ABI, tests) that do not race close.
 pub fn asHandle(ptr: ?*anyopaque) ?*Handle {
-    const id = handle_registry.decode(ptr) orelse return null;
-    const slot = handle_registry.slotFor(id.index) orelse return null;
+    const id = handleRegistry().decode(ptr) orelse return null;
+    const slot = handleRegistry().slotFor(id.index) orelse return null;
     if (slot.state.load(.acquire) >> 1 != id.generation) return null;
     const handle = slot.handle.load(.acquire) orelse return null;
     if (handle.lite_connection) |connection| return connection.current orelse handle;
@@ -506,13 +567,17 @@ pub fn HandleRegistryOf(comptime T: type) type {
 pub const HandleRegistry = HandleRegistryOf(Handle);
 
 pub var handle_registry: HandleRegistry = .{};
+/// Access the one registry after the storage descriptor validates its layout.
+pub fn handleRegistry() *HandleRegistry {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @ptrCast(@alignCast(@import("antfly_source_root").antfly_sources.storage_engine.call("registry", .{}) catch unreachable));
+    return &handle_registry;
+}
 
-/// Closes a handle id: rejects new calls, drains entered ones, frees it.
-/// Safe for stale ids and concurrent or repeated closes.
 pub fn closeHandleId(ptr: ?*anyopaque) void {
-    const handle, const id = handle_registry.beginClose(ptr) orelse return;
+    const handle, const id = handleRegistry().beginClose(ptr) orelse return;
     closeHandle(handle);
-    handle_registry.finishClose(id);
+    handleRegistry().finishClose(id);
 }
 
 /// The handle locks are called from arbitrary foreign threads, so they use

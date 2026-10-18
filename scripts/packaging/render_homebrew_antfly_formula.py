@@ -129,13 +129,39 @@ class Antfly < Formula
 
   test do
     system "#{{bin}}/antfly", "--help"
-    (testpath/"smoke.c").write <<~C
+    (testpath/"smoke.c").write <<~'C'
       #include <antfly.h>
+      #include <stdio.h>
       int main(void) {{
         uint32_t abi = antfly_abi_version();
-        if (abi != 1 && abi != 2) return 1;
-        void *db = NULL;
-        if (antfly_lite_create("smoke.aflite", (void *)&db) != ANTFLY_OK) return 2;
+        #ifdef ANTFLY_ABI_VERSION
+        if (abi != ANTFLY_ABI_VERSION) {{
+          fprintf(stderr, "libantfly ABI %u differs from header ABI %u\\n", abi, ANTFLY_ABI_VERSION);
+          return 1;
+        }}
+        #else
+        /* Historical release headers predate the ABI declaration. */
+        if (abi != 1 && abi != 2 && abi != 3) {{
+          fprintf(stderr, "unsupported legacy libantfly ABI %u\\n", abi);
+          return 1;
+        }}
+        #endif
+        #ifdef ANTFLY_ABI_VERSION
+        if (antfly_open_options_size() != sizeof(antfly_open_options)) {{
+          fprintf(stderr, "libantfly open options size differs from header\\n");
+          return 2;
+        }}
+        #endif
+        antfly_db *db = NULL;
+        antfly_error_code code = antfly_lite_create("smoke.aflite", &db);
+        if (code != ANTFLY_OK) {{
+          #ifdef ANTFLY_ABI_VERSION
+          fprintf(stderr, "antfly_lite_create: %s: %s\\n", antfly_error_code_name(code), antfly_last_error_detail());
+          #else
+          fprintf(stderr, "antfly_lite_create failed with error %u\\n", (unsigned)code);
+          #endif
+          return 3;
+        }}
         antfly_db_close(db);
         return 0;
       }}

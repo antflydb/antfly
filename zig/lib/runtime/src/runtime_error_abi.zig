@@ -38,6 +38,14 @@ test "FK publication progress and corrupt retirement proofs retain distinct boun
     try std.testing.expectEqual(error.InitialChildProvisionAlreadyCommitted, errorFromStatus(duplicate_child));
 }
 
+test "document extraction failures retain terminal identity across callbacks" {
+    for ([_]anyerror{ error.DocumentExtractionWorkingSetTooLarge, error.DocumentArtifactPublicationFailed }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expect(transported.code != @backingInt(Code.retryable));
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -726,6 +734,97 @@ pub const Detail = enum(c_int) {
     metric_not_ready,
     metric_stale,
     invalid_generated_tool_arguments,
+    sql_feature_not_supported,
+    catalog_publication_proof_pending,
+    warm_inference_server_unavailable,
+    unsupported_server_generate_option,
+    missing_inference_listener,
+    runtime_failed,
+    runtime_stopping,
+    runtime_already_ready,
+    document_extraction_working_set_too_large,
+    document_artifact_publication_failed,
+    // Physical storage callback capability, integrity and admission outcomes.
+    crc_mismatch,
+    invalid_data,
+    mapped_artifact_unsupported,
+    immutable_read_source_unsupported,
+    directory_listing_unsupported,
+    unsupported_storage_lease,
+    durable_atomic_write_unsupported,
+    durable_atomic_rename_unsupported,
+    durable_file_sync_unsupported,
+    durable_directory_sync_unsupported,
+    stable_file_lease_unsupported,
+    read_only,
+    storage_closed,
+    cache_budget_exceeded,
+    buffer_too_small,
+    file_too_big,
+    invalid_scratch,
+    invalid_atomic_write_offset,
+    canceled_range_read,
+    source_visitor_failed,
+    mapped_artifact_unavailable,
+    read_scope_reset_unsupported,
+    read_snapshot_fork_unsupported,
+    file_busy,
+    would_block,
+    inference_worker_executable_not_configured,
+    inference_worker_unavailable,
+    model_chunk_audio_too_large,
+    model_chunk_chunk_output_too_large,
+    model_chunk_chunk_request_failed,
+    model_chunk_chunk_unit_too_large,
+    model_chunk_embedding_identity_mismatch,
+    model_chunk_empty_embedding_input,
+    model_chunk_empty_response,
+    model_chunk_empty_source,
+    model_chunk_empty_video,
+    model_chunk_immutable_version_required,
+    model_chunk_incompatible_chunk_embedding_target,
+    model_chunk_incomplete_chunk_coverage,
+    model_chunk_incomplete_video_picture,
+    model_chunk_inference_admission_queue_full,
+    model_chunk_inference_capabilities_stale,
+    model_chunk_invalid_audio_window,
+    model_chunk_invalid_chunk_continuation,
+    model_chunk_invalid_chunk_coordinates,
+    model_chunk_invalid_chunk_geometry,
+    model_chunk_invalid_chunk_model,
+    model_chunk_invalid_chunk_policy,
+    model_chunk_invalid_chunk_provider,
+    model_chunk_invalid_chunk_replay,
+    model_chunk_invalid_chunk_source,
+    model_chunk_invalid_chunker_config,
+    model_chunk_invalid_chunker_response,
+    model_chunk_invalid_embedding_output,
+    model_chunk_invalid_input_shape,
+    model_chunk_invalid_sampling_policy,
+    model_chunk_invalid_source_reference,
+    model_chunk_invalid_utf8,
+    model_chunk_memory_budget_exceeded,
+    model_chunk_missing_attachment_envelope,
+    model_chunk_missing_chunk_stream_context,
+    model_chunk_model_aware_chunk_provider_required,
+    model_chunk_shared_admission_exceeded,
+    model_chunk_source_version_changed,
+    model_chunk_stale_chunk_continuation,
+    model_chunk_stream_too_long,
+    model_chunk_timestamp_overflow,
+    model_chunk_unknown_video_duration,
+    model_chunk_unresolved_chunk_source,
+    model_chunk_unsupported_audio_format,
+    model_chunk_unsupported_chunk_media_type,
+    model_chunk_working_budget,
+    model_chunk_dependency_budget,
+    model_chunk_coded_window_budget,
+    model_chunk_event_budget,
+    model_chunk_remote_bytes_budget,
+    model_chunk_remote_requests_budget,
+    model_chunk_invalid_limits,
+    model_chunk_streaming_profile,
+    model_chunk_incomplete_audio_stream,
 };
 
 pub const Status = extern struct {
@@ -743,6 +842,60 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ChunkWorkingBudgetExceeded => status(.invalid_argument, .model_chunk_working_budget),
+        error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
+        error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
+        error.ChunkEventBudgetExceeded => status(.invalid_argument, .model_chunk_event_budget),
+        error.RemoteReadBudgetExceeded => status(.invalid_argument, .model_chunk_remote_bytes_budget),
+        error.RemoteRequestBudgetExceeded => status(.invalid_argument, .model_chunk_remote_requests_budget),
+        error.InvalidChunkLimits => status(.invalid_argument, .model_chunk_invalid_limits),
+        error.UnsupportedStreamingAudioProfile => status(.unsupported, .model_chunk_streaming_profile),
+        error.IncompleteAudioStream => status(.unavailable, .model_chunk_incomplete_audio_stream),
+
+        error.AudioTooLarge => status(.invalid_argument, .model_chunk_audio_too_large),
+        error.ChunkOutputTooLarge => status(.invalid_argument, .model_chunk_chunk_output_too_large),
+        error.ChunkRequestFailed => status(.unavailable, .model_chunk_chunk_request_failed),
+        error.ChunkUnitTooLarge => status(.invalid_argument, .model_chunk_chunk_unit_too_large),
+        error.EmbeddingIdentityMismatch => status(.conflict, .model_chunk_embedding_identity_mismatch),
+        error.EmptyEmbeddingInput => status(.invalid_argument, .model_chunk_empty_embedding_input),
+        error.EmptyResponse => status(.unavailable, .model_chunk_empty_response),
+        error.EmptySource => status(.invalid_argument, .model_chunk_empty_source),
+        error.EmptyVideo => status(.invalid_argument, .model_chunk_empty_video),
+        error.ImmutableVersionRequired => status(.invalid_argument, .model_chunk_immutable_version_required),
+        error.IncompatibleChunkEmbeddingTarget => status(.invalid_argument, .model_chunk_incompatible_chunk_embedding_target),
+        error.IncompleteChunkCoverage => status(.invalid_argument, .model_chunk_incomplete_chunk_coverage),
+        error.IncompleteVideoPicture => status(.corrupt, .model_chunk_incomplete_video_picture),
+        error.InferenceAdmissionQueueFull => status(.retryable, .model_chunk_inference_admission_queue_full),
+        error.InferenceCapabilitiesStale => status(.conflict, .model_chunk_inference_capabilities_stale),
+        error.InvalidAudioWindow => status(.invalid_argument, .model_chunk_invalid_audio_window),
+        error.InvalidChunkContinuation => status(.invalid_argument, .model_chunk_invalid_chunk_continuation),
+        error.InvalidChunkCoordinates => status(.invalid_argument, .model_chunk_invalid_chunk_coordinates),
+        error.InvalidChunkGeometry => status(.invalid_argument, .model_chunk_invalid_chunk_geometry),
+        error.InvalidChunkModel => status(.invalid_argument, .model_chunk_invalid_chunk_model),
+        error.InvalidChunkPolicy => status(.invalid_argument, .model_chunk_invalid_chunk_policy),
+        error.InvalidChunkProvider => status(.invalid_argument, .model_chunk_invalid_chunk_provider),
+        error.InvalidChunkReplay => status(.conflict, .model_chunk_invalid_chunk_replay),
+        error.InvalidChunkSource => status(.invalid_argument, .model_chunk_invalid_chunk_source),
+        error.InvalidChunkerConfig => status(.invalid_argument, .model_chunk_invalid_chunker_config),
+        error.InvalidChunkerResponse => status(.invalid_argument, .model_chunk_invalid_chunker_response),
+        error.InvalidEmbeddingOutput => status(.internal, .model_chunk_invalid_embedding_output),
+        error.InvalidInputShape => status(.invalid_argument, .model_chunk_invalid_input_shape),
+        error.InvalidSamplingPolicy => status(.invalid_argument, .model_chunk_invalid_sampling_policy),
+        error.InvalidSourceReference => status(.invalid_argument, .model_chunk_invalid_source_reference),
+        error.InvalidUtf8 => status(.invalid_argument, .model_chunk_invalid_utf8),
+        error.MemoryBudgetExceeded => status(.retryable, .model_chunk_memory_budget_exceeded),
+        error.MissingAttachmentEnvelope => status(.invalid_argument, .model_chunk_missing_attachment_envelope),
+        error.MissingChunkStreamContext => status(.internal, .model_chunk_missing_chunk_stream_context),
+        error.ModelAwareChunkProviderRequired => status(.invalid_argument, .model_chunk_model_aware_chunk_provider_required),
+        error.SharedAdmissionExceeded => status(.retryable, .model_chunk_shared_admission_exceeded),
+        error.SourceVersionChanged => status(.conflict, .model_chunk_source_version_changed),
+        error.StaleChunkContinuation => status(.conflict, .model_chunk_stale_chunk_continuation),
+        error.StreamTooLong => status(.unavailable, .model_chunk_stream_too_long),
+        error.TimestampOverflow => status(.invalid_argument, .model_chunk_timestamp_overflow),
+        error.UnknownVideoDuration => status(.invalid_argument, .model_chunk_unknown_video_duration),
+        error.UnresolvedChunkSource => status(.invalid_argument, .model_chunk_unresolved_chunk_source),
+        error.UnsupportedAudioFormat => status(.unsupported, .model_chunk_unsupported_audio_format),
+        error.UnsupportedChunkMediaType => status(.unsupported, .model_chunk_unsupported_chunk_media_type),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
@@ -851,6 +1004,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
+        error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
@@ -1120,6 +1275,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
         error.IncompletePublishedSnapshot => status(.retryable, .incomplete_published_snapshot),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
+        error.FileBusy => status(.retryable, .file_busy),
+        error.WouldBlock => status(.retryable, .would_block),
         error.WriterLocked => status(.retryable, .writer_locked),
         error.LsmRootWriterAlreadyOpen => status(.retryable, .lsm_root_writer_already_open),
         error.UnexpectedHttpStatus => status(.retryable, .unexpected_http_status),
@@ -1280,6 +1437,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.BodyCapacityExceeded => status(.retryable, .body_capacity_exceeded),
         error.BodyReadFailed => status(.unavailable, .body_read_failed),
         error.InferenceProviderFailure => status(.internal, .inference_provider_failure),
+        error.InferenceWorkerExecutableNotConfigured => status(.invalid_argument, .inference_worker_executable_not_configured),
+        error.InferenceWorkerUnavailable => status(.retryable, .inference_worker_unavailable),
         error.KernelJitRequiredDynamicLoad => status(.unsupported, .kernel_jit_required_dynamic_load),
         error.UnexpectedToken => status(.internal, .unexpected_token),
         error.EnrichmentWaitCanceled => status(.cancelled, .enrichment_wait_canceled),
@@ -1395,6 +1554,37 @@ pub fn statusFromError(err: anyerror) Status {
         error.VectorMigrationUnsupportedFile => status(.conflict, .vector_migration_unsupported_file),
         error.VectorStoreRequiresOfflineCommand => status(.conflict, .vector_store_requires_offline_command),
         error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
+        error.WarmInferenceServerUnavailable => status(.unavailable, .warm_inference_server_unavailable),
+        error.UnsupportedServerGenerateOption => status(.unsupported, .unsupported_server_generate_option),
+        error.MissingInferenceListener => status(.internal, .missing_inference_listener),
+        error.RuntimeFailed => status(.internal, .runtime_failed),
+        error.RuntimeStopping => status(.cancelled, .runtime_stopping),
+        error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
+        error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
+        error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
+        error.CrcMismatch => status(.corrupt, .crc_mismatch),
+        error.InvalidData => status(.corrupt, .invalid_data),
+        error.MappedArtifactUnsupported => status(.unsupported, .mapped_artifact_unsupported),
+        error.ImmutableReadSourceUnsupported => status(.unsupported, .immutable_read_source_unsupported),
+        error.DirectoryListingUnsupported => status(.unsupported, .directory_listing_unsupported),
+        error.UnsupportedStorageLease => status(.unsupported, .unsupported_storage_lease),
+        error.DurableAtomicWriteUnsupported => status(.unsupported, .durable_atomic_write_unsupported),
+        error.DurableAtomicRenameUnsupported => status(.unsupported, .durable_atomic_rename_unsupported),
+        error.DurableFileSyncUnsupported => status(.unsupported, .durable_file_sync_unsupported),
+        error.DurableDirectorySyncUnsupported => status(.unsupported, .durable_directory_sync_unsupported),
+        error.StableFileLeaseUnsupported => status(.unsupported, .stable_file_lease_unsupported),
+        error.ReadOnly => status(.forbidden, .read_only),
+        error.StorageClosed => status(.unavailable, .storage_closed),
+        error.CacheBudgetExceeded => status(.unavailable, .cache_budget_exceeded),
+        error.BufferTooSmall => status(.invalid_argument, .buffer_too_small),
+        error.FileTooBig => status(.invalid_argument, .file_too_big),
+        error.InvalidScratch => status(.invalid_argument, .invalid_scratch),
+        error.InvalidAtomicWriteOffset => status(.invalid_argument, .invalid_atomic_write_offset),
+        error.CanceledRangeRead => status(.cancelled, .canceled_range_read),
+        error.MappedArtifactUnavailable => status(.unsupported, .mapped_artifact_unavailable),
+        error.ReadScopeResetUnsupported => status(.unsupported, .read_scope_reset_unsupported),
+        error.ReadSnapshotForkUnsupported => status(.unsupported, .read_snapshot_fork_unsupported),
+        error.SourceVisitorFailed => status(.internal, .source_visitor_failed),
         else => status(.internal, .none),
     };
 }
@@ -1439,6 +1629,86 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .model_chunk_audio_too_large => "AudioTooLarge",
+        .model_chunk_chunk_output_too_large => "ChunkOutputTooLarge",
+        .model_chunk_chunk_request_failed => "ChunkRequestFailed",
+        .model_chunk_chunk_unit_too_large => "ChunkUnitTooLarge",
+        .model_chunk_embedding_identity_mismatch => "EmbeddingIdentityMismatch",
+        .model_chunk_empty_embedding_input => "EmptyEmbeddingInput",
+        .model_chunk_empty_response => "EmptyResponse",
+        .model_chunk_empty_source => "EmptySource",
+        .model_chunk_empty_video => "EmptyVideo",
+        .model_chunk_immutable_version_required => "ImmutableVersionRequired",
+        .model_chunk_incompatible_chunk_embedding_target => "IncompatibleChunkEmbeddingTarget",
+        .model_chunk_incomplete_chunk_coverage => "IncompleteChunkCoverage",
+        .model_chunk_incomplete_video_picture => "IncompleteVideoPicture",
+        .model_chunk_inference_admission_queue_full => "InferenceAdmissionQueueFull",
+        .model_chunk_inference_capabilities_stale => "InferenceCapabilitiesStale",
+        .model_chunk_invalid_audio_window => "InvalidAudioWindow",
+        .model_chunk_invalid_chunk_continuation => "InvalidChunkContinuation",
+        .model_chunk_invalid_chunk_coordinates => "InvalidChunkCoordinates",
+        .model_chunk_invalid_chunk_geometry => "InvalidChunkGeometry",
+        .model_chunk_invalid_chunk_model => "InvalidChunkModel",
+        .model_chunk_invalid_chunk_policy => "InvalidChunkPolicy",
+        .model_chunk_invalid_chunk_provider => "InvalidChunkProvider",
+        .model_chunk_invalid_chunk_replay => "InvalidChunkReplay",
+        .model_chunk_invalid_chunk_source => "InvalidChunkSource",
+        .model_chunk_invalid_chunker_config => "InvalidChunkerConfig",
+        .model_chunk_invalid_chunker_response => "InvalidChunkerResponse",
+        .model_chunk_invalid_embedding_output => "InvalidEmbeddingOutput",
+        .model_chunk_invalid_input_shape => "InvalidInputShape",
+        .model_chunk_invalid_sampling_policy => "InvalidSamplingPolicy",
+        .model_chunk_invalid_source_reference => "InvalidSourceReference",
+        .model_chunk_invalid_utf8 => "InvalidUtf8",
+        .model_chunk_memory_budget_exceeded => "MemoryBudgetExceeded",
+        .model_chunk_missing_attachment_envelope => "MissingAttachmentEnvelope",
+        .model_chunk_missing_chunk_stream_context => "MissingChunkStreamContext",
+        .model_chunk_model_aware_chunk_provider_required => "ModelAwareChunkProviderRequired",
+        .model_chunk_shared_admission_exceeded => "SharedAdmissionExceeded",
+        .model_chunk_source_version_changed => "SourceVersionChanged",
+        .model_chunk_stale_chunk_continuation => "StaleChunkContinuation",
+        .model_chunk_stream_too_long => "StreamTooLong",
+        .model_chunk_timestamp_overflow => "TimestampOverflow",
+        .model_chunk_unknown_video_duration => "UnknownVideoDuration",
+        .model_chunk_unresolved_chunk_source => "UnresolvedChunkSource",
+        .model_chunk_unsupported_audio_format => "UnsupportedAudioFormat",
+        .model_chunk_unsupported_chunk_media_type => "UnsupportedChunkMediaType",
+        .model_chunk_working_budget => "ChunkWorkingBudgetExceeded",
+        .model_chunk_dependency_budget => "ChunkDependencyBudgetExceeded",
+        .model_chunk_coded_window_budget => "ChunkCodedWindowBudgetExceeded",
+        .model_chunk_event_budget => "ChunkEventBudgetExceeded",
+        .model_chunk_remote_bytes_budget => "RemoteReadBudgetExceeded",
+        .model_chunk_remote_requests_budget => "RemoteRequestBudgetExceeded",
+        .model_chunk_invalid_limits => "InvalidChunkLimits",
+        .model_chunk_streaming_profile => "UnsupportedStreamingAudioProfile",
+        .model_chunk_incomplete_audio_stream => "IncompleteAudioStream",
+
+        .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
+        .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .crc_mismatch => "CrcMismatch",
+        .invalid_data => "InvalidData",
+        .mapped_artifact_unsupported => "MappedArtifactUnsupported",
+        .mapped_artifact_unavailable => "MappedArtifactUnavailable",
+        .read_scope_reset_unsupported => "ReadScopeResetUnsupported",
+        .read_snapshot_fork_unsupported => "ReadSnapshotForkUnsupported",
+        .immutable_read_source_unsupported => "ImmutableReadSourceUnsupported",
+        .directory_listing_unsupported => "DirectoryListingUnsupported",
+        .unsupported_storage_lease => "UnsupportedStorageLease",
+        .durable_atomic_write_unsupported => "DurableAtomicWriteUnsupported",
+        .durable_atomic_rename_unsupported => "DurableAtomicRenameUnsupported",
+        .durable_file_sync_unsupported => "DurableFileSyncUnsupported",
+        .durable_directory_sync_unsupported => "DurableDirectorySyncUnsupported",
+        .stable_file_lease_unsupported => "StableFileLeaseUnsupported",
+        .read_only => "ReadOnly",
+        .storage_closed => "StorageClosed",
+        .cache_budget_exceeded => "CacheBudgetExceeded",
+        .buffer_too_small => "BufferTooSmall",
+        .file_too_big => "FileTooBig",
+        .invalid_scratch => "InvalidScratch",
+        .invalid_atomic_write_offset => "InvalidAtomicWriteOffset",
+        .canceled_range_read => "CanceledRangeRead",
+        .source_visitor_failed => "SourceVisitorFailed",
+
         .external_lake_read_only => "ExternalLakeReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
@@ -1549,6 +1819,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_feature_not_supported => "SqlFeatureNotSupported",
+        .catalog_publication_proof_pending => "CatalogPublicationProofPending",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
@@ -1832,6 +2104,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .index_rebuilding => "IndexRebuilding",
         .incomplete_published_snapshot => "IncompletePublishedSnapshot",
         .table_visibility_timeout => "TableVisibilityTimeout",
+        .file_busy => "FileBusy",
+        .would_block => "WouldBlock",
         .writer_locked => "WriterLocked",
         .lsm_root_writer_already_open => "LsmRootWriterAlreadyOpen",
         .unexpected_http_status => "UnexpectedHttpStatus",
@@ -2033,6 +2307,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .body_capacity_exceeded => "BodyCapacityExceeded",
         .body_read_failed => "BodyReadFailed",
         .inference_provider_failure => "InferenceProviderFailure",
+        .inference_worker_executable_not_configured => "InferenceWorkerExecutableNotConfigured",
+        .inference_worker_unavailable => "InferenceWorkerUnavailable",
         .kernel_jit_required_dynamic_load => "KernelJitRequiredDynamicLoad",
         .unexpected_token => "UnexpectedToken",
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
@@ -2081,6 +2357,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
         .storage_kernel_failure => "StorageKernelFailure",
+        .warm_inference_server_unavailable => "WarmInferenceServerUnavailable",
+        .unsupported_server_generate_option => "UnsupportedServerGenerateOption",
+        .missing_inference_listener => "MissingInferenceListener",
+        .runtime_failed => "RuntimeFailed",
+        .runtime_stopping => "RuntimeStopping",
+        .runtime_already_ready => "RuntimeAlreadyReady",
     };
 }
 
@@ -2289,6 +2571,17 @@ test "storage owner contention retains retryability and exact identity" {
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
 }
 
+test "catalog publication preparation preserves explicit retry identity across archives" {
+    const pending = statusFromError(error.CatalogPublicationProofPending);
+    try std.testing.expectEqual(@backingInt(Code.retryable), pending.code);
+    try std.testing.expectEqual(error.CatalogPublicationProofPending, errorFromStatus(pending));
+    try std.testing.expect(pending.detail != statusFromError(error.ResourceTemporarilyUnavailable).detail);
+    try std.testing.expect(pending.detail != statusFromError(error.InvalidCatalogRecord).detail);
+    var forged = pending;
+    forged.code = @backingInt(Code.corrupt);
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
+}
+
 test "released main Detail identifiers retain their exact names and numeric values" {
     @setEvalBranchQuota(2000);
     const std_test = @import("std");
@@ -2357,5 +2650,48 @@ test "external lake and spill errors retain exact identity across runtime archiv
     }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "inference command and lifecycle errors retain their identities across engine calls" {
+    inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "storage callback boundaries retain capability integrity and bounded-read outcomes" {
+    for ([_]anyerror{ error.CrcMismatch, error.InvalidData, error.MappedArtifactUnavailable, error.ReadScopeResetUnsupported, error.ReadSnapshotForkUnsupported, error.MappedArtifactUnsupported, error.ImmutableReadSourceUnsupported, error.DirectoryListingUnsupported, error.UnsupportedStorageLease, error.DurableAtomicWriteUnsupported, error.DurableAtomicRenameUnsupported, error.DurableFileSyncUnsupported, error.DurableDirectorySyncUnsupported, error.StableFileLeaseUnsupported, error.ReadOnly, error.StorageClosed, error.CacheBudgetExceeded, error.BufferTooSmall, error.FileTooBig, error.InvalidScratch, error.InvalidAtomicWriteOffset, error.CanceledRangeRead }) |err| {
+        const encoded = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(encoded));
+    }
+}
+
+test "model-aware chunk failures preserve retry and source fencing semantics" {
+    const Case = struct { err: anyerror, code: Code };
+    for ([_]Case{
+        .{ .err = error.StaleChunkContinuation, .code = .conflict },
+        .{ .err = error.SourceVersionChanged, .code = .conflict },
+        .{ .err = error.EmbeddingIdentityMismatch, .code = .conflict },
+        .{ .err = error.IncompleteChunkCoverage, .code = .invalid_argument },
+        .{ .err = error.ChunkOutputTooLarge, .code = .invalid_argument },
+        .{ .err = error.MemoryBudgetExceeded, .code = .retryable },
+        .{ .err = error.UnsupportedChunkMediaType, .code = .unsupported },
+    }) |case| {
+        const wire = statusFromError(case.err);
+        try std.testing.expectEqual(@backingInt(case.code), wire.code);
+        try std.testing.expectEqual(case.err, errorFromStatus(wire));
+    }
+}
+
+test "inference worker setup and transport failures retain distinct boundary semantics" {
+    const missing = statusFromError(error.InferenceWorkerExecutableNotConfigured);
+    const unavailable = statusFromError(error.InferenceWorkerUnavailable);
+    const capacity = statusFromError(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), missing.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), unavailable.code);
+    try std.testing.expect(missing.detail != unavailable.detail and unavailable.detail != capacity.detail);
+    for ([_]anyerror{ error.InferenceWorkerExecutableNotConfigured, error.InferenceWorkerUnavailable }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.InferenceProviderFailure)));
     }
 }

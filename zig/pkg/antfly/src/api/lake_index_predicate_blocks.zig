@@ -55,7 +55,11 @@ pub const Builder = struct {
     upper: u32 = 0,
     count: u32 = 0,
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
-        return .{ .a = a, .sort = .init(a, manager, &.{ .{}, .{} }, 512 * 1024), .bitmap = Bitmap.init(a) };
+        // Reserve capacity for sibling ordered sorts, reverse/tie builders
+        // and their merges in the shared 64-file manager.
+        var sort = local.sql_spill.Sort.init(a, manager, &.{ .{}, .{} }, 512 * 1024);
+        sort.run_limit = 4;
+        return .{ .a = a, .sort = sort, .bitmap = Bitmap.init(a) };
     }
     pub fn deinit(self: *Builder) void {
         if (self.current) |current| self.a.free(current);
@@ -172,4 +176,44 @@ test "external lake predicate blocks validate extents without decoding row IDs" 
     try std.testing.expectEqual(@as(u32, 100000), selection.interval.count);
     std.mem.writeInt(u32, bytes[5..9], 1 << shift, .big);
     try std.testing.expectError(error.InvalidNativeLakeRowIndex, decode(a, &bytes));
+}
+
+test "external lake predicate spill preserves file capacity for fused ordered consumers" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false };
+    defer manager.deinit();
+    var occupied: [55]local.sql_spill.File = undefined;
+    var count: usize = 0;
+    defer for (occupied[0..count]) |*file| file.close();
+    while (count < occupied.len) : (count += 1) occupied[count] = try manager.create();
+    {
+        var builder = Builder.init(a, &manager);
+        defer builder.deinit();
+        builder.sort.memory_bytes = 4096;
+        builder.sort.parallel_runs = false;
+        for (0..5000) |row| {
+            var forward: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, forward[0..8], @intCast(row), .big);
+            std.mem.writeInt(u64, forward[16..24], @intCast(row), .big);
+            try builder.add(&forward);
+        }
+        try builder.flush();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        for (0..5000) |row| {
+            _ = arena.reset(.free_all);
+            const record = (try builder.sort.next(arena.allocator())).?;
+            try std.testing.expectEqual(@as(u64, @intCast(row)), std.mem.readInt(u64, record.keys[0].value.string[0..8], .big));
+            const selected = try decode(arena.allocator(), record.values[0].value.string);
+            try std.testing.expectEqual(@as(u32, @intCast(row)), selected.interval.lower);
+            try std.testing.expectEqual(@as(u32, 1), selected.interval.count);
+        }
+        try std.testing.expect((try builder.sort.next(arena.allocator())) == null);
+    }
+    try std.testing.expectEqual(occupied.len, manager.files);
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
 }

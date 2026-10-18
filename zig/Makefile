@@ -10,25 +10,7 @@ INFERENCE_BIN ?= ./zig-out/bin/antfly
 # Build
 # ====================================================================================
 
-INFERENCE_DIR := pkg/inference
-ONNXRUNTIME_ROOT := $(INFERENCE_DIR)/onnxruntime
-ONNXRUNTIME_VERSION ?= 1.24.3
-GENAI_VERSION ?= 0.12.1
-ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
-
-.PHONY: build test unit-test antfly-unit-test download-onnx force-download-onnx clean-onnx
-
-$(ONNXRUNTIME_STAMP): $(INFERENCE_DIR)/scripts/download-onnxruntime.sh
-	@test -d $(INFERENCE_DIR) || (echo "ERROR: inference package not found at $(INFERENCE_DIR)" && exit 1)
-	@rm -f $(ONNXRUNTIME_ROOT)/.version-*
-	cd $(INFERENCE_DIR) && ONNXRUNTIME_ROOT=onnxruntime ./scripts/download-onnxruntime.sh $(ONNXRUNTIME_VERSION) $(GENAI_VERSION)
-	@touch $@
-
-download-onnx: $(ONNXRUNTIME_STAMP) ## Download ONNX Runtime + GenAI (skips if up-to-date).
-
-force-download-onnx: ## Force re-download of ONNX Runtime + GenAI.
-	@rm -f $(ONNXRUNTIME_ROOT)/.version-*
-	$(MAKE) download-onnx
+.PHONY: build test unit-test antfly-unit-test
 
 build: ## Build the Antfly runtime; optional inference dependencies are provisioned explicitly.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly $(ZIG_BUILD_FLAGS)
@@ -60,9 +42,6 @@ unit-test: ## Run the existing repository unit gate across libraries, Antfly, an
 antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly-unit-test $(ZIG_BUILD_FLAGS)
 
-clean-onnx: ## Remove downloaded ONNX Runtime files.
-	rm -rf $(ONNXRUNTIME_ROOT)
-
 .PHONY: inference-e2e-models
 
 inference-e2e-models: ## Prefetch the curated inference E2E model set with `antfly inference pull`.
@@ -75,9 +54,24 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 
 .PHONY: generate generated-check tls-compat-check openapi-generate openapi-check mcp-schema-fragments-generate mcp-schema-fragments-check snowball-generate snowball-check sql-grammar-generate sql-grammar-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-generate ## Regenerate checked-in generated sources.
+generate: engine-errors-generate openapi-generate snowball-generate sql-grammar-generate cabi-header-generate source-catalog-generate ## Regenerate checked-in generated sources.
 
-generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check ## Check all checked-in generated sources are current.
+generated-check: engine-errors-check tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check source-catalog-check ## Check all checked-in generated sources are current.
+
+# New model/codec failures must retain their identities across runtime units.
+.PHONY: engine-errors-generate engine-errors-check
+engine-errors-generate:
+	$(SCRIPTS_PY) tools/generate_engine_errors.py --zig $(ZIG)
+
+engine-errors-check:
+	$(SCRIPTS_PY) tools/generate_engine_errors.py --zig $(ZIG) --check
+
+.PHONY: source-catalog-generate source-catalog-check
+source-catalog-generate:
+	$(SCRIPTS_PY) tools/check_storage_compilation.py --write-control-catalog
+
+source-catalog-check:
+	$(SCRIPTS_PY) tools/check_storage_compilation.py --check-control-catalog
 
 tls-compat-check: ## Verify the checked-in Zig TLS compatibility patch has not drifted.
 	@sh lib/httpx/src/tls/check_client_compat.sh

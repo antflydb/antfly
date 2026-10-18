@@ -24,6 +24,8 @@ from pathlib import Path
 
 
 def matches(name: str, pattern: str) -> bool:
+    if pattern.startswith("^"):
+        return name.startswith(pattern[1:])
     target = name if "." in pattern else name.partition(".test.")[2] or name
     return pattern in target
 

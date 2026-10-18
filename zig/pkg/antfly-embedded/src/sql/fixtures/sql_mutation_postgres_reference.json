@@ -1,0 +1,2968 @@
+{
+  "format": 3,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "description": "Explicit bounded discovery profile, not native activation or constraint-owner evidence. Logical id is a primary key; source tables and every post-state are recorded. Typed arrays, generated/default producers, CHECK/FK and partial/expression arbiter profiles remain separate.",
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "email": {
+                "type": "keyword"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "amount": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "keyword"
+              },
+              "organization_id": {
+                "type": "keyword"
+              },
+              "priority": {
+                "type": "integer"
+              },
+              "expires_at": {
+                "type": "integer"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "json"
+              },
+              "tags": {
+                "type": "json"
+              },
+              "request_id": {
+                "type": "keyword"
+              },
+              "updated_at_ns": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "primary_key": ["id"],
+    "rows": [
+      {
+        "key": "a",
+        "value": {
+          "id": "u1",
+          "status": "active",
+          "quantity": 2,
+          "email": "a@example.test",
+          "tenant_id": "t1",
+          "amount": 5,
+          "name": "Ada",
+          "organization_id": "o1",
+          "priority": 8,
+          "expires_at": 100,
+          "enabled": true,
+          "metadata": {
+            "source": "api",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": ["seed"]
+          },
+          "tags": ["hot"],
+          "request_id": "old",
+          "updated_at_ns": 10
+        }
+      },
+      {
+        "key": "b",
+        "value": {
+          "id": "u2",
+          "status": "closed",
+          "quantity": 7,
+          "email": "b@example.test",
+          "tenant_id": "t2",
+          "amount": 9,
+          "name": "Grace",
+          "organization_id": "o2",
+          "priority": 3,
+          "expires_at": 1100,
+          "enabled": false,
+          "metadata": {
+            "source": "internal",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": ["seed"]
+          },
+          "tags": [],
+          "request_id": "other",
+          "updated_at_ns": 20
+        }
+      },
+      {
+        "key": "c",
+        "value": {
+          "id": "u_ready_seed",
+          "status": "ready",
+          "quantity": 3,
+          "email": "u3@example.test",
+          "tenant_id": "t1",
+          "amount": 17,
+          "name": "Ada",
+          "organization_id": "u1",
+          "priority": 8,
+          "expires_at": 100,
+          "enabled": true,
+          "metadata": {
+            "source": "api",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": ["seed"]
+          },
+          "tags": ["hot"],
+          "request_id": "old",
+          "updated_at_ns": 10
+        }
+      },
+      {
+        "key": "d",
+        "value": {
+          "id": "u_queued_seed",
+          "status": "queued",
+          "quantity": 4,
+          "email": "u4@example.test",
+          "tenant_id": "t1",
+          "amount": 23,
+          "name": "Ada",
+          "organization_id": "u2",
+          "priority": 8,
+          "expires_at": 100,
+          "enabled": true,
+          "metadata": {
+            "source": "api",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": ["seed"]
+          },
+          "tags": ["hot"],
+          "request_id": "old",
+          "updated_at_ns": 10
+        }
+      }
+    ],
+    "additional_tables": [
+      {
+        "name": "archived_records",
+        "schema": {
+          "version": 1,
+          "storage_mode": "relational",
+          "default_type": "row",
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "keyword"
+                  },
+                  "organization_id": {
+                    "type": "keyword"
+                  },
+                  "status": {
+                    "type": "keyword"
+                  },
+                  "archive_id": {
+                    "type": "keyword"
+                  },
+                  "archive_status": {
+                    "type": "keyword"
+                  },
+                  "archive_amount": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "primary_key": ["id"],
+        "rows": [
+          {
+            "key": "archive-a",
+            "value": {
+              "id": "u1",
+              "organization_id": "u1",
+              "status": "ready",
+              "archive_id": "archive_1",
+              "archive_status": "ready",
+              "archive_amount": 11
+            }
+          },
+          {
+            "key": "archive-b",
+            "value": {
+              "id": "u2",
+              "organization_id": "u2",
+              "status": "stale",
+              "archive_id": "archive_2",
+              "archive_status": "ready",
+              "archive_amount": 19
+            }
+          }
+        ]
+      },
+      {
+        "name": "source_records",
+        "schema": {
+          "version": 1,
+          "storage_mode": "relational",
+          "default_type": "row",
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "keyword"
+                  },
+                  "status": {
+                    "type": "keyword"
+                  },
+                  "quantity": {
+                    "type": "integer"
+                  },
+                  "email": {
+                    "type": "keyword"
+                  },
+                  "tenant_id": {
+                    "type": "keyword"
+                  },
+                  "amount": {
+                    "type": "integer"
+                  },
+                  "name": {
+                    "type": "keyword"
+                  },
+                  "organization_id": {
+                    "type": "keyword"
+                  },
+                  "priority": {
+                    "type": "integer"
+                  },
+                  "expires_at": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "metadata": {
+                    "type": "json"
+                  },
+                  "tags": {
+                    "type": "json"
+                  },
+                  "request_id": {
+                    "type": "keyword"
+                  },
+                  "updated_at_ns": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "primary_key": ["id"],
+        "rows": [
+          {
+            "key": "source-0",
+            "value": {
+              "id": "u1",
+              "status": "ready",
+              "quantity": 3,
+              "email": "a@example.test",
+              "tenant_id": "t1",
+              "amount": 5,
+              "name": "Ada",
+              "organization_id": "o1",
+              "priority": 8,
+              "expires_at": 100,
+              "enabled": true,
+              "metadata": {
+                "source": "api",
+                "billing": {
+                  "plan": "basic"
+                },
+                "flags": ["seed"]
+              },
+              "tags": ["hot"],
+              "request_id": "old",
+              "updated_at_ns": 10
+            }
+          },
+          {
+            "key": "source-1",
+            "value": {
+              "id": "u2",
+              "status": "pending",
+              "quantity": 4,
+              "email": "b@example.test",
+              "tenant_id": "t2",
+              "amount": 9,
+              "name": "Grace",
+              "organization_id": "o2",
+              "priority": 3,
+              "expires_at": 1100,
+              "enabled": false,
+              "metadata": {
+                "source": "internal",
+                "billing": {
+                  "plan": "basic"
+                },
+                "flags": ["seed"]
+              },
+              "tags": [],
+              "request_id": "other",
+              "updated_at_ns": 20
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "entries": [
+    {
+      "id": "sql-0012",
+      "command_tag": "UPDATE",
+      "affected": 4,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","done",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","done",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","done",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","done",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0013",
+      "command_tag": "DELETE",
+      "affected": 4,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [],
+          "sql_nulls": []
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0571",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["id"],
+      "column_oids": [25],
+      "rows": [
+        ["u1"]
+      ],
+      "sql_nulls": [
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","archived",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0572",
+      "command_tag": "UPDATE",
+      "affected": 4,
+      "columns": ["id"],
+      "column_oids": [25],
+      "rows": [
+        ["u1"],
+        ["u2"],
+        ["u_ready_seed"],
+        ["u_queued_seed"]
+      ],
+      "sql_nulls": [
+        [false],
+        [false],
+        [false],
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","archived",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","archived",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","archived",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","archived",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0598",
+      "command_tag": "UPDATE",
+      "affected": 2,
+      "columns": ["id"],
+      "column_oids": [25],
+      "rows": [
+        ["u1"],
+        ["u2"]
+      ],
+      "sql_nulls": [
+        [false],
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","archived",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","archived",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0599",
+      "command_tag": "UPDATE",
+      "affected": 2,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","archived",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","archived",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0606",
+      "command_tag": "DELETE",
+      "affected": 1,
+      "columns": ["id"],
+      "column_oids": [25],
+      "rows": [
+        ["u1"]
+      ],
+      "sql_nulls": [
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0607",
+      "command_tag": "DELETE",
+      "affected": 4,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [],
+          "sql_nulls": []
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0608",
+      "command_tag": "DELETE",
+      "affected": 2,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0609",
+      "command_tag": "DELETE",
+      "affected": 2,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0619",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["id"],
+      "column_oids": [25],
+      "rows": [
+        ["u1"]
+      ],
+      "sql_nulls": [
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","archived",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0620",
+      "command_tag": "DELETE",
+      "affected": 1,
+      "columns": ["id"],
+      "column_oids": [25],
+      "rows": [
+        ["u2"]
+      ],
+      "sql_nulls": [
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0657",
+      "command_tag": "UPDATE",
+      "affected": 2,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-0667",
+      "command_tag": "DELETE",
+      "affected": 2,
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1390",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","enabled"],
+      "column_oids": [25,16],
+      "rows": [
+        ["u1",true]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1392",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","quantity"],
+      "column_oids": [25,20],
+      "rows": [
+        ["u1",5]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",5,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1393",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","quantity"],
+      "column_oids": [25,20],
+      "rows": [
+        ["u1",4]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",4,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1412",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","amount"],
+      "column_oids": [25,20],
+      "rows": [
+        ["u_bad",-1]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_bad",null,null,null,null,-1,null,null,null,null,null,null,null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,true,true,true,true,false,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1439",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u_ready_seed",null]
+      ],
+      "sql_nulls": [
+        [false,true]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed",null,3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,true,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1443",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u_ready_seed","ready"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",0,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1452",
+      "command_tag": "INSERT",
+      "affected": 2,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["archive_1","ready"],
+        ["archive_2","ready"]
+      ],
+      "sql_nulls": [
+        [false,false],
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["archive_1","ready",null,null,null,11,null,null,null,null,null,null,null,null,null],
+            ["archive_2","ready",null,null,null,19,null,null,null,null,null,null,null,null,null],
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,true,true,true,false,true,true,true,true,true,true,true,true,true],
+            [false,false,true,true,true,false,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1453",
+      "command_tag": "INSERT",
+      "affected": 2,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["archive_2","ready"],
+        ["archive_1","ready"]
+      ],
+      "sql_nulls": [
+        [false,false],
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["archive_1","ready",null,null,null,12,null,null,null,null,null,null,null,null,null],
+            ["archive_2","ready",null,null,null,20,null,null,null,null,null,null,null,null,null],
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,true,true,true,false,true,true,true,true,true,true,true,true,true],
+            [false,false,true,true,true,false,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1454",
+      "command_tag": "INSERT",
+      "affected": 2,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["archive_2","ready"],
+        ["archive_1","ready"]
+      ],
+      "sql_nulls": [
+        [false,false],
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["archive_1","ready",null,null,null,12,null,null,null,null,null,null,null,null,null],
+            ["archive_2","ready",null,null,null,20,null,null,null,null,null,null,null,null,null],
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,true,true,true,false,true,true,true,true,true,true,true,true,true],
+            [false,false,true,true,true,false,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1463",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","named"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","named",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1465",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1",null]
+      ],
+      "sql_nulls": [
+        [false,true]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1",null,2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,true,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1471",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","ACTIVE_USER_#"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ACTIVE_USER_#",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1473",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","amount"],
+      "column_oids": [25,20],
+      "rows": [
+        ["u1",2]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",2,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1474",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","amount"],
+      "column_oids": [25,20],
+      "rows": [
+        ["u1",2]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",2,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1475",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","A"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","A",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1482",
+      "command_tag": "INSERT",
+      "affected": 2,
+      "columns": ["id"],
+      "column_oids": [25],
+      "rows": [
+        ["u_multi_3"],
+        ["u_multi_4"]
+      ],
+      "sql_nulls": [
+        [false],
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_multi_3","open",null,null,null,null,null,null,null,null,null,null,null,null,null],
+            ["u_multi_4","closed",null,null,null,null,null,null,null,null,null,null,null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,true,true,true,true,true,true,true,true,true,true,true,true,true],
+            [false,false,true,true,true,true,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1483",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u_multi_dup","ready"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_multi_dup","ready",null,null,null,null,null,null,null,null,null,null,null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,true,true,true,true,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1488",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns","status_key","source"],
+      "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20,25,25],
+      "rows": [
+        ["u3","open",null,null,null,null,null,null,null,null,null,{"source":"seed"},null,null,null,"open","seed"]
+      ],
+      "sql_nulls": [
+        [false,false,true,true,true,true,true,true,true,true,true,false,true,true,true,false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u3","open",null,null,null,null,null,null,null,null,null,{"source":"seed"},null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,true,true,true,true,true,true,true,true,true,false,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1489",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+      "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+      "rows": [
+        ["u_qualified","open",null,null,null,null,null,null,null,null,null,{"source":"seed"},null,null,null]
+      ],
+      "sql_nulls": [
+        [false,false,true,true,true,true,true,true,true,true,true,false,true,true,true]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_qualified","open",null,null,null,null,null,null,null,null,null,{"source":"seed"},null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,true,true,true,true,true,true,true,true,true,false,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1490",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+      "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+      "rows": [
+        ["u_public_qualified","open",null,null,null,null,null,null,null,null,null,{"source":"seed"},null,null,null]
+      ],
+      "sql_nulls": [
+        [false,false,true,true,true,true,true,true,true,true,true,false,true,true,true]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_public_qualified","open",null,null,null,null,null,null,null,null,null,{"source":"seed"},null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,true,true,true,true,true,true,true,true,true,false,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1491",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","returned_status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u_alias_fields","open"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_alias_fields","open",null,null,null,null,null,null,null,null,null,null,null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,true,true,true,true,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1492",
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": ["id","returned_status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u_public_fields","open"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_public_fields","open",null,null,null,null,null,null,null,null,null,null,null,null,null],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,true,true,true,true,true,true,true,true,true,true,true,true,true],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1499",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["metadata"],
+      "column_oids": [3802],
+      "rows": [
+        [{"flags":["seed"],"source":"api","billing":{"plan":"pro"}}]
+      ],
+      "sql_nulls": [
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"pro"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1500",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["source_text","flags_json"],
+      "column_oids": [25,3802],
+      "rows": [
+        ["api",["rated"]]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","active",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["rated"],"source":"api","billing":{"plan":"pro"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1508",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["status_key","lower_status","metadata_source"],
+      "column_oids": [25,25,25],
+      "rows": [
+        ["processing:u1","processing","api"]
+      ],
+      "sql_nulls": [
+        [false,false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","processing",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1509",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","processing"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","processing",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1510",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","disabled"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","disabled",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1512",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","disabled"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","disabled",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1514",
+      "command_tag": "DELETE",
+      "affected": 1,
+      "columns": ["id","deleted_status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","active"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1515",
+      "command_tag": "DELETE",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","active"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1517",
+      "command_tag": "DELETE",
+      "affected": 1,
+      "columns": ["id","status"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","active"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1519",
+      "command_tag": "DELETE",
+      "affected": 1,
+      "columns": ["id","status_key"],
+      "column_oids": [25,25],
+      "rows": [
+        ["u1","active"]
+      ],
+      "sql_nulls": [
+        [false,false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1533",
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "columns": ["returned_status"],
+      "column_oids": [25],
+      "rows": [
+        ["active"]
+      ],
+      "sql_nulls": [
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",2,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    },
+    {
+      "id": "sql-1564",
+      "command_tag": "DELETE",
+      "affected": 1,
+      "columns": ["returned_status"],
+      "column_oids": [25],
+      "rows": [
+        ["active"]
+      ],
+      "sql_nulls": [
+        [false]
+      ],
+      "final_tables": {
+        "usage_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u2","closed",7,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20],
+            ["u_queued_seed","queued",4,"u4@example.test","t1",23,"Ada","u2",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u_ready_seed","ready",3,"u3@example.test","t1",17,"Ada","u1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        },
+        "archived_records": {
+          "columns": ["id","organization_id","status","archive_id","archive_status","archive_amount"],
+          "column_oids": [25,25,25,25,25,20],
+          "rows": [
+            ["u1","u1","ready","archive_1","ready",11],
+            ["u2","u2","stale","archive_2","ready",19]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false],
+            [false,false,false,false,false,false]
+          ]
+        },
+        "source_records": {
+          "columns": ["id","status","quantity","email","tenant_id","amount","name","organization_id","priority","expires_at","enabled","metadata","tags","request_id","updated_at_ns"],
+          "column_oids": [25,25,20,25,25,20,25,25,20,20,16,3802,3802,25,20],
+          "rows": [
+            ["u1","ready",3,"a@example.test","t1",5,"Ada","o1",8,100,true,{"flags":["seed"],"source":"api","billing":{"plan":"basic"}},["hot"],"old",10],
+            ["u2","pending",4,"b@example.test","t2",9,"Grace","o2",3,1100,false,{"flags":["seed"],"source":"internal","billing":{"plan":"basic"}},[],"other",20]
+          ],
+          "sql_nulls": [
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false],
+            [false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]
+          ]
+        }
+      }
+    }
+  ],
+  "excluded": [],
+  "server_version": 180006
+}

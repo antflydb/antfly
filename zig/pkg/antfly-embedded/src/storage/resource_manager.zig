@@ -105,45 +105,44 @@ const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
 
-const PressureChange = if (supports_pressure_wait)
-    struct {
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
+const PressureChange = if (supports_pressure_wait) WaitingPressureChange else PollingPressureChange;
+const WaitingPressureChange = struct {
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn snapshot(self: *@This()) u64 {
-            return self.epoch.load(.acquire);
-        }
+    fn snapshot(self: *@This()) u64 {
+        return self.epoch.load(.acquire);
+    }
 
-        fn waitForChange(self: *@This(), observed: u64) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
-            while (self.epoch.load(.acquire) == observed) {
-                if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
-            }
-        }
-
-        fn advance(self: *@This()) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            _ = self.epoch.fetchAdd(1, .release);
-            if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
-            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+    fn waitForChange(self: *@This(), observed: u64) void {
+        if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+        defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+        while (self.epoch.load(.acquire) == observed) {
+            if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
         }
     }
-else
-    struct {
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn snapshot(self: *@This()) u64 {
-            return self.epoch.load(.acquire);
-        }
+    fn advance(self: *@This()) void {
+        if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+        _ = self.epoch.fetchAdd(1, .release);
+        if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
+        if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+    }
+};
+const PollingPressureChange = struct {
+    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn waitForChange(_: *@This(), _: u64) void {}
+    fn snapshot(self: *@This()) u64 {
+        return self.epoch.load(.acquire);
+    }
 
-        fn advance(self: *@This()) void {
-            _ = self.epoch.fetchAdd(1, .release);
-        }
-    };
+    fn waitForChange(_: *@This(), _: u64) void {}
+
+    fn advance(self: *@This()) void {
+        _ = self.epoch.fetchAdd(1, .release);
+    }
+};
 const default_disk_safety_floor_bytes: u64 = 1024 * MiB;
 const default_disk_safety_floor_divisor: u64 = 20;
 // Percentage-only reserves strand tens or hundreds of GiB on large volumes
@@ -585,10 +584,11 @@ pub const DenseSearchAdmissionLease = struct {
     }
 };
 
-const DenseSearchWaiters = admission.Fifo(struct {
+const DenseSearchWaiterPayload = struct {
     bytes: u64,
     enqueued_ns: u64,
-});
+};
+const DenseSearchWaiters = admission.Fifo(DenseSearchWaiterPayload);
 const DenseSearchWaiter = DenseSearchWaiters.Waiter;
 
 pub const MemoryStats = struct {
@@ -628,12 +628,16 @@ pub const CapacityObservation = struct {
 };
 
 pub const CapacitySource = struct {
+    const NativeCallbacks = struct { observe: @FieldType(CapacitySource, "observe") };
+    const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     domain_id: CapacityDomainId,
     observe: *const fn (ptr: *anyopaque) anyerror!CapacityObservation,
 
     pub fn current(self: @This()) !CapacityObservation {
-        return try self.observe(self.ptr);
+        return try NativeBoundary.call("observe", self.callback_dispatch, self.observe, .{self.ptr});
     }
 };
 
@@ -732,7 +736,7 @@ const DerivedRecoverableRetryCounters = struct {
     fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
         switch (err) {
-            error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
+            error.WriterLocked, error.WouldBlock, error.FileBusy => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
             error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
@@ -1009,6 +1013,7 @@ const MutableMemory = struct {
 const ReservationIdentity = struct {
     slice: Slice,
     bytes: u64,
+    host_charge: bool,
 };
 
 const BatchReservationIdentity = struct {
@@ -1117,7 +1122,6 @@ pub const ResourceManager = struct {
     dense_quantized_routing: bool = false,
     dense_centered_routing: bool = false,
     dense_subgroup_count: u8 = 0,
-    dense_subgroup_routing: bool = false,
     dense_global_subgroup_routing: bool = false,
     dense_compact_subgroup_routing: bool = false,
     dense_certified_subgroups: bool = false,
@@ -1183,6 +1187,14 @@ pub const ResourceManager = struct {
                 .policy = options.policies[i],
             };
         }
+        // Whole source documents are buffered in this slice before parsing, so
+        // the default caps ingestible remote documents at roughly 256 MiB.
+        // Operators ingesting larger sources can raise it explicitly.
+        const extraction_hard = @import("antfly_platform").env.getenvU64("ANTFLY_DOCUMENT_EXTRACTION_WORKING_SET_BYTES") orelse 0;
+        if (extraction_hard > 0) slices[sliceIndex(.document_extraction_working_set)].budget = .{
+            .soft_limit_bytes = extraction_hard / 4 * 3,
+            .hard_limit_bytes = extraction_hard,
+        };
         const high_sequences = options.derived_backlog_high_sequences;
         return .{
             .memory = .{ .budget = options.memory_budget },
@@ -1218,7 +1230,6 @@ pub const ResourceManager = struct {
             .dense_quantized_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_QUANTIZED_ROUTING"),
             .dense_centered_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_CENTERED_ROUTING"),
             .dense_subgroup_count = if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_16")) 16 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_8")) 8 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_4")) 4 else 0,
-            .dense_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUP_ROUTING"),
             .dense_global_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING"),
             .dense_compact_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING"),
             .dense_certified_subgroups = dense_perf.enabled("ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS"),
@@ -1385,38 +1396,41 @@ pub const ResourceManager = struct {
         if (slot.retiring and slot.in_flight == 0) slot.* = .{};
     }
 
+    // Callback return values can include logical slice credit. Only ledger
+    // deficits establish whether both host and requester admission now fit.
+    fn allocationReclaimDebt(self: *ResourceManager, requester: Slice, additional_bytes: u64) struct { total: u64, slice: u64 } {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const memory_hard = self.memory.budget.hard_limit_bytes;
+        const memory_target = if (memory_hard == 0)
+            0
+        else
+            (self.memory.used_bytes +| additional_bytes) -| memory_hard;
+        const requester_state = &self.slices[sliceIndex(requester)];
+        const slice_hard = requester_state.budget.hard_limit_bytes;
+        // These slices mix active allocations with reclaimable retained
+        // state. Satisfy their slice pressure before aggregate pressure:
+        // evicting an unrelated cache cannot raise this slice's ceiling.
+        const requester_slice_reclaimable = requester == .dense_search_working_set or
+            requester == .hbc_node_metadata_cache or
+            requester == .relational_preparation_working_set or
+            requester == .document_extraction_working_set or
+            requester == .lite_native_page_cache or requester == .lite_docstore_snapshot_cache;
+        const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
+            0
+        else
+            (requester_state.used_bytes +| additional_bytes) -| slice_hard;
+        return .{ .total = @max(memory_target, slice_target), .slice = slice_target };
+    }
+
     /// Reclaim enough aggregate cache memory to make one allocation retry
-    /// meaningful. Cache callbacks run outside the accounting mutex and may
-    /// therefore publish their byte decreases through normal accounting APIs.
+    /// meaningful. Callbacks publish their decreases through accounting APIs;
+    /// logical slice relief never substitutes for required host memory relief.
     pub fn reclaimForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
         if (additional_bytes == 0) return 0;
-        const targets = blk: {
-            lockAtomic(&self.mutex);
-            defer self.mutex.unlock();
-            const memory_hard = self.memory.budget.hard_limit_bytes;
-            const memory_target = if (memory_hard == 0)
-                0
-            else
-                (self.memory.used_bytes +| additional_bytes) -| memory_hard;
-            const requester_state = &self.slices[sliceIndex(requester)];
-            const slice_hard = requester_state.budget.hard_limit_bytes;
-            // These slices mix active allocations with reclaimable retained
-            // state. Satisfy their slice pressure before aggregate pressure:
-            // evicting an unrelated cache cannot raise this slice's ceiling.
-            const requester_slice_reclaimable = requester == .dense_search_working_set or
-                requester == .hbc_node_metadata_cache or
-                requester == .relational_preparation_working_set or
-                requester == .document_extraction_working_set or
-                requester == .lite_native_page_cache;
-            const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
-                0
-            else
-                (requester_state.used_bytes +| additional_bytes) -| slice_hard;
-            const target = @max(memory_target, slice_target);
-            if (target == 0) return 0;
-            break :blk .{ .total = target, .slice = slice_target };
-        };
-        const target_bytes = targets.total;
+        const targets = self.allocationReclaimDebt(requester, additional_bytes);
+        if (targets.total == 0) return 0;
+        var debt = targets;
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
         var reclaimed: u64 = 0;
@@ -1437,7 +1451,7 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache };
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache, .lite_docstore_snapshot_cache };
         for (candidates, 0..) |candidate_slice, candidate_index| {
             if (candidate_index == 0) {
                 if (targets.slice == 0) continue;
@@ -1445,7 +1459,7 @@ pub const ResourceManager = struct {
                 // The first pass is the only one that can resolve local
                 // pressure. Do not discard useful unrelated cache contents
                 // when live owners prevented that pass from making progress.
-                if (reclaimed < targets.slice) break;
+                if (debt.slice != 0) break;
                 if (candidate_slice == requester) continue;
             }
             if (candidate_slice == requester and
@@ -1453,7 +1467,7 @@ pub const ResourceManager = struct {
                 candidate_slice != .hbc_node_metadata_cache and
                 candidate_slice != .relational_preparation_working_set and
                 candidate_slice != .document_extraction_working_set and
-                candidate_slice != .lite_native_page_cache) continue;
+                candidate_slice != .lite_native_page_cache and candidate_slice != .lite_docstore_snapshot_cache) continue;
             // Preserve weighted fairness on the first pass. If some owners
             // cannot use their share, offer the remaining debt once more to
             // available owners before rejecting otherwise admissible work.
@@ -1491,7 +1505,7 @@ pub const ResourceManager = struct {
                         .weight = slot.weight,
                     };
                     slot.in_flight += 1;
-                    const remaining_target = target_bytes -| reclaimed;
+                    const remaining_target = debt.total;
                     if (pass == 0 and remaining_weight > invocation.weight) divided_target = true;
                     const fair_target = if (pass != 0 or remaining_weight <= invocation.weight)
                         remaining_target
@@ -1502,11 +1516,12 @@ pub const ResourceManager = struct {
 
                     reclaimed +|= invocation.reclaim(invocation.context, fair_target);
                     self.releaseReclaimerInvocation(invocation);
-                    if (reclaimed >= target_bytes) break;
+                    debt = self.allocationReclaimDebt(requester, additional_bytes);
+                    if (debt.total == 0) break;
                 }
-                if (reclaimed >= target_bytes or reclaimed == before_pass or !divided_target) break;
+                if (debt.total == 0 or reclaimed == before_pass or !divided_target) break;
             }
-            if (reclaimed >= target_bytes) break;
+            if (debt.total == 0) break;
         }
         _ = self.reclaimed_bytes.fetchAdd(reclaimed, .monotonic);
         return reclaimed;
@@ -2162,12 +2177,13 @@ pub const ResourceManager = struct {
         self: *ResourceManager,
         slice: Slice,
         bytes: u64,
+        host_charge: bool,
     ) !u64 {
         const identity = self.issueIdentityLocked();
         try self.reservation_identities.put(
             self.identity_allocator,
             identity,
-            .{ .slice = slice, .bytes = bytes },
+            .{ .slice = slice, .bytes = bytes, .host_charge = host_charge },
         );
         return identity;
     }
@@ -2184,13 +2200,14 @@ pub const ResourceManager = struct {
             reservation.identity = try self.registerReservationIdentityLocked(
                 reservation.slice,
                 0,
+                reservation.host_charge,
             );
         }
         const owned = self.reservation_identities.getPtr(reservation.identity) orelse {
             self.memory.accounting_errors +|= 1;
             return error.ReservationReleased;
         };
-        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes) {
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes or owned.host_charge != reservation.host_charge) {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
@@ -2522,7 +2539,7 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         };
 
-        const identity = try self.registerReservationIdentityLocked(slice, granted);
+        const identity = try self.registerReservationIdentityLocked(slice, granted, true);
         state.used_bytes = next_slice;
         state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
         if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
@@ -2556,7 +2573,7 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         }
         const next_memory = try self.checkMemoryLocked(bytes);
-        const identity = try self.registerReservationIdentityLocked(slice, bytes);
+        const identity = try self.registerReservationIdentityLocked(slice, bytes, true);
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
@@ -2601,7 +2618,7 @@ pub const ResourceManager = struct {
         // Minimum-progress exceptions are local slice policy; they may never
         // bypass the process-wide physical-memory envelope.
         const next_memory = try self.checkMemoryLocked(bytes);
-        const identity = try self.registerReservationIdentityLocked(slice, bytes);
+        const identity = try self.registerReservationIdentityLocked(slice, bytes, true);
         if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
@@ -2644,7 +2661,7 @@ pub const ResourceManager = struct {
             }
             oversized_grant = reservation.bytes <= hard_limit;
         }
-        const next_memory = try self.checkMemoryLocked(additional_bytes);
+        const next_memory = try self.checkMemoryLocked(if (reservation.host_charge) additional_bytes else 0);
         if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         reservation.bytes = next_reservation;
@@ -2663,6 +2680,7 @@ pub const ResourceManager = struct {
         minimum_bytes: u64,
         preferred_bytes: u64,
         max_hard_limit_multiple: u64,
+        other_owner_bytes: u64,
     ) !u64 {
         if (minimum_bytes == 0) return 0;
         lockAtomic(&self.mutex);
@@ -2675,7 +2693,8 @@ pub const ResourceManager = struct {
             std.math.maxInt(u64)
         else
             std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
-        const reservation_is_sole_user = state.used_bytes == reservation.bytes;
+        const owner_bytes = std.math.add(u64, reservation.bytes, other_owner_bytes) catch return error.ResourceBudgetExceeded;
+        const reservation_is_sole_user = state.used_bytes == owner_bytes;
 
         const Candidate = struct {
             fn allowed(
@@ -2698,7 +2717,7 @@ pub const ResourceManager = struct {
         var granted = @max(minimum_bytes, preferred_bytes);
         if (!Candidate.allowed(
             state.used_bytes,
-            reservation.bytes,
+            owner_bytes,
             granted,
             hard_limit,
             bounded_limit,
@@ -2708,7 +2727,7 @@ pub const ResourceManager = struct {
             granted = minimum_bytes;
             if (!Candidate.allowed(
                 state.used_bytes,
-                reservation.bytes,
+                owner_bytes,
                 granted,
                 hard_limit,
                 bounded_limit,
@@ -2726,11 +2745,11 @@ pub const ResourceManager = struct {
                 return hard == 0 or next <= hard;
             }
         };
-        if (!MemoryCandidate.allowed(self.memory.used_bytes, granted, self.memory.budget.hard_limit_bytes)) {
+        if (reservation.host_charge and !MemoryCandidate.allowed(self.memory.used_bytes, granted, self.memory.budget.hard_limit_bytes)) {
             granted = minimum_bytes;
             if (!Candidate.allowed(
                 state.used_bytes,
-                reservation.bytes,
+                owner_bytes,
                 granted,
                 hard_limit,
                 bounded_limit,
@@ -2747,7 +2766,7 @@ pub const ResourceManager = struct {
         }
 
         const previous_reservation = reservation.bytes;
-        const next_memory = std.math.add(u64, self.memory.used_bytes, granted) catch unreachable;
+        const next_memory = std.math.add(u64, self.memory.used_bytes, if (reservation.host_charge) granted else 0) catch unreachable;
         state.used_bytes += granted;
         reservation.bytes += granted;
         owned.bytes = reservation.bytes;
@@ -2770,17 +2789,17 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return false;
         };
-        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes) {
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes or owned.host_charge != reservation.host_charge) {
             self.memory.accounting_errors +|= 1;
             return false;
         }
         const state = &self.slices[sliceIndex(owned.slice)];
-        if (owned.bytes > state.used_bytes or owned.bytes > self.memory.used_bytes) {
+        if (owned.bytes > state.used_bytes or (owned.host_charge and owned.bytes > self.memory.used_bytes)) {
             self.memory.accounting_errors +|= 1;
             return false;
         }
         state.used_bytes -= owned.bytes;
-        self.memory.used_bytes -= owned.bytes;
+        if (owned.host_charge) self.memory.used_bytes -= owned.bytes;
         _ = self.reservation_identities.remove(reservation.identity);
         self.pressure_change.advance();
         return true;
@@ -2794,18 +2813,18 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return false;
         };
-        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes) {
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes or owned.host_charge != reservation.host_charge) {
             self.memory.accounting_errors +|= 1;
             return false;
         }
         const released = @min(bytes, owned.bytes);
         const state = &self.slices[sliceIndex(owned.slice)];
-        if (released > state.used_bytes or released > self.memory.used_bytes) {
+        if (released > state.used_bytes or (owned.host_charge and released > self.memory.used_bytes)) {
             self.memory.accounting_errors +|= 1;
             return false;
         }
         state.used_bytes -= released;
-        self.memory.used_bytes -= released;
+        if (owned.host_charge) self.memory.used_bytes -= released;
         owned.bytes -= released;
         reservation.bytes -= released;
         self.pressure_change.advance();
@@ -2818,7 +2837,7 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const owned = self.reservation_identities.getPtr(reservation.identity) orelse return error.ReservationReleased;
-        if (reservation.manager != self or reservation.released or owned.slice != reservation.slice or owned.bytes != reservation.bytes)
+        if (reservation.manager != self or reservation.released or owned.slice != reservation.slice or owned.bytes != reservation.bytes or owned.host_charge != reservation.host_charge)
             return error.ResourceAccountingMismatch;
         if (destination == reservation.slice) return;
         const source = &self.slices[sliceIndex(reservation.slice)];
@@ -2850,7 +2869,7 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
 
         if (source.manager != self or destination.manager != self or
-            source.slice != destination.slice or source == destination or
+            source.slice != destination.slice or source.host_charge != destination.host_charge or source == destination or
             (source.identity != 0 and source.identity == destination.identity) or
             source.released or destination.released)
         {
@@ -2869,8 +2888,8 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return error.ReservationReleased;
         };
-        if (source_owned.slice != source.slice or source_owned.bytes != source.bytes or
-            destination_owned.slice != destination.slice or destination_owned.bytes != destination.bytes or
+        if (source_owned.slice != source.slice or source_owned.bytes != source.bytes or source_owned.host_charge != source.host_charge or
+            destination_owned.slice != destination.slice or destination_owned.bytes != destination.bytes or destination_owned.host_charge != destination.host_charge or
             bytes > source.bytes)
         {
             self.memory.accounting_errors +|= 1;
@@ -2965,7 +2984,7 @@ pub const ResourceManager = struct {
     pub fn adoptReservationUsage(self: *ResourceManager, reservation: *Reservation, destination: Slice, current: *u64, added: u64) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (reservation.manager != self or reservation.released) return error.ResourceAccountingMismatch;
+        if (reservation.manager != self or reservation.released or !reservation.host_charge) return error.ResourceAccountingMismatch;
         const source_owned = try self.reservationIdentityLocked(reservation);
         const credit = @min(reservation.bytes, added);
         const key: ObserverKey = .{ .slice = destination, .identity = @intFromPtr(current) };
@@ -3680,6 +3699,8 @@ pub const Reservation = struct {
     identity: u64,
     slice: Slice,
     bytes: u64,
+    /// Admission against a slice may refer to residency already charged by another owner.
+    host_charge: bool = true,
     released: bool = false,
 
     pub fn reservedBytes(self: *const Reservation) u64 {
@@ -3775,13 +3796,77 @@ pub const BudgetedAllocator = struct {
     reservation: Reservation,
     max_hard_limit_multiple: u64,
     live_bytes: u64 = 0,
+    borrowed_bytes: u64 = 0,
     pinned_bytes: u64 = 0,
     credit_quantum: u64,
     budget_denied: bool = false,
     denial_generation: u64 = 0,
     reclaim_on_denial: bool = false,
+    reclaim_deficit: u64 = 0,
     last_allocation_failure: ?AllocationFailure = null,
     reservation_floor: u64 = 0,
+
+    /// Independent admission for borrowed working storage. Unlike nested
+    /// scratch floors, these leases may be released in any order.
+    pub const BorrowedScratch = struct {
+        owner: *BudgetedAllocator,
+        bytes: usize = 0,
+        reservation: Reservation,
+
+        pub fn growTo(self: *BorrowedScratch, bytes: usize) !void {
+            if (self.reservation.released) return error.ReservationReleased;
+            if (bytes <= self.bytes) return;
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            const growth = bytes - self.bytes;
+            const other_borrowed = std.math.sub(u64, self.owner.borrowed_bytes, self.bytes) catch return error.ResourceAccountingMismatch;
+            const other = std.math.add(u64, self.owner.reservation.bytes, other_borrowed) catch return error.ResourceBudgetExceeded;
+            _ = self.reservation.manager.growReservationAmortized(&self.reservation, growth, growth, self.owner.max_hard_limit_multiple, other) catch |err| {
+                self.owner.recordDenial();
+                self.owner.recordAllocationFailure(.admission, growth, @returnAddress());
+                return err;
+            };
+            self.owner.borrowed_bytes += growth;
+            self.owner.live_bytes += growth;
+            self.bytes = bytes;
+        }
+
+        pub fn shrinkTo(self: *BorrowedScratch, bytes: usize) void {
+            std.debug.assert(bytes <= self.bytes);
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            const released = self.bytes - bytes;
+            if (!self.reservation.manager.shrinkReservation(&self.reservation, released)) return;
+            self.owner.borrowed_bytes -= released;
+            self.owner.live_bytes -= released;
+            self.bytes = bytes;
+            self.owner.releaseBytes(0);
+        }
+
+        pub fn release(self: *BorrowedScratch) void {
+            if (self.reservation.released) return;
+            self.shrinkTo(0);
+            self.reservation.release();
+        }
+    };
+
+    pub fn borrowScratch(self: *BudgetedAllocator, bytes: usize) !BorrowedScratch {
+        return self.borrowResidentScratch(bytes, null);
+    }
+
+    /// Enforce query admission without charging already accounted residency twice.
+    pub fn borrowResidentScratch(self: *BudgetedAllocator, bytes: usize, resident_manager: ?*ResourceManager) !BorrowedScratch {
+        var receipt = BorrowedScratch{ .owner = self, .reservation = .{
+            .manager = self.reservation.manager,
+            .identity = 0,
+            .slice = self.reservation.slice,
+            .bytes = 0,
+            .host_charge = resident_manager != self.reservation.manager,
+        } };
+        errdefer receipt.reservation.release();
+        try receipt.growTo(bytes);
+        return receipt;
+    }
 
     pub const ScratchReservation = struct {
         owner: *BudgetedAllocator,
@@ -3799,16 +3884,22 @@ pub const BudgetedAllocator = struct {
     /// Allocations consume these same credits instead of being charged twice.
     /// Scopes nest and release in reverse order under owner serialization.
     pub fn reserveScratch(self: *BudgetedAllocator, bytes: usize) !ScratchReservation {
-        lockAtomic(&self.allocator_mutex);
-        defer self.allocator_mutex.unlock();
-        const previous_floor = self.reservation_floor;
-        if (!self.reserveGrowth(bytes)) {
+        for (0..2) |attempt| {
+            lockAtomic(&self.allocator_mutex);
+            const previous_floor = self.reservation_floor;
+            if (self.reserveGrowth(bytes, false)) {
+                self.reservation_floor = @max(previous_floor, self.live_bytes - self.borrowed_bytes);
+                self.live_bytes -= bytes;
+                self.allocator_mutex.unlock();
+                return .{ .owner = self, .previous_floor = previous_floor };
+            }
             self.recordAllocationFailure(.admission, bytes, @returnAddress());
-            return error.ResourceBudgetExceeded;
+            const deficit = self.reclaim_deficit;
+            self.allocator_mutex.unlock();
+            if (attempt == 1 or !self.reclaim_on_denial or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0)
+                return error.ResourceBudgetExceeded;
         }
-        self.reservation_floor = @max(previous_floor, self.live_bytes);
-        self.live_bytes -= bytes;
-        return .{ .owner = self, .previous_floor = previous_floor };
+        unreachable;
     }
 
     pub fn allocationFailureThreadSafe(self: *BudgetedAllocator) ?AllocationFailure {
@@ -3881,8 +3972,25 @@ pub const BudgetedAllocator = struct {
     }
 
     pub fn deinit(self: *BudgetedAllocator) void {
+        std.debug.assert(self.borrowed_bytes == 0);
         self.reservation.release();
         self.* = undefined;
+    }
+
+    /// Recognize only our own allocator and standard arena wrappers. Unknown
+    /// wrappers retain their original allocation path and budget semantics.
+    pub fn fromAllocator(candidate: std.mem.Allocator) ?*BudgetedAllocator {
+        var current = candidate;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const arena_vtable = arena.allocator().vtable;
+        for (0..8) |_| {
+            if (current.vtable.alloc == alloc or current.vtable.alloc == lockedAlloc)
+                return @ptrCast(@alignCast(current.ptr));
+            if (current.vtable != arena_vtable) return null;
+            const wrapped: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
+            current = wrapped.child_allocator;
+        }
+        return null;
     }
 
     pub fn allocator(self: *BudgetedAllocator) std.mem.Allocator {
@@ -3900,7 +4008,7 @@ pub const BudgetedAllocator = struct {
     /// Shared immutable generations may release their final allocation on a
     /// query thread while the source writer allocates a successor. Owners that
     /// publish such leases must use this interface for every allocation.
-    /// Reclaimers for this allocator must not recursively free through it.
+    /// Reclamation runs outside the owner lock; admission is revalidated on retry.
     pub fn threadSafeAllocator(self: *BudgetedAllocator) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = lockedAlloc, .resize = lockedResize, .remap = lockedRemap, .free = lockedFree } };
     }
@@ -3911,23 +4019,50 @@ pub const BudgetedAllocator = struct {
         return self.live_bytes;
     }
 
+    const LockedAllocationResult = struct { ptr: ?[*]u8, cause: ?@FieldType(AllocationFailure, "cause") };
     fn lockedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        return lockedAllocOutcome(ctx, len, alignment, ret_addr).ptr;
+    }
+    fn lockedAllocOutcome(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) LockedAllocationResult {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         lockAtomic(&self.allocator_mutex);
+        const generation = self.denial_generation;
+        const ptr = allocImpl(ctx, len, alignment, ret_addr, false);
+        const result = LockedAllocationResult{ .ptr = ptr, .cause = if (ptr == null) self.last_allocation_failure.?.cause else null };
+        const reclaim = ptr == null and self.reclaim_on_denial and self.denial_generation != generation;
+        const deficit = if (reclaim) self.reclaim_deficit else 0;
+        self.allocator_mutex.unlock();
+        if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
+        lockAtomic(&self.allocator_mutex);
         defer self.allocator_mutex.unlock();
-        return alloc(ctx, len, alignment, ret_addr);
+        const retried = allocImpl(ctx, len, alignment, ret_addr, false);
+        return .{ .ptr = retried, .cause = if (retried == null) self.last_allocation_failure.?.cause else null };
     }
     fn lockedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         lockAtomic(&self.allocator_mutex);
+        const generation = self.denial_generation;
+        const result = resizeImpl(ctx, memory, alignment, new_len, ret_addr, false);
+        const reclaim = !result and self.reclaim_on_denial and self.denial_generation != generation;
+        const deficit = if (reclaim) self.reclaim_deficit else 0;
+        self.allocator_mutex.unlock();
+        if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
+        lockAtomic(&self.allocator_mutex);
         defer self.allocator_mutex.unlock();
-        return resize(ctx, memory, alignment, new_len, ret_addr);
+        return resizeImpl(ctx, memory, alignment, new_len, ret_addr, false);
     }
     fn lockedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         lockAtomic(&self.allocator_mutex);
+        const generation = self.denial_generation;
+        const result = remapImpl(ctx, memory, alignment, new_len, ret_addr, false);
+        const reclaim = result == null and self.reclaim_on_denial and self.denial_generation != generation;
+        const deficit = if (reclaim) self.reclaim_deficit else 0;
+        self.allocator_mutex.unlock();
+        if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
+        lockAtomic(&self.allocator_mutex);
         defer self.allocator_mutex.unlock();
-        return remap(ctx, memory, alignment, new_len, ret_addr);
+        return remapImpl(ctx, memory, alignment, new_len, ret_addr, false);
     }
     fn lockedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
@@ -3950,11 +4085,9 @@ pub const BudgetedAllocator = struct {
 
         fn trackedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            lockAtomic(&self.owner.allocator_mutex);
-            defer self.owner.allocator_mutex.unlock();
-            const result = alloc(self.owner, len, alignment, ra);
-            self.last_failure = if (result == null) self.owner.last_allocation_failure.?.cause else null;
-            return result;
+            const result = lockedAllocOutcome(self.owner, len, alignment, ra);
+            self.last_failure = result.cause;
+            return result.ptr;
         }
         fn trackedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -4006,7 +4139,7 @@ pub const BudgetedAllocator = struct {
     /// Pressure reclamation must return amortized spare credit as well as
     /// freed buffers, without disturbing live bytes or an invocation's pin.
     pub fn releaseUnusedCredit(self: *BudgetedAllocator) u64 {
-        const bytes = self.reservation.bytes -| @max(self.live_bytes, @max(self.pinned_bytes, self.reservation_floor));
+        const bytes = self.reservation.bytes -| @max(self.live_bytes - self.borrowed_bytes, @max(self.pinned_bytes, self.reservation_floor));
         self.reservation.shrink(bytes);
         return bytes;
     }
@@ -4035,7 +4168,8 @@ pub const BudgetedAllocator = struct {
         self.pinned_bytes = pinned;
     }
 
-    fn reserveGrowth(self: *BudgetedAllocator, bytes: usize) bool {
+    fn reserveGrowth(self: *BudgetedAllocator, bytes: usize, allow_reclaim: bool) bool {
+        self.reclaim_deficit = 0;
         const amount = std.math.cast(u64, bytes) orelse {
             self.recordDenial();
             return false;
@@ -4044,31 +4178,26 @@ pub const BudgetedAllocator = struct {
             self.recordDenial();
             return false;
         };
-        if (next_live > self.reservation.bytes) {
-            const minimum = next_live - self.reservation.bytes;
+        const physical_live = next_live - self.borrowed_bytes;
+        if (physical_live > self.reservation.bytes) {
+            const minimum = physical_live - self.reservation.bytes;
+            self.reclaim_deficit = minimum;
             _ = self.reservation.manager.growReservationAmortized(
                 &self.reservation,
                 minimum,
                 @max(minimum, self.credit_quantum),
                 self.max_hard_limit_multiple,
+                self.borrowed_bytes,
             ) catch |err| {
                 // growReservationAmortized has released the accounting lock.
                 // Ask only for the actual deficit, not amortized spare credit.
-                if (!self.reclaim_on_denial or err != error.ResourceBudgetExceeded or
+                if (!allow_reclaim or !self.reclaim_on_denial or err != error.ResourceBudgetExceeded or
                     self.reservation.manager.reclaimForAllocation(self.reservation.slice, minimum) == 0)
                 {
                     self.recordDenial();
                     return false;
                 }
-                _ = self.reservation.manager.growReservationAmortized(
-                    &self.reservation,
-                    minimum,
-                    @max(minimum, self.credit_quantum),
-                    self.max_hard_limit_multiple,
-                ) catch {
-                    self.recordDenial();
-                    return false;
-                };
+                return self.reserveGrowth(bytes, false);
             };
         }
         self.live_bytes = next_live;
@@ -4078,21 +4207,26 @@ pub const BudgetedAllocator = struct {
     fn releaseBytes(self: *BudgetedAllocator, bytes: usize) void {
         const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
         self.live_bytes -|= amount;
-        if (self.live_bytes == 0) {
+        const physical_live = self.live_bytes - self.borrowed_bytes;
+        if (physical_live == 0) {
             self.reservation.shrink(self.reservation.bytes -| @max(self.pinned_bytes, self.reservation_floor));
             return;
         }
-        const spare = self.reservation.bytes -| self.live_bytes;
+        const spare = self.reservation.bytes -| physical_live;
         if (spare < self.credit_quantum *| 2) return;
         const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
-        const target = @max(@max(self.pinned_bytes, self.reservation_floor), self.live_bytes +| retained_spare);
+        const target = @max(@max(self.pinned_bytes, self.reservation_floor), physical_live +| retained_spare);
         if (self.reservation.bytes > target)
             self.reservation.shrink(self.reservation.bytes - target);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        return allocImpl(ctx, len, alignment, ret_addr, true);
+    }
+
+    fn allocImpl(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize, allow_reclaim: bool) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        if (!self.reserveGrowth(len)) {
+        if (!self.reserveGrowth(len, allow_reclaim)) {
             self.recordAllocationFailure(.admission, len, ret_addr);
             return null;
         }
@@ -4110,9 +4244,20 @@ pub const BudgetedAllocator = struct {
         new_len: usize,
         ret_addr: usize,
     ) bool {
+        return resizeImpl(ctx, memory, alignment, new_len, ret_addr, true);
+    }
+
+    fn resizeImpl(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+        allow_reclaim: bool,
+    ) bool {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) {
+        if (growth > 0 and !self.reserveGrowth(growth, allow_reclaim)) {
             self.recordAllocationFailure(.admission, growth, ret_addr);
             return false;
         }
@@ -4131,9 +4276,20 @@ pub const BudgetedAllocator = struct {
         new_len: usize,
         ret_addr: usize,
     ) ?[*]u8 {
+        return remapImpl(ctx, memory, alignment, new_len, ret_addr, true);
+    }
+
+    fn remapImpl(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+        allow_reclaim: bool,
+    ) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) {
+        if (growth > 0 and !self.reserveGrowth(growth, allow_reclaim)) {
             self.recordAllocationFailure(.admission, growth, ret_addr);
             return null;
         }
@@ -5613,6 +5769,7 @@ test "resource manager invokes reclaimers without holding registry mutex" {
     };
     const RetiringContext = struct {
         manager: *ResourceManager,
+        accounted: u64 = 0,
         retire_identity: u64 = 0,
         calls: u64 = 0,
 
@@ -5620,7 +5777,9 @@ test "resource manager invokes reclaimers without holding registry mutex" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             self.manager.unregisterReclaimer(self.retire_identity);
-            return target;
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
         }
     };
 
@@ -5632,8 +5791,7 @@ test "resource manager invokes reclaimers without holding registry mutex" {
     defer manager.unregisterReclaimer(retiring_id);
     retiring.retire_identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &passive, PassiveContext.reclaim);
 
-    var accounted: u64 = 0;
-    manager.observeUsage(.hbc_node_metadata_cache, &accounted, 100);
+    manager.observeUsage(.hbc_node_metadata_cache, &retiring.accounted, 100);
     // The second bounded pass can revisit the surviving owner, but never
     // invokes the registry slot retired by its first callback.
     try std.testing.expectEqual(@as(u64, 10), manager.reclaimForAllocation(.dense_apply_working_set, 10));

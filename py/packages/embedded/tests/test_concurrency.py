@@ -317,8 +317,10 @@ def test_busy_timeout_applies_to_operations_not_open(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         text=True,
     )
+    stdin, stdout = locker.stdin, locker.stdout
+    assert stdin is not None and stdout is not None
     try:
-        assert locker.stdout.readline().strip() == "locked"
+        assert stdout.readline().strip() == "locked"
         with antfly_embedded.open(path, no_sync=True) as immediate:
             with pytest.raises(antfly_embedded.BusyError):
                 immediate.batch_json({"inserts": {"blocked": {"body": "blocked"}}})
@@ -331,8 +333,8 @@ def test_busy_timeout_applies_to_operations_not_open(tmp_path: Path) -> None:
 
             def release() -> None:
                 time.sleep(0.1)
-                locker.stdin.write("release\n")
-                locker.stdin.flush()
+                stdin.write("release\n")
+                stdin.flush()
 
             release_thread = threading.Thread(target=release)
             release_thread.start()
@@ -341,7 +343,7 @@ def test_busy_timeout_applies_to_operations_not_open(tmp_path: Path) -> None:
             assert waiting.lookup("after")["body"] == "committed"
     finally:
         if locker.poll() is None:
-            locker.stdin.close()
+            stdin.close()
         locker.wait(timeout=5)
 
 
@@ -408,9 +410,11 @@ os._exit(0)
                 stdout=subprocess.PIPE,
                 text=True,
             )
-            assert locker.stdout.readline().strip() == "locked"
+            stdin, stdout = locker.stdin, locker.stdout
+            assert stdin is not None and stdout is not None
+            assert stdout.readline().strip() == "locked"
             parent = antfly_embedded.open_with_options(path, options)
-            locker.stdin.close()
+            stdin.close()
             locker.wait(timeout=5)
         elif parent is None:
             parent = antfly_embedded.open_with_options(path, options)
@@ -435,7 +439,7 @@ os._exit(0)
             assert enrichment["applied_sequence"] >= enrichment["target_sequence"]
     finally:
         if locker is not None:
-            if locker.poll() is None:
+            if locker.poll() is None and locker.stdin is not None:
                 locker.stdin.close()
             locker.wait(timeout=5)
         if parent is not None:

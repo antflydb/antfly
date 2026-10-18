@@ -3,7 +3,8 @@ info:
   version: v1alpha1
   title: Inference API
   description: |
-    Antfly inference is a local inference server for ONNX-based ML models.
+    Antfly inference is a local inference server for GGUF, safetensors, and ONNX models (ONNX graphs are
+    parsed natively, without ONNX Runtime), running on CPU, Metal, or CUDA.
 
     ## Named inference gateway
 
@@ -40,7 +41,7 @@ info:
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
     - **Embedding Generation**: OpenAI-compatible text embedding endpoints, with dense or sparse embedding payloads
-    - **Text Chunking**: Semantic chunking with ONNX models or fixed-size fallback
+    - **Text Chunking**: Fixed token-count chunking for text, with fixed time windows for audio
     - **Reranking**: Relevance re-scoring for search results
     - **Extraction**: Schema-driven entity, relation, classification, and structured extraction
     - **Text Rewriting**: Transform text using Seq2Seq models (question generation, query generation, etc.)
@@ -50,9 +51,9 @@ info:
     ## When to Use Antfly inference
 
     Antfly inference can run standalone or as part of an Antfly cluster:
-    - Local ONNX model inference without external API dependencies
+    - Local model inference without external API dependencies
     - OpenAI-compatible embedding payloads served at `/ai/v1/embed` and `/ai/v1/embeddings`
-    - Semantic text chunking for RAG pipelines
+    - Text chunking for RAG pipelines
     - Relevance reranking for improved search quality
     - Centralized model serving across distributed nodes
     - Privacy-preserving ML inference (data never leaves your infrastructure)
@@ -69,18 +70,15 @@ info:
     ## Features
 
     ### Embedding Generation
-    - **Models**: ONNX models auto-discovered from `{models_dir}/embedders/`
+    - **Models**: Embedding models auto-discovered from `{models_dir}`
     - **API**: OpenAI-compatible payloads served at `/ai/v1/embed` and `/ai/v1/embeddings`
     - **Response Shape**: Each `data[i].embedding` is either a dense float vector or a sparse `{indices, values}` object
 
     ### Text Chunking
-    - **Models**: Fixed-size chunking (always available) + ONNX models
-    - **Model Discovery**: Auto-discovers models from `{models_dir}/chunkers/`
-    - **Caching**: 2-minute TTL memory cache
-    - **Fallback**: Falls back to fixed chunking if model fails
+    - **Models**: Built-in `fixed` chunker (token count for text, time windows for audio); no model download needed
 
     ### Reranking
-    - **Model Discovery**: Auto-discovers ONNX models from `{models_dir}/rerankers/`
+    - **Model Discovery**: Auto-discovers reranker models from `{models_dir}`
     - **Quantization**: Automatically uses quantized models if available
     - **Input**: Pre-rendered text prompts (client handles field extraction)
   contact:
@@ -180,25 +178,29 @@ paths:
                 $ref: '#/components/schemas/Error'
   /chunk:
     post:
-      summary: Chunk text into smaller segments
+      summary: Chunk content with optional model-aware embeddings
       description: |
-        Splits text into smaller chunks using semantic or fixed-size chunking models.
+        Splits content into chunks. Without `embedding`, the fixed chunker and
+        legacy response remain unchanged. With `embedding`, the resolved target
+        model constrains boundaries for text, PDF pages, images or explicit tiles,
+        composited GIF frames, audio windows and consecutive video windows.
+
+        Each model-aware result pairs source coordinates and an optional vector
+        or error. `include_content` independently controls payload inclusion;
+        video uses the original source and sampling recipe. `execute: false`
+        plans without executing the embedding model. `stream: true` delivers
+        bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+        terminal record must not be treated as complete source coverage.
+        Continuations bind the original source version and semantic plan;
+        retries may deterministically recompute and must deduplicate chunk IDs.
 
         ## Models
 
-        ### Fixed Chunking (always available)
-        - Simple token-based splitting with overlap
-        - Use model="fixed"
+        ### Fixed Chunking
+        - Token-count splitting with overlap for text; fixed time windows for audio
+        - Use model="fixed" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
         - Fast and deterministic
-
-        ### ONNX Models
-        - Semantic chunking based on content similarity
-        - Models auto-discovered from `models_dir/chunkers/`
-        - Falls back to fixed chunking if model fails
-
-        ## Caching
-
-        Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+        - Other model names are rejected as unsupported
       operationId: chunkText
       requestBody:
         required: true
@@ -208,13 +210,27 @@ paths:
               $ref: '#/components/schemas/ChunkRequest'
       responses:
         '200':
-          description: Text chunked successfully
+          description: Content chunked with optional model-aware embeddings
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ChunkResponse'
+                $ref: '#/components/schemas/ChunkOperationResponse'
+            application/x-ndjson:
+              schema:
+                description: Newline-delimited events followed by a terminal coverage response; EOF alone is not completion.
+                oneOf:
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingStartEvent'
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingEvent'
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTerminalEvent'
+                  - $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingInitializationErrorEvent'
         '400':
           description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Source version, continuation plan or required model identity changed; replan against the intended generation.
           content:
             application/json:
               schema:
@@ -1277,13 +1293,12 @@ paths:
 
         ## Embedders
 
-        - ONNX models from `models_dir/embedders/`
+        - Embedding models from `models_dir`
         - Quantized variants have `-i8` suffix
 
         ## Chunkers
 
-        - Always includes "fixed" (built-in)
-        - Plus any ONNX models from `models_dir/chunkers/`
+        - Always "fixed" (built-in); chunking does not load models from `models_dir`
 
         ## Rerankers
 
@@ -1653,7 +1668,7 @@ components:
       type: object
       additionalProperties: false
       required: [content]
-      description: EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens.
+      description: EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. Video uses video/mp4, video/quicktime, video/webm or video/mp2t media/attachment parts, 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. The expanded sequence must fit 8192 tokens.
       properties:
         title:
           type: string
@@ -1887,6 +1902,20 @@ components:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkConfig'
     ChunkRequest:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkRequest'
+    ChunkEmbeddingTarget:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTarget'
+    MediaChunkPolicy:
+      $ref: '../shared/chunking.yaml#/components/schemas/MediaChunkPolicy'
+    ChunkSourceReference:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkSourceReference'
+    ChunkEmbeddingContext:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingContext'
+    ChunkEmbeddingResponse:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingResponse'
+    ChunkOperationResponse:
+      oneOf:
+        - $ref: '#/components/schemas/ChunkResponse'
+        - $ref: '#/components/schemas/ChunkEmbeddingResponse'
     ChunkResponse:
       type: object
       required:
@@ -3094,6 +3123,30 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        chunking_limits:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+          description: |
+            Effective model-aware chunk operational ceilings for working/output/event
+            bytes, chunk/dependency/index counts and remote fetched bytes, requests
+            and cache bytes. Independent of model token limits and object length.
+            Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
+            Scoped and unscoped embedding discovery expose the same values.
+        model_revision:
+          type: string
+          minLength: 64
+          maxLength: 64
+          description: Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights.
+        qualified_limits:
+          type: object
+          additionalProperties: true
+          description: |
+            Pull-time qualified request profiles for this exact artifact,
+            including backend, supported features and min/max geometry.
+            Runtime admission revalidates artifact identity and resource limits.
+            Omitted for artifacts without a qualification receipt.
         capabilities:
           type: array
           items:
@@ -3432,7 +3485,7 @@ components:
           $ref: '#/components/schemas/GenerateResponseFormat'
           description: |
             Structured output control. OpenAI-compatible entry point for requesting JSON output.
-            `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+            `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
         grammar:
           type: string
           description: |
@@ -3919,7 +3972,6 @@ components:
       enum:
         - auto
         - native
-        - onnx
         - metal
         - cuda
         - xla
@@ -3955,7 +4007,6 @@ components:
 
         Backends:
         - `native` - Native CPU backend
-        - `onnx` - ONNX Runtime backend
         - `metal` - Apple Metal backend
         - `cuda` - NVIDIA CUDA backend
         - `xla` - PJRT/XLA compiled backend
@@ -3966,7 +4017,7 @@ components:
         - `cuda` - NVIDIA CUDA GPU
         - `tpu` - Google TPU (used by XLA)
         - `cpu` - Force CPU only
-      pattern: '^(native|onnx|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$'
+      pattern: '^(native|metal|cuda|xla|webgpu|wasm)(:(auto|cuda|tpu|cpu))?$'
     ModelRef:
       type: object
       additionalProperties: false
@@ -3983,6 +4034,15 @@ components:
           example: antflydb/gemma-e2b
         backend:
           $ref: '#/components/schemas/ModelBackend'
+        cuda_precision:
+          type: string
+          enum: [auto, fp32, fp16, bf16]
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Per-model GLiNER CUDA inference precision for extractor preloads. Requires
+            CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
+            fail closed until the exact model/profile has release qualification.
+            Precision is part of the loaded-session cache identity.
         format:
           $ref: '#/components/schemas/ModelFormat'
         quantization:
@@ -4116,13 +4176,15 @@ components:
           type: string
           description: |
             Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-            - `{models_dir}/embedders/` - Embedding models (ONNX)
-            - `{models_dir}/chunkers/` - Chunking models (ONNX)
-            - `{models_dir}/rerankers/` - Reranking models (ONNX)
+            - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+            - `{models_dir}/embedders/` - Embedding models
+            - `{models_dir}/rerankers/` - Reranking models
             - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-            - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+            - `{models_dir}/rewriters/` - Seq2Seq rewriter models
 
-            Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+            Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+            (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+            chunker needs no models.
           example: ~/.antfly/inference/models
         ml_dir:
           type: string
@@ -4249,10 +4311,6 @@ components:
           type: boolean
           description: Whether the native CPU backend is built into this runtime
           example: true
-        onnx:
-          type: boolean
-          description: Whether the ONNX Runtime backend is built into this runtime
-          example: false
         metal:
           type: boolean
           description: Whether the Metal backend is built into this runtime

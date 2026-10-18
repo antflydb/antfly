@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Native cursor qualification against the actual standalone query owners."""
 
 import json
@@ -35,7 +48,8 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         "storage": {
             "engine": "local",
             "local": {"base_dir": str(tmp_path / "data")},
-        }
+        },
+        "lake_indexes": {"query_cursors": {"max_native_cuts": 2}},
     }
     if artifact_provider == "gcs":
         env["HN_GCS_BEARER"] = subprocess.run(
@@ -145,7 +159,7 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
             try:
                 call("GET", "/tables")
                 return
-            except (URLError, HTTPError):
+            except (URLError, HTTPError, ConnectionError):
                 time.sleep(0.1)
         pytest.fail("daemon did not start")
 
@@ -218,6 +232,21 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         score_query = dict(query, order_by=[{"field": "_score", "desc": True}])
         score_first = response(score_query)
         assert score_first["hits"]["hits"][0]["_source"]["amount"] == 1
+        # Fresh searches exceed the local generation cache limit. Original
+        # cursors must retain their exact durable cut through eviction/restart.
+        for _ in range(6):
+            fresh_cut = response(query)
+            assert fresh_cut["hits"]["hits"][0]["_source"]["amount"] == 1
+            assert fresh_cut["remote_snapshot"].startswith("native2:")
+        for predicate in (
+            {"term": {"path": "/amount", "value": 1}},
+            {"range": {"path": "/amount", "gte": 1, "lte": 1}},
+        ):
+            filtered = response(dict(score_query, limit=10, filter_query=predicate))
+            assert [hit["_source"]["amount"] for hit in filtered["hits"]["hits"]] == [
+                1
+            ], filtered
+            assert filtered["hits"]["total"]["value"] == 1, filtered
         score_page = dict(
             score_query,
             limit=10,
@@ -263,6 +292,19 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         composed_query = dict(
             query, source={"union": [{"table": "history"}, {"table": "current"}]}
         )
+        composed_filtered = call(
+            "POST",
+            "/query",
+            dict(
+                composed_query,
+                order_by=[{"field": "_score", "desc": True}],
+                filter_query={"term": {"path": "/amount", "value": 0}},
+                source_ranking="rrf",
+            ),
+        )["responses"][0]
+        assert [
+            hit["_source"]["amount"] for hit in composed_filtered["hits"]["hits"]
+        ] == [0], composed_filtered
         composed_first = call("POST", "/query", composed_query)["responses"][0]
         assert composed_first["hits"]["hits"][0]["_source"]["amount"] == 0, (
             composed_first
@@ -354,7 +396,19 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         retained_files = list((tmp_path / "data").rglob("query-cut.json"))
         assert retained_files
         for manifest in retained_files:
-            shutil.rmtree(manifest.parent)
+            manifest.unlink(missing_ok=True)
+        partial = response(page)
+        assert [hit["_source"]["amount"] for hit in partial["hits"]["hits"]] == [
+            2,
+            3,
+            4,
+        ], partial
+        assert not list((tmp_path / "data").rglob("query-cut.json"))
+        for manifest in retained_files:
+            try:
+                shutil.rmtree(manifest.parent)
+            except FileNotFoundError:
+                pass
         recovered = response(page)
         assert [hit["_source"]["amount"] for hit in recovered["hits"]["hits"]] == [
             2,

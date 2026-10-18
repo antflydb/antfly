@@ -109,7 +109,29 @@ from .chat_tool_name import ChatToolName
 from .chat_tools_config import ChatToolsConfig
 from .choice_decision_question import ChoiceDecisionQuestion
 from .choice_decision_question_type import ChoiceDecisionQuestionType
+from .chunk_coordinates import ChunkCoordinates
+from .chunk_coordinates_kind import ChunkCoordinatesKind
+from .chunk_coordinates_picture_basis import ChunkCoordinatesPictureBasis
+from .chunk_descriptor import ChunkDescriptor
+from .chunk_embedding_context import ChunkEmbeddingContext
+from .chunk_embedding_error import ChunkEmbeddingError
+from .chunk_embedding_event import ChunkEmbeddingEvent
+from .chunk_embedding_event_object import ChunkEmbeddingEventObject
+from .chunk_embedding_initialization_error_event import ChunkEmbeddingInitializationErrorEvent
+from .chunk_embedding_initialization_error_event_object import ChunkEmbeddingInitializationErrorEventObject
+from .chunk_embedding_object import ChunkEmbeddingObject
+from .chunk_embedding_response import ChunkEmbeddingResponse
+from .chunk_embedding_response_object import ChunkEmbeddingResponseObject
+from .chunk_embedding_response_status import ChunkEmbeddingResponseStatus
+from .chunk_embedding_start_event import ChunkEmbeddingStartEvent
+from .chunk_embedding_start_event_object import ChunkEmbeddingStartEventObject
+from .chunk_embedding_target import ChunkEmbeddingTarget
+from .chunk_embedding_terminal_event import ChunkEmbeddingTerminalEvent
+from .chunk_embedding_terminal_event_object import ChunkEmbeddingTerminalEventObject
 from .chunk_options import ChunkOptions
+from .chunk_source_reference import ChunkSourceReference
+from .chunk_source_reference_type import ChunkSourceReferenceType
+from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
@@ -232,6 +254,9 @@ from .doc_id_query import DocIdQuery
 from .document_artifact_child_range import DocumentArtifactChildRange
 from .document_artifact_manifest import DocumentArtifactManifest
 from .document_artifact_manifest_list import DocumentArtifactManifestList
+from .document_artifact_publication_failed_error import DocumentArtifactPublicationFailedError
+from .document_artifact_publication_failed_error_code import DocumentArtifactPublicationFailedErrorCode
+from .document_artifact_publication_failed_error_error import DocumentArtifactPublicationFailedErrorError
 from .document_artifact_reprocess_failure import DocumentArtifactReprocessFailure
 from .document_artifact_reprocess_job import DocumentArtifactReprocessJob
 from .document_artifact_reprocess_job_phase import DocumentArtifactReprocessJobPhase
@@ -673,6 +698,7 @@ from .graph_relationship_property_predicate import GraphRelationshipPropertyPred
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
 from .graph_resolver_config import GraphResolverConfig
+from .graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
 from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
@@ -774,6 +800,9 @@ from .inference_capacity_error_reason import InferenceCapacityErrorReason
 from .inference_chat_message import InferenceChatMessage
 from .inference_chunk import InferenceChunk
 from .inference_chunk_config import InferenceChunkConfig
+from .inference_chunk_embedding_response import InferenceChunkEmbeddingResponse
+from .inference_chunk_embedding_response_object import InferenceChunkEmbeddingResponseObject
+from .inference_chunk_embedding_response_status import InferenceChunkEmbeddingResponseStatus
 from .inference_chunk_object import InferenceChunkObject
 from .inference_chunk_object_object import InferenceChunkObjectObject
 from .inference_chunk_request import InferenceChunkRequest
@@ -784,6 +813,8 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
+from .inference_decide_long_document import InferenceDecideLongDocument
+from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
 from .inference_decide_response import InferenceDecideResponse
 from .inference_dictate_request import InferenceDictateRequest
@@ -854,9 +885,12 @@ from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
+from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
+from .inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
@@ -1015,6 +1049,7 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
+from .media_chunk_policy import MediaChunkPolicy
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -1147,6 +1182,9 @@ from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
 from .rate_limit_config import RateLimitConfig
+from .read_receipt import ReadReceipt
+from .read_requirements import ReadRequirements
+from .read_requirements_visibility import ReadRequirementsVisibility
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
@@ -1190,6 +1228,7 @@ from .relational_row_query_request import RelationalRowQueryRequest
 from .relational_row_row import RelationalRowRow
 from .relational_scalar_expression import RelationalScalarExpression
 from .relational_unique_constraint import RelationalUniqueConstraint
+from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1291,12 +1330,20 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_array_column_schema import SQLArrayColumnSchema
+from .sql_array_column_schema_type import SQLArrayColumnSchemaType
+from .sql_array_dimension import SQLArrayDimension
+from .sql_array_element_type import SQLArrayElementType
+from .sql_array_value import SQLArrayValue
+from .sql_builtin_type import SQLBuiltinType
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_numeric_modifier import SQLNumericModifier
+from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
@@ -1485,6 +1532,9 @@ from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
 from .vertex_search_config_provider import VertexSearchConfigProvider
 from .vertex_search_config_service import VertexSearchConfigService
+from .video_sampling_policy import VideoSamplingPolicy
+from .video_sampling_policy_overflow import VideoSamplingPolicyOverflow
+from .video_sampling_policy_policy import VideoSamplingPolicyPolicy
 from .web_search_config import WebSearchConfig
 from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
@@ -1602,10 +1652,32 @@ __all__ = (
     "ChatToolsConfig",
     "ChoiceDecisionQuestion",
     "ChoiceDecisionQuestionType",
+    "ChunkCoordinates",
+    "ChunkCoordinatesKind",
+    "ChunkCoordinatesPictureBasis",
+    "ChunkDescriptor",
+    "ChunkEmbeddingContext",
+    "ChunkEmbeddingError",
+    "ChunkEmbeddingEvent",
+    "ChunkEmbeddingEventObject",
+    "ChunkEmbeddingInitializationErrorEvent",
+    "ChunkEmbeddingInitializationErrorEventObject",
+    "ChunkEmbeddingObject",
+    "ChunkEmbeddingResponse",
+    "ChunkEmbeddingResponseObject",
+    "ChunkEmbeddingResponseStatus",
+    "ChunkEmbeddingStartEvent",
+    "ChunkEmbeddingStartEventObject",
+    "ChunkEmbeddingTarget",
+    "ChunkEmbeddingTerminalEvent",
+    "ChunkEmbeddingTerminalEventObject",
     "ChunkerConfig",
     "ChunkerConfigFullTextIndex",
     "ChunkerProvider",
     "ChunkOptions",
+    "ChunkSourceReference",
+    "ChunkSourceReferenceType",
+    "ChunkSourceReferenceVersionKind",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
@@ -1725,6 +1797,9 @@ __all__ = (
     "DocumentArtifactChildRange",
     "DocumentArtifactManifest",
     "DocumentArtifactManifestList",
+    "DocumentArtifactPublicationFailedError",
+    "DocumentArtifactPublicationFailedErrorCode",
+    "DocumentArtifactPublicationFailedErrorError",
     "DocumentArtifactReprocessFailure",
     "DocumentArtifactReprocessJob",
     "DocumentArtifactReprocessJobPhase",
@@ -2158,6 +2233,7 @@ __all__ = (
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
     "GraphResolverConfig",
+    "GraphResolverConfigAliasesItem",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
     "GraphResolverConfigSourceArtifactKind",
@@ -2259,6 +2335,9 @@ __all__ = (
     "InferenceChatMessage",
     "InferenceChunk",
     "InferenceChunkConfig",
+    "InferenceChunkEmbeddingResponse",
+    "InferenceChunkEmbeddingResponseObject",
+    "InferenceChunkEmbeddingResponseStatus",
     "InferenceChunkObject",
     "InferenceChunkObjectObject",
     "InferenceChunkRequest",
@@ -2269,6 +2348,8 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceDecideLongDocument",
+    "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
     "InferenceDecideResponse",
     "InferenceDictateRequest",
@@ -2339,9 +2420,12 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelFormat",
     "InferenceModelInfo",
+    "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoQualifiedLimits",
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
+    "InferenceModelRefCudaPrecision",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",
@@ -2498,6 +2582,7 @@ __all__ = (
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
+    "MediaChunkPolicy",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
@@ -2626,6 +2711,9 @@ __all__ = (
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
     "RateLimitConfig",
+    "ReadReceipt",
+    "ReadRequirements",
+    "ReadRequirementsVisibility",
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
@@ -2669,6 +2757,7 @@ __all__ = (
     "RelationalRowRow",
     "RelationalScalarExpression",
     "RelationalUniqueConstraint",
+    "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",
@@ -2770,6 +2859,12 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLArrayColumnSchema",
+    "SQLArrayColumnSchemaType",
+    "SQLArrayDimension",
+    "SQLArrayElementType",
+    "SQLArrayValue",
+    "SQLBuiltinType",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -2778,6 +2873,8 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLNumericModifier",
+    "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",
@@ -2964,6 +3061,9 @@ __all__ = (
     "VertexSearchConfig",
     "VertexSearchConfigProvider",
     "VertexSearchConfigService",
+    "VideoSamplingPolicy",
+    "VideoSamplingPolicyOverflow",
+    "VideoSamplingPolicyPolicy",
     "WebSearchConfig",
     "WebSearchConnection",
     "WebSearchProvider",

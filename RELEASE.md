@@ -46,6 +46,13 @@ requires every declared runtime archive for each supported platform.
 from the embedded archives, bundling only the native library. Prebuilt language
 packages cover Linux x86-64/ARM64 (glibc 2.28+) and macOS ARM64; the native
 archive matrix is separate. Go/Rust/C use `lib/pkgconfig/libantfly.pc`.
+Embedded package assembly runs the source commit's packaging script in a detached
+worktree at `dist/embedded-package-source`, preserving the active workspace's
+manifests and frozen pnpm lockfile. This also preserves older source commits'
+packaging-script contract. Binding checks use the staged native library and the
+workflow copies their TypeScript build into the staged wrapper before packing.
+The Homebrew C smoke test checks the installed library against
+`ANTFLY_ABI_VERSION` and the open-options layout in its installed header.
 Dispatch `.github/workflows/embedded-release-publish.yml` with the immutable tag
 and successful build run to verify and publish that snapshot. Go and Rust link
 `libantfly` from an embedded archive or local build. See
@@ -75,7 +82,7 @@ development packages made with `--working-tree` cannot be promoted. The source
 archive is included in the checksum ledger and runtime publication scope.
 Schema 4 retains the native pkg-config shape without this source artifact.
 
-All release targets use `ReleaseFast`. Linux amd64 and GNU arm64 build on their
+All release targets use `fast` optimization. Linux amd64 and GNU arm64 build on their
 native Linux architectures; portable musl arm64 and macOS arm64 cross-compile
 from the amd64 Linux runner. The macOS build uses the pinned cross-compilation
 SDK and enables Metal and Accelerate.
@@ -274,7 +281,14 @@ The canonical ABI, archive, package, wheel, backend, and consumer matrix lives
 in `scripts/release/platforms.json`; channel behavior lives in
 `scripts/release/channels.json`. Release jobs, CLI packaging, Homebrew, and
 promotion and retention read those policies instead of maintaining independent
-conditionals or platform tables. Python
+conditionals or platform tables. PyPI publication of the native CLI installer
+is temporarily paused: `publish_pypi` is false for stable and next. The separate
+`embedded-release-publish.yml` workflow publishes `antfly-embedded` independently,
+after its registry setup is complete. CLI wheels are still built and verified as
+release artifacts. Restore those policy flags to resume CLI PyPI publication.
+To finish a partially published CLI release under
+the updated policy, use the exact-ledger recovery dispatch from `main`; rerunning
+an old workflow retains its original policy. Python
 dependencies used by the release control plane are exact and hash-locked in
 `scripts/release/requirements.lock`; Node and npm versions are exact as well.
 Every workflow declares an explicit `GITHUB_TOKEN` permission baseline, and all
@@ -349,6 +363,35 @@ a local convenience.
   GHCR.
   Only after registry cleanup succeeds does the workflow remove the R2
   container-identity record and release objects.
+
+## Release qualification before tagging
+
+Select `ci:linux-release` and/or `ci:darwin-release` on a PR, then use the
+normal `/ci run <sha>` approval. The trusted controller and suite wiring must
+exist on `main` before a newly introduced label can be used. The suites share
+`qualify-release-archives.yml`, select targets from `platforms.json`, and build
+every product declared by `build-contract.json` through the production archive
+script with the pinned Nix Zig. Linux includes x86-64 and ARM64, GNU and musl;
+Darwin cross-compiles on the Linux x86-64 release runner with the pinned SDK.
+Both entry workflows can also be dispatched on `main` without publishing.
+Embedded package snapshots record their source policy's wheel platform tags;
+verification preserves historical schema-1 snapshots and does not reinterpret
+new snapshots through a later controller's platform policy.
+
+Archive checks verify product contents and native target identities. Compiler
+logs, memory summaries, and linker maps are uploaded on failure as separate
+diagnostic artifacts, without compiler caches. macOS cross builds resolve the
+versioned LLVM linker directory and check linker/nm availability before compiling.
+
+All archive targets use the bounded runner's detected memory budget (80% of the
+container limit by default), including Linux on the larger release builders.
+Project objects share the checkout's `.zig-cache/release` across server, embedded,
+and standalone inference builds. Product install/staging directories are still
+reset before assembly; the shared cache is retained and Zig invalidates entries
+when source, compiler, target, or compile options change. This enables reuse
+within a checkout, including local rebuilds, without sharing writable project
+objects between independent CI jobs. `make gc` cleans this cache with the rest
+of the checkout's Zig caches.
 
 ## Version Behavior
 

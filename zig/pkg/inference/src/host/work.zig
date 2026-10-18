@@ -888,6 +888,8 @@ pub fn decodeInlineDataUriAlloc(
 }
 
 pub const InferenceCapabilities = struct {
+    /// Stable model/tokenizer identity, available before loading weights.
+    model_revision: ?[32]u8 = null,
     task: Task,
     input_modalities: Modalities,
     accepted_mime_types: MimeTypes = .{},
@@ -908,6 +910,7 @@ pub const InferenceCapabilities = struct {
     /// envelope. Unlike borrowed_attachments, this is a wire capability and
     /// is therefore safe to advertise across process boundaries.
     framed_attachments: bool = false,
+    model_aware_chunking_v1: bool = false,
     /// The HTTP route guarantees AFN1 dense/score responses when requested
     /// exclusively. Version 1 has a fixed 4-MiB frame ceiling.
     numeric_responses_v1: bool = false,

@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-iceberg = ["pyiceberg[sql-sqlite]>=0.12,<0.13", "fastavro>=1.12,<2"]
+iceberg = ["pyiceberg[sql-sqlite]>=0.12,<0.13", "fastavro>=1.12,<2", "antfly-embedded"]
 lake = ["pyarrow>=18", "psycopg[binary]>=3.2"]
 
 [tool.pytest.ini_options]
@@ -30,3 +30,6 @@ markers = [
     "slow: marks tests that are too long-running for required E2E base CI",
     "scale: marks corpus-scale correctness gates run by dedicated scale CI",
 ]
+
+[tool.uv.sources]
+antfly-embedded = { path = "../../../py/packages/embedded", editable = true }

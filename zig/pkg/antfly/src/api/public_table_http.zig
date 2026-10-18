@@ -123,6 +123,7 @@ pub const TableApi = struct {
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
+        WritePrecommitReadUnavailable,
         ConstraintActivationUnavailable,
         WriteDefinitelyAbortedUnavailable,
         HAWriteDurabilityPending,
@@ -183,6 +184,7 @@ pub const TableApi = struct {
         GraphExternalAliasSourceUnsupported,
         GraphReverseVariablePathUnsupported,
         HierarchyCursorStale,
+        DocumentArtifactPublicationFailed,
         TopologyChanged,
         QueryEmbeddingInputTooLarge,
         EmbeddingIndexNotFound,
@@ -1752,6 +1754,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
+        error.WritePrecommitReadUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"code\":\"transaction_precommit_read_unavailable\",\"message\":\"a required integrity read is unavailable; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.ConstraintActivationUnavailable => return .{
             .status = 503,
             .body = try alloc.dupe(u8, "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -1860,6 +1868,7 @@ pub fn handleTableQueryRequest(
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
             return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
         },
+        error.OutOfMemory => return error.OutOfMemory,
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
@@ -2005,6 +2014,9 @@ pub fn handleTableQueryRequest(
             },
             error.QueryEmbeddingInputTooLarge => {
                 return try queryDependencyErrorOwnedResponse(alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false);
+            },
+            error.DocumentArtifactPublicationFailed => {
+                return try queryDependencyErrorOwnedResponse(alloc, 409, "document_artifact_publication_failed", "document extraction failed; inspect the artifact manifest and reprocess after correcting the failure", false);
             },
             error.EmbeddingIndexNotFound => {
                 return try queryDependencyErrorOwnedResponse(alloc, 422, "embedding_index_not_found", "embedding index not found", false);
@@ -3765,6 +3777,7 @@ test "public table batch handler maps write unavailable errors" {
         retry_after_seconds: ?u32 = null,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{ .err = error.WritePrecommitReadUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_read_unavailable\",\"message\":\"a required integrity read is unavailable; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.ConstraintActivationUnavailable, .status = 503, .body = "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
@@ -4272,6 +4285,19 @@ test "public table query handler preserves structured filter and hierarchy diagn
     try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", hierarchy_error.value.action);
     try std.testing.expect(std.mem.indexOf(u8, hierarchy_error.value.message, "return_mode") == null);
     try std.testing.expect(!hierarchy_error.value.retryable);
+
+    var failed_backend = Backend{ .err = error.DocumentArtifactPublicationFailed };
+    var failed_response = try handleTableQueryRequest(std.testing.allocator, "docs", "{}", null, failed_backend.iface());
+    defer failed_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), failed_response.status);
+    try std.testing.expect(failed_response.json);
+    try std.testing.expect(failed_response.retry_after_seconds == null);
+    const PublicationFailure = struct { code: []const u8, @"error": []const u8, message: []const u8, retryable: bool };
+    var failure = try std.json.parseFromSlice(PublicationFailure, std.testing.allocator, failed_response.body, .{});
+    defer failure.deinit();
+    try std.testing.expectEqualStrings("document_artifact_publication_failed", failure.value.code);
+    try std.testing.expectEqualStrings(failure.value.code, failure.value.@"error");
+    try std.testing.expect(!failure.value.retryable);
 
     var unsupported_backend = Backend{ .err = error.UnsupportedQueryRequest };
     var unsupported_resp = try handleTableQueryRequest(

@@ -1069,6 +1069,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         upper_bound: ?[]const u8 = null,
         backend_locked: bool = false,
         record_scan_value_stats: bool = true,
+        keys_only: bool = false,
         bounded_run_block_residency: bool = false,
         resident_run_source: ?usize = null,
 
@@ -1256,6 +1257,12 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             };
         }
 
+        pub fn setKeysOnly(self: *@This()) void {
+            self.keys_only = true;
+            self.record_scan_value_stats = false;
+            self.boundPersistedRunBlockResidency();
+        }
+
         pub fn close(self: *@This()) void {
             defer if (self.cursor_reservation) |*lease| lease.release();
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
@@ -1410,7 +1417,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (!entry.tombstone) {
                     self.current_visible_source = winner_source;
                     self.recordVisibleValueStat(winner_source);
-                    return .{ .key = entry.key, .value = entry.value };
+                    return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
                 }
                 self.current_visible_source = null;
                 try self.advanceForwardSourcesAtKey(entry.key);
@@ -2021,13 +2028,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             } else if (self.mutable.findIndex(self.namespace, key)) |idx| {
                 const entry = self.mutable.entryAt(idx);
                 if (entry.tombstone) return null;
-                return entry.entry();
+                return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             for (self.immutable_memtables) |state| {
                 if (state.findIndex(self.namespace, key)) |idx| {
                     const entry = state.entryAt(idx);
                     if (entry.tombstone) return null;
-                    return entry.entry();
+                    return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
                 }
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
@@ -2035,7 +2042,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const entry = self.source_entries[source_index] orelse continue;
                 if (!std.mem.eql(u8, entry.key, key)) continue;
                 if (entry.tombstone) return null;
-                return .{ .key = entry.key, .value = entry.value };
+                return .{ .key = entry.key, .value = if (self.keys_only) "" else entry.value };
             }
             return null;
         }
@@ -2103,7 +2110,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const entry = self.mutable.entryAt(idx);
             const namespace_name = namespaceOf(entry).name;
             const namespace_len = if (namespace_name) |name| name.len else 0;
-            const bytes = try self.mutableSourceEntryScratch(namespace_len + entry.key.len + entry.value.len);
+            const bytes = try self.mutableSourceEntryScratch(namespace_len + entry.key.len + (if (self.keys_only) @as(usize, 0) else entry.value.len));
             var offset: usize = 0;
             const copied_namespace = if (namespace_name) |name| blk: {
                 @memcpy(bytes[offset..][0..name.len], name);
@@ -2114,8 +2121,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memcpy(bytes[offset..][0..entry.key.len], entry.key);
             const copied_key = bytes[offset..][0..entry.key.len];
             offset += entry.key.len;
-            @memcpy(bytes[offset..][0..entry.value.len], entry.value);
-            const copied_value = bytes[offset..][0..entry.value.len];
+            const value_len = if (self.keys_only) @as(usize, 0) else entry.value.len;
+            @memcpy(bytes[offset..][0..value_len], entry.value[0..value_len]);
+            const copied_value = bytes[offset..][0..value_len];
 
             return .{
                 .namespace_name = copied_namespace,
@@ -2185,14 +2193,15 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const idx = self.mutable.findIndex(self.namespace, key) orelse return .absent;
             const entry = self.mutable.entryAt(idx);
             if (entry.tombstone) return .tombstone;
-            const bytes = try self.backend.allocator.alloc(u8, entry.key.len + entry.value.len);
+            const value_len = if (self.keys_only) @as(usize, 0) else entry.value.len;
+            const bytes = try self.backend.allocator.alloc(u8, entry.key.len + value_len);
             errdefer self.backend.allocator.free(bytes);
             @memcpy(bytes[0..entry.key.len], entry.key);
-            @memcpy(bytes[entry.key.len..][0..entry.value.len], entry.value);
+            @memcpy(bytes[entry.key.len..][0..value_len], entry.value[0..value_len]);
             self.visible_entry_bytes.setOwned(self.backend.allocator, bytes);
             return .{ .value = .{
                 .key = bytes[0..entry.key.len],
-                .value = bytes[entry.key.len..][0..entry.value.len],
+                .value = bytes[entry.key.len..][0..value_len],
             } };
         }
 
@@ -3984,6 +3993,27 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             return self.getWithLease(key, false);
         }
 
+        /// Presence owns no value bytes. Mutable decisions happen under the
+        /// writer lock; immutable and SST decisions use a pinned read layout.
+        pub fn contains(self: *@This(), key: []const u8) !bool {
+            self.backend.recordPointGet();
+            if (self.stable_point_view) {
+                if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded();
+                return try containsFromReadView(self.backend, &.{}, self.read_view.?, self.namespace, key);
+            }
+            var layout = blk: {
+                const locked = lockBackend(BackendType, self.backend);
+                defer unlockBackend(BackendType, self.backend, locked);
+                if (self.backend.mutable.findIndex(self.namespace, key)) |idx| {
+                    self.backend.recordMutableHit();
+                    return !self.backend.mutable.entryAt(idx).tombstone;
+                }
+                break :blk try CurrentReadLayout(BackendType).capturePoint(self.backend, self.allocator);
+            };
+            defer layout.deinitAfterUnlockedRead();
+            return try containsFromReadView(self.backend, layout.immutable_memtables, layout.read_view, self.namespace, key);
+        }
+
         /// Opt-in for short projection scopes. Ordinary probes deliberately
         /// copy values so long-lived maintenance probes do not pin generations.
         pub fn getLeased(self: *@This(), key: []const u8) ![]const u8 {
@@ -5011,6 +5041,26 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
         }
 
+        pub fn contains(self: *@This(), key: []const u8) !bool {
+            if (self.closed) return error.TransactionClosed;
+            self.backend.recordPointGet();
+            var bulk = self.bulk_appends.entries.items.len;
+            while (bulk != 0) {
+                bulk -= 1;
+                const entry = self.bulk_appends.entries.items[bulk];
+                if (compareEntryTo(entry, self.namespace, key) == .eq) return !entry.tombstone;
+            }
+            if (self.mutable.findIndex(self.namespace, key)) |i| return !self.mutable.entryAt(i).tombstone;
+            var layout = blk: {
+                const locked = lockBackend(BackendType, self.backend);
+                defer unlockBackend(BackendType, self.backend, locked);
+                if (self.backend.mutable.findIndex(self.namespace, key)) |i| return !self.backend.mutable.entryAt(i).tombstone;
+                break :blk try CurrentReadLayout(BackendType).capturePoint(self.backend, self.allocator);
+            };
+            defer layout.deinitAfterUnlockedRead();
+            return containsFromReadView(self.backend, layout.immutable_memtables, layout.read_view, self.namespace, key);
+        }
+
         pub fn containsManySorted(self: *@This(), keys: []const []const u8, present: []bool) !void {
             if (self.closed) return error.TransactionClosed;
             if (keys.len != present.len or !keysAreSorted(keys)) return error.InvalidBatch;
@@ -5029,15 +5079,6 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     break :blk try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
                 };
                 defer layout.deinitAfterUnlockedRead();
-                var blocks = std.ArrayListUnmanaged(BlockPin).empty;
-                defer releaseHeldBlocks(&blocks, self.backend.allocator);
-                var values = PointResultValues.empty;
-                defer {
-                    for (values.items) |value| self.allocator.free(value);
-                    values.deinit(self.allocator);
-                }
-                var group: ?usize = null;
-                var hint: ?BorrowedReadHint = null;
                 for (keys[offset..end], present[offset..end]) |key, *exists| {
                     var bulk = self.bulk_appends.entries.items.len;
                     while (bulk != 0) {
@@ -5052,10 +5093,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                             exists.* = !self.mutable.entryAt(i).tombstone;
                             continue;
                         }
-                        exists.* = if (getFromReadView(self.backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, layout.read_view, &group, &hint, &blocks, &values, self.allocator, self.namespace, key)) |_| true else |err| switch (err) {
-                            error.NotFound => false,
-                            else => return err,
-                        };
+                        exists.* = if (layout.mutable_snapshot.?.state.findIndex(self.namespace, key)) |i|
+                            !layout.mutable_snapshot.?.state.entryAt(i).tombstone
+                        else
+                            try containsFromReadView(self.backend, layout.immutable_memtables, layout.read_view, self.namespace, key);
                     }
                 }
                 offset = end;
@@ -5613,6 +5654,107 @@ fn getFromDirectoryPointCandidatesPlanned(
         start = end;
     }
     return error.NotFound;
+}
+
+/// A nullable decision distinguishes an absent key from a visible tombstone.
+/// Never copy a selected row: callers need only its tombstone bit.
+fn presenceInRun(backend: anytype, run: *Run, namespace: backend_types.Namespace, key: []const u8) !?bool {
+    if (!runMayContain(run.*, namespace, key)) return null;
+    backend.recordRunProbe();
+    if (run.state) |*state| {
+        const idx = state.findIndex(namespace, key) orelse return null;
+        return !state.entryAt(idx).tombstone;
+    }
+    if (!try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, false)) return null;
+    if (run.path == null) {
+        const table = try tableForRunMaybeLocked(backend, run, false);
+        const idx = try table.findIndex(namespace.name, key) orelse return null;
+        return !(try table.entryAt(idx)).tombstone;
+    }
+    var index_handle: ?cache_mod.Handle = if (backend.options.cache != null) try loadRunTableIndexHandle(backend, run) else null;
+    defer if (index_handle) |*handle| handle.release();
+    const index = if (index_handle) |handle| handle.runTableIndex() else try indexForRunNoCache(backend, run);
+    try requireTableBlocks(index);
+    const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
+    const block = index.blocks[block_index];
+    if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
+    if (!block.maybeContains(namespace.name, key)) {
+        backend.recordBloomNegative();
+        return null;
+    }
+    const window = index.blockWindow(block_index);
+    if (backend.options.cache) |cache| {
+        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+        if (cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, window.physicalLen())) |retained| {
+            var handle = retained;
+            defer handle.release();
+            backend.recordSharedBlockCacheHit();
+            const found = try lsm_table_file.findExactEntryInBlock(index, handle.runTableBlock(), block_index, namespace.name, key) orelse return null;
+            return !found.entry.tombstone;
+        }
+    }
+    if (localBlockCacheEnabled(backend)) {
+        if (retainLocalCachedBlock(backend, run, index, window, false)) |lease| {
+            defer lease.release();
+            const found = try lsm_table_file.findExactEntryInBlock(index, lease.bytes, block_index, namespace.name, key) orelse return null;
+            return !found.entry.tombstone;
+        }
+    }
+    if (window.compression == .prefix or window.compression == .prefix_snappy) {
+        var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspace(backend, window, true) else null;
+        defer if (workspace) |*work| work.release();
+        const scratch = if (workspace) |*work| work.allocator() else backend.allocator;
+        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+        const payload = try loadRunTableBlockWithStats(backend, scratch, run.path.?, offset, window.physicalLen());
+        defer scratch.free(payload);
+        try lsm_table_file.validateBlockPayload(payload, window.checksum);
+        const decoded = if (window.compression == .prefix_snappy) blk: {
+            try lsm_table_file.validatePrefixDecodedSize(payload, window.len);
+            break :blk try @import("../../encoding/snappy.zig").decode(scratch, payload);
+        } else payload;
+        defer if (window.compression == .prefix_snappy) scratch.free(decoded);
+        var reader = try lsm_table_file.PrefixPointReader.init(decoded, block.first_entry_index, window.len);
+        defer reader.deinit(scratch);
+        if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
+        const found = try reader.find(scratch, namespace.name, key) orelse return null;
+        return !found.entry.tombstone;
+    }
+    if (backend.options.cache != null) {
+        var handle = try loadRunTableBlockHandle(backend, run, index, window, namespace.retainDataBlocks());
+        defer handle.release();
+        const found = try lsm_table_file.findExactEntryInBlock(index, handle.runTableBlock(), block_index, namespace.name, key) orelse return null;
+        return !found.entry.tombstone;
+    }
+    const bytes = try loadOwnedBlockForWindow(backend, run, index, window);
+    defer backend.allocator.free(bytes);
+    const found = try lsm_table_file.findExactEntryInBlock(index, bytes, block_index, namespace.name, key) orelse return null;
+    return !found.entry.tombstone;
+}
+
+fn containsFromReadView(backend: anytype, immutable_memtables: []const *const State, view: RunReadView, namespace: backend_types.Namespace, key: []const u8) !bool {
+    for (immutable_memtables) |state| if (state.findIndex(namespace, key)) |idx| {
+        backend.recordMutableHit();
+        return !state.entryAt(idx).tombstone;
+    };
+    if (view.directory()) |directory| {
+        var cursor = directory.readPoint(namespace.name, key);
+        while (cursor.next()) |handle| {
+            var run = handle.run.*;
+            run.shared_read_version = true;
+            if (try presenceInRun(backend, &run, namespace, key)) |present| return present;
+        }
+        return false;
+    }
+    if (findRunGroupIndex(view.l0_groups, namespace, key)) |group| {
+        for (view.l0_groups[group].run_indices) |idx| {
+            if (try presenceInRun(backend, &view.runs[idx], namespace, key)) |present| return present;
+        }
+    }
+    for (view.levels) |level| {
+        const idx = findRunIndexInLevel(view.runs, level, namespace, key) orelse continue;
+        if (try presenceInRun(backend, &view.runs[idx], namespace, key)) |present| return present;
+    }
+    return false;
 }
 
 fn getFromReadView(
@@ -12916,4 +13058,155 @@ test "lsm point followup mandatory reclamation preserves active decoded owners" 
     defer mandatory.allocator().free(decoded);
     try std.testing.expectEqualSlices(u8, &large, decoded);
     std.debug.print("INACTIVE_SCRATCH_ADMISSION idle_owner_users=0 retained_charge={d} mandatory_bytes=98304 mandatory=success inactive_owner_preserved=true\n", .{charged});
+}
+
+test "lsm presence probes avoid value copies across source tiers (#1095)" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    for ([_]lsm_table_file.CompressionPolicy{ .none, .snappy_adaptive }) |compression| {
+        for ([_]bool{ false, true }) |with_cache| {
+            var storage = storage_io.MemoryStorage.init(a);
+            defer storage.deinit();
+            var cache = cache_mod.Cache.init(a, 16 * 1024 * 1024);
+            defer cache.deinit();
+            var backend = try Backend.open(a, "/presence-probe", .{
+                .storage = storage.storage(),
+                .cache = if (with_cache) &cache else null,
+                .flush_threshold = 8 * 1024 * 1024,
+                .compact_threshold_runs = 100,
+                .l0_overlap_compact_threshold_runs = 100,
+                .table_block_compression = compression,
+            });
+            defer backend.close();
+            var store = try backend.runtimeStore(a, .{ .name = "docs" });
+            defer store.deinit();
+            const large = try a.alloc(u8, 1024 * 1024);
+            defer a.free(large);
+            @memset(large, 'v');
+            {
+                var write = try store.beginWrite();
+                errdefer write.abort();
+                try write.put("large", large);
+                try write.put("small", "value");
+                try write.put("empty", "");
+                // Shared long keys force the prefix reader, while the wide
+                // standalone row exercises raw/Snappy blocks.
+                for (0..64) |i| {
+                    var key_buf: [128]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&key_buf, "tenant:shared-prefix-for-presence-metadata-only-read:document:{d:0>3}", .{i});
+                    try write.put(key, "value");
+                }
+                try write.commit();
+            }
+            for (0..3) |tier| {
+                if (tier == 1) {
+                    backend.options.flush_threshold = 1;
+                    var write = try store.beginWrite();
+                    errdefer write.abort();
+                    try write.put("trigger", "freeze");
+                    try write.commit();
+                } else if (tier == 2) {
+                    while (try backend.runMaintenanceStep()) {}
+                    try std.testing.expect(run_store.count(&backend) != 0);
+                }
+                const before = backend.snapshotReadStats().point_value_copies;
+                var probe = try store.beginProbe();
+                defer probe.abort();
+                for (0..2) |pass| {
+                    if (tier == 2 and pass == 1 and with_cache) {
+                        // Warm decoded blocks exercise the borrowed-cache
+                        // path as well as the first cold compressed lookup.
+                        for (0..run_store.count(&backend)) |i| {
+                            var run = run_store.at(&backend, i).*;
+                            var index_handle = try loadRunTableIndexHandle(&backend, &run);
+                            defer index_handle.release();
+                            const index = index_handle.runTableIndex();
+                            for (0..index.blocks.len) |block_index| {
+                                var block_handle = try loadRunTableBlockHandle(&backend, &run, index, index.blockWindow(block_index), true);
+                                block_handle.release();
+                            }
+                        }
+                    }
+                    try std.testing.expect(try probe.contains("large"));
+                    try std.testing.expect(try probe.contains("small"));
+                    try std.testing.expect(try probe.contains("empty"));
+                    try std.testing.expect(try probe.contains("tenant:shared-prefix-for-presence-metadata-only-read:document:017"));
+                    try std.testing.expect(!try probe.contains("larg"));
+                    try std.testing.expect(!try probe.contains("missing"));
+                }
+                try std.testing.expectEqual(before, backend.snapshotReadStats().point_value_copies);
+            }
+            // A newer tombstone decides presence even when an older SST has
+            // the value, and a later resurrection must reverse that decision.
+            for ([_]bool{ false, true }) |resurrect| {
+                {
+                    var write = try store.beginWrite();
+                    errdefer write.abort();
+                    if (resurrect) try write.put("large", large) else try write.delete("large");
+                    try write.commit();
+                }
+                for (0..2) |phase| {
+                    if (phase == 1) while (try backend.runMaintenanceStep()) {};
+                    const before = backend.snapshotReadStats().point_value_copies;
+                    var probe = try store.beginProbe();
+                    defer probe.abort();
+                    try std.testing.expectEqual(resurrect, try probe.contains("large"));
+                    try std.testing.expectEqual(before, backend.snapshotReadStats().point_value_copies);
+                }
+            }
+        }
+    }
+}
+
+test "public graph metric borrowed wire LSM write presence and key cursor preserve snapshots" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try Backend.open(a, "/authority-presence", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{});
+    defer store.deinit();
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("a", "old");
+        try write.put("c", "old-c");
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    var pinned = try store.beginRead();
+    defer pinned.abort();
+    {
+        var write = try store.beginWrite();
+        defer write.abort();
+        try std.testing.expect(try write.contains("a"));
+        try std.testing.expect(!try write.contains("b"));
+        try write.delete("a");
+        try std.testing.expect(!try write.contains("a"));
+        try write.put("b", "pending");
+        try std.testing.expect(try write.contains("b"));
+    }
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("a", "new");
+        try write.put("b", "new-b");
+        try write.commit();
+    }
+    var cursor = try pinned.openCursor();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    const Check = struct {
+        fn entry(actual: ?backend_adapter.Entry, key: []const u8) !void {
+            try std.testing.expectEqualStrings(key, actual.?.key);
+            try std.testing.expectEqual(@as(usize, 0), actual.?.value.len);
+        }
+    };
+    try Check.entry(try cursor.first(), "a");
+    try Check.entry(try cursor.next(), "c");
+    try Check.entry(try cursor.last(), "c");
+    try Check.entry(try cursor.prev(), "a");
+    try Check.entry(try cursor.seekAtOrBefore("b"), "a");
+    try std.testing.expectEqualStrings("old", try pinned.get("a"));
 }

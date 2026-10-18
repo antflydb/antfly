@@ -51,7 +51,7 @@ pub const Cursor = struct {
         pruned: bool = false,
         chunk: external.ColumnChunk,
         offset: u64,
-        decoded: ?parquet.OwnedBatch = null,
+        decoded: ?parquet.OwnedColumns = null,
         cached: ?@import("lake_decoded_cache.zig").Lease = null,
         dictionary: ?page.Dictionary = null,
         dictionary_lease: ?@import("lake_decoded_cache.zig").Lease = null,
@@ -221,7 +221,7 @@ pub const Cursor = struct {
                     var admission = self.limits;
                     admission.max_rows = @max(admission.max_rows, parsed.header.value_count);
                     admission.max_struct_allocation_bytes /= share;
-                    _ = try parquet.admitMaterialization(parsed.header.value_count, 1, admission);
+                    _ = try parquet.admitColumnMaterialization(parsed.header.value_count, 1, admission);
                     column.cached = lease;
                     column.offset += len;
                     column.count = parsed.header.value_count;
@@ -297,7 +297,7 @@ pub const Cursor = struct {
                     fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                         const value: *@This() = @ptrCast(@alignCast(raw));
                         const cursor = value.cursor;
-                        const decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
+                        const decoded = try parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
                         item.payload = .{ .columns = decoded.columns };
                         if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
                     }
@@ -308,7 +308,7 @@ pub const Cursor = struct {
                 // Cursor-owned dictionaries outlive every uncached page. Only
                 // cache publication needs an independently retained dependency.
                 limits.borrow_dictionary = true;
-                column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+                column.decoded = try parquet.buildSupportedColumnsAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
             }
             column.count = count;
             column.consumed = @intCast(self.position - column.first);
@@ -359,7 +359,7 @@ pub const Cursor = struct {
     }
     /// Inspect the next headers while this page is being consumed, then warm
     /// the exact versioned ranges used by advance. Parallelism is bounded by
-    /// the shared reader's four workers and 32 MiB lookahead quota.
+    /// the shared reader's eight jobs and 32 MiB lookahead quota.
     fn prefetchPages(self: *Cursor) !void {
         const reader = self.shared_reader orelse return;
         if (reader.context.io == null or self.position == self.group.row_count) return;
@@ -379,14 +379,12 @@ pub const Cursor = struct {
             if (self.filter != null and !column.required) continue;
             if (count == reads.len) break;
             if (column.consumed != column.count) continue;
-            const parsed = try self.header(column);
-            const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
             const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
-            if (len > end - column.offset or len > self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len)) return error.ParquetPageTooLarge;
-            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk };
+            if (column.offset >= end) continue;
+            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = @min(end - column.offset, 512) }, .purpose = .parquet_column_chunk };
+            try reader.prefetchPage(reads[count], end, self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len));
             count += 1;
         }
-        if (count != 0) try reader.prefetch(reads[0..count]);
     }
     const DecodeStats = struct { pages: usize, dictionaries: usize };
     const DecodeAllocator = @import("../../sql/parallel_scheduler.zig").LockedAllocator;

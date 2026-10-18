@@ -18715,10 +18715,6 @@ pub const HBCIndex = struct {
         return if (self.resource_manager) |manager| manager.dense_centered_routing else false;
     }
 
-    pub fn nativeSubgroupRoutingEnabled(self: *const HBCIndex) bool {
-        return if (self.resource_manager) |manager| manager.dense_subgroup_routing and !manager.dense_global_subgroup_routing else false;
-    }
-
     pub fn nativeGlobalSubgroupRoutingEnabled(self: *const HBCIndex) bool {
         if (self.nativeCertifiedSubgroupsEnabled()) return true;
         return if (self.resource_manager) |manager| manager.dense_global_subgroup_routing else false;
@@ -25605,19 +25601,19 @@ test "compact subgroup concurrent staging preserves resource accounting" {
     try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
 }
 
-fn testNativeSubgroupLifecycle(directory_mode: HBCConfig.CentroidDirectoryMode, global: bool, compact: bool) !void {
-    return testNativeSubgroupLifecycleMode(directory_mode, global, compact, false);
+fn testNativeSubgroupLifecycle(directory_mode: HBCConfig.CentroidDirectoryMode, compact: bool) !void {
+    return testNativeSubgroupLifecycleMode(directory_mode, compact, false);
 }
 
 test "certified subgroup native lifecycle preserves exact scores with flat routing" {
-    try testNativeSubgroupLifecycleMode(.flat_rabitq, true, false, true);
+    try testNativeSubgroupLifecycleMode(.flat_rabitq, false, true);
 }
 
 test "certified subgroup native lifecycle preserves exact scores with tree routing" {
-    try testNativeSubgroupLifecycleMode(.hbc, true, false, true);
+    try testNativeSubgroupLifecycleMode(.hbc, false, true);
 }
 
-fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMode, global: bool, compact: bool, certified: bool) !void {
+fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMode, compact: bool, certified: bool) !void {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
@@ -25629,8 +25625,7 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
     manager.dense_subgroup_count = 4;
-    manager.dense_subgroup_routing = true;
-    manager.dense_global_subgroup_routing = global;
+    manager.dense_global_subgroup_routing = true;
     manager.dense_compact_subgroup_routing = compact;
     manager.dense_certified_subgroups = certified;
     const Fixture = struct {
@@ -25707,7 +25702,7 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
         const vector = Fixture.vector(129);
         try idx.insertWithMetadata(129, &vector, "doc");
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(129, .{});
-        if (global) {
+        {
             var dirty = try idx.searchProfiledRequest(.{ .query = &.{ 0, 0, 1 }, .k = 10, .search_width = 128 });
             defer dirty.results.deinit();
             try std.testing.expectEqual(@as(u64, 0), dirty.profile.subgroup_vectors_skipped);
@@ -25740,28 +25735,20 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
     }
 }
 
-test "subgroup native layout preserves full coverage mutation bytes and restart with flat routing" {
-    try testNativeSubgroupLifecycle(.flat_exact, false, false);
-}
-
-test "subgroup native layout preserves full coverage mutation bytes and restart with tree routing" {
-    try testNativeSubgroupLifecycle(.hbc, false, false);
-}
-
 test "global subgroup plan preserves native lifecycle with flat routing" {
-    try testNativeSubgroupLifecycle(.flat_exact, true, false);
+    try testNativeSubgroupLifecycle(.flat_exact, false);
 }
 
 test "global subgroup plan preserves native lifecycle with tree routing" {
-    try testNativeSubgroupLifecycle(.hbc, true, false);
+    try testNativeSubgroupLifecycle(.hbc, false);
 }
 
 test "compact subgroup plan preserves native lifecycle with flat routing" {
-    try testNativeSubgroupLifecycle(.flat_exact, true, true);
+    try testNativeSubgroupLifecycle(.flat_exact, true);
 }
 
 test "compact subgroup plan preserves native lifecycle with tree routing" {
-    try testNativeSubgroupLifecycle(.hbc, true, true);
+    try testNativeSubgroupLifecycle(.hbc, true);
 }
 
 test "quantized native routing serves exact complete coverage across delta and reopen" {

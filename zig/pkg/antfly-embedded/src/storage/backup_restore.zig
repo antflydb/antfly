@@ -563,6 +563,8 @@ fn prepareRestoreSnapshotIfNeeded(
                 defer db.close();
                 if (!db.core.identity_namespace.eql(namespace))
                     try db.reassignIdentityNamespaceForInternalTransition(namespace);
+                if (prepared.nativeOpenPlan() != null)
+                    try db.rebindUnstartedNativeRestoreRepairIdentity(prepared.stagedGeneration());
             }
         }
     }
@@ -919,18 +921,11 @@ fn applyPortableRestore(
         try std.Io.Dir.cwd().openFile(io, afb_path, .{});
     defer afb_file.close(io);
     const afb_stat = try afb_file.stat(io);
-    try portable_backup.importPortableFileWithOptions(alloc, db.core.store, io, afb_file, afb_stat.size, .{
+    try db.importPortableRestoreFileIntoUnpublishedEmpty(alloc, io, afb_file, afb_stat.size, .{
         .identity_namespace = options.expected_identity_namespace,
-        .prefer_existing_identity_namespace = true,
-        .import_derived_indexes = true,
         .embedding_source_fields = embedding_source_fields,
-        .unpublished_staging = true,
         .cancellation = restore.cancellation,
     });
-    portable_backup.validateCompleteDatabaseImageAlloc(alloc, db.core.store) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return error.InvalidBackupRequest,
-    };
     // Go portable AFBs may contain portable logical artifacts (for example
     // embedding batches) as well as old on-disk index directories. Keep the
     // logical artifacts in the DocStore, but drop runtime index directories so

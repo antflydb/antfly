@@ -52,43 +52,11 @@ comptime {
 }
 
 pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void)) void {
-    const result = visited.getOrPut(module) catch @panic("OOM");
-    if (result.found_existing) return;
-
-    module.strip = true;
-    // Zig test roots otherwise retain error tracing while stripped provider
-    // archives disable it. Io futures contain trace-dependent native state;
-    // make that ABI choice explicit for every participant in this profile.
-    module.error_tracing = false;
-    for (module.import_table.values()) |imported_module| {
-        setStripRecursively(imported_module, visited);
-    }
+    @import("../../../build_support/embedded/shared_library.zig").setStripRecursively(module, visited);
 }
 
-/// Shared imports must use the same debug-information profile as every
-/// consumer. LLVM can crash when an unstripped test references declarations
-/// from a module stripped by a production archive in the same build graph.
 pub fn stripBuildGraph(b: *std.Build) void {
-    var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
-    defer steps.deinit();
-    var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
-    defer modules.deinit();
-    for (b.top_level_steps.values()) |root| stripStep(&root.step, &steps, &modules);
-}
-
-fn stripStep(step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
-    if ((steps.getOrPut(step) catch @panic("OOM")).found_existing) return;
-    if (step.cast(std.Build.Step.Compile)) |artifact| {
-        setStripRecursively(artifact.root_module, modules);
-        // Library dependencies are added by Build.Serialize after build()
-        // returns. Follow the authored links now so their roots receive the
-        // same profile as the consumer rather than retaining debug tracing.
-        for (artifact.root_module.getGraph().modules) |module| {
-            for (module.link_objects.items) |link| if (link == .other_step)
-                stripStep(&link.other_step.step, steps, modules);
-        }
-    }
-    for (step.dependencies.items) |dependency| stripStep(dependency, steps, modules);
+    @import("../../../build_support/embedded/shared_library.zig").stripBuildGraph(b);
 }
 const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 
@@ -106,7 +74,9 @@ pub const AddRuntimeOptions = struct {
     production_antfly_imports: AntflyRootImports,
     antfly_client_pkg_mod: *std.Build.Module,
     capi_mod: *std.Build.Module,
-    libantfly_link_mod: *std.Build.Module,
+    native_storage: ?*std.Build.Step.Compile,
+    native_enrichment: *std.Build.Step.Compile,
+    native_inference: *std.Build.Step.Compile,
 };
 pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
@@ -128,7 +98,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const production_antfly_imports = options.production_antfly_imports;
     const antfly_client_pkg_mod = options.antfly_client_pkg_mod;
     const capi_mod = options.capi_mod;
-    const libantfly_link_mod = options.libantfly_link_mod;
     const main_module_options: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("pkg/antfly/src/main.zig"),
         .target = target,
@@ -153,12 +122,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     });
     addMacosSdkPaths(b, antfly_main_tests.root_module, target);
     production_antfly_imports.build_info.link(antfly_main_mod);
-    production_antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, antfly_main_mod, target);
 
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
         .root_module = antfly_main_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
     });
 
     var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
@@ -204,8 +173,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             capi_options.addOption(bool, "linked_storage", true);
             // This archive is shared by the default `libantfly` and by the
             // `antfly` executable. Both link the inference runtime archive
-            // in-process (see `link_anchor.zig` and the `.inference` unit
-            // linked into `libantfly_link_mod` below), so the
+            // in-process (see `link_anchor.zig` and the embedded library
+            // composition), so the
             // embedded-inference construction path is always available.
             capi_options.addOption(bool, "inference_enabled", true);
             role_mod.addOptions("capi_build_options", capi_options);
@@ -224,27 +193,47 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
         }
 
-        const role_artifact = b.addLibrary(.{
+        // Both products consume the same three coarse compute exports. The
+        // Apache owner is already PIC and storage-free, and receives the
+        // same sanitizer setting as the server.
+        const compile_max_rss = if (unit == .inference and production_antfly_imports.shared_inference_core) 4 * 1024 * 1024 * 1024 else runtimeCompileMaxRss(unit, .{
+            .host = b.graph.host.result,
+            .target = target.result,
+            .optimize = optimize,
+            .strip = strip,
+            .cpu_inference = options.cpu_inference,
+            .sanitize_thread = sanitize_thread,
+            .macos_metal_blas_release = production_antfly_imports.darwin_release_memory,
+            .macos_shared_storage_sdk27 = production_antfly_imports.darwin_shared_storage_sdk27,
+        });
+        const role_artifact = if (unit == .enrichment_compute) blk: {
+            // Reuse the implementation without replacing the runtime's
+            // measured profile reservation with the embedded default.
+            options.native_enrichment.step.max_rss = compile_max_rss;
+            break :blk options.native_enrichment;
+        } else b.addLibrary(.{
             .name = if (unit == .storage_kernel)
                 "antfly-storage-kernel"
             else
                 b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
             .root_module = role_mod,
             .linkage = .static,
-            .max_rss = runtimeCompileMaxRss(unit, .{
-                .host = b.graph.host.result,
-                .target = target.result,
-                .optimize = optimize,
-                .strip = strip,
-                .cpu_inference = options.cpu_inference,
-                .sanitize_thread = sanitize_thread,
-            }),
+            .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
+            .max_rss = compile_max_rss,
         });
+        // Final images select their inference provider. Source-level owner
+        // fixtures compile it locally; production images link the archive.
+        // Keep that choice off this shared adapter's transitive link graph.
         const runtime_unit_step = b.step(
             b.fmt("runtime-unit-{s}", .{@tagName(unit)}),
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
         );
         runtime_unit_step.dependOn(&role_artifact.step);
+        if (unit == .storage_kernel and options.native_storage != null)
+            b.step("runtime-unit-storage-adapter", "Compile only the server storage adapter without waiting for shared engine emission").dependOn(&role_artifact.step);
+        if (unit == .storage_kernel) {
+            if (options.native_storage) |owner| runtime_unit_step.dependOn(&owner.step);
+        }
         runtime_library_artifacts[@backingInt(unit)] = role_artifact;
         if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
@@ -264,6 +253,29 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
     }
 
+    if (options.native_storage) |owner| {
+        // Exercise the server's production build/source options against the
+        // independently compiled Apache owner, not just the embedded profile.
+        const client = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });
+        production_antfly_imports.configureStorage(b, client, link_libc);
+        production_antfly_imports.storage_boundary.configureProfile(client, false, true, .all);
+        const capi_options = b.addOptions();
+        capi_options.addOption(bool, "linked_storage", true);
+        capi_options.addOption(bool, "inference_enabled", true);
+        client.addOptions("capi_build_options", capi_options);
+        client.addImport("antfly_storage_root", client);
+        const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
+        probe_mod.addImport("storage_client", @import("../../../build_support/embedded/shared_library.zig").storageConsumerModule(b, client));
+        probe_mod.linkLibrary(owner);
+        production_antfly_imports.build_info.link(probe_mod);
+        probe_mod.linkLibrary(options.native_inference);
+        probe_mod.linkLibrary(options.native_enrichment);
+        const run = @import("../../../build_support/embedded/shared_library.zig").addStorageProbe(b, probe_mod, "storage-server-owner-linkage-probe");
+        _ = run.addOutputDirectoryArg("storage-server-owner-linkage");
+        run.has_side_effects = true;
+        b.top_level_steps.get("storage-owner-linkage-test").?.step.dependOn(&run.step);
+    }
+
     // Exercise the real production archive boundary for encoded-image reads.
     // The probe resolves only the exported C function table, so it cannot
     // accidentally pass by importing pkg/inference/src/host/host.zig into the test root.
@@ -280,15 +292,20 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const linked_inference_abi_integration = b.addExecutable(.{
         .name = "linked-inference-abi-integration",
         .root_module = linked_inference_abi_integration_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
     });
     linked_inference_abi_integration.root_module.linkLibrary(
         runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
+    if (production_antfly_imports.shared_inference_core) linked_inference_abi_integration_mod.linkLibrary(options.native_inference);
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {
         antfly_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
     }
+    // ELF's archive extraction must see the adapter's undefined calls before
+    // the shared physical owner. Mach-O also permits this dependency order.
+    if (options.native_storage) |owner| antfly_main.root_module.linkLibrary(owner);
 
     if (runtime_artifact_role) |role| {
         const role_options = b.addOptions();
@@ -311,6 +328,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         const role_exe = b.addExecutable(.{
             .name = b.fmt("antfly-{s}", .{role_name}),
             .root_module = role_mod,
+            .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         });
         role_exe.link_gc_sections = true;
         switch (role) {
@@ -324,6 +342,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             },
             .inference => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
+                if (production_antfly_imports.shared_inference_core) role_exe.root_module.linkLibrary(options.native_inference);
             },
             .standalone => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);

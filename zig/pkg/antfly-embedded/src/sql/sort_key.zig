@@ -36,6 +36,23 @@ pub fn encode(values: []const Datum, orders: anytype) ?Key {
     if (values.len != orders.len or values.len > 16) return null;
     var key: Key = .{};
     for (values, orders, 0..) |value, order, index| {
+        if (value.array != null) return null;
+        if (value.numeric) |number| {
+            const numeric = @import("numeric_value.zig");
+            const keys = @import("numeric_key.zig");
+            var scratch: [32]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&scratch);
+            // Small exact keys stay allocation-free. Wide values use the
+            // authoritative comparator rather than expanding decimal text.
+            var context: numeric.Context = .{ .alloc = std.heap.page_allocator, .remaining = 64, .max_groups = 13, .max_output_bytes = scratch.len };
+            keys.encode(&context, number.*, &writer) catch return null;
+            key.types |= @as(u64, 6) << @as(u6, @intCast(index * 4));
+            const null_first = order.nulls_first orelse order.descending;
+            key.push(if (value.sql_null) if (null_first) 0 else 2 else 1, false);
+            if (value.sql_null) return null;
+            for (writer.buffered()) |byte| key.push(byte, order.descending);
+            continue;
+        }
         const kind: u4 = if (value.sql_null) 0 else switch (value.value) {
             .integer => 1,
             .float => 2,

@@ -461,6 +461,10 @@ pub const DocStore = struct {
     /// Process-local wake hint, published only after successful row/schema
     /// commits. Durable mutation IDs and timers remain the restart authority.
     columnar_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    /// Owner-local invalidation for retained-query reuse. Includes primary
+    /// metadata/graph/enrichment commits which need not append source replay.
+    /// Increment before attempting commit: ambiguous backend outcomes invalidate.
+    query_generation_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
@@ -589,6 +593,7 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Txn) !void {
+            if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             // A backend error need not prove that its commit was absent.
             // Reload the durable cut on the next observation, but never
@@ -634,6 +639,18 @@ pub const DocStore = struct {
             if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(value))
                 return error.VectorMigrationReadEpochChanged;
             return value;
+        }
+
+        /// Exact key presence in this transaction's view. Physical references
+        /// prove presence without resolving external source/artifact payloads.
+        pub fn contains(self: *Txn, key: []const u8) !bool {
+            if (self.write) |*write| return write.contains(key);
+            if (self.probe) |*probe| return try probe.contains(key);
+            _ = self.getPhysical(key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            return true;
         }
 
         pub fn getArtifactMetadata(self: *Txn, key: []const u8) !artifact_payload.Metadata {
@@ -760,7 +777,7 @@ pub const DocStore = struct {
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, value);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -784,7 +801,7 @@ pub const DocStore = struct {
                     else => return err,
                 };
             }
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, null);
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -833,6 +850,12 @@ pub const DocStore = struct {
             defer cursor.close();
             const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
             return std.mem.startsWith(u8, row.key, prefix);
+        }
+
+        pub fn openPhysicalKeyCursorAdapter(self: *Txn) !CursorAdapter {
+            var cursor = try self.openPhysicalCursorAdapter();
+            cursor.setKeysOnly();
+            return cursor;
         }
 
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
@@ -936,7 +959,7 @@ pub const DocStore = struct {
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -973,7 +996,7 @@ pub const DocStore = struct {
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may
@@ -1009,7 +1032,7 @@ pub const DocStore = struct {
                         else => return err,
                     };
                 }
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, null);
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -1085,6 +1108,7 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
             try self.retained.stage(self.alloc, self.asTxn());
@@ -2801,41 +2825,59 @@ pub const DocStore = struct {
             for (deletes.items) |key| alloc.free(key);
             deletes.deinit(alloc);
         }
+        try deletes.ensureTotalCapacityPrecise(alloc, replay_truncate_batch_keys);
 
         // Replay lanes are append-only. Capturing each lane independently is
         // sufficient below an acknowledged retirement watermark, and avoids
         // cloning/sorting unrelated document and artifact keys after every
-        // enrichment completion. The existing atomic deletion batch remains.
+        // enrichment completion.
         for (0..replay_hints.len + 1) |lane| {
             const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
-            var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
-            defer txn.abort();
-            var cur = try txn.openCursor();
-            defer cur.close();
-            const lower = internal_keys.replayRangeLower(ordinal, 0);
-            const upper = internal_keys.replayRangeUpper(ordinal);
-            cur.setUpperBound(&upper);
-            var entry = try cur.seekAtOrAfter(&lower);
-            while (entry) |kv| : (entry = try cur.next()) {
-                if (std.mem.order(u8, kv.key, &upper) != .lt) break;
-                const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
-                if (sequence > up_to_sequence) break;
-                try deletes.append(alloc, try alloc.dupe(u8, kv.key));
+            var from_sequence: u64 = 0;
+            while (true) {
+                var last_sequence = from_sequence;
+                {
+                    var txn = try self.beginReplayLaneScanTxn(ordinal, from_sequence);
+                    defer txn.abort();
+                    var cur = try txn.openCursor();
+                    defer cur.close();
+                    const lower = internal_keys.replayRangeLower(ordinal, from_sequence);
+                    const upper = internal_keys.replayRangeUpper(ordinal);
+                    cur.setUpperBound(&upper);
+                    var entry = try cur.seekAtOrAfter(&lower);
+                    while (entry) |kv| : (entry = try cur.next()) {
+                        if (std.mem.order(u8, kv.key, &upper) != .lt) break;
+                        const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
+                        if (sequence > up_to_sequence) break;
+                        const key = try alloc.dupe(u8, kv.key);
+                        errdefer alloc.free(key);
+                        try deletes.append(alloc, key);
+                        last_sequence = sequence;
+                        if (deletes.items.len == replay_truncate_batch_keys) break;
+                    }
+                }
+                if (deletes.items.len == 0) break;
+                // Release the read generation before each bounded commit.
+                // Acknowledged rows are never replayed again; interruption
+                // leaves idempotent progress for the next maintenance pass.
+                var batch = try self.beginWriteBatch();
+                errdefer batch.abort();
+                for (deletes.items) |key| {
+                    batch.delete(key) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                }
+                try batch.commit();
+                for (deletes.items) |key| alloc.free(key);
+                deletes.clearRetainingCapacity();
+                if (last_sequence >= up_to_sequence or last_sequence == std.math.maxInt(u64)) break;
+                from_sequence = last_sequence + 1;
             }
         }
-
-        if (deletes.items.len == 0) return;
-
-        var batch = try self.beginWriteBatch();
-        errdefer batch.abort();
-        for (deletes.items) |key| {
-            batch.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-        }
-        try batch.commit();
     }
+
+    const replay_truncate_batch_keys: usize = 4096;
 
     /// Scan all keys with the given prefix. Caller owns returned slices.
     pub fn scanPrefix(self: *DocStore, alloc: Allocator, prefix: []const u8) ![]OwnedKVPair {
@@ -5120,6 +5162,54 @@ test "docstore replay rows use replay keyspace" {
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
+test "docstore replay retirement pages keys within bounded memory and preserves unacknowledged rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const cutoff: u64 = DocStore.replay_truncate_batch_keys * 2 + 17;
+    const hints = [_]u8{ internal_keys.replay_all_kind, replayHintOrdinal(.dense_vector) };
+    var sequence: u64 = 1;
+    while (sequence <= cutoff + 1) {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(&internal_keys.replay_meta_init_key, "1");
+        const end = @min(sequence + 1024, cutoff + 2);
+        while (sequence < end) : (sequence += 1) {
+            const payload = try change_journal_mod.encodeRecord(alloc, .{ .sequence = sequence, .changed_doc_keys = &.{"doc"}, .target_hints = &.{.dense_vector} });
+            defer alloc.free(payload);
+            for (hints) |hint| {
+                const key = internal_keys.replayEntryKey(hint, sequence);
+                try batch.put(&key, payload);
+            }
+        }
+        try batch.commit();
+    }
+    const resources = @import("resource_manager.zig");
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = 128 * 1024 };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(alloc);
+    var bounded = resources.BudgetedAllocator.init(&manager, .lsm_read_working_set, alloc, 1);
+    defer bounded.deinit();
+    try store.truncateReplayUpTo(bounded.allocator(), cutoff);
+    // A second pass has no retired debt. Both lanes preserve the next row.
+    try store.truncateReplayUpTo(bounded.allocator(), cutoff);
+    for (hints) |hint| {
+        const retired = internal_keys.replayEntryKey(hint, cutoff);
+        try std.testing.expectError(error.NotFound, store.get(alloc, &retired));
+        const remaining = internal_keys.replayEntryKey(hint, cutoff + 1);
+        const payload = try store.get(alloc, &remaining);
+        defer alloc.free(payload);
+        var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(cutoff + 1, decoded.record.sequence);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
 test "docstore indexes replay rows by hint and truncates them" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -5366,6 +5456,17 @@ test "docstore runtime point get does not clone mutable snapshot" {
     const value = try store.get(alloc, "doc:a");
     defer alloc.free(value);
     try std.testing.expectEqualStrings("alpha", value);
+    const before_copies = backend.snapshotReadStats().point_value_copies;
+    {
+        var probe = try store.beginProbeTxn();
+        defer probe.abort();
+        try std.testing.expect(try probe.contains("doc:a"));
+        try std.testing.expect(!try probe.contains("doc:"));
+        try std.testing.expect(!try probe.contains("doc:missing"));
+        try store.delete("doc:a");
+        try std.testing.expect(!try probe.contains("doc:a"));
+    }
+    try std.testing.expectEqual(before_copies, backend.snapshotReadStats().point_value_copies);
     const after = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }
@@ -6243,4 +6344,52 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     var batch = try store.beginWriteBatch();
     defer batch.abort();
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
+}
+
+test "public graph metric borrowed wire content authority shares txn batch append abort and reopen boundaries" {
+    const a = std.testing.allocator;
+    const revision = @import("document_mutation_revision.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("last", &expected, .{});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            try store.put(key, "first");
+            var pinned = try store.beginReadTxn();
+            defer pinned.abort();
+            const before = (try revision.loadContent(&pinned, key)).?;
+            {
+                var writer = try store.beginWriteTxn();
+                defer writer.abort();
+                try writer.put(key, "aborted");
+            }
+            {
+                var batch = try store.beginWriteBatch();
+                errdefer batch.abort();
+                try batch.asTxn().appendPut(key, "last");
+                try batch.commit();
+            }
+            try std.testing.expectEqualSlices(u8, &before.digest, &(try revision.loadContent(&pinned, key)).?.digest);
+        }
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectEqualSlices(u8, &expected, &(try revision.loadContent(&current, key)).?.digest);
+        try std.testing.expectEqualStrings("last", try current.get(key));
+        if (pass == 1) {
+            try store.delete(key);
+            var deleted = try store.beginReadTxn();
+            defer deleted.abort();
+            try std.testing.expect((try revision.loadContent(&deleted, key)) == null);
+            try std.testing.expectError(error.NotFound, deleted.get(key));
+        }
+    }
 }

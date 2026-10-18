@@ -57,6 +57,15 @@ pub fn resident(comptime T: type, cached: artifacts.CachedRead, ref: local.serve
     return true;
 }
 
+/// Lookup never performs I/O; speculative readers pin only resident metadata.
+pub fn lookup(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !?Owned(T) {
+    try cached.context.ensureActive();
+    const lease = cached.cache.decoded.lookup(try cacheKey(T, cached, ref)) orelse return null;
+    errdefer lease.release();
+    try cached.context.ensureActive();
+    return .{ .lease = lease, .value = @ptrCast(@alignCast(lease.item.payload.extension)) };
+}
+
 pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, comptime load: anytype) !Owned(T) {
     try cached.context.ensureActive();
     try cancellation.check();

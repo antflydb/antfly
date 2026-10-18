@@ -33,7 +33,6 @@ pub const CT = *anyopaque;
 pub const BackendKind = enum {
     native,
     metal,
-    onnx,
     pjrt,
     cuda,
     wasm,
@@ -347,7 +346,6 @@ pub const TensorStorageClass = enum {
     host_packed_quant,
     metal_buffer,
     webgpu_buffer,
-    onnx_tensor,
     pjrt_buffer,
     cuda_buffer,
     runtime_input,
@@ -363,7 +361,7 @@ pub const TensorStorageClass = enum {
 
     pub fn isDevice(self: TensorStorageClass) bool {
         return switch (self) {
-            .metal_buffer, .webgpu_buffer, .onnx_tensor, .pjrt_buffer, .cuda_buffer => true,
+            .metal_buffer, .webgpu_buffer, .pjrt_buffer, .cuda_buffer => true,
             else => false,
         };
     }
@@ -1227,6 +1225,22 @@ pub const DecoderRuntimeDecodeContract = enum(u8) {
 
 pub const DecoderRuntimeDecodeMode = enum(u8) {
     greedy_argmax,
+    /// The frame's LM-head logits are sampled before its command buffer is
+    /// committed. Backends must reject unsupported configs during preflight;
+    /// they may not replay the frame after submission.
+    sampled_nucleus,
+};
+
+pub const DecoderRuntimeSamplingRequest = struct {
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    final_logit_softcap: f32 = 0,
+    token_history: []const i64,
 };
 
 pub const DecoderRuntimeMoeLayerSpec = struct {
@@ -1301,6 +1315,7 @@ pub const DecoderRuntimeDecodePhase = enum {
 pub const DecoderRuntimeDecodeRequest = struct {
     contract: DecoderRuntimeDecodeContract,
     mode: DecoderRuntimeDecodeMode = .greedy_argmax,
+    sampling: ?DecoderRuntimeSamplingRequest = null,
     phase: DecoderRuntimeDecodePhase = .full,
     configured_layer_count: usize,
     layer_count: usize,

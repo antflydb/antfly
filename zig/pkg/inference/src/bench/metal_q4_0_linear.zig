@@ -134,10 +134,12 @@ const Config = struct {
     warmup_iters: usize = 20,
     measure_iters: usize = 200,
     ops_per_frame: usize = 1,
+    planned_linear_scope: bool = false,
     q4_k: bool = false,
     q4_k_f16_mps: bool = false,
     q4_k_bf16: bool = false,
     compare_q6_high_row: bool = false,
+    compare_q4_e2b_disabled_baseline: bool = false,
     expect_q4_route: ?Q4MmRoute = null,
     expect_q4_mmv_variant: ?Q4MmvVariant = null,
     expect_q4_mmv_auto: bool = false,
@@ -152,7 +154,7 @@ const Config = struct {
 
 fn usage() void {
     std.debug.print(
-        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--q4-k] [--q4-k-f16-mps|--q4-k-bf16] [--compare-q6-high-row] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-q4-pair-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-pair-mmv-fallbacks N] [--expect-q4-pair-mm-route m32-n64-aligned|m32-n64-tail|m32-n32-aligned|m32-n32-tail] [--expect-q4-pair-mm-fallbacks N] [--expect-output-hash HEX] [--skip-unless-apple-m4]
+        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--q4-k] [--q4-k-f16-mps|--q4-k-bf16] [--compare-q6-high-row] [--compare-q4-e2b-disabled-baseline] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--weight-slots N] [--planned-linear-scope] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-q4-pair-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-pair-mmv-fallbacks N] [--expect-q4-pair-mm-route m32-n64-aligned|m32-n64-tail|m32-n32-aligned|m32-n32-tail] [--expect-q4-pair-mm-fallbacks N] [--expect-output-hash HEX] [--skip-unless-apple-m4]
         \\
     , .{});
 }
@@ -172,6 +174,10 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             usage();
             std.process.exit(0);
+        }
+        if (std.mem.eql(u8, arg, "--planned-linear-scope")) {
+            cfg.planned_linear_scope = true;
+            continue;
         }
         if (std.mem.eql(u8, arg, "--expect-q4-mmv-auto")) {
             cfg.expect_q4_mmv_auto = true;
@@ -197,6 +203,10 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         }
         if (std.mem.eql(u8, arg, "--compare-q6-high-row")) {
             cfg.compare_q6_high_row = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--compare-q4-e2b-disabled-baseline")) {
+            cfg.compare_q4_e2b_disabled_baseline = true;
             continue;
         }
         if (i + 1 >= args.len) return error.InvalidArgument;
@@ -248,6 +258,8 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.q4_k and cfg.in_dim % 256 != 0) return error.InvalidArgument;
     if (cfg.q4_k_f16_mps and cfg.q4_k_bf16) return error.InvalidArgument;
     if (cfg.compare_q6_high_row and cfg.mode != .q6_linear) return error.InvalidArgument;
+    if (cfg.compare_q4_e2b_disabled_baseline and
+        (cfg.q4_k or (cfg.mode != .linear and cfg.mode != .ffn))) return error.InvalidArgument;
     if ((cfg.mode == .q6_linear or cfg.mode == .q6_argmax) and cfg.in_dim % 256 != 0) return error.InvalidArgument;
     if (cfg.mode == .head_rope and (cfg.out_dim == 0 or cfg.in_dim % cfg.out_dim != 0 or cfg.kv_out_dim > cfg.out_dim)) return error.InvalidArgument;
     if (cfg.mode != .linear and cfg.kv_out_dim == 0) return error.InvalidArgument;
@@ -585,9 +597,12 @@ fn applyOnce(
     out_dim: usize,
     weight_slots: usize,
     outputs: []MetalTensor,
+    planned_scope: bool,
 ) !u64 {
     const start = nowNanos();
     try metal_runtime.beginFrame(runtime);
+    errdefer metal_runtime.cancelFrame(runtime) catch {};
+    if (planned_scope) try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.quant_linear), .ffn);
     var produced: usize = 0;
     errdefer for (outputs[0..produced]) |*output| output.deinit();
     while (produced < outputs.len) : (produced += 1) {
@@ -598,6 +613,7 @@ fn applyOnce(
             .out_dim = out_dim,
         })) orelse return error.LinearDispatchFailed;
     }
+    if (planned_scope) try metal_runtime.endPlannedComputeScope(runtime);
     try metal_runtime.submitFrame(runtime);
     try metal_runtime.waitFrame(runtime);
     for (outputs) |*output| output.deinit();
@@ -922,6 +938,74 @@ fn applyFfnOutput(
     return output;
 }
 
+fn setQ4E2bCandidateEnabled(mode: Mode, enabled: bool) !void {
+    const enable_env, const disable_env = switch (mode) {
+        .linear => .{
+            "TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED",
+            "TERMITE_METAL_DISABLE_E2B_Q4_0_MM_SG_ALIGNED",
+        },
+        .ffn => .{
+            "TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM",
+            "TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM",
+        },
+        else => return error.InvalidArgument,
+    };
+    if (enabled) {
+        if (unsetenv(disable_env) != 0 or setenv(enable_env, "1", 1) != 0) return error.EnvironmentUpdateFailed;
+    } else {
+        if (unsetenv(enable_env) != 0 or setenv(disable_env, "1", 1) != 0) return error.EnvironmentUpdateFailed;
+    }
+}
+
+fn captureQ4E2bOutput(
+    provider: *metal_native_provider.MetalNativeProvider,
+    runtime: *metal_runtime.RawMetalDecodeRuntime,
+    input: MetalTensor,
+    cfg: Config,
+) !MetalTensor {
+    return switch (cfg.mode) {
+        .linear => captureLinearOutput(provider, runtime, input, cfg.in_dim, cfg.out_dim),
+        .ffn => applyFfnOutput(runtime, input, cfg),
+        else => error.InvalidArgument,
+    };
+}
+
+fn compareQ4E2bDisabledBaseline(
+    provider: *metal_native_provider.MetalNativeProvider,
+    runtime: *metal_runtime.RawMetalDecodeRuntime,
+    input: MetalTensor,
+    cfg: Config,
+) !void {
+    // Zig initializes its stderr lock lazily by scanning the environment
+    // snapshot passed to main. Initialize it before setenv/unsetenv can
+    // invalidate that snapshot.
+    std.debug.print(
+        "q4_e2b_disabled_baseline_start mode={s} rows={d} in={d} out={d}\n",
+        .{ cfg.mode.name(), cfg.rows, cfg.in_dim, cfg.out_dim },
+    );
+    try setQ4E2bCandidateEnabled(cfg.mode, false);
+    var baseline = try captureQ4E2bOutput(provider, runtime, input, cfg);
+    defer baseline.deinit();
+    const baseline_values = try std.heap.page_allocator.dupe(f32, try baseline.toHostSlice());
+    defer std.heap.page_allocator.free(baseline_values);
+
+    try setQ4E2bCandidateEnabled(cfg.mode, true);
+    var candidate = try captureQ4E2bOutput(provider, runtime, input, cfg);
+    defer candidate.deinit();
+    const candidate_values = try candidate.toHostSlice();
+    if (baseline_values.len != candidate_values.len) return error.OutputShapeMismatch;
+
+    const baseline_bytes = std.mem.sliceAsBytes(baseline_values);
+    const candidate_bytes = std.mem.sliceAsBytes(candidate_values);
+    const baseline_hash = std.hash.Wyhash.hash(0, baseline_bytes);
+    const candidate_hash = std.hash.Wyhash.hash(0, candidate_bytes);
+    std.debug.print(
+        "q4_e2b_disabled_baseline_parity mode={s} rows={d} in={d} out={d} baseline_hash={x} candidate_hash={x}\n",
+        .{ cfg.mode.name(), cfg.rows, cfg.in_dim, cfg.out_dim, baseline_hash, candidate_hash },
+    );
+    if (!std.mem.eql(u8, baseline_bytes, candidate_bytes)) return error.Q4E2bDisabledBaselineMismatch;
+}
+
 fn applyPleOnce(
     provider: *metal_native_provider.MetalNativeProvider,
     runtime: *metal_runtime.RawMetalDecodeRuntime,
@@ -1092,6 +1176,9 @@ pub fn main(init: std.process.Init) !void {
         );
         if (max_abs_error > 0.003) return error.Q6HighRowParityExceeded;
     }
+    if (cfg.compare_q4_e2b_disabled_baseline) {
+        try compareQ4E2bDisabledBaseline(&provider, runtime, input, cfg);
+    }
     var ple_input: ?MetalTensor = null;
     defer if (ple_input) |*tensor| tensor.deinit();
     if (cfg.mode == .ple) {
@@ -1111,7 +1198,7 @@ pub fn main(init: std.process.Init) !void {
     var warmup: usize = 0;
     while (warmup < cfg.warmup_iters) : (warmup += 1) {
         _ = switch (cfg.mode) {
-            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs),
+            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs, cfg.planned_linear_scope),
             .q6_argmax => try applyLinearArgmaxOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
             .head_rope => try applyHeadRopeOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.kv_out_dim, frame_outputs),
             .pair => try applyPairOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, pair_outputs),
@@ -1128,7 +1215,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(gpu_samples);
     for (samples, gpu_samples) |*sample, *gpu_sample| {
         sample.* = switch (cfg.mode) {
-            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs),
+            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs, cfg.planned_linear_scope),
             .q6_argmax => try applyLinearArgmaxOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
             .head_rope => try applyHeadRopeOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.kv_out_dim, frame_outputs),
             .pair => try applyPairOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, pair_outputs),

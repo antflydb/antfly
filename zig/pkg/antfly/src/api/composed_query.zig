@@ -180,10 +180,11 @@ const Position = struct {
     raw_count: usize = 0,
     visible_count: usize = 0,
     total: ?usize = null,
+    identity_pinned: bool = false,
     remote_snapshot: ?[]const u8 = null,
     identity: []const u8 = "null",
 };
-const Continuation = struct { version: u16 = 2, fingerprint: []const u8, sources: []const Position, total: ?usize = null, aggregations: ?V = null };
+const Continuation = struct { version: u16 = 3, fingerprint: []const u8, sources: []const Position, total: ?usize = null, aggregations: ?V = null };
 fn clone(a: A, value: anytype, comptime T: type) !T {
     const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
     defer a.free(bytes);
@@ -218,14 +219,24 @@ const Stream = struct {
     position_arena: std.heap.ArenaAllocator,
     hits: []Hit = &.{},
     hidden: []bool = &.{},
+    page_rows: usize = batch_size,
     at: usize = 0,
     failed: ?Response = null,
     fn refill(self: *Stream, stable: A, response_a: A, root: V, orders: []const Order, rrf: bool, executor: Executor) !void {
         try executor.checkpoint(executor.ptr);
+        // Small public pages should not hydrate/highlight an entire 128-row
+        // batch per source. Fully suppressed overlay batches grow geometrically
+        // to preserve bounded archive-scale traversal and amortize refill I/O.
+        if (self.hidden.len != 0) {
+            const fully_hidden = for (self.hidden) |hidden| {
+                if (!hidden) break false;
+            } else true;
+            if (fully_hidden) self.page_rows = @min(batch_size, self.page_rows * 2);
+        }
         _ = self.arena.reset(.free_all);
         const pa = self.arena.allocator();
         var request = try clone(pa, root, V);
-        try request.object.put(pa, "limit", .{ .integer = batch_size });
+        try request.object.put(pa, "limit", .{ .integer = @intCast(self.page_rows) });
         if (rrf) {
             const encoded = try std.json.Stringify.valueAlloc(pa, [_]Order{.{ .field = "_score", .desc = true }}, .{});
             try request.object.put(pa, "order_by", try std.json.parseFromSliceLeaky(V, pa, encoded, .{}));
@@ -244,8 +255,11 @@ const Stream = struct {
         if (responses != .array or responses.array.items.len != 1) return error.InvalidQueryRequest;
         const result = responses.array.items[0];
         const identity = try std.json.Stringify.valueAlloc(pa, result.object.get("_composed_identity") orelse .null, .{});
-        if (self.position.total != null and !std.mem.eql(u8, self.position.identity, identity)) return error.CatalogGenerationChanged;
-        if (self.position.total == null) self.position.identity = try stable.dupe(u8, identity);
+        if (self.position.identity_pinned and !std.mem.eql(u8, self.position.identity, identity)) return error.CatalogGenerationChanged;
+        if (!self.position.identity_pinned) {
+            self.position.identity = try stable.dupe(u8, identity);
+            self.position.identity_pinned = true;
+        }
         const remote = result.object.get("remote_snapshot");
         if (remote) |value| {
             if (value != .string) return error.InvalidQueryRequest;
@@ -257,15 +271,36 @@ const Stream = struct {
         const items = result_hits.object.get("hits") orelse return error.InvalidQueryRequest;
         const total = result_hits.object.get("total") orelse return error.InvalidQueryRequest;
         const remaining = if (total == .integer) try integer(total) else try integer(total.object.get("value") orelse return error.InvalidQueryRequest);
-        if (total == .object) if (total.object.get("relation")) |relation| if (relation != .string or (!std.mem.eql(u8, relation.string, "exact") and !std.mem.eql(u8, relation.string, "eq"))) return error.QueryCandidateBudgetExceeded;
-        // Native text reports the full matching relation; relational ordered
-        // scans report the relation remaining after the tuple. Both are exact
-        // contracts on the retained cut. Normalize before checking page size.
+        const exact = if (total == .object) exact: {
+            const relation = total.object.get("relation") orelse return error.InvalidQueryRequest;
+            if (relation != .string) return error.InvalidQueryRequest;
+            if (std.mem.eql(u8, relation.string, "gte")) break :exact false;
+            if (!std.mem.eql(u8, relation.string, "exact") and !std.mem.eql(u8, relation.string, "eq")) return error.InvalidQueryRequest;
+            break :exact true;
+        } else true;
+        if (items != .array or items.array.items.len > self.page_rows) return error.InvalidQueryRequest;
+        if (exact and remaining < items.array.items.len) return error.CatalogGenerationChanged;
+        // Admitted ordered leaf queries provide the requested sort window even
+        // when pruning leaves cardinality as a lower bound. A short lower-bound
+        // window cannot prove exhaustion and must fail closed. Never accumulate
+        // per-page lower bounds: they may describe full or remaining relations.
         if (self.position.total) |expected| {
-            if (remaining != expected and try std.math.add(usize, self.position.raw_count, remaining) != expected) return error.CatalogGenerationChanged;
-        } else self.position.total = remaining;
-        const available = self.position.total.? - self.position.raw_count;
-        if (items != .array or items.array.items.len != @min(batch_size, available)) return error.QueryCandidateBudgetExceeded;
+            if (exact) {
+                if (remaining != expected and try std.math.add(usize, self.position.raw_count, remaining) != expected) return error.CatalogGenerationChanged;
+            } else if (remaining > expected) return error.CatalogGenerationChanged;
+        } else if (exact) {
+            if (self.position.raw_count == 0) {
+                self.position.total = remaining;
+            } else if (items.array.items.len < self.page_rows) {
+                const end = try std.math.add(usize, self.position.raw_count, items.array.items.len);
+                if (remaining != items.array.items.len and remaining != end) return error.CatalogGenerationChanged;
+                self.position.total = end;
+            }
+        }
+        if (self.position.total) |expected| {
+            if (expected < self.position.raw_count) return error.CatalogGenerationChanged;
+            if (items.array.items.len != @min(self.page_rows, expected - self.position.raw_count)) return error.QueryCandidateBudgetExceeded;
+        } else if (items.array.items.len != self.page_rows) return error.QueryCandidateBudgetExceeded;
         self.hits = try pa.alloc(Hit, items.array.items.len);
         self.hidden = try pa.alloc(bool, self.hits.len);
         @memset(self.hidden, false);
@@ -339,7 +374,7 @@ fn maskBatch(base: *Stream, changes: *const Stream, keys: []const []const u8, ki
         }
         try clauses.append(pa, try std.json.parseFromSliceLeaky(V, pa, try std.json.Stringify.valueAlloc(pa, .{ .conjuncts = terms.items }, .{}), .{}));
     }
-    const lookup = try std.json.Stringify.valueAlloc(pa, .{ .full_text_search = .{ .match_all = .{} }, .filter_query = .{ .disjuncts = clauses.items }, .fields = keys, .limit = batch_size + 1, .remote_snapshot = changes.position.remote_snapshot, .lake_read = root.object.get("lake_read") }, .{ .emit_null_optional_fields = false });
+    const lookup = try std.json.Stringify.valueAlloc(pa, .{ .full_text_search = .{ .match_all = .{} }, .filter_query = .{ .disjuncts = clauses.items }, .fields = keys, .limit = batch_size + 1, .remote_snapshot = changes.position.remote_snapshot, .read_requirements = root.object.get("read_requirements"), .lake_read = root.object.get("lake_read") }, .{ .emit_null_optional_fields = false });
     try executor.checkpoint(executor.ptr);
     var response = try executor.execute(executor.ptr, response_a, changes.position.table, lookup);
     if (response.status != 200) {
@@ -410,8 +445,9 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
         if (offset != 0 or count or value != .string) return error.InvalidQueryRequest;
         const bytes = if (executor.load_cursor) |load| try load(executor.ptr, scratch, value.string) else value.string;
         restored = std.json.parseFromSliceLeaky(Continuation, scratch, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
-        if (restored.?.version != 2 or restored.?.sources.len != leaves.len or !std.mem.eql(u8, restored.?.fingerprint, &fingerprint)) return error.CatalogGenerationChanged;
+        if ((restored.?.version != 2 and restored.?.version != 3) or restored.?.sources.len != leaves.len or !std.mem.eql(u8, restored.?.fingerprint, &fingerprint)) return error.CatalogGenerationChanged;
     }
+    const initial_rows = if (count or aggregations != null or graph_spec != null) batch_size else @max(1, @min(batch_size, offset +| limit +| 1));
     const streams = try scratch.alloc(Stream, leaves.len);
     var initialized: usize = 0;
     defer for (streams[0..initialized]) |*stream| {
@@ -425,8 +461,10 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
         const name = leaf.object.get("table") orelse return error.InvalidQueryRequest;
         if (name != .string or name.string.len == 0) return error.InvalidQueryRequest;
         if ((try names.getOrPut(scratch, name.string)).found_existing) return error.InvalidQueryRequest;
-        stream.* = .{ .position = if (restored) |state| state.sources[i] else .{ .table = name.string }, .arena = std.heap.ArenaAllocator.init(budget.allocator()), .position_arena = std.heap.ArenaAllocator.init(budget.allocator()) };
+        stream.* = .{ .page_rows = initial_rows, .position = if (restored) |state| state.sources[i] else .{ .table = name.string }, .arena = std.heap.ArenaAllocator.init(budget.allocator()), .position_arena = std.heap.ArenaAllocator.init(budget.allocator()) };
         initialized += 1;
+        // Version 2 only admitted exact counts, which also marked first binding.
+        if (restored != null and restored.?.version == 2) stream.position.identity_pinned = stream.position.total != null;
         if (!std.mem.eql(u8, stream.position.table, name.string) or stream.position.raw_count < stream.position.visible_count or (stream.position.total != null and stream.position.raw_count > stream.position.total.?)) return error.InvalidQueryRequest;
         // Reauthorize even exhausted leaves. A previous page cannot freeze grants.
         stream.refill(scratch, a, root, orders, rrf, executor) catch |err| {
@@ -450,11 +488,13 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
     var exact_total: ?usize = if (restored) |state| state.total else null;
     if (!overlay) {
         var total: usize = 0;
-        for (streams) |stream| total = try std.math.add(usize, total, stream.position.total.?);
-        exact_total = total;
+        const all_exact = for (streams) |stream| {
+            total = try std.math.add(usize, total, stream.position.total orelse break false);
+        } else true;
+        if (all_exact) exact_total = total;
     } else if (exact_total == null) {
         const complete = for (streams) |stream| {
-            if (stream.position.raw_count + stream.hits.len != stream.position.total.?) break false;
+            if (stream.position.total == null or stream.position.raw_count + stream.hits.len != stream.position.total.?) break false;
         } else true;
         if (complete) {
             var total: usize = 0;
@@ -498,6 +538,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
                         } else try maskTombstones(stream, tombstone);
                     }
                 }
+                if (stream.done()) break;
                 if (stream.hidden[stream.at]) {
                     try stream.advance(scratch, false);
                     continue;
@@ -580,7 +621,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
             const physical = if (identity == .object) identity.object.get("physical") else null;
             leaf.* = .{ .table = position.table, .physical = if (physical) |name| name.string else position.table, .token = position.remote_snapshot orelse return error.UnsupportedQueryRequest, .identity = position.identity };
         }
-        break :graph try graph.execute(scratch, specification, graph_leaves, keys, kinds, tombstone, root.object.get("lake_visibility"), output.items, complete and offset == 0, executor);
+        break :graph try graph.execute(scratch, specification, graph_leaves, keys, kinds, tombstone, root, output.items, complete and offset == 0, executor);
     } else null;
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ .status = 200, .took = 0, .hits = .{ .total = .{ .value = exact_total orelse seen, .relation = if (exact_total != null) "exact" else "gte" }, .hits = output.items }, .source_ranking = if (rrf) "rrf" else "ordered", .next_source_cursor = next, .aggregations = computed_aggregations, .graph_results = graph_results }} }, .{ .emit_null_optional_fields = false });
     errdefer a.free(encoded);
@@ -711,6 +752,11 @@ test "external lake composed query paginates a global result and expires changed
     try std.testing.expectEqualStrings("current", result.object.get("hits").?.object.get("hits").?.array.items[0].object.get("_table").?.string);
     var request = try std.json.parseFromSliceLeaky(V, scratch, first_body, .{});
     try request.object.put(scratch, "source_cursor", result.object.get("next_source_cursor").?);
+    // Keep old retained cursors readable after the independent binding marker.
+    var legacy = try std.json.parseFromSliceLeaky(V, scratch, result.object.get("next_source_cursor").?.string, .{});
+    try legacy.object.put(scratch, "version", .{ .integer = 2 });
+    for (legacy.object.getPtr("sources").?.array.items) |*position| _ = position.object.orderedRemove("identity_pinned");
+    try request.object.put(scratch, "source_cursor", .{ .string = try std.json.Stringify.valueAlloc(scratch, legacy, .{}) });
     const next_body = try std.json.Stringify.valueAlloc(scratch, request, .{});
     var next = try execute(a, next_body, fixture.executor());
     defer next.deinit(a);
@@ -737,13 +783,15 @@ test "external lake keyed composition hides a newer nonmatching row and tombston
 test "external lake disjoint RRF union proves a bounded window over archive-scale totals" {
     const Fixture = struct {
         fn checkpoint(_: *anyopaque) !void {}
-        fn execute(_: *anyopaque, a: A, _: []const u8, body: []const u8) !Response {
+        fn execute(raw: *anyopaque, a: A, _: []const u8, body: []const u8) !Response {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const scratch = arena.allocator();
             const query = try std.json.parseFromSliceLeaky(V, scratch, body, .{});
             const start = if (query.object.get("search_after")) |after| (try std.fmt.parseInt(usize, after.array.items[1].string, 10)) + 1 else 0;
             const maximum = try integer(query.object.get("limit").?);
+            const observed: *usize = @ptrCast(@alignCast(raw));
+            observed.* = @max(observed.*, maximum);
             var hits: std.ArrayList(V) = .empty;
             for (start..@min(start + maximum, 1000000)) |rank| {
                 const id = try std.fmt.allocPrint(scratch, "{d:0>8}", .{rank});
@@ -753,13 +801,14 @@ test "external lake disjoint RRF union proves a bounded window over archive-scal
             return @import("contextual_operations.zig").json(try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ .hits = .{ .total = .{ .value = 1000000 - start, .relation = "exact" }, .hits = hits.items } }} }, .{}), false);
         }
     };
-    var marker: u8 = 0;
+    var marker: usize = 0;
     const a = std.testing.allocator;
     var response = try execute(a, "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"source_ranking\":\"rrf\",\"limit\":2}", .{ .ptr = &marker, .execute = Fixture.execute, .checkpoint = Fixture.checkpoint });
     defer response.deinit(a);
     var decoded = try std.json.parseFromSlice(V, a, response.body, .{});
     defer decoded.deinit();
     const hits = decoded.value.object.get("responses").?.array.items[0].object.get("hits").?;
+    try std.testing.expectEqual(@as(usize, 3), marker);
     try std.testing.expectEqual(@as(i64, 2000000), hits.object.get("total").?.object.get("value").?.integer);
     try std.testing.expectEqual(@as(usize, 2), hits.object.get("hits").?.array.items.len);
 }
@@ -768,6 +817,7 @@ const ArchiveOverlayFixture = struct {
     calls: usize = 0,
     checks: usize = 0,
     cancel_after: ?usize = null,
+    lower_bounds: bool = false,
     fn checkpoint(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.checks += 1;
@@ -804,7 +854,7 @@ const ArchiveOverlayFixture = struct {
             const value = try std.json.Stringify.valueAlloc(pa, .{ ._id = "c10004", ._sort = [_]V{ .{ .float = 1 }, .{ .string = "c10004" } }, ._source = .{ .id = 10004, .body = "new match", .deleted = false } }, .{});
             try hits.append(pa, try std.json.parseFromSliceLeaky(V, pa, value, .{}));
         }
-        return @import("contextual_operations.zig").json(try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ ._composed_identity = "stable", .remote_snapshot = table, .hits = .{ .total = .{ .value = remaining, .relation = "exact" }, .hits = hits.items } }} }, .{}), false);
+        return @import("contextual_operations.zig").json(try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ ._composed_identity = "stable", .remote_snapshot = table, .hits = .{ .total = .{ .value = remaining, .relation = if (self.lower_bounds and std.mem.eql(u8, table, "history") and hits.items.len == try integer(request.object.get("limit").?)) "gte" else "exact" }, .hits = hits.items } }} }, .{}), false);
     }
     fn executor(self: *@This()) Executor {
         return .{ .ptr = self, .execute = run, .checkpoint = checkpoint };
@@ -812,7 +862,7 @@ const ArchiveOverlayFixture = struct {
 };
 test "external lake archive overlay streams past five thousand masked candidates and continues without replay" {
     const a = std.testing.allocator;
-    var fixture: ArchiveOverlayFixture = .{};
+    var fixture: ArchiveOverlayFixture = .{ .lower_bounds = true };
     const body = "{\"source\":{\"overlay\":{\"base\":{\"table\":\"history\"},\"changes\":{\"table\":\"current\"},\"key\":[\"id\"]}},\"source_ranking\":\"rrf\",\"limit\":3}";
     var first = try execute(a, body, fixture.executor());
     defer first.deinit(a);
@@ -878,4 +928,127 @@ test "external lake composed ID ordering accepts native cursor without a duplica
 test "external lake composed aggregations reject background corpus operators" {
     var fixture: TestExecutor = .{};
     try std.testing.expectError(error.UnsupportedQueryRequest, execute(std.testing.allocator, "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"source_ranking\":\"rrf\",\"aggregations\":{\"significant\":{\"type\":\"significant_terms\",\"field\":\"body\"}}}", fixture.executor()));
+}
+
+const LowerBoundFixture = struct {
+    changed: bool = false,
+    incomplete: bool = false,
+    calls: usize = 0,
+    rows: usize = 7,
+    full_total: bool = false,
+    inconsistent_exact: bool = false,
+    fn checkpoint(_: *anyopaque) !void {}
+    fn run(raw: *anyopaque, a: A, table: []const u8, body: []const u8) !Response {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const pa = arena.allocator();
+        const request = try std.json.parseFromSliceLeaky(V, pa, body, .{});
+        const start = if (request.object.get("search_after")) |after| try std.fmt.parseInt(usize, after.array.items[1].string, 10) + 1 else 0;
+        const maximum = try integer(request.object.get("limit").?);
+        var hits: std.ArrayList(V) = .empty;
+        for (start..@min(start + maximum, self.rows)) |rank| {
+            const id = try std.fmt.allocPrint(pa, "{d:0>8}", .{rank});
+            const item = try std.json.Stringify.valueAlloc(pa, .{ ._id = id, ._sort = [_]V{ .{ .float = 1.0 / @as(f64, @floatFromInt(rank + 1)) }, .{ .string = id } }, ._source = .{ .id = rank } }, .{});
+            try hits.append(pa, try std.json.parseFromSliceLeaky(V, pa, item, .{}));
+        }
+        const exact = self.inconsistent_exact or (!self.incomplete and hits.items.len < maximum);
+        // Change the bound between requests; it is never a snapshot identity.
+        const value = if (self.inconsistent_exact) 0 else if (exact) (if (self.full_total) self.rows else self.rows - start) else if (self.calls % 2 == 0) hits.items.len else self.rows - start;
+        return @import("contextual_operations.zig").json(try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ ._composed_identity = self.changed, .remote_snapshot = table, .hits = .{ .total = .{ .value = value, .relation = if (exact) "exact" else "gte" }, .hits = hits.items } }} }, .{}), false);
+    }
+    fn executor(self: *@This()) Executor {
+        return .{ .ptr = self, .execute = run, .checkpoint = checkpoint };
+    }
+};
+test "external lake composition retains lower-bound cuts and proves exact exhaustion" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 6, 7 }) |rows| {
+        for ([_]bool{ false, true }) |full_total| {
+            var fixture: LowerBoundFixture = .{ .rows = rows, .full_total = full_total };
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const pa = arena.allocator();
+            var request = try std.json.parseFromSliceLeaky(V, pa,
+                \\{"source":{"union":[{"table":"history"},{"table":"current"}]},"source_ranking":"rrf","limit":2}
+            , .{});
+            var seen: usize = 0;
+            var pages: usize = 0;
+            while (true) {
+                var response = try execute(a, try std.json.Stringify.valueAlloc(pa, request, .{}), fixture.executor());
+                defer response.deinit(a);
+                const result = (try std.json.parseFromSliceLeaky(V, pa, response.body, .{})).object.get("responses").?.array.items[0];
+                const hits = result.object.get("hits").?;
+                for (hits.object.get("hits").?.array.items) |hit| {
+                    try std.testing.expectEqual(@as(i64, @intCast(seen / 2)), hit.object.get("_source").?.object.get("id").?.integer);
+                    try std.testing.expectEqualStrings(if (seen % 2 == 0) "current" else "history", hit.object.get("_table").?.string);
+                    seen += 1;
+                }
+                pages += 1;
+                if (result.object.get("next_source_cursor")) |cursor| {
+                    if (pages == 1) {
+                        try std.testing.expectEqualStrings("gte", hits.object.get("total").?.object.get("relation").?.string);
+                        var next = try clone(pa, request, V);
+                        try next.object.put(pa, "source_cursor", cursor);
+                        fixture.inconsistent_exact = true;
+                        try std.testing.expectError(error.CatalogGenerationChanged, execute(a, try std.json.Stringify.valueAlloc(pa, next, .{}), fixture.executor()));
+                        fixture.inconsistent_exact = false;
+                        fixture.changed = true;
+                        try std.testing.expectError(error.CatalogGenerationChanged, execute(a, try std.json.Stringify.valueAlloc(pa, next, .{}), fixture.executor()));
+                        fixture.changed = false;
+                    }
+                    try request.object.put(pa, "source_cursor", cursor);
+                } else {
+                    try std.testing.expectEqualStrings("exact", hits.object.get("total").?.object.get("relation").?.string);
+                    try std.testing.expectEqual(@as(i64, @intCast(rows * 2)), hits.object.get("total").?.object.get("value").?.integer);
+                    break;
+                }
+                try std.testing.expect(pages < 10);
+            }
+            try std.testing.expectEqual(rows * 2, seen);
+        }
+    }
+}
+test "external lake composition rejects short lower-bound windows and inexact count requests" {
+    const a = std.testing.allocator;
+    var fixture: LowerBoundFixture = .{ .incomplete = true };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, execute(a,
+        \\{"source":{"union":[{"table":"history"},{"table":"current"}]},"source_ranking":"rrf","limit":10}
+    , fixture.executor()));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, execute(a,
+        \\{"source":{"union":[{"table":"history"},{"table":"current"}]},"source_ranking":"rrf","count":true}
+    , fixture.executor()));
+}
+
+test "external lake composition keeps million-row lower-bound leaves bounded" {
+    const a = std.testing.allocator;
+    var fixture: LowerBoundFixture = .{ .rows = 1000000 };
+    var response = try execute(a,
+        \\{"source":{"union":[{"table":"history"},{"table":"current"}]},"source_ranking":"rrf","limit":2}
+    , fixture.executor());
+    defer response.deinit(a);
+    var parsed = try std.json.parseFromSlice(V, a, response.body, .{});
+    defer parsed.deinit();
+    const hits = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?;
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 2), hits.object.get("hits").?.array.items.len);
+    try std.testing.expectEqualStrings("gte", hits.object.get("total").?.object.get("relation").?.string);
+    try std.testing.expectEqual(@as(i64, 2), hits.object.get("total").?.object.get("value").?.integer);
+}
+test "external lake composition accepts an exact empty terminal window after unknown totals" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const after = [_]V{ .{ .float = 1.0 / 7.0 }, .{ .string = "00000006" } };
+    var stream: Stream = .{ .position = .{ .table = "history", .after = &after, .raw_count = 7, .visible_count = 7, .identity = "false", .identity_pinned = true, .remote_snapshot = "history" }, .arena = std.heap.ArenaAllocator.init(a), .position_arena = std.heap.ArenaAllocator.init(a) };
+    defer stream.arena.deinit();
+    defer stream.position_arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(V, pa, "{}", .{});
+    var fixture: LowerBoundFixture = .{};
+    try stream.refill(pa, a, root, &.{.{ .field = "_score", .desc = true }}, true, fixture.executor());
+    try std.testing.expect(stream.done());
+    try std.testing.expectEqual(@as(usize, 7), stream.position.total.?);
+    try std.testing.expectEqual(@as(usize, 0), stream.hits.len);
 }

@@ -24,6 +24,10 @@ pub fn has(node: *const ast.Scalar) bool {
         .call => |part| blk: {
             if (part.subquery != null) break :blk true;
             for (part.args) |arg| if (has(arg)) break :blk true;
+            if (part.window) |window| {
+                for (window.partition) |value| if (has(value)) break :blk true;
+                for (window.order) |order| if (order.expression) |value| if (has(value)) break :blk true;
+            }
             break :blk if (part.filter) |filter| has(filter) else false;
         },
         .unary => |part| has(part.operand),
@@ -43,9 +47,9 @@ pub fn has(node: *const ast.Scalar) bool {
 }
 
 /// A read in one of these positions is not demanded on every row. Moving it
-/// into a grouped/hoisted child could expose cardinality, type, or permission
-/// errors from a branch SQL would never evaluate. This is the admission
-/// boundary until a masked Apply operator owns branch-row and snapshot state.
+/// into a grouped/hoisted child could expose runtime cardinality/value errors
+/// from a branch SQL would never evaluate. Binding/authorization still cover
+/// every branch; masked Apply owns execution demand, not permission bypasses.
 pub fn hasConditional(node: *const ast.Scalar) bool {
     return switch (node.*) {
         .literal, .column => false,
@@ -90,25 +94,45 @@ pub fn accepts(statement: ast.Select) bool {
     for (statement.group_by) |value| if (has(value)) return true;
     if (statement.having) |value| if (has(value)) return true;
     for (statement.order_by) |order| if (order.expression) |value| if (has(value)) return true;
+    for (statement.windows) |definition| {
+        for (definition.window.partition) |value| if (has(value)) return true;
+        for (definition.window.order) |order| if (order.expression) |value| if (has(value)) return true;
+    }
     return false;
 }
 const Names = std.StringHashMapUnmanaged(void);
-fn aliases(alloc: Allocator, relation: *const ast.Relation, names: *Names) !void {
+/// Compiler-owned input relations can retain multiple lexical qualifiers even
+/// though their physical rows are supplied by one prepared cursor.
+pub const PreparedScope = struct { table: []const u8, qualifiers: []const []const u8 };
+fn aliases(alloc: Allocator, relation: *const ast.Relation, names: *Names, prepared: ?PreparedScope) !void {
     switch (relation.*) {
-        .table => |table| try names.put(alloc, table.alias orelse table.name.table, {}),
-        .derived => |query| try names.put(alloc, query.alias, {}),
+        .table => |table| {
+            if (table.prepared_rows) if (prepared) |scope| if (std.mem.eql(u8, table.name.table, scope.table)) {
+                for (scope.qualifiers) |qualifier| try names.put(alloc, qualifier, {});
+                return;
+            };
+            try names.put(alloc, table.alias orelse table.name.table, {});
+        },
+        .derived => |query| if (query.phase_scope != null or query.preserve_scope) {
+            if (query.query.source) |source| try aliases(alloc, source, names, prepared) else if (query.query.table) |table| try names.put(alloc, table.table, {});
+            if (query.phase_scope != null) try names.put(alloc, query.alias, {});
+        } else try names.put(alloc, query.alias, {}),
         .join => |join| {
-            try aliases(alloc, join.left, names);
-            try aliases(alloc, join.right, names);
+            try aliases(alloc, join.left, names, prepared);
+            try aliases(alloc, join.right, names, prepared);
         },
     }
 }
 const Key = struct { inner: *const ast.Scalar, outer: *const ast.Scalar, comparison: ast.Scalar.Binary = .eq };
 const Builder = struct {
     alloc: Allocator,
+    prepared_scope: ?PreparedScope = null,
     source: *const ast.Relation,
     outer: Names = .empty,
     serial: usize = 0,
+    window_demand: ?*const ast.Scalar = null,
+    window_inputs: std.ArrayList(struct { original: *const ast.Scalar, demand: ?*const ast.Scalar, value: *const ast.Scalar }) = .empty,
+    row_producers: std.ArrayList(struct { query: *const ast.Select, demand: ?*const ast.Scalar, alias: []const u8 }) = .empty,
     fn scalar(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
         const out = try self.alloc.create(ast.Scalar);
         out.* = value;
@@ -143,6 +167,9 @@ const Builder = struct {
         source: ?*const ast.Relation = null,
         table: ?ast.Name = null,
         local: ?*const Names = null,
+        /// A closure proof cannot assume that an unqualified name belongs to
+        /// a table whose layout has not been pinned yet.
+        conservative: bool = false,
     };
     fn relationDefines(value: *const ast.Relation, qualifier: []const u8) bool {
         return switch (value.*) {
@@ -161,9 +188,11 @@ const Builder = struct {
         return false;
     }
     fn nestedOuterField(self: *Builder, name: []const u8, scope: ?*const NestedScope) bool {
-        const separator = std.mem.indexOfScalar(u8, name, 0) orelse return false;
+        if (name.len == 0) return false;
+        const conservative = if (scope) |frame| frame.conservative else false;
+        const separator = std.mem.indexOfScalar(u8, name, 0) orelse return conservative;
         const qualifier = name[0..separator];
-        return !nestedScopeDefines(scope, qualifier) and self.outer.contains(qualifier);
+        return !nestedScopeDefines(scope, qualifier) and (conservative or self.outer.contains(qualifier));
     }
     /// A nested value relation is safe to leave inside a derived child only
     /// when it cannot reach past that child's lexical parent. The child will
@@ -213,11 +242,13 @@ const Builder = struct {
         return switch (value.*) {
             .table => false,
             .derived => |part| self.nestedOuterSelect(part.query, scope),
-            .join => |part| self.nestedOuterRelation(part.left, scope) or self.nestedOuterRelation(part.right, scope) or if (part.condition) |condition| self.nestedOuterScalar(condition, scope) else false,
+            .join => |part| self.nestedOuterRelation(part.left, scope) or self.nestedOuterRelation(part.right, scope) or
+                (if (part.condition) |condition| self.nestedOuterScalar(condition, scope) else false) or
+                (if (part.demand) |demand| self.nestedOuterScalar(demand, scope) else false),
         };
     }
     fn nestedOuterSelect(self: *Builder, query: *const ast.Select, parent: ?*const NestedScope) bool {
-        const scope: NestedScope = .{ .parent = parent, .source = query.source, .table = query.table };
+        const scope: NestedScope = .{ .parent = parent, .source = query.source, .table = query.table, .conservative = if (parent) |frame| frame.conservative else false };
         for (query.values_arms) |arm| if (self.nestedOuterSelect(arm, &scope)) return true;
         if (query.set_operation) |set| if (self.nestedOuterSelect(set.left, &scope) or self.nestedOuterSelect(set.right, &scope)) return true;
         if (query.source) |source| if (self.nestedOuterRelation(source, &scope)) return true;
@@ -371,7 +402,7 @@ const Builder = struct {
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         if (!exists and original.columns.len != 1 and !original.count_all) return error.InvalidSqlParameters;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         if (exists) if (original.predicate) |predicate| {
             const filter = try self.predicateScalar(predicate);
             if (self.hasOuterOr(filter, local)) {
@@ -501,7 +532,7 @@ const Builder = struct {
     /// NULL; evaluating the original scalar expression here preserves that
     /// empty-input contract even for CASE, arithmetic and COALESCE.
     fn aggregateResult(self: *Builder, input: *const ast.Scalar, alias: []const u8, columns: *std.ArrayList(ast.Projection)) anyerror!*const ast.Scalar {
-        if (input.* == .call and @import("aggregate_binding.zig").aggregateKind(input.call.name) != null) {
+        if (input.* == .call and (input.call.within_group != null or @import("aggregate_binding.zig").aggregateKind(input.call.name) != null)) {
             if (columns.items.len >= 256) return error.SqlProgramLimitExceeded;
             const name = try std.fmt.allocPrint(self.alloc, "$aggregate_{d}", .{columns.items.len});
             try columns.append(self.alloc, .{ .alias = name, .expression = input });
@@ -513,7 +544,7 @@ const Builder = struct {
             .column => return error.SqlGroupingError,
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.aggregateResult(part.operand, alias, columns) } },
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.aggregateResult(part.left, alias, columns), .right = try self.aggregateResult(part.right, alias, columns) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .operand = try self.aggregateResult(part.operand, alias, columns) } },
+            .cast => |part| .{ .cast = part.withOperand(try self.aggregateResult(part.operand, alias, columns)) },
             .call => |part| blk: {
                 if (part.subquery != null or part.window != null or part.filter != null or part.distinct or part.star) return error.UnsupportedSqlShape;
                 var copy = part;
@@ -543,6 +574,7 @@ const Builder = struct {
         if (std.mem.eql(u8, suffix, "like") or std.mem.eql(u8, suffix, "ilike") or std.mem.eql(u8, suffix, "not_like") or std.mem.eql(u8, suffix, "not_ilike"))
             return self.patternQuantified(expression, every, std.mem.endsWith(u8, suffix, "ilike"), std.mem.startsWith(u8, suffix, "not_"));
         const op = std.meta.stringToEnum(ast.Scalar.Binary, suffix) orelse return error.UnsupportedSqlShape;
+        if (try self.quantifiedNeedsApply(expression.call.subquery.?)) return self.quantifiedProducer(expression, op, every, false);
         if ((!every and op == .eq) or (every and op == .neq)) {
             const result = try self.membership(expression);
             return if (every) self.scalar(.{ .unary = .{ .op = .not, .operand = result } }) else result;
@@ -551,7 +583,7 @@ const Builder = struct {
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         const value = original.columns[0].expression orelse try self.scalar(.{ .column = original.columns[0].field });
         if (self.referencesOuter(value, local)) return error.UnsupportedSqlShape;
         const operand = try self.rewrite(expression.call.args[0]);
@@ -610,11 +642,12 @@ const Builder = struct {
     }
 
     fn patternQuantified(self: *Builder, expression: *const ast.Scalar, every: bool, insensitive: bool, negated: bool) anyerror!*const ast.Scalar {
+        if (try self.quantifiedNeedsApply(expression.call.subquery.?)) return self.quantifiedProducer(expression, if (insensitive) .ilike else .like, every, negated);
         const original = try self.valueQuery(expression.call.subquery.?, true);
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         const value = original.columns[0].expression orelse try self.scalar(.{ .column = original.columns[0].field });
         if (self.referencesOuter(value, local)) return error.UnsupportedSqlShape;
         const operand = try self.rewrite(expression.call.args[0]);
@@ -659,11 +692,13 @@ const Builder = struct {
     /// A plain semi/anti join is insufficient: an unmatched NOT IN must still
     /// become UNKNOWN when the correlated inner set contains SQL NULL.
     fn membership(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
+        if (expression.call.args.len == 1 and expression.call.args[0].* == .call and std.mem.eql(u8, expression.call.args[0].call.name, "$row")) return self.tupleMembership(expression);
+        if (try self.quantifiedNeedsApply(expression.call.subquery.?)) return self.quantifiedProducer(expression, .eq, false, false);
         const original = try self.valueQuery(expression.call.subquery.?, true);
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         const value = original.columns[0].expression orelse try self.scalar(.{ .column = original.columns[0].field });
         if (self.referencesOuter(value, local)) return error.UnsupportedSqlShape;
         const operand = try self.rewrite(expression.call.args[0]);
@@ -722,42 +757,457 @@ const Builder = struct {
         branches[2] = .{ .condition = try self.scalar(.{ .binary = .{ .op = .@"or", .left = try self.scalar(.{ .unary = .{ .op = .is_null, .operand = operand } }), .right = try self.scalar(.{ .binary = .{ .op = .gt, .left = total, .right = nonnull } }) } }), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) };
         return self.scalar(.{ .case_when = .{ .branches = branches, .otherwise = try self.scalar(.{ .literal = .{ .boolean = false } }) } });
     }
+    /// Keep keyed summaries for ordinary children, but never move a complete
+    /// query boundary or a non-keyed outer predicate into an independent scope.
+    fn quantifiedNeedsApply(self: *Builder, query: *const ast.Select) !bool {
+        if (scalarBoundary(query.*) or query.count_all or @import("aggregate_binding.zig").accepts(query.*)) {
+            // A provably closed boundary still belongs to the shared hash
+            // build. Unknown/unqualified references stay in Apply until the
+            // catalog binder resolves their lexical ownership.
+            const scope: NestedScope = .{ .conservative = true };
+            return self.nestedOuterSelect(query, &scope);
+        }
+        var local: Names = .empty;
+        if (query.source) |source| {
+            try aliases(self.alloc, source, &local, self.prepared_scope);
+            const scope: NestedScope = .{ .source = source };
+            if (self.nestedOuterRelation(source, &scope)) return true;
+        } else if (query.table) |table| try local.put(self.alloc, table.table, {});
+        for (query.columns) |column| {
+            if (column.wildcard) return true;
+            const value = column.expression orelse try self.scalar(.{ .column = column.field });
+            if (self.referencesOuter(value, local)) return true;
+            if (query.source == null and query.table == null and value.* == .column) return true;
+        }
+        if (query.predicate) |predicate| {
+            var keys: std.ArrayList(Key) = .empty;
+            _ = self.extract(try self.predicateScalar(predicate), local, &keys, null) catch |err| switch (err) {
+                error.UnsupportedSqlShape => return true,
+                else => return err,
+            };
+        }
+        return false;
+    }
+
+    /// Compare actual child outputs after its sort/page/group/window boundary.
+    /// Materialize each comparison once; true/false and unknown witnesses have
+    /// separate states so empty input retains ANY=false and ALL=true.
+    fn quantifiedProducer(self: *Builder, expression: *const ast.Scalar, op: ast.Scalar.Binary, every: bool, negated: bool) anyerror!*const ast.Scalar {
+        if (expression.call.args.len != 1) return error.InvalidSqlParameters;
+        const operand = try self.prerequisite(try self.rewrite(expression.call.args[0]), null);
+        const alias = try self.quantifiedAlias("$quantified_demand");
+        const input_alias = try self.quantifiedAlias("$quantified_input");
+        const compared_alias = try self.quantifiedAlias("$quantified_compared");
+        var comparison = try self.scalar(.{ .binary = .{ .op = op, .left = operand, .right = try self.field(input_alias, "$value") } });
+        if (negated) comparison = try self.scalar(.{ .unary = .{ .op = .not, .operand = comparison } });
+        const compared = try self.alloc.create(ast.Select);
+        compared.* = .{
+            .source = try self.relation(.{ .derived = .{ .query = expression.call.subquery.?, .alias = input_alias, .columns = &.{"$value"} } }),
+            .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$comparison", .expression = comparison }}),
+        };
+        const value = try self.field(compared_alias, "$comparison");
+        const decisive = try self.call("bool_or", &.{try self.testValue(if (every) .is_false else .is_true, value)});
+        const unknown = try self.call("bool_or", &.{try self.testValue(.is_null, value)});
+        const truth = try self.scalar(.{ .case_when = .{
+            .branches = try self.alloc.dupe(ast.Scalar.Branch, &.{
+                .{ .condition = try self.testValue(.is_true, decisive), .value = try self.scalar(.{ .literal = .{ .boolean = !every } }) },
+                .{ .condition = try self.testValue(.is_true, unknown), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) },
+            }),
+            .otherwise = try self.scalar(.{ .literal = .{ .boolean = every } }),
+        } });
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{
+            .source = try self.relation(.{ .derived = .{ .query = compared, .alias = compared_alias } }),
+            .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$value", .expression = truth }}),
+        };
+        self.source = try self.relation(.{ .join = .{ .kind = .left, .left = self.source, .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }) } });
+        return self.field(alias, "$value");
+    }
+
+    fn quantifiedAlias(self: *Builder, prefix: []const u8) ![]const u8 {
+        while (self.serial < 64) {
+            const name = try std.fmt.allocPrint(self.alloc, "{s}_{d}", .{ prefix, self.serial });
+            self.serial += 1;
+            // Quoted SQL identifiers can spell our prefixes. Never shadow a
+            // target binding merely because it resembles an internal name.
+            if (self.outer.contains(name)) continue;
+            try self.outer.put(self.alloc, name, {});
+            return name;
+        }
+        return error.SqlProgramLimitExceeded;
+    }
+
+    fn tupleMembership(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
+        const original = expression.call.subquery.?;
+        const operands = expression.call.args[0].call.args;
+        if (operands.len == 0 or operands.len > 256) return error.InvalidSqlSyntax;
+        var local: Names = .empty;
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        var keys: std.ArrayList(Key) = .empty;
+        // Non-keyed correlated query boundaries need an Apply-owned producer;
+        // never strip their sort/page/group domain while hoisting a build.
+        const residual = if (original.predicate) |predicate| self.extract(try self.predicateScalar(predicate), local, &keys, null) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return self.tupleProducer(original, operands),
+            else => return err,
+        } else null;
+        for (original.columns) |column| if (!column.wildcard) {
+            const value = column.expression orelse try self.scalar(.{ .column = column.field });
+            if (self.referencesOuter(value, local) or (keys.items.len != 0 and value.* != .column and value.* != .literal)) return self.tupleProducer(original, operands);
+        };
+        if (keys.items.len != 0 and scalarBoundary(original.*)) return self.tupleProducer(original, operands);
+        if (keys.items.len + operands.len > 256) return error.SqlProgramLimitExceeded;
+        const alias = try std.fmt.allocPrint(self.alloc, "$membership_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const probes = try self.alloc.alloc(*const ast.Scalar, keys.items.len + operands.len);
+        var query = original.*;
+        if (keys.items.len != 0) {
+            const columns = try self.alloc.alloc(ast.Projection, keys.items.len + original.columns.len);
+            for (keys.items, columns[0..keys.items.len], probes[0..keys.items.len]) |key, *column, *probe| {
+                column.* = .{ .expression = key.inner };
+                probe.* = try self.rewrite(key.outer);
+            }
+            @memcpy(columns[keys.items.len..], original.columns);
+            query.columns = columns;
+            query.predicate = if (residual) |value| blk: {
+                const predicate = try self.alloc.create(ast.Predicate);
+                predicate.* = .{ .scalar = value };
+                break :blk predicate;
+            } else null;
+        }
+        for (operands, probes[keys.items.len..]) |operand, *probe| probe.* = try self.rewrite(operand);
+        const owned = try self.alloc.create(ast.Select);
+        owned.* = query;
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = owned, .alias = alias, .hidden = true } }),
+            .membership = .{ .probes = probes, .correlations = keys.items.len, .alias = alias },
+        } });
+        return self.field(alias, "$value");
+    }
+
+    /// Preserve complex correlated query boundaries and demand. Summarize the
+    /// child's actual output rows, not rows eliminated by its WHERE/sort/page
+    /// operators. A row equality is a three-valued conjunction; separate true
+    /// and unknown witnesses distinguish an empty/false set from NULL evidence.
+    fn tupleProducer(self: *Builder, original: *const ast.Select, operands: []const *const ast.Scalar) anyerror!*const ast.Scalar {
+        const alias = try std.fmt.allocPrint(self.alloc, "$tuple_demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const names = try self.alloc.alloc([]const u8, operands.len);
+        var comparison: ?*const ast.Scalar = null;
+        for (operands, names, 0..) |operand, *name, index| {
+            name.* = try std.fmt.allocPrint(self.alloc, "$value_{d}", .{index});
+            const value = try self.prerequisite(try self.rewrite(operand), null);
+            const equal = try self.scalar(.{ .binary = .{ .op = .eq, .left = value, .right = try self.field("$tuple_input", name.*) } });
+            comparison = if (comparison) |prior| try self.scalar(.{ .binary = .{ .op = .@"and", .left = prior, .right = equal } }) else equal;
+        }
+        const yes = try self.call("bool_or", &.{comparison.?});
+        const unknown = try self.call("bool_or", &.{try self.testValue(.is_null, comparison.?)});
+        const truth = try self.scalar(.{ .case_when = .{
+            .branches = try self.alloc.dupe(ast.Scalar.Branch, &.{
+                .{ .condition = try self.testValue(.is_true, yes), .value = try self.scalar(.{ .literal = .{ .boolean = true } }) },
+                .{ .condition = try self.testValue(.is_true, unknown), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) },
+            }),
+            .otherwise = try self.scalar(.{ .literal = .{ .boolean = false } }),
+        } });
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{ .source = try self.relation(.{ .derived = .{ .query = original, .alias = "$tuple_input", .columns = names } }), .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$value", .expression = truth }}) };
+        self.source = try self.relation(.{ .join = .{ .kind = .left, .left = self.source, .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }) } });
+        return self.field(alias, "$value");
+    }
+
     fn rewrite(self: *Builder, input: *const ast.Scalar) anyerror!*const ast.Scalar {
+        return self.rewriteDemand(input, null);
+    }
+
+    fn mask(self: *Builder, parent: ?*const ast.Scalar, predicate: *const ast.Scalar) !*const ast.Scalar {
+        return if (parent) |prior| self.scalar(.{ .binary = .{ .op = .@"and", .left = prior, .right = predicate } }) else predicate;
+    }
+
+    fn testValue(self: *Builder, op: ast.Scalar.Unary, value: *const ast.Scalar) !*const ast.Scalar {
+        return self.scalar(.{ .unary = .{ .op = op, .operand = value } });
+    }
+
+    /// A hidden one-cell producer materializes branch prerequisites exactly
+    /// once. It retains the original source's visible names and qualifiers.
+    /// Physical children remain in the enclosing captured relation plan.
+    fn produce(self: *Builder, value: *const ast.Scalar, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        const alias = try std.fmt.allocPrint(self.alloc, "$demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{ .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$value", .expression = value }}) };
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }),
+            .demand = demand,
+        } });
+        return self.field(alias, "$value");
+    }
+
+    fn prerequisite(self: *Builder, value: *const ast.Scalar, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        return if (value.* == .literal or value.* == .column) value else self.produce(value, demand);
+    }
+
+    /// Preserve the complete child query's domain (including its sort, page,
+    /// grouping and HAVING) inside a lateral producer. Summarize only its
+    /// resulting rows: the scalar cardinality contract must not count rows
+    /// discarded by the child's own operators. Invariant children and hash
+    /// builds use the enclosing Apply engine's statement-owned caches.
+    fn scalarProducer(self: *Builder, original: *const ast.Select, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        // The positional derived-column descriptor validates arity after
+        // wildcard/set expansion, even when the producer is never demanded.
+        const alias = try std.fmt.allocPrint(self.alloc, "$scalar_demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const bounded = try self.alloc.create(ast.Select);
+        bounded.* = original.*;
+        bounded.scalar_cardinality_limit = true;
+        // An explicit internal bound also disables ordinary unbounded-result
+        // overflow sentinels. Parameter limits are validated before capping.
+        if (bounded.limit == null) bounded.limit = .{ .integer = 2 };
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{
+            .source = try self.relation(.{ .derived = .{ .query = bounded, .alias = "$scalar_input", .columns = &.{"$value"} } }),
+            .columns = try self.alloc.dupe(ast.Projection, &.{
+                .{ .alias = "$count", .expression = try self.scalar(.{ .call = .{ .name = "count", .args = &.{}, .star = true } }) },
+                .{ .alias = "$value", .expression = try self.call("min", &.{try self.field("$scalar_input", "$value")}) },
+            }),
+        };
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }),
+            .demand = demand,
+        } });
+        return self.call("$single", &.{ try self.field(alias, "$value"), try self.field(alias, "$count") });
+    }
+
+    fn rowProducer(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        const original = input.call.subquery.?;
+        const width = original.required_output_columns orelse return error.InvalidSqlBackendResponse;
+        if (width == 0 or width > 1024 or input.call.args.len != 1) return error.InvalidSqlBackendResponse;
+        const argument = input.call.args[0];
+        if (argument.* != .literal or argument.literal != .integer) return error.InvalidSqlBackendResponse;
+        const slot = std.math.cast(usize, argument.literal.integer) orelse return error.InvalidSqlBackendResponse;
+        if (slot >= width) return error.InvalidSqlBackendResponse;
+        const output_name = try std.fmt.allocPrint(self.alloc, "$row_{d}", .{slot});
+        for (self.row_producers.items) |producer| {
+            if (producer.query == original and producer.demand == demand) return self.field(producer.alias, output_name);
+        }
+        const alias = try std.fmt.allocPrint(self.alloc, "$row_demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const names = try self.alloc.alloc([]const u8, width);
+        for (names, 0..) |*name, index| name.* = try std.fmt.allocPrint(self.alloc, "$row_{d}", .{index});
+        const bounded = try self.alloc.create(ast.Select);
+        bounded.* = original.*;
+        bounded.scalar_cardinality_limit = true;
+        if (bounded.limit == null) bounded.limit = .{ .integer = 2 };
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = bounded, .alias = alias, .columns = names, .hidden = true, .lateral = true } }),
+            .demand = demand,
+            .single_row = true,
+        } });
+        try self.row_producers.append(self.alloc, .{ .query = original, .demand = demand, .alias = alias });
+        return self.field(alias, output_name);
+    }
+
+    fn scalarBoundary(query: ast.Select) bool {
+        return query.set_operation != null or query.ctes.len != 0 or query.order_by.len != 0 or query.limit != null or query.offset != null or query.group_by.len != 0 or query.having != null or @import("window_binding.zig").accepts(query);
+    }
+
+    fn scalarNeedsApply(self: *Builder, query: ast.Select) !bool {
+        if (scalarBoundary(query)) return true;
+        if (query.predicate == null and (query.source != null or query.table != null)) return true;
+        var local: Names = .empty;
+        if (query.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (query.table) |table| try local.put(self.alloc, table.table, {});
+        for (query.columns) |projection| {
+            if (projection.wildcard) continue;
+            const value = projection.expression orelse try self.scalar(.{ .column = projection.field });
+            if (self.referencesOuter(value, local)) return true;
+            // Value programs can fail or call a provider. Do not evaluate
+            // unused groups/rows through an eager MIN summary before demand.
+            if (value.* != .column and value.* != .literal) return true;
+            // A source-free child has no local columns. Resolve any names in
+            // its actual outer frame, including unqualified references, rather
+            // than treating them as inputs to an uncorrelated aggregate.
+            if (query.source == null and query.table == null and self.referenceSides(value, local) != 0) return true;
+        }
+        if (query.predicate) |predicate| {
+            // Keep equality decorrelation's grouped, statement-wide fast path.
+            // Preflight before modifying the relation: non-keyed correlation
+            // instead retains the original predicate inside a lateral child.
+            var keys: std.ArrayList(Key) = .empty;
+            _ = self.extract(try self.predicateScalar(predicate), local, &keys, null) catch |err| switch (err) {
+                error.UnsupportedSqlShape => return true,
+                else => return err,
+            };
+        }
+        return false;
+    }
+
+    fn windowInput(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;
-        if (input.* == .call and input.call.subquery != null) return self.subquery(input);
-        if (hasConditional(input)) return error.UnsupportedSqlShape;
+        for (self.window_inputs.items) |prior| if (prior.original == input and prior.demand == demand) return prior.value;
+        const value = try self.prerequisite(try self.rewriteDemand(input, demand), demand);
+        try self.window_inputs.append(self.alloc, .{ .original = input, .demand = demand, .value = value });
+        return value;
+    }
+
+    fn rewriteWindow(self: *Builder, original: ast.Window, demand: ?*const ast.Scalar) anyerror!ast.Window {
+        var window = original;
+        const partitions = try self.alloc.alloc(*const ast.Scalar, original.partition.len);
+        for (original.partition, partitions) |value, *out| out.* = try self.windowInput(value, demand);
+        window.partition = partitions;
+        const orders = try self.alloc.dupe(ast.Order, original.order);
+        for (orders) |*order| if (order.expression) |value| {
+            order.expression = try self.windowInput(value, demand);
+        };
+        window.order = orders;
+        return window;
+    }
+
+    fn rewriteDemand(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
+        if (!has(input)) return input;
+        if (input.* == .call and input.call.subquery != null) {
+            if (std.mem.eql(u8, input.call.name, "$row_scalar")) return self.rowProducer(input, demand);
+            if (std.mem.eql(u8, input.call.name, "$scalar") and (demand != null or try self.scalarNeedsApply(input.call.subquery.?.*)))
+                return self.scalarProducer(input.call.subquery.?, demand);
+            return if (demand != null) self.produce(input, demand) else self.subquery(input);
+        }
         return self.scalar(switch (input.*) {
             .call => |part| blk: {
                 var copy = part;
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
-                for (part.args, args) |arg, *out| out.* = try self.rewrite(arg);
+                const input_demand = if (part.window != null) self.window_demand else demand;
+                var remaining = input_demand;
+                // FILTER belongs to the aggregate's input-row domain. Its
+                // argument producers must remain unopened for rejected rows,
+                // while the filter itself is evaluated once and remains bound.
+                copy.filter = if (part.filter) |filter| try self.prerequisite(try self.rewriteDemand(filter, input_demand), input_demand) else null;
+                if (copy.filter) |filter| remaining = try self.mask(input_demand, try self.testValue(.is_true, filter));
+                for (part.args, args, 0..) |arg, *out, i| {
+                    out.* = try self.rewriteDemand(arg, remaining);
+                    if (std.mem.eql(u8, part.name, "coalesce") and i + 1 < args.len) {
+                        out.* = try self.prerequisite(out.*, remaining);
+                        remaining = try self.mask(remaining, try self.testValue(.is_null, out.*));
+                    }
+                }
                 copy.args = args;
-                copy.filter = if (part.filter) |filter| try self.rewrite(filter) else null;
+                // Every WHERE-qualified row needs its partition/sort keys,
+                // even if this aggregate's FILTER rejects its argument.
+                copy.window = if (part.window) |window| try self.rewriteWindow(window, self.window_demand) else null;
                 break :blk .{ .call = copy };
             },
-            .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewrite(part.operand) } },
-            .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.rewrite(part.left), .right = try self.rewrite(part.right) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .operand = try self.rewrite(part.operand) } },
+            .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewriteDemand(part.operand, demand) } },
+            .binary => |part| blk: {
+                var left = try self.rewriteDemand(part.left, demand);
+                var right_demand = demand;
+                if (part.op == .@"and" or part.op == .@"or") {
+                    left = try self.prerequisite(left, demand);
+                    right_demand = try self.mask(demand, try self.testValue(if (part.op == .@"and") .is_not_false else .is_not_true, left));
+                }
+                break :blk .{ .binary = .{ .op = part.op, .left = left, .right = try self.rewriteDemand(part.right, right_demand) } };
+            },
+            .cast => |part| .{ .cast = part.withOperand(try self.rewriteDemand(part.operand, demand)) },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
-                for (part.branches, branches) |branch, *out| out.* = .{ .condition = try self.rewrite(branch.condition), .value = try self.rewrite(branch.value) };
-                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (part.otherwise) |other| try self.rewrite(other) else null } };
+                var remaining = demand;
+                for (part.branches, branches) |branch, *out| {
+                    const condition = try self.prerequisite(try self.rewriteDemand(branch.condition, remaining), remaining);
+                    out.* = .{ .condition = condition, .value = try self.rewriteDemand(branch.value, try self.mask(remaining, try self.testValue(.is_true, condition))) };
+                    remaining = try self.mask(remaining, try self.testValue(.is_not_true, condition));
+                }
+                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (part.otherwise) |other| try self.rewriteDemand(other, remaining) else null } };
             },
             .in_list => |part| blk: {
+                const operand = try self.prerequisite(try self.rewriteDemand(part.operand, demand), demand);
+                var remaining: ?*const ast.Scalar = try self.mask(demand, try self.testValue(.is_not_null, operand));
                 const values = try self.alloc.alloc(*const ast.Scalar, part.values.len);
-                for (part.values, values) |item, *out| out.* = try self.rewrite(item);
-                break :blk .{ .in_list = .{ .operand = try self.rewrite(part.operand), .values = values, .negated = part.negated } };
+                for (part.values, values, 0..) |item, *out, i| {
+                    out.* = try self.rewriteDemand(item, remaining);
+                    if (i + 1 < values.len) {
+                        out.* = try self.prerequisite(out.*, remaining);
+                        const equal = try self.scalar(.{ .binary = .{ .op = .eq, .left = operand, .right = out.* } });
+                        remaining = try self.mask(remaining, try self.testValue(.is_not_true, equal));
+                    }
+                }
+                break :blk .{ .in_list = .{ .operand = operand, .values = values, .negated = part.negated } };
             },
             else => unreachable,
         });
     }
 };
+fn rowProjectionReads(statement: ast.Select) bool {
+    if (statement.group_by.len != 0 or statement.having != null or
+        @import("aggregate_binding.zig").accepts(statement) or @import("window_binding.zig").accepts(statement)) return false;
+    for (statement.columns) |column| if (column.expression) |value| if (has(value)) return true;
+    return false;
+}
+
+pub fn needsOwnProjectionDomain(statement: ast.Select) bool {
+    if (statement.order_by.len == 0 or !rowProjectionReads(statement)) return false;
+    const positional = for (statement.order_by) |order| {
+        if (order.position != null) break true;
+    } else false;
+    if (!positional) return false;
+    for (statement.columns) |column| if (column.wildcard) return true;
+    return false;
+}
+
+pub fn needsProjectionDomain(statement: ast.Select) bool {
+    if (@import("phase_projection.zig").accepts(statement)) return true;
+    if (needsOwnProjectionDomain(statement)) return true;
+    for (statement.values_arms) |arm| if (needsProjectionDomain(arm.*)) return true;
+    if (statement.set_operation) |set| return needsProjectionDomain(set.left.*) or needsProjectionDomain(set.right.*);
+    return false;
+}
+
+fn selectionOrders(alloc: Allocator, statement: ast.Select) !?[]ast.Order {
+    if (statement.order_by.len == 0 or !rowProjectionReads(statement)) return null;
+    var wildcard = false;
+    for (statement.columns) |column| {
+        wildcard = wildcard or column.wildcard;
+    }
+    const normalized = try @import("order_aliases.zig").normalize(alloc, statement);
+    const orders = try alloc.dupe(ast.Order, normalized.order_by);
+    for (orders) |*order| {
+        if (order.position) |position| {
+            if (wildcard or position == 0 or position > statement.columns.len) return null;
+            const column = statement.columns[position - 1];
+            order.position = null;
+            order.expression = column.expression orelse blk: {
+                const value = try alloc.create(ast.Scalar);
+                value.* = .{ .column = column.field };
+                break :blk value;
+            };
+        }
+        if (order.expression != null) order.field = "";
+    }
+    return orders;
+}
+
 pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
+    return lowerWithPreparedScope(alloc, statement, null);
+}
+
+pub fn lowerWithPreparedScope(alloc: Allocator, statement: ast.Select, prepared_scope: ?PreparedScope) !ast.Select {
     if (statement.values_arms.len != 0) {
         const arms = try alloc.alloc(*const ast.Select, statement.values_arms.len);
         for (statement.values_arms, arms) |arm, *out| {
             const rewritten = try alloc.create(ast.Select);
-            rewritten.* = if (accepts(arm.*)) try lower(alloc, arm.*) else arm.*;
+            rewritten.* = if (accepts(arm.*) and !needsProjectionDomain(arm.*)) try lowerWithPreparedScope(alloc, arm.*, prepared_scope) else arm.*;
             out.* = rewritten;
         }
         var result = statement;
@@ -766,42 +1216,131 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     }
     if (statement.set_operation) |set| {
         const left = try alloc.create(ast.Select);
-        left.* = if (accepts(set.left.*)) try lower(alloc, set.left.*) else set.left.*;
+        left.* = if (accepts(set.left.*) and !needsProjectionDomain(set.left.*)) try lowerWithPreparedScope(alloc, set.left.*, prepared_scope) else set.left.*;
         const right = try alloc.create(ast.Select);
-        right.* = if (accepts(set.right.*)) try lower(alloc, set.right.*) else set.right.*;
+        right.* = if (accepts(set.right.*) and !needsProjectionDomain(set.right.*)) try lowerWithPreparedScope(alloc, set.right.*, prepared_scope) else set.right.*;
         var result = statement;
         result.set_operation = .{ .kind = set.kind, .all = set.all, .left = left, .right = right };
         return result;
     }
-    var builder: Builder = .{ .alloc = alloc, .source = undefined };
+    if (statement.offset != null and statement.order_by.len == 0 and rowProjectionReads(statement)) {
+        // Without a sort PostgreSQL's projection is below OFFSET: a scalar
+        // cardinality/value error on a skipped row still belongs to execution.
+        // A streaming derived producer preserves that boundary without
+        // materializing rows or changing their output labels/types.
+        const projected = try alloc.create(ast.Select);
+        projected.* = statement;
+        projected.limit = null;
+        projected.offset = null;
+        projected.scalar_cardinality_limit = false;
+        const source = try alloc.create(ast.Relation);
+        source.* = .{ .derived = .{ .query = projected, .alias = "$offset_output" } };
+        return .{
+            .source = source,
+            .limit = statement.limit,
+            .offset = statement.offset,
+            .scalar_cardinality_limit = statement.scalar_cardinality_limit,
+        };
+    }
+    var builder: Builder = .{ .alloc = alloc, .source = undefined, .prepared_scope = prepared_scope };
     if (statement.source) |source| builder.source = source else if (statement.table) |table| builder.source = try builder.relation(.{ .table = .{ .name = table } }) else {
         const singleton = try alloc.create(ast.Select);
         singleton.* = .{ .columns = try alloc.dupe(ast.Projection, &.{.{ .expression = try builder.scalar(.{ .literal = .{ .integer = 1 } }) }}) };
         builder.source = try builder.relation(.{ .derived = .{ .query = singleton, .alias = "$singleton", .hidden = true } });
     }
-    try aliases(alloc, builder.source, &builder.outer);
+    try aliases(alloc, builder.source, &builder.outer, prepared_scope);
     var result = statement;
+    // Resolve the row-selection domain before attaching downstream producers.
+    // Keep the predicate as a hidden, single-evaluation prerequisite: repeating
+    // it in each mask could duplicate expensive or volatile provider work.
+    var demand: ?*const ast.Scalar = null;
+    var consumers = statement;
+    consumers.predicate = null;
+    const needs_row_demand = accepts(consumers);
+    if (statement.predicate) |predicate| {
+        const rewritten = try builder.rewrite(try builder.predicateScalar(predicate));
+        const value = if (needs_row_demand) try builder.prerequisite(rewritten, null) else rewritten;
+        const out = try alloc.create(ast.Predicate);
+        out.* = .{ .scalar = value };
+        result.predicate = out;
+        if (needs_row_demand) demand = try builder.testValue(.is_true, value);
+    }
+    builder.window_demand = demand;
     const columns = try alloc.dupe(ast.Projection, statement.columns);
+    var sorted_offset = false;
+    if (try selectionOrders(alloc, statement)) |orders| {
+        for (orders) |*order| if (order.expression) |value| {
+            if (value.* == .column) continue;
+            var matched = false;
+            for (statement.columns, columns) |original, *column| {
+                if (original.expression != value) continue;
+                if (column.expression == value) column.expression = try builder.prerequisite(try builder.rewriteDemand(value, demand), demand);
+                if (column.alias == null) column.alias = "?column?";
+                order.expression = column.expression;
+                matched = true;
+                break;
+            }
+            // Sort-required reads run before selection, independent output
+            // reads after it. A shared alias owns one computed value, never
+            // a second invocation when the selected row is projected.
+            if (!matched and has(value)) order.expression = try builder.prerequisite(try builder.rewriteDemand(value, demand), demand);
+        };
+        const selected = try alloc.create(ast.Select);
+        selected.* = .{
+            .source = builder.source,
+            .predicate = result.predicate,
+            .order_by = orders,
+            .order_aliases_expanded = true,
+            .limit = statement.limit,
+            .offset = statement.offset,
+            .scalar_cardinality_limit = statement.scalar_cardinality_limit,
+            .selection_prefix = statement.offset != null,
+        };
+        sorted_offset = statement.offset != null;
+        builder.source = try builder.relation(.{ .derived = .{ .query = selected, .alias = "$selected", .preserve_scope = true } });
+        result.predicate = null;
+        result.order_by = &.{};
+        result.limit = null;
+        result.offset = null;
+        result.scalar_cardinality_limit = false;
+        result.selection_staged = true;
+        demand = null;
+    }
     for (columns) |*column| if (column.expression) |value| {
-        if (column.alias == null and has(value)) column.alias = if (value.* == .call and value.call.subquery != null and std.mem.eql(u8, value.call.name, "$exists")) "exists" else "?column?";
-        column.expression = try builder.rewrite(value);
+        if (column.alias == null and has(value)) column.alias = if (value.* == .call and value.call.window != null) value.call.name else if (value.* == .call and value.call.subquery != null and std.mem.eql(u8, value.call.name, "$exists")) "exists" else "?column?";
+        column.expression = try builder.rewriteDemand(value, demand);
     };
     result.columns = columns;
-    if (statement.predicate) |predicate| {
-        const out = try alloc.create(ast.Predicate);
-        out.* = .{ .scalar = try builder.rewrite(try builder.predicateScalar(predicate)) };
-        result.predicate = out;
-    }
+    // Named windows have already been expanded by the compiler. Retain their
+    // input expressions: PostgreSQL can demand subqueries even in an unused
+    // definition. Pointer-owned inputs reuse the expanded call's producer.
+    const definitions = try alloc.alloc(ast.NamedWindow, statement.windows.len);
+    for (statement.windows, definitions) |definition, *out| out.* = .{
+        .name = definition.name,
+        .window = try builder.rewriteWindow(definition.window, builder.window_demand),
+    };
+    result.windows = definitions;
     const groups = try alloc.alloc(*const ast.Scalar, statement.group_by.len);
-    for (statement.group_by, groups) |value, *out| out.* = try builder.rewrite(value);
+    for (statement.group_by, groups) |value, *out| out.* = try builder.rewriteDemand(value, demand);
     result.group_by = groups;
-    result.having = if (statement.having) |value| try builder.rewrite(value) else null;
-    const orders = try alloc.dupe(ast.Order, statement.order_by);
+    result.having = if (statement.having) |value| try builder.rewriteDemand(value, demand) else null;
+    const orders = try alloc.dupe(ast.Order, result.order_by);
     for (orders) |*order| if (order.expression) |value| {
-        order.expression = try builder.rewrite(value);
+        order.expression = try builder.rewriteDemand(value, demand);
     };
     result.order_by = orders;
     result.source = builder.source;
     result.table = null;
+    if (sorted_offset) {
+        const projected = try alloc.create(ast.Select);
+        projected.* = result;
+        return .{
+            .source = try builder.relation(.{ .derived = .{ .query = projected, .alias = "$sorted_offset_output" } }),
+            .limit = statement.limit,
+            .offset = statement.offset,
+            .scalar_cardinality_limit = statement.scalar_cardinality_limit,
+            .required_output_columns = statement.required_output_columns,
+        };
+    }
     return result;
 }

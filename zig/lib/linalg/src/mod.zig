@@ -17,6 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 pub const x86 = @import("x86.zig");
 pub const primitives = @import("primitives.zig");
+pub const prepared_gemm = @import("packed_gemm.zig");
 pub const gemm = @import("gemm_dispatch.zig");
 pub const pool = @import("pool.zig");
 pub const attention = @import("attention.zig");
@@ -186,6 +187,76 @@ fn SgemmDispatchCtx(comptime BT: type, comptime add_slice: anytype) type {
     };
 }
 
+/// Column dispatch for C = A @ B^T with few rows (decode GEMV). Row
+/// dispatch cannot split m < 2*MR, so each worker instead owns a contiguous
+/// range of output columns, i.e. a contiguous panel of B rows, and runs the
+/// same AddSlice kernel on every row of A. Results are bit-identical to the
+/// row-dispatched path: each output element is one kernel dot product.
+fn TransBColsCtx(comptime BT: type, comptime add_slice: anytype) type {
+    return struct {
+        n_start: usize,
+        n_end: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: []const f32,
+        b: []const BT,
+        c_out: []f32,
+
+        const Self = @This();
+
+        fn run(raw: *anyopaque) void {
+            const ctx: *const Self = @ptrCast(@alignCast(raw));
+            const cols = ctx.n_end - ctx.n_start;
+            const b_panel = ctx.b[ctx.n_start * ctx.k ..][0 .. cols * ctx.k];
+            for (0..ctx.m) |row| {
+                add_slice(0, 1, cols, ctx.k, ctx.alpha, ctx.a[row * ctx.k ..][0..ctx.k], b_panel, ctx.c_out[row * ctx.n + ctx.n_start ..][0..cols]);
+            }
+        }
+    };
+}
+
+const min_cols_per_worker: usize = 64;
+
+/// Returns false when column dispatch does not apply; the caller then uses
+/// row dispatch.
+fn dispatchColsTransB(
+    io: ?Io,
+    comptime CtxT: type,
+    template: CtxT,
+    m: usize,
+    n: usize,
+    work: u64,
+) Cancelable!bool {
+    if (m >= 2 * sgemm_tile.MR) return false;
+    if (work < sgemm_thread_flops_threshold or builtin.single_threaded) return false;
+    const workers = @min(@min(sgemm_max_workers, cachedCpuCount()), n / min_cols_per_worker);
+    if (workers <= 1) return false;
+    var contexts: [sgemm_max_workers]CtxT = undefined;
+    var jobs: [sgemm_max_workers]PoolJob = undefined;
+    var num_jobs: usize = 0;
+    for (0..workers) |w| {
+        // Keep NR-aligned panels so every worker stays on the tiled path.
+        const start = ((n * w / workers) / sgemm_tile.NR) * sgemm_tile.NR;
+        const end = if (w + 1 == workers) n else ((n * (w + 1) / workers) / sgemm_tile.NR) * sgemm_tile.NR;
+        if (start >= end) continue;
+        contexts[num_jobs] = template;
+        contexts[num_jobs].n_start = start;
+        contexts[num_jobs].n_end = end;
+        jobs[num_jobs] = .{ .fn_ptr = CtxT.run, .ctx = @ptrCast(&contexts[num_jobs]) };
+        num_jobs += 1;
+    }
+    if (io) |io_runtime| {
+        try pool.dispatchJobsIo(io_runtime, jobs[0..num_jobs]);
+    } else {
+        dispatchJobs(jobs[0..num_jobs]);
+    }
+    return true;
+}
+
+const SgemmTransBF16ColsCtx = TransBColsCtx(f16, sgemmTransBF16AddSlice);
+
 const SgemmCtx = SgemmDispatchCtx(f32, sgemmAddSlice);
 const SgemmTransBCtx = SgemmDispatchCtx(f32, sgemmTransBAddSlice);
 const SgemmTransBF16Ctx = SgemmDispatchCtx(f16, sgemmTransBF16AddSlice);
@@ -244,6 +315,17 @@ pub fn sgemmTransBF16WeightsSync(
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
+    if (dispatchColsTransB(null, SgemmTransBF16ColsCtx, .{
+        .n_start = 0,
+        .n_end = 0,
+        .m = m,
+        .n = n,
+        .k = k,
+        .alpha = alpha,
+        .a = a,
+        .b = b,
+        .c_out = c_out,
+    }, m, n, work) catch unreachable) return;
     dispatchRows(null, SgemmTransBF16Ctx, .{
         .m_start = 0,
         .m_end = 0,
@@ -340,9 +422,11 @@ pub const t5RelativePositionBucket = attention.t5RelativePositionBucket;
 pub const ropeCore = attention.ropeCore;
 pub const flashCausalAttentionHost = attention.flashCausalAttentionHost;
 pub const flashAttentionHost = attention.flashAttentionHost;
+pub const flashAttentionHostWithIo = attention.flashAttentionHostWithIo;
 pub const segmentAttentionHost = attention.segmentAttentionHost;
 pub const segmentAttentionHostWithGemm = attention.segmentAttentionHostWithGemm;
 pub const segmentAttentionHostWithGemmParallelIo = attention.segmentAttentionHostWithGemmParallelIo;
+pub const segmentAttentionHostWithGemmSerialIo = attention.segmentAttentionHostWithGemmSerialIo;
 pub const segmentTrainingAttentionForwardHost = attention.segmentTrainingAttentionForwardHost;
 pub const segmentTrainingAttentionBackwardHost = attention.segmentTrainingAttentionBackwardHost;
 pub const SegmentTrainingAttentionForward = attention.SegmentTrainingAttentionForward;
@@ -455,6 +539,17 @@ pub fn sgemmTransBF16Weights(
     applyBeta(c_out[0 .. m * n], beta);
     if (k == 0) return;
     const work = @as(u64, m) * @as(u64, n) * @as(u64, k);
+    if (try dispatchColsTransB(io, SgemmTransBF16ColsCtx, .{
+        .n_start = 0,
+        .n_end = 0,
+        .m = m,
+        .n = n,
+        .k = k,
+        .alpha = alpha,
+        .a = a,
+        .b = b,
+        .c_out = c_out,
+    }, m, n, work)) return;
     return dispatchRows(io, SgemmTransBF16Ctx, .{
         .m_start = 0,
         .m_end = 0,
@@ -917,5 +1012,82 @@ test "sgemmTransBSync matches reference for CLIP/CLAP production shapes" {
         // Larger tolerance than the small tests — accumulation order
         // differences across a 4096-K dot product produce ~1e-3 drift.
         for (c_ref, c_test) |x, y| try std.testing.expect(@abs(x - y) < 5e-3);
+    }
+}
+
+test "sgemmTransBF16Weights column dispatch matches the serial kernel for few rows" {
+    const a_alloc = std.testing.allocator;
+    const n: usize = 1030;
+    const k: usize = 4100; // m * n * k crosses the threading threshold
+    for ([_]usize{ 1, 3 }) |m| {
+        const a = try a_alloc.alloc(f32, m * k);
+        defer a_alloc.free(a);
+        const b = try a_alloc.alloc(f16, n * k);
+        defer a_alloc.free(b);
+        for (a, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) / 17.0 - 0.5;
+        for (b, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(i % 23)) / 23.0 - 0.5);
+        const got = try a_alloc.alloc(f32, m * n);
+        defer a_alloc.free(got);
+        const want = try a_alloc.alloc(f32, m * n);
+        defer a_alloc.free(want);
+        @memset(want, 0);
+        sgemmTransBF16AddSlice(0, m, n, k, 1.0, a, b, want);
+        sgemmTransBF16WeightsSync(m, n, k, 1.0, a, b, 0.0, got);
+        try std.testing.expectEqualSlices(f32, want, got);
+    }
+}
+
+pub const segmentAttentionGroupedHostWithGemmIo = attention.segmentAttentionGroupedHostWithGemmIo;
+pub const denseAttentionHostWithGemmIo = attention.denseAttentionHostWithGemmIo;
+pub const denseAttentionPortableHostWithIo = attention.denseAttentionPortableHostWithIo;
+
+pub const segmentAttentionGroupedHostWithGemmParallelIo = attention.segmentAttentionGroupedHostWithGemmParallelIo;
+
+extern fn antfly_x86_sgemm_prepared(start: usize, end: usize, n: usize, k: usize, panel_count: usize, data: [*]f32, a: [*]const f32, c: [*]f32) callconv(.c) void;
+const PreparedCtx = struct {
+    m_start: usize = 0,
+    m_end: usize = 0,
+    panels: prepared_gemm.Panels,
+    a: []const f32,
+    c: []f32,
+    pub fn run(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (comptime x86.enabled) {
+            if (x86.selected() == .avx2) {
+                antfly_x86_sgemm_prepared(self.m_start, self.m_end, self.panels.n, self.panels.k, self.panels.data.len, self.panels.data.ptr, self.a.ptr, self.c.ptr);
+                return;
+            }
+        }
+        prepared_gemm.rows(self.panels, self.m_start, self.m_end, self.a, self.c);
+    }
+};
+pub fn sgemmPrepared(io: ?Io, m: usize, panels: prepared_gemm.Panels, a: []const f32, c: []f32) Cancelable!void {
+    if (m == 0) return;
+    return dispatchRows(io, PreparedCtx, .{ .panels = panels, .a = a, .c = c }, m, @as(u64, m) * panels.n * panels.k);
+}
+
+test "prepared GEMM threaded sync and Io dispatch preserve independent columns" {
+    const a = std.testing.allocator;
+    const m = 64;
+    const n = 131;
+    const k = 513;
+    const x = try a.alloc(f32, m * k);
+    defer a.free(x);
+    const w = try a.alloc(f32, n * k);
+    defer a.free(w);
+    const expected = try a.alloc(f32, m * n);
+    defer a.free(expected);
+    const actual = try a.alloc(f32, m * n);
+    defer a.free(actual);
+    for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) / 13;
+    for (w, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) / 17;
+    const panels = try prepared_gemm.Panels.init(a, w, n, k);
+    defer panels.deinit(a);
+    prepared_gemm.rows(panels, 0, m, x, expected);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]?Io{ null, io }) |runtime| {
+        @memset(actual, std.math.nan(f32));
+        try sgemmPrepared(runtime, m, panels, x, actual);
+        for (expected, actual) |e, v| try std.testing.expectApproxEqAbs(e, v, 2e-5);
     }
 }

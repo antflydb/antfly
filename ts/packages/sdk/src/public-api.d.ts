@@ -2189,8 +2189,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset across a table range
-         * @description Runs a bounded operational repair pass for any asset producer type
+         * Reprocess a derived artifact across a table range
+         * @description Runs a bounded operational repair pass for any asset or embedding producer
          *     across source rows in key order. Use `next_key` from the response as
          *     the next request's `from_key` for simple single-cursor continuation.
          *     Distributed repair controllers should persist `shard_cursors` from the
@@ -2255,7 +2255,7 @@ export interface paths {
         /**
          * Create a derived document artifact reprocess job
          * @description Creates a durable user-facing repair job for a derived document
-         *     artifact. The job advances through the same bounded per-shard repair
+         *     asset or embedding artifact. The job advances through the same bounded per-shard repair
          *     primitive used by `/reprocess`, and stores returned continuation
          *     cursors so hosted controllers can resume large sharded table repairs
          *     without collapsing progress into a single global key cursor.
@@ -2395,11 +2395,15 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset
+         * Reprocess a derived artifact
          * @description Invalidates the current artifact state and requests the producer to
          *     rebuild the derived asset for the source document. Copy, generator,
          *     reader, transcriber, extractor, and document-extraction producers are
-         *     all supported.
+         *     all supported, as are dense and sparse embedding producers. Embedding
+         *     reprocessing regenerates vectors even when the source chunks are unchanged.
+         *     Embedding requests are committed durably and queued for supervised
+         *     inference. Acceptance does not wait for inference; inspect index coverage
+         *     and repair issues for the eventual outcome.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -3712,24 +3716,28 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Chunk text into smaller segments
-         * @description Splits text into smaller chunks using semantic or fixed-size chunking models.
+         * Chunk content with optional model-aware embeddings
+         * @description Splits content into chunks. Without `embedding`, the fixed chunker and
+         *     legacy response remain unchanged. With `embedding`, the resolved target
+         *     model constrains boundaries for text, PDF pages, images or explicit tiles,
+         *     composited GIF frames, audio windows and consecutive video windows.
+         *
+         *     Each model-aware result pairs source coordinates and an optional vector
+         *     or error. `include_content` independently controls payload inclusion;
+         *     video uses the original source and sampling recipe. `execute: false`
+         *     plans without executing the embedding model. `stream: true` delivers
+         *     bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+         *     terminal record must not be treated as complete source coverage.
+         *     Continuations bind the original source version and semantic plan;
+         *     retries may deterministically recompute and must deduplicate chunk IDs.
          *
          *     ## Models
          *
-         *     ### Fixed Chunking (always available)
-         *     - Simple token-based splitting with overlap
-         *     - Use model="fixed"
+         *     ### Fixed Chunking
+         *     - Token-count splitting with overlap for text; fixed time windows for audio
+         *     - Use model="fixed" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
          *     - Fast and deterministic
-         *
-         *     ### ONNX Models
-         *     - Semantic chunking based on content similarity
-         *     - Models auto-discovered from `models_dir/chunkers/`
-         *     - Falls back to fixed chunking if model fails
-         *
-         *     ## Caching
-         *
-         *     Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+         *     - Other model names are rejected as unsupported
          */
         post: operations["chunkText"];
         delete?: never;
@@ -4305,13 +4313,12 @@ export interface paths {
          *
          *     ## Embedders
          *
-         *     - ONNX models from `models_dir/embedders/`
+         *     - Embedding models from `models_dir`
          *     - Quantized variants have `-i8` suffix
          *
          *     ## Chunkers
          *
-         *     - Always includes "fixed" (built-in)
-         *     - Plus any ONNX models from `models_dir/chunkers/`
+         *     - Always "fixed" (built-in); chunking does not load models from `models_dir`
          *
          *     ## Rerankers
          *
@@ -4726,14 +4733,44 @@ export interface components {
             revocation_confirmed: boolean;
         };
         /**
-         * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+         * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
          * @enum {string}
          */
-        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown";
+        /**
+         * @description Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
+         * @enum {string}
+         */
+        SQLArrayElementType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
+        SQLArrayDimension: {
+            length: number;
+            lower_bound: number;
+        };
+        /**
+         * @description Non-NULL SQL array result. Elements are flat, row-major values using the
+         *     column's element_type. Their count equals the product of dimension
+         *     lengths. Empty arrays have no dimensions and no elements. Integer
+         *     elements are canonical decimal strings. Exact numeric elements are
+         *     decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+         *     Floating elements are JSON
+         *     numbers, or the strings NaN, Infinity and -Infinity. Element null flags
+         *     distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
+         *     array is an outer null result cell, not an empty array or this envelope.
+         */
+        SQLArrayValue: {
+            dimensions: components["schemas"]["SQLArrayDimension"][];
+            values: unknown[];
+            /** @description Exactly one flag per value. True requires a null value; false permits a JSON null only for jsonb elements. */
+            sql_nulls: boolean[];
+        };
         SQLColumn: {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
+            /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
+            element_type?: components["schemas"]["SQLArrayElementType"];
+            /** @description Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding. */
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
         };
         SQLPrepareRequest: {
             statement: string;
@@ -4745,6 +4782,7 @@ export interface components {
             connection_id?: string;
         };
         SQLPreparedExecutionRequest: {
+            read_requirements?: components["schemas"]["ReadRequirements"];
             parameters?: unknown[];
             /** @default 128 */
             limit?: number;
@@ -4771,6 +4809,12 @@ export interface components {
             database: string;
             namespace: string;
         };
+        /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. */
+        SQLParameterDescriptor: {
+            type: components["schemas"]["SQLColumnType"];
+            element_type?: components["schemas"]["SQLArrayElementType"];
+            nullable: boolean;
+        };
         SQLPreparedResponse: {
             prepared_id: string;
             /** Format: int64 */
@@ -4778,6 +4822,8 @@ export interface components {
             /** @description Exact decimal API owner identifier, preserved by JavaScript clients. */
             owner_node_id: string;
             parameter_types: components["schemas"]["SQLColumnType"][];
+            /** @description Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays. */
+            parameter_descriptors: components["schemas"]["SQLParameterDescriptor"][];
             columns: components["schemas"]["SQLColumn"][];
         };
         /** @description One typed setting value, matching the declared kind. */
@@ -4843,9 +4889,10 @@ export interface components {
          *     memory, and encoded results to a 16 MiB allocation budget.
          */
         SQLRequest: {
+            read_requirements?: components["schemas"]["ReadRequirements"];
             /**
-             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution are not supported.
-             * @default committed
+             * @deprecated
+             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
              * @enum {string}
              */
             lake_visibility?: "committed" | "accepted";
@@ -4884,6 +4931,8 @@ export interface components {
          *     is JSON null; sql_nulls distinguishes it from a JSON column containing
          *     the JSON literal null. Integer-typed values are exact decimal strings; datetime
          *     values are strings. Objects and arrays in JSON columns remain JSON.
+         *     Array-typed columns contain SQLArrayValue envelopes, with their element
+         *     descriptor in the corresponding SQLColumn. They are not JSON columns.
          */
         SQLResponse: {
             columns: components["schemas"]["SQLColumn"][];
@@ -4938,6 +4987,8 @@ export interface components {
             code: string;
             /** @description Human-readable diagnostic with no sensitive parameter values. */
             message: string;
+            /** @description Public column identifier for a column constraint violation; no row values are included. */
+            column_name?: string;
             /** @description Optional one-based character position in the submitted SQL statement. */
             position?: number;
             /** @description Native transaction receipt for reconciliation when a mutation outcome is unknown. */
@@ -5314,7 +5365,20 @@ export interface components {
              */
             retryable: true;
         };
-        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"];
+        /** @description The requested source artifact failed publication and requires inspection and reprocessing. */
+        DocumentArtifactPublicationFailedError: {
+            /** @enum {string} */
+            code: "document_artifact_publication_failed";
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "document_artifact_publication_failed";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"] | components["schemas"]["DocumentArtifactPublicationFailedError"];
         /** @description A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity. */
         UnsupportedHierarchyGroupingError: {
             /**
@@ -10441,6 +10505,29 @@ export interface components {
                 [key: string]: string;
             } | string[];
         };
+        /** @description Opaque write receipt returned by ingestion. Pass it back unchanged to require a read including that write; it is a minimum freshness frontier, not an exact snapshot. */
+        ReadReceipt: {
+            /** Format: uint64 */
+            table_id: number;
+            /** Format: uint64 */
+            object_generation: number;
+            /** Format: uint64 */
+            wal_lsn: number;
+        };
+        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt. */
+        ReadRequirements: {
+            /**
+             * @description Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
+             * @enum {string}
+             */
+            visibility?: "accepted" | "committed" | "published";
+            after_write?: components["schemas"]["ReadReceipt"];
+            /**
+             * Format: uint32
+             * @description Readiness wait budget within the query or statement timeout. Defaults to 5000 ms when requirements are supplied; zero fails immediately if coverage is unavailable.
+             */
+            wait_ms?: number;
+        };
         LakeReadReceipt: {
             /** Format: uint64 */
             table_id: number;
@@ -10463,6 +10550,8 @@ export interface components {
             wait_ms?: number;
         };
         QueryRequest: {
+            read_requirements?: components["schemas"]["ReadRequirements"];
+            /** @deprecated */
             lake_read?: components["schemas"]["LakeReadRequirement"];
             /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. */
             remote_snapshot?: string;
@@ -12603,6 +12692,11 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** @description PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC. */
+        SQLNumericModifier: {
+            precision: number;
+            scale: number;
+        };
         /**
          * @description The reranking provider to use.
          * @enum {string}
@@ -13054,6 +13148,80 @@ export interface components {
             /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
             overlap_duration_ms?: number;
         };
+        ChunkEmbeddingTarget: {
+            model: string;
+            /** @description Optional required embedding-weight/recipe identity; a changed model is rejected before delivery. */
+            model_identity?: string;
+            /** @default RETRIEVAL_DOCUMENT */
+            task_type?: string;
+            dimensions?: number;
+            /**
+             * @description False resolves model limits and plans descriptors without running embedding inference.
+             * @default true
+             */
+            execute?: boolean;
+            /**
+             * @description Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable embedding failure.
+             * @default false
+             */
+            allow_partial?: boolean;
+        };
+        /** @description Semantic chunk policy. Execution batch size and queue depth are deliberately separate. */
+        MediaChunkPolicy: {
+            /**
+             * @description Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
+             * @default 1048576
+             */
+            max_text_bytes?: number;
+            /** @default 500 */
+            target_tokens?: number;
+            /** @default 50 */
+            overlap_tokens?: number;
+            /**
+             * Format: int64
+             * @default 32000000000
+             */
+            window_ns?: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            overlap_ns?: number;
+            /**
+             * Format: int64
+             * @default 1000000000
+             */
+            step_ns?: number;
+            /**
+             * @description Select the displayed picture at each video cadence target, including VFR holds. Zero retains at-or-after timestamp sampling.
+             * @default 1
+             */
+            video_hold?: number;
+            /** @default 32 */
+            max_frames?: number;
+            /** @default 0 */
+            tile_width?: number;
+            /** @default 0 */
+            tile_height?: number;
+            /** @default 0 */
+            tile_overlap?: number;
+            /**
+             * Format: int64
+             * @description Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
+             * @default 0
+             */
+            audio_pause_ns?: number;
+            /**
+             * Format: int64
+             * @default 5000000000
+             */
+            audio_pause_search_ns?: number;
+            /**
+             * @description Absolute normalized PCM amplitude threshold in thousandths.
+             * @default 10
+             */
+            audio_silence_milli?: number;
+        };
         /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
         ChunkOptions: {
             /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
@@ -13065,16 +13233,19 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
         };
         /**
          * @description Configuration for the Antfly inference chunking provider.
          *
          *     Antfly inference is Antfly's built-in ML service for local chunking.
-         *     The model name maps to ONNX model directory names (similar to how Ollama works).
          *
          *     **Chunking Models:**
-         *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
-         *     - Any other name will attempt to load from models/chunkers/{name}/ directory
+         *     - fixed: Fixed-size chunking by token count, with fixed time windows for audio
+         *       (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the
+         *       only chunking model Antfly inference implements; other model names are
+         *       rejected as unsupported.
          *
          *     **Deduplication:**
          *     - Within a single document write, chunk results are deduplicated when multiple
@@ -13154,6 +13325,8 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
         };
         /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
         EnrichmentNeighborContextConfig: {
@@ -13673,7 +13846,7 @@ export interface components {
             provider: "antfly";
             /**
              * @description The name of the generator model.
-             * @example onnxruntime/Gemma-3-ONNX
+             * @example ggml-org/gemma-4-E4B-it-GGUF
              */
             model: string;
             /**
@@ -13917,6 +14090,16 @@ export interface components {
             source_artifact_kind?: "asset" | "chunk" | "any";
             resolution_artifact: string;
             key_template: string;
+            /**
+             * @description Materialize canonical entity documents. False resolves graph keys without promotion.
+             * @default true
+             */
+            promote?: boolean;
+            /** @description Explicit redirects between fully rendered keys in this resolver's table; no entity documents required. Changes trigger corpus re-resolution. */
+            aliases?: {
+                key: string;
+                target: string;
+            }[];
             /** @description Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table). */
             labels?: string[];
             /** @default true */
@@ -13998,9 +14181,31 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array";
+        /**
+         * @description Exact PostgreSQL builtin identity for a relational root scalar column.
+         *     SQL array columns use SQLArrayElementType for their element identity.
+         *     Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+         *     these values. The underlying property type must match. SQL array storage
+         *     is not implied by this annotation. Existing unannotated schemas retain
+         *     their original domains.
+         *     The numeric identity uses an underlying number property and exact
+         *     PostgreSQL NUMERIC semantics, never binary float. Submit finite values
+         *     as JSON numeric lexemes or decimal strings; special values use strings
+         *     NaN, Infinity and -Infinity. Const/enum finite numeric members must be
+         *     JSON numbers, not strings. Bounds and multipleOf are exact decimals.
+         *     Public scalar NUMERIC schemas require reader capability version 22.
+         *     To constrain a NUMERIC scalar or SQL-array column, set the root
+         *     property's `x-antfly-sql-numeric-modifier` annotation to an object with
+         *     precision (1..1000) and signed scale (-1000..1000). The annotation
+         *     requires numeric identity and reader capability version 23. Assignment
+         *     rounds before constraints, indexes and generated dependents; overflow
+         *     rejects the write. Restore verifies stored values without rounding.
+         * @enum {string}
+         */
+        SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
         /**
          * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
          *     A literal requires type; omitted value means typed null. A column
@@ -14015,19 +14220,80 @@ export interface components {
          *     row and expression set. An integer literal may use a decimal string
          *     for exact int64 transport; blob uses base64 and datetime uses the
          *     normal relational datetime representation.
-         *     Comparisons require operands of the same type and return boolean or
+         *     Comparisons require operands of compatible types (integer and number may mix) and return boolean or
          *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
          *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
          *     evaluate left to right with SQL three-valued short-circuit semantics;
          *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         *     Numeric literals and arithmetic operations may specify sql_type to
+         *     retain PostgreSQL builtin overflow and float4 rounding semantics.
+         *     Without it, integer and number operations retain int64 and float64
+         *     semantics. Numeric cast requires type and sql_type, takes one numeric
+         *     argument, and performs a checked conversion when evaluated (not when
+         *     the schema is compiled). Floating-to-integer casts round ties to even.
+         *     The numeric expression type uses exact PostgreSQL NUMERIC values and
+         *     may specify sql_type numeric. Its literals accept decimal strings or
+         *     exact JSON numeric lexemes, including string-valued special values.
+         *     Exact NUMERIC programs require reader capability version 21 even when
+         *     their result is boolean or integer. Float/integer assignment casts keep
+         *     their declared PostgreSQL rounding and overflow semantics.
+         *     A cast to numeric may specify numeric_modifier for PostgreSQL precision
+         *     and signed-scale coercion. Overflow is checked when the selected cast
+         *     executes; unselected lazy branches do not fail. Modifier-bearing programs
+         *     require reader capability version 23 even with integer/boolean output.
+         *     The sql_array expression type requires sql_type on literals, including
+         *     typed NULL, to declare the element builtin. Non-null literals use the
+         *     ordinal SQL array envelope (dimensions with length/lower_bound, values,
+         *     and sql_nulls), retaining shape and lower bounds. Array columns derive
+         *     their exact element identity from the immutable schema. Comparisons,
+         *     IN, COALESCE and CASE require matching array element identities; no
+         *     element type is inferred from values. Array-dependent programs require
+         *     reader capability version 24 even with scalar output. Assignment to a
+         *     NUMERIC array column applies its precision/signed-scale modifier to
+         *     each element. Array casts require type sql_array and an explicit matching
+         *     sql_type; identity casts borrow the immutable input. Casts of numeric
+         *     arrays may additionally specify numeric_modifier, coercing each non-NULL
+         *     element with PostgreSQL precision and signed-scale semantics while
+         *     preserving dimensions, lower bounds and NULL slots. Coercion is lazy
+         *     and shares invocation admission with the surrounding expression.
+         *     Array-valued ordered index keys and element-changing array casts are
+         *     not supported by this expression contract.
+         *     The array constructor requires sql_type and zero to 32 arguments.
+         *     Constructor programs additionally require reader capability version 25,
+         *     including constructors hidden inside scalar/boolean expressions.
+         *     Scalar arguments must have the declared element domain, with explicit
+         *     width-preserving numeric casts where needed. SQL NULL arguments become
+         *     NULL elements. Array arguments must all have matching element types,
+         *     dimensions and lower bounds; one leading dimension with lower bound 1
+         *     is added. All empty/NULL subarrays produce an empty array; mixing an
+         *     empty/NULL subarray with a nonempty one is a dimension mismatch. Child
+         *     expressions execute once, with shared work/cancellation and byte limits.
+         *     case_when takes alternating boolean conditions and result expressions,
+         *     followed by a mandatory fallback result (3 to 31 arguments, at most
+         *     15 branches). Conditions are evaluated in order; only the selected
+         *     result is evaluated, and a NULL condition is not TRUE. All result
+         *     expressions must have the same physical type. Numeric SQL lowering
+         *     records builtin result-domain promotions as explicit casts. This
+         *     operation requires schema capability version 18.
+         *     modulo takes two same-domain integer or NUMERIC operands and returns the signed
+         *     remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
+         *     in_list and not_in_list take one probe followed by 1 to 127 same-domain
+         *     candidates. The probe is evaluated once; NULL probes return UNKNOWN.
+         *     A matching candidate wins over NULL candidates; otherwise a NULL
+         *     candidate makes the result UNKNOWN. These operations require schema
+         *     capability version 19.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
             type?: components["schemas"]["RelationalExpressionType"];
+            /** @description Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24). */
+            sql_type?: components["schemas"]["SQLBuiltinType"];
+            /** @description Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23. */
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
             /** @description Typed literal value, including null. */
             value?: unknown;
             column?: string;
-            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            /** @description Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes. */
             collation?: string;
             args?: components["schemas"]["RelationalScalarExpression"][];
         };
@@ -14285,6 +14551,12 @@ export interface components {
             expression?: components["schemas"]["RelationalScalarExpression"];
         };
         /**
+         * @description Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
+         * @default constraint
+         * @enum {string}
+         */
+        RelationalUniqueConstraintOrigin: "constraint" | "index";
+        /**
          * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
          *     requires deferrable=true and validates the final transaction state.
          *     NO ACTION permits a valid final-state parent replacement; RESTRICT
@@ -14301,6 +14573,7 @@ export interface components {
          */
         RelationalUniqueConstraint: {
             name: string;
+            origin?: components["schemas"]["RelationalUniqueConstraintOrigin"];
             /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
             primary?: boolean;
             columns?: string[];
@@ -14448,6 +14721,32 @@ export interface components {
             fields?: {
                 [key: string]: components["schemas"]["DocumentSubfieldMapping"];
             };
+        };
+        /**
+         * @description JSON Schema property declaration for one typed SQL-array column in a
+         *     relational table. Use it as a root property of DocumentSchema.schema.
+         *     The element identity is mandatory; a JSON Schema `array` remains a JSON
+         *     column and is never inferred to be a SQL array. Column values use the
+         *     lossless SQLArrayValue envelope: dimensions with lower bounds, flat
+         *     row-major values and explicit SQL NULL flags. Integer elements are
+         *     decimal strings, even when small. JSONB null and SQL NULL are distinct.
+         *     Float elements acquire their declared width before validation and
+         *     storage. Outer null represents a SQL NULL array when nullable is true.
+         *     Additional JSON Schema constraints apply to this envelope, not to
+         *     PostgreSQL array subscripts. SQL array index keys and SQL DDL activation
+         *     are not implied by accepting this storage schema.
+         */
+        SQLArrayColumnSchema: {
+            /** @enum {string} */
+            type: "sql_array";
+            "x-antfly-sql-type": components["schemas"]["SQLArrayElementType"];
+            /** @description Accepted only with numeric element identity. Applies assignment coercion to each non-NULL element while preserving dimensions and lower bounds. Requires reader capability version 23. */
+            "x-antfly-sql-numeric-modifier"?: components["schemas"]["SQLNumericModifier"];
+            /** @default false */
+            nullable?: boolean;
+            description?: string;
+        } & {
+            [key: string]: unknown;
         };
         /** @description Defines the structure of a document type */
         DocumentSchema: {
@@ -16863,6 +17162,22 @@ export interface components {
             type: "image_url";
             image_url: components["schemas"]["ImageURL"];
         };
+        /** @description Explicit EmbeddingGemma 2 video-group sampling. Timestamp windows are half-open and relative to the first presentation picture. */
+        VideoSamplingPolicy: {
+            /** @enum {string} */
+            policy: "reference" | "timestamps";
+            /** Format: int64 */
+            start_ns?: number;
+            /** Format: int64 */
+            end_ns?: number;
+            /** Format: int64 */
+            step_ns?: number;
+            max_frames?: number;
+            /** @enum {string} */
+            overflow?: "uniform" | "truncate";
+            /** @description Sample the displayed picture, including VFR holds, rather than the next picture at or after the target. */
+            hold?: boolean;
+        };
         /** @description Inline binary media content (audio, image, etc.). */
         MediaContentPart: {
             /** @enum {string} */
@@ -16874,6 +17189,7 @@ export interface components {
             data: string;
             /** @description MIME type (audio/wav, image/gif, image/png, etc.). */
             mime_type: string;
+            sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
         /** @description A content part for multimodal input (text, image URL, or inline media). */
         ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
@@ -17372,6 +17688,8 @@ export interface components {
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
         GraphMetricQuery: {
+            /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description Optional result key. Defaults to the metric name. */
             name?: string;
             /** @description Graph index that owns the published metric. */
@@ -17400,6 +17718,8 @@ export interface components {
         };
         /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
         GraphMetricRerank: {
+            /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description Graph index that owns the published metric. */
             index: string;
             /** @description Graph metric name to blend into the search hit score. */
@@ -17760,6 +18080,11 @@ export interface components {
             edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
             /** @default 100 */
             limit?: number;
+            /**
+             * @description Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+             * @default true
+             */
+            deduplicate_nodes?: boolean;
             /** @default false */
             include_paths?: boolean;
             /**
@@ -18443,7 +18768,7 @@ export interface components {
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
         InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
         InferenceContentPart: components["schemas"]["ContentPart"];
-        /** @description EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens. */
+        /** @description EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. Video uses video/mp4, video/quicktime, video/webm or video/mp2t media/attachment parts, 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. The expanded sequence must fit 8192 tokens. */
         InferenceEmbeddingGroup: {
             /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
             title?: string;
@@ -18563,7 +18888,27 @@ export interface components {
              */
             input: string | components["schemas"]["InferenceChunkContentPart"];
             config?: components["schemas"]["InferenceChunkConfig"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
+            /** @description Caller source identity; immutable content is independently fingerprinted. */
+            source_id?: string;
+            /** @description Immutable caller version, included in continuation and plan identity. */
+            source_version?: string;
+            /** @description Resume the exact source and semantic plan; changed inputs are rejected. */
+            continuation?: string;
+            /**
+             * @description In model-aware mode include chunk payloads in addition to mandatory descriptors.
+             * @default false
+             */
+            include_content?: boolean;
+            /**
+             * @description In model-aware mode return NDJSON chunk events followed by a terminal coverage response.
+             * @default false
+             */
+            stream?: boolean;
         };
+        InferenceChunkEmbeddingResponse: components["schemas"]["ChunkEmbeddingResponse"];
+        InferenceChunkOperationResponse: components["schemas"]["InferenceChunkResponse"] | components["schemas"]["InferenceChunkEmbeddingResponse"];
         /**
          * @example {
          *       "object": "list",
@@ -19125,6 +19470,27 @@ export interface components {
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
+            /**
+             * @description Effective model-aware chunk operational ceilings for working/output/event
+             *     bytes, chunk/dependency/index counts and remote fetched bytes, requests
+             *     and cache bytes. Independent of model token limits and object length.
+             *     Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
+             *     Scoped and unscoped embedding discovery expose the same values.
+             */
+            chunking_limits?: {
+                [key: string]: number;
+            };
+            /** @description Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights. */
+            model_revision?: string;
+            /**
+             * @description Pull-time qualified request profiles for this exact artifact,
+             *     including backend, supported features and min/max geometry.
+             *     Runtime admission revalidates artifact identity and resource limits.
+             *     Omitted for artifacts without a qualification receipt.
+             */
+            qualified_limits?: {
+                [key: string]: unknown;
+            };
             /** @description List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring. */
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
@@ -19137,6 +19503,7 @@ export interface components {
             model_identity?: string;
             input?: string;
             inputs?: components["schemas"]["DecisionInput"][];
+            long_document?: components["schemas"]["InferenceDecideLongDocument"];
             questions: components["schemas"]["InferenceDecideQuestion"][];
             embedding_options?: components["schemas"]["EmbeddingDecisionOptions"];
         };
@@ -19372,7 +19739,7 @@ export interface components {
             presence_penalty?: number;
             /**
              * @description Structured output control. OpenAI-compatible entry point for requesting JSON output.
-             *     `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+             *     `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
              */
             response_format?: components["schemas"]["InferenceGenerateResponseFormat"];
             /**
@@ -19639,7 +20006,7 @@ export interface components {
          *     `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
          * @enum {string}
          */
-        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
+        InferenceModelBackend: "auto" | "native" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
         /**
          * @description Optional artifact format preference for loading a model.
          * @enum {string}
@@ -19661,7 +20028,6 @@ export interface components {
          *
          *     Backends:
          *     - `native` - Native CPU backend
-         *     - `onnx` - ONNX Runtime backend
          *     - `metal` - Apple Metal backend
          *     - `cuda` - NVIDIA CUDA backend
          *     - `xla` - PJRT/XLA compiled backend
@@ -19683,6 +20049,14 @@ export interface components {
              */
             name: string;
             backend?: components["schemas"]["InferenceModelBackend"];
+            /**
+             * @description Per-model GLiNER CUDA inference precision for extractor preloads. Requires
+             *     CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
+             *     fail closed until the exact model/profile has release qualification.
+             *     Precision is part of the loaded-session cache identity.
+             * @enum {string}
+             */
+            cuda_precision?: "auto" | "fp32" | "fp16" | "bf16";
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
             /**
@@ -19789,13 +20163,15 @@ export interface components {
             api_key?: string;
             /**
              * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-             *     - `{models_dir}/embedders/` - Embedding models (ONNX)
-             *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
-             *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
+             *     - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+             *     - `{models_dir}/embedders/` - Embedding models
+             *     - `{models_dir}/rerankers/` - Reranking models
              *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models
              *
-             *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+             *     Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+             *     (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+             *     chunker needs no models.
              * @example ~/.antfly/inference/models
              */
             models_dir?: string;
@@ -19916,11 +20292,6 @@ export interface components {
              * @example true
              */
             native?: boolean;
-            /**
-             * @description Whether the ONNX Runtime backend is built into this runtime
-             * @example false
-             */
-            onnx?: boolean;
             /**
              * @description Whether the Metal backend is built into this runtime
              * @example true
@@ -20259,6 +20630,163 @@ export interface components {
         };
         ExtensionError: {
             error: string;
+        };
+        ChunkSourceReference: {
+            /** @enum {string} */
+            type: "source";
+            /** @description HTTP(S) or S3 object URI resolved through configured content security and credentials. */
+            uri: string;
+            mime_type: string;
+            /** @description Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read. */
+            version: string;
+            /**
+             * @description Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+             * @enum {string}
+             */
+            version_kind?: "strong_etag" | "s3_version_id";
+            /**
+             * Format: int64
+             * @description Exact immutable object length, verified against Content-Range.
+             */
+            length: number;
+        };
+        ChunkEmbeddingContext: {
+            source_reference?: components["schemas"]["ChunkSourceReference"];
+            source_id?: string;
+            source_fingerprint: string;
+            source_version: string;
+            plan_id: string;
+            model: string;
+            model_identity: string;
+            model_revision: string;
+            task_type: string;
+            /** @description Known vector width; may be absent before a planning-only or failed first item. */
+            dimensions?: number;
+            policy: components["schemas"]["MediaChunkPolicy"];
+            /** Format: int64 */
+            start_ordinal: number;
+        };
+        ChunkEmbeddingStartEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.start";
+            context: components["schemas"]["ChunkEmbeddingContext"];
+        };
+        /** @description Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets. */
+        ChunkCoordinates: {
+            /** @enum {string} */
+            kind: "text" | "pdf" | "image" | "gif" | "audio" | "video";
+            /** Format: int64 */
+            start_byte?: number;
+            /** Format: int64 */
+            end_byte?: number;
+            page?: number;
+            /** @description Full-raster coordinates [left, top, right, bottom], end exclusive; raster_width/height declare the basis, including adaptively rendered PDF pages. */
+            region?: number[];
+            /** @description Width of the complete source/prepared-page raster before tiling, not the returned crop width. */
+            raster_width?: number;
+            /** @description Height of the complete source/prepared-page raster before tiling; map PDF regions through page_box and page_rotation. */
+            raster_height?: number;
+            /** Format: int64 */
+            start_ns?: number;
+            /** Format: int64 */
+            end_ns?: number;
+            /** Format: int64 */
+            first_picture?: number;
+            /** @description Ordered selectors in the immutable source index, including repeated cadence selections. */
+            selected_pictures?: number[];
+            /**
+             * @description WebM logical presentation pictures or the first MP4 packet of a completed picture assembly.
+             * @enum {string}
+             */
+            picture_basis?: "logical" | "packet_assembly";
+            picture_count?: number;
+            /** Format: int64 */
+            start_sample?: number;
+            /** Format: int64 */
+            end_sample?: number;
+            /** Format: int64 */
+            sample_rate?: number;
+            /** Format: int64 */
+            start_tick?: number;
+            /** Format: int64 */
+            end_tick?: number;
+            /** Format: int64 */
+            timescale?: number;
+            /** Format: int64 */
+            page_rotation?: number;
+            /** @description Original PDF page box in PDF user-space coordinates. */
+            page_box?: number[];
+        };
+        ChunkDescriptor: {
+            /** @description Opaque source-plan-bound inference identity; not a database artifact ID. */
+            id: string;
+            /** Format: int64 */
+            ordinal: number;
+            coordinates: components["schemas"]["ChunkCoordinates"];
+            input_tokens: number;
+        };
+        ChunkEmbeddingError: {
+            code: string;
+            message: string;
+        };
+        ChunkEmbeddingObject: {
+            descriptor: components["schemas"]["ChunkDescriptor"];
+            mime_type: string;
+            embedding?: number[];
+            error?: components["schemas"]["ChunkEmbeddingError"];
+            text?: string;
+            /**
+             * Format: byte
+             * @description Optional base64 payload; source coordinates remain mandatory.
+             */
+            data?: string;
+        };
+        ChunkEmbeddingEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding";
+            data: components["schemas"]["ChunkEmbeddingObject"];
+        };
+        ChunkEmbeddingResponse: {
+            /** @enum {string} */
+            object: "chunk.embedding.list";
+            data: components["schemas"]["ChunkEmbeddingObject"][];
+            /**
+             * @description Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
+             * @enum {string}
+             */
+            status: "complete" | "partial" | "failed";
+            source_reference?: components["schemas"]["ChunkSourceReference"];
+            source_id?: string;
+            source_fingerprint: string;
+            source_version: string;
+            plan_id: string;
+            model: string;
+            model_identity: string;
+            /** @description Model generation revision used by inference capability leases. */
+            model_revision: string;
+            task_type: string;
+            dimensions: number;
+            policy: components["schemas"]["MediaChunkPolicy"];
+            /** Format: int64 */
+            start_ordinal: number;
+            /**
+             * Format: int64
+             * @description Exclusive end of acknowledged output ordinals; failed chunk coordinates are reported in gaps.
+             */
+            covered_through_ordinal: number;
+            error?: components["schemas"]["ChunkEmbeddingError"];
+            next_continuation?: string;
+            gaps: components["schemas"]["ChunkCoordinates"][];
+        };
+        ChunkEmbeddingTerminalEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.complete";
+            response: components["schemas"]["ChunkEmbeddingResponse"];
+        };
+        ChunkEmbeddingInitializationErrorEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.error";
+            code: string;
         };
         /**
          * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
@@ -20928,7 +21456,7 @@ export interface components {
             };
         };
         /** @description Content part supported by chunking requests. */
-        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"];
+        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["ChunkSourceReference"];
         /** @description Options for Voice Activity Detection (VAD) based audio segmentation. */
         VADOptions: {
             /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
@@ -20954,7 +21482,7 @@ export interface components {
          */
         InferenceChunkConfig: {
             /**
-             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+             * @description The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected.
              * @default fixed
              * @example fixed
              */
@@ -20963,7 +21491,7 @@ export interface components {
             max_chunks?: number;
             /**
              * Format: float
-             * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+             * @description Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker.
              */
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
@@ -20972,6 +21500,23 @@ export interface components {
         DecisionInput: {
             id?: string;
             input: string;
+        };
+        /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
+        InferenceDecideLongDocument: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @default 1024 */
+            window_words?: number;
+            /**
+             * @description Must be smaller than window_words. Only valid in window mode.
+             * @default 32
+             */
+            overlap_words?: number;
+            /** @default 128 */
+            max_windows?: number;
         };
         /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
         DecisionChoice: {
@@ -21371,7 +21916,7 @@ export interface components {
                 "application/json": components["schemas"]["HierarchyCursorStaleError"];
             };
         };
-        /** @description The query's pinned hierarchy or table topology changed while it was running */
+        /** @description The query's pinned hierarchy or table topology changed, or a requested source artifact failed publication */
         QueryConflict: {
             headers: {
                 [name: string]: unknown;
@@ -21655,7 +22200,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL reads follow committed snapshots. */
+            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL defaults to committed snapshots and can opt into accepted visibility with read_requirements. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -21663,6 +22208,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         state?: string;
+                        read_receipt?: components["schemas"]["ReadReceipt"];
                         /** Format: uint64 */
                         wal_lsn?: number;
                         /** Format: uint64 */
@@ -25988,7 +26534,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
             };
             400: components["responses"]["BadRequest"];
             /** @description Source already exists */
@@ -26701,6 +27249,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["QueryConflict"];
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
@@ -29015,13 +29564,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Text chunked successfully */
+            /** @description Content chunked with optional model-aware embeddings */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["InferenceChunkResponse"];
+                    "application/json": components["schemas"]["InferenceChunkOperationResponse"];
+                    "application/x-ndjson": components["schemas"]["ChunkEmbeddingStartEvent"] | components["schemas"]["ChunkEmbeddingEvent"] | components["schemas"]["ChunkEmbeddingTerminalEvent"] | components["schemas"]["ChunkEmbeddingInitializationErrorEvent"];
                 };
             };
             /** @description Invalid request */
@@ -29035,6 +29585,15 @@ export interface operations {
             };
             /** @description Authentication is enabled and valid credentials were not supplied */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Source version, continuation plan or required model identity changed; replan against the intended generation. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

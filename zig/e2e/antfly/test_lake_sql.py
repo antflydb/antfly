@@ -21,6 +21,7 @@ Run: uv run --extra lake --project e2e/antfly pytest e2e/antfly/test_lake_sql.py
 import hashlib
 import json
 import os
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -35,6 +36,30 @@ from conftest import (
 )
 
 pytestmark = pytest.mark.fresh_antfly_process
+
+
+def _request_with_idle_ddl_retry(server, method, path, body, *, retry_ddl=False):
+    """Replay only an explicitly unadmitted DDL while its catalog publishes."""
+    deadline = time.monotonic() + 30
+    while True:
+        response = requests.request(
+            method,
+            server.api_url + path,
+            json=body,
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=60,
+        )
+        if response.ok or not retry_ddl or response.status_code != 503:
+            return response
+        error = response.json()
+        if (
+            error.get("code") != "53300"
+            or error.get("retryable") is not True
+            or error.get("transaction_status") != "idle"
+        ):
+            return response
+        assert time.monotonic() < deadline, response.text + server.debug_logs()
+        time.sleep(0.1)
 
 
 @pytest.mark.parametrize("dictionary", [False, True])
@@ -196,7 +221,11 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         # Prove actual artifact consumption: a checksum failure after selection
         # aborts an eligible query; a predicate lacking an equivalence proof
         # still scans Parquet. Restore the object before the restart checks.
-        aggregate_root = None
+        # Pause publication/GC while locating and damaging immutable objects.
+        # A prior contribution can carry the same SUM recipe in a different
+        # fused cohort, so cover every matching root rather than the first one.
+        server.pause()
+        checksums = set()
         for artifact_path in artifact_root.rglob("*"):
             if not artifact_path.is_file():
                 continue
@@ -211,15 +240,16 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     and inputs[0]["spec"]["kind"] == "sum"
                     and inputs[0]["column"]["path"] == "amount"
                 ):
-                    aggregate_root = candidate
-                    break
-        assert aggregate_root is not None, "Native exact aggregate root missing"
-        checksum = aggregate_root["blocks"][0]["artifact"]["checksum"]
-        candidates = list((artifact_root / "objects").rglob(checksum))
+                    checksums.update(
+                        block["artifact"]["checksum"] for block in candidate["blocks"]
+                    )
+        assert checksums, "Native exact aggregate blocks missing"
+        candidates = [
+            path
+            for checksum in sorted(checksums)
+            for path in (artifact_root / "objects").rglob(checksum)
+        ]
         assert candidates, "Native aggregate block missing"
-        # Overlapping publication attempts can retain identical blocks under
-        # distinct scopes. Damage every copy so selection cannot choose an
-        # intact generation, and restore all copies even if an assertion fails.
         originals = []
         try:
             for artifact_path in candidates:
@@ -229,6 +259,13 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 damaged = bytearray(original)
                 damaged[marker] ^= 1
                 artifact_path.write_bytes(damaged)
+            # COUNT can warm a fused block containing SUM, and verified immutable
+            # bytes may also survive on disk. Make source-integrity admission
+            # explicitly cold instead of treating a valid cache hit as fallback.
+            for cache_root in list(server.root.rglob("lake-ranges")):
+                if cache_root.is_dir():
+                    shutil.rmtree(cache_root)
+            server.resume()
             for statement in (
                 "SELECT SUM(amount) FROM lake_events",
                 "SELECT SUM(amount), COUNT(*) FROM lake_events",
@@ -239,8 +276,9 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
                     timeout=60,
                 )
-                assert not response.ok, (
-                    "Selected corrupt aggregate silently fell back to scanning"
+                assert response.status_code == 500, (
+                    "Selected corrupt aggregate did not fail integrity admission: "
+                    f"{response.status_code} {response.text}"
                 )
             assert request(
                 "POST",
@@ -248,8 +286,12 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 {"statement": "SELECT SUM(amount) FROM lake_events WHERE amount >= 0"},
             )["rows"] == [[str(amount_sum)]]
         finally:
+            server.pause()
             for artifact_path, original in originals:
-                artifact_path.write_bytes(original)
+                # Do not resurrect obsolete generations collected after resume.
+                if artifact_path.exists():
+                    artifact_path.write_bytes(original)
+            server.resume()
         assert request(
             "POST", "/sql", {"statement": "SELECT SUM(amount) FROM lake_events"}
         )["rows"] == [[str(amount_sum)]]
@@ -467,6 +509,46 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             },
         )
         assert filtered_join["rows"] == [["1199"], ["1198"], ["1197"]]
+        # Cost sampling must replay unique keys exactly once; repeated keys
+        # exercise batched typed partial reducers over independent Parquet data.
+        unique_join = (
+            "SELECT COUNT(*), SUM(l.amount), MIN(r.amount) "
+            "FROM lake_large l JOIN lake_large r ON l.amount=r.amount"
+        )
+        assert request("POST", "/sql", {"statement": unique_join})["rows"] == [
+            [str(large_count), str(sum(range(large_count))), "0"]
+        ]
+        compact_join = (
+            "SELECT COUNT(*), SUM(l.amount), MIN(r.amount), MAX(l.amount) "
+            "FROM (SELECT amount % 11 AS k, amount FROM lake_events) l "
+            "JOIN (SELECT amount % 11 AS k, amount FROM lake_events) r ON l.k=r.k"
+        )
+        cardinalities = [len(range(k, count, 11)) for k in range(11)]
+        expected_compact = [
+            [
+                str(sum(n * n for n in cardinalities)),
+                str(
+                    sum(sum(range(k, count, 11)) * cardinalities[k] for k in range(11))
+                ),
+                "0",
+                str(count - 1),
+            ]
+        ]
+        assert (
+            request("POST", "/sql", {"statement": compact_join})["rows"]
+            == expected_compact
+        )
+        assert (
+            request(
+                "POST",
+                "/sql",
+                {
+                    "statement": compact_join
+                    + " AND (l.amount IS NOT DISTINCT FROM l.amount)"
+                },
+            )["rows"]
+            == expected_compact
+        )
         shared_windows = request(
             "POST",
             "/sql",
@@ -833,8 +915,13 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
             if marker >= 0:
                 document = json.loads(data[marker - 1 :])
                 if len(document["declarations"]) == 320:
+                    ids = contribution_ids(document)
+                    # Retained immutable objects include checkpoint directories
+                    # written before contribution publication completes.
+                    if len(ids) != 320:
+                        continue
                     directory_found = True
-                    old_contribution_ids = contribution_ids(document)
+                    old_contribution_ids = ids
                     break
         assert directory_found, (
             "320 declarations were not published through an immutable directory"
@@ -898,6 +985,10 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
                 document = json.loads(data[marker - 1 :])
                 if len(document["declarations"]) == 321:
                     ids = contribution_ids(document)
+                    # Both source files need every declaration. The immutable
+                    # index may also retain contributions from earlier views.
+                    if len(ids) < 2 * 321:
+                        continue
                     assert old_contribution_ids <= ids
                     reused = True
                     break
@@ -948,13 +1039,9 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
     failed = True
     try:
 
-        def call(method, path, body=None, lines=False):
-            response = requests.request(
-                method,
-                server.api_url + path,
-                json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                timeout=60,
+        def call(method, path, body=None, lines=False, retry_ddl=False):
+            response = _request_with_idle_ddl_retry(
+                server, method, path, body, retry_ddl=retry_ddl
             )
             assert response.ok, response.text + "\n" + server.debug_logs()
             if lines:
@@ -984,6 +1071,7 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
                 "statement": "CREATE INDEX amount_idx ON lake_ordered (amount)"
                 + (" INCLUDE (label)" if covering else "")
             },
+            retry_ddl=True,
         )
         deadline = time.monotonic() + 60
         while True:
@@ -1000,11 +1088,7 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
         assert next(i for i in listed if i["config"]["name"] == "amount_idx")["status"][
             "readiness"
         ]["queryable"]
-        version = (
-            resource["config"]["schema_version"]
-            if "schema_version" in resource["config"]
-            else None
-        )
+        version = resource["config"].get("schema_version", None)
         primary = call(
             "POST",
             "/tables/lake_ordered/rows/query",
@@ -1042,20 +1126,22 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
             )["rows"]
             == expected
         )
-        with psycopg.connect(
-            host="127.0.0.1",
-            port=server.pgwire_port,
-            user="admin",
-            password=AUTH_BOOTSTRAP_PASSWORD,
-            dbname="default",
-            sslmode="disable",
-            autocommit=True,
-        ) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"SELECT amount, COUNT(*) FROM lake_ordered WHERE amount = {base + 17} GROUP BY amount"
-                )
-                assert cursor.fetchall() == [(base + 17, 12)]
+        with (
+            psycopg.connect(
+                host="127.0.0.1",
+                port=server.pgwire_port,
+                user="admin",
+                password=AUTH_BOOTSTRAP_PASSWORD,
+                dbname="default",
+                sslmode="disable",
+                autocommit=True,
+            ) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                f"SELECT amount, COUNT(*) FROM lake_ordered WHERE amount = {base + 17} GROUP BY amount"
+            )
+            assert cursor.fetchall() == [(base + 17, 12)]
 
         def check_filtered_limits():
             # OFFSET crosses an indexed value boundary; covered-column
@@ -1609,7 +1695,9 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             subset_hits[1]["_id"]
         ]
         snapshot_token = ordered_first["remote_snapshot"]
-        assert len(snapshot_token) == 64, ordered_first
+        # Retained cut capabilities are opaque; replay below proves their
+        # identity and persistence without assuming a digest representation.
+        assert isinstance(snapshot_token, str) and snapshot_token, ordered_first
         sort_tuple = ordered_first["hits"]["hits"][0]["_sort"]
         ordered_next = call(
             "POST",
@@ -1779,13 +1867,9 @@ def test_native_remote_signed_timestamp_index(tmp_path, covering):
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
     failed = True
 
-    def call(method, path, body=None, lines=False):
-        response = requests.request(
-            method,
-            server.api_url + path,
-            json=body,
-            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-            timeout=60,
+    def call(method, path, body=None, lines=False, retry_ddl=False):
+        response = _request_with_idle_ddl_retry(
+            server, method, path, body, retry_ddl=retry_ddl
         )
         assert response.ok, response.text + server.debug_logs()
         return (
@@ -1822,6 +1906,7 @@ def test_native_remote_signed_timestamp_index(tmp_path, covering):
                 "statement": "CREATE INDEX ts_idx ON lake_epoch (ts)"
                 + (" INCLUDE (label)" if covering else "")
             },
+            retry_ddl=True,
         )
         deadline = time.monotonic() + 60
         while True:
@@ -1877,7 +1962,7 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             pa.Table.from_pylist(
                 [
                     {
-                        "body": "needle",
+                        "body": f"needle marker{amount}",
                         "amount": amount,
                         "dense_native": "[1,0]",
                         "sparse_native": '{"1":2}',
@@ -2040,6 +2125,38 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 == {hit["_id"] for hit in results[1]["hits"]["hits"]}
                 == {hit["_id"] for hit in results[2]["hits"]["hits"]}
             )
+            # The unchanged first file stays selected while other files change
+            # global DF. A cached physical reader must get fresh scoring state.
+            selective_query = {
+                "conjuncts": [
+                    {"match": "marker1", "field": "body"},
+                    {"match": "needle", "field": "body"},
+                ]
+            }
+            selective = call(
+                "POST",
+                "/tables/incremental/query",
+                dict(text_request, full_text_search=selective_query),
+            )["hits"]["hits"]
+            oracle = call(
+                "POST",
+                "/tables/incremental/query",
+                dict(
+                    text_request,
+                    full_text_search={
+                        "disjuncts": [
+                            selective_query,
+                            {"prefix": "never_present_in_fixture", "field": "body"},
+                        ]
+                    },
+                ),
+            )["hits"]["hits"]
+            assert [h["_id"] for h in selective] == [h["_id"] for h in oracle]
+            assert len(selective) == int(1 in expected)
+            if selective:
+                assert selective[0]["_score"] == pytest.approx(
+                    oracle[0]["_score"], abs=1e-6
+                )
             ordered = call(
                 "POST",
                 "/sql",
@@ -2048,7 +2165,7 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 },
             )
             assert ordered["rows"] == [
-                [str(amount), "needle"] for amount in sorted(expected)
+                [str(amount), f"needle marker{amount}"] for amount in sorted(expected)
             ], ordered
             grouped = call(
                 "POST",
@@ -2061,6 +2178,18 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 [str(amount), "1", str(amount), str(amount), str(amount)]
                 for amount in sorted(expected)
             ], grouped
+            filtered_groups = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount, SUM(amount), COUNT(*) FILTER (WHERE amount < 0) FROM incremental WHERE amount >= 0 GROUP BY amount ORDER BY amount"
+                },
+            )
+            assert filtered_groups["rows"] == [
+                [str(amount), str(amount), "0"]
+                for amount in sorted(expected)
+                if amount >= 0
+            ], filtered_groups
             public_id = results[0]["hits"]["hits"][0]["_id"]
             for request in (text_request, dense_request, sparse_request):
                 filtered = call(
@@ -2074,12 +2203,15 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             return results
 
         def native_roots():
-            roots = []
-            manifests = {}
+            roots, manifests, pages = [], {}, {}
             for path in (server.root / "artifacts").rglob("*"):
                 if not path.is_file():
                     continue
                 payload = path.read_bytes()
+                begin = payload.find(b"AFGPT003")
+                if begin >= 0:
+                    encoded = payload[begin:]
+                    pages[hashlib.sha256(encoded).digest()] = encoded
                 for prefix in (b'{"version":', b'{"file":'):
                     begin = payload.find(prefix)
                     if begin < 0:
@@ -2090,21 +2222,80 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                     except (ValueError, UnicodeDecodeError):
                         continue
                     if "file" in document and "segments" in document:
-                        manifests[hashlib.sha256(encoded).hexdigest()] = document
+                        manifests[hashlib.sha256(encoded).hexdigest()] = (
+                            document,
+                            len(encoded),
+                        )
                     elif "file_groups" in document or "file_states" in document:
                         roots.append(document)
-            # Resolve authenticated per-file text manifests into the same
-            # logical directory used for incremental artifact reuse assertions.
+
+            def records(ref, domain):
+                page = pages[bytes(ref["digest"])]
+                assert len(page) == ref["bytes"]
+                assert page[:8] == b"AFGPT003" and page[8] == ref["height"]
+                assert page[24:56] == bytes(domain)
+                assert struct.unpack_from("<Q", page, 16)[0] == ref["records"]
+                count = struct.unpack_from("<I", page, 12)[0]
+                offset = 56 + struct.unpack_from("<H", page, 10)[0]
+                for _ in range(count):
+                    key_size, value_size = struct.unpack_from("<II", page, offset)
+                    offset += 8
+                    key = page[offset : offset + key_size]
+                    offset += key_size
+                    value = page[offset : offset + value_size]
+                    offset += value_size
+                    assert len(key) == key_size and len(value) == value_size
+                    if ref["height"]:
+                        child = {
+                            "digest": list(value[:32]),
+                            "bytes": struct.unpack_from("<I", value, 32)[0],
+                            "height": value[36],
+                            "records": struct.unpack_from("<Q", value, 37)[0],
+                        }
+                        assert child["height"] + 1 == ref["height"]
+                        yield from records(child, domain)
+                    else:
+                        yield key, value
+                assert offset == len(page)
+
+            def manifest(ref):
+                group, size = manifests[ref["checksum"].removeprefix("sha256:")]
+                assert size == ref["byte_len"]
+                return group
+
+            # Resolve both legacy arrays and authenticated paged catalogs.
+            # Detailed segment descriptors are not maintenance file manifests.
             for document in roots:
-                if document.get("manifests"):
-                    groups = [
-                        manifests[ref["checksum"].removeprefix("sha256:")]
-                        for ref in document["manifests"]
-                    ]
-                    document["file_groups"] = groups
-                    document["segments"] = [
-                        segment for group in groups for segment in group["segments"]
-                    ]
+                if document.get("inventory_version") == 3:
+                    chunks = {}
+                    file_root = document["directories"]["files"]
+                    for key, value in (
+                        records(file_root, document["domain"]) if file_root else ()
+                    ):
+                        assert len(key) == 36
+                        chunk = chunks.setdefault(key[:32], bytearray())
+                        assert int.from_bytes(key[32:], "big") == len(chunk)
+                        chunk.extend(value)
+                    groups = []
+                    for identity, encoded in chunks.items():
+                        file = json.loads(encoded)
+                        assert (
+                            hashlib.sha256(file["file"]["id"].encode()).digest()
+                            == identity
+                        )
+                        group = manifest(file["manifest"])
+                        assert group["file"]["id"] == file["file"]["id"]
+                        assert group["file"]["digest"] == file["file"]["digest"]
+                        groups.append(group)
+                    assert len(groups) == document["file_count"]
+                elif document.get("manifests"):
+                    groups = [manifest(ref) for ref in document["manifests"]]
+                else:
+                    continue
+                document["file_groups"] = groups
+                document["segments"] = [
+                    segment for group in groups for segment in group["segments"]
+                ]
             return roots
 
         wait_ready()
@@ -2150,9 +2341,13 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
         verify([3])
         put_file("part.parquet", 1)
         rebuild(4)
-        before_restart = verify([1, 3])
+        verify([1, 3])
+        # A previously cached selected first file becomes the full corpus.
+        (objects / "part2.parquet").unlink()
+        rebuild(5)
+        before_restart = verify([1])
         server.restart()
-        after_restart = verify([1, 3])
+        after_restart = verify([1])
         assert [
             [hit["_id"] for hit in result["hits"]["hits"]] for result in after_restart
         ] == [
@@ -2688,7 +2883,10 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 },
             },
         )
-        deadline = time.monotonic() + 300
+        # This fixture builds several ordered indexes over more than 100,000
+        # rows. Allow bounded Debug publication setup before checking indexed
+        # query semantics; this is not a publication-latency benchmark.
+        deadline = time.monotonic() + 600
         while True:
             resource = call("GET", "/tables/indexed_predicates/indexes/body_text")
             if resource["status"]["readiness"]["queryable"]:
@@ -2776,6 +2974,23 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [h["_source"]["amount"] for h in unfiltered["hits"]["hits"]] == [
                 amount
             ]
+            # The prefix clause forces full-corpus admission but cannot match.
+            # Selective routing must retain global BM25 collection statistics.
+            full_corpus = query(
+                {"match_all": {}},
+                full_text_search={
+                    "disjuncts": [
+                        search,
+                        {"prefix": "never_present_in_fixture", "field": "body"},
+                    ]
+                },
+            )
+            assert [h["_id"] for h in full_corpus["hits"]["hits"]] == [
+                h["_id"] for h in unfiltered["hits"]["hits"]
+            ]
+            assert full_corpus["hits"]["hits"][0]["_score"] == pytest.approx(
+                unfiltered["hits"]["hits"][0]["_score"], abs=1e-6
+            )
             selected = query(broad, full_text_search=search)
             assert [h["_source"]["amount"] for h in selected["hits"]["hits"]] == (
                 [amount] if matches else []
@@ -3118,7 +3333,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             + query(point)["hits"]["hits"]
         )
         assert [h["_source"]["amount"] for h in tied["hits"]["hits"]] == [
-            sorted(zeros, key=lambda h: h["_id"])[0]["_source"]["amount"]
+            min(zeros, key=lambda h: h["_id"])["_source"]["amount"]
         ], tied
         assert tied["profile"]["sort"]["candidate_source"] == "ordered_lake_index", tied
         assert tied["profile"]["sort"]["candidate_count"] <= 4, tied
@@ -3679,6 +3894,1091 @@ def test_native_sparse_metadata_filters_preserve_quantized_scores_and_ranking(tm
         assert [(h["_id"], h["_score"]) for h in ranged] == [
             (h["_id"], h["_score"]) for h in reopened
         ]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
+    """Wide reducers stream compact states instead of retaining page-sized arrays."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    # Keep source identity long enough to exercise schema derivation admission
+    # independently of the runner's temporary directory name.
+    root = tmp_path / ("wide-source-" + "a" * 160) / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    count, width = 8192, 128
+    data = tmp_path / "wide.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "k": pa.array([i // 2 for i in range(count)], type=pa.int64()),
+                **{
+                    f"v{j}": pa.array([i + j for i in range(count)], type=pa.int64())
+                    for j in range(width)
+                },
+            }
+        ),
+        data,
+        compression="snappy",
+        row_group_size=1000,
+    )
+    payload = data.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(path, body):
+            response = requests.post(
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json()
+
+        call(
+            "/tables/wide_join",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "wide-join",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                },
+            },
+        )
+        assert call("/sql", {"statement": "SELECT COUNT(*) FROM wide_join"})[
+            "rows"
+        ] == [[str(count)]]
+        query = (
+            "SELECT "
+            + ",".join(f"SUM(l.v{j})" for j in range(width))
+            + " FROM wide_join l JOIN wide_join r ON l.k=r.k"
+        )
+        # The dedicated COUNT compiler path must consume the same typed partial
+        # protocol as a query containing multiple aggregate expressions.
+        assert call(
+            "/sql",
+            {
+                "statement": "SELECT COUNT(*) FROM wide_join l JOIN wide_join r ON l.k=r.k"
+            },
+        )["rows"] == [[str(2 * count)]]
+        assert call(
+            "/sql",
+            {
+                "statement": "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k"
+            },
+        )["rows"] == [["4"]]
+        # Each source row has exactly two matches. Python integer arithmetic
+        # supplies an independent reference for every reducer and orientation.
+        expected = [[str(count * (count - 1) + 2 * count * j) for j in range(width)]]
+        assert call("/sql", {"statement": query})["rows"] == expected
+        assert (
+            call(
+                "/sql",
+                {"statement": query + " AND (l.v0 IS NOT DISTINCT FROM l.v0)"},
+            )["rows"]
+            == expected
+        )
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_optional_term_directory_refresh_preserves_unchanged_parquet_matches(tmp_path):
+    """An unrepresentable optional key must never turn refresh into an incomplete index."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+
+    def put(name, body):
+        path = tmp_path / name
+        pq.write_table(
+            pa.table({"body": [body], "amount": [1]}), path, compression="snappy"
+        )
+        payload = path.read_bytes()
+        (objects / name).write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
+        )
+
+    put("a.parquet", "x" * 262120 + " retainedneedle")
+    put("b.parquet", "initial")
+    # More than one compaction group ensures refresh also retains an unchanged
+    # group when the formerly disabled optional directory becomes admissible.
+    for name in "cdefghi":
+        put(f"{name}.parquet", "retainedneedle")
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=90,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json() if response.content else None
+            return (
+                value["responses"][0]
+                if isinstance(value, dict) and "responses" in value
+                else value
+            )
+
+        def ready():
+            deadline = time.monotonic() + 90
+            while True:
+                resources = call("GET", "/tables/directory/indexes")
+                assert all(
+                    r["status"]["readiness"]["state"] != "failed" for r in resources
+                ), str(resources) + server.debug_logs()
+                if resources and all(
+                    r["status"]["readiness"]["queryable"] for r in resources
+                ):
+                    return
+                assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+                time.sleep(0.1)
+
+        def check():
+            ready()
+            value = call(
+                "POST",
+                "/tables/directory/query",
+                {
+                    "full_text_search": {"match": "retainedneedle", "field": "body"},
+                    "full_text_index": "body_text",
+                    "fields": ["amount"],
+                    "limit": 10,
+                },
+            )
+            assert len(value["hits"]["hits"]) == 8, value
+
+        call(
+            "POST",
+            "/tables/directory",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "directory",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        check()
+        for phase, name, body in (
+            (1, "b.parquet", "replacement"),
+            (2, "a.parquet", "retainedneedle"),
+            (3, "b.parquet", "another replacement"),
+        ):
+            put(name, body)
+            call(
+                "POST",
+                f"/tables/directory/indexes/wake{phase}",
+                {
+                    "type": "algebraic",
+                    "derive_from_schema": True,
+                    "aggregates": [{"name": "rows", "op": "count"}],
+                },
+            )
+            check()
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("covering", [False, True])
+def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
+    """Sparse build keys drive index probes, including duplicates, NULLs and large fanout."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "probe.parquet"
+    count, fanout = 8192, 600
+    # Nine real files exercise durable run compaction and final assembly.
+    physical_objects = []
+    for part, begin in enumerate(range(0, count, 1000)):
+        end = min(count, begin + 1000)
+        pq.write_table(
+            pa.table(
+                {
+                    "k": pa.array(
+                        [0 if i < fanout else i for i in range(begin, end)],
+                        type=pa.int64(),
+                    ),
+                    "v": pa.array(range(begin, end), type=pa.int64()),
+                }
+            ),
+            path,
+            compression="snappy",
+            use_dictionary=False,
+            row_group_size=256,
+        )
+        payload = path.read_bytes()
+        header = (
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+        )
+        object_path = objects / f"part-{part}.parquet"
+        object_path.write_bytes(header + payload)
+        physical_objects.append((object_path, header, payload))
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, route, body=None):
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        call(
+            "POST",
+            "/tables/join_probe",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "join-probe",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "k_idx",
+                            "keys": [{"column": "k"}],
+                            "include_columns": ["v"] if covering else [],
+                        }
+                    ],
+                },
+            },
+        )
+        deadline = time.monotonic() + 90
+        while True:
+            resources = call("GET", "/tables/join_probe/indexes")
+            assert all(
+                r["status"]["readiness"]["state"] != "failed" for r in resources
+            ), str(resources) + server.debug_logs()
+            if resources and all(
+                r["status"]["readiness"]["queryable"] for r in resources
+            ):
+                break
+            assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+            time.sleep(0.1)
+        statement = (
+            f"SELECT p.v, b.k FROM join_probe p JOIN (VALUES (-1),(0),({count - 1}),(0),(NULL)) b(k) "
+            "ON p.k=b.k ORDER BY p.v, b.k"
+        )
+        expected = [[str(i), "0"] for i in range(fanout) for _ in range(2)] + [
+            [str(count - 1), str(count - 1)]
+        ]
+        assert (
+            call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"]
+            == expected
+        )
+        # Beyond the former 65536-probe cutoff, keys remain a complete bounded
+        # stream. Most miss; duplicates retain join multiplicity.
+        build_keys = (
+            list(range(count - 100, count))
+            + list(range(count + 1, count + 70001))
+            + [count - 1, None]
+        )
+        build_root = tmp_path / "build-lake"
+        build_objects = build_root / "buckets" / "antfly" / "objects"
+        build_objects.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"k": pa.array(build_keys, type=pa.int64())}),
+            path,
+            compression="snappy",
+            row_group_size=512,
+        )
+        build_payload = path.read_bytes()
+        (build_objects / "part.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(build_payload), 0)
+            + hashlib.sha256(build_payload).hexdigest().encode()
+            + build_payload
+        )
+        call(
+            "POST",
+            "/tables/join_build",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "join-build",
+                        "format": "parquet",
+                        "uri": build_root.as_uri(),
+                    },
+                },
+            },
+        )
+        large_statement = "SELECT COUNT(*) FROM join_probe p JOIN (SELECT k FROM join_build) b ON p.k=b.k"
+        assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
+        server.pause()
+        if covering:
+            # Preserve object identity/footer while making every physical data
+            # page unreadable. The leased covering index must satisfy the join.
+            for object_path, header, payload in physical_objects:
+                footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+                object_path.write_bytes(
+                    header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+                )
+        for cached in list(server.root.rglob("lake-ranges")):
+            if cached.is_dir():
+                shutil.rmtree(cached)
+        server.resume()
+        assert (
+            call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"]
+            == expected
+        )
+        assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type):
+    """NUMERIC seeks and covering filters agree beyond f64 precision, cold too."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    count = 4096
+    if physical_type == "integer":
+        keys = [9007199254740993, 9007199254740992] + list(range(2, count))
+        targets = ["9007199254740993", "4095"]
+        values = pa.array(keys, type=pa.int64())
+    else:
+        keys = ["9007199254740993.125", "9007199254740993.124"] + [
+            f"{i}.125" for i in range(2, count)
+        ]
+        targets = ["9007199254740993.125", "4095.125"]
+        values = pa.array(keys, type=pa.string())
+    path = tmp_path / "numeric.parquet"
+    pq.write_table(
+        pa.table({"k": values, "v": pa.array(range(count), type=pa.int64())}),
+        path,
+        compression="snappy",
+        use_dictionary=False,
+        row_group_size=256,
+    )
+    payload = path.read_bytes()
+    header = (
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+    )
+    object_path = objects / "part.parquet"
+    object_path.write_bytes(header + payload)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, route, body=None):
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        call(
+            "POST",
+            "/tables/numeric_probe",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "numeric-probe",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "k": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    },
+                                    "v": {"type": "integer"},
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "k_idx",
+                            "keys": [{"column": "k"}],
+                            "include_columns": ["v"],
+                        }
+                    ],
+                },
+            },
+        )
+        deadline = time.monotonic() + 90
+        while True:
+            resources = call("GET", "/tables/numeric_probe/indexes")
+            assert all(
+                r["status"]["readiness"]["state"] != "failed" for r in resources
+            ), str(resources) + server.debug_logs()
+            if resources and all(
+                r["status"]["readiness"]["queryable"] for r in resources
+            ):
+                break
+            assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+            time.sleep(0.1)
+        terms = ",".join(f"(CAST('{key}' AS NUMERIC))" for key in targets + targets[:1])
+        statement = f"SELECT p.v FROM numeric_probe p JOIN (VALUES {terms}) b(k) ON p.k=b.k ORDER BY p.v"
+        expected = [["0"], ["0"], [str(count - 1)]]
+        predicate = (
+            f"SELECT v FROM numeric_probe WHERE k=CAST('{targets[0]}' AS NUMERIC)"
+        )
+        assert call("POST", "/sql", {"statement": predicate})["rows"] == [["0"]]
+        assert call(
+            "POST", "/sql", {"statement": f"SELECT CAST('{targets[0]}' AS NUMERIC)"}
+        )["rows"] == [[targets[0]]]
+        assert call(
+            "POST", "/sql", {"statement": "SELECT k FROM numeric_probe WHERE v=0"}
+        )["rows"] == [[targets[0]]]
+        assert call(
+            "POST", "/sql", {"statement": f"SELECT k FROM (VALUES {terms}) b(k)"}
+        )["rows"] == [[key] for key in targets + targets[:1]]
+        residual = statement.replace("ON p.k=b.k", "ON p.k+CAST('0' AS NUMERIC)=b.k")
+        assert call("POST", "/sql", {"statement": residual})["rows"] == expected
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        server.pause()
+        # Keep identity/footer intact but remove usable data pages, then drop
+        # range caches. The repeated cold query must consume covering values.
+        footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+        object_path.write_bytes(
+            header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+        )
+        for cached in server.root.rglob("lake-ranges"):
+            if cached.is_dir():
+                shutil.rmtree(cached)
+        server.resume()
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        # Exact standalone equality/range predicates must seek the same native
+        # covering index; a residual scan cannot read the damaged data pages.
+        assert call("POST", "/sql", {"statement": predicate})["rows"] == [["0"]]
+        assert (
+            call(
+                "POST",
+                "/sql",
+                {
+                    "statement": f"SELECT v FROM numeric_probe WHERE k>CAST('{targets[0]}' AS NUMERIC)"
+                },
+            )["rows"]
+            == []
+        )
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
+    tmp_path, physical_type
+):
+    """Independent Parquet values retain NUMERIC identity through publication and restart."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    keys = (
+        ["9007199254740992", "9007199254740993"]
+        if physical_type == "integer"
+        else ["9007199254740993.124", "9007199254740993.125"]
+    )
+    values = (
+        pa.array([int(k) for k in keys] + [None], type=pa.int64())
+        if physical_type == "integer"
+        else pa.array(keys + [None])
+    )
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "numeric.parquet"
+    pq.write_table(
+        pa.table({"k": values}), path, compression="snappy", use_dictionary=False
+    )
+    payload = path.read_bytes()
+    header = (
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+    )
+    object_path = objects / "part.parquet"
+    object_path.write_bytes(header + payload)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, route, body=None):
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        call(
+            "POST",
+            "/tables/numeric_groups",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "numeric-groups",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "k": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    }
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                },
+                "indexes": {
+                    "stats": {
+                        "type": "algebraic",
+                        "derive_from_schema": True,
+                        "aggregates": [
+                            {"name": "counts", "op": "count", "group_by": ["k"]},
+                            *[
+                                {
+                                    "name": op,
+                                    "op": op,
+                                    "measure": "k",
+                                    "group_by": ["k"],
+                                }
+                                for op in ("sum", "min", "max")
+                            ],
+                        ],
+                    }
+                },
+            },
+        )
+        deadline = time.monotonic() + 90
+        while True:
+            resource = call("GET", "/tables/numeric_groups/indexes/stats")
+            assert resource["status"]["readiness"]["state"] != "failed", (
+                str(resource) + server.debug_logs()
+            )
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        statement = "SELECT k, COUNT(*), SUM(k), MIN(k), MAX(k) FROM numeric_groups GROUP BY k ORDER BY k"
+        expected = [[k, "1", k, k, k] for k in keys] + [[None, "1", None, None, None]]
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        residual = (
+            statement.replace("GROUP BY k", "GROUP BY k+CAST('0' AS NUMERIC)")
+            .replace("SELECT k,", "SELECT k+CAST('0' AS NUMERIC),")
+            .replace("ORDER BY k", "ORDER BY k+CAST('0' AS NUMERIC)")
+        )
+        assert call("POST", "/sql", {"statement": residual})["rows"] == expected
+        server.pause()
+        footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+        object_path.write_bytes(
+            header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+        )
+        for cached in server.root.rglob("lake-ranges"):
+            if cached.is_dir():
+                shutil.rmtree(cached)
+        server.resume()
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp_path):
+    """More than 64 independent Parquet segments match the full-corpus path exactly."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    for part in range(67):
+        path = tmp_path / "part.parquet"
+        rows = [
+            {"body": "quasar " * (i % 4 + 1) + "common " * (i % 3), "amount": i}
+            for i in range(part * 3, part * 3 + 3)
+        ]
+        pq.write_table(
+            pa.Table.from_pylist(rows), path, compression="snappy", row_group_size=2
+        )
+        payload = path.read_bytes()
+        (objects / f"part-{part:03}.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
+        )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, route, body=None):
+            response = requests.request(
+                method,
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json() if response.content else None
+            return (
+                value["responses"][0]
+                if isinstance(value, dict) and "responses" in value
+                else value
+            )
+
+        call(
+            "POST",
+            "/tables/paged_text",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "doc",
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "amount": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "body": {
+                                        "type": "string",
+                                        "x-antfly-field": {"type": "text"},
+                                    },
+                                },
+                            }
+                        }
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "amount_idx",
+                            "keys": [{"column": "amount"}],
+                            "include_columns": ["body"],
+                        }
+                    ],
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "paged-text",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {
+                    "body_text": {"type": "full_text", "field": "body"},
+                    "all_text": {"type": "full_text"},
+                    "stored_text": {
+                        "type": "full_text",
+                        "field": "body",
+                        "store_source": True,
+                    },
+                },
+            },
+        )
+        deadline = time.monotonic() + 120
+        while True:
+            resource = call("GET", "/tables/paged_text/indexes/body_text")
+            assert resource["status"]["readiness"]["state"] != "failed", (
+                str(resource) + server.debug_logs()
+            )
+            sortable = call("GET", "/tables/paged_text/indexes/all_text")
+            assert sortable["status"]["readiness"]["state"] != "failed", (
+                str(sortable) + server.debug_logs()
+            )
+            stored = call("GET", "/tables/paged_text/indexes/stored_text")
+            assert stored["config"]["store_source"] is True, stored
+            assert stored["status"]["readiness"]["state"] != "failed", (
+                str(stored) + server.debug_logs()
+            )
+            if all(
+                item["status"]["readiness"]["queryable"]
+                for item in (resource, sortable, stored)
+            ):
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        request = {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "full_text_index": "body_text",
+            "fields": ["amount"],
+            "limit": 201,
+        }
+        # Profiling deliberately uses full admission, providing an independent
+        # score/tie oracle for the bounded coordinator and final hydration.
+        oracle = call("POST", "/tables/paged_text/query", dict(request, profile=True))
+        expected = [
+            (h["_id"], h["_score"], h["_source"]["amount"])
+            for h in oracle["hits"]["hits"]
+        ]
+        assert len(expected) == 201
+
+        def check():
+            result = call(
+                "POST", "/tables/paged_text/query", dict(request, limit=19, offset=61)
+            )
+            assert [
+                (h["_id"], h["_score"], h["_source"]["amount"])
+                for h in result["hits"]["hits"]
+            ] == expected[61:80]
+            total = result["hits"]["total"]
+            assert total["relation"] in ("exact", "gte")
+            assert total["value"] <= 201
+            if total["relation"] == "exact":
+                assert total["value"] == 201
+            counted = call("POST", "/tables/paged_text/query", dict(request, limit=0))
+            assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
+            assert counted["hits"]["hits"] == []
+            shapes = [
+                {"highlight": {"fields": ["body"]}},
+                {"full_text_index": "stored_text", "highlight": {"fields": ["body"]}},
+                {"filter_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
+                {
+                    "exclusion_query": {
+                        "range": {"path": "/amount", "gte": 50, "lt": 160}
+                    }
+                },
+                {
+                    "filter_query": {"range": {"path": "/amount", "gte": 50}},
+                    "exclusion_query": {"range": {"path": "/amount", "gte": 160}},
+                },
+                {
+                    "order_by": [{"field": "amount", "desc": True}],
+                    "full_text_index": "all_text",
+                },
+                {
+                    "filter_query": {"range": {"path": "/amount", "gte": 50}},
+                    "order_by": [{"field": "amount"}],
+                    "full_text_index": "all_text",
+                    "highlight": {"fields": ["body"]},
+                },
+            ]
+            for shape in shapes:
+                query = dict(request, **shape, limit=7)
+                reference = call(
+                    "POST", "/tables/paged_text/query", dict(query, profile=True)
+                )
+                actual = call("POST", "/tables/paged_text/query", query)
+                assert actual["hits"]["hits"] == reference["hits"]["hits"], (
+                    actual,
+                    reference,
+                )
+                counted = call("POST", "/tables/paged_text/query", dict(query, limit=0))
+                assert (
+                    counted["hits"]["total"]
+                    == call(
+                        "POST",
+                        "/tables/paged_text/query",
+                        dict(query, limit=0, profile=True),
+                    )["hits"]["total"]
+                )
+                assert counted["hits"]["hits"] == []
+                assert all(
+                    set(h["_source"]) == {"amount"} for h in actual["hits"]["hits"]
+                )
+                if "highlight" in shape:
+                    assert all(h["_highlights"]["body"] for h in actual["hits"]["hits"])
+                if "order_by" in shape:
+                    cursor = actual["hits"]["hits"][-1]["_sort"]
+                    forward = dict(
+                        query,
+                        search_after=cursor,
+                        remote_snapshot=actual["remote_snapshot"],
+                    )
+                    following = call("POST", "/tables/paged_text/query", forward)
+                    assert (
+                        following["hits"]["hits"]
+                        == call(
+                            "POST",
+                            "/tables/paged_text/query",
+                            dict(forward, profile=True),
+                        )["hits"]["hits"]
+                    )
+                    backward = dict(
+                        query,
+                        search_before=following["hits"]["hits"][0]["_sort"],
+                        remote_snapshot=following["remote_snapshot"],
+                    )
+                    assert (
+                        call("POST", "/tables/paged_text/query", backward)["hits"][
+                            "hits"
+                        ]
+                        == actual["hits"]["hits"]
+                    )
+
+        check()
+        server.restart()
+        check()
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+def test_numeric_predicates_use_only_compatible_parquet_pruning(
+    tmp_path, physical_type
+):
+    """Exact integer stats prune; eight-byte decimal strings never become int stats."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    keys = (
+        [9007199254740992, 9007199254740993]
+        if physical_type == "integer"
+        else [10000000, 99999999]
+    )
+    values = (
+        pa.array(keys, type=pa.int64())
+        if physical_type == "integer"
+        else pa.array([str(k) for k in keys])
+    )
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "numbers.parquet"
+    pq.write_table(
+        pa.table({"k": values}),
+        path,
+        compression=None,
+        use_dictionary=False,
+        write_page_index=True,
+        data_page_version="2.0",
+    )
+    payload = path.read_bytes()
+    header = (
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+    )
+    object_path = objects / "part.parquet"
+    object_path.write_bytes(header + payload)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(route, body):
+            response = requests.post(
+                server.api_url + route,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json()
+
+        call(
+            "/tables/numeric_pruning",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "numeric-pruning",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "k": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    }
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                },
+                "indexes": {},
+            },
+        )
+        for key in keys:
+            assert call(
+                "/sql",
+                {
+                    "statement": f"SELECT k FROM numeric_pruning WHERE k=CAST('{key}' AS NUMERIC)"
+                },
+            )["rows"] == [[str(key)]]
+        if physical_type == "integer":
+            server.pause()
+            # Column/offset indexes lie between data pages and the footer.
+            # Keep those authenticated planning structures readable as well.
+            damaged = bytearray(payload)
+            metadata = pq.ParquetFile(path).metadata
+            for group in range(metadata.num_row_groups):
+                for column in range(metadata.row_group(group).num_columns):
+                    chunk = metadata.row_group(group).column(column)
+                    start = (
+                        chunk.dictionary_page_offset
+                        if chunk.has_dictionary_page
+                        else chunk.data_page_offset
+                    )
+                    end = start + chunk.total_compressed_size
+                    damaged[start:end] = b"\xff" * (end - start)
+            unreadable_root = tmp_path / "unreadable"
+            unreadable_objects = unreadable_root / "buckets" / "antfly" / "objects"
+            unreadable_objects.mkdir(parents=True)
+            # Authenticate the deliberately unreadable source as a distinct
+            # current snapshot, as the independent Bloom regression does.
+            unreadable_objects.joinpath("part.parquet").write_bytes(
+                b"AFOBJ001"
+                + struct.pack("<QI", len(damaged), 0)
+                + hashlib.sha256(damaged).hexdigest().encode()
+                + damaged
+            )
+            for cached in server.root.rglob("lake-ranges"):
+                if cached.is_dir():
+                    shutil.rmtree(cached)
+            server.resume()
+            call(
+                "/tables/numeric_pruning_unreadable",
+                {
+                    "num_shards": 1,
+                    "schema": {
+                        "storage_mode": "relational",
+                        "default_type": "row",
+                        "base_source": {
+                            "kind": "external",
+                            "table_id": "numeric-pruning-unreadable",
+                            "format": "parquet",
+                            "uri": unreadable_root.as_uri(),
+                        },
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "k": {
+                                            "type": "number",
+                                            "x-antfly-sql-type": "numeric",
+                                        }
+                                    },
+                                    "additionalProperties": False,
+                                }
+                            }
+                        },
+                    },
+                    "indexes": {},
+                },
+            )
+            for op, bound in (
+                (">", "9007199254740993.125"),
+                ("=", "9007199254740994"),
+                ("<", "9007199254740991.875"),
+            ):
+                assert call(
+                    "/sql",
+                    {
+                        "statement": f"SELECT COUNT(*) FROM numeric_pruning_unreadable WHERE k{op}CAST('{bound}' AS NUMERIC)"
+                    },
+                )["rows"] == [["0"]]
         failed = False
     finally:
         server.stop(test_failed=failed)

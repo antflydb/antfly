@@ -23,6 +23,10 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 /// Validate every item before any model invocation. This also keeps the
 /// classification-only checkpoint from silently serving unrelated heads.
 pub fn preflight(request: *const wire.Request) !void {
+    return preflightClassification(request, false);
+}
+
+pub fn preflightClassification(request: *const wire.Request, allow_windowing: bool) !void {
     if (request.items.len == 0) return error.InvalidDecisionRequest;
     for (request.items) |item| {
         try item.options.validateNativeLimits(.{});
@@ -31,7 +35,7 @@ pub fn preflight(request: *const wire.Request) !void {
         if (s.classifications.len == 0 or s.entities.len != 0 or s.entity_attributes.len != 0 or
             s.relations.len != 0 or s.structures.len != 0 or s.joint_ie != null)
             return error.UnsupportedDecisionSchema;
-        if (item.options.long_document.mode != .reject) return error.UnsupportedDecisionWindowing;
+        if (!allow_windowing and item.options.long_document.mode != .reject) return error.UnsupportedDecisionWindowing;
         for (s.classifications) |classification| {
             if (classification.hypothesis_template != null) return error.UnsupportedDecisionHypothesisTemplate;
             if (classification.task.labels.len < 2) return error.InvalidDecisionTask;

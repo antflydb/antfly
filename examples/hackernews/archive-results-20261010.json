@@ -1,0 +1,343 @@
+{
+  "project": "antfly-dev-01",
+  "bucket": "colony-import-sources-antfly-dev-01",
+  "prefix": "hn-poc/20261009-full-portability-2b1f7524d047/archive",
+  "object_count": 334,
+  "bytes": 21195813507,
+  "rows": 47717307,
+  "note": "Generation-fenced footer inventory; source bodies were not downloaded.",
+  "inventory_sha256": "411937231d695319998b41ba8d0f822be6a98bcac96443f1f40e3357811e7042",
+  "max_row_group_rows": 145186,
+  "archive_latency_qualified": false,
+  "date": "2026-10-10",
+  "baseline": {
+    "revision": "083142678ceda2b11fdc352e5991af0ecfed55f9",
+    "harness_revision": "6a6467b650",
+    "target": "x86_64-linux-musl",
+    "optimization": "fast",
+    "binary_sha256": "275ea8fb119cfb052c19295bdd2c2069a58450c65450b294410e203e188d0442",
+    "resources": {
+      "cpu": 8,
+      "memory_gib": 48,
+      "disk_gib": 10
+    },
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "ParquetRowGroupTooLarge",
+    "table_registration_ms": 49582.25,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 36,
+    "derived_bytes_deleted": 102278
+  },
+  "fix": {
+    "revision": "235f9f16c7b5e6bc857ba74b6a87e72f67ad307c",
+    "shape": "Decode column vectors without per-column physical row-reference arrays; aligned cursors generate references once per output batch.",
+    "parquet_tests_passed": 132,
+    "lake_sql_tests_passed": 31,
+    "wide_page_rows": 145186,
+    "wide_page_columns": 12,
+    "output_batch_max_rows": 4096,
+    "single_column_measured_peak_bytes": 4065504,
+    "single_column_allocator_budget_bytes": 5592404,
+    "regional_rerun_status": "failed_before_queries",
+    "binary_sha256": "3ec9dae11634327ad77cbd37ab8e76ca6608943fb9445026a247750ad7949e2e",
+    "target": "x86_64-linux-musl",
+    "optimization": "fast"
+  },
+  "budget": {
+    "approved_ceiling_usd": 150,
+    "prior_work_reserved_usd": 25,
+    "first_attempt_reserved_usd": 20,
+    "second_attempt_reserved_usd": 20,
+    "note": "Reservations are conservative allowances, not measured cloud billing.",
+    "third_attempt_reserved_usd": 20,
+    "fourth_diagnostic_reserved_usd": 20,
+    "total_reserved_usd": 150,
+    "max_planned_reserved_usd": 150,
+    "max_attempts": 6,
+    "fifth_attempt_reserved_usd": 20,
+    "sixth_diagnostic_reserved_usd": 20,
+    "run_allowances_exhausted": true,
+    "local_diagnostics_reserved_usd": 5
+  },
+  "rerun": {
+    "revision": "235f9f16c7b5e6bc857ba74b6a87e72f67ad307c",
+    "resources": {
+      "cpu": 8,
+      "memory_gib": 48,
+      "disk_gib": 10
+    },
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "SqlProgramLimitExceeded",
+    "table_registration_ms": 41870.0,
+    "elapsed_since_build_start_seconds": 195.33,
+    "build_peak_rss_bytes": 182185984,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 78,
+    "derived_bytes_deleted": 144166
+  },
+  "next_blocker": {
+    "shape": "TLS flush truncation fixed; complete public search and full-archive qualification.",
+    "diagnosis": "A focused production builder reproduced Timeout during segment_statistics GCS PUT. TLS flush discarded a plaintext tail when ciphertext framing filled its output buffer; preserving and draining that tail fixes the exact-buffer loopback regression.",
+    "required_work": "Complete serving-path cold/warm/filter/concurrent/deep-cursor/restart samples and full-archive qualification after actual-charge reconciliation permits another bounded cloud attempt."
+  },
+  "bounded_construction": {
+    "revision": "cfc382c7b419d2d5b9b3aa98a235f30d6930229b",
+    "binary_sha256": "0d53dec77003c9a676af60ffc671f3bbfa5786d998b7eebd5b6833ff5ae79bec",
+    "target": "x86_64-linux-musl",
+    "optimization": "fast",
+    "shape": "Per-file replay, metadata sorts, text DF reduction and durable non-serving checkpoints; renewed full-definition CAS and vacuum protection.",
+    "lake_regressions_passed": 83,
+    "replay_checkpoint_and_multi_file_recovery": "passed",
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "SqlProgramLimitExceeded",
+    "table_registration_ms": 24110.98,
+    "elapsed_since_build_start_seconds": 841.58,
+    "build_peak_rss_bytes": 280494080,
+    "observed_ordered_root_rows": 142577,
+    "observed_completed_files_per_root": 1,
+    "total_source_files": 334,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 8486,
+    "derived_bytes_deleted": 202020853
+  },
+  "predicate_capacity_fix": {
+    "shape": "Limit predicate sort runs to four within the fused ordered builders shared 64-file manager; record synchronized spill file/byte admission diagnostics.",
+    "regression": "55 sibling files plus 5000 distinct predicate blocks, with repeated merges, sorted values and zero retained spill bytes.",
+    "before": "SqlProgramLimitExceeded",
+    "after": "passed",
+    "cloud_failure_attribution": "The constrained-capacity regression demonstrates a remaining risk; the previous cloud error does not identify its exact limit site.",
+    "optimized_archive_rerun": "failed_before_queries_with_Unauthorized",
+    "lake_regressions_passed": 84
+  },
+  "search_diagnostic": {
+    "scope": "One unchanged raw BigQuery Parquet file, separately generation-fenced and copied server-side; does not qualify full-archive latency.",
+    "rows": 142577,
+    "bytes": 61797036,
+    "source_original_preserved": true,
+    "status": "failed_before_queries",
+    "revision": "cfc382c7b419d2d5b9b3aa98a235f30d6930229b",
+    "binary_sha256": "0d53dec77003c9a676af60ffc671f3bbfa5786d998b7eebd5b6833ff5ae79bec",
+    "stage": "index_build",
+    "error": "Timeout",
+    "table_registration_ms": 545.38,
+    "elapsed_since_build_start_seconds": 640.18,
+    "build_peak_rss_bytes": 273072128,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 7215,
+    "derived_bytes_deleted": 182131440,
+    "source_copy_retained_for_retry": false,
+    "source_copy_note": "Retained for attempt six, then deleted with its recorded generation after both pods stopped."
+  },
+  "construction_recovery_harness": {
+    "shape": "Record Timeout/DeadlineExceeded observations and allow the engine queued checkpoint recovery within the original absolute build deadline; permanent admission errors fail immediately.",
+    "tests_passed": 4,
+    "note": "The first diagnostic aborted at its first timeout; it did not wait for the already queued engine retry."
+  },
+  "predicate_capacity_rerun": {
+    "revision": "a71048bc20cf5550bfeb48315db651a564f92cb1",
+    "binary_sha256": "aa572a6b010e958629e9ca55b772e2c762a867105749ea3f7e03fde3844a3e58",
+    "scope": "Full 47,717,307-row archive",
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "Unauthorized",
+    "table_registration_ms": 20480.62,
+    "elapsed_since_build_start_seconds": 670.21,
+    "build_peak_rss_bytes": 229490688,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 7131,
+    "derived_bytes_deleted": 168950869,
+    "credential_diagnosis": "Consistent with cached bearer expiration; original token expiry was not recorded, so attribution is unconfirmed."
+  },
+  "credential_lifetime_admission": {
+    "shape": "Force refresh once per pod, require expiry beyond its remaining hard deadline, reuse the admitted token across cycles, persist only nonsecret expiry evidence.",
+    "live_check": {
+      "expires_at": "2026-10-11T00:59:42+00:00",
+      "remaining_seconds": 3598.01,
+      "required_seconds": 3400
+    },
+    "qualification_regional_recovery_tests_passed": 22
+  },
+  "search_diagnostic_retry": {
+    "scope": "One unchanged 142,577-row raw BigQuery Parquet file; does not qualify full-archive latency.",
+    "rows": 142577,
+    "bytes": 61797036,
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "exception": "RuntimeError",
+    "error": "Index not queryable within 2700-second build deadline",
+    "revision": "f973688f6e53575fca27e65c596a59b9f7c3c21a",
+    "binary_sha256": "6e6eddfb8bf9cbc313df1727df3f6ac361019597a4390413ab0941d9ba6c4f8c",
+    "harness_sha256": {
+      "archive_qualification.py": "fdcaedb4e68efe10d552b4a99e5bf07342a55ab0f5d0f62734d6f5df1dfcbf3e",
+      "regional.py": "f0bb721c91f8c9ab87726765ca5cbae80f42debc661fc6135a1df8ce1209fef5",
+      "poc.py": "7797b61bee80f2abcf390b91e388b41c74e56eaa97f9f6ad2ac40376fcd2de04"
+    },
+    "optimization": "fast",
+    "target": "x86_64-linux-musl",
+    "build_steps_passed": 48,
+    "elapsed_since_build_start_seconds": 2700.0,
+    "table_registration_ms": 619.92,
+    "build_peak_rss_bytes": 367050752,
+    "concurrent_maintenance_note": "Artifact collection remained in its mark phase with no eligible deletions; its trace is retained without attributing the construction failure to maintenance.",
+    "engine_timeout_events": 38,
+    "last_index_status": {
+      "index_type": "full_text",
+      "readiness": {
+        "state": "pending",
+        "queryable": false,
+        "complete": false,
+        "target_revision": 39,
+        "pending_reasons": [
+          "publication"
+        ]
+      },
+      "target_revision": 39
+    },
+    "observed_transient_failures": [
+      {
+        "error": "Timeout",
+        "observations": 86,
+        "first_elapsed_seconds": 729.36,
+        "last_elapsed_seconds": 2696.24
+      }
+    ],
+    "latencies": null,
+    "credential_admission": {
+      "expires_at": "2026-10-11T01:05:59+00:00",
+      "remaining_seconds": 3598.81,
+      "required_seconds": 3395.46
+    },
+    "observed_ordered_roots": 16,
+    "checkpoint_reuse_observed_at_unix": 1791678010.4145129,
+    "distinct_ordered_child_ref_sets": 5,
+    "ordered_root_records": [
+      142577
+    ],
+    "checkpoint_reuse_evidence": "Retry generations share the five completed ordered child-tree reference sets; full-text file contribution remains incomplete.",
+    "pod_deleted": true,
+    "derived_objects_deleted": 27123,
+    "derived_bytes_deleted": 1127561937,
+    "source_copy_deleted": true,
+    "original_source_preserved": true,
+    "note": "Native transfer probes ran during construction; pod-wide build network counters include their traffic. No search measurements were taken."
+  },
+  "native_gcs_transfer_probes": {
+    "scope": "Native Linux fast HTTP client in the existing diagnostic pod; authenticated GCS media operations on only the owned run prefix, separate from search workloads.",
+    "upload_samples": [
+      {
+        "bytes": 24576,
+        "ms": 105
+      },
+      {
+        "bytes": 1048576,
+        "ms": 94
+      },
+      {
+        "bytes": 8388608,
+        "ms": 253
+      }
+    ],
+    "round_trip_samples": [
+      {
+        "bytes": 24576,
+        "upload_ms": 124,
+        "read_ms": 62
+      },
+      {
+        "bytes": 1048576,
+        "upload_ms": 85,
+        "read_ms": 76
+      },
+      {
+        "bytes": 8388608,
+        "upload_ms": 248,
+        "read_ms": 223
+      }
+    ],
+    "http_status": 200,
+    "uploaded_sizes_verified": true,
+    "read_bodies_verified": true,
+    "upload_binary_sha256": "799fedba6b1047b50e7d52c8b58bfede4d6ed2e8b4584b26f35ece0c08309052",
+    "read_binary_sha256": "35505b8f2086e41f60cb384fddb92385ee570c2d12589e564da5e94908f5a3e8",
+    "additional_pod_reservations": 0,
+    "conclusion": "Basic large-body GCS transfers work; the exact higher-level Timeout stage remains unconfirmed."
+  },
+  "text_build_diagnostics": {
+    "shape": "Log publication/checkpoint phase and text source-row, ordinal-page, encoding/pack and statistics stages; include only generation/file ordinal, completed segment count and error. Preserve the original error and suppress cancellation warnings.",
+    "present_in_sixth_run_binary": false,
+    "lake_regressions_passed": 160,
+    "qualification_regional_recovery_tests_passed": 22,
+    "keep_alive_tls_upload_regression": "24 KiB, 1 MiB and 8 MiB request bodies verified on one reused localhost TLS connection."
+  },
+  "source_copy_cleanup": {
+    "deleted": true,
+    "key": "hn-poc/archive-search-sample-20261010-2ba61a289fde4125b1d7c26113368b27/archive/part-000000000000.parquet",
+    "generation": "1791673632332785",
+    "bytes": 61797036,
+    "generation_conditioned": true,
+    "original_source_preserved": true,
+    "original_generation": "1791578150213682",
+    "reader_pods_stopped": true
+  },
+  "tls_flush_fix": {
+    "shape": "Consume only encrypted plaintext and repeat flush until the buffer is empty; engine HTTP timeouts unchanged.",
+    "regression_before": "Timeout",
+    "regression_after": "Passed with TLS 1.2 and TLS 1.3, including exact plaintext-buffer capacity and reused connections.",
+    "https_tests_passed": 7,
+    "harness_tests_passed": 23,
+    "raw_file": {
+      "rows": 142577,
+      "bytes": 61797036,
+      "sha256": "e568043355dd35700f29e9a6c055f3e4dd541724e4c844db3436f409d38b5a52",
+      "cloud_source_generation": "1791578150213682"
+    },
+    "before_fix_gcs": {
+      "stage": "segment_statistics",
+      "error": "Timeout",
+      "objects": 84,
+      "bytes": 7660290,
+      "generation_conditioned_cleanup": true
+    },
+    "fixed_bounded_gcs": {
+      "status": "stopped_at_local_300_second_bound",
+      "engine_timeout_observed": false,
+      "objects": 1995,
+      "bytes": 139903056,
+      "generation_conditioned_cleanup": true
+    },
+    "scope": "Focused native aarch64-macos fast production publication builder, testing allocator, body-only schema and local unchanged raw Parquet source with real GCS artifacts. Excludes coordinator, serving API and public search measurements.",
+    "binary_sha256": "c14d975f7545683d4b23c42bab2df325ae383c342cf5f799b0b90e120348c09e",
+    "filesystem_publication": {
+      "status": "passed",
+      "elapsed_ms": 1294288,
+      "optimization": "debug",
+      "note": "Testing allocator; correctness diagnostic, not performance qualification."
+    },
+    "billing_reconciliation": "Export usage predates the final diagnostic jobs; reservations cannot yet be released.",
+    "fixed_completion_gcs": {
+      "status": "stopped_at_local_600_second_bound_before_publication",
+      "engine_timeout_observed": false,
+      "objects": 2265,
+      "bytes": 157341017,
+      "remaining_work_sample": "Document-frequency statistics Builder.add -> PageStore.get -> GCS getObject -> HTTP socket receive; one-second sample, not a performance attribution.",
+      "complete_publication_verified": false,
+      "search_measurements": null,
+      "cleanup": {
+        "prefix": "hn-poc/local-construction-diagnostic/eb2719bfeabd4314b3c7e538c72ffe11/indexes",
+        "deleted": 2265,
+        "bytes": 157341017,
+        "generation_conditioned": true,
+        "source_preserved": true,
+        "readers_stopped": true
+      }
+    }
+  }
+}

@@ -106,6 +106,12 @@ function findUp(
     if (existsSync(candidate)) {
       return candidate;
     }
+    // A nested checkout/worktree must use its own artifact. Its .git marker
+    // can be either a directory or a file; do not load a different branch's
+    // library from an enclosing checkout.
+    if (existsSync(join(dir, ".git"))) {
+      return undefined;
+    }
     const parent = dirname(dir);
     if (parent === dir) {
       return undefined;

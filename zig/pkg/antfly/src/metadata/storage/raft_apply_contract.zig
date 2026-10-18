@@ -38,6 +38,14 @@ pub const AppliedMetadataCheckpoint = struct {
     }
 };
 
+/// Scalar observation only. Native scan ownership and final publication
+/// admission stay in the storage owner; receiving this is not apply authority.
+pub const RelationPublicationEvidence = struct {
+    state: @import("antfly_local_sources").system_catalog_relation_reconciliation.State,
+    applied_index: u64,
+    root: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Generation,
+};
+
 pub const TableTransitionFence = struct {
     generation: u64 = 0,
     active_count: u32 = 0,
@@ -237,6 +245,24 @@ pub const SystemCatalogCommand = struct {
 
 pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
 
+pub fn transitionMutatesRelationSource(command: anytype) bool {
+    return switch (command) {
+        .apply_system_catalog,
+        .apply_restore_staging,
+        .create_restore_job_with_staging,
+        .apply_fk_generation_publication,
+        .apply_fk_initial_create,
+        .upsert_table,
+        .compare_and_replace_table,
+        .remove_table,
+        .apply_table_topology,
+        .apply_extension_lifecycle,
+        .apply_extension_lifecycle_v2,
+        => true,
+        else => false,
+    };
+}
+
 const store_report_update = @import("../store_report_update.zig");
 pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
@@ -254,6 +280,8 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_query_definition: []const u8,
     catalog_write_validation: []const u8,
     catalog_write_validation_revision: void,
+    relation_source_tracking: void,
+    relation_reconciliation_work: void,
     topology_activation: void,
     report_cursor: u64,
     read_control_stores: []const u64,

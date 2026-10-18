@@ -90,15 +90,13 @@ pub const AudioContext = enum {
     }
 };
 
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
+/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
 pub const BackendPriorityEntry = []const u8;
 
 /// Runtime backends compiled into this inference server.
 pub const BackendRuntimes = struct {
     /// Whether the native CPU backend is built into this runtime
     native: ?bool = null,
-    /// Whether the ONNX Runtime backend is built into this runtime
-    onnx: ?bool = null,
     /// Whether the Metal backend is built into this runtime
     metal: ?bool = null,
     /// Whether the CUDA backend is built into this runtime
@@ -111,7 +109,6 @@ pub const BackendRuntimes = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "native", "native", true },
-        .{ "onnx", "onnx", true },
         .{ "metal", "metal", true },
         .{ "cuda", "cuda", true },
         .{ "xla", "xla", true },
@@ -130,10 +127,6 @@ pub const BackendRuntimes = struct {
         try jw.beginObject();
         if (self.native) |value| {
             try jw.objectField("native");
-            try jw.write(value);
-        }
-        if (self.onnx) |value| {
-            try jw.objectField("onnx");
             try jw.write(value);
         }
         if (self.metal) |value| {
@@ -391,6 +384,12 @@ pub const Chunk = struct {
 
 pub const ChunkConfig = antfly_chunking_api_openapi.InferenceChunkConfig;
 
+pub const ChunkEmbeddingContext = antfly_chunking_api_openapi.ChunkEmbeddingContext;
+
+pub const ChunkEmbeddingResponse = antfly_chunking_api_openapi.ChunkEmbeddingResponse;
+
+pub const ChunkEmbeddingTarget = antfly_chunking_api_openapi.ChunkEmbeddingTarget;
+
 /// A chunk result object. Text chunks have mime_type text/plain.
 pub const ChunkObject = struct {
     /// The chunk text content
@@ -491,6 +490,8 @@ pub const ChunkObject = struct {
     }
 };
 
+pub const ChunkOperationResponse = std.json.Value;
+
 pub const ChunkRequest = antfly_chunking_api_openapi.InferenceChunkRequest;
 
 pub const ChunkResponse = struct {
@@ -505,6 +506,8 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
+pub const ChunkSourceReference = antfly_chunking_api_openapi.ChunkSourceReference;
+
 pub const Config = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
     max_concurrent_requests: ?i64 = null,
@@ -512,7 +515,7 @@ pub const Config = struct {
     api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
@@ -1549,7 +1552,7 @@ pub const EmbeddingBatchSummary = struct {
 
 pub const EmbeddingDecisionOptions = antfly_decision_openapi.EmbeddingDecisionOptions;
 
-/// EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens.
+/// EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. Video uses video/mp4, video/quicktime, video/webm or video/mp2t media/attachment parts, 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. The expanded sequence must fit 8192 tokens.
 pub const EmbeddingGroup = struct {
     /// Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
     title: ?[]const u8 = null,
@@ -2334,7 +2337,7 @@ pub const GenerateRequest = struct {
     frequency_penalty: ?f32 = null,
     /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
     presence_penalty: ?f32 = null,
-    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
     response_format: ?GenerateResponseFormat = null,
     /// inference-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
     grammar: ?[]const u8 = null,
@@ -2733,13 +2736,14 @@ pub const Level = enum {
     }
 };
 
+pub const MediaChunkPolicy = antfly_chunking_api_openapi.MediaChunkPolicy;
+
 pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
 
 /// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
 pub const ModelBackend = enum {
     auto,
     native,
-    onnx,
     metal,
     cuda,
     xla,
@@ -2750,7 +2754,6 @@ pub const ModelBackend = enum {
         const s = switch (self) {
             .auto => "auto",
             .native => "native",
-            .onnx => "onnx",
             .metal => "metal",
             .cuda => "cuda",
             .xla => "xla",
@@ -2768,7 +2771,6 @@ pub const ModelBackend = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "auto", .auto },
             .{ "native", .native },
-            .{ "onnx", .onnx },
             .{ "metal", .metal },
             .{ "cuda", .cuda },
             .{ "xla", .xla },
@@ -2813,6 +2815,12 @@ pub const ModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const ModelInfo = struct {
+    /// Effective model-aware chunk operational ceilings for working/output/event bytes, chunk/dependency/index counts and remote fetched bytes, requests and cache bytes. Independent of model token limits and object length. Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>. Scoped and unscoped embedding discovery expose the same values.
+    chunking_limits: ?std.json.ArrayHashMap(i64) = null,
+    /// Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights.
+    model_revision: ?[]const u8 = null,
+    /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
+    qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -2820,6 +2828,9 @@ pub const ModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "chunking_limits", "chunking_limits", true },
+        .{ "model_revision", "model_revision", true },
+        .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -2834,6 +2845,18 @@ pub const ModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.chunking_limits) |value| {
+            try jw.objectField("chunking_limits");
+            try jw.write(value);
+        }
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
+        if (self.qualified_limits) |value| {
+            try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
         if (self.capabilities) |value| {
             try jw.objectField("capabilities");
             try jw.write(value);
@@ -2928,6 +2951,8 @@ pub const ModelRef = struct {
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
     backend: ?ModelBackend = null,
+    /// Per-model GLiNER CUDA inference precision for extractor preloads. Requires CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests fail closed until the exact model/profile has release qualification. Precision is part of the loaded-session cache identity.
+    cuda_precision: ?[]const u8 = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
     /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
@@ -2940,6 +2965,7 @@ pub const ModelRef = struct {
         .{ "kind", "kind", false },
         .{ "name", "name", false },
         .{ "backend", "backend", true },
+        .{ "cuda_precision", "cuda_precision", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
         .{ "residency_mode", "residency_mode", true },
@@ -2962,6 +2988,10 @@ pub const ModelRef = struct {
         try jw.write(self.name);
         if (self.backend) |value| {
             try jw.objectField("backend");
+            try jw.write(value);
+        }
+        if (self.cuda_precision) |value| {
+            try jw.objectField("cuda_precision");
             try jw.write(value);
         }
         if (self.format) |value| {
@@ -3470,7 +3500,7 @@ pub const RuntimeConfig = struct {
     api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,

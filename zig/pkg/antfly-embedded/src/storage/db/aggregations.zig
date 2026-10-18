@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const storage_engine = @import("../engine_selection.zig");
 const Allocator = std.mem.Allocator;
 pub const contract = @import("aggregations_contract.zig");
 const types = @import("types.zig");
@@ -166,6 +167,7 @@ pub fn computeSearchAggregations(
     result: types.SearchResult,
     ctx: Context,
 ) anyerror![]SearchAggregationResult {
+    if (comptime storage_engine.enabled) return @import("../aggregation_engine.zig").compute(alloc, requests, result, ctx);
     if (result.hits.len > max_aggregation_source_hits) return error.QueryCandidateBudgetExceeded;
     return try computeSearchAggregationsAtDepth(alloc, requests, result, ctx, true);
 }
@@ -12528,6 +12530,7 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
         &left_identity_writes,
         left_doc_keys[0..],
         &.{},
+        null,
     );
     try left_store.putBatchWithReplay(null, left_identity_writes.items, &.{}, null);
     {
@@ -14629,6 +14632,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
@@ -14758,6 +14762,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         &extra_identity_writes,
         extra_doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, extra_identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = extra_docs[0..] });
@@ -15381,6 +15386,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });

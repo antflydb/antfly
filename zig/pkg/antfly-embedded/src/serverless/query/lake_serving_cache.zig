@@ -41,6 +41,8 @@ pub const Cache = struct {
     persistent_mutex: std.Io.Mutex = .init,
     persistent_retry_after_ns: i96 = 0,
     persistent_ready: std.atomic.Value(bool) = .init(false),
+    persistent_startup: std.Io.Group = .init,
+    persistent_startup_io: ?std.Io = null,
 
     const Mapping = struct {
         cache: *Cache,
@@ -65,23 +67,62 @@ pub const Cache = struct {
     /// Publish one disk owner. The server owns the worker and drains it
     /// after cursors are quiescent; a request never owns cache I/O state.
     pub fn ensurePersistent(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources) !void {
+        return self.ensurePersistentAt(io, root, policy, resources, std.Io.Clock.now(.awake, io).nanoseconds);
+    }
+
+    // Retry optional startup without blocking concurrent RAM/source reads.
+    fn ensurePersistentAt(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources, now: i96) !void {
         try policy.validate();
         if (root.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
         if (self.persistent_ready.load(.acquire)) return;
-        // Another request may be inventorying a large cache. Reads can use
-        // RAM/source rather than queue behind optional cache startup I/O.
         if (!self.persistent_mutex.tryLock()) return;
         defer self.persistent_mutex.unlock(io);
-        if (self.persistent_ready.load(.acquire)) return;
+        if (self.persistent_ready.load(.acquire) or now < self.persistent_retry_after_ns) return;
+        try self.initializePersistent(io, root, policy, resources, now);
+    }
+
+    /// Schedule inventory restoration once, without borrowing request memory or
+    /// waiting for filesystem work. Until publication, reads use RAM/source.
+    /// The caller's Io and resource manager must outlive this cache.
+    pub fn startPersistent(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources) !void {
+        try policy.validate();
+        if (root.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
+        if (self.persistentReady() or !self.persistent_mutex.tryLock()) return;
+        var handed_off = false;
+        defer if (!handed_off) self.persistent_mutex.unlock(io);
         const now = std.Io.Clock.now(.awake, io).nanoseconds;
-        if (now < self.persistent_retry_after_ns) return;
+        if (self.persistentReady() or now < self.persistent_retry_after_ns) return;
+        const owned = self.alloc.dupe(u8, root) catch |err| {
+            self.recordDiskUnavailable(err);
+            self.persistent_retry_after_ns = now +| 30 * std.time.ns_per_s;
+            return;
+        };
+        defer if (!handed_off) self.alloc.free(owned);
+        self.persistent_startup_io = io;
+        self.persistent_startup.concurrent(io, restorePersistent, .{ self, io, owned, policy, resources }) catch |err| {
+            self.recordDiskUnavailable(err);
+            self.persistent_retry_after_ns = now +| 30 * std.time.ns_per_s;
+            return;
+        };
+        handed_off = true;
+    }
+
+    fn restorePersistent(self: *Cache, io: std.Io, root: []u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources) std.Io.Cancelable!void {
+        defer self.persistent_mutex.unlock(io);
+        defer self.alloc.free(root);
+        try self.initializePersistent(io, root, policy, resources, std.Io.Clock.now(.awake, io).nanoseconds);
+    }
+
+    /// Requires the startup mutex, which remains held by the background owner
+    /// until publication or failure. No cache-memory lock covers inventory I/O.
+    fn initializePersistent(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources, now: i96) std.Io.Cancelable!void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         self.stats.disk_init_attempts +|= 1;
         self.mutex.unlock();
         var coordinated = resources;
         coordinated.reclaim_idle = .{ .ptr = self, .reclaim_one = reclaimIdleMapping };
-        self.persistent = parquet.PersistentObjectRangeCache.initWithPolicyAndResources(io, root, policy, coordinated) catch |err| {
-            if (err == error.Canceled) return err;
+        const disk = parquet.PersistentObjectRangeCache.initWithPolicyAndResources(io, root, policy, coordinated) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
             // Local cache availability is never source/readiness authority.
             // Retry transient ownership, worker, or filesystem failures without
             // repeating startup inventory I/O or warnings for every request.
@@ -93,22 +134,37 @@ pub const Cache = struct {
             self.persistent_retry_after_ns = now +| 30 * std.time.ns_per_s;
             return;
         };
+        // Publish only after the complete disk owner is initialized.
+        self.persistent = disk;
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         self.stats.disk_unavailable = null;
         self.mutex.unlock();
         self.persistent_ready.store(true, .release);
     }
 
-    pub fn persistentStats(self: *Cache) ?parquet.PersistentObjectRangeCacheStats {
-        // Status must not wait for startup inventory I/O. Once published, the
-        // disk owner is immutable until server readers/status calls quiesce.
-        return if (self.persistentCache()) |disk| disk.statsSnapshot() else null;
+    /// The owner is immutable after publication, until all server readers
+    /// quiesce. Startup callers can skip path allocation and startup locking
+    /// once ready; a failed initialization must still enter bounded recovery.
+    pub fn persistentReady(self: *const Cache) bool {
+        return self.persistent_ready.load(.acquire);
     }
-    /// A retry may publish the disk owner while older RAM-only readers are
-    /// running. Acquire publication before touching the optional owner.
+
     fn persistentCache(self: *Cache) ?*parquet.PersistentObjectRangeCache {
         if (!self.persistent_ready.load(.acquire)) return null;
         return &self.persistent.?;
+    }
+
+    pub fn recordDiskUnavailable(self: *Cache, err: anyerror) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.stats.disk_unavailable = @errorName(err);
+    }
+
+    pub fn persistentStats(self: *Cache) ?parquet.PersistentObjectRangeCacheStats {
+        // Status must not wait for startup inventory I/O. Once published, the
+        // disk owner is immutable until server readers/status calls quiesce.
+        const disk = self.persistentCache() orelse return null;
+        return disk.statsSnapshot();
     }
 
     const Flight = struct { key: []u8, event: std.Io.Event = .unset, refs: usize = 1 };
@@ -208,6 +264,9 @@ pub const Cache = struct {
         return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
+        // Request/status callers are quiescent. Cancel and join restoration
+        // before destroying its cache, callback owner or filesystem Io.
+        if (self.persistent_startup_io) |io| self.persistent_startup.cancel(io);
         // Readers are quiescent. Join accepted writes before destroying the
         // mapping table borrowed by the worker's pressure callback.
         if (self.persistent) |*disk| disk.flush();
@@ -306,6 +365,29 @@ pub const Cache = struct {
     /// or copy occurs on a hit; pinned entries remain charged and unevictable.
     /// Large contiguous segment callers retain readImmutableLease's disk-first
     /// policy so they can discard clean mapped pages under memory pressure.
+    /// Lookup only: never fetch the provider. A persisted broad pack can serve
+    /// sparse reads after restart through one verified, bounded disk mapping.
+    pub fn pinImmutableBlock(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context) !?ImmutableLease {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        if (self.pin(key)) |pinned| {
+            errdefer pinned.release();
+            try context.ensureActive();
+            return .{ .shared = pinned };
+        }
+        if (self.pinMapping(key)) |mapping| {
+            errdefer mapping.release();
+            try context.ensureActive();
+            return .{ .mapping = mapping };
+        }
+        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
+            self.recordRead(true, mapped.bytes.len);
+            return self.admitMapping(key, mapped);
+        };
+        return null;
+    }
+
     pub fn readImmutableBlockLease(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) !ImmutableLease {
         try context.ensureActive();
         const key = try immutableKey(a, scope, identity, length, digest);
@@ -421,16 +503,21 @@ pub const Cache = struct {
     fn reclaimIdleMapping(raw: *anyopaque) bool {
         const self: *Cache = @ptrCast(@alignCast(raw));
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
         var victim: ?*Mapping = null;
         var entries = self.mappings.valueIterator();
         while (entries.next()) |entry| {
             if (entry.*.refs != 0) continue;
             if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
         }
-        const retired = victim orelse return false;
+        const retired = victim orelse {
+            self.mutex.unlock();
+            return false;
+        };
         _ = self.mappings.remove(retired.key);
         self.mapped_bytes -= retired.value.mapping.len;
+        self.mutex.unlock();
+        // munmap and the disk owner's lease release may block under paging.
+        // Detach first so unrelated readers can use the cache meanwhile.
         retired.destroy();
         return true;
     }
@@ -438,41 +525,56 @@ pub const Cache = struct {
     // atomic; pins keep the original mapping and disk eviction lease alive.
     // Large contiguous artifacts keep their separate disk-first lifetime.
     fn admitMapping(self: *Cache, key: []const u8, value: parquet.PersistentObjectRangeCache.MappedEntry) ImmutableLease {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
-        if (self.mappings.get(key)) |existing| {
-            existing.refs += 1;
-            var redundant = value;
-            redundant.deinit();
-            return .{ .mapping = existing };
-        }
-        if (value.mapping.len > self.max_mapped_bytes or self.max_mappings == 0) return .{ .mapped = value };
-        while (value.mapping.len > self.max_mapped_bytes -| self.mapped_bytes or self.mappings.count() >= self.max_mappings) {
-            var victim: ?*Mapping = null;
-            var entries = self.mappings.valueIterator();
-            while (entries.next()) |entry| {
-                if (entry.*.refs != 0) continue;
-                if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
+        var reclaimed: usize = 0;
+        while (true) {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            var locked = true;
+            defer if (locked) self.mutex.unlock();
+            if (self.mappings.get(key)) |existing| {
+                existing.refs += 1;
+                self.mutex.unlock();
+                locked = false;
+                var redundant = value;
+                redundant.deinit();
+                return .{ .mapping = existing };
             }
-            const retired = victim orelse return .{ .mapped = value };
-            _ = self.mappings.remove(retired.key);
-            self.mapped_bytes -= retired.value.mapping.len;
-            retired.destroy();
+            if (value.mapping.len > self.max_mapped_bytes or self.max_mappings == 0) return .{ .mapped = value };
+            if (value.mapping.len > self.max_mapped_bytes -| self.mapped_bytes or self.mappings.count() >= self.max_mappings) {
+                // Admission is optional. Bound retries when other readers keep
+                // consuming capacity while cleanup runs outside the lock.
+                if (reclaimed >= self.max_mappings) return .{ .mapped = value };
+                var victim: ?*Mapping = null;
+                var entries = self.mappings.valueIterator();
+                while (entries.next()) |entry| {
+                    if (entry.*.refs != 0) continue;
+                    if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
+                }
+                const retired = victim orelse return .{ .mapped = value };
+                _ = self.mappings.remove(retired.key);
+                self.mapped_bytes -= retired.value.mapping.len;
+                self.mutex.unlock();
+                locked = false;
+                retired.destroy();
+                reclaimed += 1;
+                // Another reader may have populated this key or used the freed
+                // capacity. Recheck identity and both limits after cleanup.
+                continue;
+            }
+            const mapping = self.alloc.create(Mapping) catch return .{ .mapped = value };
+            const owned = self.alloc.dupe(u8, key) catch {
+                self.alloc.destroy(mapping);
+                return .{ .mapped = value };
+            };
+            self.tick +|= 1;
+            mapping.* = .{ .cache = self, .key = owned, .value = value, .touched = self.tick };
+            self.mappings.put(self.alloc, owned, mapping) catch {
+                self.alloc.free(owned);
+                self.alloc.destroy(mapping);
+                return .{ .mapped = value };
+            };
+            self.mapped_bytes += value.mapping.len;
+            return .{ .mapping = mapping };
         }
-        const mapping = self.alloc.create(Mapping) catch return .{ .mapped = value };
-        const owned = self.alloc.dupe(u8, key) catch {
-            self.alloc.destroy(mapping);
-            return .{ .mapped = value };
-        };
-        self.tick +|= 1;
-        mapping.* = .{ .cache = self, .key = owned, .value = value, .touched = self.tick };
-        self.mappings.put(self.alloc, owned, mapping) catch {
-            self.alloc.free(owned);
-            self.alloc.destroy(mapping);
-            return .{ .mapped = value };
-        };
-        self.mapped_bytes += value.mapping.len;
-        return .{ .mapping = mapping };
     }
 
     fn readImmutableKeyAlloc(self: *Cache, a: Allocator, key: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
@@ -610,32 +712,127 @@ pub const Cache = struct {
     }
 };
 pub const Reader = struct {
+    const Scheduling = @import("../../sql/parallel_scheduler.zig");
+    const Prefetch = struct {
+        task: Scheduling.Task(anyerror!void),
+        bytes: usize,
+        key: [32]u8,
+        work: *Warm,
+    };
+    const Warm = struct {
+        reader: *Reader,
+        read: ranges.RangeRead,
+        arena: std.heap.ArenaAllocator,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        page_end: ?u64 = null,
+        page_limit: usize = 0,
+        fn destroy(self: *Warm) void {
+            self.arena.deinit();
+            std.heap.page_allocator.destroy(self);
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const Warm = @ptrCast(@alignCast(raw));
+            if (self.cancelled.load(.acquire)) return true;
+            self.reader.context.ensureActive() catch return true;
+            return false;
+        }
+    };
     cache: *Cache,
     base: ObjectReader,
     scope: [32]u8,
     context: Context,
-    pending: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = @splat(null),
+    scheduler: *Scheduling.Scheduler = Scheduling.global(),
+    pending: [8]?Prefetch = @splat(null),
     prefetch_bytes: usize = 0,
-    prefetch_cancelled: std.atomic.Value(bool) = .init(false),
-    /// One lookahead batch, four concurrent ranges, at most 32 MiB in flight.
+    /// Rolling lookahead, at most eight ranges and 32 MiB per reader. Shared
+    /// I/O admission further limits in-flight bytes under memory pressure.
     /// Workers use independent page allocations, never a SQL arena/quota.
     pub fn prefetch(self: *Reader, reads: []const ranges.RangeRead) !void {
-        self.drain(false);
+        return self.prefetchImpl(reads, null, 0);
+    }
+    /// Header discovery belongs to I/O workers. Reserve the bounded possible
+    /// payload before discovering its size, rather than blocking a scan pull.
+    pub fn prefetchPage(self: *Reader, read: ranges.RangeRead, chunk_end: u64, limit: usize) !void {
+        if (chunk_end <= read.range.offset or limit < read.range.len) return;
+        return self.prefetchImpl(&.{read}, chunk_end, @intCast(@min(chunk_end - read.range.offset, @min(limit, 2 * 1024 * 1024))));
+    }
+    fn prefetchImpl(self: *Reader, reads: []const ranges.RangeRead, page_end: ?u64, page_limit: usize) !void {
+        self.reapPrefetch();
         const io = self.context.io orelse return;
         try self.context.ensureActive();
-        self.prefetch_cancelled.store(false, .release);
-        self.prefetch_bytes = 0;
-        for (reads[0..@min(reads.len, self.pending.len)], 0..) |read, i| {
-            if (read.range.len > 32 * 1024 * 1024 -| self.prefetch_bytes) break;
-            self.prefetch_bytes += @intCast(read.range.len);
-            self.pending[i] = @import("../../sql/parallel_scheduler.zig").global().submit(io, @intCast(read.range.len *| 2), warm, .{ self, read }) orelse break;
+        for (reads) |read| {
+            const slot = for (self.pending, 0..) |pending, i| {
+                if (pending == null) break i;
+            } else break;
+            const reserved = @max(read.range.len, page_limit);
+            if (reserved > 32 * 1024 * 1024 -| self.prefetch_bytes) continue;
+            const key = try self.objectKey(std.heap.page_allocator, read, "prefetch-v1");
+            const duplicate = for (self.pending) |pending| {
+                if (pending) |active| if (std.mem.eql(u8, &key, &active.key)) break true;
+            } else false;
+            if (duplicate) continue;
+            const work = try std.heap.page_allocator.create(Warm);
+            work.* = .{ .reader = self, .read = read, .arena = .init(std.heap.page_allocator) };
+            work.page_end = page_end;
+            work.page_limit = page_limit;
+            errdefer work.destroy();
+            const a = work.arena.allocator();
+            work.read.object.bucket = try a.dupe(u8, read.object.bucket);
+            work.read.object.key = try a.dupe(u8, read.object.key);
+            work.read.object.version.etag = try a.dupe(u8, read.object.version.etag);
+            work.read.object.version.version_id = try a.dupe(u8, read.object.version.version_id);
+            work.read.compression_codec = try a.dupe(u8, read.compression_codec);
+            work.read.decoded_column_id = try a.dupe(u8, read.decoded_column_id);
+            const task = self.scheduler.submitIoTransient(io, @intCast(reserved *| 2), warm, .{work}) orelse {
+                work.destroy();
+                continue;
+            };
+            self.pending[slot] = .{ .task = task, .bytes = @intCast(reserved), .key = key, .work = work };
+            self.prefetch_bytes += @intCast(reserved);
         }
     }
-    fn warm(self: *Reader, read: ranges.RangeRead) anyerror!void {
+    /// Completed workers have already released execution admission. Joining
+    /// them here only reclaims descriptors; unrelated slow reads never stall
+    /// a scan pull or the submission of another batch.
+    pub fn reapPrefetch(self: *Reader) void {
+        const io = self.context.io orelse return;
+        for (&self.pending) |*pending| if (pending.*) |*active| {
+            if (!active.task.isComplete()) continue;
+            active.task.await(io) catch {};
+            self.prefetch_bytes -= active.bytes;
+            active.work.destroy();
+            pending.* = null;
+        };
+    }
+    fn warm(work: *Warm) anyerror!void {
+        const self = work.reader;
+        const read = work.read;
         var worker: Reader = .{ .cache = self.cache, .base = self.base, .scope = self.scope, .context = self.context };
-        const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = prefetchCanceled };
+        const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = work, .is_cancelled_fn = Warm.canceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
+        if (work.page_end) |end| {
+            var probe = read;
+            const page = @import("lake_parquet_page.zig");
+            while (true) {
+                const lease = try readLease(&worker, std.heap.page_allocator, probe);
+                defer lease.release();
+                const parsed = page.parsePageHeader(lease.bytes) catch |err| {
+                    const next = @min(end - probe.range.offset, @min(probe.range.len * 2, @min(work.page_limit, 64 * 1024)));
+                    if (next <= probe.range.len) return err;
+                    probe.range.len = next;
+                    continue;
+                };
+                try parsed.header.validateResourceLimits();
+                const length = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
+                if (length > end - probe.range.offset or length > work.page_limit) return;
+                if (length <= lease.bytes.len) return;
+                probe.range.len = length;
+                const payload = try readLease(&worker, std.heap.page_allocator, probe);
+                payload.release();
+                return;
+            }
+        }
         if (read.purpose == .parquet_footer) {
             const lease = try worker.footerRead(read);
             defer lease.release();
@@ -644,26 +841,30 @@ pub const Reader = struct {
             defer bytes.release();
         }
     }
-    fn prefetchCanceled(raw: *const anyopaque) bool {
-        const self: *const Reader = @ptrCast(@alignCast(raw));
-        if (self.prefetch_cancelled.load(.acquire)) return true;
-        self.context.ensureActive() catch return true;
-        return false;
-    }
     /// Prefetch failures are speculative. Required reads preserve their own
     /// errors; close cancels/joins before footer metadata or clients are freed.
     pub fn drain(self: *Reader, cancel: bool) void {
-        if (cancel) self.prefetch_cancelled.store(true, .release);
+        self.drainExceptFooter(cancel, false);
+    }
+    /// Footer jobs own their immutable range descriptors and belong to the
+    /// scan, so file teardown can preserve them without borrowing file metadata.
+    pub fn clearFile(self: *Reader) void {
+        self.drainExceptFooter(true, true);
+    }
+    fn drainExceptFooter(self: *Reader, cancel: bool, preserve_footer: bool) void {
         const io = self.context.io orelse return;
         for (&self.pending) |*future| if (future.*) |*active| {
+            if (preserve_footer and active.work.read.purpose == .parquet_footer) continue;
             if (cancel) {
-                active.cancel(io) catch {};
+                active.work.cancelled.store(true, .release);
+                active.task.cancel(io) catch {};
             } else {
-                active.await(io) catch {};
+                active.task.await(io) catch {};
             }
+            self.prefetch_bytes -= active.bytes;
+            active.work.destroy();
             future.* = null;
         };
-        self.prefetch_bytes = 0;
     }
     pub fn reader(self: *Reader) parquet.ObjectRangeReader {
         return .{ .ctx = self, .read_range_alloc = readRange, .read_planned_range_alloc = readPlanned, .read_planned_range_lease = readLease };
@@ -801,14 +1002,14 @@ test "external lake shared cache bounds memory and segregates versions and crede
     try std.testing.expectEqual(@as(u64, 1), stats.evictions);
 }
 
-test "external lake prefetch overlaps bounded ranges warms versions and joins on close" {
+test "external lake prefetch rolls across blocked batches warms versions and joins on close" {
     const storage = @import("../../storage/object_storage.zig");
     const a = std.testing.allocator;
     var memory = storage.MemoryObjectStorage.init(a);
     defer memory.deinit();
     var client = memory.client();
     try client.makeBucket("bucket");
-    var put = try client.putObject("bucket", "data", "abcdefghijklmnop", .{});
+    var put = try client.putObject("bucket", "data", "abcdefghijklmnopqrstuvwxyz012345", .{});
     defer put.deinit(a);
     const Slow = struct {
         base: storage.ObjectStorage,
@@ -838,9 +1039,10 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     slow.vtable.get_object = Slow.get;
     var cache = Cache.init(a);
     defer cache.deinit();
-    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    var scheduler: Reader.Scheduling.Scheduler = .{ .max_io_workers = 8, .max_bytes = 128 };
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io }, .scheduler = &scheduler };
     defer reader.drain(true);
-    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "data", .byte_len = 16, .version = .{ .etag = put.etag.? } };
+    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "data", .byte_len = 32, .version = .{ .etag = put.etag.? } };
     var reads: [4]ranges.RangeRead = undefined;
     for (&reads, 0..) |*read, i| read.* = .{ .object = object, .range = .{ .offset = i * 4, .len = 4 }, .purpose = .parquet_column_chunk };
     try reader.prefetch(&reads);
@@ -850,13 +1052,41 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expect(slow.entered.load(.acquire) >= 2);
+    var next_reads = reads;
+    for (&next_reads) |*read| read.range.offset += 16;
+    const Rolling = struct {
+        fn run(target: *Reader, next: []const ranges.RangeRead, finished: *std.atomic.Value(bool)) !void {
+            try target.prefetch(next);
+            finished.store(true, .release);
+        }
+    };
+    var finished: std.atomic.Value(bool) = .init(false);
+    var rolling = try std.testing.io.concurrent(Rolling.run, .{ &reader, &next_reads, &finished });
+    var rolling_joined = false;
+    defer if (!rolling_joined) {
+        slow.gate.store(true, .release);
+        _ = rolling.cancel(std.testing.io) catch {};
+    };
+    for (0..200) |_| {
+        if (finished.load(.acquire)) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const submitted_while_blocked = finished.load(.acquire);
+    // Open the provider before joining even on regression, so a drain-before-
+    // submit implementation fails the assertion instead of wedging the suite.
     slow.gate.store(true, .release);
+    const rolling_result = rolling.await(std.testing.io);
+    rolling_joined = true;
+    try rolling_result;
+    try std.testing.expect(submitted_while_blocked);
+    try std.testing.expectEqual(@as(usize, 32), reader.prefetch_bytes);
     reader.drain(false);
-    try std.testing.expectEqual(@as(usize, 4), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 8), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     const bytes = try reader.reader().readPlannedAlloc(a, reads[2]);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("ijkl", bytes);
-    try std.testing.expectEqual(@as(usize, 4), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 8), slow.entered.load(.acquire));
     try std.testing.expect(cache.snapshot().hits > 0);
     // Concurrent misses for an identical immutable range share one provider
     // request. Each waiter remains cancelable under its own read context.
@@ -878,7 +1108,13 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     slow.gate.store(false, .release);
     reader.scope[0] = 1;
     const entered_before = slow.entered.load(.acquire);
-    try reader.prefetch(&reads);
+    // Shared memory pressure shrinks the rolling window. A large first range
+    // must not prevent a later small useful range from being admitted.
+    scheduler.max_bytes = 24;
+    var large = reads[0];
+    large.range.len = 16;
+    try reader.prefetch(&.{ large, reads[0], reads[1], reads[2], reads[3] });
+    try std.testing.expectEqual(@as(usize, 4), reader.prefetch_bytes);
     for (0..200) |_| {
         if (slow.entered.load(.acquire) > entered_before) break;
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
@@ -886,6 +1122,62 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     reader.drain(true);
     try std.testing.expect(slow.canceled.load(.acquire) > 0);
     for (reader.pending) |future| try std.testing.expect(future == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_bytes);
+    // A next-file footer owns its descriptors and remains scan-owned while
+    // current-file page jobs are canceled. Final close still joins the footer.
+    scheduler.max_bytes = 128;
+    reader.scope[0] = 3;
+    slow.gate.store(false, .release);
+    const footer_before = slow.entered.load(.acquire);
+    var footer = reads[0];
+    footer.purpose = .parquet_footer;
+    try reader.prefetch(&.{ footer, reads[1] });
+    for (0..200) |_| {
+        if (slow.entered.load(.acquire) >= footer_before + 2) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(footer_before + 2, slow.entered.load(.acquire));
+    const canceled_before = slow.canceled.load(.acquire);
+    reader.clearFile();
+    try std.testing.expectEqual(canceled_before + 1, slow.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), reader.prefetch_bytes);
+    var retained: usize = 0;
+    for (reader.pending) |future| if (future) |active| {
+        retained += 1;
+        try std.testing.expectEqual(@as(@TypeOf(footer.purpose), .parquet_footer), active.work.read.purpose);
+        try std.testing.expect(active.work.read.object.key.ptr != footer.object.key.ptr);
+        try std.testing.expect(!active.work.cancelled.load(.acquire));
+    };
+    try std.testing.expectEqual(@as(usize, 1), retained);
+    reader.drain(true);
+    try std.testing.expectEqual(canceled_before + 2, slow.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), reader.prefetch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    // A required next-file open joins the preserved parsed-footer flight;
+    // it does not issue another provider request after file teardown.
+    const parquet_bytes = try @import("lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "n", .values = &.{ 1, 2 } }});
+    defer a.free(parquet_bytes);
+    var next_put = try client.putObject("bucket", "next.parquet", parquet_bytes, .{});
+    defer next_put.deinit(a);
+    const next_file: @import("../external_source/types.zig").FileEntry = .{ .file_id = @constCast("next"), .object_uri = @constCast("s3://bucket/next.parquet"), .etag = next_put.etag.?, .byte_len = parquet_bytes.len, .row_count = 2, .row_groups = &.{} };
+    const next_footer = try ranges.planParquetFooterRead(try ranges.objectRefForExternalFileUri(next_file), 64 * 1024);
+    scheduler.max_bytes = 1024 * 1024;
+    reader.scope[0] = 4;
+    const opened_before = slow.entered.load(.acquire);
+    try reader.prefetch(&.{next_footer});
+    for (0..200) |_| {
+        if (slow.entered.load(.acquire) > opened_before) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(opened_before + 1, slow.entered.load(.acquire));
+    reader.clearFile();
+    slow.gate.store(true, .release);
+    const parsed = try reader.footer(next_file);
+    parsed.release();
+    reader.drain(false);
+    try std.testing.expectEqual(opened_before + 1, slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
 }
 
 test "external lake immutable artifact cache survives restart without provider reads" {
@@ -1211,6 +1503,128 @@ test "external lake disk cache initialization failure preserves source reads and
     try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.writes_completed);
 }
 
+const InventoryGate = struct {
+    var base: std.Io = undefined;
+    var entered: std.Io.Event = .unset;
+    var release: std.Io.Event = .unset;
+    fn stat(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+        entered.set(base);
+        try release.wait(base);
+        return base.vtable.dirStatFile(raw, dir, path, options);
+    }
+    fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        entered.set(base);
+        try release.wait(base);
+        return base.vtable.fileReadPositional(raw, file, data, offset);
+    }
+};
+
+test "external lake background inventory does not block reads and retains restart hits" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+    defer io_impl.deinit();
+    const base = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/background", .{tmp.sub_path});
+    defer a.free(root);
+    const policy: parquet.PersistentObjectRangeCachePolicy = .{ .max_entries = 1, .max_total_bytes = 1024 };
+    // Use the actual payload digest in the authenticated key and read below.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+    const authenticated_key = try Cache.immutableKey(a, @splat(1), "segment", 4, digest);
+    defer a.free(authenticated_key);
+    {
+        var disk = try parquet.PersistentObjectRangeCache.initWithPolicy(base, root, policy);
+        defer disk.deinit();
+        try std.testing.expectEqual(.enqueued, disk.enqueueWrite(authenticated_key, "data"));
+        disk.flush();
+    }
+    InventoryGate.base = base;
+    InventoryGate.entered = .unset;
+    InventoryGate.release = .unset;
+    var vtable = base.vtable.*;
+    vtable.dirStatFile = InventoryGate.stat;
+    const io: std.Io = .{ .userdata = base.userdata, .vtable = &vtable };
+    var cache = Cache.initWithMemoryLimit(a, 0);
+    defer cache.deinit();
+    defer InventoryGate.release.set(base);
+    const borrowed = try a.dupe(u8, root);
+    try cache.startPersistent(io, borrowed, policy, .{});
+    a.free(borrowed);
+    try InventoryGate.entered.wait(base);
+    try std.testing.expect(!cache.persistentReady());
+    try std.testing.expect(cache.persistentStats() == null);
+    // A second request neither waits on inventory nor starts a second owner.
+    try cache.startPersistent(io, root, policy, .{});
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_attempts);
+    const Provider = struct {
+        calls: usize = 0,
+        fn load(raw: *anyopaque, alloc: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "data");
+        }
+    };
+    var provider: Provider = .{};
+    const loader: Cache.ImmutableLoader = .{ .ptr = &provider, .load = Provider.load };
+    var first = try cache.readImmutableLease(a, @splat(1), "segment", 4, digest, .{ .io = base }, loader);
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    InventoryGate.release.set(base);
+    try cache.persistent_startup.await(io);
+    try std.testing.expect(cache.persistentReady());
+    var restarted = try cache.readImmutableLease(a, @splat(1), "segment", 4, digest, .{ .io = base }, loader);
+    defer restarted.deinit();
+    try std.testing.expectEqualStrings("data", restarted.bytes());
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.entries);
+    try std.testing.expect(cache.persistentStats().?.stored_bytes <= policy.max_total_bytes);
+}
+
+test "external lake shutdown cancels and joins blocked inventory restoration" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+    defer io_impl.deinit();
+    const base = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cancel", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var disk = try parquet.PersistentObjectRangeCache.init(base, root);
+        defer disk.deinit();
+        try std.testing.expectEqual(.enqueued, disk.enqueueWrite("key", "data"));
+        disk.flush();
+    }
+    for ([_]bool{ false, true }) |header_read| {
+        InventoryGate.base = base;
+        InventoryGate.entered = .unset;
+        InventoryGate.release = .unset;
+        var vtable = base.vtable.*;
+        if (header_read) vtable.fileReadPositional = InventoryGate.read else vtable.dirStatFile = InventoryGate.stat;
+        const io: std.Io = .{ .userdata = base.userdata, .vtable = &vtable };
+        var cache = Cache.init(a);
+        var closed = false;
+        defer if (!closed) cache.deinit();
+        try cache.startPersistent(io, root, .{}, .{});
+        try InventoryGate.entered.wait(base);
+        if (header_read) {
+            cache.persistent_startup.cancel(io);
+            // Provenance recovery must propagate cancellation, never publish a
+            // partially restored cache after treating Canceled as an unprotected key.
+            try std.testing.expect(!cache.persistentReady());
+        }
+        cache.deinit();
+        closed = true;
+        // The canceled owner must release OWNER.lock and all inventoried memory.
+        var disk = try parquet.PersistentObjectRangeCache.init(base, root);
+        defer disk.deinit();
+        try std.testing.expectEqual(@as(usize, 1), disk.statsSnapshot().entries);
+    }
+}
+
 test "external lake query phase counters retain nested hydration and saturate" {
     var cache = Cache.init(std.testing.allocator);
     defer cache.deinit();
@@ -1227,6 +1641,49 @@ test "external lake query phase counters retain nested hydration and saturate" {
     cache.stats.query_total_ns = std.math.maxInt(u64);
     cache.recordQuery(phases);
     try std.testing.expectEqual(std.math.maxInt(u64), cache.snapshot().query_total_ns);
+}
+
+test "external lake disk cache recovers from ownership contention with bounded retries" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/recovered-cache", .{tmp.sub_path});
+    defer a.free(root);
+    const start = 100 * std.time.ns_per_s;
+    const retry = start + 30 * std.time.ns_per_s;
+    var cache = Cache.initWithMemoryLimit(a, 0);
+    defer cache.deinit();
+    try std.testing.expect(!cache.persistentReady());
+    {
+        var owner = try parquet.PersistentObjectRangeCache.init(io, root);
+        defer owner.deinit();
+        try cache.ensurePersistentAt(io, root, .{}, .{}, start);
+        try std.testing.expect(cache.persistentCache() == null);
+        try std.testing.expectEqualStrings("WouldBlock", cache.snapshot().disk_unavailable.?);
+        try std.testing.expect(!cache.persistentReady());
+        try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_failures);
+        // A busy serving process must not repeat inventory/lock attempts.
+        for (0..100) |_| try cache.ensurePersistentAt(io, root, .{}, .{}, retry - 1);
+        try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_attempts);
+    }
+    try cache.ensurePersistentAt(io, root, .{}, .{}, retry);
+    try std.testing.expect(cache.persistentReady());
+    try std.testing.expect(cache.persistentStats() != null);
+    try std.testing.expect(cache.snapshot().disk_unavailable == null);
+    try std.testing.expectEqual(@as(u64, 2), cache.snapshot().disk_init_attempts);
+    try cache.ensurePersistentAt(io, root, .{}, .{}, retry + 60 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, 2), cache.snapshot().disk_init_attempts);
+    // The recovered tier accepts and serves verified bytes with RAM disabled.
+    const disk = cache.persistentCache().?;
+    try std.testing.expectEqual(parquet.PersistentObjectRangeCacheEnqueueResult.enqueued, disk.enqueueWrite("recovered", "bytes"));
+    disk.flush();
+    const bytes = (try disk.readAlloc(a, "recovered", 5)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("bytes", bytes);
+    try std.testing.expectEqual(@as(usize, 1), disk.statsSnapshot().writes_completed);
 }
 
 test "external lake immutable block leases borrow RAM and pin bytes through eviction pressure" {

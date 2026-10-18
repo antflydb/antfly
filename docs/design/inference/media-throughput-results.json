@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "evidence_snapshot": {
+    "commit": "01cb3636fe502a48a83f9881bd8df9d925d36a70",
+    "reports_url": "https://github.com/antflydb/antfly/tree/01cb3636fe502a48a83f9881bd8df9d925d36a70/docs/design/inference",
+    "repository_snapshot_zip": "https://github.com/antflydb/antfly/archive/01cb3636fe502a48a83f9881bd8df9d925d36a70.zip",
+    "evidence_only_zip_sha256": "7636a5815710006aba00c5dd6697d2413823a8a5fd35de6d11d3d3971e7ba8d3",
+    "evidence_only_zip_local_name": "pr-1088-evidence-01cb3636fe.zip",
+    "scope": "Pinned GitHub snapshot retains detailed checked-in reports. The separately generated local evidence-only ZIP includes those reports/guides and verbatim diaries; ignored raw logs/transcripts and model assets remain local."
+  },
+  "hardware": "Apple M4 Max, 32 GPU cores, 36 GiB unified memory",
+  "ocr": {
+    "model_id": "ggml-org/gemma-4-e2b-it-gguf--antfly-a57de6cd832e5c07",
+    "runtime_source_revision": "7f4d7fa577aa9005bfdadcfc696a665b24daa487",
+    "binary_sha256": "ea5de9696973d4b796475c1cafeec6f733f50d026eb0d5198f27c99c0e3a8c77",
+    "harness_sha256": "f77a95bd1ab24661839e1cdcdb0e936b2ca2a18afdc79cc5200c53a9745ae339",
+    "detailed_report_sha256": "902dfcbf35e517a2766f699dc02c4d62778fd7c676a0a98456615b2e2c74ea05",
+    "scope": "Recognition over pre-rendered public PDF pages; image preparation/prefill/decode/HTTP included, PDF rendering and server startup excluded. Full transcript parity compares ordinary model outputs, not annotated OCR accuracy. No audio/CUDA throughput qualification.",
+    "pages": 8,
+    "completion_tokens_per_pass": 4057,
+    "corpus": [
+      {
+        "document": "attention",
+        "page": 1,
+        "raster_sha256": "6faa411ee04948077cbf4cf98c1c2437bb773b2b85ffede4d0d211f457c2392a"
+      },
+      {
+        "document": "attention",
+        "page": 3,
+        "raster_sha256": "734a37cafa163cb58ac1f878c20ff9f83d05da38addf17fc9c392bd1e381339a"
+      },
+      {
+        "document": "attention",
+        "page": 6,
+        "raster_sha256": "372604b0426694beddbddb356406bade6e53afac5013807011d0d1819c9f4847"
+      },
+      {
+        "document": "nist-2021",
+        "page": 5,
+        "raster_sha256": "be455bd2b902c948f4814a844097555389fe32277e262e7cb7edd634d2a57cff"
+      },
+      {
+        "document": "nist-2021",
+        "page": 6,
+        "raster_sha256": "78d4cbb421cf54f49881901f8089602a06fd03b1d6fafe3e359e021264772b66"
+      },
+      {
+        "document": "nist-2021",
+        "page": 9,
+        "raster_sha256": "54c1eab6282b73b28af19ffa4f046b46167722162fafb232979f160e859f9cfb"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 8,
+        "raster_sha256": "bd67856d74eedf1af65662cebe8ae67cb08632d8ec2bf20803f265c641acc2f2"
+      },
+      {
+        "document": "nbs-1907",
+        "page": 12,
+        "raster_sha256": "7ef9d17c0681f68472ab3d34d0c3502713ddd083b454d32e44eec39592a44166"
+      }
+    ],
+    "ordinary_brackets_seconds": {
+      "before": [
+        57.572247458,
+        56.525887458
+      ],
+      "after": [
+        55.524319583,
+        55.33875975
+      ]
+    },
+    "candidates": [
+      {
+        "case": "cohort4w8pool",
+        "seconds": [
+          52.842514917,
+          52.205960749999996
+        ],
+        "mean_seconds": 52.524237833499996,
+        "mean_time_reduction_fraction": 0.06607478077775397,
+        "mean_throughput_increase_fraction": 0.07074954120285959,
+        "passes_output_gate": true
+      },
+      {
+        "case": "cohort4w8head",
+        "seconds": [
+          49.304392625,
+          48.81911766700001
+        ],
+        "mean_seconds": 49.061755146,
+        "mean_time_reduction_fraction": 0.12764064134725672,
+        "mean_throughput_increase_fraction": 0.14631658396418512,
+        "passes_output_gate": true
+      }
+    ],
+    "qualified_head_flags": {
+      "TERMITE_SERVER_GENERATE_TIMING": "1",
+      "ANTFLY_GEMMA4_OCR_PROFILE": "1",
+      "ANTFLY_GEMMA4_MTP_PROFILE": "1",
+      "ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_MULTIROW": "1",
+      "TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME": "1",
+      "TERMITE_METAL_ENABLE_Q4_0_SHORT_ROWS_SPECIALIZED": "0",
+      "ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET": "0",
+      "ANTFLY_GEMMA4_MTP_ADAPTIVE_K": "0",
+      "ANTFLY_GEMMA4_METAL_OCR_BATCH": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS": "4",
+      "ANTFLY_GEMMA4_METAL_OCR_WINDOW": "8",
+      "ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC": "1",
+      "TERMITE_METAL_Q4_0_BATCH_INVARIANT": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_PLE": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_CANONICAL_TAIL": "1",
+      "TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS": "1",
+      "ANTFLY_GEMMA4_METAL_OCR_HEAD_FRAME": "1"
+    },
+    "qualification": {
+      "full_transcripts_and_counts_match": true,
+      "recorded_native_page_observations": 128,
+      "recorded_completion_tokens": 79222,
+      "extended_and_probe_timings_qualify_speedup": false,
+      "gpu_tests": {
+        "runtime_source_revision": "7f4d7fa577aa9005bfdadcfc696a665b24daa487",
+        "experiments_enabled": {
+          "selected": 66,
+          "passed": 66,
+          "skipped": 0
+        },
+        "default_flags": {
+          "selected": 101,
+          "passed": 101,
+          "skipped": 0
+        },
+        "optional_sumsq": {
+          "selected": 1,
+          "passed": 1,
+          "skipped": 0
+        },
+        "scope": "Distinct rows, partial tiles, full E2B FFN shapes, output-buffer reuse, carrier lifetime/role separation, QKV, Q4/Q6 head logits and suppression/frame ownership, MTP/decoder/scheduler/HTTP regressions."
+      },
+      "harness_tests": {
+        "passed": 9
+      },
+      "defaults": "Experimental flags remain off; non-invariant matrix and MTP paths are not promoted."
+    },
+    "apple_accurate_baseline": {
+      "eight_page_seconds": 2.087,
+      "mean_word_f1_proxy": 0.973,
+      "scope": "Earlier warm Apple Vision OCR campaign, excludes PNG preparation/HTTP; not a fresh bracketed comparison. First warmup was 47.859 seconds; not a repeatable cold-start result."
+    }
+  },
+  "image_embeddings": {
+    "model": "google/embeddinggemma-2",
+    "backend": "Metal",
+    "baseline_commit": "14f39270e8",
+    "detailed_report_sha256": "3a3a01e5335d73f35a6635c023284475cd2de9f7f5bf7222c1be6d16bc0c6087",
+    "scope": "Eight images, borrowed raster through final embedding; file reads/model loading excluded. Two warmups, five measurements.",
+    "cases": [
+      {
+        "image": "square",
+        "batch": 8,
+        "baseline_p50_seconds": 11.827304,
+        "candidate_p50_seconds": 2.376729
+      },
+      {
+        "image": "photo",
+        "batch": 8,
+        "baseline_p50_seconds": 12.1278,
+        "candidate_p50_seconds": 2.387706
+      }
+    ],
+    "minimum_final_cosine": 0.999999962,
+    "limits": "Lookahead benefit and HTTP saturation not independently qualified; these are not PDF ingestion measurements."
+  },
+  "audio_embeddings": {
+    "backend": "metal",
+    "baseline_commit": "6017034d7a",
+    "detailed_report_sha256": "b32decb323111000fd5dcd9d43f51d590f3052c77750fa6070266b231742a89f",
+    "scope": "Encoded audio to synchronized final vectors; files and model load excluded",
+    "cases": [
+      {
+        "model": "gemma4",
+        "batch": 8,
+        "baseline_p50_seconds": 1.267908,
+        "candidate_p50_seconds": 1.167748,
+        "min_cosine": 0.9999999999991847,
+        "max_abs_difference": 1.6763806343078613e-07
+      },
+      {
+        "model": "gemma4",
+        "batch": 16,
+        "baseline_p50_seconds": 2.532721,
+        "candidate_p50_seconds": 2.340417,
+        "min_cosine": 0.9999999999991847,
+        "max_abs_difference": 1.6763806343078613e-07
+      },
+      {
+        "model": "clap",
+        "batch": 8,
+        "baseline_p50_seconds": 0.62931,
+        "candidate_p50_seconds": 0.619373,
+        "min_cosine": 1.0,
+        "max_abs_difference": 0
+      },
+      {
+        "model": "clap",
+        "batch": 16,
+        "baseline_p50_seconds": 1.018386,
+        "candidate_p50_seconds": 0.89976,
+        "min_cosine": 1.0,
+        "max_abs_difference": 0
+      }
+    ],
+    "limits": "Short WAV clips; concurrent compilation; Gemma conformer remains per clip. No CUDA/audio-generation gain."
+  },
+  "pdf_and_codecs": {
+    "overall_pdf_embedding_speedup_qualified": false,
+    "production_pdf_renderer": "CPU",
+    "gpu_renderer": "Benchmark-only; mixed four-page render-only ~62 to ~38 ms with exact eligible pixels, roughly matching parallel CPU. Parsing/codecs/host raster copy remain.",
+    "jpeg": "Isolated CPU decode ~9% faster, exact RGBA; full embedding timings reverse by process order.",
+    "webp": "VP8L/compressed-alpha fixture gains with exact RGBA; ordinary VP8 unchanged. Codec gains are not end-to-end embedding gains."
+  }
+}

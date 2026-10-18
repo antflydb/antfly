@@ -87,6 +87,11 @@ bounded batch per call. Repeat the exact original job to resume or retrieve its
 receipt. Existing leases may renew during a job. No owner timeout releases a
 prepared plan or a provider write whose outcome is unknown.
 
+The controller conditionally removes expired native pins in bounded batches and
+rechecks for renewed pins before proceeding. `max_readers` limits active pins and
+the number of expired pins reclaimed per call. Grant the controller conditional
+delete access to the native pin registry as well as read access.
+
 `GET /v1/antfly/maintenance/status` reports admission ownership. After a lost
 catalog response, call `POST /v1/antfly/maintenance/recover-writer`: a committed
 property/commit-history marker resolves the write. An absent marker does not

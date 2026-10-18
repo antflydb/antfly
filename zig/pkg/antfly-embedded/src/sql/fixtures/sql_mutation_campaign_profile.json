@@ -1,0 +1,378 @@
+{
+  "format": 1,
+  "description": "Explicit bounded discovery profile, not native activation or constraint-owner evidence. Logical id is a primary key; source tables and every post-state are recorded. Typed arrays, generated/default producers, CHECK/FK and partial/expression arbiter profiles remain separate.",
+  "schema": {
+    "version": 1,
+    "storage_mode": "relational",
+    "default_type": "row",
+    "document_schemas": {
+      "row": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "status": {
+              "type": "keyword"
+            },
+            "quantity": {
+              "type": "integer"
+            },
+            "email": {
+              "type": "keyword"
+            },
+            "tenant_id": {
+              "type": "keyword"
+            },
+            "amount": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "organization_id": {
+              "type": "keyword"
+            },
+            "priority": {
+              "type": "integer"
+            },
+            "expires_at": {
+              "type": "integer"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "metadata": {
+              "type": "json"
+            },
+            "tags": {
+              "type": "json"
+            },
+            "request_id": {
+              "type": "keyword"
+            },
+            "updated_at_ns": {
+              "type": "integer"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "primary_key": [
+    "id"
+  ],
+  "rows": [
+    {
+      "key": "a",
+      "value": {
+        "id": "u1",
+        "status": "active",
+        "quantity": 2,
+        "email": "a@example.test",
+        "tenant_id": "t1",
+        "amount": 5,
+        "name": "Ada",
+        "organization_id": "o1",
+        "priority": 8,
+        "expires_at": 100,
+        "enabled": true,
+        "metadata": {
+          "source": "api",
+          "billing": {
+            "plan": "basic"
+          },
+          "flags": [
+            "seed"
+          ]
+        },
+        "tags": [
+          "hot"
+        ],
+        "request_id": "old",
+        "updated_at_ns": 10
+      }
+    },
+    {
+      "key": "b",
+      "value": {
+        "id": "u2",
+        "status": "closed",
+        "quantity": 7,
+        "email": "b@example.test",
+        "tenant_id": "t2",
+        "amount": 9,
+        "name": "Grace",
+        "organization_id": "o2",
+        "priority": 3,
+        "expires_at": 1100,
+        "enabled": false,
+        "metadata": {
+          "source": "internal",
+          "billing": {
+            "plan": "basic"
+          },
+          "flags": [
+            "seed"
+          ]
+        },
+        "tags": [],
+        "request_id": "other",
+        "updated_at_ns": 20
+      }
+    },
+    {
+      "key": "c",
+      "value": {
+        "id": "u_ready_seed",
+        "status": "ready",
+        "quantity": 3,
+        "email": "u3@example.test",
+        "tenant_id": "t1",
+        "amount": 17,
+        "name": "Ada",
+        "organization_id": "u1",
+        "priority": 8,
+        "expires_at": 100,
+        "enabled": true,
+        "metadata": {
+          "source": "api",
+          "billing": {
+            "plan": "basic"
+          },
+          "flags": [
+            "seed"
+          ]
+        },
+        "tags": [
+          "hot"
+        ],
+        "request_id": "old",
+        "updated_at_ns": 10
+      }
+    },
+    {
+      "key": "d",
+      "value": {
+        "id": "u_queued_seed",
+        "status": "queued",
+        "quantity": 4,
+        "email": "u4@example.test",
+        "tenant_id": "t1",
+        "amount": 23,
+        "name": "Ada",
+        "organization_id": "u2",
+        "priority": 8,
+        "expires_at": 100,
+        "enabled": true,
+        "metadata": {
+          "source": "api",
+          "billing": {
+            "plan": "basic"
+          },
+          "flags": [
+            "seed"
+          ]
+        },
+        "tags": [
+          "hot"
+        ],
+        "request_id": "old",
+        "updated_at_ns": 10
+      }
+    }
+  ],
+  "additional_tables": [
+    {
+      "name": "archived_records",
+      "schema": {
+        "version": 1,
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {
+          "row": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "keyword"
+                },
+                "organization_id": {
+                  "type": "keyword"
+                },
+                "status": {
+                  "type": "keyword"
+                },
+                "archive_id": {
+                  "type": "keyword"
+                },
+                "archive_status": {
+                  "type": "keyword"
+                },
+                "archive_amount": {
+                  "type": "integer"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "primary_key": [
+        "id"
+      ],
+      "rows": [
+        {
+          "key": "archive-a",
+          "value": {
+            "id": "u1",
+            "organization_id": "u1",
+            "status": "ready",
+            "archive_id": "archive_1",
+            "archive_status": "ready",
+            "archive_amount": 11
+          }
+        },
+        {
+          "key": "archive-b",
+          "value": {
+            "id": "u2",
+            "organization_id": "u2",
+            "status": "stale",
+            "archive_id": "archive_2",
+            "archive_status": "ready",
+            "archive_amount": 19
+          }
+        }
+      ]
+    },
+    {
+      "name": "source_records",
+      "schema": {
+        "version": 1,
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {
+          "row": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "keyword"
+                },
+                "status": {
+                  "type": "keyword"
+                },
+                "quantity": {
+                  "type": "integer"
+                },
+                "email": {
+                  "type": "keyword"
+                },
+                "tenant_id": {
+                  "type": "keyword"
+                },
+                "amount": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "keyword"
+                },
+                "organization_id": {
+                  "type": "keyword"
+                },
+                "priority": {
+                  "type": "integer"
+                },
+                "expires_at": {
+                  "type": "integer"
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "tags": {
+                  "type": "json"
+                },
+                "request_id": {
+                  "type": "keyword"
+                },
+                "updated_at_ns": {
+                  "type": "integer"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "primary_key": [
+        "id"
+      ],
+      "rows": [
+        {
+          "key": "source-0",
+          "value": {
+            "id": "u1",
+            "status": "ready",
+            "quantity": 3,
+            "email": "a@example.test",
+            "tenant_id": "t1",
+            "amount": 5,
+            "name": "Ada",
+            "organization_id": "o1",
+            "priority": 8,
+            "expires_at": 100,
+            "enabled": true,
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "basic"
+              },
+              "flags": [
+                "seed"
+              ]
+            },
+            "tags": [
+              "hot"
+            ],
+            "request_id": "old",
+            "updated_at_ns": 10
+          }
+        },
+        {
+          "key": "source-1",
+          "value": {
+            "id": "u2",
+            "status": "pending",
+            "quantity": 4,
+            "email": "b@example.test",
+            "tenant_id": "t2",
+            "amount": 9,
+            "name": "Grace",
+            "organization_id": "o2",
+            "priority": 3,
+            "expires_at": 1100,
+            "enabled": false,
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "basic"
+              },
+              "flags": [
+                "seed"
+              ]
+            },
+            "tags": [],
+            "request_id": "other",
+            "updated_at_ns": 20
+          }
+        }
+      ]
+    }
+  ]
+}

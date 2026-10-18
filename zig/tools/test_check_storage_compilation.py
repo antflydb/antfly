@@ -36,6 +36,45 @@ SPEC.loader.exec_module(measurement)
 
 
 class LiteralSourceOwnership(unittest.TestCase):
+    def test_catalog_check_accepts_current_and_rejects_stale_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = root / "pkg/antfly-embedded/src/source_catalog_control.zig"
+            catalog.parent.mkdir(parents=True)
+            with (
+                mock.patch.object(measurement, "ZIG_ROOT", root),
+                mock.patch.object(
+                    measurement, "control_catalog_contents", return_value="current\n"
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["check_storage_compilation", "--check-control-catalog"],
+                ),
+            ):
+                catalog.write_text("current\n")
+                measurement.main()
+                catalog.write_text("stale\n")
+                with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as failure:
+                    measurement.main()
+                self.assertEqual(failure.exception.code, 1)
+                self.assertEqual(catalog.read_text(), "stale\n")
+
+    def test_removed_physical_section_preserves_formatter_spacing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            local = root / "pkg/antfly-embedded/src"
+            local.mkdir(parents=True)
+            (local / "source_catalog.zig").write_text(
+                "// header\n" * 16
+                + '\npub const db = @import("storage/db/db.zig");\n\ncomptime {}\n'
+            )
+            with mock.patch.object(measurement, "ZIG_ROOT", root):
+                rendered = measurement.control_catalog_contents()
+            self.assertNotIn("pub const db", rendered)
+            self.assertNotIn("\n\n\n", rendered)
+            self.assertIn("\n\ncomptime {}\n", rendered)
+
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
@@ -136,18 +175,33 @@ class BuildMemoryAccounting(unittest.TestCase):
 
 
 class BuildFailureEvidence(unittest.TestCase):
-    def test_contract_rollover_discards_both_caches_and_keeps_mutations(self):
+    def test_contract_reuses_both_caches_when_disk_has_headroom(self):
+        self.exercise_contract_cache(low_disk=False)
+
+    def test_disk_pressure_rollover_discards_both_caches_and_keeps_mutations(self):
+        self.exercise_contract_cache(low_disk=True)
+
+    def exercise_contract_cache(self, *, low_disk):
         expected = (
             ("cold", set()),
             ("warm", set()),
-            ("read coordination", {"antfly-runtime-distributed"}),
+            (
+                "read coordination",
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+            ),
             ("write coordination", {"antfly-runtime-distributed"}),
             ("physical DB", {"antfly-storage-kernel"}),
             ("physical local query", {"antfly-storage-kernel"}),
             ("owner integration test", {"storage-owner-tests"}),
             ("consumer test root", {"api-table-read-tests"}),
-            ("storage contract cold", set()),
-            ("storage contract warm", set()),
+            *(
+                (
+                    ("storage contract cold", set()),
+                    ("storage contract warm", set()),
+                )
+                if low_disk
+                else ()
+            ),
             (
                 "storage contract",
                 {
@@ -166,6 +220,7 @@ class BuildFailureEvidence(unittest.TestCase):
             label, rebuilt = expected[len(seen)]
             local_cache = Path(command[command.index("--cache-dir") + 1])
             self.assertNotIn("--global-cache-dir", command)
+            self.assertIn("-Dstrip=true", command)
             global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
             self.assertEqual(local_cache.parent, cwd.parent.parent)
             self.assertEqual(global_cache.parent, cwd.parent.parent)
@@ -183,6 +238,9 @@ class BuildFailureEvidence(unittest.TestCase):
                     b"storage compilation ownership regression",
                     (cwd / "pkg/antfly/src/api/table_reads.zig").read_bytes(),
                 )
+            if label == "storage contract" and not low_disk:
+                self.assertTrue((local_cache / "marker").is_file())
+                self.assertTrue((global_cache / "marker").is_file())
             local_cache.mkdir(exist_ok=True)
             (local_cache / "marker").touch()
             (global_cache / "marker").touch()
@@ -223,13 +281,13 @@ class BuildFailureEvidence(unittest.TestCase):
                 mock.patch.object(
                     measurement, "measured_build", side_effect=fake_build
                 ),
-                # This case exercises the explicit contract rollover. Host disk
-                # pressure has its own runtime trigger and must not change the
-                # mocked sequence of builds.
+                # Trigger disk pressure only before the final mutation.
                 mock.patch.object(
                     measurement.shutil,
                     "disk_usage",
-                    return_value=mock.Mock(free=64 << 30),
+                    side_effect=lambda *_: mock.Mock(
+                        free=(8 if low_disk and len(seen) == 8 else 64) << 30
+                    ),
                 ),
             ):
                 measurement.main()
@@ -332,6 +390,9 @@ pub fn create(b: *std.Build) ?void {
         return subprocess.run(
             [self.zig, "build", "check-storage-compilation", "-j2", *args],
             cwd=self.root,
+            # Fixture-generated sources belong to its own lifetime, even when
+            # the caller configures a disposable phase cache for other builds.
+            env={**os.environ, "ZIG_LOCAL_CACHE_DIR": str(self.root / ".zig-cache")},
             text=True,
             capture_output=True,
             timeout=120,
@@ -340,6 +401,18 @@ pub fn create(b: *std.Build) ?void {
     def test_extra_owner_fixture_does_not_expand_audit(self):
         result = self.build()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_inherited_local_cache_stays_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shared = Path(directory)
+            marker = shared / "caller-owned"
+            marker.write_text("preserve")
+            with mock.patch.dict(os.environ, {"ZIG_LOCAL_CACHE_DIR": str(shared)}):
+                result = self.build()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(list(shared.iterdir()), [marker])
+            self.assertEqual(marker.read_text(), "preserve")
+            self.assertTrue((self.root / ".zig-cache" / "o").is_dir())
 
     def test_missing_required_artifact_reports_its_identity(self):
         for name in ("storage-owner-source-tests", "api-table-read-tests"):

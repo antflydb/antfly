@@ -44,6 +44,149 @@ import (
 
 type relationalHTTPDoer func(*http.Request) (*http.Response, error)
 
+func TestRelationalUniqueOwnershipOriginRoundTrip(t *testing.T) {
+	for _, origin := range []RelationalUniqueConstraintOrigin{RelationalUniqueConstraintOriginConstraint, RelationalUniqueConstraintOriginIndex} {
+		rule := RelationalUniqueConstraint{Name: "email_key", Columns: []string{"email"}, Origin: origin}
+		encoded, err := json.Marshal(rule)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded RelationalUniqueConstraint
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !decoded.Origin.Valid() || decoded.Origin != origin {
+			t.Fatalf("origin did not round-trip: %s", encoded)
+		}
+	}
+	if RelationalUniqueConstraintOrigin("display-label").Valid() {
+		t.Fatal("invalid ownership kind accepted")
+	}
+}
+
+func TestRelationalExactNumericPublicExpressionContract(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(`{"op":"literal","type":"numeric","sql_type":"numeric","value":"9007199254740993.2500"}`), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if expression.Type != oapi.RelationalExpressionTypeNumeric || expression.SqlType != oapi.SQLBuiltinTypeNumeric || expression.Value != "9007199254740993.2500" {
+		t.Fatalf("lost exact NUMERIC identity or literal: %+v", expression)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Type != expression.Type || restored.SqlType != expression.SqlType || restored.Value != expression.Value {
+		t.Fatalf("lost exact NUMERIC contract after transport: %s", encoded)
+	}
+}
+
+func TestRelationalNumericAssignmentCastBuiltinIdentity(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(`{"op":"cast","type":"integer","sql_type":"int16","args":[{"op":"literal","type":"integer","sql_type":"int32","value":32768}]}`), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if !expression.Op.Valid() || expression.Op != oapi.RelationalExpressionOpCast || expression.SqlType != oapi.SQLBuiltinTypeInt16 {
+		t.Fatalf("lost numeric cast identity: %+v", expression)
+	}
+	if len(expression.Args) != 1 || expression.Args[0].SqlType != oapi.SQLBuiltinTypeInt32 {
+		t.Fatalf("lost recursive source domain: %+v", expression.Args)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.SqlType != expression.SqlType || restored.Args[0].SqlType != expression.Args[0].SqlType {
+		t.Fatalf("numeric identities changed after transport: %s", encoded)
+	}
+}
+
+func TestRelationalConditionalExpressionContract(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(`{"op":"case_when","args":[{"op":"literal","type":"boolean","value":true},{"op":"column","column":"source"},{"op":"literal","type":"integer","sql_type":"int32","value":null}]}`), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if !expression.Op.Valid() || expression.Op != oapi.RelationalExpressionOpCaseWhen || len(expression.Args) != 3 {
+		t.Fatalf("lost conditional contract: %+v", expression)
+	}
+	if expression.Args[1].Column != "source" || expression.Args[2].SqlType != oapi.SQLBuiltinTypeInt32 {
+		t.Fatalf("lost ordered branches or typed fallback: %+v", expression.Args)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Op != expression.Op || len(restored.Args) != 3 || restored.Args[1].Column != "source" {
+		t.Fatalf("conditional changed after transport: %s", encoded)
+	}
+}
+
+func TestRelationalNumericArrayModifierRoundTrip(t *testing.T) {
+	for _, modifier := range []string{"", `,"x-antfly-sql-numeric-modifier":{"precision":2,"scale":-3}`} {
+		source := `{"type":"sql_array","x-antfly-sql-type":"numeric"` + modifier + `}`
+		var column oapi.SQLArrayColumnSchema
+		if err := json.Unmarshal([]byte(source), &column); err != nil {
+			t.Fatal(err)
+		}
+		if (column.XAntflySqlNumericModifier == nil) != (modifier == "") {
+			t.Fatalf("lost optional modifier: %+v", column)
+		}
+		encoded, err := json.Marshal(column)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		_, present := fields["x-antfly-sql-numeric-modifier"]
+		if present != (modifier != "") {
+			t.Fatalf("changed modifier presence: %s", encoded)
+		}
+		var restored oapi.SQLArrayColumnSchema
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if modifier != "" && (restored.XAntflySqlNumericModifier.Precision != 2 || restored.XAntflySqlNumericModifier.Scale != -3) {
+			t.Fatalf("changed modifier: %s", encoded)
+		}
+	}
+}
+
+func TestRelationalNumericCastModifierRoundTrip(t *testing.T) {
+	source := `{"op":"cast","type":"numeric","sql_type":"numeric","numeric_modifier":{"precision":2,"scale":-3},"args":[{"op":"literal","type":"numeric","value":"1.245"}]}`
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(source), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if expression.NumericModifier.Precision != 2 || expression.NumericModifier.Scale != -3 {
+		t.Fatalf("lost modifier: %+v", expression)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.NumericModifier != expression.NumericModifier || len(restored.Args) != 1 {
+		t.Fatalf("changed modifier: %s", encoded)
+	}
+}
+
 func (fn relationalHTTPDoer) Do(req *http.Request) (*http.Response, error) { return fn(req) }
 
 func TestRelationalRowQueryPreservesExactInteger(t *testing.T) {

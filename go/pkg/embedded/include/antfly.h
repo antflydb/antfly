@@ -16,6 +16,9 @@
 #ifndef ANTFLY_H
 #define ANTFLY_H
 
+/* ABI implemented by this header; compare with antfly_abi_version() at runtime. */
+#define ANTFLY_ABI_VERSION 3
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -38,12 +41,16 @@ typedef enum antfly_error_code {
     /* The operation requires a capability unavailable on this platform or
      * filesystem. Retrying unchanged will not succeed. */
     ANTFLY_UNSUPPORTED = 8,
-    /* A bounded drain such as run-until-idle found a managed index making no
-     * forward progress for its stall window and gave up. */
+    /* Derived work stalled or a worker failed. Inspect pending-work diagnostics
+     * and repair or reopen the database; primary-only writes may still succeed. */
     ANTFLY_STALLED = 9,
-    /* The caller cancelled the call by returning false from its progress or
-     * stream callback. */
+    /* The operation was cancelled, including a pending replacement or a
+     * progress/stream callback returning false. */
     ANTFLY_CANCELLED = 10,
+    /* Stable replacement precondition failures, distinct from malformed input. */
+    ANTFLY_REPLACEMENT_FAILED = 11,
+    ANTFLY_REPLACEMENT_PENDING = 12,
+    ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH = 13,
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
@@ -153,7 +160,9 @@ typedef struct antfly_open_options {
     /* Milliseconds to retry a Lite operation while another process holds the
      * writer lease (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
     uint64_t busy_timeout_ms;
-    uint64_t reserved[8];
+    uint64_t reserved[6];
+    /* Optional model directory for database enrichments; empty uses default. */
+    antfly_slice models_dir;
 } antfly_open_options;
 
 /*
@@ -268,6 +277,12 @@ typedef struct antfly_scan_hash_result {
 
 uint32_t antfly_abi_version(void);
 uint32_t antfly_open_options_size(void);
+/* Borrowed thread-local detail for the last error-code-returning call. Empty
+ * on success or when no concrete validation detail is available. Copy before
+ * another call on this thread; this accessor never changes the detail. */
+const char *antfly_last_error_detail(void);
+/* Code associated with the retained detail; ANTFLY_OK after success. */
+antfly_error_code antfly_last_error_code(void);
 const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
 antfly_error_code antfly_open_options_init(antfly_open_options *options);
@@ -339,6 +354,10 @@ antfly_error_code antfly_db_capabilities_json(antfly_db *db, antfly_buffer *out)
  * atomically replaces an existing destination.
  */
 antfly_error_code antfly_db_backup(antfly_db *db, antfly_buffer *out);
+/** Portable backup with optional {"tables":["default","healthy"]} scope.
+ * Explicit scope includes default and exactly the named tables. Full backup
+ * fails closed if any table is unavailable; it never silently omits data. */
+antfly_error_code antfly_db_backup_json(antfly_db *db, antfly_slice options_json, antfly_buffer *out);
 antfly_error_code antfly_db_import_backup(antfly_db *db, antfly_slice backup);
 antfly_error_code antfly_restore_backup_json(
     const char *dest_path,
@@ -434,8 +453,69 @@ antfly_error_code antfly_db_run_until_idle_json(antfly_db *db, antfly_buffer *ou
 antfly_error_code antfly_db_pending_work_stats_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_replay_generated_enrichments_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_list_indexes_json(antfly_db *db, antfly_buffer *out);
+/** Render a durable resolver's key without writes. Mention JSON: {"text","label"}.
+ * Returns {"minted_key","key","table","config_generation"}; key follows configured aliases.
+ * Free output with antfly_buffer_free. ANN matching is not performed. */
+antfly_error_code antfly_db_render_resolver_key_json(antfly_db *db, antfly_slice resolver_name, antfly_slice mention_json, antfly_buffer *out_json);
+
+/* Resolve {"text":"..."} through the resolver's configured asset extractor, or
+ * {"extraction":{"entities":[...]}} through the same resolver. Includes aliases,
+ * mention embeddings, ANN candidates and scoring. Returns {extraction,resolution}
+ * with canonical doc_refs and decisions. Does not write documents or artifacts.
+ * Requires an asset-scoped resolver; text requires an extractor producer. */
+antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out_json);
+/** Merge fully rendered keys: {"key":"concept/old","target":"concept/new"}.
+ * Durable and idempotent. Cycles/redirect replacement are rejected. Drain with
+ * antfly_db_run_until_idle to re-resolve existing artifacts and replace mention edges.
+ * Promotion-enabled resolvers also reconcile entity documents. Arbitrary application
+ * references and manually supplied graph edges are not rewritten.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
+antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice merge_json);
+
+/* Lists active and retired identities, including durable merges. */
+antfly_error_code antfly_db_list_resolver_identities_json(antfly_db *db, antfly_buffer *out);
+/* Drops a retired identity and its merges; rejects an active identity.
+ * Existing resolution artifacts and promoted documents remain. Delete source
+ * documents to remove their artifacts; delete canonical rows explicitly only
+ * after checking other resolvers/application references.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
+antfly_error_code antfly_db_drop_resolver_identity(antfly_db *db, antfly_slice resolver_name, bool *out_deleted);
+/** Set {table,key_template} and choose reset_merges:true (clears inline aliases too,
+ * unless an explicit replacement aliases array is supplied) or
+ * key_map:[{key,target},...] mapping every inline/durable alias endpoint.
+ * A durable fence rejects stale inline namespaces/aliases even after reset.
+ * Validates atomically; drain to reconcile resolver-owned artifacts and edges.
+ * Application-owned documents/references are not renamed.
+ * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
+antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json);
+
+/* Schema admission (add, replaces, delete, namespace changes and identity drop)
+ * may return ANTFLY_BUSY before mutation when replay/promotion is active for
+ * approximately 100 ms. Retry the identical request with bounded backoff.
+ * replaces registers a hidden resumable shadow and returns; the old graph
+ * serves until background activation. Identical requests are idempotent.
+ * Acts as add when the old index is absent. Optional wait:{timeout_ms:N}
+ * waits for activation; deadline BUSY leaves the accepted shadow running.
+ * Waiting releases admission between work quanta and remains bound to the
+ * admitted generation. Cancellation or target-name reuse returns ANTFLY_CANCELLED;
+ * a different generation under the same name never completes the original wait.
+ * Precondition failures are ANTFLY_REPLACEMENT_FAILED,
+ * ANTFLY_REPLACEMENT_PENDING or ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH.
+ * pending_work_stats_json reports progress, retry_count, retry_after_ns and
+ * last_error. Consecutive transient failures retry four times with persisted
+ * backoff; durable forward progress resets the consecutive budget. A separate
+ * lifetime ceiling permits at most 64 retries (total_retry_count/max_total_retries
+ * in status). Backward-clock deadlines are clamped to at most 3.2 seconds.
+ * ANTFLY_CANCELLED also covers interrupted IO/mutex admission; interruption of
+ * a call does not cancel accepted work. Inspect state if completion raced it. */
 antfly_error_code antfly_db_add_index_json(antfly_db *db, antfly_slice config_json);
+/* May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
 antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool *out_deleted);
+/** Cancel a running or failed shadow by its new name; idempotent. Leaves the
+ * serving index intact and schedules bounded shadow-artifact cleanup. Failed
+ * jobs do not retry or pin replay; cancel before registering a fresh attempt.
+ * delete_index on either name also cancels dependent replacements. */
+antfly_error_code antfly_db_cancel_replacement(antfly_db *db, antfly_slice name, bool *out_cancelled);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_add_enrichment_json(antfly_db *db, antfly_slice config_json);
 antfly_error_code antfly_db_delete_enrichment(

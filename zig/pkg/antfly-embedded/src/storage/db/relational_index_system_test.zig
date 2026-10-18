@@ -32,6 +32,307 @@ test {
     _ = @import("antfly_server_test_sources").local_test_sources.storage_retained_read_registry;
 }
 
+test "relational index system SQL precise schema publication upgrades catalog atomically and survives LSM reopen" {
+    const storage_schema = @import("../schema.zig");
+    const catalog = @import("table_catalog.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-precise-type-reopen");
+    defer directory.cleanup();
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        // A deployed document owner with no schema requires only format 15.
+        // Seed the durable fixture; do not introduce an upgrade write on open.
+        var previous = db.core.table_catalog;
+        previous.schema_format_version = 15;
+        const bytes = previous.encode();
+        var transaction = try db.core.store.beginWriteTxn();
+        errdefer transaction.abort();
+        try transaction.put(catalog.key, &bytes);
+        try transaction.commit();
+    }
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(u32, 15), db.core.table_catalog.schema_format_version);
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 }} });
+        try std.testing.expectEqual(storage_schema.storage_format_version, db.core.table_catalog.schema_format_version);
+        try db.batch(.{ .writes = &.{.{ .key = "valid", .value = "{\"n\":32767}" }} });
+        try std.testing.expectError(error.InvalidRelationalRow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":1}" }, .{ .key = "invalid", .value = "{\"n\":32768}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try std.testing.expect((try db.get(alloc, "invalid")) == null);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    try std.testing.expectEqual(storage_schema.storage_format_version, reopened.core.table_catalog.schema_format_version);
+    try std.testing.expectEqual(@import("../../common/sql_builtin_type.zig").Type.int16, reopened.core.schema.?.relational_columns[0].sql_element_type.?);
+    const bytes = (try reopened.get(alloc, "valid")).?;
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 32767), parsed.value.object.get("n").?.integer);
+}
+
+test "relational index system SQL typed arrays survive LSM reopen and portable restore" {
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    const storage_schema = @import("../schema.zig");
+    const wire = @import("../../sql/array_wire.zig");
+    var directory = try TestDirectory.init("sql-stored-array-reopen");
+    defer directory.cleanup();
+    var target_directory = try TestDirectory.init("sql-stored-array-portable");
+    defer target_directory.cleanup();
+    const array_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"sql_array","x-antfly-sql-type":"int64","nullable":true},"j":{"type":"sql_array","x-antfly-sql-type":"jsonb","nullable":true},"f":{"type":"sql_array","x-antfly-sql-type":"float32","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const json =
+        \\{"a":{"dimensions":[{"length":2,"lower_bound":-3}],"values":["9007199254740993",null],"sql_nulls":[false,true]},"j":{"dimensions":[{"length":2,"lower_bound":1}],"values":[null,null],"sql_nulls":[false,true]},"f":{"dimensions":[{"length":1,"lower_bound":1}],"values":[0.1],"sql_nulls":[false]}}
+    ;
+    var archive = std.ArrayListUnmanaged(u8).empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchemaJson(alloc, array_schema);
+        try db.batch(.{ .writes = &.{ .{ .key = "row", .value = json }, .{ .key = "null", .value = "{\"a\":null,\"j\":null}" }, .{ .key = "empty", .value = "{\"a\":{\"dimensions\":[],\"values\":[],\"sql_nulls\":[]}}" } } });
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = json }, .{ .key = "invalid", .value = "{\"a\":{\"dimensions\":[{\"length\":1,\"lower_bound\":1}],\"values\":[9007199254740993],\"sql_nulls\":[false]}}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "invalid-json-null", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
+        var changed = try std.json.parseFromSlice(std.json.Value, alloc, array_schema, .{});
+        defer changed.deinit();
+        changed.value.object.getPtr("version").?.* = .{ .integer = 2 };
+        changed.value.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object.getPtr("a").?.object.getPtr("x-antfly-sql-type").?.* = .{ .string = "int32" };
+        const reinterpreted = try std.json.Stringify.valueAlloc(alloc, changed.value, .{});
+        defer alloc.free(reinterpreted);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchemaJson(alloc, reinterpreted));
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target_directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expectEqual(storage_schema.storage_format_version, db.core.table_catalog.schema_format_version);
+        try std.testing.expectEqual(storage_schema.RelationalColumnType.sql_array, db.core.schema.?.relational_columns[0].column_type);
+        try std.testing.expect(db.core.schema.?.requires_public_schema);
+        const bytes = (try db.get(alloc, "row")).?;
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        var a = try wire.decode(alloc, .int64, parsed.value.object.get("a").?, .{});
+        defer a.deinit();
+        try std.testing.expectEqual(@as(i64, 9007199254740993), a.value.elements[0].value.integer);
+        try std.testing.expectEqual(@as(i32, -3), a.value.dimensions[0].lower);
+        try std.testing.expect(a.value.elements[1].sql_null);
+        var j = try wire.decode(alloc, .jsonb, parsed.value.object.get("j").?, .{});
+        defer j.deinit();
+        try std.testing.expect(j.value.elements[0].value == .null and !j.value.elements[0].sql_null);
+        try std.testing.expect(j.value.elements[1].sql_null);
+        var f = try wire.decode(alloc, .float32, parsed.value.object.get("f").?, .{});
+        defer f.deinit();
+        try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), f.value.elements[0].value.float);
+        const empty = (try db.get(alloc, "empty")).?;
+        defer alloc.free(empty);
+        const null_row = (try db.get(alloc, "null")).?;
+        defer alloc.free(null_row);
+        try std.testing.expect(!std.mem.eql(u8, empty, null_row));
+    }
+}
+
+test "relational index system wide logical CHECKs survive LSM reopen and portable restore" {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("wide-checks-lsm");
+    defer directory.cleanup();
+    var target = try @import("../../common/test_directory.zig").TestDirectory.init("wide-checks-restore");
+    defer target.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    const payload = try a.alloc(u8, 600 * 1024);
+    @memset(payload, 0);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(payload.len));
+    _ = std.base64.standard.Encoder.encode(encoded, payload);
+    const text = try a.alloc(u8, 1024 * 1024 + 1);
+    @memset(text, 'x');
+    const schema_json = try std.json.Stringify.valueAlloc(a, .{
+        .version = 1,
+        .storage_mode = "relational",
+        .default_type = "row",
+        .checks = .{
+            .{ .name = "same", .column = "b", .op = "eq", .value = encoded },
+            .{ .name = "text", .column = "s", .op = "gt", .value = "" },
+        },
+        .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = .{ .b = .{ .type = "blob" }, .s = .{ .type = "keyword" } }, .additionalProperties = false } } },
+    }, .{});
+    const valid = try std.json.Stringify.valueAlloc(a, .{ .b = encoded, .s = text }, .{});
+    const invalid = try std.json.Stringify.valueAlloc(a, .{ .b = encoded, .s = "" }, .{});
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = valid }} });
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = valid }, .{ .key = "invalid", .value = invalid } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        const bytes = (try db.get(alloc, "row")).?;
+        defer alloc.free(bytes);
+        var document = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer document.deinit();
+        try std.testing.expectEqualStrings(encoded, document.value.object.get("b").?.string);
+        try std.testing.expectEqualStrings(text, document.value.object.get("s").?.string);
+    }
+}
+
+test "relational index system public NUMERIC modifiers normalize before indexing and survive LSM restore" {
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("numeric-modifier-lsm");
+    defer directory.cleanup();
+    var target_directory = try TestDirectory.init("numeric-modifier-lsm-restore");
+    defer target_directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_n","keys":[{"column":"n"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number","x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":4,"scale":2}},"a":{"type":"sql_array","x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":4,"scale":2}}},"additionalProperties":false}}}}
+    ;
+    const json =
+        \\{"n":1.245,"a":{"dimensions":[{"length":2,"lower_bound":-7}],"values":["1.245",null],"sql_nulls":[false,true]}}
+    ;
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = json }} });
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = json }, .{ .key = "invalid", .value = "{\"n\":99.995}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        var changed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+        defer changed.deinit();
+        changed.value.object.getPtr("version").?.* = .{ .integer = 2 };
+        changed.value.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object.getPtr("n").?.object.getPtr("x-antfly-sql-numeric-modifier").?.object.getPtr("scale").?.* = .{ .integer = 1 };
+        const reinterpreted = try std.json.Stringify.valueAlloc(alloc, changed.value, .{});
+        defer alloc.free(reinterpreted);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchemaJson(alloc, reinterpreted));
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target_directory.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_numeric_modifiers);
+        const row = (try db.get(alloc, "row")).?;
+        defer alloc.free(row);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("1.25", parsed.value.object.get("n").?.number_string);
+        const array = parsed.value.object.get("a").?.object;
+        try std.testing.expectEqualStrings("1.25", array.get("values").?.array.items[0].string);
+        try std.testing.expect(array.get("sql_nulls").?.array.items[1].bool);
+        _ = try readyIndex(db, "by_n");
+        const bound = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(alloc, .{ .string = "1.25" });
+        defer alloc.free(bound);
+        var reader = try db.beginRelationalRows(alloc, .{
+            .index = "by_n",
+            .fields = &.{"n"},
+            .lower = .{ .values = &.{.{ .numeric = bound }} },
+            .upper = .{ .values = &.{.{ .numeric = bound }} },
+        });
+        defer reader.deinit();
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 10, .records = 100 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("row", page.rows[0].key);
+    }
+}
+
+test "relational index system NUMERIC public array schema survives LSM reopen and portable restore" {
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("numeric-public-array");
+    defer directory.cleanup();
+    var target_directory = try TestDirectory.init("numeric-public-array-restore");
+    defer target_directory.cleanup();
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"sql_array","x-antfly-sql-type":"numeric","nullable":true}},"additionalProperties":false}}}}
+        );
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value =
+            \\{"n":{"dimensions":[{"length":3,"lower_bound":-7}],"values":["9007199254740993.1200","NaN",null],"sql_nulls":[false,false,true]}}
+        }} });
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target_directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expectEqual(@import("../schema.zig").storage_format_version, db.core.table_catalog.schema_format_version);
+        try std.testing.expectEqual(@import("../../common/sql_builtin_type.zig").Type.numeric, db.core.schema.?.relational_columns[0].sql_element_type.?);
+        const bytes = (try db.get(alloc, "row")).?;
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        var array = try @import("../../sql/array_wire.zig").decode(alloc, .numeric, parsed.value.object.get("n").?, .{});
+        defer array.deinit();
+        try std.testing.expectEqual(@as(i32, -7), array.value.dimensions[0].lower);
+        try std.testing.expectEqual(@as(u16, 4), array.value.elements[0].numeric.?.scale);
+        try std.testing.expectEqual(@import("../../sql/numeric_value.zig").Kind.nan, array.value.elements[1].numeric.?.kind);
+        try std.testing.expect(array.value.elements[2].sql_null);
+        var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = alloc };
+        const text = try @import("../../sql/numeric_value.zig").format(&context, array.value.elements[0].numeric.?.*);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("9007199254740993.1200", text);
+    }
+}
+
+test "relational index system SQL public scalar schema survives LSM reopen and rejects domain reinterpretation" {
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"f":{"type":"number","x-antfly-sql-type":"float32"}},"additionalProperties":false}}}}
+    ;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-public-scalar-reopen");
+    defer directory.cleanup();
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchemaJson(alloc, json);
+        try db.batch(.{ .writes = &.{.{ .key = "valid", .value = "{\"n\":32767,\"f\":0.1}" }} });
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":1}" }, .{ .key = "overflow", .value = "{\"n\":32768}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        var changed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer changed.deinit();
+        changed.value.object.getPtr("version").?.* = .{ .integer = 2 };
+        const property = changed.value.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object.getPtr("n").?;
+        property.object.getPtr("x-antfly-sql-type").?.* = .{ .string = "int32" };
+        const widened = try std.json.Stringify.valueAlloc(alloc, changed.value, .{});
+        defer alloc.free(widened);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchemaJson(alloc, widened));
+        try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    try std.testing.expectEqual(@import("../../common/sql_builtin_type.zig").Type.int16, reopened.core.schema.?.relational_columns[0].sql_element_type.?);
+    const bytes = (try reopened.get(alloc, "valid")).?;
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 32767), parsed.value.object.get("n").?.integer);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), parsed.value.object.get("f").?.float);
+    try std.testing.expectError(error.InvalidBatchRequest, reopened.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"n\":-32769}" }} }));
+}
+
 test "relational index system statement fence never waits on partial prepared transactions" {
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("statement-fence");
     defer directory.cleanup();
@@ -2700,4 +3001,188 @@ test "relational index system LSM write rebuild query and churn work benchmark" 
     const after = try scan(&db, true);
     try std.testing.expect(after.examined <= index_scan.examined + 1);
     std.debug.print("relational-index benchmark rows={} write_ns={} build_ns={} build_pages={} primary_records={} index_records={} churn_ns={} forward={} reverse={} logical_bytes={} active_sst_bytes={} obsolete_bytes={} wal_bytes={}\n", .{ count, write_ns, build_ns, build_pages, primary_scan.examined, index_scan.examined, churn_ns, forward, reverse, logical_bytes, usage.active_sst_bytes, usage.obsolete_file_bytes, usage.wal_retained_bytes });
+}
+
+test "relational index system runUntilIdle drains builds across maintenance slices without workers" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-idle-drain");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const base =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, base);
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"n\":7}" }} });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var declaration = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{});
+    try declaration.object.put(a, "version", .{ .integer = 2 });
+    var indexes: std.array_list.Managed(std.json.Value) = .init(a);
+    for (0..20) |i| {
+        const definition = try std.fmt.allocPrint(a, "{{\"name\":\"by_n_{d}\",\"keys\":[{{\"column\":\"n\"}}]}}", .{i});
+        try indexes.append(try std.json.parseFromSliceLeaky(std.json.Value, a, definition, .{}));
+    }
+    try declaration.object.put(a, "relational_indexes", .{ .array = indexes });
+    try db.setSchemaJson(alloc, try std.json.Stringify.valueAlloc(a, declaration, .{}));
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("by_n_0")).state);
+    try std.testing.expectError(error.DeadlineExceeded, db.runRelationalIndexMaintenanceUntilIdle(.none, time.monotonicNs()));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, db.runRelationalIndexMaintenanceUntilIdle(db_mod.types.CancellationToken.fromAtomic(&canceled), null));
+    try std.testing.expectError(error.DeadlineExceeded, db.ensureRelationalIndexesReady(&.{"by_n_19"}, .none, time.monotonicNs()));
+    try std.testing.expectError(error.Canceled, db.ensureRelationalIndexesReady(&.{"by_n_19"}, db_mod.types.CancellationToken.fromAtomic(&canceled), null));
+    try db.ensureRelationalIndexesReady(&.{"by_n_19"}, .none, null);
+    try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus("by_n_19")).state);
+    // Targeted admission neither builds unrelated indexes nor requires a
+    // clean sweep. Background ownership advances one page and returns debt.
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("by_n_0")).state);
+    try std.testing.expect(try db.runBackgroundMaintenanceWithCancellation(.none));
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("by_n_18")).state);
+    try db.runUntilIdle();
+    for (0..20) |i| {
+        const name = try std.fmt.allocPrint(a, "by_n_{d}", .{i});
+        try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus(name)).state);
+    }
+    // A clean sweep may need multiple slices even after builds are ready.
+    for (0..8) |_| {
+        if (!try db.runBackgroundMaintenanceWithCancellation(.none)) break;
+    } else return error.IndexMaintenanceDidNotConverge;
+    var reader = try db.beginRelationalRows(alloc, .{ .index = "by_n_19" });
+    defer reader.deinit();
+    var page = try reader.nextPage(alloc, db.backend_runtime.io(), .{ .rows = 10 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+}
+
+test "relational index system query lease typed point hydration retains nulls numbers and snapshot" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("query-typed-points");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"},"optional":{"type":["json","null"]}},"required":["payload"],"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"payload\":null,\"optional\":null}", .json_null_fields = &.{"payload"} }} });
+    try db.batch(.{ .writes = &.{.{ .key = "z", .value = "{\"payload\":{\"old\":1},\"optional\":null}" }} });
+    var reader = captured: {
+        var lease = try db.beginQueryReadLease();
+        defer lease.release();
+        break :captured try lease.relationalRows(alloc, &.{ "payload", "optional" }, 1);
+    };
+    defer reader.deinit();
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"payload\":{\"fraction\":0.123456789012345678901},\"optional\":null}" }} });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const retained = (try reader.lookupTypedRow(a, "a")).?;
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, retained.sql_nulls.?);
+    try std.testing.expect(retained.typed.?.object.get("payload").? == .null);
+    try std.testing.expect(try reader.lookupTypedRow(a, "missing") == null);
+    const native = (try reader.lookupSqlRow(a, "a")).?;
+    try std.testing.expect(native.typed == null and native.sql_nulls == null);
+    const native_row: @import("../../sql/catalog.zig").Row = .{ .id = native.key, .version = native.version, .value = .null, .typed_cells = native.typed_cells };
+    try std.testing.expect(!(try native_row.cell("payload")).sql_null);
+    try std.testing.expect((try native_row.cell("payload")).value == .null);
+    try std.testing.expect((try native_row.cell("optional")).sql_null);
+    try std.testing.expect(try reader.lookupSqlRow(a, "missing") == null);
+    var current = try db.beginRelationalRows(alloc, .{ .fields = &.{ "payload", "optional" } });
+    defer current.deinit();
+    const updated = (try current.lookupTypedRow(a, "a")).?;
+    try std.testing.expectEqualStrings("0.123456789012345678901", updated.typed.?.object.get("payload").?.object.get("fraction").?.number_string);
+    const output_layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(a, &.{ "score", "optional", "payload" });
+    const batch = try reader.lookupSqlBatch(a, &.{ "z", "a", "missing" }, output_layout, 256 * 1024);
+    try std.testing.expectEqual(@as(usize, 3), batch.consumed);
+    try std.testing.expectEqualStrings("z", batch.rows[0].?.key);
+    try std.testing.expectEqualStrings("a", batch.rows[1].?.key);
+    try std.testing.expect(batch.rows[2] == null);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true }, batch.rows[1].?.typed_cells.?.presence.?);
+    try std.testing.expect(!batch.rows[1].?.typed_cells.?.values[2].sql_null);
+    try std.testing.expect(batch.rows[1].?.typed_cells.?.values[2].value == .null);
+    const one = try reader.lookupSqlBatch(a, &.{ "z", "a" }, output_layout, 1);
+    try std.testing.expectEqual(@as(usize, 1), one.consumed);
+    const Probe = struct {
+        fn run(backing: std.mem.Allocator, live: *@import("relational_rows.zig").Reader) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(region.allocator(), &.{ "payload", "optional", "score" });
+            const result = try live.lookupSqlBatch(region.allocator(), &.{ "z", "a", "missing" }, layout, 256 * 1024);
+            try std.testing.expectEqualStrings("z", result.rows[0].?.key);
+            try std.testing.expectEqual(@as(usize, 3), result.consumed);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Probe.run, .{&reader});
+    // Paired allocation fixture for the former point-hydration/output-copy
+    // path versus sorted batch hydration directly into the final layout.
+    var ids_buffer: [64][8]u8 = undefined;
+    var ids: [64][]const u8 = undefined;
+    var writes: [64]db_mod.types.BatchWrite = undefined;
+    for (&ids_buffer, &ids, &writes, 0..) |*buffer, *id, *write_out, i| {
+        id.* = try std.fmt.bufPrint(buffer, "x{d:0>3}", .{63 - i});
+        write_out.* = .{ .key = id.*, .value = "{\"payload\":null,\"optional\":null}", .json_null_fields = &.{"payload"} };
+    }
+    try db.batch(.{ .writes = &writes });
+    var peaks: [2]usize = undefined;
+    var calls: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |batched, i| {
+        const test_alloc = @import("../lite/test_allocator.zig");
+        var counted = std.testing.FailingAllocator.init(alloc, .{});
+        var stable: test_alloc.NoResizeAllocator = .{ .backing = counted.allocator() };
+        var budget: test_alloc.BudgetAllocator = .{ .backing = stable.allocator() };
+        {
+            var points = try db.beginRelationalRows(budget.allocator(), .{ .fields = &.{ "payload", "optional" } });
+            defer points.deinit();
+            var output = std.heap.ArenaAllocator.init(budget.allocator());
+            defer output.deinit();
+            const out = output.allocator();
+            const layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(out, &.{ "payload", "optional" });
+            if (batched) {
+                const result = try points.lookupSqlBatch(out, &ids, layout, 256 * 1024);
+                try std.testing.expectEqual(@as(usize, 64), result.consumed);
+                for (result.rows, &ids) |row, id| {
+                    try std.testing.expectEqualStrings(id, row.?.key);
+                    try std.testing.expect(!row.?.typed_cells.?.values[0].sql_null);
+                }
+            } else {
+                var source_layout: ?*const @import("../../sql/catalog.zig").Row.TypedLayout = null;
+                for (ids) |id| {
+                    const row = (try points.lookupSqlRowWithLayout(out, id, &source_layout)).?;
+                    const values = try out.dupe(@import("../../sql/catalog.zig").Row.Cell, row.typed_cells.?.values);
+                    _ = try out.dupe(bool, row.typed_cells.?.presence.?);
+                    try std.testing.expect(!values[0].sql_null);
+                }
+            }
+            peaks[i] = budget.peak;
+            calls[i] = counted.alloc_index;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(calls[1] < calls[0]);
+    // A tiny-row batch trades bounded read-scope metadata for fewer heap
+    // allocations. Do not claim that every workload lowers its peak.
+    try std.testing.expect(peaks[1] <= peaks[0] + 2 * 1024 * 1024);
+    std.debug.print("SQL ranked hydration: rows=64 point_peak={} batch_peak={} point_allocations={} batch_allocations={}\n", .{ peaks[0], peaks[1], calls[0], calls[1] });
+    // Wide unselected bodies must not turn a small output page into an
+    // unbounded prefetch. Scoped source quota can shrink the microbatch.
+    const body = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(body);
+    var random = std.Random.DefaultPrng.init(42);
+    for (body) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    const wide = try std.fmt.allocPrint(alloc, "{{\"payload\":\"{s}\",\"optional\":null}}", .{body});
+    defer alloc.free(wide);
+    var wide_writes: [16]db_mod.types.BatchWrite = undefined;
+    for (&wide_writes, ids[0..16]) |*entry, id| entry.* = .{ .key = id, .value = wide };
+    try db.batch(.{ .writes = &wide_writes });
+    var wide_reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"optional"} });
+    defer wide_reader.deinit();
+    const small_layout = try @import("../../sql/catalog.zig").Row.TypedLayout.init(a, &.{"optional"});
+    var delivered: usize = 0;
+    while (delivered < 16) {
+        const result = try wide_reader.lookupSqlBatch(a, ids[delivered..16], small_layout, 256 * 1024);
+        try std.testing.expect(result.consumed > 0);
+        for (result.rows, ids[delivered..][0..result.consumed]) |row, id| {
+            try std.testing.expectEqualStrings(id, row.?.key);
+            try std.testing.expect(row.?.typed_cells.?.values[0].sql_null);
+        }
+        delivered += result.consumed;
+    }
 }

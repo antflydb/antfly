@@ -138,14 +138,15 @@ pub const IntentValue = struct {
     }
 };
 
-/// Conservative admission credits for the retained input/AROW, transient
-/// exact-number DOM, and per-row commit metadata. Limits apply to the entire
-/// transaction, including repeated prepares; replacing a key releases credits.
+/// Admission counts retained input/AROW bytes and per-row commit metadata.
+/// Transient parsing and preparation allocations are independently charged by
+/// the preparation allocator, rather than multiplying payload bytes by a DOM
+/// worst case. Limits apply across prepares; replacing a key releases credits.
 pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
     var payload: u64 = (if (intent.value) |value| value.len else 0) +
         (if (intent.prepared_row) |row| row.len else 0);
     for (intent.json_null_fields) |field| payload = std.math.add(u64, payload, field.len + @sizeOf([]const u8)) catch return error.TransactionTooLarge;
-    const bytes = std.math.mul(u64, payload, 64) catch return error.TransactionTooLarge;
+    const bytes = payload;
     const keys = std.math.mul(u64, intent.key.len, 16) catch return error.TransactionTooLarge;
     return std.math.add(u64, bytes, std.math.add(u64, keys, 4096) catch return error.TransactionTooLarge) catch error.TransactionTooLarge;
 }
@@ -3441,6 +3442,14 @@ test "transaction cumulative admission is atomic and membership metadata is incr
     const member_key = try TxnManager.makeIntentMemberKey(alloc, txn, "a");
     defer alloc.free(member_key);
     try std.testing.expectError(error.NotFound, mgr.getAlloc(alloc, member_key));
+}
+
+test "transaction admission counts retained payload rather than a JSON expansion estimate" {
+    const payload = try std.testing.allocator.alloc(u8, 3 * 1024 * 1024);
+    defer std.testing.allocator.free(payload);
+    const cost = try intentAdmissionBytes(.{ .key = "row", .value = payload, .prepared_row = payload });
+    try std.testing.expect(cost >= 2 * payload.len);
+    try std.testing.expect(cost < 2 * payload.len + 8192);
 }
 
 test "transaction admission rejects before copying payloads and coalesces duplicate keys" {

@@ -55,12 +55,17 @@ const InferenceHandle = struct {
 /// inference handle passed to an `antfly_db_*` call, is rejected.
 var registry: db.HandleRegistryOf(InferenceHandle) = .{};
 
-pub export fn antfly_inference_options_size() u32 {
+pub fn antfly_inference_options_size() callconv(.c) u32 {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_options_size), .{ .name = "antfly_inference_options_size" }), .{});
     return @intCast(@sizeOf(capi.InferenceOptions));
 }
 
-pub export fn antfly_inference_options_init(options: ?*capi.InferenceOptions) capi.ErrorCode {
-    const opts = options orelse return .invalid_argument;
+pub fn antfly_inference_options_init(options: ?*capi.InferenceOptions) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_options_init), .{ .name = "antfly_inference_options_init" }), .{options});
+    capi.clearLastError();
+    const opts = options orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": options pointer must not be null");
     opts.* = .{};
     return .ok;
 }
@@ -111,9 +116,6 @@ fn openInference(options: ?*const capi.InferenceOptions) !*anyopaque {
     // which the runtime resolves on its own.
     const created = try inference_provider.createEmbeddedInferenceNode(".", io_impl.io(), resolved.node);
     errdefer inference_provider.destroyEmbeddedInferenceNode(created.handle, created.resource_owner);
-    // Unlike a Lite handle, which still serves storage without inference, a
-    // handle that cannot run inference is useless: fail the open instead.
-    if (created.configure_error != null) return error.InferenceRuntimeStartupFailed;
     handle.* = .{
         .io = io_impl,
         .lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner },
@@ -123,11 +125,14 @@ fn openInference(options: ?*const capi.InferenceOptions) !*anyopaque {
     return registry.register(handle);
 }
 
-pub export fn antfly_inference_open(
+pub fn antfly_inference_open(
     options: ?*const capi.InferenceOptions,
     out_handle: ?*?*anyopaque,
-) capi.ErrorCode {
-    const out = out_handle orelse return .invalid_argument;
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_open), .{ .name = "antfly_inference_open" }), .{ options, out_handle });
+    capi.clearLastError();
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output pointer must not be null");
     out.* = null;
     out.* = openInference(options) catch |err| return capi.mapError(err);
     return .ok;
@@ -135,13 +140,16 @@ pub export fn antfly_inference_open(
 
 /// Rejects new calls, waits for in-flight ones, then stops the runtime.
 /// Safe for NULL, stale, and concurrent or repeated closes.
-pub export fn antfly_inference_close(handle_ptr: ?*anyopaque) void {
+pub fn antfly_inference_close(handle_ptr: ?*anyopaque) callconv(.c) void {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_close), .{ .name = "antfly_inference_close" }), .{handle_ptr});
     const handle, const id = registry.beginClose(handle_ptr) orelse return;
     handle.destroy();
     registry.finishClose(id);
 }
 
 fn errorForStatus(status: u16) capi.ErrorCode {
+    capi.clearLastError();
     return switch (status) {
         200...299 => .ok,
         404 => .not_found,
@@ -173,8 +181,8 @@ fn invoke(
     request: []const u8,
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer @TypeOf(registry).leave(slot);
     const deadline_ns = handle.deadline();
     const response = inference_provider.invokeEmbeddedInferenceRoute(
@@ -194,27 +202,39 @@ fn invoke(
     return errorForStatus(response.status);
 }
 
-pub export fn antfly_inference_embed_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_embed_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_embed_json), .{ .name = "antfly_inference_embed_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "embed", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_rerank_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_rerank_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_rerank_json), .{ .name = "antfly_inference_rerank_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "rerank", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_chunk_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_chunk_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_chunk_json), .{ .name = "antfly_inference_chunk_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "chunk", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_generate_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_generate_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_generate_json), .{ .name = "antfly_inference_generate_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     // There is no stream sink across the C ABI; without this check the
     // runtime fails a streaming request with an opaque internal error.
     if (requestsStreaming(request_json.bytes())) {
-        const buffer = db.resetOutBuffer(out) orelse return .invalid_argument;
+        const buffer = db.resetOutBuffer(out) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
         const body = "{\"error\":\"STREAMING_UNSUPPORTED\",\"message\":\"use antfly_inference_generate_stream_json to stream\"}";
-        const owned = alloc.dupe(u8, body) catch return .internal;
+        const owned = alloc.dupe(u8, body) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         buffer.* = .{ .ptr = owned.ptr, .len = owned.len };
-        return .invalid_argument;
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": non-streaming generation cannot accept stream=true");
     }
     return invoke(h, .post, "generate", request_json.bytes(), out);
 }
@@ -231,32 +251,53 @@ fn requestsStreaming(request: []const u8) bool {
 
 /// Runs up to 128 non-streaming generate requests as one batch. Item failures
 /// are reported per item in the response; the call itself succeeds.
-pub export fn antfly_inference_generate_batch_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_generate_batch_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_generate_batch_json), .{ .name = "antfly_inference_generate_batch_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "generate/batch", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_rewrite_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_rewrite_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_rewrite_json), .{ .name = "antfly_inference_rewrite_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "rewrite", request_json.bytes(), out);
 }
 
 /// Uses the model-independent DecideRequest/DecideResponse contract.
-pub export fn antfly_inference_decide_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_decide_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_decide_json), .{ .name = "antfly_inference_decide_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "decisions", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_extract_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_extract_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_extract_json), .{ .name = "antfly_inference_extract_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "extract", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_read_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_read_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_read_json), .{ .name = "antfly_inference_read_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "read", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_transcribe_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_transcribe_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_transcribe_json), .{ .name = "antfly_inference_transcribe_json" }), .{ h, request_json, out });
+    capi.clearLastError();
     return invoke(h, .post, "transcribe", request_json.bytes(), out);
 }
 
-pub export fn antfly_inference_list_models_json(h: ?*anyopaque, out: ?*capi.Buffer) capi.ErrorCode {
+pub fn antfly_inference_list_models_json(h: ?*anyopaque, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_list_models_json), .{ .name = "antfly_inference_list_models_json" }), .{ h, out });
+    capi.clearLastError();
     return invoke(h, .get, "models", "", out);
 }
 
@@ -417,6 +458,7 @@ fn sliceOf(bytes: []const u8) capi.Slice {
 
 /// Maps a failed pull, by the error name in its result JSON.
 fn pullErrorCode(name: []const u8) capi.ErrorCode {
+    capi.clearLastError();
     const table = [_]struct { []const u8, capi.ErrorCode }{
         .{ "HubModelNotFound", .not_found },
         .{ "NoModelFilesFound", .not_found },
@@ -446,20 +488,23 @@ fn pullErrorCode(name: []const u8) capi.ErrorCode {
         .{ "NetworkUnreachable", .busy },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], name)) return entry[1];
-    return .internal;
+    return capi.recordError(.internal, name);
 }
 
 /// Downloads models into this handle's models directory, calling `progress`
 /// (if set) on the calling thread as files download; see `PullCall`.
-pub export fn antfly_inference_pull_json(
+pub fn antfly_inference_pull_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
     progress: ?capi.InferencePullProgressFn,
     progress_context: ?*anyopaque,
     out_buf: ?*capi.Buffer,
-) capi.ErrorCode {
-    const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_pull_json), .{ .name = "antfly_inference_pull_json" }), .{ handle_ptr, request_json, progress, progress_context, out_buf });
+    capi.clearLastError();
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer @TypeOf(registry).leave(slot);
     const io = handle.io.io();
     var call = PullCall{
@@ -476,7 +521,7 @@ pub export fn antfly_inference_pull_json(
     const result = call.result orelse return if (pulled) |_| .internal else |err| mapCallError(err);
     out.* = .{ .ptr = result.ptr, .len = result.len };
     _ = pulled catch {
-        const parsed = std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, result, .{ .ignore_unknown_fields = true }) catch return .internal;
+        const parsed = std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, result, .{ .ignore_unknown_fields = true }) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         defer parsed.deinit();
         return pullErrorCode(parsed.value.@"error");
     };
@@ -602,21 +647,24 @@ fn streamingRequest(request: []const u8) ![]u8 {
 
 /// Streams a generate call: `on_chunk` receives each chunk's JSON on the
 /// calling thread and returns false to stop generation.
-pub export fn antfly_inference_generate_stream_json(
+pub fn antfly_inference_generate_stream_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
     on_chunk: ?capi.InferenceStreamFn,
     chunk_context: ?*anyopaque,
     out_buf: ?*capi.Buffer,
-) capi.ErrorCode {
-    const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const callback = on_chunk orelse return .invalid_argument;
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_inference_generate_stream_json), .{ .name = "antfly_inference_generate_stream_json" }), .{ handle_ptr, request_json, on_chunk, chunk_context, out_buf });
+    capi.clearLastError();
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
+    const callback = on_chunk orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": stream callback must not be null");
     const request = streamingRequest(request_json.bytes()) catch |err| switch (err) {
-        error.OutOfMemory => return .internal,
-        else => return .invalid_argument,
+        error.OutOfMemory => return capi.mapError(err),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": malformed streaming generation request"),
     };
     defer alloc.free(request);
-    const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     defer @TypeOf(registry).leave(slot);
 
     var call = StreamCall{ .callback = callback, .callback_context = chunk_context };
@@ -630,13 +678,13 @@ pub export fn antfly_inference_generate_stream_json(
     if (call.relay.cancelled.load(.acquire)) return .cancelled;
     _ = call.outcome catch |err| return mapCallError(err);
     if (call.stream_error) |message| {
-        const body = std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{ .@"error" = "STREAM_FAILED", .message = message }, .{})}) catch return .internal;
+        const body = std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{ .@"error" = "STREAM_FAILED", .message = message }, .{})}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         out.* = .{ .ptr = body.ptr, .len = body.len };
-        return .internal;
+        return capi.recordError(.internal, message);
     }
     // A request rejected before streaming started gets an ordinary response.
     if (call.status == 0) {
-        const response = call.response orelse return .internal;
+        const response = call.response orelse return capi.recordError(.internal, @src().fn_name ++ ": inference worker returned no response");
         call.response = null;
         out.* = .{ .ptr = response.body.ptr, .len = response.body.len };
         return errorForStatus(response.status);
@@ -1032,4 +1080,26 @@ test "capi inference streaming reports request errors without a model" {
     db.antfly_buffer_free(&out);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_generate_stream_json(handle, testSlice("[1]"), Ignore.onChunk, null, &out));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_generate_stream_json(handle, testSlice(missing), null, null, &out));
+}
+
+comptime {
+    @import("exports.zig").publish(@This(), &.{
+        "antfly_inference_options_size",
+        "antfly_inference_options_init",
+        "antfly_inference_open",
+        "antfly_inference_close",
+        "antfly_inference_embed_json",
+        "antfly_inference_rerank_json",
+        "antfly_inference_chunk_json",
+        "antfly_inference_generate_json",
+        "antfly_inference_generate_batch_json",
+        "antfly_inference_rewrite_json",
+        "antfly_inference_decide_json",
+        "antfly_inference_extract_json",
+        "antfly_inference_read_json",
+        "antfly_inference_transcribe_json",
+        "antfly_inference_list_models_json",
+        "antfly_inference_pull_json",
+        "antfly_inference_generate_stream_json",
+    });
 }

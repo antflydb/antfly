@@ -46,20 +46,6 @@ fn selectTestFilters(b: *std.Build, default_filters: []const []const u8) []const
     );
 }
 
-fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
-    const platform_str = switch (target.result.os.tag) {
-        .macos => "darwin",
-        .linux => "linux",
-        else => "unknown",
-    };
-    const arch_str = switch (target.result.cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "amd64",
-        else => "unknown",
-    };
-    return b.fmt("onnxruntime/{s}-{s}", .{ platform_str, arch_str });
-}
-
 fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     const host = b.graph.host.result;
     return target.result.os.tag == host.os.tag and
@@ -110,20 +96,6 @@ fn configureMetal(
     module.addCSourceFile(.{ .file = b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
 }
 
-fn configureOnnxRuntime(
-    b: *std.Build,
-    module: *std.Build.Module,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-) void {
-    if (!enable_onnx) return;
-    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
-    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
-    module.linkSystemLibrary("onnxruntime", .{});
-    module.linkSystemLibrary("onnxruntime-genai", .{});
-}
-
 fn configureNativeTool(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
@@ -166,10 +138,6 @@ pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, wasm_memory_model, "wasm32") and !std.mem.eql(u8, wasm_memory_model, "wasm64")) {
         @panic("invalid -Dwasm-memory-model (expected wasm32 or wasm64)");
     }
-    const onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime backend");
-    const enable_onnx = if (enable_wasm or !link_libc) false else (onnx_option orelse false);
-    const onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root (default: ./onnxruntime/<platform>)");
-    const effective_onnx_root = onnx_root_opt orelse defaultOnnxRuntimeRoot(b, target);
     const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (target.result.os.tag == .macos));
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
     const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
@@ -255,8 +223,6 @@ pub fn build(b: *std.Build) void {
         },
         .register_public_modules = true,
         .backend = .{
-            .enable_onnx = enable_onnx,
-            .onnx_root = effective_onnx_root,
             .enable_metal = enable_metal,
             .enable_cuda = enable_cuda,
             .cuda_artifacts = cuda_artifacts,
@@ -282,6 +248,7 @@ pub fn build(b: *std.Build) void {
         .b = b,
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .paths = runtime_config.paths,
         .backend = runtime_config.backend,
         .graph = runtime_graph,
@@ -1103,9 +1070,86 @@ pub fn build(b: *std.Build) void {
     embeddinggemma2_bench.root_module.link_libc = true;
     const install_embeddinggemma2_bench = b.addInstallArtifact(embeddinggemma2_bench, .{});
     b.step("build-embeddinggemma2-bench", "Build the prepared-text encoder benchmark without running it").dependOn(&install_embeddinggemma2_bench.step);
+    const live_bench = b.addExecutable(.{ .name = "antfly-embeddinggemma2-live", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/embeddinggemma2_live.zig"), .target = target, .optimize = optimize }) });
+    live_bench.root_module.addImport("build_options", build_options_mod);
+    live_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    live_bench.root_module.addImport("antfly_media", inference_internal_mod.import_table.get("antfly_media").?);
+    live_bench.root_module.addImport("antfly_video", inference_internal_mod.import_table.get("antfly_video").?);
+    runtime_graph.identities.addImports(live_bench.root_module);
+    live_bench.root_module.link_libc = true;
+    b.step("build-embeddinggemma2-live", "Build pretrained live adapter/complete-clip parity qualification").dependOn(&b.addInstallArtifact(live_bench, .{}).step);
     const run_embeddinggemma2_bench = b.addRunArtifact(embeddinggemma2_bench);
     run_embeddinggemma2_bench.addPassthruArgs();
     b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
+
+    const gemma4_image_bench = b.addExecutable(.{
+        .name = "antfly-gemma4-image-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_image.zig"), .target = target, .optimize = optimize }),
+    });
+    gemma4_image_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_image_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(gemma4_image_bench.root_module);
+    gemma4_image_bench.root_module.link_libc = true;
+    const install_gemma4_image_bench = b.addInstallArtifact(gemma4_image_bench, .{});
+    b.step("build-gemma4-image-bench", "Build the synchronized Gemma4 image benchmark").dependOn(&install_gemma4_image_bench.step);
+    const run_gemma4_image_bench = b.addRunArtifact(gemma4_image_bench);
+    run_gemma4_image_bench.addPassthruArgs();
+    b.step("bench-gemma4-image", "Benchmark Gemma4 vision and image embeddings").dependOn(&run_gemma4_image_bench.step);
+
+    const audio_embedding_bench = b.addExecutable(.{
+        .name = "antfly-audio-embedding-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/audio_embedding.zig"), .target = target, .optimize = optimize }),
+    });
+    audio_embedding_bench.root_module.addImport("build_options", build_options_mod);
+    audio_embedding_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(audio_embedding_bench.root_module);
+    audio_embedding_bench.root_module.link_libc = true;
+    const install_audio_embedding_bench = b.addInstallArtifact(audio_embedding_bench, .{});
+    b.step("build-audio-embedding-bench", "Build the synchronized real-model audio embedding benchmark").dependOn(&install_audio_embedding_bench.step);
+
+    if (target.result.os.tag == .macos) {
+        const pdf_ocr_bench = b.addExecutable(.{
+            .name = "antfly-pdf-ocr-comparison",
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/pdf_ocr_comparison.zig"), .target = target, .optimize = optimize }),
+        });
+        pdf_ocr_bench.root_module.addImport("inference_internal", inference_internal_mod);
+        pdf_ocr_bench.root_module.addCSourceFile(.{ .file = b.path(b.fmt("{s}/lib/readers/src/apple_vision.m", .{shared_lib_root})), .flags = &.{"-fobjc-arc"} });
+        for ([_][]const u8{ "Vision", "Foundation", "CoreGraphics", "ImageIO" }) |framework| pdf_ocr_bench.root_module.linkFramework(framework, .{});
+        runtime_graph.identities.addImports(pdf_ocr_bench.root_module);
+        pdf_ocr_bench.root_module.link_libc = true;
+        b.step("build-pdf-ocr-comparison", "Build Gemma4 versus Apple Vision corpus benchmark").dependOn(&b.addInstallArtifact(pdf_ocr_bench, .{}).step);
+    }
+
+    const pdf_module = inference_internal_mod.import_table.get("antfly_pdf").?;
+    const gemma4_pdf_bench = b.addExecutable(.{ .name = "antfly-gemma4-pdf-bench", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_pdf.zig"), .target = target, .optimize = optimize }) });
+    gemma4_pdf_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_pdf_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    gemma4_pdf_bench.root_module.addImport("antfly_pdf", pdf_module);
+    runtime_graph.identities.addImports(gemma4_pdf_bench.root_module);
+    gemma4_pdf_bench.root_module.link_libc = true;
+    if (enable_metal and target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, gemma4_pdf_bench.root_module, target);
+        gemma4_pdf_bench.root_module.linkFramework("Foundation", .{});
+        gemma4_pdf_bench.root_module.linkFramework("Metal", .{});
+        gemma4_pdf_bench.root_module.addCSourceFile(.{ .file = b.path("src/bench/pdf_gpu.m"), .flags = &.{"-fobjc-arc"} });
+    }
+    const pdf_gpu_test_module = b.createModule(.{ .root_source_file = b.path("src/bench/pdf_gpu.zig"), .target = target, .optimize = optimize });
+    pdf_gpu_test_module.addImport("antfly_pdf", pdf_module);
+    pdf_gpu_test_module.addImport("build_options", build_options_mod);
+    pdf_gpu_test_module.link_libc = true;
+    if (enable_metal and target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_gpu_test_module, target);
+        pdf_gpu_test_module.linkFramework("Foundation", .{});
+        pdf_gpu_test_module.linkFramework("Metal", .{});
+        pdf_gpu_test_module.addCSourceFile(.{ .file = b.path("src/bench/pdf_gpu.m"), .flags = &.{"-fobjc-arc"} });
+    }
+    const pdf_gpu_tests = b.addTest(.{ .root_module = pdf_gpu_test_module });
+    b.step("pdf-gpu-test", "Validate prototype eligibility and GPU/native pixel parity").dependOn(&b.addRunArtifact(pdf_gpu_tests).step);
+    const install_gemma4_pdf_bench = b.addInstallArtifact(gemma4_pdf_bench, .{});
+    b.step("build-gemma4-pdf-bench", "Build the real-PDF Gemma4 benchmark and Metal painter prototype").dependOn(&install_gemma4_pdf_bench.step);
+    const run_gemma4_pdf_bench = b.addRunArtifact(gemma4_pdf_bench);
+    run_gemma4_pdf_bench.addPassthruArgs();
+    b.step("bench-gemma4-pdf", "Compare CPU/GPU page painting and resident Gemma4 embedding").dependOn(&run_gemma4_pdf_bench.step);
 
     const embeddinggemma2_attention_check = b.addExecutable(.{
         .name = "antfly-embeddinggemma2-attention-check",
@@ -1295,6 +1339,46 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_local_check_step.dependOn(q4_pair_route_tail);
     }
 
+    // Focused E2B prefill qualification suite. It remains a separate local
+    // check because it allocates production-sized Q4_0 weights. Verify the
+    // qualified routes against their independently disabled baselines.
+    const e2b_q4_mm_cases = [_]struct { rows: []const u8, in_dim: []const u8, out_dim: []const u8, route: []const u8 }{
+        .{ .rows = "32", .in_dim = "1536", .out_dim = "6144", .route = "aligned" },
+        .{ .rows = "31", .in_dim = "1536", .out_dim = "12288", .route = "aligned-tail" },
+        .{ .rows = "32", .in_dim = "12288", .out_dim = "1536", .route = "aligned" },
+        .{ .rows = "31", .in_dim = "6144", .out_dim = "1536", .route = "aligned-tail" },
+    };
+    var e2b_prefill_route_tail: ?*std.Build.Step = null;
+    for (e2b_q4_mm_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_E2B_Q4_0_MM_SG_ALIGNED", "0");
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "linear", "--rows", case.rows, "--in", case.in_dim, "--out", case.out_dim, "--warmup", "1", "--iters", "3", "--compare-q4-e2b-disabled-baseline", "--expect-q4-route", case.route });
+        if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);
+        e2b_prefill_route_tail = &check.step;
+    }
+    const e2b_q4_pair_cases = [_]struct { rows: []const u8, out_dim: []const u8, route: []const u8 }{
+        .{ .rows = "32", .out_dim = "6144", .route = "m32-n64-aligned" },
+        .{ .rows = "31", .out_dim = "6144", .route = "m32-n64-tail" },
+        .{ .rows = "32", .out_dim = "12288", .route = "m32-n64-aligned" },
+        .{ .rows = "31", .out_dim = "12288", .route = "m32-n64-tail" },
+    };
+    for (e2b_q4_pair_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "0");
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "ffn", "--rows", case.rows, "--in", "1536", "--out", case.out_dim, "--warmup", "1", "--iters", "3", "--compare-q4-e2b-disabled-baseline", "--expect-q4-pair-mm-route", case.route });
+        if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);
+        e2b_prefill_route_tail = &check.step;
+    }
+    const e2b_prefill_route_check_step = b.step(
+        "bench-metal-gemma4-e2b-prefill-routes",
+        "Run E2B Q4_0 aligned linear and fused FFN prefill route qualification on Apple M4",
+    );
+    e2b_prefill_route_check_step.dependOn(e2b_prefill_route_tail.?);
+
     workflows_benches.addPagedAttention(workflow_ctx);
 
     const turboquant_distortion_bench_exe = b.addExecutable(.{
@@ -1356,7 +1440,6 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(gliner2_e2e_bench_exe.root_module);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
-    configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     b.step("bench-gliner2-e2e-build", "Build the GLiNER2 end-to-end benchmark").dependOn(&b.addInstallArtifact(gliner2_e2e_bench_exe, .{}).step);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
     run_gliner2_e2e_bench.addPassthruArgs();
@@ -1385,7 +1468,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(clipclap_native_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
     run_clipclap_native_bench.addPassthruArgs();
     const clipclap_native_bench_step = b.step("bench-clipclap-native", "Run end-to-end CLIP/CLAP native encoder benches with random quantized weights");
@@ -1413,7 +1495,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(clipclap_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
     run_clipclap_e2e_bench.addPassthruArgs();
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
@@ -1449,7 +1530,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(qwen3_embedding_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, qwen3_embedding_e2e_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, qwen3_embedding_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_qwen3_embedding_e2e_bench = b.addRunArtifact(qwen3_embedding_e2e_bench_exe);
     run_qwen3_embedding_e2e_bench.addPassthruArgs();
     const qwen3_embedding_e2e_bench_step = b.step("bench-qwen3-embedding-e2e", "Run pretokenized Qwen3-Embedding encoder E2E benchmarks");
@@ -1477,7 +1557,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(nomic_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, nomic_e2e_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, nomic_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_nomic_e2e_bench = b.addRunArtifact(nomic_e2e_bench_exe);
     run_nomic_e2e_bench.addPassthruArgs();
     const nomic_e2e_bench_step = b.step("bench-nomic-e2e", "Run pretokenized Nomic v1.5 encoder E2E benchmarks");
@@ -1504,7 +1583,6 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(reranker_e2e_bench_exe.root_module);
     reranker_e2e_bench_exe.root_module.link_libc = true;
-    configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
     run_reranker_e2e_bench.addPassthruArgs();
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
@@ -1515,6 +1593,44 @@ pub fn build(b: *std.Build) void {
     // Tests
     const suite = workflows_tests.create(workflow_ctx);
     const tests = suite.tests;
+    b.step("test-embeddinggemma2", "Run the filtered inference suite for EmbeddingGemma 2 qualification").dependOn(&suite.run_tests.step);
+    b.step("install-embeddinggemma2-tests", "Install the filtered EmbeddingGemma2 suite for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "embeddinggemma2-tests" }).step);
+    const video_model_root = b.createModule(.{ .root_source_file = b.path("src/inference_internal.zig"), .target = target, .optimize = optimize });
+    var video_imports = inference_internal_mod.import_table.iterator();
+    while (video_imports.next()) |entry| video_model_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    video_model_root.addImport("inference_internal", video_model_root);
+    runtime_build.configureRuntimeLinks(b, video_model_root, target, runtime_config.backend, runtime_config.paths);
+    video_model_root.link_libc = runtime_config.backend.link_libc;
+    const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video", "embeddinggemma2 model VFR", "metal native embeddinggemma2 BF16 and F32 shared" } });
+    b.step("check-video-model", "Compile video model qualification for cross-platform checks").dependOn(&video_model_tests.step);
+    b.step("install-video-model-tests", "Install native video model policy/lifetime tests for another host").dependOn(&b.addInstallArtifact(video_model_tests, .{ .dest_sub_path = "video-model-tests" }).step);
+    const media_chunk_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{"model aware media"} });
+    const media_chunk_step = b.step("test-media-chunking", "Qualify model-aware chunk coverage, source coordinates and cancellation");
+    media_chunk_step.dependOn(&b.addRunArtifact(media_chunk_tests).step);
+    const chunk_audio_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    @import("antfly_media").support.attach(b, chunk_audio_root, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
+    chunk_audio_root.link_libc = link_libc;
+    const chunk_audio_tests = b.addTest(.{ .root_module = chunk_audio_root, .filters = &.{ "bounded audio cancellation", "streaming audio" } });
+    const run_chunk_audio_tests = b.addRunArtifact(chunk_audio_tests);
+    media_chunk_step.dependOn(&run_chunk_audio_tests.step);
+    b.step("test-audio-streaming", "Qualify bounded audio block visitors, clocks and cancellation").dependOn(&run_chunk_audio_tests.step);
+    const chunk_planning_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/chunker/src/planning.zig", .{shared_lib_root})), .target = target, .optimize = optimize }) });
+    media_chunk_step.dependOn(&b.addRunArtifact(chunk_planning_tests).step);
+    const chunk_sampling_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/video/src/sampling.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    chunk_sampling_root.addImport("antfly_media", inference_audio_mod.import_table.get("antfly_media").?);
+    const chunk_sampling_tests = b.addTest(.{ .root_module = chunk_sampling_root });
+    media_chunk_step.dependOn(&b.addRunArtifact(chunk_sampling_tests).step);
+    b.step("check-media-chunking", "Compile model-aware media qualification").dependOn(&media_chunk_tests.step);
+    const install_media_chunks = b.step("install-media-chunking-tests", "Install portable model-aware media qualification");
+    install_media_chunks.dependOn(&b.addInstallArtifact(media_chunk_tests, .{ .dest_sub_path = "media-chunking-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_audio_tests, .{ .dest_sub_path = "media-chunk-audio-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_planning_tests, .{ .dest_sub_path = "media-chunk-planning-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_sampling_tests, .{ .dest_sub_path = "media-chunk-sampling-tests" }).step);
+    const run_video_model_tests = b.addRunArtifact(video_model_tests);
+    // Device availability and producer/consumer lifetimes must be checked on
+    // each qualification run, even when the executable itself is cached.
+    run_video_model_tests.has_side_effects = true;
+    b.step("test-video-model", "Qualify video processor, token layout and native/Metal buffer lifetime without checkpoint weights").dependOn(&run_video_model_tests.step);
     const run_cli_tests = suite.run_cli_tests;
 
     const bge_m3_e2e_bench_tests = bge_benchmark.tests;
@@ -1579,7 +1695,6 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"wasm_compute:"},
     });
-    runtime_build.applyCBindings(wasm_compute_tests.root_module, runtime_graph.c_bindings);
     wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1607,7 +1722,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, wasm_compute_tests.root_module, target, blas_root);
     }
     configureMetal(b, wasm_compute_tests.root_module, target, enable_metal);
-    configureOnnxRuntime(b, wasm_compute_tests.root_module, enable_onnx, effective_onnx_root);
     wasm_compute_tests.root_module.link_libc = true;
     const run_wasm_compute_tests = b.addRunArtifact(wasm_compute_tests);
     const test_wasm_compute_step = b.step("test-wasm-compute", "Run focused WasmCompute backend tests");
@@ -1637,7 +1751,6 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"projector"},
     });
-    runtime_build.applyCBindings(web_projector_tests.root_module, runtime_graph.c_bindings);
     web_projector_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     web_projector_tests.root_module.addImport("httpx", httpx_mod);
     web_projector_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1665,7 +1778,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, web_projector_tests.root_module, target, blas_root);
     }
     configureMetal(b, web_projector_tests.root_module, target, enable_metal);
-    configureOnnxRuntime(b, web_projector_tests.root_module, enable_onnx, effective_onnx_root);
     web_projector_tests.root_module.link_libc = true;
     const run_web_projector_tests = b.addRunArtifact(web_projector_tests);
     const test_web_projector_step = b.step("test-web-projector", "Run focused web projector/runtime tests");
@@ -1703,6 +1815,15 @@ pub fn build(b: *std.Build) void {
     const run_linalg_tests = b.addRunArtifact(linalg_tests);
     const linalg_test_step = b.step("test-linalg", "Run linalg tests");
     linalg_test_step.dependOn(&run_linalg_tests.step);
+    b.step("install-linalg-tests", "Install portable linalg qualification for another host").dependOn(&b.addInstallArtifact(linalg_tests, .{ .dest_sub_path = "linalg-tests" }).step);
+    inline for (.{ .{ "attention", "attention_benchmark.zig" }, .{ "transb", "transb_benchmark.zig" }, .{ "prepared", "prepared_benchmark.zig" } }) |entry| {
+        const benchmark = b.addExecutable(.{ .name = "antfly-linalg-" ++ entry[0], .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/linalg/{s}", .{ shared_lib_root, entry[1] })), .target = target, .optimize = optimize }) });
+        runtime_build.addX86Kernels(b, benchmark.root_module, b.path(b.pathJoin(&.{ shared_lib_root, "lib/linalg" })), target, optimize);
+        b.step("build-linalg-" ++ entry[0], "Build portable linalg " ++ entry[0] ++ " qualification").dependOn(&b.addInstallArtifact(benchmark, .{}).step);
+        const run = b.addRunArtifact(benchmark);
+        run.has_side_effects = true;
+        b.step("bench-linalg-" ++ entry[0], "Measure portable linalg " ++ entry[0] ++ " kernels").dependOn(&run.step);
+    }
 
     // Tokenizer-only tests
     const tok_tests = b.addTest(.{
@@ -1731,6 +1852,11 @@ pub fn build(b: *std.Build) void {
     tok_test_step.dependOn(&run_tok_tests.step);
     tok_test_step.dependOn(&run_hf_tok_tests.step);
 
+    @import("antfly_media").support.addTests(b, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path(b.fmt("{s}/lib/video", .{shared_lib_root})), target, optimize);
+    default_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    default_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
+
     const audio_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_test_root.zig", .{shared_lib_root})),
@@ -1752,6 +1878,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .safe,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_open_corpus.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_open_corpus.root_module.link_libc = true;
     const run_audio_open_corpus = b.addRunArtifact(audio_open_corpus);
     run_audio_open_corpus.addPassthruArgs();
@@ -1766,6 +1893,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_xiph_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_xiph_corpora_e2e.root_module.link_libc = true;
     const audio_xiph_corpora_e2e_step = b.step("audio-xiph-corpora-e2e", "Build the lib/audio upstream Xiph corpora e2e runner");
     audio_xiph_corpora_e2e_step.dependOn(&audio_xiph_corpora_e2e.step);
@@ -1791,6 +1919,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_misc_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_misc_corpora_e2e.root_module.link_libc = true;
     const audio_misc_corpora_e2e_step = b.step("audio-misc-corpora-e2e", "Build the lib/audio external MP3/AAC/MP4 corpora e2e runner");
     audio_misc_corpora_e2e_step.dependOn(&audio_misc_corpora_e2e.step);
@@ -2049,8 +2178,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_module_tests_all.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_module_tests_all.root_module.link_libc = true;
-    audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
+    const run_audio_codecs = b.addRunArtifact(audio_module_tests_all);
+    audio_module_test_step.dependOn(&run_audio_codecs.step);
+    b.step("test-audio-codecs", "Run the complete shared audio codec suite").dependOn(&run_audio_codecs.step);
 
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{
@@ -2062,6 +2194,7 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = &.{filter},
         });
+        @import("antfly_media").support.attach(b, audio_module_tests.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
         audio_module_tests.root_module.link_libc = true;
         const run_audio_module_tests = b.addRunArtifact(audio_module_tests);
         audio_module_test_step.dependOn(&run_audio_module_tests.step);

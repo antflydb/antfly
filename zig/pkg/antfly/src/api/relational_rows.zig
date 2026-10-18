@@ -119,6 +119,19 @@ test "relational mutation boundary preserves exact row and version integers" {
     ));
 }
 
+test "relational mutation boundary preserves exact NUMERIC lexemes through owned generated rows" {
+    const a = std.testing.allocator;
+    var parsed = try parseMutation(a,
+        \\{"schema_version":3,"mutations":[{"key":"a","expected_version":"0","row":{"n":9007199254740993.2500,"tiny":1e-999,"special":"NaN"}}]}
+    );
+    defer parsed.deinit(a);
+    var row = try std.json.parseFromSlice(std.json.Value, a, parsed.req.writes[0].value, .{ .parse_numbers = false });
+    defer row.deinit();
+    try std.testing.expectEqualStrings("9007199254740993.2500", row.value.object.get("n").?.number_string);
+    try std.testing.expectEqualStrings("1e-999", row.value.object.get("tiny").?.number_string);
+    try std.testing.expectEqualStrings("NaN", row.value.object.get("special").?.string);
+}
+
 test "relational mutation boundary preserves required initial zero schema epoch" {
     const alloc = std.testing.allocator;
     var parsed = try parseMutation(alloc,

@@ -405,6 +405,35 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.build(target, settings=settings, succeeds=False),
                     )
 
+    def test_compute_owner_ignores_storage_abi_changes(self):
+        contract = self.own("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig")
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "success",
+        )
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+        contract.write_bytes(
+            contract.read_bytes() + b"\n// storage ABI cache regression\n"
+        )
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+        # Compute must remain buildable without declaring this storage-only
+        # contract, rather than merely avoiding semantic use of its types.
+        contract.unlink()
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+
     def test_runtime_owner_dependencies(self):
         owners = (
             ("zig/lib/mcp/src/root.zig", ("api_kernel",)),
@@ -544,32 +573,6 @@ class RuntimeCacheTest(unittest.TestCase):
                             self.build(target), rf"compile {artifact} debug \S+ cached"
                         )
 
-    def test_optional_onnx_dependencies(self):
-        source = self.own("zig/lib/audio/src/mod.zig")
-        source.write_bytes(
-            source.read_bytes()
-            + b'\npub const cache_test_profile = @import("builtin").mode;\n'
-        )
-        settings = ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}")
-        for standalone in (False, True):
-            with self.subTest(standalone=standalone):
-                if standalone:
-                    self.use_standalone()
-                self.build("--help", settings=settings)
-                self.assertIn(
-                    "BENCH_PROFILE debug debug",
-                    self.build("cache-antfly-inference-audio-bench", settings=settings),
-                )
-                if not standalone:
-                    self.build("lib-hash-test", settings=settings)
-                target = "cache-inference" if standalone else "cache-probe"
-                self.build(target)
-                failure = self.build(target, settings=settings, succeeds=False)
-                self.assertIn("onnxruntime", failure)
-                self.assertNotIn("panic:", failure)
-                self.assertIn("Build Summary:", failure)
-                self.build(target)
-
     def test_native_artifact_profiles(self):
         for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
             path = self.own(source)
@@ -635,10 +638,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(*targets, backend=backend, settings=settings),
@@ -715,10 +714,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(
@@ -882,10 +877,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(
@@ -1207,7 +1198,14 @@ class RuntimeCacheTest(unittest.TestCase):
         contents = project.read_text()
         attachment = 'default_test_step.dependOn(&b.top_level_steps.get("test-finetune-unit").?.step);'
         self.assertIn(attachment, contents)
-        project.write_text(contents.replace(attachment, "_ = default_test_step;"))
+        # Keep this graph mutation compilable even when other suites also
+        # reference the default step. A discard becomes a Zig compile error
+        # once another owner uses it, hiding the intended ownership failure.
+        project.write_text(
+            contents.replace(
+                attachment, "std.mem.doNotOptimizeAway(default_test_step);"
+            )
+        )
         failure = self.build("cache-finetune-standalone", succeeds=False)
         self.assertIn(
             "standalone gate must reach shared finetuning owner once", failure
@@ -1285,7 +1283,7 @@ class RuntimeCacheTest(unittest.TestCase):
                         ("-Dskip-openapi=true",),
                     ]
                 else:
-                    settings_to_check += [("-Donnx=true",), ("-Dpjrt=true",)]
+                    settings_to_check += [("-Dpjrt=true",)]
                 for settings in settings_to_check:
                     output = self.build(
                         "cache-inference-wasm", settings=base + settings

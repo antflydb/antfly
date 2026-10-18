@@ -50,6 +50,7 @@ const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const vision_config = @import("../readers/vision_config.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
 const PoolingStrategy = embedding_mod.PoolingStrategy;
@@ -73,31 +74,6 @@ const runtime = @import("../runtime/root.zig");
 const onnx_graph = @import("onnx_graph");
 const ml = @import("ml");
 
-fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
-    // GLiNER has a native DeBERTa + span-head path. When native weights are
-    // present, prefer the directory-backed session so the model does not get
-    // pinned to ONNX just because an export also exists.
-    if (!manifestHasNativeAssets(man)) return false;
-    if (man.model_type == .embedder and
-        man.visual_model_path == null and
-        man.audio_model_path == null and
-        man.text_projection_path == null and
-        man.visual_projection_path == null and
-        man.audio_projection_path == null)
-    {
-        return true;
-    }
-    if (man.gliner_model_type.len > 0) return true;
-    switch (man.model_type) {
-        .classifier, .extractor => return true,
-        else => {},
-    }
-    return switch (man.native_arch_hint) {
-        .clip, .whisper, .florence, .layoutlmv3 => true,
-        .clap, .none => false,
-    };
-}
-
 fn nativeBackendsAvailable() bool {
     return build_options.enable_native or build_options.enable_metal or build_options.enable_cuda;
 }
@@ -118,7 +94,6 @@ fn artifactCandidateForBackend(
     backend: backends.BackendType,
 ) ?ArtifactCandidateKind {
     if (backend == .pjrt) return null;
-    if (backend == .onnx) return if (man.onnx_path != null) .onnx else null;
     if (man.nativeWeightArtifactKind()) |artifact| {
         return switch (artifact) {
             .gguf => .gguf,
@@ -682,19 +657,17 @@ pub fn compatibilitySummaryForBackend(
         };
         artifacts.deinit();
 
-        if (backend != .onnx or !build_options.enable_onnx) {
-            backends.imported_onnx_session.inspectGraphCompatibility(
-                allocator,
-                path,
-            ) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                return .{
-                    .level = .incompatible,
-                    .code = .invalid_graph,
-                    .message = "ONNX graph cannot be converted and validated by the selected backend",
-                };
+        backends.imported_onnx_session.inspectGraphCompatibility(
+            allocator,
+            path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{
+                .level = .incompatible,
+                .code = .invalid_graph,
+                .message = "ONNX graph cannot be converted and validated by the selected backend",
             };
-        }
+        };
     }
     return summaryFromAssessment(assessment);
 }
@@ -847,17 +820,7 @@ const ComponentInspection = struct {
         backend: backends.BackendType,
     ) CompatibilitySummary {
         if (self.invalid_summary) |summary| return summary;
-        if (backend == .onnx and self.has_native_component) {
-            return .{
-                .level = .incompatible,
-                .code = .unsupported_backend,
-                .message = "the ONNX Runtime backend cannot load a directory-backed component",
-            };
-        }
-        if (self.has_onnx_component and
-            (backend != .onnx or !build_options.enable_onnx) and
-            !self.imported_graph_compatible)
-        {
+        if (self.has_onnx_component and !self.imported_graph_compatible) {
             return .{
                 .level = .incompatible,
                 .code = .invalid_graph,
@@ -1242,7 +1205,7 @@ fn validateComponentNativeArtifacts(
         );
         if (inspection.invalid_summary != null) return;
         for (preferred_backends) |backend| {
-            if (!backend.supportsDirectSessionLoad() or backend == .onnx) continue;
+            if (!backend.supportsDirectSessionLoad()) continue;
             const summary = try compatibilitySummaryForBackend(
                 allocator,
                 path,
@@ -1264,14 +1227,7 @@ fn validateComponentImportedGraphs(
     preferred_backends: []const backends.BackendType,
     inspection: *ComponentInspection,
 ) !void {
-    var required = false;
-    for (preferred_backends) |backend| {
-        if (backend != .onnx or !build_options.enable_onnx) {
-            required = true;
-            break;
-        }
-    }
-    if (!required or !inspection.has_onnx_component or inspection.invalid_summary != null) return;
+    if (preferred_backends.len == 0 or !inspection.has_onnx_component or inspection.invalid_summary != null) return;
 
     for (component_paths, 0..) |path, path_index| {
         if (!std.mem.endsWith(u8, path, ".onnx")) continue;
@@ -2342,7 +2298,223 @@ fn ownSelectedFirstBackendPreference(
     return result;
 }
 
+fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+        if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest, field)) == ?[]const u8) {
+            if (@field(manifest, field)) |path| try paths.append(alloc, path);
+        }
+    }
+    if (manifest.safetensors_index_path) |path| {
+        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+        if (index == .object) if (index.object.get("weight_map")) |weights| {
+            if (weights != .object) return error.InvalidModelLayout;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (weights.object.values()) |file| {
+                if (file != .string) return error.InvalidModelLayout;
+                const slot = try seen.getOrPut(alloc, file.string);
+                if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
+            }
+        };
+    }
+    var external: std.ArrayList([]const u8) = .empty;
+    for (paths.items) |path| {
+        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(alloc, path);
+        defer artifacts.deinit();
+        for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
+    }
+    try paths.appendSlice(alloc, external.items);
+    return componentDependencySignature(io, paths.items);
+}
+
+// Legacy managed receipts may lack a digest. Hash those files once per local
+// file generation, keeping the resulting identity content-based across copies.
+const LegacyArtifactDigestCache = struct {
+    const Entry = struct { signature: [32]u8, digest: [32]u8 };
+    var mutex: std.atomic.Mutex = .unlocked;
+    var entries: [256]?Entry = @splat(null);
+    var next: usize = 0;
+    var forbid_hashing_for_test: bool = false;
+
+    fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
+        const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
+        spinLock(&mutex);
+        for (entries) |item| if (item) |entry| {
+            if (std.mem.eql(u8, &entry.signature, &signature)) {
+                mutex.unlock();
+                return entry.digest;
+            }
+        };
+        mutex.unlock();
+        const memo_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.antfly-sha256-cache", .{artifact.canonical_path});
+        defer std.heap.page_allocator.free(memo_path);
+        const memo_bytes = std.Io.Dir.cwd().readFileAlloc(io, memo_path, std.heap.page_allocator, .limited(1024)) catch null;
+        defer if (memo_bytes) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo_bytes) |bytes| {
+            if (std.json.parseFromSlice(Entry, std.heap.page_allocator, bytes, .{})) |memo| {
+                defer memo.deinit();
+                if (std.mem.eql(u8, &signature, &memo.value.signature)) {
+                    spinLock(&mutex);
+                    defer mutex.unlock();
+                    entries[next] = memo.value;
+                    next = (next + 1) % entries.len;
+                    return memo.value.digest;
+                }
+            } else |_| {}
+        }
+        if (builtin.is_test and forbid_hashing_for_test) return error.UnexpectedModelRehash;
+        var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+        defer file.close(io);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (count == 0) break;
+            hasher.update(buffer[0..count]);
+        }
+        var result: [32]u8 = undefined;
+        hasher.final(&result);
+        if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
+        const memo = std.json.Stringify.valueAlloc(std.heap.page_allocator, Entry{ .signature = signature, .digest = result }, .{}) catch null;
+        defer if (memo) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo) |bytes| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = memo_path, .data = bytes }) catch {};
+        spinLock(&mutex);
+        defer mutex.unlock();
+        entries[next] = .{ .signature = signature, .digest = result };
+        next = (next + 1) % entries.len;
+        return result;
+    }
+};
+
+/// Stable identity before loading weights. Managed receipts use relative paths
+/// and pinned content digests, so copying/restoring a model preserves reuse.
+pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var receipt = try managed_receipt.loadValidated(a, io, model_dir);
+    defer if (receipt) |*validated| validated.deinit();
+    if (receipt) |*validated| {
+        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
+        defer a.free(artifacts);
+        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+                return std.mem.lessThan(u8, left.path, right.path);
+            }
+        }.less);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (artifacts) |artifact| {
+            const decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+            if (artifact.sha256) |digest| {
+                if (digest.len != 64) return error.InvalidManagedDownload;
+                var expected: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
+            }
+            hash.update(artifact.path);
+            hash.update(&.{0});
+            hash.update(&decoded);
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+    return resolutionModelRevision(a, io, manifest);
+}
+
+const ChunkPlanningSnapshot = struct { digest: [32]u8, signature: [32]u8 };
+fn chunkPlanningPaths(manifest: manifest_mod.ModelManifest, out: *[9][]const u8) []const []const u8 {
+    var count: usize = 0;
+    inline for (.{ "config_path", "tokenizer_json_path", "vocab_txt_path", "tokenizer_config_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path" }) |name| if (@field(manifest, name)) |path| {
+        out[count] = path;
+        count += 1;
+    };
+    if (manifest.tokenizer_json_path == null and manifest.vocab_txt_path == null) if (manifest.gguf_path) |path| {
+        out[count] = path;
+        count += 1;
+    };
+    return out[0..count];
+}
+fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, fallback: [32]u8) !ChunkPlanningSnapshot {
+    var storage: [9][]const u8 = undefined;
+    const paths = chunkPlanningPaths(manifest, &storage);
+    const signature = try componentDependencySignature(io, paths);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-model-chunk-planning-v1");
+    const recipe = try std.json.Stringify.valueAlloc(a, .{ .style = manifest.embedding_style, .tokenizer = manifest.tokenizer_type, .context = manifest.maxTextSequenceLength() }, .{});
+    defer a.free(recipe);
+    hash.update(recipe);
+    if (manifest.tokenizer_json_path == null and manifest.vocab_txt_path == null) hash.update(&fallback);
+    for (paths) |path| {
+        // GGUF may own its tokenizer. The fallback digest already pins that
+        // immutable artifact; never stream gigabytes of weights for planning.
+        if (manifest.gguf_path) |gguf| if (std.mem.eql(u8, path, gguf)) continue;
+        hash.update(std.fs.path.basename(path));
+        hash.update(&.{0});
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        var file_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (count == 0) break;
+            file_hash.update(buffer[0..count]);
+        }
+        hash.update(&file_hash.finalResult());
+    }
+    if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, paths))) return error.ModelArtifactsChanging;
+    return .{ .digest = hash.finalResult(), .signature = signature };
+}
+
+/// Tokenizer/processor-only ownership for planning. Never constructs a backend
+/// session or loads model tensors. Immutable identity checks still apply.
+pub const ChunkPlanningAssets = struct {
+    model_dir: []const u8,
+    identity_signature: ?[32]u8 = null,
+    allocator: std.mem.Allocator,
+    manifest: manifest_mod.ModelManifest,
+    hf_tok: ?*hf_tokenizer.HfTokenizer = null,
+    sp_tok: ?*sentencepiece.Processor = null,
+    lease: ?runtime.tier.memory.AdmissionLease = null,
+    revision: [32]u8,
+    identity: [64]u8,
+    planning: ChunkPlanningSnapshot,
+    io: std.Io,
+    pub fn tokenizer(self: *@This()) tokenizer_mod.Tokenizer {
+        if (self.hf_tok) |tok| return tok.tokenizer();
+        return self.sp_tok.?.tokenizer();
+    }
+    pub fn verify(self: *@This()) !void {
+        if (self.identity_signature) |expected| {
+            const actual = try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, self.io, self.model_dir, self.manifest.safetensors_path.?);
+            if (!std.mem.eql(u8, &actual, &expected)) return error.ModelArtifactsChanging;
+        }
+        var paths: [9][]const u8 = undefined;
+        const signature = try componentDependencySignature(self.io, chunkPlanningPaths(self.manifest, &paths));
+        if (!std.mem.eql(u8, &signature, &self.planning.signature)) return error.ModelArtifactsChanging;
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.hf_tok) |tok| tok.deinitSelf();
+        if (self.sp_tok) |tok| {
+            tok.deinit();
+            self.allocator.destroy(tok);
+        }
+        self.manifest.deinit();
+        if (self.lease) |*lease| lease.release();
+    }
+};
+
 pub const LoadedModel = struct {
+    chunk_planning: ?ChunkPlanningSnapshot = null,
+    resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
     embedding_asset_signature: ?[32]u8 = null,
     manifest: manifest_mod.ModelManifest,
@@ -2386,6 +2558,10 @@ pub const LoadedModel = struct {
     /// state within a loaded model. Keep one model-local lane while allowing
     /// independent models to overlap.
     target_inference_run_lock: std.atomic.Mutex = .unlocked,
+    /// CUDA boundary requests execute serially on this session. Queue before
+    /// reserving their full device scratch ceiling, without holding a provider
+    /// lock during admission/eviction. Every waiter retains a ModelHandle.
+    gliner_boundary_admission_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,
@@ -2423,6 +2599,14 @@ pub const LoadedModel = struct {
     /// fault. Existing handles may finish unwinding; the last one destroys the
     /// retired model while new requests load a fresh session.
     retired: bool = false,
+
+    pub fn chunkPlanningIdentity(self: *LoadedModel) ![32]u8 {
+        const snapshot = self.chunk_planning orelse return self.resolution_revision orelse error.InvalidEmbeddingIdentity;
+        var paths: [9][]const u8 = undefined;
+        const signature = try componentDependencySignature(self.executor_io orelse std.Options.debug_io, chunkPlanningPaths(self.manifest, &paths));
+        if (!std.mem.eql(u8, &signature, &snapshot.signature)) return error.ModelArtifactsChanging;
+        return snapshot.digest;
+    }
 
     pub fn verifyEmbeddingIdentity(self: *const LoadedModel) !void {
         const expected = self.embedding_asset_signature orelse return;
@@ -2862,8 +3046,8 @@ pub const LoadedModel = struct {
     pub fn embeddingPipelineLocked(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
         const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
-        const resident_text_encoder = (self.session.backend() == .metal or self.session.backend() == .cuda) and
-            session_factory.supportsResidentTextEncoder(self.session);
+        const resident_text_encoder = (self.session.backend() == .native and self.manifest.embedding_style == .embedding_gemma2) or
+            ((self.session.backend() == .metal or self.session.backend() == .cuda) and session_factory.supportsResidentTextEncoder(self.session));
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.maxTextSequenceLength(),
             .reject_truncation = self.manifest.embedding_style == .embedding_gemma2,
@@ -3089,7 +3273,6 @@ pub const LoadedModel = struct {
         for (optional_sessions, 1..) |session, index| {
             if (session) |component| close_scopes[index] = component.beginClose();
         }
-        defer for (&close_scopes) |*scope| scope.deinit();
         self.native_generation_graph_cache.deinit();
         self.prompt_prefix_cache.deinit();
         self.session.close();
@@ -3105,17 +3288,6 @@ pub const LoadedModel = struct {
         if (self.visual_projection_resource_lease) |*lease| lease.release();
         if (self.audio_projection_resource_lease) |*lease| lease.release();
         if (self.whisper_prompt_cache) |*cache| cache.deinit();
-        if (self.hf_tok) |ht| ht.deinitSelf();
-        if (self.sp_tok) |sp| {
-            sp.deinit();
-            self.allocator.destroy(sp);
-        }
-        if (self.tokenizer_resource_lease) |*lease| lease.release();
-        if (self.chat_tmpl) |ct| {
-            var ct_mut = @constCast(ct);
-            ct_mut.deinit();
-            self.allocator.destroy(ct_mut);
-        }
         if (self.shared_moe_cache) |cache| {
             cache.deinit();
             self.allocator.destroy(cache);
@@ -3131,6 +3303,21 @@ pub const LoadedModel = struct {
         if (self.cleanup_head) |head| {
             head.deinit();
             self.allocator.destroy(head);
+        }
+        // All session/cache/prefetch driver cleanup has returned. End protection
+        // before unrelated host tokenizer/template destruction: large vocabularies
+        // under Debug allocation tracking can otherwise trigger a false restart.
+        for (&close_scopes) |*scope| scope.deinit();
+        if (self.hf_tok) |ht| ht.deinitSelf();
+        if (self.sp_tok) |sp| {
+            sp.deinit();
+            self.allocator.destroy(sp);
+        }
+        if (self.tokenizer_resource_lease) |*lease| lease.release();
+        if (self.chat_tmpl) |ct| {
+            var ct_mut = @constCast(ct);
+            ct_mut.deinit();
+            self.allocator.destroy(ct_mut);
         }
         if (self.resource_lease) |*lease| lease.release();
         self.manifest.deinit();
@@ -3388,7 +3575,6 @@ test "target inference gates are GPU-only and model-local" {
     try std.testing.expectEqual(&second, targetInferenceExecutionMutexForBackend(.metal, &second).?);
     try std.testing.expectEqual(&first, targetInferenceExecutionMutexForBackend(.cuda, &first).?);
     try std.testing.expect(targetInferenceExecutionMutexForBackend(.native, &first) == null);
-    try std.testing.expect(targetInferenceExecutionMutexForBackend(.onnx, &first) == null);
     try std.testing.expect(targetInferenceExecutionMutexForBackend(.wasm, &first) == null);
 }
 
@@ -3402,6 +3588,7 @@ const LoadFlight = struct {
     completed: std.Io.Event = .unset,
     io: std.Io,
     hard_cancellation: ?execution_control_mod.HardCancellationBoundary = null,
+    native_call_policy: execution_control_mod.NativeCallPolicy = .require_supervision,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
     /// Protected by ModelManager.load_lock. The manager-owned task holds one
@@ -3466,6 +3653,7 @@ const LoadFlightControl = struct {
             .ptr = self,
             .check_fn = check,
             .hard_cancellation = self.flight.hard_cancellation,
+            .native_call_policy = self.flight.native_call_policy,
         };
     }
 };
@@ -3565,20 +3753,17 @@ fn admissionBackendClassForRuntime(
     return if (backend_runtime.usesGpuHostedSession()) .gpu else .cpu;
 }
 
-fn admittedSessionCudaLimit(
-    backend_runtime: backends.BackendRuntime,
-    resident: runtime.tier.memory.AdmissionAmounts,
-) !?usize {
-    if (backend_runtime.backend != .onnx or
-        backend_runtime.onnx_execution_provider != .cuda)
-    {
-        return null;
-    }
-    return try std.math.add(
-        usize,
-        resident.backend_weight_bytes,
-        resident.backend_scratch_bytes,
-    );
+fn qwenEmbeddingAdmissionConfig(
+    backend: backends.BackendType,
+    man: ?*const manifest_mod.ModelManifest,
+    config: ?@import("../architectures/gpt.zig").Config,
+) ?@import("../architectures/gpt.zig").Config {
+    if (backend != .metal) return null;
+    const manifest = man orelse return null;
+    if (manifest.model_type != .embedder or !manifest.isLastTokenDecoderEmbedder()) return null;
+    const cfg = config orelse return null;
+    if (!@import("../architectures/gpt.zig").denseQwen3PrefillEligible(cfg)) return null;
+    return cfg;
 }
 
 fn attachSessionRunAdmission(
@@ -3604,21 +3789,100 @@ fn attachSessionRunAdmission(
         resident.host_weight_bytes,
         resident.backend_weight_bytes,
     ) catch std.math.maxInt(usize);
+    const qwen_cfg = if (backend_runtime.backend == .metal and
+        metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+        session_factory.getGptConfig(session.*)
+    else
+        null;
     session.run_admission = .{
         .controller = controller,
         .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
-        .backend_workspace_reserved = backend_runtime.backend == .onnx and
-            backend_runtime.onnx_execution_provider == .cuda,
-        .model_profile = if (man) |manifest| .{
-            .hidden_size = manifest.hidden_size,
-            .intermediate_size = manifest.intermediate_size,
-            .attention_heads = manifest.num_attention_heads,
-            .quadratic_attention = backend_runtime.backend == .onnx and
-                backend_runtime.onnx_execution_provider != .cuda,
-        } else .{},
+        .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
+}
+
+fn sessionRunAdmissionModelProfile(
+    backend_runtime: backends.BackendRuntime,
+    man: ?*const manifest_mod.ModelManifest,
+    config: ?@import("../architectures/gpt.zig").Config,
+) @import("../backends/session.zig").RunAdmission.ModelProfile {
+    const manifest = man orelse return .{};
+    const qwen_cfg = qwenEmbeddingAdmissionConfig(backend_runtime.backend, man, config);
+    return .{
+        .hidden_size = manifest.hidden_size,
+        .intermediate_size = manifest.intermediate_size,
+        .attention_heads = manifest.num_attention_heads,
+        .qwen_dense_workspace = qwen_cfg != null,
+        .query_width = if (qwen_cfg) |cfg| @as(usize, cfg.num_attention_heads) * cfg.headDim() else 0,
+        .kv_width = if (qwen_cfg) |cfg| @as(usize, cfg.effectiveKVHeads()) * cfg.headDim() else 0,
+    };
+}
+
+test "Qwen embedding admission preserves reranker capacity and gates dense workspace" {
+    const Session = @import("../backends/session.zig").Session;
+    const Probe = struct {
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } }};
+        }
+    };
+    var cfg = @import("../architectures/gpt.zig").Config{
+        .family = .qwen3,
+        .norm_type = .rms_norm,
+        .position_encoding = .rope,
+        .activation = .silu,
+        .hidden_size = 1024,
+        .intermediate_size = 3072,
+        .num_hidden_layers = 28,
+        .num_attention_heads = 16,
+        .num_key_value_heads = 8,
+        .attention_head_dim = 128,
+    };
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .hidden_size = 1024,
+        .intermediate_size = 3072,
+        .num_attention_heads = 16,
+        .pooling = .last,
+        // Even a legacy last-pooling/document-prefix reranker must not qualify.
+        .embedding_profile = .{ .document = .{ .prefix = "Document: " } },
+    };
+    var controller = runtime.tier.memory.AdmissionController{};
+    var session = Session{
+        .ptr = &controller,
+        .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.outputInfo, .backend = undefined, .close = undefined },
+        .run_admission = .{
+            .controller = &controller,
+            .backend_class = .gpu,
+            .limits = .{ .scratch_limit_bytes = 384 * runtime.tier.memory.bytes_per_mib },
+            .static_workspace_bytes = 80 * runtime.tier.memory.bytes_per_mib,
+            .check_live_memory = false,
+            .model_profile = sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg),
+        },
+    };
+    try std.testing.expect(!session.run_admission.?.model_profile.qwen_dense_workspace);
+    var permit = try session.admit(.{ .batch = 4, .sequence = 256, .input_bytes = 4 * 256 * 24 });
+    defer permit.deinit();
+    permit.deinit();
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+
+    manifest.model_type = .generator;
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg).qwen_dense_workspace);
+    manifest.model_type = .embedder;
+    manifest.embedding_style = .qwen3_embedding;
+    const embedding_profile = sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg);
+    try std.testing.expect(embedding_profile.qwen_dense_workspace);
+    try std.testing.expectEqual(@as(usize, 2048), embedding_profile.query_width);
+    try std.testing.expectEqual(@as(usize, 1024), embedding_profile.kv_width);
+    session.run_admission.?.model_profile = embedding_profile;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admit(.{ .batch = 4, .sequence = 256, .input_bytes = 4 * 256 * 24 }));
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .native }, &manifest, cfg).qwen_dense_workspace);
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, null).qwen_dense_workspace);
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, null, cfg).qwen_dense_workspace);
+    cfg.family = .qwen3_vl;
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg).qwen_dense_workspace);
 }
 
 pub const ModelHandle = struct {
@@ -3894,6 +4158,23 @@ const TeardownTicket = struct {
     }
 };
 pub const ModelManager = struct {
+    pub const MemoryAdmissionDiagnostic = struct {
+        pressure: []const u8 = "none",
+        denied_count: u64 = 0,
+        last_denied_ns: u64 = 0,
+        request_count: u64 = 0,
+        requested_host_bytes: u64 = 0,
+        requested_backend_bytes: u64 = 0,
+        requested_kv_bytes: u64 = 0,
+        requested_scratch_bytes: u64 = 0,
+        admitted_host_bytes: u64 = 0,
+        admitted_backend_bytes: u64 = 0,
+        host_limit_bytes: u64 = 0,
+        backend_limit_bytes: u64 = 0,
+        combined_limit_bytes: u64 = 0,
+        available_memory_bytes: u64 = 0,
+    };
+
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
     const tokenizer_cache_budget_shard_count = 16;
     const tokenizer_cache_admission_quantum_bytes = 1024 * 1024;
@@ -4101,6 +4382,8 @@ pub const ModelManager = struct {
     session_manager: backends.SessionManager,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
     serving_policy: ?model_compatibility.Policy = null,
+    admission_diagnostic_mutex: std.atomic.Mutex = .unlocked,
+    admission_diagnostic: MemoryAdmissionDiagnostic = .{},
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
@@ -4119,6 +4402,7 @@ pub const ModelManager = struct {
     keep_alive_ms: u64 = 0,
     max_loaded_models: usize = 0,
     eviction_group: std.Io.Group = .init,
+    eviction_stop: std.Io.Event = .unset,
     eviction_io: ?std.Io = null,
     eviction_loop_started: bool = false,
     /// Cold initialization is owned by the manager rather than whichever
@@ -4251,6 +4535,26 @@ pub const ModelManager = struct {
         self: *const ModelManager,
     ) *runtime.tier.memory.AdmissionController {
         return &self.resource_domain.?.admission;
+    }
+
+    /// Read the physical admission ledger without holding model/catalog locks.
+    /// ResourceDomain stays owned by the live manager until requests drain.
+    pub fn currentAdmissionAmounts(self: *ModelManager) runtime.tier.memory.AdmissionAmounts {
+        spinLock(&self.tokenizer_cache_config_mutex);
+        const domain = self.resource_domain;
+        self.tokenizer_cache_config_mutex.unlock();
+        return if (domain) |owner| owner.admission.snapshot() else .{};
+    }
+
+    /// Account bounded metadata/codec inspection before a model is loaded.
+    /// Uses the same physical host domain as loaded models and execution.
+    pub fn admitHostPreflight(self: *ModelManager, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightChecked(bytes, true);
+    }
+    fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
+        const domain = self.resource_domain.?;
+        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -5213,8 +5517,33 @@ pub const ModelManager = struct {
         pressure: ?runtime.tier.memory.AdmissionPressure,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) void {
-        if (builtin.is_test) return;
         const admitted = self.admissionController().snapshot();
+        var diagnostic: MemoryAdmissionDiagnostic = .{
+            .pressure = if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
+            .last_denied_ns = platform.time.monotonicNs(),
+            .request_count = requests.len,
+            .admitted_host_bytes = admitted.hostTotalBytes(),
+            .admitted_backend_bytes = admitted.backendTotalBytes(),
+        };
+        for (requests) |request| {
+            diagnostic.requested_host_bytes +|= request.amounts.hostTotalBytes();
+            diagnostic.requested_backend_bytes +|= request.amounts.backendTotalBytes();
+            diagnostic.requested_kv_bytes +|= request.amounts.kvTotalBytes();
+            diagnostic.requested_scratch_bytes +|= request.amounts.scratchTotalBytes();
+        }
+        if (requests.len > 0) {
+            diagnostic.host_limit_bytes = requests[0].limits.host_limit_bytes;
+            diagnostic.backend_limit_bytes = requests[0].limits.backend_limit_bytes;
+            diagnostic.combined_limit_bytes = requests[0].limits.combined_limit_bytes;
+        }
+        if (!builtin.is_test) if (runtime.tier.memory.currentSystemMemoryInfoForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance)) |info| {
+            diagnostic.available_memory_bytes = info.available_bytes orelse 0;
+        };
+        spinLock(&self.admission_diagnostic_mutex);
+        diagnostic.denied_count = self.admission_diagnostic.denied_count +| 1;
+        self.admission_diagnostic = diagnostic;
+        self.admission_diagnostic_mutex.unlock();
+        if (builtin.is_test) return;
         std.log.warn(
             "inference run admission denied pressure={s} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
             .{
@@ -5244,6 +5573,12 @@ pub const ModelManager = struct {
                 },
             );
         }
+    }
+
+    pub fn memoryAdmissionDiagnostic(self: *ModelManager) MemoryAdmissionDiagnostic {
+        spinLock(&self.admission_diagnostic_mutex);
+        defer self.admission_diagnostic_mutex.unlock();
+        return self.admission_diagnostic;
     }
 
     fn evictExpired(self: *ModelManager) void {
@@ -5280,10 +5615,14 @@ pub const ModelManager = struct {
             @min(@max(self.keep_alive_ms / 4, 1), @as(u64, 30_000)),
         );
         while (true) {
-            try io.sleep(
-                std.Io.Duration.fromMilliseconds(@intCast(interval_ms)),
-                .awake,
-            );
+            self.eviction_stop.waitTimeout(io, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(interval_ms)),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return error.Canceled,
+            };
+            if (self.eviction_stop.isSet()) return;
             self.evictExpired();
         }
     }
@@ -5748,14 +6087,13 @@ pub const ModelManager = struct {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
 
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (resource_lease) |*lease| lease.release();
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
-                const artifact_bytes = artifact_estimate.bytesForBackend(backend) catch |err| {
+                const artifact_bytes = artifact_estimate.encodedBytes() catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
@@ -5780,12 +6118,6 @@ pub const ModelManager = struct {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
-                if (try admittedSessionCudaLimit(
-                    backend_runtime,
-                    resident_amounts,
-                )) |cuda_limit| {
-                    session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
-                }
                 resource_lease = self.acquireAmountsWithEviction(
                     admissionBackendClassForRuntime(backend_runtime),
                     admission_limits,
@@ -5921,6 +6253,50 @@ pub const ModelManager = struct {
         return .{ .manager = self, .model = model };
     }
 
+    /// Pin the same cached publication selected by ordinary request loading,
+    /// including required-backend and A4B policy keys. Never load cold assets
+    /// or join a load flight while reading request-admission metadata.
+    pub fn acquireCachedFromDir(self: *ModelManager, model_dir: []const u8) !?ModelHandle {
+        var required_backend_scratch: [1]backends.BackendType = undefined;
+        const effective_backends = try self.session_manager.requiredBackendCandidates(
+            self.session_manager.preferred_backends,
+            &required_backend_scratch,
+        );
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        const model = (try self.lookupLoadedModelLocked(
+            model_dir,
+            effective_backends,
+            true,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+        )) orelse return null;
+        model.active_handles += 1;
+        return .{ .manager = self, .model = model };
+    }
+
+    /// Return owned warm-request metadata without holding a second runtime
+    /// owner through execution or integrity recovery. Cold paths still inspect
+    /// the manifest before loading assets.
+    pub fn copyCachedQwenEmbeddingManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (model.manifest.embedding_style != .qwen3_embedding or model.session.backend() != .metal) return null;
+        return try model.manifest.clone(allocator);
+    }
+
+    /// Admission metadata belongs to the loaded immutable generation. A clone
+    /// outlives the cache pin; execution independently pins and verifies its
+    /// generation before consuming input. Explicit retirement/reload publishes
+    /// a different manifest instead of reparsing the tokenizer per request.
+    pub fn copyCachedEmbeddingGemma2Manifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (model.manifest.embedding_style != .embedding_gemma2) return null;
+        return try model.manifest.clone(allocator);
+    }
+
     /// Pin one handle for every currently published model. Callers may release
     /// load_lock before taking per-model locks without racing model eviction or
     /// retirement destruction. Metrics/listing observation does not renew TTL;
@@ -6002,7 +6378,10 @@ pub const ModelManager = struct {
         // IO until their final close scope, even after the cache owner exits.
         defer if (self.teardown_domain) |domain| domain.release();
         if (self.load_io) |io| self.load_group.cancel(io);
-        if (self.eviction_io) |io| self.eviction_group.cancel(io);
+        if (self.eviction_io) |io| {
+            self.eviction_stop.set(io);
+            self.eviction_group.cancel(io);
+        }
         std.debug.assert(self.in_flight_loads.count() == 0);
         std.debug.assert(self.in_flight_composite_assets.count() == 0);
         self.in_flight_loads.deinit(self.allocator);
@@ -6047,7 +6426,7 @@ pub const ModelManager = struct {
         const start_eviction_loop = self.keep_alive_ms > 0 and
             !self.eviction_loop_started;
         if (start_eviction_loop) {
-            // This loop only ends on cancellation. async may execute inline
+            // This loop waits for shutdown. async may execute inline
             // when the CPU-bound worker limit is zero or exhausted, hanging
             // startup. concurrent must either spawn it or report failure.
             try self.eviction_group.concurrent(io, evictionLoop, .{ self, io });
@@ -6610,6 +6989,7 @@ pub const ModelManager = struct {
             .load_state = .{
                 .io = coordination_io,
                 .hard_cancellation = if (control) |active| active.hard_cancellation else null,
+                .native_call_policy = self.session_manager.native_call_policy,
             },
         };
         const task = CompositeLoadTask.create(self, flight, asset_generation, model_dir, component_paths, kind) catch |err| {
@@ -6711,6 +7091,13 @@ pub const ModelManager = struct {
             inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
             control,
         );
+    }
+
+    /// Explicit GLiNER precision is immutable and part of both the resident
+    /// variant and in-flight load identity. Later ordinary requests may reuse
+    /// the default alias published by this startup preload.
+    pub fn acquireFromDirWithGlinerCudaPrecision(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision) !ModelHandle {
+        return self.loadFromDirCoordinated(model_dir, &.{.cuda}, true, .{ .gliner_cuda_precision = precision, .accept_default_alias = false }, null);
     }
 
     /// Acquire a model using an immutable A4B policy for this load. Explicit
@@ -6819,11 +7206,12 @@ pub const ModelManager = struct {
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             if (modelBackendIsUnhealthy(self, model_dir, backend)) continue;
-            const variant_key = try backendVariantCacheKey(
+            const variant_key = try backendVariantCacheKeyWithPrecision(
                 self.allocator,
                 model_dir,
                 backend,
                 policy.a4b_request,
+                policy.gliner_cuda_precision,
             );
             defer self.allocator.free(variant_key);
             if (self.loaded.get(variant_key)) |model| return model;
@@ -6880,10 +7268,12 @@ pub const ModelManager = struct {
                 },
             );
         defer self.allocator.free(prefix);
-        const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
-        @memcpy(key[0..prefix.len], prefix);
+        const precision_prefix = try std.fmt.allocPrint(self.allocator, "{s}gliner_cuda_precision={s}:", .{ prefix, if (policy.gliner_cuda_precision) |value| @tagName(value) else "none" });
+        defer self.allocator.free(precision_prefix);
+        const key = try self.allocator.alloc(u8, precision_prefix.len + preferred_backends.len);
+        @memcpy(key[0..precision_prefix.len], precision_prefix);
         for (preferred_backends, 0..) |backend, idx| {
-            key[prefix.len + idx] = @intCast(@backingInt(backend));
+            key[precision_prefix.len + idx] = @intCast(@backingInt(backend));
         }
         return key;
     }
@@ -7067,17 +7457,17 @@ pub const ModelManager = struct {
         return io;
     }
 
-    /// Establish a lifetime ticket before entering a process-required backend.
-    /// Embedded/nonisolated callers fail here; cooperative fallback can still
-    /// proceed. Nothing allocates or arms a monitor when eventual close starts.
+    /// Establish a lifetime ticket before entering an uninterruptible backend.
+    /// Embedded runtimes accept waiting for native close; supervised runtimes
+    /// retain a watchdog ticket. Nothing arms a monitor when close starts.
     fn prepareSessionClose(self: *ModelManager, backend_runtime: backends.BackendRuntime) !?backends.Session.CloseProtection {
-        if (!backend_runtime.requiresProcessIsolation()) return null;
+        if (!backend_runtime.hasUninterruptibleCalls()) return null;
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        if (!self.session_manager.process_isolation_available) {
+        if (!self.session_manager.process_termination_available) {
             // In-process hosts accept that a wedged close blocks rather than
             // being ended by killing the worker.
-            if (execution_control_mod.uninterruptibleInProcessAllowed()) return null;
+            if (self.session_manager.native_call_policy == .in_process) return null;
             return error.ProcessIsolationRequired;
         }
         if (self.teardown_domain == null) {
@@ -7090,7 +7480,7 @@ pub const ModelManager = struct {
     }
 
     fn offlineLoadBoundaryLocked(self: *ModelManager, io: std.Io) !?execution_control_mod.HardCancellationBoundary {
-        if (!self.session_manager.process_isolation_available) return null;
+        if (!self.session_manager.process_termination_available) return null;
         if (self.owned_load_watchdog == null) {
             const watchdog = try HardCancellationWatchdog.create(self.allocator);
             errdefer watchdog.destroy();
@@ -7166,6 +7556,7 @@ pub const ModelManager = struct {
         flight.* = .{
             .io = coordination_io,
             .hard_cancellation = hard_cancellation,
+            .native_call_policy = self.session_manager.native_call_policy,
         };
         const owned_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
             self.allocator.destroy(flight);
@@ -7212,6 +7603,7 @@ pub const ModelManager = struct {
         );
         session_manager.io = coordination_io;
         session_manager.a4b_inference_request = policy.a4b_request;
+        session_manager.gliner_cuda_precision = policy.gliner_cuda_precision;
         task.* = .{
             .manager = self,
             .flight = flight,
@@ -7249,6 +7641,48 @@ pub const ModelManager = struct {
             self.load_group.async(coordination_io, runLoadTask, .{task});
         }
         return self.waitForLoadFlight(flight_key, flight, control);
+    }
+
+    pub fn loadChunkPlanningAssets(self: *ModelManager, model_dir: []const u8, io: std.Io, control: InferenceExecutionControl) !ChunkPlanningAssets {
+        try control.check();
+        var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        errdefer man.deinit();
+        const revision = try self.modelIdentityForManifest(model_dir, man);
+        const planning = try chunkPlanningSnapshot(self.allocator, io, man, revision);
+        const kind = if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) manifest_mod.TokenizerType.sentencepiece else man.tokenizer_type orelse return error.NoTokenizerFound;
+        const plan = try tokenizerLoadAdmissionPlan(self.allocator, model_dir, &man, kind);
+        var lease = try self.acquireTokenizerAdmission(plan);
+        errdefer if (lease) |*active| active.release();
+        var hf: ?*hf_tokenizer.HfTokenizer = null;
+        var sp: ?*sentencepiece.Processor = null;
+        errdefer if (hf) |tok| tok.deinitSelf();
+        errdefer if (sp) |tok| {
+            tok.deinit();
+            self.allocator.destroy(tok);
+        };
+        switch (kind) {
+            .huggingface => {
+                hf = try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
+                try hf.?.configureBpeCache(self.tokenizer_cache_config);
+                try hf.?.configureParallelBpe(self.tokenizer_parallel_bpe_config);
+            },
+            .sentencepiece => {
+                sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) sp.?.setPreserveInlineSpecialsAfterLiteralBos(true);
+                try loadSentencePieceAddedTokens(model_dir, self.allocator, sp.?);
+            },
+        }
+        const identity = if (man.embedding_style == .embedding_gemma2)
+            (try @import("../models/embedding_gemma2_identity.zig").snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control)).digest
+        else
+            std.fmt.bytesToHex(revision, .lower);
+        if (lease) |*active| try active.retain(plan.resident);
+        try control.check();
+        return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = self.allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
+    }
+
+    pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+        return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
     }
 
     fn loadFromDirUncached(
@@ -7299,6 +7733,8 @@ pub const ModelManager = struct {
             sm.preferred_backends = eg2_backends[0..count];
         }
 
+        const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
+        const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -7520,7 +7956,7 @@ pub const ModelManager = struct {
         } else null;
         // Hash only after tokenizer/session admission owns the loaded assets.
         const embedding_snapshot: ?eg2_identity.Snapshot = if (embedding_signature) |before| blk: {
-            const snapshot = try eg2_identity.snapshot(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
+            const snapshot = try eg2_identity.snapshotCached(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
             if (!std.mem.eql(u8, &before, &snapshot.signature)) return error.ModelArtifactsChanging;
             break :blk snapshot;
         } else null;
@@ -7531,7 +7967,10 @@ pub const ModelManager = struct {
         var model_storage_owned = true;
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
+            .chunk_planning = try chunkPlanningSnapshot(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision),
+            .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
             .manifest = man,
@@ -7624,7 +8063,7 @@ pub const ModelManager = struct {
 
         if (control) |active| try active.check();
         unpublished_model_owned = false;
-        return self.publishLoadedModel(model, cache_default_alias, a4b_request);
+        return self.publishLoadedModel(model, cache_default_alias, a4b_request, sm.gliner_cuda_precision);
     }
 
     /// Publish a fully constructed model with only a short map critical section.
@@ -7636,6 +8075,7 @@ pub const ModelManager = struct {
         model: *LoadedModel,
         cache_default_alias: bool,
         a4b_request: ?backend_contracts.A4bInferenceRequest,
+        gliner_cuda_precision: ?session_factory.GlinerCudaPrecision,
     ) !ModelHandle {
         var model_owned = true;
         errdefer if (model_owned) {
@@ -7644,11 +8084,12 @@ pub const ModelManager = struct {
             _ = platform.allocator.reclaimUnusedProcessMemory();
         };
 
-        const variant_key = try backendVariantCacheKey(
+        const variant_key = try backendVariantCacheKeyWithPrecision(
             self.allocator,
             model.model_dir,
             model.session.backend(),
             a4b_request,
+            gliner_cuda_precision,
         );
         var variant_key_owned = true;
         defer if (variant_key_owned) self.allocator.free(variant_key);
@@ -7740,6 +8181,7 @@ fn modelCacheHasPublicationCapacity(loaded_count: usize, max_loaded_models: usiz
 }
 
 const ModelLoadCachePolicy = struct {
+    gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
     a4b_request: ?backend_contracts.A4bInferenceRequest = null,
     accept_default_alias: bool = true,
     /// Policy-free acquisition consumes the model's explicitly published
@@ -7841,6 +8283,123 @@ fn modelBackendIsUnhealthy(
     if (now_ns < retry_after_ns) return true;
     _ = self.unhealthy_model_backends.remove(key);
     return false;
+}
+
+fn backendVariantCacheKeyWithPrecision(allocator: std.mem.Allocator, model_dir: []const u8, backend: backends.BackendType, a4b_request: ?backend_contracts.A4bInferenceRequest, precision: ?session_factory.GlinerCudaPrecision) ![]u8 {
+    const base = try backendVariantCacheKey(allocator, model_dir, backend, a4b_request);
+    if (precision) |value| {
+        defer allocator.free(base);
+        return std.fmt.allocPrint(allocator, "{s}\ngliner_cuda_precision={s}", .{ base, @tagName(value) });
+    }
+    return base;
+}
+
+test "GLiNER CUDA precision isolates resident and in-flight loads" {
+    const a = std.testing.allocator;
+    const base = try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, null);
+    defer a.free(base);
+    var manager: ModelManager = undefined;
+    manager.allocator = a;
+    const values = [_]session_factory.GlinerCudaPrecision{ .auto, .fp32, .fp16, .bf16 };
+    for (values, 0..) |value, index| {
+        const key = try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, value);
+        defer a.free(key);
+        try std.testing.expect(!std.mem.eql(u8, base, key));
+        const flight = try manager.loadFlightKey("model", &.{.cuda}, true, .{ .gliner_cuda_precision = value, .accept_default_alias = false });
+        defer a.free(flight);
+        for (values[0..index]) |other| {
+            const other_key = try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, other);
+            defer a.free(other_key);
+            try std.testing.expect(!std.mem.eql(u8, key, other_key));
+            const other_flight = try manager.loadFlightKey("model", &.{.cuda}, true, .{ .gliner_cuda_precision = other, .accept_default_alias = false });
+            defer a.free(other_flight);
+            try std.testing.expect(!std.mem.eql(u8, flight, other_flight));
+        }
+    }
+}
+
+test "GLiNER CUDA managed Ettin full context retains admission and recovers after denial" {
+    if (!build_options.enable_cuda) return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return error.SkipZigTest;
+    const precision = std.meta.stringToEnum(session_factory.GlinerCudaPrecision, platform.env.getenv("ANTFLY_GLINER25_FAMILY_CUDA_PRECISION") orelse "fp32") orelse return error.InvalidPrecision;
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, std.testing.io));
+    manager.session_manager.test_allow_unqualified_gliner_cuda_precision = true;
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    defer manager.deinit();
+    var handle = try manager.acquireFromDirWithGlinerCudaPrecision(directory, precision);
+    defer handle.release();
+    const loaded = handle.get();
+    try qualifyGlinerEttinForTest(&manager, loaded, directory, precision);
+}
+
+/// Reused by the socket qualification test after its cold preload. Keeping
+/// the same owner also verifies serving survives the failed managed runs.
+pub fn qualifyGlinerEttinForTest(manager: *ModelManager, loaded: *LoadedModel, directory: []const u8, precision: session_factory.GlinerCudaPrecision) !void {
+    if (!builtin.is_test) @compileError("GLiNER managed qualification is test-only");
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(.cuda, loaded.session.backend());
+    try std.testing.expect(loaded.session.run_admission != null);
+    var alias = try manager.acquireFromDir(directory);
+    defer alias.release();
+    try std.testing.expectEqual(loaded, alias.get());
+    var pipeline = loaded.glinerPipeline(a);
+    try std.testing.expectEqual(@as(u32, 7999), pipeline.config.max_length);
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "family/decide_1b/capacity_cases.json");
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer parsed.deinit();
+    const cases = parsed.value.object.get("cases").?.array.items;
+    const text = cases[cases.len - 1].object.get("texts").?.array.items[0].string;
+    const gliner = @import("../pipelines/gliner.zig");
+    const labels = [_]gliner.DecisionLabel{ .{ .name = "refund" }, .{ .name = "support" }, .{ .name = "cancel" } };
+    const tasks = [_]gliner.DecisionTask{.{ .name = "intent", .labels = &labels }};
+    const requests = [_]gliner.DecisionRequest{.{ .text = text, .tasks = &tasks }};
+    const watchdog = try HardCancellationWatchdog.create(a);
+    defer watchdog.destroy();
+    try watchdog.start(std.testing.io);
+    const Cancellation = struct {
+        session: backends.Session,
+        cancelled: bool = false,
+        after_launch: ?usize = null,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+            if (comptime session_factory.CudaRuntimeStats != void) {
+                if (self.after_launch) |limit| {
+                    if (session_factory.getCudaRuntimeStats(self.session).?.kernel_launches >= limit) return error.Cancelled;
+                }
+            }
+        }
+    };
+    var cancellation = Cancellation{ .session = loaded.session };
+    pipeline.execution_control = .{ .ptr = &cancellation, .check_fn = Cancellation.check, .hard_cancellation = watchdog.boundary(), .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
+    manager.configureForcedRunAdmissionDenialsForTesting(1);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pipeline.decideBatch(&requests));
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+    cancellation.cancelled = true;
+    try std.testing.expectError(error.Cancelled, pipeline.decideBatch(&requests));
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+    cancellation.cancelled = false;
+    if (comptime session_factory.CudaRuntimeStats != void) {
+        const limit = session_factory.getCudaRuntimeStats(loaded.session).?.kernel_launches + 8;
+        cancellation.after_launch = limit;
+        try std.testing.expectError(error.Cancelled, pipeline.decideBatch(&requests));
+        try std.testing.expect(session_factory.getCudaRuntimeStats(loaded.session).?.kernel_launches >= limit);
+        try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+        cancellation.after_launch = null;
+    }
+    const results = try pipeline.decideBatch(&requests);
+    defer {
+        for (results) |*result| result.deinit(a);
+        a.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(usize, 7999), results[0].prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 0), results[0].tasks[0].selections[0].label_index);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5019554), results[0].tasks[0].selections[0].probability, if (precision == .auto or precision == .fp32) @as(f32, 5e-4) else @as(f32, 5e-3));
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+    std.debug.print("family_cuda_managed: precision={s} tokens=7999 denial_recovered=true cancellation_recovered=true leases_released=true\n", .{@tagName(precision)});
 }
 
 fn backendVariantCacheKey(
@@ -7977,6 +8536,8 @@ test "explicit backend lookup reuses only a matching default alias" {
         var aliases = manager.loaded_aliases.iterator();
         while (aliases.next()) |entry| allocator.free(entry.key_ptr.*);
         manager.loaded_aliases.deinit(allocator);
+        var loaded = manager.loaded.iterator();
+        while (loaded.next()) |entry| allocator.free(entry.key_ptr.*);
         manager.loaded.deinit(allocator);
         manager.in_flight_loads.deinit(allocator);
     }
@@ -8014,6 +8575,21 @@ test "explicit backend lookup reuses only a matching default alias" {
     try std.testing.expect(matching == &model);
     try std.testing.expect(mismatching == null);
     try std.testing.expect(policy_free == &model);
+
+    // Startup preloads need not publish the path-only alias. Warm admission
+    // must use the identical backend-qualified key used by request execution.
+    const alias = manager.loaded_aliases.fetchRemove("model").?;
+    allocator.free(alias.key);
+    try manager.loaded.put(allocator, try backendVariantCacheKey(allocator, "model", .metal, null), &model);
+    manager.session_manager.preferred_backends = &.{.metal};
+    model.active_handles = 0;
+    model.retired = false;
+    var cached = (try manager.acquireCachedFromDir("model")).?;
+    try std.testing.expect(cached.get() == &model);
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    cached.release();
+    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
+    try std.testing.expect((try manager.acquireCachedFromDir("cold model")) == null);
 }
 
 test "explicit A4B loads ignore unqualified model aliases" {
@@ -8240,7 +8816,7 @@ test "loaded model snapshot final retired observation keeps protected cleanup an
     try manager.ensureResourceOwnerReady();
     var probe = TeardownTestProbe{};
     const model = try teardownTestModel(&manager, &probe);
-    var inference = try manager.publishLoadedModel(model, true, null);
+    var inference = try manager.publishLoadedModel(model, true, null, null);
     defer inference.release();
     var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
     defer snapshot.deinit();
@@ -8262,6 +8838,43 @@ test "loaded model snapshot final retired observation keeps protected cleanup an
     spinLock(&watchdog.mutex);
     defer watchdog.mutex.unlock();
     try std.testing.expectEqual(@as(usize, 0), watchdog.entries.items.len);
+}
+
+test "warm Qwen admission copy releases its pin and permits single-model recovery" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    model.manifest.embedding_style = .qwen3_embedding;
+    model.manifest.hidden_size = 1024;
+    model.manifest.embedding_profile.query.prefix = try allocator.dupe(u8, "Instruct: retrieve\nQuery: ");
+    model.manifest.inputs = try allocator.alloc([]const u8, 1);
+    model.manifest.inputs[0] = try allocator.dupe(u8, "text");
+    var inference = try manager.publishLoadedModel(model, true, null, null);
+    defer inference.release();
+
+    var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.copyCachedQwenEmbeddingManifest(failure.allocator(), "teardown-fixture"));
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    try std.testing.expect(!probe.closed);
+    var copy = (try manager.copyCachedQwenEmbeddingManifest(allocator, "teardown-fixture")) orelse return error.MissingTestModel;
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    inference.retire();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    // Metadata remains usable after all old runtime storage has been freed.
+    try std.testing.expectEqual(@as(u32, 1024), copy.hidden_size);
+    try std.testing.expectEqualStrings("Instruct: retrieve\nQuery: ", copy.queryPrefix());
+    try std.testing.expectEqualStrings("text", copy.inputs[0]);
+    // The same hard cap that admitted one model admits its replacement now.
+    var replacement = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_weight_bytes = 64 });
+    defer replacement.release();
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expect((try manager.copyCachedQwenEmbeddingManifest(allocator, "teardown-fixture")) == null);
 }
 
 test "failed loaded model retires from lookup while active handles unwind" {
@@ -8501,35 +9114,12 @@ fn preferredModelPathForBackend(
     backend: backends.BackendType,
 ) ?[]const u8 {
     return switch (backend) {
-        .onnx => man.onnx_path orelse model_dir,
         .native, .metal, .cuda, .wasm => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
             man.onnx_path.?
         else
             model_dir,
         .pjrt => null,
     };
-}
-
-fn effectiveLoadBackends(
-    scratch: *[7]backends.BackendType,
-    preferred_backends: []const backends.BackendType,
-    man: manifest_mod.ModelManifest,
-) []const backends.BackendType {
-    if (!shouldPreferNativeSession(man)) return preferred_backends;
-
-    var idx: usize = 0;
-    for (preferred_backends) |backend| {
-        if (backend == .onnx) continue;
-        scratch[idx] = backend;
-        idx += 1;
-    }
-    for (preferred_backends) |backend| {
-        if (backend == .onnx) {
-            scratch[idx] = backend;
-            idx += 1;
-        }
-    }
-    return scratch[0..idx];
 }
 
 fn sessionManagerForPreferredBackends(
@@ -8546,22 +9136,37 @@ fn sessionManagerForPreferredBackends(
         .kernel_jit = source.kernel_jit,
         .kernel_jit_load_context = source.kernel_jit_load_context,
         .a4b_inference_request = source.a4b_inference_request,
-        .onnx_execution_provider = source.onnx_execution_provider,
-        .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
+        .gliner_cuda_precision = source.gliner_cuda_precision,
+        .test_allow_unqualified_gliner_cuda_precision = source.test_allow_unqualified_gliner_cuda_precision,
         .io = source.io,
-        .process_isolation_available = source.process_isolation_available,
+        .process_termination_available = source.process_termination_available,
+        .native_call_policy = source.native_call_policy,
     };
 }
 
 test "session manager load clones preserve process isolation policy" {
     var source = backends.SessionManager.init(std.testing.allocator);
-    source.process_isolation_available = false;
+    source.process_termination_available = false;
+    source.native_call_policy = .in_process;
     const clone = sessionManagerForPreferredBackends(
         std.testing.allocator,
         &.{.native},
         &source,
     );
-    try std.testing.expect(!clone.process_isolation_available);
+    try std.testing.expect(!clone.process_termination_available);
+    try std.testing.expectEqual(execution_control_mod.NativeCallPolicy.in_process, clone.native_call_policy);
+}
+
+test "GLiNER CUDA load clones retain per-manager qualification policy" {
+    var source = backends.SessionManager.init(std.testing.allocator);
+    const ordinary = sessionManagerForPreferredBackends(std.testing.allocator, &.{.cuda}, &source);
+    try std.testing.expect(!ordinary.test_allow_unqualified_gliner_cuda_precision);
+    source.gliner_cuda_precision = .fp16;
+    source.test_allow_unqualified_gliner_cuda_precision = true;
+    const candidate = sessionManagerForPreferredBackends(std.testing.allocator, &.{.cuda}, &source);
+    try std.testing.expect(candidate.test_allow_unqualified_gliner_cuda_precision);
+    try std.testing.expectEqual(.fp16, candidate.gliner_cuda_precision.?);
+    try std.testing.expect(!ordinary.test_allow_unqualified_gliner_cuda_precision);
 }
 
 pub const ManagedSession = struct {
@@ -8659,12 +9264,6 @@ const ModelLoadAdmissionPlan = struct {
 fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
     const min_workspace = 16 * 1024 * 1024;
     const max_workspace = 1024 * 1024 * 1024;
-    return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
-}
-
-fn onnxCudaArenaAllowance(weight_bytes: usize) usize {
-    const min_workspace = 64 * 1024 * 1024;
-    const max_workspace = 2 * 1024 * 1024 * 1024;
     return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
 }
 
@@ -8831,14 +9430,11 @@ const ComponentArtifactEstimate = union(enum) {
         self.* = .disabled;
     }
 
-    fn bytesForBackend(
-        self: *const ComponentArtifactEstimate,
-        backend: backends.BackendType,
-    ) !usize {
+    fn encodedBytes(self: *const ComponentArtifactEstimate) !usize {
         return switch (self.*) {
             .disabled => 0,
             .onnx => |bytes| bytes,
-            .native => |man| estimateModelArtifactBytes(man, backend),
+            .native => |man| estimateModelArtifactBytes(man),
         };
     }
 
@@ -8911,12 +9507,9 @@ fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]
     total.* = std.math.add(usize, total.*, size) catch return error.ResourceLimitExceeded;
 }
 
-fn estimateModelArtifactBytes(
-    man: manifest_mod.ModelManifest,
-    backend: backends.BackendType,
-) !usize {
+fn estimateModelArtifactBytes(man: manifest_mod.ModelManifest) !usize {
     var total: usize = 0;
-    const uses_native_weights = backend != .onnx and manifestHasNativeAssets(man);
+    const uses_native_weights = manifestHasNativeAssets(man);
     if (uses_native_weights) {
         const native_weight_bytes = std.math.cast(
             usize,
@@ -8972,9 +9565,8 @@ fn estimateModelLoadAdmission(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
-    const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
-    const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
-    if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
+    const weights = try estimateModelArtifactBytes(man);
+    if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .metal) {
         if (!laya_packed) {
             if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
@@ -9222,29 +9814,6 @@ fn onnxModelLoadAdmission(
     backend_runtime: backends.BackendRuntime,
 ) !ModelLoadAdmissionPlan {
     return switch (backend_runtime.backend) {
-        .onnx => if (backend_runtime.onnx_execution_provider == .cuda) .{
-            .peak = .{
-                // ORT parses and materializes the protobuf on the host before
-                // CUDA owns its device initializers. Charge the same two-copy
-                // host construction peak as ORT CPU plus device residency.
-                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
-                    return error.ResourceLimitExceeded,
-                .backend_weight_bytes = weights,
-                .backend_scratch_bytes = onnxCudaArenaAllowance(weights),
-            },
-            .resident = .{
-                .backend_weight_bytes = weights,
-                // ORT's CUDA arena retains its high-water allocation. Reserve
-                // and cap one bounded workspace for the session lifetime.
-                .backend_scratch_bytes = onnxCudaArenaAllowance(weights),
-            },
-        } else .{
-            .peak = .{
-                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
-                    return error.ResourceLimitExceeded,
-            },
-            .resident = .{ .host_weight_bytes = weights },
-        },
         .metal, .cuda => .{
             .peak = .{
                 // The importer retains encoded host bytes while constructing device
@@ -9301,7 +9870,7 @@ fn nativeModelLoadAdmission(
                 .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
             },
         },
-        .native, .onnx, .wasm => .{
+        .native, .wasm => .{
             .peak = .{
                 // Native import may retain a source mapping while materializing or
                 // repacking resident weights.
@@ -9339,8 +9908,7 @@ fn loadSessionForPreferredBackends(
         preferred_backends,
         &required_backend_scratch,
     );
-    var effective_scratch: [7]backends.BackendType = undefined;
-    const effective_backends = effectiveLoadBackends(&effective_scratch, policy_backends, man);
+    const effective_backends = policy_backends;
     const fail_closed_cuda_a4b = source_session_manager.a4b_inference_request == null and
         backends.backendOrderSelectsCudaBeforeCpu(effective_backends) and
         (try session_factory.resolveCudaA4bInferenceConfigForModelListing(
@@ -9356,6 +9924,7 @@ fn loadSessionForPreferredBackends(
     var laya_resident_attempted = false;
     const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, model_dir);
     for (effective_backends) |backend| {
+        if (source_session_manager.gliner_cuda_precision != null and backend != .cuda) continue;
         // Once opted-in Metal residency is attempted, preserve its actionable
         // admission/load error rather than silently publishing a CPU session.
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
@@ -9397,7 +9966,6 @@ fn loadSessionForPreferredBackends(
             rememberPreferredLoadError(&first_err, err);
             continue;
         };
-        backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
@@ -9426,15 +9994,6 @@ fn loadSessionForPreferredBackends(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            if (admittedSessionCudaLimit(
-                backend_runtime,
-                resident_amounts,
-            ) catch |err| {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            }) |cuda_limit| {
-                backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
-            }
             if (control) |active| try active.check();
             resource_lease = manager.acquireAmountsWithEviction(
                 admissionBackendClassForRuntime(backend_runtime),
@@ -9896,7 +10455,7 @@ test "managed constructors retain cooperative fallback without a process boundar
     var manager = ModelManager.init(allocator, .{
         .allocator = allocator,
         .preferred_backends = &.{ .metal, .native },
-        .process_isolation_available = false,
+        .process_termination_available = false,
     });
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
@@ -9956,8 +10515,7 @@ test "preferred load attempt releases admission on cancellation and guard failur
         .{ .hard_cancellation = .{ .ptr = &manager, .arm_fn = Hooks.failArm, .disarm_fn = Hooks.disarm } },
     };
     const errors = [_]anyerror{ error.ProcessIsolationRequired, error.Timeout, error.OutOfMemory };
-    // Metal and CPU ONNX have the same process-required construction contract;
-    // use Metal's runtime descriptor so this test needs no optional ORT install.
+    // Use Metal's process-required construction contract for this test.
     for (0..3) |_| for (controls, errors) |control, expected| {
         try std.testing.expectError(expected, loadSessionForPreferredBackends(
             &manager,
@@ -10420,20 +10978,6 @@ test "serving admission applies the node-wide host-memory override" {
     );
 }
 
-test "shouldPreferNativeSession prefers native GLiNER weights" {
-    const allocator = std.testing.allocator;
-    var man = manifest_mod.ModelManifest{ .allocator = allocator };
-    defer man.deinit();
-
-    try std.testing.expect(!shouldPreferNativeSession(man));
-
-    man.gliner_model_type = try allocator.dupe(u8, "gliner2");
-    try std.testing.expect(!shouldPreferNativeSession(man));
-
-    man.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(man));
-}
-
 test "optional sessions retain the selected backend before fallbacks" {
     const preferred = [_]backends.BackendType{ .metal, .native };
     const owned = try ownSelectedFirstBackendPreference(
@@ -10515,7 +11059,6 @@ test "preferredModelPathForBackend keeps metal/native on model directory when na
     man.onnx_path = try allocator.dupe(u8, "/tmp/model.onnx");
     man.safetensors_path = try allocator.dupe(u8, "/tmp/model.safetensors");
 
-    try std.testing.expectEqualStrings("/tmp/model.onnx", preferredModelPathForBackend("/tmp/model", man, .onnx).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .metal).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .native).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .metal).?);
@@ -10530,21 +11073,9 @@ test "preferredModelPathForBackend routes direct compute backends to onnx path f
     man.visual_model_path = try allocator.dupe(u8, "/tmp/visual_model.onnx");
     man.audio_model_path = try allocator.dupe(u8, "/tmp/audio_model.onnx");
 
-    try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .onnx).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .native).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .metal).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .metal).?);
-}
-
-test "shouldPreferNativeSession prefers split GLiNER gguf bundle" {
-    const allocator = std.testing.allocator;
-    var man = manifest_mod.ModelManifest{ .allocator = allocator };
-    defer man.deinit();
-
-    man.gliner_model_type = try allocator.dupe(u8, "gliner2");
-    man.gguf_path = try allocator.dupe(u8, "encoder.gguf");
-    man.gliner_head_gguf_path = try allocator.dupe(u8, "gliner_head.gguf");
-    try std.testing.expect(shouldPreferNativeSession(man));
 }
 
 test "isManifestPotentiallyLoadableInCurrentBuild rejects incomplete GLiNER bundle" {
@@ -10557,74 +11088,10 @@ test "isManifestPotentiallyLoadableInCurrentBuild rejects incomplete GLiNER bund
     try std.testing.expect(!isManifestPotentiallyLoadableInCurrentBuild(man));
 }
 
-test "shouldPreferNativeSession prefers native CLIP, Whisper, and Florence weights" {
-    const allocator = std.testing.allocator;
-
-    var clip = manifest_mod.ModelManifest{ .allocator = allocator, .native_arch_hint = .clip };
-    defer clip.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(clip));
-    clip.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(clip));
-
-    var whisper = manifest_mod.ModelManifest{ .allocator = allocator, .native_arch_hint = .whisper };
-    defer whisper.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(whisper));
-    whisper.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(whisper));
-
-    var florence = manifest_mod.ModelManifest{ .allocator = allocator, .native_arch_hint = .florence };
-    defer florence.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(florence));
-    florence.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(florence));
-}
-
-test "shouldPreferNativeSession prefers native classifier and extractor weights" {
-    const allocator = std.testing.allocator;
-
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(classifier));
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(classifier));
-
-    var extractor = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .extractor };
-    defer extractor.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(extractor));
-    extractor.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(extractor));
-}
-
-test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before onnx" {
-    const allocator = std.testing.allocator;
-    const preferred = [_]backends.BackendType{ .onnx, .metal, .native };
-    var scratch: [7]backends.BackendType = undefined;
-
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-
-    const effective = effectiveLoadBackends(&scratch, &preferred, classifier);
-    try std.testing.expectEqualSlices(backends.BackendType, &.{ .metal, .native, .onnx }, effective);
-}
-
-test "effectiveLoadBackends preserves explicit onnx-only classifier preference" {
-    const allocator = std.testing.allocator;
-    const preferred = [_]backends.BackendType{.onnx};
-    var scratch: [7]backends.BackendType = undefined;
-
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-
-    const effective = effectiveLoadBackends(&scratch, &preferred, classifier);
-    try std.testing.expectEqualSlices(backends.BackendType, &preferred, effective);
-}
-
 test "required backend is applied before model manager backend planning" {
     const allocator = std.testing.allocator;
     var source = backends.SessionManager.init(allocator);
-    source.preferred_backends = &.{ .native, .onnx };
+    source.preferred_backends = &.{ .native, .metal };
     source.required_backend = .cuda;
     source.required_backend_invalid = false;
 
@@ -10634,13 +11101,7 @@ test "required backend is applied before model manager backend planning" {
         &required_scratch,
     );
 
-    var load_scratch: [7]backends.BackendType = undefined;
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-
-    const effective = effectiveLoadBackends(&load_scratch, policy_backends, classifier);
-    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, effective);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, policy_backends);
 }
 
 test "model manager rejects an unavailable required backend before artifact selection" {
@@ -10688,10 +11149,6 @@ test "hybrid artifact candidates are isolated by backend" {
     hybrid.safetensors_path = try allocator.dupe(u8, "model.safetensors");
     hybrid.onnx_path = try allocator.dupe(u8, "model.onnx");
 
-    try std.testing.expectEqual(
-        ArtifactCandidateKind.onnx,
-        artifactCandidateForBackend(hybrid, .onnx).?,
-    );
     try std.testing.expectEqual(
         ArtifactCandidateKind.safetensors,
         artifactCandidateForBackend(hybrid, .native).?,
@@ -11812,7 +12269,7 @@ test "projector residency follows its request-scoped lifecycle" {
 
     try std.testing.expectEqual(
         decoder_bytes,
-        try estimateModelArtifactBytes(man, .native),
+        try estimateModelArtifactBytes(man),
     );
     const request = try projectorRunAdmissionAmounts(man, .native, .{});
     try std.testing.expectEqual(projector_bytes, request.host_weight_bytes);
@@ -11830,32 +12287,18 @@ test "projector residency follows its request-scoped lifecycle" {
 
 test "onnx admission separates encoded staging from completed residency" {
     const weights: usize = 1024 * 1024;
-    const cpu = try onnxModelLoadAdmission(weights, .{ .backend = .onnx });
+    const cpu = try onnxModelLoadAdmission(weights, .{ .backend = .native });
     try std.testing.expectEqual(weights * 2, cpu.peak.host_weight_bytes);
     try std.testing.expectEqual(weights, cpu.resident.host_weight_bytes);
 
-    const gpu = try onnxModelLoadAdmission(weights, .{
-        .backend = .onnx,
-        .onnx_execution_provider = .cuda,
-    });
-    try std.testing.expectEqual(weights * 2, gpu.peak.host_weight_bytes);
+    const gpu = try onnxModelLoadAdmission(weights, .{ .backend = .metal });
+    try std.testing.expectEqual(weights, gpu.peak.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.peak.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), gpu.resident.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.resident.backend_weight_bytes);
     try std.testing.expectEqual(
-        onnxCudaArenaAllowance(weights),
-        gpu.peak.backend_scratch_bytes,
-    );
-    try std.testing.expectEqual(
-        onnxCudaArenaAllowance(weights),
-        gpu.resident.backend_scratch_bytes,
-    );
-    try std.testing.expectEqual(
         runtime.tier.memory.BackendClass.gpu,
-        admissionBackendClassForRuntime(.{
-            .backend = .onnx,
-            .onnx_execution_provider = .cuda,
-        }),
+        admissionBackendClassForRuntime(.{ .backend = .metal }),
     );
 }
 
@@ -11878,10 +12321,10 @@ test "directory-backed component admission charges native model artifacts" {
     defer estimate.deinit();
     try std.testing.expectEqual(
         @as(usize, weight_bytes),
-        try estimate.bytesForBackend(.native),
+        try estimate.encodedBytes(),
     );
     const plan = try nativeModelLoadAdmission(
-        try estimate.bytesForBackend(.native),
+        try estimate.encodedBytes(),
         .native,
         .{},
     );
@@ -12851,16 +13294,16 @@ test "gliner boundary cache pinned small Metal handle retention eviction and rel
 
 test "offline load runtime supplies a real hard cancellation boundary only for disposable processes" {
     const alloc = std.testing.allocator;
-    var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_isolation_available = false });
+    var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_termination_available = false });
     defer manager.deinit();
     try std.testing.expect(try manager.offlineLoadBoundaryLocked(std.testing.io) == null);
     try std.testing.expect(manager.owned_load_watchdog == null);
-    manager.session_manager.process_isolation_available = true;
+    manager.session_manager.process_termination_available = true;
     const boundary = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
     const again = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
     try std.testing.expectEqual(boundary.ptr, again.ptr);
     const control = InferenceExecutionControl{ .hard_cancellation = boundary };
-    var guard = try control.enterUninterruptible(.process_required);
+    var guard = try control.enterUninterruptible(.uninterruptible);
     guard.deinit();
     try std.testing.expectEqual(@as(usize, 0), manager.owned_load_watchdog.?.entries.items.len);
 }
@@ -13117,6 +13560,49 @@ test "model manager teardown dormant ticket covers nested close without allocati
     try std.testing.expectEqual(@as(usize, 1), domain.refs.load(.acquire));
 }
 
+test "model manager teardown disarms driver protection before host tokenizer destruction" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    const Observer = struct {
+        domain: *TeardownDomain,
+        checking: bool = false,
+        frees: usize = 0,
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, ret);
+        }
+        fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+            return std.testing.allocator.rawResize(memory, alignment, len, ret);
+        }
+        fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(memory, alignment, len, ret);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.checking) {
+                if (self.domain.watchdog.entries.items.len != 0)
+                    @panic("driver teardown protection extends into host tokenizer destruction");
+                self.frees += 1;
+            }
+            std.testing.allocator.rawFree(memory, alignment, ret);
+        }
+        const vtable = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    var observer = Observer{ .domain = manager.teardown_domain.? };
+    model.hf_tok = try hf_tokenizer.HfTokenizer.loadFromBytes(.{ .ptr = &observer, .vtable = &Observer.vtable },
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"<unk>":0},"merges":[]}}
+    );
+    observer.checking = true;
+    manager.destroyLoadedModel(model);
+    try std.testing.expect(probe.closed);
+    try std.testing.expect(observer.frees != 0);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+}
+
 test "model manager teardown raw session retains monitor and offline driver IO after manager" {
     const allocator = std.testing.allocator;
     var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
@@ -13140,13 +13626,13 @@ test "model manager teardown raw session retains monitor and offline driver IO a
 
 test "model manager teardown rejects missing isolation and failed ticket before backend entry" {
     const allocator = std.testing.allocator;
-    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native}, .process_isolation_available = false });
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native}, .process_termination_available = false });
     defer manager.deinit();
     try std.testing.expectError(error.ProcessIsolationRequired, manager.prepareSessionClose(.{ .backend = .metal }));
     try std.testing.expect(manager.teardown_domain == null and manager.owned_load_runtime == null);
     try std.testing.expect(try manager.prepareSessionClose(.{ .backend = .native }) == null);
 
-    manager.session_manager.process_isolation_available = true;
+    manager.session_manager.process_termination_available = true;
     _ = try manager.loadCoordinationIoLocked();
     const domain = try TeardownDomain.create(allocator, manager.owned_load_io_owner);
     manager.teardown_domain = domain;
@@ -13237,7 +13723,7 @@ test "model manager teardown supervised child fixture" {
             optional.ticket.?.close_timeout_ns = 100 * std.time.ns_per_ms;
             var cached = TeardownCacheProbe{ .primary = &probe, .optional = &optional, .block = true };
             try cached.attach(model);
-            var handle = try manager.publishLoadedModel(model, true, null);
+            var handle = try manager.publishLoadedModel(model, true, null, null);
             handle.release();
             std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
             manager.evictExpiredAt(model.last_used_ns + 2 * std.time.ns_per_ms);
@@ -13245,7 +13731,7 @@ test "model manager teardown supervised child fixture" {
             std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
             manager.destroyLoadedModel(model);
         } else {
-            var handle = try manager.publishLoadedModel(model, true, null);
+            var handle = try manager.publishLoadedModel(model, true, null, null);
             std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
             if (std.mem.eql(u8, mode, "retired")) {
                 manager.retireLoadedModel(model);
@@ -13389,4 +13875,116 @@ test "ONNX export tokenizer format takes precedence over root JSON" {
         defer a.free(ids);
         try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
     }
+}
+
+test "embeddinggemma2 preflight shares host capacity before model load and preserves denied leases" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128, .scratch_limit_bytes = 128 });
+    var first = try manager.admitHostPreflightChecked(128, false);
+    defer first.release();
+    try std.testing.expectEqual(@as(usize, 128), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflightChecked(1, false));
+    try std.testing.expectEqual(@as(usize, 128), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    first.release();
+    var retry = try manager.admitHostPreflightChecked(128, false);
+    retry.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+}
+
+test "capi resolver model identity uses receipt digests before load and survives copying" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    const body = "identical fake model weights";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 2, .source = .{ .owner = "test", .name = "identity", .variant = "safetensors", .selected_format = "safetensors" }, .artifacts = &.{.{ .path = "model.safetensors", .size = body.len, .sha256 = &hex }} }, .{});
+    defer a.free(receipt);
+    for ([_]std.Io.Dir{ first.dir, second.dir }) |dir| {
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    }
+    const first_path = try first.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(first_path);
+    const second_path = try second.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(second_path);
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a };
+    const original = try modelIdentity(a, io, first_path, manifest);
+    const copied = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &copied);
+    LegacyArtifactDigestCache.entries = @splat(null); // a reopened owner/process
+    LegacyArtifactDigestCache.forbid_hashing_for_test = true;
+    defer LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    try std.testing.expectEqualSlices(u8, &original, &try modelIdentity(a, io, second_path, manifest));
+    LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    const legacy = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .artifacts = &.{.{ .path = "model.safetensors", .size = body.len }} }, .{});
+    defer a.free(legacy);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = legacy });
+    const legacy_identity = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &legacy_identity);
+    try std.testing.expectEqualSlices(u8, &legacy_identity, &try modelIdentity(a, io, second_path, manifest));
+    // Invalid weight bytes deliberately prove identity lookup does not load a model.
+    const changed = try std.mem.replaceOwned(u8, a, receipt, &hex, "0000000000000000000000000000000000000000000000000000000000000000");
+    defer a.free(changed);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = changed });
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
+    // A stale pinned receipt must also reject in-place weight replacement.
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    try second.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "different fake model weights" });
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
+}
+
+test "embeddinggemma2 generation metadata clones survive retirement and release pins on OOM" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    model.manifest.embedding_style = .embedding_gemma2;
+    model.manifest.hidden_size = 512;
+    model.manifest.embedding_profile.query.prefix = try a.dupe(u8, "task: search result | query: ");
+    var inference = try manager.publishLoadedModel(model, true, null, null);
+    defer inference.release();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.copyCachedEmbeddingGemma2Manifest(failing.allocator(), "teardown-fixture"));
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    var copy = (try manager.copyCachedEmbeddingGemma2Manifest(a, "teardown-fixture")).?;
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    inference.retire();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqual(@as(u32, 512), copy.hidden_size);
+    try std.testing.expectEqualStrings("task: search result | query: ", copy.queryPrefix());
+    try std.testing.expect((try manager.copyCachedEmbeddingGemma2Manifest(a, "teardown-fixture")) == null);
+}
+
+test "memory admission diagnostics retain pressure and recover after release" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var held = try manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 80 });
+    defer held.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 }));
+    const denied = manager.memoryAdmissionDiagnostic();
+    try std.testing.expectEqualStrings("domain_host", denied.pressure);
+    try std.testing.expectEqual(@as(u64, 1), denied.denied_count);
+    try std.testing.expectEqual(@as(u64, 30), denied.requested_host_bytes);
+    try std.testing.expectEqual(@as(u64, 80), denied.admitted_host_bytes);
+    try std.testing.expectEqual(@as(u64, 100), denied.host_limit_bytes);
+    held.release();
+    var recovered = try manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 });
+    recovered.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+    // The last denial remains observable after recovery; its timestamp/count
+    // distinguish it from the current request and survive DB snapshot refresh.
+    try std.testing.expectEqual(denied.denied_count, manager.memoryAdmissionDiagnostic().denied_count);
 }

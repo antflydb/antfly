@@ -1,0 +1,25 @@
+{
+  "reference": "PostgreSQL exact SQL",
+  "entries": [
+    {"sql": "'{\"a\":1,\"b\":2}'::jsonb || '{\"b\":3,\"c\":4}'::jsonb", "value": {"a":1,"b":3,"c":4}},
+    {"sql": "'{\"nested\":{\"a\":1}}'::jsonb || '{\"nested\":{\"b\":2}}'::jsonb", "value": {"nested":{"b":2}}},
+    {"sql": "'{}'::jsonb || '{}'::jsonb", "value": {}},
+    {"sql": "'[1,2]'::jsonb || '[2,3]'::jsonb", "value": [1,2,2,3]},
+    {"sql": "'[]'::jsonb || '[1]'::jsonb", "value": [1]},
+    {"sql": "'[1]'::jsonb || '[]'::jsonb", "value": [1]},
+    {"sql": "'[]'::jsonb || '[]'::jsonb", "value": []},
+    {"sql": "'1'::jsonb || '2'::jsonb", "value": [1,2]},
+    {"sql": "'null'::jsonb || 'null'::jsonb", "value": [null,null]},
+    {"sql": "'null'::jsonb || '[1]'::jsonb", "value": [null,1]},
+    {"sql": "'[1]'::jsonb || 'null'::jsonb", "value": [1,null]},
+    {"sql": "'{}'::jsonb || 'null'::jsonb", "value": [{},null]},
+    {"sql": "'null'::jsonb || '{}'::jsonb", "value": [null,{}]},
+    {"sql": "'{}'::jsonb || '[]'::jsonb", "value": [{}]},
+    {"sql": "'[]'::jsonb || '{}'::jsonb", "value": [{}]},
+    {"sql": "'[[1]]'::jsonb || '[[2]]'::jsonb", "value": [[1],[2]]},
+    {"sql": "'\"a\"'::jsonb || 'true'::jsonb", "value": ["a",true]},
+    {"sql": "'9007199254740993'::jsonb || '9007199254740994'::jsonb", "value": [9007199254740993,9007199254740994]},
+    {"sql": "NULL::jsonb || '{}'::jsonb", "value": null, "sql_null": true},
+    {"sql": "'{}'::jsonb || NULL::jsonb", "value": null, "sql_null": true}
+  ]
+}

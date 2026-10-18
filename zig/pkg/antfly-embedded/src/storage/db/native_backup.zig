@@ -93,7 +93,7 @@ pub const Artifact = struct {
     path: []const u8,
     /// Authenticated runtime-relative destination. Snapshot namespaces do not
     /// implicitly define the live database layout.
-    install_path: []const u8,
+    install_path: []const u8 = "",
     size_bytes: u64,
     sha256: []const u8,
     role: ArtifactRole,
@@ -938,7 +938,7 @@ pub fn validateAndMaterializeWithCancellation(
     return loaded;
 }
 
-/// Parses the one released generation schema and validates its complete
+/// Parses current and released v0.2.1+ generation schemas and validates their complete
 /// logical inventory before any artifact bytes are admitted. The caller may
 /// then materialize exactly the declared files from a local or remote source.
 pub fn parseManifestBytes(alloc: Allocator, raw: []const u8) !LoadedManifest {
@@ -949,7 +949,7 @@ pub fn parseManifestBytes(alloc: Allocator, raw: []const u8) !LoadedManifest {
     var loaded = LoadedManifest{ .alloc = alloc, .parsed = parsed };
     errdefer loaded.deinit();
     const manifest = loaded.value();
-    if (manifest.format_version != format_version or
+    if ((manifest.format_version != format_version and manifest.format_version != 3) or
         manifest.artifacts.len == 0 or
         manifest.artifacts.len > max_artifacts)
     {
@@ -957,6 +957,20 @@ pub fn parseManifestBytes(alloc: Allocator, raw: []const u8) !LoadedManifest {
     }
     try validateProjectionInventory(manifest.capture_target_sequence, manifest.projections);
     try validatePrimary(manifest.primary);
+
+    if (manifest.format_version == 3) {
+        // Released v0.2.1-v0.2.5 writers authenticate snapshot-relative
+        // paths and roles. Their fixed install mapping predates install_path;
+        // recover exactly that mapping, then run the same ownership checks.
+        const owned = parsed.arena.allocator();
+        const artifacts = try owned.dupe(Artifact, manifest.artifacts);
+        for (artifacts) |*artifact| {
+            if (artifact.install_path.len != 0 or artifact.role == .shared_acceleration)
+                return error.InvalidNativeBackupManifest;
+            artifact.install_path = try artifactInstallPath(artifact.path, artifact.role);
+        }
+        loaded.parsed.value.artifacts = artifacts;
+    }
 
     var previous_path: ?[]const u8 = null;
     var install_paths = std.StringHashMapUnmanaged(void).empty;
@@ -988,6 +1002,14 @@ pub fn parseManifestBytes(alloc: Allocator, raw: []const u8) !LoadedManifest {
     for (manifest.projections) |projection| {
         if (projection.artifact_state == .repair_required)
             try loaded.invalidateProjection(projection.name, .capture_repair_required);
+        // Released v3 captures have neither current full-text provenance nor
+        // native dense physical generations. Admit their authenticated primary
+        // image and let the existing durable restore repair rebuild these
+        // projections before publication, rather than opening them read-only.
+        if (manifest.format_version == 3 and
+            (std.mem.eql(u8, projection.kind, "full_text") or
+                std.mem.eql(u8, projection.kind, "dense_vector")))
+            try loaded.invalidateProjection(projection.name, .backend_mismatch);
     }
     return loaded;
 }
@@ -1682,6 +1704,26 @@ test "shared vector acceleration corruption preserves native posting authority" 
     try std.testing.expect(!try pathExists(std.testing.io, restored_vector));
 }
 
+test "native v02 released generation manifest recovers only canonical install paths" {
+    const alloc = std.testing.allocator;
+    var loaded = try parseManifestBytes(alloc, @embedFile("../testdata/v02-server/native-generation.json"));
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), loaded.value().format_version);
+    try std.testing.expect(loaded.projectionInvalid("dense"));
+    try std.testing.expect(loaded.projectionInvalid("full_text_index_v0"));
+    try std.testing.expect(!loaded.projectionInvalid("sparse"));
+    try std.testing.expect(!loaded.projectionInvalid("links"));
+    for (loaded.value().artifacts) |artifact| {
+        try std.testing.expectEqualStrings(try artifactInstallPath(artifact.path, artifact.role), artifact.install_path);
+    }
+    // A modern manifest missing its authenticated install paths must fail.
+    const modern = try alloc.dupe(u8, @embedFile("../testdata/v02-server/native-generation.json"));
+    defer alloc.free(modern);
+    const offset = std.mem.indexOf(u8, modern, "\"format_version\":3").?;
+    modern[offset + "\"format_version\":".len] = '5';
+    try std.testing.expectError(error.InvalidNativeBackupArtifactPath, parseManifestBytes(alloc, modern));
+}
+
 test "native generation manifest captures validates and materializes generated artifacts" {
     const alloc = std.testing.allocator;
     var source_tmp = std.testing.tmpDir(.{});
@@ -1730,7 +1772,7 @@ test "native generation manifest captures validates and materializes generated a
     defer alloc.free(unreleased);
     const version_offset = std.mem.indexOf(u8, unreleased, "\"format_version\":5") orelse
         return error.TestUnexpectedResult;
-    unreleased[version_offset + "\"format_version\":".len] = '3';
+    unreleased[version_offset + "\"format_version\":".len] = '4';
     try std.testing.expectError(error.InvalidNativeBackupManifest, parseManifestBytes(alloc, unreleased));
     var loaded = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
     defer loaded.deinit();

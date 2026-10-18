@@ -236,7 +236,8 @@ pub const Registry = struct {
         defer a.free(marker_name);
         const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(marker_path);
-        const marker: ?std.Io.File = if (owner.read_only) null else try self.createMarker(marker_path);
+        const reader_fenced = owner.read_only or owner.artifact_reader_fence;
+        const marker: ?std.Io.File = if (reader_fenced) null else try self.createMarker(marker_path);
         errdefer if (marker) |file| {
             file.close(runtime);
             std.Io.Dir.cwd().deleteFile(runtime, marker_path) catch {};
@@ -244,12 +245,12 @@ pub const Registry = struct {
         // Writable roots are protected by the catalog reference. Read-only
         // sources use the established external-reader lock, since they cannot
         // publish a lease and external writers must not reuse their pages.
-        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !owner.read_only, .no_sync = true });
+        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .no_sync = true });
         errdefer reader.close();
         reader.page_cache_enabled.store(false, .monotonic);
         var capture = Capture{ .allocator = a, .key = key, .lease_key = lease_key };
         errdefer capture.value.deinit(a);
-        if (owner.read_only) {
+        if (reader_fenced) {
             capture.checkpoint = reader.activeCheckpoint();
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
         } else try owner.submitMutation(&capture, Capture.apply);
@@ -263,13 +264,13 @@ pub const Registry = struct {
             .marker_path = marker_path,
             .marker = marker,
         };
-        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visit, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
+        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
         _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager, .acquire_use = State.acquireUse, .release_use = State.releaseUse, .enable_idle_expiry = State.enableIdleExpiry } };
+        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .visit_range = State.visit, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager, .acquire_use = State.acquireUse, .release_use = State.releaseUse, .enable_idle_expiry = State.enableIdleExpiry } };
     }
 };
 
@@ -388,7 +389,18 @@ const State = struct {
         return if (self.cache) |*cache| cache.retainedBytes() else 0;
     }
 
-    fn visit(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+    fn visit(ptr: *anyopaque, offset: u64, length: u64, visitor_port: @import("../../segment_source.zig").SourceVisitor) !void {
+        var receiving_visitor = visitor_port;
+        const context: *anyopaque = &receiving_visitor;
+        const visitor = @import("../../segment_source.zig").SourceVisitor.consume;
+        const self: *State = @ptrCast(@alignCast(ptr));
+        return self.cache.?.visitRange(offset, length, context, visitor);
+    }
+
+    fn visitUncached(ptr: *anyopaque, offset: u64, length: u64, visitor_port: @import("../../segment_source.zig").SourceVisitor) !void {
+        var receiving_visitor = visitor_port;
+        const context: *anyopaque = &receiving_visitor;
+        const visitor = @import("../../segment_source.zig").SourceVisitor.consume;
         const self: *State = @ptrCast(@alignCast(ptr));
         return self.reader.visitIndexValue(self.value, offset, length, self.checkpoint, context, visitor);
     }

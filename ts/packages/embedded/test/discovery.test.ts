@@ -156,6 +156,36 @@ describe("resolveLibrary", () => {
     expect(result).toEqual({ path: "libantfly.so", source: "system" });
   });
 
+  it("does not load a parent checkout's artifact across a worktree boundary", () => {
+    const result = resolveLibrary({
+      platform: "darwin",
+      arch: "arm64",
+      env: {},
+      startDir: "/repo/.worktrees/followup/ts/packages/embedded/src",
+      existsSync: (p) =>
+        p === "/repo/.worktrees/followup/.git" || p === "/repo/zig/zig-out/lib/libantfly.dylib",
+      resolve: () => {
+        throw new Error("not installed");
+      },
+    });
+    expect(result).toEqual({ path: "libantfly.dylib", source: "system" });
+  });
+
+  it("finds the current checkout's artifact before stopping at its git boundary", () => {
+    const path = "/repo/zig/zig-out/lib/libantfly.dylib";
+    const result = resolveLibrary({
+      platform: "darwin",
+      arch: "arm64",
+      env: {},
+      startDir: "/repo/ts/packages/embedded/src",
+      existsSync: (p) => p === "/repo/.git" || p === path,
+      resolve: () => {
+        throw new Error("not installed");
+      },
+    });
+    expect(result).toEqual({ path, source: "source-tree" });
+  });
+
   it("throws UnsupportedPlatformError for an unsupported platform", () => {
     expect(() => resolveLibrary({ platform: "aix", arch: "ppc64" })).toThrow(
       UnsupportedPlatformError

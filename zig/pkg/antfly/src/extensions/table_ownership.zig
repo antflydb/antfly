@@ -113,30 +113,90 @@ pub fn definitionMutationTouchesOwnedState(
     }
     if (std.mem.eql(u8, expected.indexes_json, replacement.indexes_json)) return false;
 
-    var expected_indexes = std.json.parseFromSlice(std.json.Value, alloc, expected.indexes_json, .{}) catch
-        return error.InvalidTableIndexMetadata;
-    defer expected_indexes.deinit();
-    var replacement_indexes = std.json.parseFromSlice(std.json.Value, alloc, replacement.indexes_json, .{}) catch
-        return error.InvalidTableIndexMetadata;
-    defer replacement_indexes.deinit();
-    if (expected_indexes.value != .object or replacement_indexes.value != .object)
-        return error.InvalidTableIndexMetadata;
-
-    for (snapshot.extension_members) |member| {
-        const member_table = memberTableName(member) orelse continue;
-        if (!std.mem.eql(u8, member_table, replacement.name)) continue;
-        const unchanged = switch (member.object_kind) {
-            .index => optionalJsonValuesEqual(
-                expected_indexes.value.object.get(member.object_name),
-                replacement_indexes.value.object.get(member.object_name),
-            ),
-            .enrichment => optionalJsonValuesEqual(
-                try enrichmentByName(expected_indexes.value, member.object_name),
-                try enrichmentByName(replacement_indexes.value, member.object_name),
-            ),
-            else => true,
-        };
-        if (!unchanged) return true;
-    }
+    var guard = try DefinitionMutationGuard.init(alloc, expected, replacement);
+    defer guard.deinit();
+    for (snapshot.extension_members) |member| if (try guard.touches(member)) return true;
     return false;
+}
+
+/// Streaming equivalent of snapshot ownership admission. Index metadata is
+/// parsed once; the caller may visit only this table's durable owner index.
+pub const DefinitionMutationGuard = struct {
+    table_name: []const u8,
+    shape_changed: bool,
+    expected_indexes: ?std.json.Parsed(std.json.Value) = null,
+    replacement_indexes: ?std.json.Parsed(std.json.Value) = null,
+
+    pub fn init(alloc: std.mem.Allocator, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !@This() {
+        var without_indexes = replacement;
+        without_indexes.indexes_json = expected.indexes_json;
+        var result: @This() = .{ .table_name = replacement.name, .shape_changed = !metadata_table_manager.tableDefinitionsEqual(expected, without_indexes) };
+        errdefer result.deinit();
+        if (!std.mem.eql(u8, expected.indexes_json, replacement.indexes_json)) {
+            result.expected_indexes = std.json.parseFromSlice(std.json.Value, alloc, expected.indexes_json, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidTableIndexMetadata;
+            result.replacement_indexes = std.json.parseFromSlice(std.json.Value, alloc, replacement.indexes_json, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidTableIndexMetadata;
+            if (result.expected_indexes.?.value != .object or result.replacement_indexes.?.value != .object) return error.InvalidTableIndexMetadata;
+        }
+        return result;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        if (self.expected_indexes) |*parsed| parsed.deinit();
+        if (self.replacement_indexes) |*parsed| parsed.deinit();
+        self.* = undefined;
+    }
+
+    pub fn touches(self: *const @This(), member: extension_domain.ExtensionMember) !bool {
+        const name = memberTableName(member) orelse return false;
+        if (!std.mem.eql(u8, name, self.table_name)) return false;
+        if (self.shape_changed) switch (member.object_kind) {
+            .table_schema => return true,
+            .data_shape => if (member.shape_kind) |kind| if (kind == .document or kind == .row) return true,
+            else => {},
+        };
+        const before = if (self.expected_indexes) |parsed| parsed.value else return false;
+        const after = self.replacement_indexes.?.value;
+        return switch (member.object_kind) {
+            .index => !optionalJsonValuesEqual(before.object.get(member.object_name), after.object.get(member.object_name)),
+            .enrichment => !optionalJsonValuesEqual(try enrichmentByName(before, member.object_name), try enrichmentByName(after, member.object_name)),
+            else => false,
+        };
+    }
+};
+
+test "relation mutation ownership streams semantic index checks and preserves shape ownership" {
+    const Fixture = struct {
+        const before: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .indexes_json = "{\"owned\":{\"type\":\"text\",\"enabled\":true},\"other\":{\"type\":\"text\"}}" };
+        const after: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .indexes_json = "{\"other\":{\"type\":\"text\",\"enabled\":false},\"owned\":{\"enabled\":true,\"type\":\"text\"}}" };
+        const member: extension_domain.ExtensionMember = .{ .extension_name = "owner", .scope = .{ .kind = .table, .table_name = "rows" }, .table_name = "rows", .object_kind = .index, .object_name = "owned" };
+        fn run(alloc: std.mem.Allocator) !void {
+            var guard = try DefinitionMutationGuard.init(alloc, before, after);
+            defer guard.deinit();
+            try std.testing.expect(!try guard.touches(member));
+            var other = member;
+            other.object_name = "other";
+            try std.testing.expect(try guard.touches(other));
+            other.table_name = "different";
+            try std.testing.expect(!try guard.touches(other));
+            var shape = member;
+            shape.object_kind = .table_schema;
+            try std.testing.expect(!try guard.touches(shape));
+            var changed = after;
+            changed.description = "changed shape metadata";
+            var shape_guard = try DefinitionMutationGuard.init(alloc, before, changed);
+            defer shape_guard.deinit();
+            try std.testing.expect(try shape_guard.touches(shape));
+            shape.object_kind = .data_shape;
+            shape.shape_kind = .row;
+            try std.testing.expect(try shape_guard.touches(shape));
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    // Optional in-place arena growth must not change the numbered fault
+    // schedule according to backing-heap placement between invocations.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{});
+    var invalid = Fixture.after;
+    invalid.indexes_json = "[]";
+    try std.testing.expectError(error.InvalidTableIndexMetadata, DefinitionMutationGuard.init(std.testing.allocator, Fixture.before, invalid));
 }

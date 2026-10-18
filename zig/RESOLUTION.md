@@ -141,7 +141,7 @@ the v1 runtime intentionally exposes one blocking strategy per resolver.
 ### 2. Scoring (comparison levels -- "Fellegi-Sunter")
 
 The scorer is the one pluggable interface. It is **implemented** today in
-`zig/lib/matcher/` and is pure, deterministic, and allocation-light so it is
+`zig/pkg/antfly-embedded/matcher/` and is pure, deterministic, and allocation-light so it is
 safe inside replay workers.
 
 A `Comparison` pairs a field on the mention (`left`) with a field on the
@@ -178,7 +178,7 @@ probability.
 }
 ```
 
-Supported comparators (see `lib/matcher/src/mod.zig`):
+Supported comparators (see `pkg/antfly-embedded/matcher/src/mod.zig`):
 
 | Comparator     | Operates on | Notes |
 |----------------|-------------|-------|
@@ -232,7 +232,7 @@ Generality lives in the comparator + level space, not in arbitrary code.
 
 ## Resolution Stage Runtime (backend_runtime)
 
-The resolution stage worker body is implemented in `lib/resolver` as
+The resolution stage worker body is implemented in `pkg/antfly-embedded/resolver` as
 `ResolutionStage`, behind two vtable seams so it stays pure and unit-testable:
 
 - `ArtifactStore` -- `get`/`put`/`delete` of artifact bytes by primary-store key.
@@ -519,13 +519,13 @@ Open/index/enrichment validation should reject:
 
 The design in this document -- deterministic resolver, promoter, fusion data
 model, and cross-shard candidate blocking -- is implemented and tested. The
-scorer and comparators live in `lib/matcher`; the resolver core, resolution
-stage, and `DocRef` type live in `lib/resolver`; the resolution and promotion
+scorer and comparators live in `pkg/antfly-embedded/matcher`; the resolver core, resolution
+stage, and `DocRef` type live in `pkg/antfly-embedded/resolver`; the resolution and promotion
 managed replay stages are `resolution_runtime.zig` and `promotion_runtime.zig`;
 cross-shard candidate blocking and the promoter's cross-shard entity sink are
 `api/distributed_candidate_source.zig`; and the resolver catalog persists
 through `resolver_catalog.zig` and `table_provisioner`. Test coverage spans
-`lib/matcher`, `lib/resolver`, and the `antfly-storage-db-test` /
+`pkg/antfly-embedded/matcher`, `pkg/antfly-embedded/resolver`, and the `antfly-storage-db-test` /
 `e2e/antfly/test_resolution.py` suites.
 
 Learned-weights resolution, a review queue/curation UI, entity merge/split, and
@@ -579,17 +579,42 @@ and both are served by the same seam:
    query can hydrate promoted entity docs across shards. Verified by db-tests and
    the live multi-node e2e.
 
-Embedding generation for ANN blocking and entity+edge atomicity are not yet
-built; see "Open work" below.
+Lite supports candidate reads and atomic promotion across named tables. A
+configured `name_embedding` is generated from each mention using the destination
+table's dense embedding index configuration, before ANN candidate blocking.
+Configure `candidate_search: "ann"`, `candidate_ann_index`, `name_embedding`,
+and `name_embedding_dims` to match that index. The entity table needs a dense
+index over its canonical name; its embeddings and the query mention must use
+the same model and dimensions. `run_until_idle_json` drains destination tables
+as well as source tables, including recursive generator/resolver pipelines.
+
+For known synonyms, write an entity document at the exact minted alias key
+with `merged_into` set to the surviving canonical key (and `merged_into_table`
+for a different table). The survivor must exist. Exact aliases are followed
+before statistical scoring, even when no scorer is configured; dangling
+redirects never authorize a match. This allows deterministic corrections such
+as `concept/qwen3` → `concept/qwen3_embedding` without embeddings.
+
+The `slug` template helper is ASCII-only for compatibility with existing keys.
+Use the opt-in `{{ uslug _entity.text }}` helper for Unicode identities. It
+normalizes with NFKC, folds case, retains Unicode letters and numbers, and
+separates runs with `_`. `Qwen3`, `qwen3` and `Ｑｗｅｎ３` become `qwen3`;
+`Straße` becomes `strasse`; `東京 大学` becomes `東京_大学`. The Unicode 16.0.0
+normalization tables are checked in, independent of the host locale. Existing
+non-empty `slug` keys retain their spelling. Both helpers reject an empty
+result with `EmptyEntityKey`, including all-CJK inputs passed to ASCII `slug`,
+so a resolver cannot silently mint `entity/`. Keep the original mention in
+`canonical_name` and `aliases` for display and search.
+
+Resolution merges mentions that extraction found; it cannot recover a missing
+subject. For short claims, use specific labels and descriptions naming the
+expected domain (for example, model or software component), and measure recall
+on representative claims while lowering the extraction threshold. Lower
+thresholds also increase false positives. Track missing main subjects separately
+from synonym resolution and keep an application-supplied subject when available.
 
 ## Open work
 
-- **Name-embedding generation for ANN blocking.** ANN candidate search needs
-  the mention `name_embedding` to be produced -- a name-embedding enrichment
-  over the extraction entities (an `embedding` artifact the resolver reads),
-  reusing the dense-embedding producer already in the enrichment runtime. This
-  is the recommended next step, since it unblocks the `ann` candidate source
-  end to end.
 - **Entity + edge atomicity.** Entity promotion is transactional across entity
   shards, but atomically coupling the entity upsert with graph-edge artifacts
   needs a graph-edge participant in `TableCommitRequest`. Until then, entity
@@ -612,3 +637,777 @@ built; see "Open work" below.
 Recommended order: (a) the name-embedding enrichment to feed the cross-shard
 `ann` source, (b) graph-edge participation in `TableCommitRequest` for optional
 entity+edge atomicity.
+
+
+### Per-mention admission and replay isolation
+
+A mention whose `slug` or `uslug` is empty is skipped before embedding or candidate
+blocking. Other mentions in the document still resolve. The resolution artifact
+records `skipped_mentions`, and the native log identifies the skipped local ID.
+Invalid templates and resource failures still fail the operation.
+
+Graph replay ignores corrupt persisted resolution entries individually, preserving
+valid siblings and logging each omission. An unparseable resolution artifact contributes
+no endpoints; it does not invent owning-document or raw-text fallback endpoints and
+does not prevent unrelated artifacts from materializing. Allocation/storage failures
+still propagate.
+
+ANN vector hydration follows the scorer's candidate field names for comparisons
+against the mention `name_embedding`. Text-only scorers consume the original stored
+JSON. A hit whose indexed vector disappeared remains a candidate with a missing
+value; it does not abort processing of the remaining hits.
+
+
+### Original two-hop request (#1089)
+
+The regression uses the original request verbatim (with the configured index name
+substituted for `<graph>`), including default node deduplication. It asserts the
+second claim is reached through a shared concept, with paths and documents enabled.
+The same request also passes on the issue's reported revision `1258e8cfcb`, returning
+the second claim at depth 2 with its document and a three-node path. This rules out
+a general unsupported-option/parser restriction at that revision. The original
+failure is not reproduced; identifying it requires the original database state or
+linked native binary rather than guessing a routing fix.
+
+The receipt and test-only patch are retained in
+`pkg/antfly-embedded/testdata/issue1089_two_hop_baseline.{json,patch}`. To reproduce,
+create a detached worktree at `1258e8cfcb`, apply the patch, then run from `zig/`:
+
+```sh
+python3 tools/run_bounded_zig_build.py build capi-test -Dembedded-only=true \
+  '-Dtest-filter=--test-filter=capi issue1089 original revision exact two hop request' -j1
+```
+
+## Query keys, aliases, and migration (Lite native)
+
+Use `antfly_db_render_resolver_key_json(db, resolver_name, mention_json, &out)`
+with `{"text":"Qwen3","label":"concept"}`. It reads the durable resolver,
+executes its exact key template (including Unicode 16 NFKC/case folding and
+attached combining marks), and returns `minted_key`, alias-canonical `key`,
+`table`, and `config_generation`. Free the result with `antfly_buffer_free`.
+Python exposes `db.render_resolver_key("concepts", mention)`; Go exposes
+`db.RenderResolverKeyJSON("concepts", mentionJSON)`. This is a read-only render
+operation: it does not extract text, run ANN, or create documents. Extract
+mentions using `Inference.extract` first if needed, or use `resolve_query` below
+to run the configured extractor and ANN resolution together. Query callers must
+use the configured resolver name, not copy its template into application code.
+
+Inline resolvers accept aliases between **fully rendered keys**, for example:
+
+```json
+"aliases": [{"key":"concept/qwen3","target":"concept/qwen3_embedding"}]
+```
+
+These explicit aliases take precedence over fuzzy matches and require no
+canonical entity documents. Set `promote: false` and `table` to `default` to keep keys in the source
+table without creating an entity table. With `promote: false`, both minted and aliased mentions produce graph keys
+without materializing entity documents. Alias chains are followed;
+empty keys, duplicate sources, and cycles are rejected. Aliases use exact key
+bytes; use the render API when deriving either endpoint from text. Known alias
+redirects also canonicalize scorer-selected keys in the resolver's table.
+
+To merge an existing key after ingestion, call
+`antfly_db_merge_resolver_keys_json(db, resolver, {"key":"concept/old","target":"concept/new"})`,
+or Python `db.merge_resolver_keys(resolver, old, new)`, or Go
+`db.MergeResolverKeysJSON(resolver, requestJSON)`. This atomically persists the
+redirect and its corpus-backfill cursor, bumps the resolver generation, and
+returns before replay. Repeat requests are idempotent; replacing an existing
+redirect is rejected (merge its canonical target instead). `run_until_idle`
+then re-resolves stored extraction artifacts and replaces their mention and
+relation edge contributions. It retains unrelated graph contributors. Reopen
+resumes pending backfill from the durable catalog/cursor. Concurrent rendering
+may observe either complete resolver generation, not an uncommitted alias.
+
+This operation changes **resolver-owned identity**, not arbitrary manually
+supplied edges. With promotion enabled, its existing merge path updates entity
+documents and leaves redirects for prior promoted keys. With `promote: false`,
+entity documents are untouched;
+application references outside resolution artifacts need their own migration.
+Human-curated per-document overrides keep their existing precedence. Source
+artifacts must still exist for replay. Treat a template/helper change as an
+identity migration; aliases preserve old query seeds while replay converges.
+Reapplying an old inline resolver config can replace its alias list, so keep
+migration aliases in the application configuration too.
+
+## Embedding merge recipe and ordering
+
+The supported setup uses public table/index calls; it does not silently create
+or take ownership of an application's entity table. The real Qwen regression
+`TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity` executes
+this recipe through `AddIndexJSON` and tests a non-empty merged key. Set
+`ANTFLY_LITE_EMBEDDING_MODELS_DIR` to a model root containing the Qwen bundle to
+run it.
+
+1. Open Lite with profile `native`, local inference enabled, and an explicit
+   `models_dir` containing both extraction and embedding bundles. For a JSON-field
+   artifact without a model producer, also enable `generated_enrichment_replay`.
+2. Create an `entities` table and open its handle. Add this index to it:
+
+```json
+{"name":"names","type":"embeddings","dims":1024,"field":"canonical_name","metric":"cosine","embedder":{"provider":"antfly","model":"Qwen/Qwen3-Embedding-0.6B-GGUF"}}
+```
+
+3. Add an artifact-backed graph index to the source table with this inline
+   resolver (the `kg` artifact can be produced by an extractor or a JSON field):
+
+```json
+{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","candidate_search":"ann","candidate_ann_index":"names","candidate_limit":25,"name_embedding":"names","name_embedding_dims":1024,"type_must_match":true,"scorer_json":"{\"comparisons\":[{\"name\":\"embedding\",\"left\":\"name_embedding\",\"right\":\"name_embedding\",\"levels\":[{\"when\":\"cosine > 0.9\",\"weight\":8.0},{\"else\":true,\"weight\":-6.0}]}],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}","config_generation":1}
+```
+
+`name_embedding` names the destination table's configured embedding index, not
+an arbitrary model ID. The mention and candidate must use the same model and
+dimensions. The cosine floor (`0.9` above) controls semantic similarity; the
+matcher decision (`0.9`) is a separate logistic-score threshold. Calibrate both
+on actual synonyms and hard negatives. Keep `type_must_match` unless your label
+policy explicitly allows merging across types. Known aliases need no seed
+documents; optional curated ANN seeds use `canonical_name` and `entity_type`.
+
+A successful **database-root** `run_until_idle` drains all tables repeatedly,
+including embeddings queued by cross-table promotion. Entities promoted during
+that drain are ANN-visible to requests submitted **after it returns**. Candidate
+search inside a drain can precede another document's promotion/embedding;
+within-batch document order is not an ANN visibility guarantee. For deterministic
+incremental merging, submit one ingestion unit, drain the root, then submit the
+next. Batch ingestion may mint separate keys; use the explicit merge API and
+another drain to reconcile them. A failed/non-convergent drain does not provide
+the barrier. This contract avoids order-dependent claims that a replay batch
+or candidate snapshot cannot satisfy.
+
+## Comparing extraction configs
+
+`scripts/eval_extract.py` runs two or more extraction-v2 configs against the same
+labelled JSONL corpus through the public embedded inference API. Example:
+
+```sh
+PYTHONPATH=py/packages/embedded/src python scripts/eval_extract.py \
+  --models-dir "$ANTFLY_INFERENCE_MODELS_DIR" \
+  --corpus scripts/testdata/eval_extract/corpus.jsonl \
+  --config scripts/testdata/eval_extract/plain.json \
+  --config scripts/testdata/eval_extract/descriptions.json \
+  --output comparison.json
+```
+
+Set `ANTFLY_LIBRARY` if the shared library is not on its normal search path.
+The report records installed models, config/corpus SHA256s, effective configs,
+raw outputs, timings, per-label mention counts, and exact-span precision,
+recall and F1. Annotation offsets are Unicode code points, end-exclusive.
+Duplicate label/spans are counted once; repeated text at different offsets is
+counted separately. Every row needs an explicit `entities` list, including
+negative examples. Undefined denominators are `null`, not perfect scores.
+Malformed annotations, incompatible response offsets, and inference errors
+fail the run. The bundled two-document corpus is a smoke fixture, not an
+accuracy benchmark. Use held-out domain annotations before choosing a config.
+
+Descriptions are prompt/schema input, not output filters; changing them can
+change logits, token budget and which candidates cross `threshold`. Compare
+both descriptions at fixed threshold/window geometry first, then sweep
+thresholds on a development split and evaluate the selected setting on a
+held-out split. Longer windows increase context and attention cost while
+reducing window count; overlaps can recover boundary mentions and affect
+cross-window duplicate merging. Keep identical geometry when isolating the
+effect of descriptions, and inspect empty outputs as well as precision.
+
+Windowed descriptions and single-label classification are qualified for the
+FP32 base and multi-Decide bundles described in [the qualification guide](pkg/inference/models/gliner2/GLINER25.md). The fp16-encoder
+base remains qualified only for its existing feature set; windowed descriptions
+are unsupported and **not planned for this implementation**. Its measured Metal
+throughput is worse than FP32, and FP32 remains the recommended bundle. A future
+fp16 description qualification requires pinned upstream non-empty fixtures and
+reviewed parity tolerances; this change does not widen its advertised capabilities.
+
+### Resolve ad-hoc query text and mentions
+
+`antfly_db_resolve_query_json(db, resolver_name, request, out)` (Go
+`ResolveQueryJSON`, Python `Database.resolve_query`, Rust `resolve_query_json`)
+accepts exactly one of:
+
+```json
+{"text":"What did Apple announce in Cupertino?"}
+```
+
+```json
+{"extraction":{"entities":[{"id":"q0","label":"company","text":"Apple"}]}}
+```
+
+The text form invokes the extractor producer on the resolver's source asset,
+with its durable model, schema, descriptions and thresholds. The extraction form
+lets callers keep their own GLiNER extraction and still use Antfly's full
+resolution pipeline. Both return `{extraction, resolution}`; `resolution.entities`
+contains canonical `doc_ref` (table/key), decision, confidence, and mention
+identity. Empty or unkeyable mentions are reflected in `skipped_mentions`.
+
+Resolution uses the same label routing, sibling identities, explicit aliases,
+exact/prefix/ANN candidates, configured mention embeddings, and scorer as
+write-time resolution. Configure `candidate_search:"ann"`, `candidate_ann_index`,
+`name_embedding`, dimensions and the scorer as in the embedding-merge recipe
+above. Supplied mention vectors are accepted too. Existing embeddings must be
+visible before querying; drain the root after writing candidate documents.
+Explicit aliases do not require canonical documents or embedding IO.
+
+Query extraction and resolution never publish a synthetic document, resolution
+artifact, promotion, graph edge, or replay record. They also work on read-only
+handles. Read-only text queries lazily cache a foreground extractor producer on
+the handle, reusing its inference provider and loaded models across calls.
+Only cache construction holds the producer mutex; each extraction gets an
+invocation context and uses the synchronized capability cache. Native Lite
+captures an owned extractor plan and pins its root inference snapshot, then
+releases the connection, path gate and file lease during text extraction.
+Concurrent text queries and writer commits can proceed on the same database
+path. The short canonical lookup/resolution phase reacquires a current snapshot;
+a resolver or extractor config change during extraction returns a retryable busy
+error. Model execution/admission gates still apply. Named tables share their root
+snapshot's cache. Retired snapshots retain providers until their last in-flight
+query finishes; the cache is released with the snapshot.
+They use resolver-level aliases and ignore document-specific curation
+since the query has no stored document identity. Queries currently require an
+asset-scoped resolver (including `source_artifact_kind:"any"`); a chunk-scoped
+resolver is rejected rather than inventing chunk context. The text form requires
+an extractor producer; copy-only or missing source assets fail with a diagnostic.
+For callers that only need template/alias rendering, `render_resolver_key` stays
+available and avoids extraction, embeddings and candidate search.
+
+### Durable merges, config replay and compatibility
+
+API-created key merges live in `resolver_merges_v1` metadata, separately from
+inline `aliases`. The resolver catalog records their version and generation;
+merge state, generation, and backfill cursors commit in one transaction. Normal
+inline config upserts preserve merge state even when callers omit all aliases.
+Callers can keep reapplying declarative index configs on open without reading
+curated merges first. Replaying an identical native index config on an existing
+index is idempotent, including after close/reopen; a different physical config
+is rejected. Durable merges take precedence over an inline redirect of
+the same source. Removing a resolver deliberately removes its associated merge
+state; merely replacing its configuration does not. Splits and portable backups copy both catalogs. Memory/file restore and live
+import validate and preserve durable merge state. Once merges exist, changes to
+`table` or `key_template` are rejected with a namespace diagnostic; callers must
+explicitly reset or migrate the identities before changing their namespace
+using `set_resolver_namespace` (C `antfly_db_set_resolver_namespace_json`, Go
+`SetResolverNamespaceJSON`, Rust `set_resolver_namespace_json`).
+The effective resolution revision advances on either a config change or merge,
+even when the incoming config generation equals the preceding merge revision.
+For example, config generation 2 → merge → config generation 3 yields effective
+revisions 2 → 3 → 4. Identical config replay leaves the revision unchanged.
+Namespace operations preserve the caller-owned `config_generation` and advance
+the internal clock, so reapplying the correctly updated inline config does not
+schedule a second replay.
+Missing, corrupt, cyclic, or unsupported required merge metadata fails opening
+rather than silently resolving keys differently. Both mention and relation
+edges are reconciled on the root drain, including removal of old endpoints.
+
+The namespace request contains `table`, `key_template`, and exactly one of:
+
+- `reset_merges:true`: explicitly discard durable redirects and inline aliases.
+  Optional `aliases:[...]` supplies their complete replacement under the new
+  namespace; omitting it leaves no inline aliases. This is also the explicit
+  way to change aliases after a namespace fence has been installed.
+- `key_map:[{"key":"concept/old","target":"topic/old"}, ...]`: map every
+  stored inline/durable alias source and target into the new namespace. Incomplete
+  maps, empty keys, duplicate sources, resulting duplicate aliases and cycles
+  fail before mutation. Existing merges are transformed, preserving identity
+  relationships rather than deleting the resolver.
+
+The operation validates the destination table and commits the config, merge store,
+and replay cursors atomically. Call `run_until_idle` to reconcile resolver-owned
+mention/relation edges. Application-owned documents and references are not
+renamed. Update your declarative inline config to the new table/template and
+mapped inline aliases before reapplying it. A durable namespace fence rejects
+old table/template or alias configurations even after reset leaves zero merges.
+Further identity changes require another explicit namespace operation. Changing an existing physical index config still requires
+its normal delete/recreate lifecycle, which retains resolver identity and merges.
+Resolver identity is scoped by source table and resolver name, independently of physical
+index names: deleting index v1 and adding index v2 with the same resolver name
+and source/output artifact bindings retains merges and namespace fences. Renaming
+the resolver itself creates a new identity; removing it deliberately deletes its
+curation. Inline declarations own resolver execution: deleting the last declaring
+index retires its resolver, so rendering/query resolution returns not found and
+new source writes do not run that resolver. A shared declaring index keeps it
+active. Retired definitions retain merges and namespace fences in the portable
+catalog, including across backup/restore; re-add/rename reactivates them through
+the same namespace admission checks. Reactivation advances the internal revision
+so source changes made while retired cannot reuse stale decisions. Independently
+registered resolvers remain
+active when an index is removed. Reapplying an older inline declaration records
+its ownership without changing its resolution revision. Retirement is additive
+catalog metadata and does not advance the required merge-state format version.
+A previous reader that tolerates optional fields can open the database, but may
+execute retired definitions; use a lifecycle-aware library when relying on
+retirement to suspend execution. Native Lite and Directory C API handles both
+reapply inline resolvers when adding an identical existing index.
+Existing artifact/index repair APIs rebuild derived state under the declared
+identity rules; they do not infer a key migration. This namespace operation
+reuses the existing resolver replay/repair pipeline for derived reconciliation.
+
+Only material resolution changes (including an explicit `config_generation`
+bump) schedule replay; changing revision bookkeeping alone does not. A changed
+scorer, routing rule or identity rule can affect every subscribed document and
+requires scanning its source corpus. Backfill skips source artifacts whose
+subscribers already have the current internal resolution revision, avoiding
+unrelated journal writes, ANN searches and embedding generation. The internal
+clock also advances on material changes before the first merge. Stale empty
+resolutions with no currently routed mentions are skipped; nonempty previous
+decisions are always revisited to retire removed labels/edges. A global scorer
+change necessarily revisits every source with eligible mentions; it cannot
+safely infer unchanged decisions without evaluating the new scorer. Older
+catalogs acquire the internal clock on their first material change. Identical
+config reapplication incurs no backfill. Portable import cross-checks sidecar
+records against the resolver catalog before publishing destination state,
+including missing required records and orphan/duplicate records.
+
+Default resolver catalogs omit new default fields (`aliases:[]`, `promote:true`,
+and zero merge metadata), retaining the previous wire shape. The current reader
+tolerates unknown optional fields and rejects unsupported `merge_state_version`
+values explicitly. **Downgrading a database using aliases, disabled promotion,
+or durable merges to a library predating those features is unsupported.** Such
+old strict readers reject the feature metadata; this is intentional protection
+against silently losing identity rules. Keep a pre-upgrade backup for rollback,
+or export primary application documents and rebuild a separate older database.
+Do not delete merge metadata or strip feature fields to force an old open.
+Files written by interim PR builds are not a supported downgrade format.
+
+The normal native regression now ingests an extraction, promotes its first
+entity, computes its embedding through the enrichment runtime, drains the root,
+and matches a different mention through ANN. It uses a deterministic embedding
+provider for both canonical entities and mentions so the ordering contract runs
+in ordinary CI. The required public Python Qwen test downloads the SHA-pinned
+Q8 bundle from the runtime registry, exercises the same promotion/drain/second-
+mention path with real embeddings and checks ad-hoc ANN query resolution.
+The opt-in Go Qwen test also exercises this contract. Neither test writes a candidate entity
+or its vector by hand.
+
+Both base and full-validation jobs run the required real extraction and public
+Qwen embedding gates. The pinned CPU extraction CI test sets
+`ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1`: missing runtime/model support is an error,
+not a skip. CI then runs `scripts/eval_extract.py` through its real-model gate on
+`regression.jsonl`, compares plain/described schemas, checks minimum precision
+and recall and non-empty correct spans for each label, and uploads the complete
+report even on failure. This 23-document curated regression set includes six
+negative documents, repeated names, accented/Arabic/Indic text, and a document
+long enough to require windowing. It remains a regression set, not a claim of
+production-domain accuracy; domain-specific labelled evaluation is still needed.
+
+## Incremental resolution work
+
+Resolution artifacts contain an optional, versioned `_resolution_work` cache.
+Each extraction-local mention records its embedding dependencies, candidate
+universe revision, candidate records and raw comparator features. This is
+reusable work, not authoritative identity state: old artifacts without it work
+normally, and malformed or unknown cache versions are discarded and recomputed.
+Public `resolve_query` responses omit the private cache and do not serialize
+or calculate persistence revisions for ephemeral work. Canonical records and
+vectors shared by several mentions are stored once per artifact. A validated
+candidate/mention revision also avoids rehashing unchanged vectors while
+reusing their comparison features.
+
+| Change | Repeated work |
+| --- | --- |
+| Match/review threshold, scorer weights or bias | Recombine cached features and classify candidates |
+| Comparator, comparison fields or similarity cutoff | Reuse raw similarities with matching input digests; compute missing comparisons |
+| Mention text or vector | Recompute that mention's dependent work |
+| Mention label/confidence or sibling routing | Readmit mentions and recompute affected candidate/decision dependencies |
+| Key template | Render keys again, refresh exact/blocked candidates, reuse embeddings and unchanged comparisons |
+| Blocking strategy, ANN index, candidate limit or hydrated vector fields | Fetch the new candidate set; reuse comparisons whose inputs still match |
+| Embedding producer or dimensions | Regenerate mention embeddings and dependent candidates/comparisons |
+| Alias/merge or human review | Apply current redirects/overrides to freshly classified decisions |
+
+Native Lite candidate revisions include the physical table binding, committed
+source/enrichment sequences, selected index configuration and its applied replay
+sequence. This covers canonical inserts/deletes, table recreation and vectors
+becoming visible after an ANN drain. Mention embedding keys combine the model
+identity, dimensions, effective provider settings (including input type,
+instruction and truncation), and a hash of the exact input string, independently of the
+source or destination table. Local capabilities expose identity before weights
+load: managed downloads hash sorted relative artifact paths and pinned receipt
+SHA-256 digests. Copying or restoring identical files preserves that identity.
+Receipt digests are verified against file content. Verified digests are memoized
+in memory and in disposable file-generation sidecars; inode, size, mtime and ctime
+changes invalidate verification. Legacy managed receipts use the same persistent
+content-hash memo, avoiding full rehash on every process reopen. Only
+unmanaged local models fall back to resolved weight, shard, ONNX external tensor,
+tokenizer and processor file generations (inode/size/mtime/ctime).
+Model construction cross-checks file generations to reject mid-load changes, and
+an already-loaded model retains its immutable identity. Unattested providers
+conservatively re-embed. Runtime adapters without complete candidate revisions
+refetch candidates while still allowing an attested embedding identity to reuse
+mention vectors.
+Embedding cache identities include the provider endpoint, region/project,
+credential source and resolved API-key digest, secret-store generation, and all
+embedding settings in addition to model revision. Keys never contain plaintext
+credentials. Equivalent destinations can still share vectors; distinct tenants,
+endpoints, rotated secrets and embedding settings cannot.
+
+The distributed adapter currently takes this conservative path. Candidate cache
+dependencies use the effective blocking strategy: a resolver without a scorer
+uses exact-key lookup even if its declarative strategy is prefix or ANN.
+Cross-table redirect candidates are refetched because the source-table revision
+does not cover survivor changes in another table. Comparison input hashes still
+allow safe feature reuse when the refreshed candidate fields are unchanged.
+
+The work cache is part of the resolution artifact, so the existing atomic
+artifact/replay commit, portable backup/import, source deletion and bounded
+crash-resumable replay own its lifetime. Resolver catalog changes mark the
+existing durable source-index cursors dirty in the same transaction. Replay
+loads the current configuration, so a superseding change does not install old
+cached decisions. Cache/revision-only refreshes with identical identity payloads
+publish a graph-only handoff and completion marker; they do not repeat canonical
+entity promotion. Changes to the promotion setting use the full handoff.
+
+A global scorer/template change still visits eligible source artifacts and
+mentions. It no longer requires rerunning extraction, embeddings, candidate
+search or comparisons whose dependencies are unchanged. Reuse is deliberately
+conservative: a destination mutation invalidates the table's candidate revision,
+including empty candidate sets, even if it ultimately changes no matches.
+
+
+### Embedded upgrade and identity management
+
+Prefer `add_index({..., "replaces":"knowledge_v1"})` for graph index versioning.
+Registration validates the request, reserves a hidden shadow and returns. The
+existing maintenance owner builds bounded source pages and catches up replay,
+saving its cursor and applied sequence after projection durability. The old
+index serves until the final bounded tail and atomic catalog swap. Field-backed
+changes re-process their changed sources rather than abandoning the build.
+Catch-up coalesces bounded journal windows by source key; larger activation
+windows resume per entry. Repeated updates to a hot document can share one
+reconstruction per window. Replay retention advances after durable checkpoints;
+it does not pin the entire journal.
+Restart resumes the durable marker/checkpoints, without rebuilding completed
+pages. Background construction retains its private manager across rounds, shares
+a source snapshot across each page, and checkpoints its resumable progress.
+Source pages collect at most 32 sources per turn, sharing their write plan,
+artifact transaction and graph apply. Collection yields after 100 ms, followed
+by the current bounded source batch. Resident managers are invalidated when the
+catalog revision changes, so reused builders cannot retain stale resolver rules.
+The private builder uses the LSM backend's existing bounded block cache to avoid
+repeated native immutable-source lease publication across checkpoint runs.
+It also drives the existing bounded foreground compaction policy, since private
+builders have no independent compactor to limit checkpoint-run accumulation. A resident progress cursor lets these
+short turns share a durability checkpoint: checkpoint the first turn, then at
+most once per second during construction, and always before activation. The
+journal remains pinned at the last durable cut; crash recovery repeats only
+unacknowledged work. Checkpoint fsync remains required before the durable cursor
+advances. The scan excludes unrelated metadata/journal keys, and replay begins
+strictly after the last consumed sequence.
+
+Explicit transient resource, disk-full and remote/network failures retry at most
+four consecutive times with persisted 50 ms, 200 ms, 800 ms and 3200 ms backoff.
+A durable source/replay checkpoint resets the consecutive count and backoff;
+volatile work does not. Each accepted job also has a lifetime ceiling of 64
+retries, which progress never resets. `retry_count`, `total_retry_count`,
+`max_total_retries`, `retry_after_ns` (Unix nanoseconds) and `last_error` are visible
+in replacement status. Generic `Unexpected`, `InputOutput`, `ReadFailed`,
+`WriteFailed` and `UnexpectedReadFailure` errors fail immediately, rather than
+presuming ambiguous storage failures are transient. Failure recording reloads the
+latest durable checkpoint so it cannot undo progress from the failed turn.
+Backoff survives reopen. When the scheduler reads a deadline more than 3.2 seconds
+in the future, it persistently clamps it to that horizon; a backward wall-clock
+step cannot impose an hours-long stall. Persisting the clamp once prevents it
+sliding forward on every poll. Waiting jobs yield to later replacements and
+ordinary maintenance.
+A permanent failure or exhausted retry budget enters terminal `phase: "failed"`,
+exposes `last_error`, releases its
+journal retention pin and retires any inline execution owned only by that shadow.
+It is excluded from scheduling: later replacements, artifact repair, drains and
+backups continue. Backups export serving state and exclude failed shadow outputs.
+Call `cancel_replacement(new_name)` to remove a running or failed reservation and
+schedule bounded artifact cleanup; the serving old index stays intact. Repeated
+cancellation is a no-op. Deleting the pending new name cancels its reservation.
+Deleting the serving old name removes it and cancels its shadow in one catalog
+transaction; a rejected deletion preserves the reservation and old index.
+Cancel and drain cleanup before registering a fresh attempt after failure.
+Plain `add_index` with the identical pending config joins its shadow even without
+`replaces`; conflicting configs are rejected before changing catalogs or storage.
+The final write fence consumes and durably checkpoints a bounded tail even when
+the gap exceeds 1024. An intra-entry source cursor also permits yielding within a
+large journal batch. Each pause advances completed sources rather than restarting
+the tail. Ordinary activation uses a 100 ms cooperative work budget, followed by
+the required durability checkpoint. After eight yielding attempts, the budget
+increases to at most one second, still capped by an explicit wait deadline.
+Escalation always has a finite deadline: it yields and persists its cursor when
+that budget expires. A current batch (up to 32 sources), storage operation or
+fsync may overrun the cooperative budget, so this is not a hard wall-clock bound
+on writer latency. In-process writers block on the apply lock for up to about
+one second during escalation, plus any in-flight batch and durability checkpoint.
+Sustained producers can require further bounded rounds; the
+old index keeps serving until the atomic swap. `activation_attempts` persists
+across reopen and is reported with replacement progress.
+Cutover coalesces windows containing at most 32 unique sources. Larger windows
+use resumable per-entry batches, including during escalation. Repeated writes to
+a hot document can coalesce within a window; the entire tail is not promised to
+finish in one pass. Partial large entries retain a durable source ordinal.
+Tail rebuilds share a source snapshot and write plan across batches of 32
+sources. Graph owner cleanup also pins one coherent outgoing/reverse snapshot
+pair for each batch, instead of reopening both stores for every document/prefix. Full document rebuilds cover their owned artifacts, so those artifacts
+are excluded from the source scan and journal artifact pass. Resolution batches
+also deduplicate owning extraction artifacts, rendering canonical relation
+endpoints once after all mention resolutions are applied.
+
+Identical in-progress requests join the existing reservation generation. A wait
+captures that generation under registration admission and retains it across
+quanta. Cancellation or target-name reuse returns `ANTFLY_CANCELLED`; a new
+serving index or reservation with the same name (even the same configuration)
+cannot complete the original wait. `replaces` and optional
+`"wait":{"timeout_ms":10000}` are command fields, excluded from stored config.
+Waiting cooperatively advances the same work, releasing handle/path locks between
+quanta so another caller can cancel or write. A missing job record triggers a
+second committed-catalog check, so a racing successful swap returns success.
+`ANTFLY_CANCELLED` describes cancellation of the call: it includes an explicitly
+cancelled replacement, callback cancellation, or interrupted IO/mutex admission.
+Interrupting a worker or a call does not cancel or fail accepted durable work;
+volatile work is discarded and the checkpoint remains resumable. If interruption
+races completion, inspect the index/job state. Storage/admission errors propagate, and a manual runtime sleeps through
+its control IO rather than spinning. Replacement precondition errors have distinct
+codes in C, Python, Go and Rust: `ANTFLY_REPLACEMENT_FAILED`,
+`ANTFLY_REPLACEMENT_PENDING` and `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`.
+Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
+handles and databases requiring ordered maintenance; it never chooses a local
+write merely to shorten a retry deadline.
+A pending plain replacement temporarily raises the minimum reader version to 2
+and publishes a versioned resolver envelope. The envelope fences pre-epoch
+writers whose replay cleanup ignores shadow retention, including already-open
+Lite writers when they refresh before mutation or maintenance. Failure releases replay retention but retains the name reservation and its
+compatibility fence. Once the last reservation swaps or is cancelled, its
+catalog transaction removes the temporary fence. Cancellation validates both
+in-memory and durable generation ownership before retiring anything; a foreign
+publication returns `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH` without mutation. A separate baseline preserves permanent resolver-feature
+requirements: a plain completed replacement returns to version 1, while actual
+authoritative resolver features retain version 2, and inline resolver handoffs
+or graph producer ownership metadata require version 3. Graph TTL expiry
+namespace migration requires permanent version 4; cancelling a shadow cannot
+remove that format fence.
+Deadline Busy means registration
+was accepted and the shadow continues in the background. Without wait, Busy is
+limited to bounded registration admission. Drain with `run_until_idle` to await
+all replacements. When both names are absent, the command behaves like ordinary
+add. Atomic replacement currently supports graph-to-graph upgrades with distinct
+names; other index kinds are rejected before inline configuration is changed.
+
+The separate-call recipe is add v2 first, then delete v1. When changing identity
+rules, migrate/reset the resolver namespace first and submit v2 with the new
+inline rules; existing v1 keeps execution active during this sequence. Delete-first
+upgrades are supported too: `list_resolver_identities` includes archived configs
+and durable merges, and `set_resolver_namespace` works on retired identities
+without reactivating them. Adding v2 then reactivates the migrated identity.
+`drop_resolver_identity` explicitly discards an archived identity and its merges;
+it rejects active identities. It does not delete existing resolution artifacts,
+canonical rows, application references or their redirects. Delete the source
+documents to remove their artifacts, and drain index cleanup to remove retired
+graph contributions. Explicitly delete canonical rows only after checking other
+resolvers and application references; shared destination rows have no single
+resolver owner. Index deletion only retires last-owner identities.
+
+The capabilities/status JSON reports the effective `minimum_reader_version`
+compatibility guard independently of package release: 1 for the baseline catalog,
+2 for extended identity/ownership/cache-policy fields such as `inline_managed`
+or `retired`, 3 for inline resolver handoffs or graph producer ownership, and
+4 for the separate graph-expiry namespace.
+Producer-replay reservations also temporarily require epoch 3, even with explicit
+producers and no staged resolver; plain field-backed reservations require epoch 2. The authoritative feature epoch is monotonic;
+a pending replacement can temporarily raise its effective guard as described
+above. Opening checks the effective epoch before parsing resolver definitions.
+Extended catalogs also use a versioned object envelope, which pre-epoch array readers
+reject even if they ignore unknown resolver fields. Older unstamped
+catalogs infer their epoch on load; the next mutation stamps it. Status polling
+uses cached epochs under a read guard. Plain table creation/drop preserves the
+original table catalog format and reader epoch 1; actual resolver format changes
+stamp the aggregate requirement in separate metadata. Authoritative feature
+epochs remain monotonic; removing a temporary replacement guard restores
+its authoritative baseline. Open loads the lightweight table catalog,
+then opens each table on demand. Named-table mutations aggregate only permanent
+format requirements into the root's authoritative baseline, including when the
+root itself has a temporary fence. Temporary guards remain scoped to their table
+reservations; status combines the effective cached epochs of loaded tables.
+Cancelling or completing a plain named-table replacement does not permanently
+upgrade the root. Background discovery isolates an unavailable table and reports its error
+in `unavailable_tables`; unrelated root/table reads remain available. Portable
+exports retain the stamp; imports validate it against supported versions and
+catalog requirements before publication. CI checks a real pinned pre-PR reader
+against both a plain database and one containing inline ownership fields.
+
+### Cache storage and mutation invariants
+
+Inline resolver configs accept `retain_work: "none" | "embeddings" | "full"`
+(default `full`) and `max_work_bytes` (default 1 MiB, maximum 16 MiB). The latter
+bounds persisted private work per resolution artifact; oversize work is omitted
+entirely without dropping authoritative entity decisions. `embeddings` retains
+only per-mention embedding references and dependencies, never candidate records
+or comparison features. Embedded mention vectors live once per model/text key
+in a shared content-addressed side store. Generated ANN candidate vectors retain
+index name, vector id and index revision; application-provided vectors reference
+the primary document field instead, preserving their values. Reuse reloads and
+validates each reference. Missing ids, moved revisions or missing/corrupt cache
+entries trigger candidate fetching or inference, never an identity change based
+on an absent vector. Scorer inputs remain lossless f32.
+
+Public artifact lookup and raw resolution lookup strip `_resolution_work`.
+Artifact deletion/replay own the reference lifetime. The mention side store is
+strictly expendable and excluded from portable backups. Inserts queue in a bounded
+16 MiB buffer. Root-source resolutions include the shared-cache writes in their
+resolution transaction; named sources flush one optional shared-cache transaction
+per resolution window after source commit, since Directory tables have distinct
+physical stores. No inference result commits independently per mention. A durable
+byte counter and eviction bound the shared store to 256 MiB across all tables.
+Periodic expiration visits at most 256 cache entries per page, never document
+keys, and expires entries after 30 days. Explicit vacuum can additionally mark
+live artifact references and discard unreferenced entries. Losing cache entries
+only costs inference.
+Portable artifacts may retain cache references; restore safely recomputes misses.
+
+Candidate epochs must advance on every visible destination insert, update,
+delete, TTL expiration and index publication. TTL uses ordinary guarded delete
+batches and advances the same replay clock. TTL-enabled destinations disable
+candidate reuse because logical expiration can precede physical cleanup. Physical
+compaction preserves that clock and cannot resurrect a deleted candidate. Directory adapters return no
+candidate revision until they can provide a pinned snapshot across tables;
+they refetch instead of reusing an unpinned candidate set. Aliases and merges are
+applied from current identity state on each resolution and override cached matches.
+Retiring a labeled resolver invalidates its source-sharing catch-all siblings and
+publishes durable backfill cursors in the retirement transaction. Routing dependencies
+use the same artifact-scope overlap rule as admission and query routing: `any`
+overlaps both `asset` and `chunk`, while `asset` and `chunk` remain disjoint.
+Activation and label changes use this rule too.
+
+### Source-table identity and retries
+
+Resolver names, aliases, merges and namespace fences are scoped by source table.
+Two source tables may use the same resolver name and key template. Separate
+destinations give independent entities. With a shared destination, identical keys
+intentionally identify the same canonical row: promotion preserves its first
+canonical name and unions aliases. Native promotions serialize under the database
+writer fence; Directory promotions use the transaction coordinator's version
+checks. Conflicting writes retry rather than silently overwrite one another.
+A merge on source A does not modify source B's resolver mappings, even when both
+promote to the same destination; shared destination rows remain shared data.
+
+`ANTFLY_BUSY` means concurrent execution/configuration prevented establishing a
+consistent operation. The public schema calls `add_index` (including `replaces`),
+`delete_index`, `set_resolver_namespace`, `drop_resolver_identity` and key merging
+may also return Busy before mutation when replay/promotion exceeds their bounded
+admission wait. Retry the identical schema request. Retry `resolve_query` with
+bounded exponential backoff (for example 5 ms doubling to 100 ms, with jitter).
+Queries perform no writes and are safe to retry. Identical index config replay,
+namespace reset/mapping to the same desired state, and repeated key merges are
+idempotent in outcome; revisions may advance on explicit namespace operations.
+Inspect identity/catalog state after an uncertain transport failure before retrying
+an irreversible drop. Catalog activity admission waits at most 100 one-millisecond
+intervals, then returns Busy before mutation; index deletion cannot spin forever
+behind extraction or promotion. No internal text-query retries repeat model work
+without the caller's latency budget. Native same-path calls retain the documented
+path serialization while inference releases the fence with pinned lifetimes.
+
+
+### Unavailable embedded namespaces
+
+Database-wide drain discovers available tables and reports failed opens in
+`pending_work_stats_json.unavailable_tables`, in both Lite and Directory.
+Healthy-table work and SQL reads continue; an operation that actually references
+an unavailable table still fails. Coordinated SQL constraints require a complete
+catalog and fail closed when dependency metadata is unavailable.
+
+Full portable backup retains its completeness guarantee and fails if any table
+cannot be opened. Explicit `backup_json({"tables":["healthy"]})` (Python
+`backup(tables=["healthy"])`) includes default plus exactly those named tables,
+without opening unrelated namespaces. Restore reconstructs only that explicit
+scope. Include dependency tables when exporting schemas with cross-table
+constraints or resolver references. Go and Rust expose `BackupJSON`/`backup_json`;
+all bindings expose replacement cancellation.
+
+## Inline resolvers during graph replacement
+
+Embedded `add_index` with `replaces` can transfer an inline resolver to a new
+graph version without changing its public resolver name. A changed resolver must
+use fresh extraction **and** resolution artifact names. An overlapping extraction
+subscription cannot already belong to a serving resolver or another pending
+replacement. Siblings within one replacement may share their private source;
+asset and chunk subscriptions remain disjoint unless either uses `any`. Ordinary
+resolver admission and reactivation cannot join a reserved private source until
+that replacement finishes or is cancelled. Publication revalidates this rule for
+reservations from older writers. Admission stages a
+separate execution contract alongside the serving resolver, records it with the
+durable shadow reservation, and resets the existing bounded resolution replay
+cursors. Inline extraction producers are admitted in that transaction too;
+existing documents are replayed in resumable pages before graph construction,
+without a corpus scan at admission or activation. This replay covers every
+artifact source required by the new graph and its upstream producers, including
+graphs with absent or unchanged resolvers and staged resolver sources that are
+not direct graph sources. A missing enrichment runtime is
+created on demand, including after reopen; manual owners retain synchronous
+execution without starting background workers. The old graph and public resolver
+remain authoritative during the build. Label exclusions, query routing, and
+sibling canonical-key dependencies use separate serving and per-replacement
+views, including for legacy reservations with shared input streams. Graph replay,
+relation endpoint maps, foreground projection and mention-state protection use
+only public resolvers plus the target graph's own private contracts. Serving
+graphs cannot consume staged decisions even when they share its extraction
+producer without declaring a resolver, or are admitted after staging. Every
+successor advances its revision and schedules bounded replay at cutover,
+including resolve-only contracts, to release decisions to those serving graphs.
+`run_until_idle` drains replay released by its final swap before returning,
+including on manual owners without background workers.
+Cancellation of fresh reservations
+never changes serving sibling revisions. Cancelling or failing a legacy shared-source
+reservation invalidates any potentially contaminated serving decisions durably. Cutover durably invalidates source-sharing
+siblings affected by retiring the predecessor, including canonical-key dependencies and resets their replay cursors in
+the catalog transaction. Explicit waits drive manual enrichment
+with the remaining caller deadline, without enabling background workers or
+resuming deliberately paused background owners. A named wait advances its own
+reservation and rechecks its generation under scheduler ownership, so an earlier
+corpus build or a cancelled-and-reused name cannot redirect its work.
+Resolution yields between source artifacts, after at most 32 keys per quantum,
+and checks the same monotonic deadline before each unit. Each source keeps its
+sibling resolver routing intact, including ordered receipt/read-set validation. An in-flight source/provider operation can overrun the deadline; a large
+journal batch cannot extend that into unbounded additional source operations.
+A durable intra-record cursor advances only after source output publication, and
+the resolution watermark stays pinned until the entire record completes. Restart
+and ordinary workers resume this cursor. The resident runtime retains one decoded
+record across quanta to avoid repeatedly parsing a large batch.
+The same deadline bounds indexed backfill discovery and legacy source-index
+repair. These scans count physical rows, including stale markers, and retain
+cursors behind unfinished sources. Replay is durable before discovery markers
+are repaired; a failed append cannot hide source work from a retry.
+Write-fenced and ordered owners leave prerequisites queued; waiting can still
+observe completion or reach its deadline without choosing local mutations.
+Producer replay yields after at most 4096 physical records, a 4 MiB byte budget,
+or a 100 ms quantum (and honors an earlier caller deadline). Byte and time
+budgets are checked between records, so a single oversized record still makes
+progress. Its durable cursor includes artifact-only pages, rather than counting
+only primary documents toward the work budget. The scan ends at the document
+namespace boundary; replay journals and identity state do not extend it.
+The successor takes the public name in the same transaction that activates the
+shadow graph; cancellation or terminal build failure retires only the staged
+execution contract. Staged resolver decisions cannot promote entity documents.
+Activation advances the successor's resolution revision and saves a bounded
+backfill cursor in the same transaction. That backfill releases promotions after
+cutover, including after a restart and when retained resolver work is disabled;
+serving resolver promotions continue during construction.
+
+Graph shorthand records producer ownership in the enrichment catalog. Removal,
+cancellation and cutover atomically remove owned producers with no surviving
+index, resolver, pending shadow or downstream producer references. Quarantined
+indexes retain their ownership and dependencies even without loaded runtimes;
+malformed quarantined definitions retain producers conservatively. Reachability
+walks each upstream dependency once. Explicit
+producer upserts adopt ownership, keeping those producers available independently.
+Older producer catalogs without ownership provenance are conservatively retained.
+Pending replacement and resolution work resume after reopen.
+
+The successor inherits durable merges and, when omitted in its declaration,
+inline aliases. Resolver mutations return `replacement_pending` during the build;
+finish or cancel the replacement before making further identity changes. A
+resolver independently created through the resolver API, or declared by another
+configured graph, including a quarantined one, cannot be taken over. An unchanged resolver contract can be reused
+without creating a new execution stream. Pending graph reservations participate
+in ownership checks too. A graph cannot acquire a resolver while its handoff is
+pending, and publication revalidates exclusive ownership before retiring the
+serving execution contract.
+
+Changing a key template is supported when no aliases, merges, or explicit
+namespace fence exist. Curated namespaces still require an explicit
+`set_resolver_namespace` migration with an endpoint mapping (or an explicit reset)
+before requesting a replacement with a different table or template. Replacement
+cannot infer an arbitrary old-key to new-key mapping and does not discard curated
+redirects to make that change succeed.
+
+Internal predecessor contracts remain retired so replay can recognize old
+resolution artifacts without executing the old resolver. They do not appear in
+public resolver or identity listings. Databases containing staged contracts
+require resolver reader version 3; older readers reject them before parsing.

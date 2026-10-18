@@ -71,7 +71,7 @@ fn jobKey(a: A, store: *Store, table: u64, cut: [32]u8) ![]u8 {
 fn cancellation(context: Context) Cancellation {
     return if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
 }
-pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool) ![]const Declared {
+pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64) ![]const Declared {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -87,7 +87,7 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     var job: Job = if (saved) |value| try std.json.parseFromSliceLeaky(Job, scratch, value.body, .{ .allocate = .alloc_always }) else .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = overlay.pending.lsn, .archive_generation = publication.generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut };
     if (job.version != 1 or !std.mem.eql(u8, &job.cut, &cut) or job.table_id != table.table_id or job.object_generation != table.object_storage_generation or job.wal_lsn != overlay.pending.lsn or job.archive_generation != publication.generation or !std.mem.eql(u8, &job.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
-    if (job.state == .ready and job.expires_ms > now +| @import("lake_retained_cut.zig").ttl_ms) {
+    if (job.state == .ready and job.expires_ms > @max(now, cut_expires_ms)) {
         const encoded = try std.json.Stringify.valueAlloc(scratch, job.declarations, .{});
         return std.json.parseFromSliceLeaky([]const Declared, a, encoded, .{ .allocate = .alloc_always });
     }
@@ -96,7 +96,7 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     const io = context.io orelse return error.UnsupportedQueryRequest;
     job.state = .building;
     job.lease_until_ms = now +| 120_000;
-    job.expires_ms = now +| retention_ms;
+    job.expires_ms = @max(now +| retention_ms, cut_expires_ms +| 1);
     job.attempts +|= 1;
     io.random(&job.owner_token);
     job.last_error = null;
@@ -417,4 +417,33 @@ test "external lake interrupted enrichment claims release conditionally without 
     defer recovered_state.deinit();
     try std.testing.expectEqual(@as(u64, 0), recovered_state.value.lease_until_ms);
     try std.testing.expectEqualStrings("interrupted", recovered_state.value.last_error.?);
+}
+
+// A ten-minute generation can serve a five-minute cut, but cannot be bound
+// into an hour-long cursor, even while it remains ready and unexpired.
+test "external lake recent vectors require retention through the entire query cut" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-recent-retention");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    var store = try Store.open(alloc, &config, null, false);
+    defer store.deinit();
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "history", .schema_json = "{}", .indexes_json = "{}" };
+    const publication: local.metadata_lake_index_catalog.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    const overlay = try overlay_api.Overlay.init(a, .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{} });
+    const cut = try cutDigest(a, table, publication, &overlay);
+    const key = try jobKey(a, &store, table.table_id, cut);
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    const job: Job = .{ .state = .ready, .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = 8, .archive_generation = publication.generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut, .expires_ms = now + 600_000 };
+    var client = store.opened.client;
+    var saved = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(a, job, .{}), .{});
+    defer saved.deinit(client.allocator);
+    try std.testing.expectEqual(@as(usize, 0), (try prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_000)).len);
+    try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 3_600_000));
+    try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, job.expires_ms));
 }

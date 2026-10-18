@@ -178,6 +178,52 @@ pub const DecideAnswer = union(enum) {
     }
 };
 
+/// Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
+pub const DecideLongDocument = struct {
+    mode: ?[]const u8 = null,
+    window_words: ?i64 = null,
+    /// Must be smaller than window_words. Only valid in window mode.
+    overlap_words: ?i64 = null,
+    max_windows: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "window_words", "window_words", true },
+        .{ "overlap_words", "overlap_words", true },
+        .{ "max_windows", "max_windows", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.window_words) |value| {
+            try jw.objectField("window_words");
+            try jw.write(value);
+        }
+        if (self.overlap_words) |value| {
+            try jw.objectField("overlap_words");
+            try jw.write(value);
+        }
+        if (self.max_windows) |value| {
+            try jw.objectField("max_windows");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DecideQuestion = union(enum) {
     multi_choice_decision_question: *MultiChoiceDecisionQuestion,
     choice_decision_question: *ChoiceDecisionQuestion,
@@ -284,6 +330,7 @@ pub const DecideRequest = struct {
     model_identity: ?[]const u8 = null,
     input: ?[]const u8 = null,
     inputs: ?[]const DecisionInput = null,
+    long_document: ?DecideLongDocument = null,
     questions: []const DecideQuestion,
     embedding_options: ?EmbeddingDecisionOptions = null,
 
@@ -293,6 +340,7 @@ pub const DecideRequest = struct {
         .{ "model_identity", "model_identity", true },
         .{ "input", "input", true },
         .{ "inputs", "inputs", true },
+        .{ "long_document", "long_document", true },
         .{ "questions", "questions", false },
         .{ "embedding_options", "embedding_options", true },
     };
@@ -319,6 +367,10 @@ pub const DecideRequest = struct {
         }
         if (self.inputs) |value| {
             try jw.objectField("inputs");
+            try jw.write(value);
+        }
+        if (self.long_document) |value| {
+            try jw.objectField("long_document");
             try jw.write(value);
         }
         try jw.objectField("questions");

@@ -34,7 +34,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     // ReleaseSafe avoids LLVM inference miscompilation and V8's local-variable
     // limit for unoptimized database batch functions.
     const optimize: std.lang.Optimize = .safe;
-    const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse false;
+    // Browser bundles retain ReleaseSafe checks but do not need DWARF in the
+    // shipped module. Keep debugger metadata an explicit opt-in: it accounts
+    // for most of the bundle size and its Linux LLVM build exhausted 24 GiB.
+    const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse true;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -120,6 +123,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const regex_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     regex_mod.addImport("antfly_fst", fst_mod);
     regex_mod.addImport("antfly_platform", wasm_platform_mod);
+    const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, wasm_target, optimize, b.path("lib/sql_regex"));
+    regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     const chunking_mod = b.createModule(.{ .root_source_file = b.path("lib/chunking/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     chunking_mod.addImport("antfly-json", json_mod);
     chunking_mod.addImport("antfly_chunking_api_openapi", api.chunking_api);
@@ -148,6 +153,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         wasm_hash_mod,
         fst_mod,
         regex_mod,
+        sql_regex_mod,
         wasm_image_mod,
         wasm_font_mod,
         wasm_pdf_mod,
@@ -216,12 +222,12 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     }));
     const wasm_matcher_mod = b.createModule(.{
-        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/matcher/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     const wasm_resolver_mod = b.createModule(.{
-        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/resolver/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
@@ -323,7 +329,6 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
 
     // --- Inference WASM modules for unified antfly.wasm ---
     const inference_wasm_build_options = b.addOptions();
-    inference_wasm_build_options.addOption(bool, "enable_onnx", false);
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
@@ -382,11 +387,13 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    @import("antfly_media").support.attach(b, wasm_inference_audio_mod, b.path("lib/media"));
     const inference_wasm_inference_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
+    inference_wasm_inference_mod.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig")));
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
     inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
@@ -416,10 +423,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const antfly_wasm = b.addExecutable(.{
         .name = "antfly_wasm",
         .root_module = antfly_wasm_mod,
-        // Cold ReleaseSafe LLVM codegen measured 18.45 GB. Reserve 20 GiB
-        // with headroom so full-suite admission does not overlap it with
-        // the large native engine archives beyond the build memory budget.
-        .max_rss = 20 * 1024 * 1024 * 1024,
+        // Keep the production bundle's existing conservative reservation.
+        // The optional DWARF build exceeded the 24 GiB runner envelope; its
+        // larger reservation makes a bounded CI invocation reject that
+        // profile before spending time on a build which cannot fit.
+        .max_rss = (if (strip) @as(u64, 20) else 32) * 1024 * 1024 * 1024,
     });
     antfly_wasm.entry = .disabled;
     antfly_wasm.rdynamic = true;

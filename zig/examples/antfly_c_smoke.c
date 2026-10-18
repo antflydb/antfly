@@ -145,7 +145,7 @@ int main(void) {
     (void)remove(missing_path);
     (void)remove(bad_path);
 
-    if (antfly_abi_version() != 2) {
+    if (antfly_abi_version() != 3) {
         fprintf(stderr, "unexpected Antfly ABI version: %u\n", antfly_abi_version());
         return 1;
     }

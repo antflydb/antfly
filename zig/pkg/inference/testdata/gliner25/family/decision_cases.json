@@ -1,0 +1,205 @@
+{
+  "format_version": 1,
+  "cases": [
+    {
+      "id": "support_intent",
+      "texts": [
+        "My subscription renewed on April 15 for ¥5,400 after the service was already down. Can I get that charge refunded?"
+      ],
+      "tasks": {
+        "intent": [
+          "order_status",
+          "refund_request",
+          "cancel_subscription",
+          "update_payment",
+          "login_problem",
+          "shipping_delay",
+          "bug_report",
+          "speak_to_human",
+          "other"
+        ]
+      }
+    },
+    {
+      "id": "travel",
+      "texts": [
+        "I need to move my Friday flight to Paris to Saturday morning, same cabin, and keep the aisle seat if you can."
+      ],
+      "tasks": {
+        "request": [
+          "book",
+          "change",
+          "cancel",
+          "status",
+          "seat_change",
+          "refund",
+          "baggage"
+        ]
+      }
+    },
+    {
+      "id": "hotel_multi_task",
+      "texts": [
+        "Guest in room 1408 says the AC has been out since yesterday and they want to move tonight or leave. They also asked for the incidentals hold to be released."
+      ],
+      "tasks": {
+        "intent": [
+          "maintenance",
+          "room_change",
+          "checkout",
+          "billing",
+          "complaint",
+          "amenity_request"
+        ],
+        "priority": [
+          "low",
+          "normal",
+          "high",
+          "urgent"
+        ],
+        "needs_human": [
+          "yes",
+          "no"
+        ],
+        "topics": {
+          "labels": [
+            "hvac",
+            "billing",
+            "housekeeping",
+            "noise",
+            "safety"
+          ],
+          "multi_label": true,
+          "cls_threshold": 0.4
+        }
+      }
+    },
+    {
+      "id": "passage_question",
+      "texts": [
+        "The treaty was signed in Paris in 1992. It entered into force the following year, after the last signatory ratified it."
+      ],
+      "tasks": {
+        "answer": {
+          "labels": [
+            "yes",
+            "no"
+          ],
+          "prompt": "Did the treaty enter into force in 1992?"
+        }
+      }
+    },
+    {
+      "id": "described_labels",
+      "texts": [
+        "Please reset the card PIN. The new one never arrived and the old one is locked after three tries."
+      ],
+      "tasks": {
+        "intent": {
+          "labels": {
+            "card_pin_change": "The customer wants a new PIN or the current PIN replaced",
+            "card_lost": "The physical card is missing",
+            "balance_inquiry": "The customer wants the current balance"
+          }
+        }
+      }
+    },
+    {
+      "id": "ordinal",
+      "texts": [
+        "I finished it in two nights. The ending is earned, the middle drags, and I would still hand it to a friend."
+      ],
+      "tasks": {
+        "rating": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10"
+        ]
+      }
+    },
+    {
+      "id": "book_genre",
+      "texts": [
+        "She closed the ledger, blew out the lamp, and listened for the stair. The house had been empty since the winter the river took the bridge"
+      ],
+      "tasks": {
+        "genre": [
+          "mystery",
+          "romance",
+          "history",
+          "science_fiction",
+          "literary_fiction",
+          "cookbook"
+        ]
+      }
+    },
+    {
+      "id": "sentiment_multi",
+      "texts": [
+        "Great food but the service was painfully slow and our waiter was rude!"
+      ],
+      "tasks": {
+        "sentiment": [
+          "positive",
+          "negative",
+          "mixed",
+          "neutral"
+        ],
+        "aspects": {
+          "labels": [
+            "food",
+            "service",
+            "price",
+            "ambience"
+          ],
+          "multi_label": true
+        }
+      }
+    },
+    {
+      "id": "distinct_multilingual",
+      "texts": [
+        "Please refund the duplicate charge.",
+        "Je souhaite annuler mon abonnement.",
+        "Bitte helfen Sie mir beim Anmelden.",
+        "重複した請求を返金してください。",
+        "يرجى إلغاء اشتراكي.",
+        "Quiero cancelar mi suscripción.",
+        "로그인할 수 없습니다.",
+        ""
+      ],
+      "tasks": {
+        "intent": [
+          "refund",
+          "cancel_subscription",
+          "login_problem",
+          "other"
+        ]
+      }
+    },
+    {
+      "id": "ragged_descriptions",
+      "texts": [
+        "Refund.",
+        "The application has been unavailable since yesterday. I have already contacted support twice and need someone to help me log in."
+      ],
+      "tasks": {
+        "intent": {
+          "labels": {
+            "refund": "Return a payment",
+            "technical_support": "Help fix a technical problem",
+            "sales": "Buy a product"
+          }
+        }
+      }
+    }
+  ]
+}

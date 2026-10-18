@@ -112,3 +112,49 @@ def test_find_library_uses_lib_dir_env_var(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.delenv("ANTFLY_LIBRARY", raising=False)
     monkeypatch.setenv("ANTFLY_LIB_DIR", str(tmp_path))
     assert find_library() == lib_path
+
+
+def test_native_error_detail_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Library:
+        def antfly_last_error_code(self):
+            return errors.INVALID_ARGUMENT
+
+        def antfly_last_error_detail(self):
+            return b"MissingIndexType"
+
+    monkeypatch.setattr(_ffi, "_lib", Library())
+    with pytest.raises(errors.InvalidArgumentError, match="MissingIndexType"):
+        errors.raise_for_code(errors.INVALID_ARGUMENT)
+
+
+def test_unrelated_native_detail_is_not_attached(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Library:
+        def antfly_last_error_code(self):
+            return errors.INVALID_ARGUMENT
+
+        def antfly_last_error_detail(self):
+            return b"MissingIndexType"
+
+    monkeypatch.setattr(_ffi, "_lib", Library())
+    with pytest.raises(errors.NotFoundError) as result:
+        errors.raise_for_code(errors.NOT_FOUND)
+    assert "MissingIndexType" not in str(result.value)
+
+
+def test_models_directory_survives_options_marshalling(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+    import gc
+
+    import antfly_embedded
+
+    class Library:
+        def antfly_open_options_init(self, options):
+            return errors.OK
+
+    monkeypatch.setattr(_ffi, "get_lib", lambda: Library())
+    options, keep_alive = antfly_embedded._build_c_options(
+        antfly_embedded.OpenOptions(models_dir=Path("/tmp/model-café"))
+    )
+    gc.collect()
+    assert ctypes.string_at(options.models_dir.ptr, options.models_dir.len) == "/tmp/model-café".encode()
+    assert keep_alive is not None

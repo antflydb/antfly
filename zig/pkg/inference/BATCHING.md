@@ -104,7 +104,7 @@ model generation. Neither layer merges task semantics or resets deadlines.
 | Dense text, including Qwen3 embedding profiles | Text broker; task/instruction-aware keys; observed adaptive execution |
 | Sparse text | Typed sparse-vector broker; fixed-shape/serial graphs bypass native fill delay |
 | CLIP/ClipClap images | Encoded-image or borrowed-raster groups |
-| CLAP/ClipClap audio | Indexed decoding and bounded PCM/feature windows |
+| CLAP/ClipClap audio | Indexed decoding, bounded waves of up to eight clips, and one future CPU feature wave overlapping the resident native encoder |
 | GLiNER NER, relations, structured extraction, classification | Shared encoder boundary; classification retains independent score decoding; ONNX remains compatibility execution |
 | Native generators, including multimodal architectures | Existing token-step coordinator, now reachable from isolated direct and non-streaming HTTP requests |
 | Fixed chunker | Immediate bounded transform; no model fill delay |
@@ -283,6 +283,26 @@ descriptors, not JSON arrays. A typed invocation rejects an absent numeric resul
 rather than falling back to JSON under a numeric-only memory allowance. These
 contracts apply independently of model family and do not change public APIs.
 
+Worker route capabilities constrain rendering before materialization. The
+worker advertises a 64 MiB complete request envelope
+(`attachment_envelope_max_bytes`, applied even with zero attachments) and a
+separate 1 MiB attachment-metadata ceiling (`attachment_metadata_max_bytes`).
+Metadata is measured from the actual serialized JSON, including escaping, not
+from UTF-8 length divided by an expansion factor; text-only requests keep the
+original logical JSON ceiling. Only raw PDF planning derives a tightly packed
+RGBA pixel ceiling from the payload limit; encoded images keep the model's
+pixel allowance, and raw accounting includes stride padding. Embedding windows
+check both ceilings with framing arithmetic shared with the envelope encoder,
+split mixed text/image windows without shrinking valid text-only batches, and
+reject an indivisible oversized item before provider dispatch.
+
+Private provider errors are diagnosed by their owning runtime before the first
+ABI or worker-RPC hop normalizes them to `InferenceProviderFailure`. Linked and
+isolated inference share one bounded operation/error/model diagnostic policy;
+the receiving bridge does not re-log normalized errors or expose
+backend-specific error names in its wire ABI, and logs never include request
+bodies or media bytes.
+
 This is shared fused-batching infrastructure, not a claim that every artifact
 and provider now executes natively batched. GPU generation's shared graph,
 stream, scratch and request-budget state still needs backend-specific isolation;
@@ -334,6 +354,171 @@ Explicit per-item-error requests and traced HTTP requests keep their existing
 executors. Native cross-request support is not inferred merely from sharing a
 model family or provider. Observed native results and coalesced groups are
 separate broker metrics; a compatibility fallback is not called a native batch.
+
+## GPU residency for media embeddings
+
+Intermediate numeric tensors stay on the inference device for an admitted batch.
+Compressed media, parsing, metadata and final vectors remain host boundaries.
+Ownership, resource admission and cancellation extend through the last consumer;
+residency does not mean retaining an ingestion corpus in VRAM. A backend lacking
+required operations retains a typed compatibility route. Explicit resident entry
+points reject unsupported capabilities rather than silently exporting activations.
+
+### Transfer boundaries
+
+| Input | Host preparation | Resident work |
+| --- | --- | --- |
+| Image | Codec decode, model-exact resize/crop, normalized pixels/patches | Patch/token assembly, attention, pooling and projection |
+| PDF raster | CPU parser/renderer, borrowed RGBA; no PNG round trip | Vision and image-only embedding prompt/encoder/pooling |
+| PDF text | Text extraction/tokenization | Text encoder; rasterization is unnecessary for text embeddings |
+| Gemma4 audio | Codec decode, bounded resampling, Hann-window frame packing | DFT, magnitude, mel/log features, subsampling, conformer where supported, projected rows and embedding encoder |
+| CLAP audio | Mel/batch-norm/spectrogram preparation and compatibility AFF frontend | Resident Swin encoder, pooling and projection |
+
+GPU preprocessing is not an unconditional speed win: full-resolution pixels can
+be much larger than model-sized pixels, and preprocessing competes with inference
+for device resources. Unified-memory Metal still incurs synchronization and host
+materialization. NVIDIA nvJPEG/nvImageCodec or DALI are potential implementation
+references, not dependencies introduced by this work. The shared CPU
+[JPEG/PDF and WebP preparation](../../../docs/design/inference/history/gemma4/media-optimization-2026-10.md#pdf-rendering-and-codecs)
+optimizations do not make codecs GPU-resident.
+
+### Implemented first phase: CLIP eager vision residency
+
+`visionEncoderForwardTensor` borrows normalized F32 NCHW pixels and returns an
+owned tensor freed with the creating backend. Patch packing, CLS/position
+assembly, head layouts, CLS gather and projection use backend operations.
+Accelerated host-facing calls export only the final embedding; Metal explicitly
+stages pixels into device storage. CPU retains contiguous host patch extraction.
+Static quantized-weight materialization and graph-runtime routes are separate
+concerns. CLIP's path does not imply residency in every architecture.
+
+### Gemma 4 vision residency
+
+Patch projection, position addition, head RMS, spatial RoPE, vision blocks,
+spatial pooling, standardization, norm and projection retain backend tensors.
+Backend transposes preserve Gemma's rotary spatial-axis pairing and SDPA scale;
+pooling gathers preserve image/merge order. Static position offsets may be
+prepared on CPU. Decode, resize, initial patch packing and the direct projector's
+first patch norm remain host work. Diagnostic stage dumps and unsupported
+providers retain explicit export/fallback boundaries.
+
+Image-only embedding and generative prompt handoffs now retain projected rows
+through the next encoder/prefill where supported. Public host-array projector
+APIs, mixed/titled compatibility groups and providers missing operations retain
+their existing boundaries. Do not infer residency merely from model family.
+
+### Gemma 4 audio, CLAP, OCR and Qwen extensions
+
+| Route | Numeric residency contract | Remaining boundaries |
+| --- | --- | --- |
+| Gemma4 audio | 320-sample Hann windows, 160-hop, 512-point zero-padded DFT, **magnitude**, mel projection, additive 1e-3 floor, natural log and valid-frame mask; subsampling/encoder consume features directly | CPU decode/resample/frame packing; CUDA conformer operations without kernels retain host compatibility |
+| CLAP eager audio | Patch convolution/layout/norm, shifted/unshifted Swin, relative bias/masks, patch merges, pooling/projection | CPU features/input norm; AFF compatibility before Swin; graph strategies remain explicit |
+| OCR CTC | Resident session output, argmax, winning-score gather | Download O(time) choices/scores for blank/repeat collapse, dictionary and confidence; detection/crops/layout remain host routes |
+| Qwen3 VL | Patch position addition and base-text/image prompt assembly | CPU static interpolation, final visual/deepstack arrays, opt-in qualification hashes |
+| Qwen2 VL / ColQwen | Backend patch-weight reshape and spatial/temporal vision RoPE in merge order | CPU decode/resize/patch packing and metadata; unsupported attention/RoPE retains typed fallback |
+
+Gemma's audio frontend retains the 480,000-sample bound. Transient DFT/mel
+matrices are not cached as model weights. `TERMITE_GEMMA4_AUDIO_HOST_OPS=features`
+(or `all`) restores CPU operations for diagnosis. Account for live frame/spectrum/
+mel scratch before raising concurrency. CLAP's window/head bias scratch scales
+with batch, heads and window area; small maps/masks remain host metadata.
+
+CTC validates `[1,time,vocabulary]`, preserves original score/confidence semantics
+and reuses the already-computed resident output if reductions are unsupported.
+Cancellation/resource failures propagate instead of re-running inference.
+Qwen3 hashes are explicit diagnostic synchronization; Qwen2 spatial RoPE restarts
+axes in the original grouping, including temporal slices. Synthetic parity and
+transfer fixtures qualify these boundaries; CUDA cross-compilation is not CUDA
+hardware qualification. Dated pass counts are in the history summary below.
+
+### Gemma 4 cross-image batches and measurement
+
+Same-grid images share patch projection, vision blocks, pooling and projection.
+Rows flatten in image/patch order; attention retains independent batch/sequence
+axes, and spatial RoPE restarts for each image. Different grids and token/scratch
+ceilings split cohorts without padding inside vision attention. Low-level
+`ImageBatchOptions` defaults: four images, 10,080 patch tokens, 768 MiB estimated
+scratch; explicit offline APIs allow eight, while serving remains at four.
+An oversized singleton returns `ImageBatchBudgetExceeded` before GPU work.
+Geometry/pixel lengths are validated before allocation.
+
+Encoded and borrowed-raster pipelines reserve bounded host preprocessing before
+decode, then acquire GPU scratch under the model execution gate. Queued requests
+do not retain vision scratch. Vision and encoder temporaries have disjoint
+lifetimes: reserve their larger workspace plus retained/output storage. A
+physical vision cohort may split while the downstream encoder still batches.
+Codec/validation failures keep original indexes; resource/control/backend failures
+propagate. The geometry-qualified image-only broker below coalesces across callers;
+client concurrency remains distinct from physical model batching.
+
+`antfly-gemma4-image-bench` scopes: prepared `projector`, encoded `image`, borrowed
+raster full `embedding`, and independent-decode `encoded-embedding`. Shared-raster
+scope decodes once; encoded scope decodes every row. File reads/model load stay
+outside warm timing. Requested count differs from actual projector occupancy;
+internal embedding projector counters may be unavailable and reported null.
+Final-vector agreement, actual occupancy, scoped transfer counters and memory
+counter coverage are separate evidence. Runtime/model pools and bounded workspace
+are not interchangeable peak-memory measurements.
+
+Use [image campaigns](scripts/embeddinggemma2/image_campaign.py) for pinned
+baseline/candidate order, hashes, complete vectors and HTTP concurrency 1/2/4/8.
+Warm distributions need ten warmups and at least 100 samples; cold first-forward
+runs use a separate process. Amortized batch seconds/image is not caller latency.
+Qualify residency and batching separately at actual patch geometry; retain errors
+and host-contention observations instead of silently retrying overload.
+
+### Local Gemma 4 image measurements (2026-10-11)
+
+Dated measurements moved to the [media throughput history](../../../docs/design/inference/history/gemma4/media-optimization-2026-10.md#image-and-audio-embeddings).
+The initial four-row projector gained ~11%; eight rows were slower and doubled
+activation storage. Serving remains capped at four. Later Flash/frame results
+are qualified separately; historical HTTP concurrency did not establish increased
+physical batching or a throughput gain. [Results](../../../docs/design/inference/media-throughput-results.json) link the pinned detailed evidence.
+
+### Gemma4 PDF measurement and resident embedding handoff
+
+Image-only `embedImages`/`embedRasters` retain projected visual rows through
+backend prompt assembly, embedding encoder and masked pooling; only final pooled
+vectors download. The owner retains its creating backend through cleanup.
+`Options.resident_images=false` selects the host comparison. Mixed/titled groups
+and unsupported providers retain compatibility. Current audio-only handoff has
+its own qualification below.
+
+The [PDF benchmark](scripts/embeddinggemma2/pdf_campaign.py)
+measures actual parser/rendered rasters through embedding, with explicit document/
+page IDs, round-robin scheduling, at most four live pages, four private readers,
+256 MiB raster output, private 256 MiB scratch per worker and eight-million-pixel
+page/DPI/dimension bounds. Initial parsing/model load are reported separately.
+CPU production rendering avoids image re-encoding between renderer and model.
+
+The Metal PDF painter is **benchmark-only**. It supports opaque closed fills and
+axis-aligned nearest-sampled images; any unsupported text/stroke/transparency/
+clipping/shading/pattern/rotation or lossy coordinates rejects the page before
+submission and uses exact CPU rendering. Bounded workers publish scenes/fallback
+classification, permitting painting to overlap remaining CPU fallback; cleanup
+joins every worker. Paint order survives 32×32 tile binning, capped at four
+million references/16 MiB per page; dense pages use bounds-culled rendering.
+Four synchronous reusable buffer slots are capped at 512 MiB, accounted separately.
+GPU rasters copy to host for model-exact CPU preprocessing. There is no resident
+all-GPU PDF decoder or prepared-page cache.
+
+Pixel gates and vector gates precede timing; failed GPU execution/parity is not
+silently replaced by CPU. Compare same-batch render-only and full-pipeline cases,
+retaining fallback counts, actual geometry/cohorts, copies and scoped memory.
+Enqueue/phase times are not isolated GPU kernel durations. Dated renderer/JPEG
+results and unresolved end-to-end variation are in the linked history.
+Production rendering stays CPU until representative coverage and end-to-end gains
+are qualified.
+
+### Further implementation and measurement
+
+Durable rules above supersede the earlier step-by-step implementation diary.
+The [media history](../../../docs/design/inference/history/gemma4/media-optimization-2026-10.md)
+records decisions, rejected trials and exact baseline scopes. Extend qualification
+with realistic pages/audio lengths and idle-host repetitions. Backend-specific
+Flash/fusion/residency results do not transfer automatically to other models or
+CUDA. Keep startup, preparation, recognition, embedding and renderer timings
+separate; only a measured full pipeline establishes ingestion throughput.
 
 ## Synchronous generation batch endpoint
 
@@ -417,7 +602,7 @@ creating the durable job.
 The `/read` endpoint accepts multiple images and routes them through a reader-level batch API instead of invoking the model once per image. The public HTTP request is capped at 64 images and an aggregate downloaded-input byte cap (`ANTFLY_INFERENCE_READ_BATCH_BYTES`, default 256 MiB). With positive admission capacity, the effective cap is also limited to 16 MiB per configured `max_concurrent_requests` unit and the request reserves the larger of one unit per 16 MiB of possible downloaded input and one unit per two declared images. The same policy covers image-backed `/extract` requests and embedded direct reads, and admission occurs before model resolution or downloading. `max_concurrent_requests: 0` intentionally disables both admission accounting and the capacity-derived byte clamp and is not safe for untrusted production traffic. The reader abstraction has two layers:
 
 - `LoadedReader.readBatch`: the stable reader contract used by the server and local direct calls.
-- Model-family implementations: native Florence can use a real batch fast path; VLM, GenAI, Pix2Struct, and multistage OCR may keep the serial fallback until their runtimes expose safe batch execution.
+- Model-family implementations: native Florence can use a real batch fast path; Pix2Struct and multistage OCR may keep the serial fallback until their runtimes expose safe batch execution.
 
 `/read` can also use Qwen3-VL, a general vision-language model, for OCR and
 document transcription. Split GGUF generator bundles are accepted when their
@@ -429,4 +614,119 @@ correctness path, not a claim of batched Qwen projector or decoder execution.
 
 Native Florence batching is throughput-oriented. A request batch is chunked by `ANTFLY_INFERENCE_READ_BATCH_SIZE` (default 8, clamped to 1..64), preprocessed into `[batch, 3, H, W]`, then run through the Florence encoder once for the chunk. CUDA and Metal use the incremental decoder KV cache in batch mode when available: self-attention keys/values are appended per row, cross-attention keys/values are precomputed for the whole encoder batch, and the LM head is applied over `[batch, hidden]` at each generated position. Metal exposes the generic eager backend hooks needed by the preallocated KV slab path (`allocUninitF32Shape`, `copyRows2D`, and device-backed row concat/slice) and has a batched device `attention_f32` entry that dispatches all `batch * q_len * heads` rows in one Metal command. The reader pipeline does not need a Florence-specific Metal API. Rows that emit EOS stop contributing new text tokens while the rest of the batch continues. If the batched KV path is unsupported by a backend shape or operator, native Florence falls back to the full batched decoder path; non-native and unsupported reader families keep the serial fallback behind the same `LoadedReader.readBatch` contract.
 
+Resident Florence OCR separates cross-attention cache backing ownership from active tensor shape. In-place EOS compaction moves surviving rows without resizing the backing allocation; the decoder then publishes exact active-prefix views and attends through them. Backing buffers outlive every view (CUDA row views are non-retaining; Metal keeps retained device views), repeated compaction replaces only view descriptors, and teardown releases views before backing storage.
+
 The current `/read` HTTP response remains all-or-error at the envelope level, matching the existing API behavior. The future generic batch wrapper above should add per-item errors for bad image bytes, media fetch failures, and per-row inference failures without changing the `/read` response schema.
+
+
+### Gemma4 vision throughput follow-up
+
+Gemma4 uses model-qualified unmasked head-dimension-64 Flash attention for
+all-valid same-grid sequences of 257–4,096 patches, with portable fallback.
+Qwen dispatch remains independent. Sixteen per-layer Metal frames retain deferred
+buffer ownership; an active caller frame keeps ownership, and owned failures
+cancel before freeing intermediates. Image-only brokers match both grid axes,
+loaded generation, task prefix, dimensions, source kind and preparation options.
+They retain a bounded default 200-µs wait, earliest deadline, original indexes,
+codec errors and at most four rows. Resource policy can reduce occupancy;
+geometry is excluded from shard hashing to avoid cyclic array-enrollment waits.
+Mixed/titled groups retain compatibility.
+
+Each stable CPU lookahead slot uses a bounded 512 MiB host allocator, acquires
+no speculative GPU lease, and is joined on every exit. The active call owns the
+model execution gate through preparation and GPU consumption; queued callers
+reserve no preprocessing memory. Admission pressure drains speculation before
+retrying current work; future pressure retries once after the current wave.
+Codec/control/runtime failures do not retry. CPU/single-threaded execution stays
+sequential. Profiling adds synchronization and is separate from throughput.
+
+Controls: `TERMITE_METAL_DISABLE_GEMMA4_VISION_FLASH=1`,
+`TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES=1`,
+`ANTFLY_GEMMA4_DISABLE_IMAGE_BROKER=1`, `prepare_ahead=false` (or benchmark
+`--prepare-ahead off`). `ANTFLY_GEMMA4_IMAGE_BROKER_TRACE=1` reports cohort grids;
+`ANTFLY_GEMMA4_VISION_PROFILE=1` and `TERMITE_METAL_TRACE_DISPATCH_PROFILE=1`
+are diagnostic. [Measurements](../../../docs/design/inference/media-throughput-results.json)
+and [history](../../../docs/design/inference/history/gemma4/media-optimization-2026-10.md#image-and-audio-embeddings)
+retain qualification limits.
+
+### Gemma4 and CLAP audio preparation and batching
+
+See the [results](../../../docs/design/inference/media-throughput-results.json)
+and [history](../../../docs/design/inference/history/gemma4/media-optimization-2026-10.md#image-and-audio-embeddings)
+for real-model paired measurements and limits. Gemma4 audio-only accelerated cohorts
+retain projected rows through prompt packing and physically batch the embedding
+encoder in length-qualified groups of at most four (25% padding, 1,024-token
+sequence cap); conformer execution remains per clip. CLAP retains native batches
+of up to eight and singleton fusion/fallback behavior. Both prepare one bounded
+future CPU wave, join producers on every exit and preserve indexed codec errors.
+CLAP selects channel count and forced short-clip fusion from the full logical
+request. Every physical wave and admission retry keeps that policy; a singleton
+tail of a larger request does not activate singleton fusion.
+Gemma4 audio-only server groups can use the generation-qualified broker; mixed
+and titled groups retain compatibility. No CUDA performance gain is claimed.
+
+Audio retains the strict 30-second Gemma input limit, including <=1,024 prompt
+tokens with four framing tokens. Preparation uses a bounded 64 MiB Gemma CPU
+allocator (current admitted phase can use its existing 512 MiB host workspace)
+and CLAP's configured decode budget. Unknown encoded lengths reserve 1,024 tokens
+per row/four rows before length qualification. Pipeline switches:
+`gemma4_audio_batching`, `audio_prepared_batches`, `audio_prepare_ahead`;
+`ANTFLY_GEMMA4_DISABLE_AUDIO_BROKER=1` restores compatibility and
+`ANTFLY_GEMMA4_AUDIO_BROKER_TRACE=1` reports execution. CPU/ONNX retain existing
+compatibility; accelerated encoding/PCM entry points share the admitted route.
+
+### Media benchmark reproduction
+
+From `zig/pkg/inference`, build the applicable executable with Zig 0.17:
+
+```sh
+zig build build-gemma4-image-bench build-audio-embedding-bench \
+  build-gemma4-pdf-bench -Doptimize=ReleaseFast
+zig-out/bin/antfly-gemma4-image-bench --model MODEL --image IMAGE \
+  --scope embedding --batch 8 --warmups 2 --iterations 5 --output /tmp/image.json
+zig-out/bin/antfly-audio-embedding-bench --model MODEL --audio CLIP \
+  --audio OTHER --batch 16 --warmups 2 --iterations 5 --output /tmp/audio.json
+```
+
+Image `projector` excludes decode, `embedding` shares a borrowed raster after one
+decode, and `encoded-embedding` decodes every row. Audio `--scope pcm` excludes
+codec decode; `--prepare-ahead off` and `--batching off` isolate compatibility.
+`zig/pkg/inference/scripts/embeddinggemma2/{image,pdf}_campaign.py` retains pinned binaries/inputs,
+ordered vectors, errors and baseline/candidate order. PDF `--scope render` compares
+CPU/GPU rendering without a model. Run its pixel preflight before measured waves;
+report real and synthetic pages separately. Scope and warmup/sample counts in the
+results JSON apply to the recorded campaigns; use longer idle-host repetitions
+for latency distributions. Codec regressions run through the shared image suite.
+
+### Gemma4 generative OCR optimization
+
+The [OCR design](../../../docs/design/inference/gemma4-ocr-optimization.md)
+owns runtime controls, operation-family contracts and qualification gates;
+[OCR history](../../../docs/design/inference/history/gemma4/media-optimization-2026-10.md#ocr-correctness-and-rejected-speedups)
+summarizes the superseded matrix/MTP experiments and links full evidence.
+
+Ordinary generation remains serialized. The native OCR opt-in retains independent
+page positions/KV in bounded cohorts of at most four, with optional continuous
+request windows of eight (maximum sixteen), reserving every live KV allocation.
+Projector/prefill and decode use distinct protected ownership boundaries; only
+token IDs return during eligible greedy decode. Finished pages retire promptly.
+The full prepared singleton operation family is retained by default. Matrix
+arithmetic additionally requires `ANTFLY_GEMMA4_METAL_OCR_MATRIX_ARITHMETIC=1`;
+the legacy multirow switch alone no longer selects it. Scoped rollbacks/EOS
+confirmation cannot repair accumulated noncanonical history.
+
+The final local Q4 invariant-tail/QKV/carrier/head-frame case takes 48.819–49.304
+seconds for **all eight pages**, versus same-binary ordinary brackets of
+55.339–57.572 seconds: 12.8% less mean time with exact transcripts/counts.
+Shared-weight kernels are excluded from that configuration. All experimental
+controls remain off; no Antfly MTP speedup, CUDA performance gain or audio
+text-generation speedup is qualified by this OCR campaign. PDF rendering and
+startup are outside recognition timing. Historical matrix speedups failed later
+paragraph/order/memory gates and are not current serving claims.
+
+The live design preserves the experiment flags, diagnostic exclusivity and frame/
+KV failure rules. The sweep rejects incomplete/capped output before ranking
+throughput, excludes diagnostic/probe timing, samples worker RSS/Metal separately
+and records HTTP payload limits independently from model admission. Promotion
+requires complete free-running output gates and repeated bracketed gains; token
+counts, `stop` status or operator equality alone are insufficient.

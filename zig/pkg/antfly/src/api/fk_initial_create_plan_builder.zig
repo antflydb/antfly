@@ -122,6 +122,20 @@ pub fn build(
     target: domain.Target,
     request: tables.CreateTableRequest,
 ) !publication.InitialCreatePlan {
+    return buildWithScratch(server, alloc, alloc, context, identity, target, request);
+}
+
+/// The plan belongs to alloc; validation and witness projections are scoped
+/// to reclaiming scratch, rather than nested under the plan's owning arena.
+pub fn buildWithScratch(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+) !publication.InitialCreatePlan {
     try context.ensureActive();
     const logical_child = try target.resourceNameAlloc(alloc);
     defer alloc.free(logical_child);
@@ -154,7 +168,7 @@ pub fn build(
     // Calculate support definitions against this settled read cut, but do
     // not publish any parent here. Begin owns each exact before/after pair in
     // one metadata transaction with the hidden child/name reservation.
-    var witness = try @import("relational_witness_ddl.zig").prepare(alloc, snapshot.tables, child.name, child.schema_json, "");
+    var witness = try @import("relational_witness_ddl.zig").prepare(scratch, snapshot.tables, child.name, child.schema_json, "");
     defer witness.deinit();
     child.schema_json = try alloc.dupe(u8, witness.schema_json);
     const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
@@ -171,7 +185,7 @@ pub fn build(
     for (derived) |item| {
         if (std.mem.eql(u8, item.parent_table_name, child.name)) {
             if (!self_target_checked) {
-                try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child.schema_json, child.name, child.schema_json);
+                try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(scratch, child.schema_json, child.name, child.schema_json);
                 self_target_checked = true;
             }
             try self_transitions.append(alloc, item.transition);
@@ -247,7 +261,7 @@ pub fn build(
         .logical_name = try alloc.dupe(u8, target.table),
         .namespace_id = namespace_id,
     };
-    try plan.validate(alloc);
+    try plan.validate(scratch);
     return plan;
 }
 

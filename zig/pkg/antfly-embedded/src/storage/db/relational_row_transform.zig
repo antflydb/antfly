@@ -116,7 +116,7 @@ pub const Program = struct {
             ordinal.* = if (old) |index| @intCast(index) else null;
             if (old) |index| {
                 const previous = from[index];
-                if (previous.column_type != column.column_type or previous.is_json != column.is_json or previous.json_kind != column.json_kind)
+                if (previous.column_type != column.column_type or previous.is_json != column.is_json or previous.json_kind != column.json_kind or previous.sql_element_type != column.sql_element_type)
                     return error.RelationalRewriteTypeChange;
             }
         }
@@ -197,7 +197,7 @@ pub const Program = struct {
             if (expression_set) |set| {
                 if (!set.read_columns[ordinal] or set.generated_columns[ordinal]) continue;
                 expression_input_cells += 1;
-                values[ordinal] = try scalarValue(column.column_type, cell);
+                values[ordinal] = try scalarValue(column, cell);
             }
         }
         if (expression_set) |set| {
@@ -288,13 +288,18 @@ fn validateStored(alloc: Allocator, bytes: []const u8, view: registry.SchemaView
     }
 }
 
-fn scalarValue(kind: schema.RelationalColumnType, cell: codec.Cell) !expressions.Value {
+fn scalarValue(column: schema.RelationalColumn, cell: codec.Cell) !expressions.Value {
     if (cell.is_null) return .null;
-    return switch (kind) {
+    return switch (column.column_type) {
         .string => .{ .string = cell.value.bytes_val },
         .blob => .{ .blob = cell.value.bytes_val },
         .integer => .{ .integer = cell.value.i64_val },
         .number => .{ .number = cell.value.f64_val },
+        .numeric => .{ .numeric = cell.value.bytes_val },
+        .sql_array => if (cell.sql_array_element_type == column.sql_element_type and column.sql_element_type != null)
+            .{ .sql_array = .{ .element_type = column.sql_element_type.?, .bytes = cell.value.bytes_val } }
+        else
+            error.InvalidRelationalExpressionInput,
         .boolean => .{ .boolean = cell.value.bool_val },
         .datetime => .{ .datetime = cell.value.u64_val },
         else => error.InvalidRelationalExpressionInput,
@@ -302,20 +307,38 @@ fn scalarValue(kind: schema.RelationalColumnType, cell: codec.Cell) !expressions
 }
 
 fn scalarCell(column: schema.RelationalColumn, ordinal: u32, value: expressions.Value) !codec.Cell {
+    if (value == .sql_array and (column.column_type != .sql_array or value.sql_array.element_type != column.sql_element_type)) return error.InvalidRelationalExpressionInput;
     const value_type: @import("../../section/typed_doc_values.zig").ValueType = switch (column.column_type) {
-        .string, .blob => .bytes_val,
+        .string, .blob, .numeric, .sql_array => .bytes_val,
         .integer => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
         .datetime => .u64_val,
         else => return error.InvalidRelationalExpressionInput,
     };
-    return .{ .ordinal = ordinal, .path = column.path, .value_type = value_type, .is_null = value == .null, .value = switch (value) {
+    return .{ .ordinal = ordinal, .path = column.path, .value_type = value_type, .is_numeric = column.column_type == .numeric, .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null, .is_null = value == .null, .value = switch (value) {
         .null => .{ .bytes_val = "" },
-        .string, .blob => |bytes| .{ .bytes_val = bytes },
+        .string, .blob, .numeric => |bytes| .{ .bytes_val = bytes },
         .integer => |integer| .{ .i64_val = integer },
         .number => |number| .{ .f64_val = number },
         .boolean => |boolean| .{ .bool_val = boolean },
         .datetime => |datetime| .{ .u64_val = std.math.cast(u64, datetime) orelse return error.InvalidRelationalExpressionInput },
+        .sql_array => |array| .{ .bytes_val = array.bytes },
     } };
+}
+
+test "relational index system array rewrite operands retain canonical bytes and reject element reinterpretation" {
+    const column: schema.RelationalColumn = .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 };
+    const value: expressions.Value = .{ .sql_array = .{ .element_type = .int64, .bytes = &.{ 1, 0, 0, 0, 0, 0, 0, 0 } } };
+    const cell = try scalarCell(column, 0, value);
+    try std.testing.expectEqual(column.sql_element_type, cell.sql_array_element_type);
+    const borrowed = try scalarValue(column, cell);
+    try std.testing.expectEqual(value.sql_array.bytes.ptr, borrowed.sql_array.bytes.ptr);
+    try std.testing.expectEqual(value.sql_array.element_type, borrowed.sql_array.element_type);
+    var wrong = column;
+    wrong.sql_element_type = .int32;
+    try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarCell(wrong, 0, value));
+    try std.testing.expectError(error.InvalidRelationalExpressionInput, scalarValue(wrong, cell));
+    const nullable = try scalarCell(column, 0, .null);
+    try std.testing.expectEqual(expressions.Value.null, try scalarValue(column, nullable));
 }

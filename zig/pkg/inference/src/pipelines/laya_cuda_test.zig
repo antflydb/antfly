@@ -18,6 +18,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const support = @import("../util/laya_test_support.zig");
 const native = @import("../ops/native_compute.zig");
+const ops = @import("../ops/ops.zig");
 const cuda = @import("../ops/cuda/cuda_compute.zig");
 
 fn requireCuda() !void {
@@ -248,4 +249,224 @@ test "laya CUDA packed exact GELU matches unfused projection slices" {
             for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
         }
     }
+}
+
+test "GLiNER CUDA fused QKV RoPE preserves split-half rotations and batch positions" {
+    if (comptime !build_options.enable_cuda) return requireCuda();
+    try requireCuda();
+    const a = std.testing.allocator;
+    var gpu = try cuda.CudaCompute.init(a);
+    defer gpu.deinit();
+    const cb = gpu.computeBackend();
+    const Shape = struct { batch: usize, seq: usize, dim: usize };
+    for ([_]Shape{ .{ .batch = 3, .seq = 17, .dim = 64 }, .{ .batch = 2, .seq = 513, .dim = 128 }, .{ .batch = 1, .seq = 7999, .dim = 64 } }) |shape| {
+        const heads = 2;
+        const rows = shape.batch * shape.seq;
+        const hidden = heads * shape.dim;
+        const values = try a.alloc(f32, rows * 3 * hidden);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+        const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(3 * hidden) });
+        defer cb.free(input);
+        gpu.gliner_encoder_attention = false;
+        try std.testing.expect(try cb.splitQkvRope(input, shape.batch, shape.seq, heads, shape.dim, 160000) == null);
+        gpu.gliner_encoder_attention = true;
+        try std.testing.expectError(error.InvalidShape, cb.splitQkvRope(input, shape.batch, shape.seq, heads, shape.dim, 0));
+        try std.testing.expectError(error.InvalidShape, cb.splitQkvRope(input, shape.batch, shape.seq, heads, shape.dim - 1, 160000));
+        for ([_]f32{ 10000, 160000 }) |theta| {
+            const parts = (try cb.splitQkvRope(input, shape.batch, shape.seq, heads, shape.dim, theta)).?;
+            const actual_parts = [_]ops.CT{ parts.first, parts.second, parts.third };
+            defer for (actual_parts) |part| cb.free(part);
+            for (actual_parts, 0..) |part, index| {
+                const slice = try cb.sliceLastDim(input, index * hidden, (index + 1) * hidden);
+                defer cb.free(slice);
+                const expected = if (index < 2) try cb.rope(slice, shape.seq, shape.dim, shape.dim, theta, 1, 0, false) else slice;
+                defer if (index < 2) cb.free(expected);
+                const want = try cb.toFloat32(expected, a);
+                defer a.free(want);
+                const got = try cb.toFloat32(part, a);
+                defer a.free(got);
+                try std.testing.expectEqualSlices(f32, want, got);
+            }
+        }
+    }
+}
+
+test "GLiNER CUDA long attention respects global local and fully masked rows" {
+    if (comptime !build_options.enable_cuda) return requireCuda();
+    try requireCuda();
+    const a = std.testing.allocator;
+    var gpu = try cuda.CudaCompute.init(a);
+    defer gpu.deinit();
+    gpu.gliner_encoder_attention = true;
+    const cb = gpu.computeBackend();
+    for ([_]usize{ 513, 2048, 7999 }) |seq| {
+        const dim = 64;
+        const values = try a.alloc(f32, 2 * seq * dim);
+        defer a.free(values);
+        @memset(values, 0);
+        const qk = try cb.fromFloat32Shape(values, &.{ @intCast(2 * seq), dim });
+        defer cb.free(qk);
+        for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt((i / dim) % seq)) * 0.001 + @as(f32, @floatFromInt(i % dim)) * 0.005;
+        const v = try cb.fromFloat32Shape(values, &.{ @intCast(2 * seq), dim });
+        defer cb.free(v);
+        const mask = try a.alloc(i64, 2 * seq);
+        defer a.free(mask);
+        @memset(mask, 0);
+        @memset(mask[0 .. seq - 17], 1);
+        for ([_]usize{ 64, seq }) |radius| {
+            const result = if (radius == seq)
+                try cb.scaledDotProductAttention(qk, qk, v, mask, null, 2, seq, 1, dim)
+            else
+                (try cb.encoderLocalAttention(qk, qk, v, mask, 2, seq, 1, dim, radius)).?;
+            defer cb.free(result);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            for (0..seq) |row| {
+                const begin = row -| radius;
+                const end = @min(seq - 17, row + radius + 1);
+                for (0..dim) |d| {
+                    const expected: f32 = if (end > begin) @as(f32, @floatFromInt(begin + end - 1)) * 0.0005 + @as(f32, @floatFromInt(d)) * 0.005 else 0;
+                    try std.testing.expectApproxEqAbs(expected, actual[row * dim + d], 2e-4);
+                }
+            }
+            for (actual[seq * dim ..]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+        }
+    }
+}
+
+test "GLiNER CUDA mixed attention matches masked FP32 reference across tile tails" {
+    if (comptime !build_options.enable_cuda) return requireCuda();
+    try requireCuda();
+    const a = std.testing.allocator;
+    var gpu = try cuda.CudaCompute.init(a);
+    defer gpu.deinit();
+    gpu.gliner_encoder_attention = true;
+    gpu.gliner_mixed_attention = true;
+    const cb = gpu.computeBackend();
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var cpu = native.NativeCompute.init(a, &store, null);
+    defer cpu.deinit();
+    const ref = cpu.computeBackend();
+    for ([_]usize{ 1, 31, 33, 65, 129, 513, 2049 }) |seq| {
+        const hidden = 2 * 64;
+        const values = try a.alloc(f32, 3 * seq * hidden);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+        const q = try cb.fromFloat32Shape(values, &.{ @intCast(3 * seq), hidden });
+        defer cb.free(q);
+        const rq = try ref.fromFloat32Shape(values, &.{ @intCast(3 * seq), hidden });
+        defer ref.free(rq);
+        for (values, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.17);
+        const k = try cb.fromFloat32Shape(values, &.{ @intCast(3 * seq), hidden });
+        defer cb.free(k);
+        const rk = try ref.fromFloat32Shape(values, &.{ @intCast(3 * seq), hidden });
+        defer ref.free(rk);
+        for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.19);
+        const v = try cb.fromFloat32Shape(values, &.{ @intCast(3 * seq), hidden });
+        defer cb.free(v);
+        const rv = try ref.fromFloat32Shape(values, &.{ @intCast(3 * seq), hidden });
+        defer ref.free(rv);
+        const mask = try a.alloc(i64, 3 * seq);
+        defer a.free(mask);
+        @memset(mask, 1);
+        @memset(mask[seq -| 3 .. 2 * seq], 0);
+        const result = try cb.scaledDotProductAttention(q, k, v, mask, null, 3, seq, 2, 64);
+        defer cb.free(result);
+        const expected = try ref.scaledDotProductAttention(rq, rk, rv, mask, null, 3, seq, 2, 64);
+        defer ref.free(expected);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        const oracle = try ref.toFloat32(expected, a);
+        defer a.free(oracle);
+        for (actual, oracle, 0..) |got, want, i| {
+            try std.testing.expect(std.math.isFinite(got));
+            if (mask[i / hidden] == 1) try std.testing.expectApproxEqAbs(want, got, 5e-4);
+            if (i / hidden >= seq and i / hidden < 2 * seq) try std.testing.expectEqual(@as(f32, 0), got);
+        }
+        for ([_]usize{ 0, 1, 64, seq + 7 }) |radius| {
+            const local = (try cb.encoderLocalAttention(q, k, v, mask, 3, seq, 2, 64, radius)).?;
+            defer cb.free(local);
+            // Compare with the separate FP32 CUDA kernel, including padded
+            // queries whose local key window is completely masked.
+            gpu.gliner_mixed_attention = false;
+            const full_precision = (try cb.encoderLocalAttention(q, k, v, mask, 3, seq, 2, 64, radius)).?;
+            defer cb.free(full_precision);
+            gpu.gliner_mixed_attention = true;
+            const got = try cb.toFloat32(local, a);
+            defer a.free(got);
+            const want = try cb.toFloat32(full_precision, a);
+            defer a.free(want);
+            for (got, want) |x, y| try std.testing.expectApproxEqAbs(y, x, 5e-4);
+        }
+    }
+}
+
+test "GLiNER CUDA boundary matrix mirrors preserve source identity and task heads" {
+    if (comptime !build_options.enable_cuda) return requireCuda();
+    try requireCuda();
+    const a = std.testing.allocator;
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var gpu = try cuda.CudaCompute.init(a);
+    defer gpu.deinit();
+    gpu.strict_f32_weights = true;
+    gpu.gliner_boundary_inference = true;
+    gpu.gliner_mixed_attention = true;
+    const cb = gpu.computeBackend();
+    var data: [16 * 16]f32 = @splat(0);
+    for (0..16) |i| data[i * 16 + i] = 1.0001;
+    var source = try Tensor.initFloat32(a, "", &.{ 16, 16 }, &data);
+    defer source.deinit();
+    const encoder = "encoder.layer.0.attention.self.query_proj.weight";
+    const head = "classifier.0.weight";
+    const embedding = "embeddings.word_embeddings.weight";
+    for ([_][]const u8{ encoder, head, embedding }) |name| {
+        try gpu.insertWeightFromTensor(try a.dupe(u8, name), &source);
+        try gpu.prepareGlinerBoundaryF16Mirror(name, &source);
+    }
+    try std.testing.expectEqual(@as(u32, 1), gpu.gliner_boundary_f16_mirrors.count());
+    try std.testing.expectError(error.DuplicateWeight, gpu.prepareGlinerBoundaryF16Mirror(encoder, &source));
+    const input = try cb.fromFloat32Shape(&@as([32]f32, @splat(2)), &.{ 2, 16 });
+    defer cb.free(input);
+    const bias = try cb.fromFloat32Shape(&@as([16]f32, @splat(0.125)), &.{16});
+    defer cb.free(bias);
+    for ([_][]const u8{ encoder, head, embedding }) |name| {
+        const resident = gpu.resident_weights.getPtr(name).?;
+        try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f32, resident.dtype);
+        const expected: f32 = if (std.mem.eql(u8, name, encoder)) 2 else 2.0002;
+        const output = try cb.linear(input, @ptrCast(resident), bias, 2, 16, 16);
+        defer cb.free(output);
+        const got = try cb.toFloat32(output, a);
+        defer a.free(got);
+        for (got) |value| try std.testing.expectApproxEqAbs(expected + 0.125, value, 2e-6);
+        const no_bias = try cb.linearNoBias(input, @ptrCast(resident), 2, 16, 16);
+        defer cb.free(no_bias);
+        const plain = try cb.toFloat32(no_bias, a);
+        defer a.free(plain);
+        for (plain) |value| try std.testing.expectApproxEqAbs(expected, value, 2e-6);
+    }
+    // Reusing a mirrored projection must preserve each invocation's FP32 bias.
+    const other_bias = try cb.fromFloat32Shape(&@as([16]f32, @splat(-0.03125)), &.{16});
+    defer cb.free(other_bias);
+    const refreshed = try cb.linear(input, @ptrCast(gpu.resident_weights.getPtr(encoder).?), other_bias, 2, 16, 16);
+    defer cb.free(refreshed);
+    const refreshed_values = try cb.toFloat32(refreshed, a);
+    defer a.free(refreshed_values);
+    for (refreshed_values) |value| try std.testing.expectApproxEqAbs(@as(f32, 1.96875), value, 2e-6);
+    try std.testing.expectEqualSlices(f32, &data, source.asFloat32());
+    gpu.gliner_mixed_attention = false;
+    const original = try cb.linearNoBias(input, @ptrCast(gpu.resident_weights.getPtr(encoder).?), 2, 16, 16);
+    defer cb.free(original);
+    const original_values = try cb.toFloat32(original, a);
+    defer a.free(original_values);
+    for (original_values) |value| try std.testing.expectApproxEqAbs(@as(f32, 2.0002), value, 2e-6);
+    try std.testing.expectError(error.InvalidCudaState, gpu.prepareGlinerBoundaryF16Mirror(encoder, &source));
+    gpu.gliner_mixed_attention = true;
+    var overflow = try Tensor.initFloat32(a, "", &.{ 1, 1 }, &.{70000});
+    defer overflow.deinit();
+    const bad_name = "encoder.layer.1.output.dense.weight";
+    try gpu.insertWeightFromTensor(try a.dupe(u8, bad_name), &overflow);
+    try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, gpu.prepareGlinerBoundaryF16Mirror(bad_name, &overflow));
+    try std.testing.expectEqual(@as(u32, 1), gpu.gliner_boundary_f16_mirrors.count());
 }

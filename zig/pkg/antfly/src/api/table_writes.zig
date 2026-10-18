@@ -14287,10 +14287,6 @@ pub const ProvisionedTableWriteSource = struct {
                 std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
                 return err;
             };
-        const has_generated_producers = if (configured_indexes) |summary|
-            summary.has_generated_producers
-        else
-            false;
         // Restore repair intentionally uses a workerless exclusive owner. An
         // ordinary cold index repair, however, can enqueue generated provider
         // work whose lifetime spans many bounded repair quanta. Promote that
@@ -14415,14 +14411,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         // Configuration establishes capability, never ownership. Inspect the
         // exact durable shard state with workers disabled, and promote only an
-        // interrupted generated pipeline into the resident writer cache. A
-        // clean generated shard remains a bounded startup inspection and is
+        // interrupted generated or resolver pipeline into the resident writer
+        // cache. A clean shard remains a bounded startup inspection and is
         // closed below instead of retaining one worker set per local shard.
         if (!use_live_owner and
             !cold_open_uses_writer_cache and
-            has_generated_producers and
             self.write_cache != null and
-            try managedDbNeedsResidentGeneratedRecovery(alloc, db))
+            try managedDbNeedsResidentReplayRecovery(alloc, db))
         {
             std.debug.assert(cached_db != null and uncached_db == null);
             cached_db.?.deinit(alloc);
@@ -30894,15 +30889,30 @@ fn managedDbNeedsGeneratedCoverageReplay(alloc: std.mem.Allocator, db: *db_mod.D
     return try db.generatedCoverageReplayNeeded(alloc);
 }
 
-/// Exact cold-start admission for a long-lived generated owner. Configuration
-/// only proves that a producer exists; durable replay or missing source
+/// Exact cold-start admission for a long-lived replay owner. Configuration
+/// only proves that a producer or resolver exists; durable replay or missing source
 /// outcomes prove that the producer has work which must survive this bounded
 /// startup quantum.
-fn managedDbNeedsResidentGeneratedRecovery(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
-    if (!db.core.hasGeneratedEnrichmentTargets()) return false;
-    const enrichment = db.pendingWorkStats().enrichment;
+fn managedDbNeedsResidentReplayRecovery(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+    const has_generated = db.core.hasGeneratedEnrichmentTargets();
+    if (!has_generated and !db.hasConfiguredResolvers()) return false;
+    const pending = db.pendingWorkStats();
+    if (hasStartupOwnedResolverReplayDebt(pending, .isolated)) return true;
+    if (!has_generated) return false;
+    const enrichment = pending.enrichment;
     if (enrichment.applied_sequence < enrichment.target_sequence) return true;
     return try db.generatedCoverageReplayNeeded(alloc);
+}
+
+fn hasStartupOwnedResolverReplayDebt(pending: anytype, owner: ManagedCatchUpOwner) bool {
+    const workers = [_]bool{ pending.resolution_worker_started, pending.promotion_worker_started };
+    for ([_]db_mod.types.ReplayStageStats{ pending.resolution, pending.promotion }, workers) |stage, worker_started| {
+        // Healthy resident workers own their ordinary lag without taking the
+        // group-exclusive startup lease away from foreground readers.
+        if (owner == .live_writer and worker_started) continue;
+        if (stage.enabled and (stage.catch_up_required or stage.blocked or stage.applied_sequence < stage.target_sequence)) return true;
+    }
+    return false;
 }
 
 /// Debt that must retain the group-exclusive catch-up owner instead of being
@@ -30916,6 +30926,7 @@ fn managedDbHasNonRepairCatchUpDebt(
     owner: ManagedCatchUpOwner,
 ) !bool {
     const pending_work = db.pendingWorkStats();
+    if (hasStartupOwnedResolverReplayDebt(pending_work, owner)) return true;
     // The resident executor is the sole producer for ordinary derived replay.
     // Its lag is build activity, not startup repair, and must remain compatible
     // with readers. Cold/isolated owners still need the broad replay path.
@@ -31016,7 +31027,8 @@ fn catchUpManagedDb(
         !resident_enrichment.worker_failed;
     var had_debt = generated_coverage_replay_needed;
     const derived_replay_debt = hasStartupOwnedReplayDebt(before, resident_owns_derived);
-    had_debt = had_debt or derived_replay_debt;
+    const resolver_replay_debt = hasStartupOwnedResolverReplayDebt(pending_work_before, owner);
+    had_debt = had_debt or derived_replay_debt or resolver_replay_debt;
     const repair_metadata_rebuild_pending = pending_work_before.repair_metadata_rebuild_pending;
     const enrichment_before = pending_work_before.enrichment;
     if (enrichment_before.enabled and
@@ -31188,7 +31200,7 @@ fn catchUpManagedDb(
         // phase-marker-only quanta.
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         std.log.info("managed restore repair quantum complete group_id={d} repaired={} steps={d}", .{ group_id, repaired_restore_runtime, repair_steps });
-    } else if (runs_broad_debt and derived_replay_debt) {
+    } else if (runs_broad_debt and (derived_replay_debt or resolver_replay_debt)) {
         var pass: usize = 0;
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);
         while (pass < max_startup_catch_up_replay_passes) : (pass += 1) {
@@ -31432,6 +31444,13 @@ fn catchUpManagedDb(
                 .made_progress = made_progress,
             };
         }
+        if (hasStartupOwnedResolverReplayDebt(db.pendingWorkStats(), owner)) {
+            return .{
+                .had_debt = initial_repair_debt,
+                .cleared_debt = false,
+                .made_progress = made_progress,
+            };
+        }
         if (db.denseArtifactRebuildMaintenanceNeeded(alloc) catch |err| {
             std.log.warn("managed startup catch-up post-check dense rebuild probe failed table={s} err={}", .{ table_name, err });
             return err;
@@ -31546,6 +31565,13 @@ fn startupReplayDebtSignature(alloc: std.mem.Allocator, db: *db_mod.DB) !Startup
         signature.applied_sum += status.applied_sequence;
         signature.target_sum += status.target_sequence;
         if (status.catch_up_required) signature.remaining += 1;
+    }
+    const pending = db.pendingWorkStats();
+    for ([_]db_mod.types.ReplayStageStats{ pending.resolution, pending.promotion }) |stage| {
+        if (!stage.enabled) continue;
+        signature.applied_sum += stage.applied_sequence;
+        signature.target_sum += stage.target_sequence;
+        if (stage.catch_up_required or stage.blocked or stage.applied_sequence < stage.target_sequence) signature.remaining += 1;
     }
     return signature;
 }
@@ -56683,6 +56709,208 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), leadership.calls);
         }
 
+        test "managed startup catch-up retains resolver-only recovery after reopen" {
+            const alloc = std.testing.allocator;
+            const NoCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/resolver-recovery", .{tmp.sub_path});
+            defer alloc.free(path);
+            const options: db_mod.OpenOptions = .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+                .start_resolver_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            };
+            {
+                var db = try db_mod.DB.open(alloc, path, options);
+                defer db.close();
+                try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json =
+                    \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+                });
+                try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"relations\":{\"entities\":[]}}" }}, .sync_level = .full_index });
+                try db.runUntilIdle();
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                _ = try db.core.upsertResolver(.{
+                    .name = "kg",
+                    .table = "entities",
+                    .source_artifact = "relations_v1",
+                    .resolution_artifact = "resolution_v1",
+                    .key_template = "{{ _entity.text }}",
+                    .config_generation = 1,
+                });
+            }
+            var reopened = try db_mod.DB.open(alloc, path, options);
+            defer reopened.close();
+            const indexes = try reopened.listDerivedReplayDebt(alloc);
+            defer {
+                for (indexes) |*index| index.deinit(alloc);
+                alloc.free(indexes);
+            }
+            for (indexes) |index| try std.testing.expect(!index.catch_up_required);
+            const pending = reopened.pendingWorkStats();
+            try std.testing.expect(pending.enrichment.applied_sequence >= pending.enrichment.target_sequence);
+            try std.testing.expect(pending.resolution.catch_up_required or pending.promotion.catch_up_required);
+            try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, &reopened, .isolated));
+            try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, &reopened, .live_writer));
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &reopened));
+            var resident_pending = pending;
+            resident_pending.resolution_worker_started = true;
+            resident_pending.promotion_worker_started = true;
+            try std.testing.expect(!hasStartupOwnedResolverReplayDebt(resident_pending, .live_writer));
+            try std.testing.expect(hasStartupOwnedResolverReplayDebt(resident_pending, .isolated));
+
+            var source = ProvisionedTableWriteSource.init(path, NoCatalog.iface());
+            defer source.deinit();
+            const blocked = try catchUpManagedDb(&source, alloc, 7001, "docs", &reopened, false, .isolated, .all_debt, .{});
+            try std.testing.expect(blocked.had_debt);
+            try std.testing.expect(blocked.made_progress);
+            try std.testing.expect(!blocked.cleared_debt);
+            const blocked_promotion = reopened.pendingWorkStats().promotion;
+            try std.testing.expect(blocked_promotion.blocked);
+            try std.testing.expectEqualStrings("missing_entity_sink", blocked_promotion.blocked_reason);
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &reopened));
+
+            // Serving installs the sink before activating resolver replay.
+            // This empty-entity fixture must consume its durable promotion
+            // record without producing any entity writes once the sink exists.
+            const Sink = struct {
+                fn upsert(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+                    return error.UnexpectedEntityUpsert;
+                }
+            };
+            var sink_token: u8 = 0;
+            reopened.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
+            const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &reopened, false, .isolated, .all_debt, .{});
+            try std.testing.expect(result.had_debt);
+            try std.testing.expect(result.made_progress);
+            try std.testing.expect(result.cleared_debt);
+            try std.testing.expect(!hasStartupOwnedResolverReplayDebt(reopened.pendingWorkStats(), .isolated));
+            try std.testing.expect(!(try managedDbNeedsResidentReplayRecovery(alloc, &reopened)));
+        }
+
+        test "managed startup catch-up retains cursor-only resolver recovery on workerless reopen" {
+            const alloc = std.testing.allocator;
+            const resolver_catalog = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
+            const Sink = struct {
+                fn upsert(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+                    return error.UnexpectedEntityUpsert;
+                }
+            };
+            var sink_token: u8 = 0;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cursor-only-resolver-recovery", .{tmp.sub_path});
+            defer alloc.free(path);
+            const options: db_mod.OpenOptions = .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+                .start_resolver_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            };
+            var watermark: u64 = 0;
+            {
+                var db = try db_mod.DB.open(alloc, path, options);
+                defer db.close();
+                try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json =
+                    \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+                });
+                try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"relations\":{\"entities\":[]}}" }}, .sync_level = .full_index });
+                var cfg: index_manager_mod.ResolverConfig = .{
+                    .name = "kg",
+                    .table = "entities",
+                    .source_artifact = "relations_v1",
+                    .resolution_artifact = "resolution_v1",
+                    .key_template = "{{ _entity.text }}",
+                    .config_generation = 1,
+                };
+                {
+                    db.core.lockApply();
+                    defer db.core.unlockApply();
+                    _ = try db.core.upsertResolver(cfg);
+                }
+                db.setEntitySink(.{ .ptr = &sink_token, .vtable = &.{ .upsert = Sink.upsert } });
+                try db.runUntilIdle();
+                const settled = db.pendingWorkStats();
+                watermark = settled.resolution.applied_sequence;
+                try std.testing.expect(watermark > 0);
+                try std.testing.expectEqual(watermark, settled.resolution.target_sequence);
+                try std.testing.expectEqual(watermark, settled.promotion.applied_sequence);
+                try std.testing.expect(!hasStartupOwnedResolverReplayDebt(settled, .isolated));
+
+                // Catalog edits can require corpus re-resolution without
+                // appending a new replay sequence. Only the durable cursors
+                // distinguish this state from the settled state above.
+                cfg.key_template = "{{ _entity.text }}-updated";
+                cfg.config_generation = 2;
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                _ = try db.core.upsertResolver(cfg);
+                try std.testing.expectEqual(watermark, db.core.nextDerivedSequence());
+            }
+            var workerless_options = options;
+            workerless_options.start_optional_runtimes = false;
+            var db = try db_mod.DB.open(alloc, path, workerless_options);
+            defer db.close();
+            const pending = db.pendingWorkStats();
+            try std.testing.expectEqual(watermark, pending.resolution.applied_sequence);
+            try std.testing.expectEqual(watermark, pending.resolution.target_sequence);
+            try std.testing.expect(pending.resolution.catch_up_required);
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &db));
+            try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, &db, .isolated));
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.delete(resolver_catalog.reresolve_resume_key);
+                try txn.commit();
+            }
+            // The independently persisted repair cursor must also admit work.
+            try std.testing.expect(db.pendingWorkStats().resolution.catch_up_required);
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &db));
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.delete(resolver_catalog.reresolve_repair_resume_key);
+                try txn.commit();
+            }
+            try std.testing.expect(!db.pendingWorkStats().resolution.catch_up_required);
+            try std.testing.expect(!(try managedDbNeedsResidentReplayRecovery(alloc, &db)));
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.put(resolver_catalog.reresolve_resume_key, "");
+                try txn.commit();
+            }
+            // An empty cursor denotes the first page; it is still durable debt.
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &db));
+            const status = try db.stats(alloc);
+            defer db_mod.types.freeDBStats(alloc, status);
+            try std.testing.expect(!status.resolver_replay.resolution_runtime_present);
+            try std.testing.expect(!status.resolver_replay.promotion_runtime_present);
+        }
+
         test "managed startup catch-up invalidates stale cached writer status after replay clears debt" {
             const alloc = std.testing.allocator;
 
@@ -59068,187 +59296,191 @@ fn implementationTests() type {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            const FakeEmbeddingProvider = struct {
-                request_count: std.atomic.Value(u32) = .init(0),
+            // Reconfiguration installs producers without overriding the owner
+            // policy: startup owners drain inline; serving owners use workers.
+            for ([_]ManagedDbOpenMode{ .startup_catch_up, .default_async }) |open_mode| {
+                const FakeEmbeddingProvider = struct {
+                    request_count: std.atomic.Value(u32) = .init(0),
 
-                fn dense(
-                    ptr: *anyopaque,
-                    allocator: std.mem.Allocator,
-                    model: []const u8,
-                    texts: []const []const u8,
-                ) anyerror![][]f32 {
-                    const self: *@This() = @ptrCast(@alignCast(ptr));
-                    try std.testing.expectEqualStrings("test-embed", model);
-                    try std.testing.expect(texts.len > 0);
-                    try std.testing.expect(std.mem.indexOf(u8, texts[0], "alpha body") != null);
-                    _ = self.request_count.fetchAdd(1, .monotonic);
+                    fn dense(
+                        ptr: *anyopaque,
+                        allocator: std.mem.Allocator,
+                        model: []const u8,
+                        texts: []const []const u8,
+                    ) anyerror![][]f32 {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try std.testing.expectEqualStrings("test-embed", model);
+                        try std.testing.expect(texts.len > 0);
+                        try std.testing.expect(std.mem.indexOf(u8, texts[0], "alpha body") != null);
+                        _ = self.request_count.fetchAdd(1, .monotonic);
 
-                    const vectors = try allocator.alloc([]f32, texts.len);
-                    errdefer allocator.free(vectors);
-                    for (vectors, 0..) |*vector, i| {
-                        vector.* = allocator.dupe(f32, &.{ 1, 0, 0 }) catch |err| {
-                            for (vectors[0..i]) |owned| allocator.free(owned);
-                            return err;
+                        const vectors = try allocator.alloc([]f32, texts.len);
+                        errdefer allocator.free(vectors);
+                        for (vectors, 0..) |*vector, i| {
+                            vector.* = allocator.dupe(f32, &.{ 1, 0, 0 }) catch |err| {
+                                for (vectors[0..i]) |owned| allocator.free(owned);
+                                return err;
+                            };
+                        }
+                        return vectors;
+                    }
+
+                    fn sparse(
+                        _: *anyopaque,
+                        allocator: std.mem.Allocator,
+                        _: []const u8,
+                        _: []const []const u8,
+                    ) anyerror![]db_embedder.SparseEmbedding {
+                        return try allocator.alloc(db_embedder.SparseEmbedding, 0);
+                    }
+
+                    fn interface(self: *@This()) managed_embedder.AntflyProvider {
+                        return .{
+                            .ptr = self,
+                            .embed_dense_texts = dense,
+                            .embed_sparse_texts = sparse,
                         };
                     }
-                    return vectors;
+                };
+
+                const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-managed-runtime-race/{t}", .{ tmp.sub_path, open_mode });
+                defer alloc.free(replica_root_dir);
+                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+                defer alloc.free(path);
+
+                // Model the create-table race: startup observed the catalog before the
+                // managed index was published and opened the generation with only the
+                // default index. The create request below is the newer authority.
+                const Catalog = struct {
+                    var indexes_json_buf: []const u8 = tables_api.default_indexes_json;
+
+                    fn iface() table_catalog.CatalogSource {
+                        return .{
+                            .ptr = undefined,
+                            .vtable = &.{
+                                .admin_snapshot = adminSnapshot,
+                                .free_admin_snapshot = freeAdminSnapshot,
+                                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                            },
+                        };
+                    }
+
+                    fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                        const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+                        errdefer std.testing.allocator.free(tables);
+                        tables[0] = .{
+                            .table_id = 7,
+                            .name = "docs",
+                            .schema_json = tables_api.default_schema_json,
+                            .indexes_json = indexes_json_buf,
+                            .placement_role = "data",
+                        };
+                        const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+                        errdefer std.testing.allocator.free(ranges);
+                        ranges[0] = .{
+                            .group_id = 7001,
+                            .range_id = 7101,
+                            .table_id = 7,
+                            .start_key = "",
+                            .end_key = null,
+                        };
+                        return .{
+                            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                            .tables = tables,
+                            .ranges = ranges,
+                            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                        };
+                    }
+
+                    fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+                        std.testing.allocator.free(snapshot.tables);
+                        std.testing.allocator.free(snapshot.ranges);
+                    }
+                };
+
+                const managed_indexes_json =
+                    \\{"full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},"enrichments":[{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":128},{"name":"body_dense_v1","kind":"embedding","field":"body","source_artifact_name":"body_chunks_v1","expected_dims":3,"producer_json":"{\"provider\":\"antfly\",\"model\":\"test-embed\"}"}],"title_body":{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","dimension":3,"embedder":{"provider":"antfly","model":"test-embed"}},"artifact_vectors":{"name":"artifact_vectors","type":"embeddings","dimension":3,"sources":[{"artifact":"body_dense_v1"}]}}
+                ;
+                Catalog.indexes_json_buf = tables_api.default_indexes_json;
+                var provider = FakeEmbeddingProvider{};
+
+                var write_cache = ProvisionedTableWriteCache.init(alloc);
+                defer write_cache.deinit();
+                var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+                defer source.deinit();
+                source.write_cache = &write_cache;
+                _ = source.withAntflyProvider(provider.interface());
+
+                {
+                    var stale_owner = try write_cache.getOrOpenLockedMode(
+                        path,
+                        Catalog.iface(),
+                        7001,
+                        source.visibleRootGeneration(7001),
+                        "docs",
+                        open_mode,
+                    );
+                    defer stale_owner.deinit(alloc);
+                    try std.testing.expect(stale_owner.db.enrichment_runtime == null);
+                    // Reproduce the production failure precisely: metadata publication
+                    // advanced independently while the resident runtime stayed stale.
+                    // A fingerprint match alone must never let create skip installation.
+                    ProvisionedTableWriteCache.publishEntryManagedConfig(stale_owner.entry.?, managed_indexes_json);
+                    try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(
+                        stale_owner.entry.?,
+                        managed_indexes_json,
+                    ));
                 }
 
-                fn sparse(
-                    _: *anyopaque,
-                    allocator: std.mem.Allocator,
-                    _: []const u8,
-                    _: []const []const u8,
-                ) anyerror![]db_embedder.SparseEmbedding {
-                    return try allocator.alloc(db_embedder.SparseEmbedding, 0);
-                }
+                // Admission has committed the new catalog value, but the startup cache
+                // still owns a writer constructed from the earlier snapshot.
+                Catalog.indexes_json_buf = managed_indexes_json;
+                var req = tables_api.CreateTableRequest{
+                    .indexes_json = try alloc.dupe(u8, managed_indexes_json),
+                };
+                defer req.deinit(alloc);
+                _ = try source.source().createTable(alloc, "docs", req);
 
-                fn interface(self: *@This()) managed_embedder.AntflyProvider {
-                    return .{
-                        .ptr = self,
-                        .embed_dense_texts = dense,
-                        .embed_sparse_texts = sparse,
-                    };
-                }
-            };
+                try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+                const entry = write_cache.entries.items[0];
+                try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors") != null);
+                const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
+                try std.testing.expectEqual(open_mode != .startup_catch_up, runtime.stats().worker_started);
 
-            const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-managed-runtime-race", .{tmp.sub_path});
-            defer alloc.free(replica_root_dir);
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
-            defer alloc.free(path);
+                _ = try source.source().batch(alloc, "docs", .{
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
+                    .sync_level = .full_index,
+                });
+                try std.testing.expect(provider.request_count.load(.monotonic) > 0);
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors").?.index.metadata.active_count > 0);
 
-            // Model the create-table race: startup observed the catalog before the
-            // managed index was published and opened the generation with only the
-            // default index. The create request below is the newer authority.
-            const Catalog = struct {
-                var indexes_json_buf: []const u8 = tables_api.default_indexes_json;
+                const query_vec = [_]f32{ 1, 0, 0 };
+                var result = try entry.db.search(alloc, .{
+                    .index_name = "title_body",
+                    .dense = .{ .vector = query_vec[0..], .k = 1 },
+                    .limit = 1,
+                });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+                try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
-                fn iface() table_catalog.CatalogSource {
-                    return .{
-                        .ptr = undefined,
-                        .vtable = &.{
-                            .admin_snapshot = adminSnapshot,
-                            .free_admin_snapshot = freeAdminSnapshot,
-                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
-                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
-                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
-                        },
-                    };
-                }
-
-                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-                    const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
-                    errdefer std.testing.allocator.free(tables);
-                    tables[0] = .{
-                        .table_id = 7,
-                        .name = "docs",
-                        .schema_json = tables_api.default_schema_json,
-                        .indexes_json = indexes_json_buf,
-                        .placement_role = "data",
-                    };
-                    const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
-                    errdefer std.testing.allocator.free(ranges);
-                    ranges[0] = .{
-                        .group_id = 7001,
-                        .range_id = 7101,
-                        .table_id = 7,
-                        .start_key = "",
-                        .end_key = null,
-                    };
-                    return .{
-                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                        .tables = tables,
-                        .ranges = ranges,
-                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-                    };
-                }
-
-                fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-                    std.testing.allocator.free(snapshot.tables);
-                    std.testing.allocator.free(snapshot.ranges);
-                }
-            };
-
-            const managed_indexes_json =
-                \\{"full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},"enrichments":[{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":128},{"name":"body_dense_v1","kind":"embedding","field":"body","source_artifact_name":"body_chunks_v1","expected_dims":3,"producer_json":"{\"provider\":\"antfly\",\"model\":\"test-embed\"}"}],"title_body":{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","dimension":3,"embedder":{"provider":"antfly","model":"test-embed"}},"artifact_vectors":{"name":"artifact_vectors","type":"embeddings","dimension":3,"sources":[{"artifact":"body_dense_v1"}]}}
-            ;
-            Catalog.indexes_json_buf = tables_api.default_indexes_json;
-            var provider = FakeEmbeddingProvider{};
-
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
-            var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
-            source.write_cache = &write_cache;
-            _ = source.withAntflyProvider(provider.interface());
-
-            {
-                var stale_owner = try write_cache.getOrOpenLockedMode(
-                    path,
-                    Catalog.iface(),
-                    7001,
-                    source.visibleRootGeneration(7001),
-                    "docs",
-                    .startup_catch_up,
-                );
-                defer stale_owner.deinit(alloc);
-                try std.testing.expect(stale_owner.db.enrichment_runtime == null);
-                // Reproduce the production failure precisely: metadata publication
-                // advanced independently while the resident runtime stayed stale.
-                // A fingerprint match alone must never let create skip installation.
-                ProvisionedTableWriteCache.publishEntryManagedConfig(stale_owner.entry.?, managed_indexes_json);
-                try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(
-                    stale_owner.entry.?,
-                    managed_indexes_json,
-                ));
+                var artifact_result = try entry.db.search(alloc, .{
+                    .index_name = "artifact_vectors",
+                    .dense = .{ .vector = query_vec[0..], .k = 1 },
+                    .limit = 1,
+                });
+                defer artifact_result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), artifact_result.hits.len);
+                try std.testing.expectEqualStrings("doc:a", artifact_result.hits[0].id);
             }
-
-            // Admission has committed the new catalog value, but the startup cache
-            // still owns a writer constructed from the earlier snapshot.
-            Catalog.indexes_json_buf = managed_indexes_json;
-            var req = tables_api.CreateTableRequest{
-                .indexes_json = try alloc.dupe(u8, managed_indexes_json),
-            };
-            defer req.deinit(alloc);
-            _ = try source.source().createTable(alloc, "docs", req);
-
-            try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-            const entry = write_cache.entries.items[0];
-            try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors") != null);
-            const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
-            try std.testing.expect(runtime.stats().worker_started);
-
-            _ = try source.source().batch(alloc, "docs", .{
-                .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
-                .sync_level = .full_index,
-            });
-            try std.testing.expect(provider.request_count.load(.monotonic) > 0);
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors").?.index.metadata.active_count > 0);
-
-            const query_vec = [_]f32{ 1, 0, 0 };
-            var result = try entry.db.search(alloc, .{
-                .index_name = "title_body",
-                .dense = .{ .vector = query_vec[0..], .k = 1 },
-                .limit = 1,
-            });
-            defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
-            try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
-
-            var artifact_result = try entry.db.search(alloc, .{
-                .index_name = "artifact_vectors",
-                .dense = .{ .vector = query_vec[0..], .k = 1 },
-                .limit = 1,
-            });
-            defer artifact_result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), artifact_result.hits.len);
-            try std.testing.expectEqualStrings("doc:a", artifact_result.hits[0].id);
         }
 
         test "provisioned table write source restore table does not hold local db mutex during restore work" {

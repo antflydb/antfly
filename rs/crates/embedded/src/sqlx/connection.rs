@@ -38,7 +38,11 @@ use std::{
     fmt,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock, Weak, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 use tokio::sync::oneshot;
@@ -113,7 +117,16 @@ impl Drop for PendingResource {
         }
     }
 }
+// A channel can remain allocated after its worker panics. Track the worker's
+// lifetime directly so pool health checks never queue behind native work.
+struct WorkerLifetime(Arc<AtomicBool>);
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 struct Worker {
+    alive: Arc<AtomicBool>,
     sender: Option<mpsc::Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -144,6 +157,8 @@ impl Worker {
                 .map_err(protocol)?
                 .join(&options.path)
         };
+        let alive = Arc::new(AtomicBool::new(true));
+        let lifetime = WorkerLifetime(Arc::clone(&alive));
         let (sender, receiver) = mpsc::channel::<Job>();
         let (started, start) = mpsc::sync_channel(1);
         let native_options = OpenOptions {
@@ -156,16 +171,18 @@ impl Worker {
             .name("antfly-sqlx".into())
             .stack_size(MIN_THREAD_STACK_SIZE)
             .spawn(move || {
+                let _lifetime = lifetime;
                 let database = match Database::open(&thread_path, &native_options) {
                     Ok(db) => Ok(db),
-                    Err(crate::Error::NotFound) => Database::create(&thread_path, &native_options)
-                        .or_else(|error| {
+                    Err(error) if error.kind() == crate::Error::NotFound => {
+                        Database::create(&thread_path, &native_options).or_else(|error| {
                             if thread_path.exists() {
                                 Database::open(&thread_path, &native_options)
                             } else {
                                 Err(error)
                             }
-                        }),
+                        })
+                    }
                     Err(e) => Err(e),
                 };
                 match database {
@@ -188,6 +205,7 @@ impl Worker {
             .map_err(protocol)?
             .map_err(|e| native_error(e.into()))?;
         let worker = Arc::new(Worker {
+            alive,
             sender: Some(sender),
             thread: Some(thread),
         });
@@ -200,21 +218,29 @@ impl Worker {
             .get_or_init(Default::default)
             .lock()
             .map_err(protocol)?;
-        if let Some(worker) = registry.get(&key).and_then(Weak::upgrade) {
+        if let Some(worker) = registry
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .filter(|worker| worker.alive.load(Ordering::Acquire))
+        {
             return Ok(worker);
         }
+        let alive = Arc::new(AtomicBool::new(true));
+        let lifetime = WorkerLifetime(Arc::clone(&alive));
         let (sender, receiver) = mpsc::channel::<Job>();
         let database = Arc::clone(database);
         let thread = std::thread::Builder::new()
             .name("antfly-sqlx".into())
             .stack_size(MIN_THREAD_STACK_SIZE)
             .spawn(move || {
+                let _lifetime = lifetime;
                 for job in receiver {
                     job(&database)
                 }
             })
             .map_err(protocol)?;
         let worker = Arc::new(Worker {
+            alive,
             sender: Some(sender),
             thread: Some(thread),
         });
@@ -477,11 +503,12 @@ impl Connection for AntflyConnection {
         self.close().await
     }
     async fn ping(&mut self) -> Result<(), Error> {
-        self.ensure().await?;
-        self.worker
-            .run(|db| Ok(db.status_json()?))
-            .await
-            .map(|_| ())
+        if self.closed || !self.worker.alive.load(Ordering::Acquire) {
+            return Err(protocol("native SQL worker has stopped"));
+        }
+        // Dropped/canceled transactions still need their queued rollback.
+        // An idle in-process connection has no network state to probe.
+        self.ensure().await
     }
     async fn begin(&mut self) -> Result<Transaction<'_, Antfly>, Error> {
         Transaction::begin(self, None).await
@@ -651,8 +678,9 @@ impl<'c> Executor<'c> for &'c mut AntflyConnection {
          let opened=self.worker.run_resource(ResourceKind::Cursor, move|db|db.sql_cursor_open_json(cursor_request)).await;
          self.pending=false;
          match opened{
-          Ok(id)=>{let cursor=CursorGuard{worker:self.worker.clone(),id};loop{
-           let bytes=self.worker.run(move|db|db.sql_cursor_fetch_json(id,128)).await?;
+          Ok(id)=>{let cursor=CursorGuard{worker:self.worker.clone(),id};let cursor_statement:Arc<str>=Arc::from(statement.as_str());loop{
+           let cursor_statement=Arc::clone(&cursor_statement);
+           let bytes=self.worker.run(move|db|db.sql_cursor_fetch_json(id,128).map_err(|error|error.with_statement(&cursor_statement))).await?;
            #[derive(Deserialize)]struct Page{result:Output,exhausted:bool}
            let page:Page=serde_json::from_slice(&bytes).map_err(protocol)?;let (page_rows,result)=rows(page.result)?;
            for row in page_rows{yield Either::Right(row)}if page.exhausted{yield Either::Left(result);break}
@@ -695,5 +723,36 @@ impl<'c> Executor<'c> for &'c mut AntflyConnection {
             })
         }
         .boxed()
+    }
+}
+
+#[cfg(all(test, feature = "libantfly"))]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn idle_ping_is_local_and_detects_a_stopped_worker() {
+        let (sender, receiver) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
+        let worker = Arc::new(Worker {
+            alive: Arc::clone(&alive),
+            sender: Some(sender),
+            thread: None,
+        });
+        let mut connection = AntflyConnection {
+            worker,
+            session: 1,
+            depth: 0,
+            pending: false,
+            closed: false,
+        };
+        assert!(connection.ping().now_or_never().unwrap().is_ok());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(WorkerLifetime(alive));
+        assert!(connection.ping().now_or_never().unwrap().is_err());
+        connection.closed = true;
     }
 }

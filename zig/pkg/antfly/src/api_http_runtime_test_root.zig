@@ -39,6 +39,7 @@ test {
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
     _ = @import("api/kernel_owner_source.zig");
+    _ = @import("api/sql_execution.zig");
     _ = @import("api/sql_pgwire.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
@@ -81,8 +82,26 @@ test "system catalog routing and transport discovery" {
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 test {
     _ = @import("api/lake_sql_cursor.zig");
+    _ = @import("api/native_query_repository.zig");
+    _ = @import("api/lake_query_metrics.zig");
+    _ = @import("api/lake_index_native_text.zig");
+    _ = @import("api/lake_index_text_query.zig");
+    _ = @import("api/lake_index_ordered_rows.zig");
+    _ = @import("api/lake_index_text_statistics.zig");
+    _ = @import("api/lake_index_seekable_text.zig");
+    _ = @import("api/lake_index_text_opening_pack.zig");
 }
 
 test {
     _ = @import("api/lake_sql_integration_test.zig");
+}
+
+// Schema admission is part of the public lake SQL binding contract.
+test "external lake SQL schema cache discovery" {
+    _ = @import("api/sql_schema_cache.zig");
+}
+
+// Filtered roots must reach the mounted transport tests through a named anchor.
+test "api HTTP runtime discovery" {
+    _ = httpx_handler;
 }

@@ -16,6 +16,7 @@
 //! Physical local-query execution. Routing and owner acquisition belong to callers.
 
 const std = @import("std");
+const storage_engine = @import("engine.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_exec_mod = @import("db/query/graph_exec.zig");
@@ -78,6 +79,7 @@ const validateAlgebraicPartialsAccessPaths = contract.validateAlgebraicPartialsA
 const validateAlgebraicProgramPartialsProof = contract.validateAlgebraicProgramPartialsProof;
 
 pub fn validateGraphHydrateResolvedDocFilterForDb(req: local_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryValidateGraphHydrateResolvedDocFilterForDb", .{ req, db });
     if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
     if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
@@ -91,6 +93,7 @@ pub fn executeStorageKernelGraphExpand(
     table_name: []const u8,
     req: local_graph.GraphExpandRequest,
 ) !local_graph.GraphExpandResponse {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelGraphExpand", .{ alloc, db, table_name, req });
     if (req.topology_epoch != 0) return error.InvalidArgument;
     const expansions = try alloc.alloc(local_graph.GraphExpansion, req.frontier.len);
     var initialized: usize = 0;
@@ -105,10 +108,17 @@ pub fn executeStorageKernelGraphExpand(
         defer local_graph.freeExpandSearchRequest(alloc, search_req);
         var result = try db.search(alloc, search_req);
         defer result.deinit();
-        var graph_result = if (result.graph_results.len > 0)
-            try local_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
-        else
-            try local_graph.emptyGraphSearchResult(alloc, req.name);
+        var graph_result = if (result.graph_results.len > 0) take: {
+            if (req.exclude_nodes.len == 0 and req.exclude_edges.len == 0) {
+                // Search and expansion share the allocator, and this result is
+                // consumed exclusively. Transfer all owners, including metric
+                // slabs and statuses, before retiring the source container.
+                const owned = result.graph_results[0];
+                result.graph_results[0] = .{ .name = &.{}, .hits = &.{}, .total_hits = 0 };
+                break :take owned;
+            }
+            break :take try local_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges);
+        } else try local_graph.emptyGraphSearchResult(alloc, req.name);
         errdefer graph_result.deinit(alloc);
         for (graph_result.hits) |*hit| hit.deinit(alloc);
         if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
@@ -129,6 +139,7 @@ pub fn executeStorageKernelGraphHydrate(
     db: *db_mod.DB,
     req: local_graph.GraphHydrateRequest,
 ) !local_graph.GraphHydrateResponse {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelGraphHydrate", .{ alloc, db, req });
     if (req.topology_epoch != 0) return error.InvalidArgument;
     try validateGraphHydrateResolvedDocFilterForDb(req, db);
     try validateGraphHydrateIncomingIndexIdentity(req, db);
@@ -213,6 +224,7 @@ pub fn executeStorageKernelGraphEdges(
     db: *db_mod.DB,
     req: local_graph.GraphEdgesRequest,
 ) !local_graph.GraphEdgesResponse {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelGraphEdges", .{ alloc, db, req });
     if (req.topology_epoch != 0) return error.InvalidArgument;
     const control_req = db_mod.types.SearchRequest{
         .identity_read_generation = req.identity_read_generation,
@@ -233,6 +245,7 @@ pub fn validateGraphHydrateIncomingIndexIdentity(
     req: local_graph.GraphHydrateRequest,
     db: *db_mod.DB,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryValidateGraphHydrateIncomingIndexIdentity", .{ req, db });
     if (req.incoming_index_name.len > 0) {
         if (!req.incoming_index_identity.valid()) return error.IndexGenerationMismatch;
         const actual = db.core.index_manager.coverageIdentityForIndex(req.incoming_index_name) orelse
@@ -257,6 +270,7 @@ pub fn validateGraphHydrateIncomingIndexIdentity(
 }
 
 pub fn currentIdentityReadGenerationForDb(requested: ?u64, db: *db_mod.DB) !u64 {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryCurrentIdentityReadGenerationForDb", .{ requested, db });
     return try db.currentIdentityReadGenerationForRequest(requested);
 }
 
@@ -265,6 +279,7 @@ pub fn algebraicIndexFreshEnoughForName(
     index_name_opt: ?[]const u8,
     db: *db_mod.DB,
 ) !bool {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryAlgebraicIndexFreshEnoughForName", .{ alloc, index_name_opt, db });
     const entry = if (index_name_opt) |index_name|
         db.core.index_manager.algebraicIndex(index_name) orelse return false
     else
@@ -283,6 +298,7 @@ pub fn collectTextStatsFromDbForRequest(
     db: *db_mod.DB,
     request: ParsedTextStatsRequest,
 ) ![]const distributed_stats_mod.TextFieldStats {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryCollectTextStatsFromDbForRequest", .{ alloc, db, request });
     return switch (request) {
         .query_request => |owned_query| try db.collectSearchRequestTextStats(alloc, owned_query.req),
         .explicit_fields => |parsed| blk: {
@@ -312,6 +328,7 @@ pub fn collectBackgroundTextStatsFromDbForRequest(
     db: *db_mod.DB,
     request: ParsedTextStatsRequest,
 ) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryCollectBackgroundTextStatsFromDbForRequest", .{ alloc, db, request });
     return switch (request) {
         .background_fields => |parsed| blk: {
             const generation = try db.currentIdentityReadGenerationForRequest(parsed.identity_read_generation);
@@ -342,6 +359,7 @@ pub fn collectAlgebraicPartialsFromDbForRequest(
     db: *db_mod.DB,
     request: ParsedAlgebraicPartialsRequest,
 ) ![]db_mod.algebraic.distributed.Partial {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryCollectAlgebraicPartialsFromDbForRequest", .{ alloc, db, request });
     const generation = try db.currentIdentityReadGenerationForRequest(request.identity_read_generation);
     const entry = if (request.index_name) |index_name|
         db.core.index_manager.algebraicIndex(index_name) orelse return error.UnsupportedQueryRequest
@@ -373,6 +391,7 @@ pub fn algebraicTensorProgramOutputExpressionsForIndexAlloc(
     access_paths: []OwnedAlgebraicTensorAccessPath,
     program: *const OwnedAlgebraicTensorProgram,
 ) ![]algebraic_ir.TensorExpr {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryAlgebraicTensorProgramOutputExpressionsForIndexAlloc", .{ alloc, index, access_paths, program });
     const path_values = try algebraicTensorAccessPathValuesAlloc(alloc, access_paths);
     defer if (path_values.len > 0) alloc.free(path_values);
     var view = try program.asProgramAlloc(alloc);
@@ -401,6 +420,7 @@ pub fn algebraicTensorProgramOutputExpressionForStep(
     path_values: []const algebraic_ir.PhysicalAccessPath,
     expr: algebraic_ir.TensorExpr,
 ) !algebraic_ir.TensorExpr {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryAlgebraicTensorProgramOutputExpressionForStep", .{ alloc, index, path_values, expr });
     if (expr.layout == .materialized_expr) {
         var plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, expr)) orelse return error.InvalidQueryRequest;
         defer plan.deinit(alloc);
@@ -424,6 +444,7 @@ pub fn findAlgebraicMaterialization(
     index: *const db_mod.algebraic.index.Index,
     name: []const u8,
 ) ?db_mod.algebraic.index.MaterializationConfig {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryFindAlgebraicMaterialization", .{ index, name }) catch @panic("incompatible storage owner");
     for (index.config().materializations) |mat| {
         if (std.mem.eql(u8, mat.name, name)) return mat;
     }
@@ -436,6 +457,7 @@ pub fn executeStorageKernelTextStats(
     table_name: []const u8,
     body: []const u8,
 ) ![]u8 {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelTextStats", .{ alloc, db, table_name, body });
     var parsed = try parseTextStatsRequest(alloc, table_name, body);
     defer parsed.deinit(alloc);
     return switch (parsed) {
@@ -457,6 +479,7 @@ pub fn executeStorageKernelAlgebraicPartials(
     db: *db_mod.DB,
     body: []const u8,
 ) ![]u8 {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelAlgebraicPartials", .{ alloc, db, body });
     var parsed = try parseAlgebraicPartialsRequest(alloc, body);
     defer parsed.deinit(alloc);
     const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed);
@@ -470,6 +493,7 @@ pub fn executeStorageKernelPreflight(
     table_name: []const u8,
     request_json: []const u8,
 ) ![]u8 {
+    if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelPreflight", .{ alloc, db, table_name, request_json });
     var wire = try std.json.parseFromSlice(StorageKernelPreflightWireRequest, alloc, request_json, .{});
     defer wire.deinit();
     var owned = try query_api.parseQueryRequest(alloc, null, table_name, wire.value.query_json);

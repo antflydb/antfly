@@ -69,8 +69,6 @@ pub const AudioChunkConfig = antfly_chunking_api_openapi.InferenceAudioChunkConf
 pub const BackendRuntimes = struct {
     /// Whether the native CPU backend is built into this runtime
     native: ?bool = null,
-    /// Whether the ONNX Runtime backend is built into this runtime
-    onnx: ?bool = null,
     /// Whether the Metal backend is built into this runtime
     metal: ?bool = null,
     /// Whether the CUDA backend is built into this runtime
@@ -83,7 +81,6 @@ pub const BackendRuntimes = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "native", "native", true },
-        .{ "onnx", "onnx", true },
         .{ "metal", "metal", true },
         .{ "cuda", "cuda", true },
         .{ "xla", "xla", true },
@@ -102,10 +99,6 @@ pub const BackendRuntimes = struct {
         try jw.beginObject();
         if (self.native) |value| {
             try jw.objectField("native");
-            try jw.write(value);
-        }
-        if (self.onnx) |value| {
-            try jw.objectField("onnx");
             try jw.write(value);
         }
         if (self.metal) |value| {
@@ -197,7 +190,7 @@ pub const Config = struct {
     api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
@@ -1275,7 +1268,6 @@ pub const MediaContentPart = struct {
 pub const ModelBackend = enum {
     auto,
     native,
-    onnx,
     metal,
     cuda,
     xla,
@@ -1286,7 +1278,6 @@ pub const ModelBackend = enum {
         const s = switch (self) {
             .auto => "auto",
             .native => "native",
-            .onnx => "onnx",
             .metal => "metal",
             .cuda => "cuda",
             .xla => "xla",
@@ -1304,7 +1295,6 @@ pub const ModelBackend = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "auto", .auto },
             .{ "native", .native },
-            .{ "onnx", .onnx },
             .{ "metal", .metal },
             .{ "cuda", .cuda },
             .{ "xla", .xla },
@@ -1349,6 +1339,8 @@ pub const ModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const ModelInfo = struct {
+    /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
+    qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// List of capabilities this model supports (omitted when empty)
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -1356,6 +1348,7 @@ pub const ModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -1370,6 +1363,10 @@ pub const ModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.qualified_limits) |value| {
+            try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
         if (self.capabilities) |value| {
             try jw.objectField("capabilities");
             try jw.write(value);
@@ -1823,7 +1820,7 @@ pub const RuntimeConfig = struct {
     api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,

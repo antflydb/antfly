@@ -1675,8 +1675,7 @@ const DirtyRanges = struct {
                 if (opts.columnar_stats) |stats| stats.primary_predicate_rows += 1;
             }
             if (!try plan.matches(scratch, id, typed)) continue;
-            const projected = if (opts.include_documents) try projectPrimary(plan, materializer, scratch, id, typed) else null;
-            try deliver(alloc, row, projected, opts, visitor, progress);
+            try deliverPrimary(alloc, scratch, plan, materializer, row, typed, opts, visitor, progress);
         }
         return replaced;
     }
@@ -2487,7 +2486,7 @@ const Block = struct {
             .number => .f64_val,
             .boolean => .bool_val,
             .geopoint => .geo_point,
-            .string, .blob, .geoshape, .json, .dense_vector => .bytes_val,
+            .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
         };
     }
 
@@ -2497,7 +2496,10 @@ const Block = struct {
             const values = try self.alloc.alloc(?codec.Cell, self.rows.len);
             @memset(values, null);
             if (column_view.bitmaps.len != 0) for (values, 0..) |*value, i| {
-                if (column_view.bitmaps[null_bytes + i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0) value.* = .{ .ordinal = ordinal, .path = self.table.relational_columns[ordinal].path, .value_type = self.valueType(ordinal), .is_null = true, .value = undefined };
+                if (column_view.bitmaps[null_bytes + i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0) {
+                    const col = self.table.relational_columns[ordinal];
+                    value.* = .{ .ordinal = ordinal, .path = col.path, .value_type = self.valueType(ordinal), .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .is_null = true, .value = undefined };
+                }
             };
             column_view.cells = values;
             if (self.stats) |stats| stats.cell_slots_initialized += values.len;
@@ -2642,7 +2644,7 @@ const Block = struct {
             if (source >= decoded.values.len) continue;
             const cell_value = decoded.values[source] orelse continue;
             if (values[row] != null or !column_view.present(row)) return error.InvalidColumnSegment;
-            values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .value = cell_value };
+            values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .value = cell_value };
         }
         for (first..end) |i| if ((values[i] != null) != column_view.present(i)) return error.InvalidColumnSegment;
         column_view.loaded_pages.set(page);
@@ -2697,6 +2699,26 @@ const Block = struct {
         logical_slots[row] = logical;
         if (self.stats) |stats| stats.values_materialized += 1;
         return logical;
+    }
+
+    /// Projection borrows decoded cells while this block pins their payloads.
+    /// Predicate/materialization caches remain independent of row-owned output.
+    fn projectionSource(self: *@This(), ordinal: u32, row: usize, row_alloc: alloc_type) !?ProjectionPlan.Source {
+        const value = try self.column(ordinal);
+        if (!value.present(row)) return null;
+        if (value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return .{ .logical = .null };
+        const column_schema = &self.table.relational_columns[ordinal];
+        if (column_schema.is_json) return .{ .json = (try self.jsonView(ordinal, row)).? };
+        const cells_view = try self.initCells(ordinal);
+        if (cells_view[row] != null) {
+            if (self.stats) |stats| stats.cell_cache_hits += 1;
+        } else try self.loadPage(ordinal, value.pages.?.containing(row));
+        const cell = cells_view[row] orelse return error.InvalidColumnSegment;
+        const source = try ProjectionPlan.sourceForCell(row_alloc, column_schema, cell, false);
+        if (source == .native) if (self.stats) |stats| {
+            source.native.materialized_count = &stats.values_materialized;
+        };
+        return source;
     }
 
     pub fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
@@ -3108,6 +3130,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                 if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, row.key, to) != .lt else std.mem.order(u8, row.key, to) == .gt)) continue;
                 if (ttl_ns != 0 and row.timestamp != 0 and @import("../ttl.zig").isExpired(row.timestamp, ttl_ns, now_ns)) continue;
                 var projected: ?[]u8 = null;
+                var streamed: ?@import("query/streamed_projection.zig").Context = null;
                 var row_arena = std.heap.ArenaAllocator.init(alloc);
                 defer row_arena.deinit();
                 const row_alloc = row_arena.allocator();
@@ -3117,15 +3140,11 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                         var object = ProjectionPlan.Sources.empty;
                         for (projection.base.ordinals) |ordinal| {
                             const name = block.table.relational_columns[ordinal].name;
-                            if (block.table.relational_columns[ordinal].is_json) {
-                                if (try block.jsonView(ordinal, i)) |json_view| {
-                                    try object.put(row_alloc, name, .{ .json = json_view });
-                                    continue;
-                                }
-                            }
-                            if (try block.logicalValue(ordinal, i)) |value| try object.put(row_alloc, name, .{ .logical = value });
+                            if (try block.projectionSource(ordinal, i, row_alloc)) |value| try object.put(row_alloc, name, value);
                         }
-                        projected = try projection.projectSources(row_alloc, row_alloc, object);
+                        if (visitor.borrow_documents) {
+                            streamed = .{ .scratch = row_alloc, .value = .{ .sources = .{ .plan = projection, .sources = object } } };
+                        } else projected = try projection.projectSources(row_alloc, row_alloc, object);
                     } else {
                         var primary_scope = try txn.openReadScope(row_alloc);
                         defer primary_scope.close();
@@ -3140,10 +3159,17 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                         // A clean covered row must still name the exact primary
                         // image. Never emit stale selection after derived damage.
                         if (!std.mem.eql(u8, &row.hash, &typed.semanticHash()) or row.timestamp != typed.writeTimestampNs()) return error.InvalidColumnSegment;
+                        if (visitor.borrow_documents and opts.fields.len == 0 and opts.include_all_fields) {
+                            // The primary scope must outlive synchronous delivery.
+                            var context: @import("query/streamed_projection.zig").Context = .{ .scratch = row_alloc, .value = .{ .whole_row = typed } };
+                            try deliverValue(alloc, row, null, context.borrow(), opts, visitor, progress);
+                            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+                            continue;
+                        }
                         projected = try projectPrimary(schema_plan, materializer, row_alloc, row.key, typed);
                     }
                 }
-                try deliver(alloc, row, projected, opts, visitor, progress);
+                try deliverValue(alloc, row, projected, if (streamed) |*context| context.borrow() else null, opts, visitor, progress);
                 if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
             }
             window_first = window_end;
@@ -3190,9 +3216,31 @@ fn eligibleRow(row: Row, from: []const u8, to: []const u8, byte_range: types.Byt
     return ttl_ns == 0 or row.timestamp == 0 or !@import("../ttl.zig").isExpired(row.timestamp, ttl_ns, now_ns);
 }
 
+/// Dirty overlays and uncovered primary ranges share the same synchronous
+/// producer contract. Scope retirement always follows consumer completion.
+fn deliverPrimary(alloc: alloc_type, scratch: alloc_type, plan: *const scan_plan.Plan, materializer: Materializer, row: Row, typed: codec.OrdinalRowView, opts: types.ScanOptions, visitor: types.ScanVisitor, progress: *Progress) !void {
+    var streamed: ?@import("query/streamed_projection.zig").Context = null;
+    if (visitor.borrow_documents and opts.include_documents) if (plan.projected) |projection| {
+        streamed = .{ .scratch = scratch, .value = .{ .row = .{ .plan = projection, .row = typed } } };
+    };
+    if (visitor.borrow_documents and opts.include_documents and opts.fields.len == 0 and opts.include_all_fields) {
+        streamed = .{ .scratch = scratch, .value = .{ .whole_row = typed } };
+    }
+    const projected = if (opts.include_documents and streamed == null) try projectPrimary(plan, materializer, scratch, row.key, typed) else null;
+    try deliverValue(alloc, row, projected, if (streamed) |*context| context.borrow() else null, opts, visitor, progress);
+}
+
 fn deliver(alloc: alloc_type, row: Row, projected: ?[]const u8, opts: types.ScanOptions, visitor: types.ScanVisitor, progress: *Progress) !void {
+    return deliverValue(alloc, row, projected, null, opts, visitor, progress);
+}
+fn deliverValue(alloc: alloc_type, row: Row, projected: ?[]const u8, stream: ?types.BorrowedScanDocument, opts: types.ScanOptions, visitor: types.ScanVisitor, progress: *Progress) !void {
     try progress.last_key.ensureTotalCapacity(alloc, row.key.len);
-    visitor.visit(visitor.context, .{ .id = row.key, .hash = std.mem.readInt(u64, row.hash[0..8], .little), .content_hash = if (opts.include_content_hashes) row.hash else null, .document_json = projected }) catch |err| {
+    var fallback: ?@import("query/streamed_projection.zig").Context = null;
+    if (stream == null and visitor.borrow_documents) if (projected) |json| {
+        fallback = .{ .scratch = alloc, .value = .{ .json_fields = json } };
+    };
+    const producer: ?types.BorrowedScanDocument = if (stream) |value| value else if (fallback) |*context| context.borrow() else null;
+    visitor.visitEntry(.{ .id = row.key, .hash = std.mem.readInt(u64, row.hash[0..8], .little), .content_hash = if (opts.include_content_hashes) row.hash else null, .document_json = if (producer == null) projected else null, .document_stream = producer }) catch |err| {
         progress.callback_failed = true;
         return err;
     };
@@ -3312,8 +3360,7 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
                 break :blk try plan.matches(scratch, row.key, typed);
             };
             if (!matched) return .@"continue";
-            const projected = if (self.opts.include_documents) try projectPrimary(plan, self.materializer, scratch, row.key, typed) else null;
-            try deliver(self.alloc, row, projected, self.opts, self.visitor, self.progress);
+            try deliverPrimary(self.alloc, scratch, plan, self.materializer, row, typed, self.opts, self.visitor, self.progress);
             return if (self.opts.limit > 0 and self.progress.delivered >= self.opts.limit) .stop else .@"continue";
         }
     };

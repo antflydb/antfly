@@ -18,7 +18,7 @@ export type ExtractorCapability = "labels" | "zeroshot" | "relations" | "answers
 
 export type QuantizationType = "f32" | "f16" | "i8" | "i8-st" | "i4" | "i4-cuda";
 
-export type Backend = "native" | "onnx" | "metal" | "cuda" | "xla" | "wasm";
+export type Backend = "native" | "metal" | "cuda" | "xla" | "wasm";
 
 // Hardware capabilities that models can run on
 export type HardwareCapability = "nvidia-gpu" | "apple-silicon" | "google-tpu" | "cpu";
@@ -61,7 +61,6 @@ export const HARDWARE_INFO: Record<HardwareCapability, HardwareInfo> = {
 // Map backends to supported hardware capabilities
 export const BACKEND_TO_HARDWARE: Record<Backend, HardwareCapability[]> = {
   native: ["cpu"],
-  onnx: ["nvidia-gpu", "apple-silicon", "cpu"],
   metal: ["apple-silicon"],
   cuda: ["nvidia-gpu"],
   xla: ["google-tpu", "nvidia-gpu", "cpu"],
@@ -85,6 +84,9 @@ export function getHardwareCapabilities(backends?: Backend[]): HardwareCapabilit
   }
 
   // Return in a logical order: GPU first, then Apple, then TPU, then CPU
+  if (capabilities.size === 0) {
+    return ["cpu"];
+  }
   const order: HardwareCapability[] = ["nvidia-gpu", "apple-silicon", "google-tpu", "cpu"];
   return order.filter((cap) => capabilities.has(cap));
 }

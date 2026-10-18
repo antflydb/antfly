@@ -63,12 +63,20 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_media": ("zig/lib/media/src/mod.zig",),
+    "antfly_video": ("zig/lib/video/src/mod.zig",),
+    "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
+    "storage_ordinal_options": (),
+    "storage_engine_options": (),
+    "storage_engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
     "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
-    "onnx_c": ("zig/pkg/inference/src/backends/onnx_c.h",),
-    "ortgenai_c": ("zig/pkg/inference/src/backends/ortgenai_c.h",),
     "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),
     "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
+    "antfly_inference_engine": ("zig/pkg/inference/src/host/engine.zig",),
+    "engine_options": (),
+    "engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
+    "engine_memory": ("zig/lib/runtime/src/runtime_memory_abi.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
@@ -211,7 +219,7 @@ SOURCE_MODULES = {
     "antfly_logging_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_logging_openapi/root.zig",
     ),
-    "antfly_matcher": ("zig/lib/matcher/src/mod.zig",),
+    "antfly_matcher": ("zig/pkg/antfly-embedded/matcher/src/mod.zig",),
     "antfly_metadata_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_metadata_openapi/root.zig",
     ),
@@ -232,11 +240,13 @@ SOURCE_MODULES = {
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
+    "antfly_capture_regex": ("zig/lib/regex/src/captures.zig",),
+    "antfly_sql_regex": ("zig/lib/sql_regex/src/mod.zig",),
     "antfly_reranking": ("zig/lib/reranking/src/mod.zig",),
     "antfly_reranking_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_reranking_openapi/root.zig",
     ),
-    "antfly_resolver": ("zig/lib/resolver/src/mod.zig",),
+    "antfly_resolver": ("zig/pkg/antfly-embedded/resolver/src/mod.zig",),
     "antfly_root": ("zig/pkg/antfly-embedded/src/capi_embedded_root.zig",),
     "antfly_s3_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig",

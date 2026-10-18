@@ -111,6 +111,11 @@ fn standaloneInferenceRequestAdmissionStats(
     out.* = standalone_inference_host.linkedInferenceRequestAdmissionStats(handle);
 }
 
+fn standaloneInferenceMemoryAdmissionStats(handle: *anyopaque, out: *standalone_inference_bridge.MemoryAdmissionStats) callconv(.c) standalone_inference_bridge.Status {
+    out.* = standalone_inference_host.linkedInferenceMemoryAdmissionStats(handle) catch |err| return standalone_inference_bridge.statusFromError(err);
+    return .ok;
+}
+
 fn standaloneInferencePullModel(context: *const standalone_inference_bridge.PullModelContext) callconv(.c) standalone_inference_bridge.Status {
     if (!standalone_inference_bridge.validContext(
         standalone_inference_bridge.PullModelContext,
@@ -135,7 +140,7 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
         standalone_inference_bridge.Capability.route_manifest |
         standalone_inference_bridge.Capability.resource_budget |
         standalone_inference_bridge.Capability.request_admission |
-        standalone_inference_bridge.Capability.model_pull,
+        standalone_inference_bridge.Capability.model_pull | standalone_inference_bridge.Capability.memory_admission,
     .create = &standaloneInferenceCreate,
     .configure = &standaloneInferenceConfigure,
     .invoke_provider = &standaloneInferenceInvokeProvider,
@@ -148,6 +153,7 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .request_admission_stats = &standaloneInferenceRequestAdmissionStats,
     .destroy = &standaloneInferenceDestroy,
     .pull_model = &standaloneInferencePullModel,
+    .memory_admission_stats = &standaloneInferenceMemoryAdmissionStats,
 };
 
 fn standaloneInferenceGetFunctionTable() callconv(.c) *const standalone_inference_bridge.FunctionTable {
@@ -160,5 +166,6 @@ fn reportStandaloneInferenceFailure(comptime operation: []const u8, err: anyerro
 }
 
 comptime {
+    if (@import("antfly_inference_engine").enabled) _ = @import("antfly_inference_engine").exports;
     @export(&standaloneInferenceGetFunctionTable, .{ .name = "antfly_standalone_inference_get_function_table", .visibility = .hidden });
 }

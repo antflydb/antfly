@@ -83,7 +83,7 @@ const legacy_tokenizer_config = FilePin{ .path = "tokenizer_config.json", .size_
 pub const decide_1b_production_qualified = true;
 const decide_1b_weight = FilePin{ .path = "model.safetensors", .size_bytes = 4_755_208_228, .sha256 = "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3" };
 const decide_1b_q8_encoder = FilePin{ .path = "gliner2-encoder.Q8_0.gguf", .size_bytes = 1_118_356_576, .sha256 = "9ba4aea751bc8ce3586e70c4dfb3db93d0a850da5023b39d1bb68d21247f1694" };
-const decide_1b_q8_head = FilePin{ .path = "gliner_head.gguf", .size_bytes = 617_195_872, .sha256 = "9a6c1a8ae0f58158404ea6875012e0c27e5923188906492ec7d948968741f558" };
+const decide_1b_q8_head = FilePin{ .path = "gliner2-head.Q8_0.gguf", .size_bytes = 617_195_872, .sha256 = "9a6c1a8ae0f58158404ea6875012e0c27e5923188906492ec7d948968741f558" };
 const decide_1b_config = FilePin{ .path = "config.json", .size_bytes = 464, .sha256 = "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2" };
 const decide_1b_encoder_config = FilePin{ .path = "encoder_config/config.json", .size_bytes = 2160, .sha256 = "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d" };
 const decide_1b_tokenizer = FilePin{ .path = "tokenizer.json", .size_bytes = 3_585_055, .sha256 = "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb" };
@@ -165,19 +165,31 @@ pub fn require(identity: Identity) !QualifiedVariant {
     return qualifiedVariant(identity) orelse error.UnsupportedGlinerDecisionArtifact;
 }
 
-/// Apply only after preprocessing has produced its exact, untruncated token
-/// geometry. The 1B production proof covers one request on Native and Metal
-/// through 198 prepared tokens; its architectural 7999-token encoder ceiling
-/// and CUDA implementation are deliberately not serving qualification.
-pub fn requireRequest(variant: QualifiedVariant, backend: Backend, request_items: usize, prepared_sequences: usize, prepared_sequence_tokens: usize) !void {
-    switch (variant) {
-        .decide_deberta => return,
-        .decide_1b => {
-            if (backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
-            if (request_items != 1 or prepared_sequences != 1 or prepared_sequence_tokens == 0 or prepared_sequence_tokens > 198)
-                return error.UnsupportedGlinerDecisionGeometry;
-        },
-    }
+pub const RequestLimits = struct {
+    request_items: usize = 1,
+    prepared_sequences: usize = 1,
+    sequence_tokens: usize = 198,
+};
+
+/// The two immutable precision variants share the measured request geometry.
+/// Their numerical and serving evidence remain independently captured.
+pub fn requestLimits(identity: Identity) !?RequestLimits {
+    const variant = try require(identity);
+    if (variant != .decide_1b) return null;
+    return .{ .prepared_sequences = 64, .sequence_tokens = 1024 };
+}
+
+pub fn supportsSpanExtraction(identity: Identity) bool {
+    return qualifiedVariant(identity) == .decide_1b and identity.weight_companion == null;
+}
+
+pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize, sequences: usize, tokens: usize) !void {
+    const variant = try require(identity);
+    if (variant != .decide_1b) return;
+    if (backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
+    const limits = (try requestLimits(identity)).?;
+    if (items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
+        return error.UnsupportedGlinerDecisionGeometry;
 }
 
 fn digestFromPin(pin: FilePin) Digest {
@@ -220,7 +232,7 @@ test "GLiNER Decide qualification binds exact loaded legacy identity" {
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
 }
 
-test "GLiNER Decide 1B qualification binds exact loaded identity" {
+pub const pinned_fp32_identity: Identity = blk: {
     var identity = legacyIdentity();
     identity.encoder_family = .modern_bert;
     identity.geometry = .{ .hidden_size = 1792, .intermediate_size = 3840, .num_hidden_layers = 28, .num_attention_heads = 28, .vocab_size = 50378, .max_position_embeddings = 7999 };
@@ -234,8 +246,20 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
         .tokenizer_config = digestFromPin(decide_1b_tokenizer_config),
         .special_tokens_map = null,
     };
+    break :blk identity;
+};
+
+test "GLiNER Decide 1B qualification binds exact loaded identity" {
+    var identity = pinned_fp32_identity;
     try std.testing.expect(isDecide1B(identity));
     try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
+    try std.testing.expect(supportsSpanExtraction(identity));
+    try requireRequestIdentity(identity, .native, 1, 1, 1024);
+    try requireRequestIdentity(identity, .metal, 1, 64, 1024);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .native, 1, 1, 1025));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .native, 2, 1, 700));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 65, 700));
+
     identity.inventory.all_f32 = false;
     try std.testing.expect(!isDecide1B(identity));
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
@@ -244,6 +268,13 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     identity.weight_companion = digestFromPin(decide_1b_q8_head);
     try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
     const quantized = identity;
+    try std.testing.expect(!supportsSpanExtraction(identity));
+    try requireRequestIdentity(identity, .metal, 1, 64, 1024);
+    try requireRequestIdentity(identity, .native, 1, 64, 1024);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 1, 1025));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 65, 700));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .native, 2, 1, 700));
+
     identity.weight_companion = null;
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
     identity = quantized;
@@ -265,16 +296,4 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     identity.weight = digestFromPin(decide_1b_weight);
     identity.inventory.all_f32 = true;
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
-}
-
-test "GLiNER Decide 1B serving policy stays within measured backend and geometry" {
-    try requireRequest(.decide_1b, .native, 1, 1, 198);
-    try requireRequest(.decide_1b, .metal, 1, 1, 1);
-    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequest(.decide_1b, .cuda, 1, 1, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 2, 1, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 1, 2, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 1, 1, 199));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequest(.decide_1b, .native, 1, 1, 0));
-    // Existing qualified DeBERTa behavior is retained by this additive gate.
-    try requireRequest(.decide_deberta, .cuda, 2, 9, 513);
 }
