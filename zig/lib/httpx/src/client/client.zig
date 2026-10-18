@@ -6518,12 +6518,14 @@ test "HTTPS client uploads large immutable packs without truncation" {
         \\                data += chunk
         \\            headers, body = data.split(b'\r\n\r\n', 1)
         \\            length = int(next(line.split(b':', 1)[1] for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')))
-        \\            while len(body) < length:
-        \\                chunk = connection.recv(min(65536, length-len(body)))
+        \\            received = len(body)
+        \\            assert received <= length and body == b'*' * received
+        \\            while received < length:
+        \\                chunk = connection.recv(min(65536, length-received))
         \\                if not chunk:
         \\                    raise RuntimeError('Truncated request body')
-        \\                body += chunk
-        \\            assert body == b'*' * length
+        \\                assert chunk == b'*' * len(chunk)
+        \\                received += len(chunk)
         \\            connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok')
         \\listener.close()
     ;
