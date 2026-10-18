@@ -2137,3 +2137,10 @@ passed independently. All four public V1/V2 mixed/NULL-only attachment and resta
 cases were attempted, but storage admission stopped them before launch (about
 2.0 GiB free versus 16.25 GiB required). They remain pending in `e2e-full`; no
 production admission safeguard was disabled.
+
+The final page-expansion guard rerun passed all 271 reader/cursor tests without
+leaks. A complete stripped, optimized (`--release=fast`) Antfly server build also
+passed on Zig 0.17.0, and the installed CLI reports its version successfully.
+Repository license/boundary, source catalog, generated engine error catalog,
+formatting and whitespace checks passed. Cache cleanup preserved active caches;
+it did not free enough space to satisfy the public E2E storage floor.
