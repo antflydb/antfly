@@ -53,6 +53,34 @@ pub const Comparison = enum {
 };
 pub const Quantifier = enum { any, all };
 
+/// Allocation-free concatenation layout. Evaluators may fold layouts in the
+/// original expression tree before committing a single output allocation.
+pub const ConcatLayout = struct {
+    axes: [6]Dimension = undefined,
+    rank: usize = 0,
+    count: usize = 0,
+    pub fn from(value: Value) !ConcatLayout {
+        if (value.dimensions.len > 6) return error.SqlProgramLimitExceeded;
+        var result: ConcatLayout = .{ .rank = value.dimensions.len, .count = value.cardinality() };
+        @memcpy(result.axes[0..result.rank], value.dimensions);
+        return result;
+    }
+    pub fn combine(left: ConcatLayout, right: ConcatLayout) !ConcatLayout {
+        if (left.count == 0) return right;
+        if (right.count == 0) return left;
+        if (left.rank == 0 or right.rank == 0) return error.InvalidSqlArrayShape;
+        if (@max(left.rank, right.rank) - @min(left.rank, right.rank) > 1) return error.SqlArrayConcatenationDimensions;
+        var result = if (left.rank >= right.rank) left else right;
+        const lower = if (left.rank >= right.rank) right else left;
+        const tails = if (left.rank == right.rank) lower.axes[1..lower.rank] else lower.axes[0..lower.rank];
+        for (result.axes[1..result.rank], tails) |a, b| if (a.length != b.length or a.lower != b.lower) return error.SqlArrayConcatenationDimensions;
+        result.count = std.math.add(usize, left.count, right.count) catch return error.SqlProgramLimitExceeded;
+        result.axes[0].length = std.math.add(u32, result.axes[0].length, if (left.rank == right.rank) right.axes[0].length else 1) catch return error.SqlProgramLimitExceeded;
+        _ = try validateShape(result.axes[0..result.rank], result.count, .{ .elements = std.math.maxInt(i32) });
+        return result;
+    }
+};
+
 pub const Value = struct {
     element_type: ElementType,
     dimensions: []const Dimension,
@@ -285,19 +313,61 @@ pub const Value = struct {
         var count: usize = 0;
         var non_null: usize = 0;
         var text_bytes: usize = 0;
-        for (0..self.cardinality()) |i| {
-            const element = self.flatCell(i);
-            const matched = try compareElement(self.element_type, element, needle, work) == .eq;
-            if (matched) {
-                changed = true;
-                if (matches) |bitmap| bitmap[i / 8] |= @as(u8, 1) << @intCast(i % 8);
-                if (replacement == null) continue;
+        const native = if (self.stored) |view| view.validation != null and matches != null else false;
+        if (native) {
+            _ = try self.knownNonNullCount();
+            const view = self.stored.?;
+            var matched_count: usize = 0;
+            var cursor: usize = 0;
+            while (cursor < self.cardinality()) {
+                const block_count = @min(64, self.cardinality() - cursor);
+                const bits = @import("array_compact.zig").ResultBuilder.nullBits(view.*, cursor, block_count);
+                var matched: u64 = 0;
+                if (needle.sql_null) {
+                    try work.consume(block_count);
+                    matched = bits;
+                } else {
+                    try work.consume(@popCount(bits));
+                    const mask = if (block_count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(block_count)) - 1;
+                    var candidates = ~bits & mask;
+                    while (candidates != 0) {
+                        const bit = @ctz(candidates);
+                        candidates &= candidates - 1;
+                        if (try compareElement(self.element_type, self.flatCell(cursor + bit), needle, work) == .eq) matched |= @as(u64, 1) << @intCast(bit);
+                    }
+                }
+                for (0..(block_count + 7) / 8) |byte| matches.?[cursor / 8 + byte] = @truncate(matched >> @intCast(byte * 8));
+                matched_count += @popCount(matched);
+                cursor += block_count;
             }
-            const emitted = if (matched) replacement.? else element;
-            count += 1;
-            if (!emitted.sql_null) {
-                non_null += 1;
-                if (self.element_type == .text) text_bytes = std.math.add(usize, text_bytes, emitted.value.string.len) catch return error.SqlProgramLimitExceeded;
+            changed = matched_count != 0;
+            count = self.cardinality() - if (replacement == null) matched_count else @as(usize, 0);
+            non_null = view.validation.?.non_null - if (needle.sql_null) @as(usize, 0) else matched_count;
+            if (replacement) |value| if (!value.sql_null) {
+                non_null += matched_count;
+            };
+            if (self.element_type == .text) {
+                text_bytes = (try self.knownTextBytes()).? - if (needle.sql_null) @as(usize, 0) else matched_count * needle.value.string.len;
+                if (replacement) |value| if (!value.sql_null) {
+                    const added = std.math.mul(usize, matched_count, value.value.string.len) catch return error.SqlProgramLimitExceeded;
+                    text_bytes = std.math.add(usize, text_bytes, added) catch return error.SqlProgramLimitExceeded;
+                };
+            }
+        } else {
+            for (0..self.cardinality()) |i| {
+                const element = self.flatCell(i);
+                const matched = try compareElement(self.element_type, element, needle, work) == .eq;
+                if (matched) {
+                    changed = true;
+                    if (matches) |bitmap| bitmap[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+                    if (replacement == null) continue;
+                }
+                const emitted = if (matched) replacement.? else element;
+                count += 1;
+                if (!emitted.sql_null) {
+                    non_null += 1;
+                    if (self.element_type == .text) text_bytes = std.math.add(usize, text_bytes, emitted.value.string.len) catch return error.SqlProgramLimitExceeded;
+                }
             }
         }
         if (!changed and self.cardinality() <= limits.elements and try self.admissionBytes() <= limits.bytes) {
@@ -310,13 +380,35 @@ pub const Value = struct {
         @memcpy(dimensions, self.dimensions[0..rank_]);
         if (replacement == null and count != 0) dimensions[0].length = @intCast(count);
         var output = try @import("array_compact.zig").ResultBuilder.initPlanned(alloc, self.element_type, dimensions, count, non_null, if (self.element_type == .text) text_bytes else null, limits);
-        for (0..self.cardinality()) |i| {
-            try work.consume(1);
-            const matched = if (matches) |bitmap| bitmap[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0 else try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq;
-            if (matched and replacement == null) continue;
-            try output.append(if (matched) replacement.? else self.flatCell(i), work);
+        if (native) {
+            try work.consume(self.cardinality());
+            var cursor: usize = 0;
+            while (cursor < self.cardinality()) {
+                const next = nextMatch(matches.?, cursor, self.cardinality());
+                try output.appendRange(self, cursor, next - cursor, work);
+                if (next == self.cardinality()) break;
+                if (replacement) |value| try output.append(value, work);
+                cursor = next + 1;
+            }
+        } else {
+            for (0..self.cardinality()) |i| {
+                try work.consume(1);
+                const matched = if (matches) |bitmap| bitmap[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0 else try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq;
+                if (matched and replacement == null) continue;
+                try output.append(if (matched) replacement.? else self.flatCell(i), work);
+            }
         }
         return output.finish(alloc, limits, work);
+    }
+
+    fn nextMatch(bitmap: []const u8, begin: usize, count: usize) usize {
+        var cursor = begin;
+        while (cursor < count) {
+            const byte = bitmap[cursor / 8] & (@as(u8, 0xff) << @intCast(cursor % 8));
+            if (byte != 0) return @min(count, cursor / 8 * 8 + @ctz(byte));
+            cursor = (cursor / 8 + 1) * 8;
+        }
+        return count;
     }
 
     /// Append/prepend preserve an existing one-dimensional lower bound.
@@ -346,23 +438,9 @@ pub const Value = struct {
         if (self.element_type != other.element_type) return error.SqlTypeMismatch;
         if (self.cardinality() == 0) return other;
         if (other.cardinality() == 0) return self;
-        const left_rank = self.dimensions.len;
-        const right_rank = other.dimensions.len;
-        if (@max(left_rank, right_rank) - @min(left_rank, right_rank) > 1) return error.SqlArrayConcatenationDimensions;
-        const higher = if (left_rank >= right_rank) self else other;
-        const lower_rank = if (left_rank >= right_rank) other else self;
-        const tails = if (left_rank == right_rank) lower_rank.dimensions[1..] else lower_rank.dimensions;
-        for (higher.dimensions[1..], tails) |a, b| {
-            if (a.length != b.length or a.lower != b.lower) return error.SqlArrayConcatenationDimensions;
-        }
-        const count = self.cardinality() + other.cardinality();
-        const first_length = higher.dimensions[0].length + @as(u32, if (left_rank == right_rank) other.dimensions[0].length else 1);
-        if (@as(i64, higher.dimensions[0].lower) + first_length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        var axes: [6]Dimension = undefined;
-        if (higher.dimensions.len > axes.len) return error.SqlProgramLimitExceeded;
-        const dimensions = axes[0..higher.dimensions.len];
-        @memcpy(dimensions, higher.dimensions);
-        dimensions[0].length = first_length;
+        const shape = try ConcatLayout.combine(try ConcatLayout.from(self), try ConcatLayout.from(other));
+        const count = shape.count;
+        const dimensions = shape.axes[0..shape.rank];
         var non_null: ?usize = null;
         if (try self.knownNonNullCount()) |left| if (try other.knownNonNullCount()) |right| {
             non_null = left + right;
@@ -1025,4 +1103,48 @@ test "SQL native transform custom larger inputs retain bounded scratch replay" {
     try std.testing.expectEqual(@as(usize, 65536), result.cardinality());
     try std.testing.expectEqual(@as(?usize, 0), try result.knownNonNullCount());
     _ = try @import("../common/sql_array_layout.zig").View.open(.int64, result.stored.?.bytes, .{});
+}
+
+test "SQL native bitmap transforms match opaque scalar NULL NaN text and removal semantics" {
+    const a = std.testing.allocator;
+    const compact = @import("array_compact.zig");
+    for ([_]ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64, .text }) |kind| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const region = arena.allocator();
+        var cells: [129]Element = undefined;
+        var present: usize = 0;
+        var payload: usize = 0;
+        for (&cells, 0..) |*cell, i| {
+            cell.* = if (i % 3 == 0) .{} else .json(switch (kind) {
+                .boolean => .{ .bool = i % 2 == 0 },
+                .float32, .float64 => .{ .float = if (i % 8 == 7) std.math.nan(f64) else if (i % 8 == 1) -0.0 else @floatFromInt(i % 5) },
+                .text => .{ .string = if (i % 2 == 0) "é☺" else "other" },
+                else => .{ .integer = @intCast(i % 5) },
+            });
+            if (!cell.sql_null) {
+                present += 1;
+                if (kind == .text) payload += cell.value.string.len;
+            }
+        }
+        var builder = try compact.CheckedBuilder.init(region, kind, &.{.{ .length = 129, .lower = -7 }}, 129, present, payload, .{});
+        var build_work: Budget = .{};
+        for (cells) |cell| try builder.appendChecked(cell, kind, .{}, &build_work);
+        const source = try builder.finish(region, .{});
+        var view = source.stored.?.*;
+        view.validation = null;
+        var unproven = source;
+        unproven.stored = &view;
+        for ([_]Element{ .{}, cells[1], cells[7] }) |needle| for ([_]?Element{ null, Element{}, cells[2] }) |replacement| {
+            var fast_work: Budget = .{};
+            var slow_work: Budget = .{};
+            const fast = try source.transform(region, needle, replacement, .{}, &fast_work);
+            const slow = try unproven.transform(region, needle, replacement, .{}, &slow_work);
+            try std.testing.expectEqual(slow_work.remaining, fast_work.remaining);
+            const expected = try @import("array_storage.zig").encodeAlloc(region, slow, .{});
+            const actual = try @import("array_storage.zig").encodeAlloc(region, fast, .{});
+            try std.testing.expectEqualSlices(u8, expected, actual);
+            _ = try @import("../common/sql_array_layout.zig").View.open(kind, actual, .{});
+        };
+    }
 }

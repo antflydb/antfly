@@ -3287,6 +3287,7 @@ const Evaluator = struct {
                 }
                 switch (call.function) {
                     .array_append, .array_prepend, .array_cat => {
+                        if (call.function == .array_cat) if (try self.fusedConcat(index, depth)) |value| break :blk value;
                         const left = try self.runDatum(call.args[0], depth + 1);
                         const right = try self.runDatum(call.args[1], depth + 1);
                         if (call.function == .array_cat) {
@@ -3866,6 +3867,7 @@ const Evaluator = struct {
                 try output.appendValue(array.*, &work);
                 continue;
             }
+            if (try output.appendConverted(array.*, &work)) continue;
             for (0..array.cardinality()) |array_cell_0| {
                 const element = array.flatCell(array_cell_0);
                 try self.workOwner().charge(1);
@@ -3875,6 +3877,97 @@ const Evaluator = struct {
         const value = try self.alloc.create(arrays.Value);
         value.* = try output.finish(self.alloc, limits, &work);
         return Datum.typedArray(value);
+    }
+
+    const ConcatPlan = struct {
+        leaves: [64]*const arrays.Value = undefined,
+        count: usize = 0,
+    };
+    const ConcatNode = struct { shape: arrays.ConcatLayout = .{}, sql_null: bool = true };
+
+    // Only same-domain calls and identity casts may be crossed. Numeric
+    // modifiers, conversions and constant-owner fast paths remain boundaries.
+    fn concatNode(self: *Evaluator, index: u32, kind: arrays.ElementType) ?u32 {
+        const instruction = self.program.instructions[index];
+        if (instruction.type.kind != .array or instruction.type.element_type != kind) return null;
+        if (self.program.constant_arrays.contains(index) or self.program.constant_inputs.contains(index)) return null;
+        switch (instruction.operation) {
+            .call => |call| if (call.function == .array_cat) return index,
+            .cast => |cast| if (cast.type == .array and cast.element_type == kind and cast.numeric_modifier == null and self.program.instructions[cast.operand].type.kind == .array and self.program.instructions[cast.operand].type.element_type == kind) return cast.operand,
+            else => {},
+        }
+        return null;
+    }
+    fn concatLeaves(self: *Evaluator, index: u32, kind: arrays.ElementType, remaining: usize) usize {
+        if (remaining == 0) return 65;
+        const node = self.concatNode(index, kind) orelse return 1;
+        if (node != index) return self.concatLeaves(node, kind, remaining - 1);
+        const call = self.program.instructions[node].operation.call;
+        const left = self.concatLeaves(call.args[0], kind, remaining - 1);
+        if (left > 64) return 65;
+        return @min(65, left + self.concatLeaves(call.args[1], kind, remaining - 1));
+    }
+    fn planConcat(self: *Evaluator, index: u32, kind: arrays.ElementType, depth: usize, root: bool, plan: *ConcatPlan) anyerror!ConcatNode {
+        if (depth >= self.limits.depth) return self.workOwner().limit();
+        if (self.concatNode(index, kind)) |node| {
+            if (!root) try self.workOwner().charge(1);
+            if (node != index) return self.planConcat(node, kind, depth + 1, false, plan);
+            const call = self.program.instructions[node].operation.call;
+            const left = try self.planConcat(call.args[0], kind, depth + 1, false, plan);
+            const right = try self.planConcat(call.args[1], kind, depth + 1, false, plan);
+            // Preserve the original tree's error order, including mixed ranks.
+            if (left.sql_null) return right;
+            if (right.sql_null) return left;
+            if (left.shape.count == 0) return right;
+            if (right.shape.count == 0) return left;
+            const shape = try arrays.ConcatLayout.combine(left.shape, right.shape);
+            _ = try arrays.validateShape(shape.axes[0..shape.rank], shape.count, .{});
+            return .{ .sql_null = false, .shape = shape };
+        }
+        const value = try self.runDatum(index, depth);
+        if (value.sql_null) return .{};
+        const array = value.array orelse return error.SqlTypeMismatch;
+        if (array.element_type != kind) return error.SqlTypeMismatch;
+        if (plan.count == plan.leaves.len) return error.SqlProgramLimitExceeded;
+        plan.leaves[plan.count] = array;
+        plan.count += 1;
+        return .{ .sql_null = false, .shape = try arrays.ConcatLayout.from(array.*) };
+    }
+    fn fusedConcat(self: *Evaluator, index: u32, depth: usize) !?Datum {
+        const kind = self.program.instructions[index].type.element_type orelse return null;
+        const leaves = self.concatLeaves(index, kind, self.limits.depth -| depth);
+        if (leaves < 3 or leaves > 64) return null;
+        var plan: ConcatPlan = .{};
+        const node = try self.planConcat(index, kind, depth, true, &plan);
+        if (node.sql_null) return Datum{};
+        var nonempty: usize = 0;
+        var identity: *const arrays.Value = plan.leaves[plan.count - 1];
+        var present: ?usize = 0;
+        var text_bytes: ?usize = if (kind == .text) 0 else null;
+        for (plan.leaves[0..plan.count]) |array| {
+            if (array.cardinality() != 0) {
+                nonempty += 1;
+                identity = array;
+            }
+            if (present != null) {
+                if (try array.knownNonNullCount()) |n| present.? += n else present = null;
+            }
+            if (text_bytes != null) {
+                if (try array.knownTextBytes()) |n| text_bytes = std.math.add(usize, text_bytes.?, n) catch return error.SqlProgramLimitExceeded else text_bytes = null;
+            }
+        }
+        if (nonempty <= 1) return Datum.typedArray(identity);
+        const results = @import("array_compact.zig").ResultBuilder;
+        const axes = node.shape.axes[0..node.shape.rank];
+        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+        var output = try results.initPlanned(self.alloc, kind, axes, node.shape.count, present, text_bytes, limits);
+        var work = self.workBudget();
+        for (plan.leaves[0..plan.count]) |array| try output.appendValue(array.*, &work);
+        const result = try output.finish(self.alloc, limits, &work);
+        try self.charge(try result.admissionBytes());
+        const owned = try self.alloc.create(arrays.Value);
+        owned.* = result;
+        return Datum.typedArray(owned);
     }
 
     fn castArray(self: *Evaluator, datum: Datum, target: arrays.ElementType) !Datum {
@@ -3889,11 +3982,11 @@ const Evaluator = struct {
         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes };
         var output = try results.initKnown(self.alloc, target, source.dimensions, source.cardinality(), non_null, limits);
         var work = self.workBudget();
-        for (0..source.cardinality()) |array_cell_0| {
+        if (!try output.appendConverted(source.*, &work)) for (0..source.cardinality()) |array_cell_0| {
             const element = source.flatCell(array_cell_0);
             try self.workOwner().charge(1);
             try output.append(if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else try self.castDatumBuiltin(element, source.element_type, target), &work);
-        }
+        };
         const value = try self.alloc.create(arrays.Value);
         value.* = try output.finish(self.alloc, limits, &work);
         return Datum.typedArray(value);
@@ -5803,5 +5896,239 @@ test "SQL native text scalar producers fit bounded memory through nested arrays 
             try std.testing.expectEqual(@as(i32, -7), bounds.lower);
         }
         try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "SQL fused concat retains one allocation shape identity errors and bounded work" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var source_arena = std.heap.ArenaAllocator.init(a);
+            defer source_arena.deinit();
+            const results = @import("array_compact.zig").ResultBuilder;
+            var builder = try results.initKnown(source_arena.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+            var work: arrays.Budget = .{};
+            for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &work);
+            const source = try builder.finish(source_arena.allocator(), .{}, &work);
+            var compiled = try @import("compiler.zig").compileScalar(a, "a || a || a || a || a || a || a || a", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int64 }}, &.{}, .{});
+            defer program.deinit();
+            var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 1024 * 1024 };
+            {
+                var arena = std.heap.ArenaAllocator.init(counter.allocator());
+                defer arena.deinit();
+                const result = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&source)}, &.{}, .{ .output_bytes = 1024 * 1024, .steps = 131072 })).array.?;
+                try std.testing.expectEqual(@as(usize, 65536), result.cardinality());
+                for (0..65536) |i| try std.testing.expectEqual(@as(i64, @intCast(i % 8192)), result.flatCell(i).value.integer);
+                _ = try @import("../common/sql_array_layout.zig").View.open(.int64, result.stored.?.bytes, .{});
+                std.debug.print("SQL_FUSED_CONCAT cells=65536 operands=8 peak={} retained={}\n", .{ counter.peak, try result.retainedBytes() });
+            }
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.failing_allocator, &.{Datum.typedArray(&source)}, &.{}, .{ .output_bytes = 100 }));
+            try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.failing_allocator, &.{Datum.typedArray(&source)}, &.{}, .{ .steps = 0 }));
+        }
+    };
+    // A separate small fixture enumerates allocation faults below; the large
+    // fixture proves the allocator and explicit shared-work bounds together.
+    try Fixture.run(std.testing.allocator);
+}
+
+test "SQL fused concat preserves tree errors NULL identities and modifier boundaries" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const source = (try @import("array_text.zig").decodeLeaky(source_arena.allocator(), .int64, "[0:1]={1,2}", .{ .compact = true })).value;
+    const incompatible = (try @import("array_text.zig").decodeLeaky(source_arena.allocator(), .int64, "[1:1][1:2]={{3,4}}", .{ .compact = true })).value;
+    const cases = [_]struct { sql: []const u8, err: ?anyerror = null }{
+        .{ .sql = "(a || b) || bad::int8[]", .err = error.SqlArrayConcatenationDimensions },
+        .{ .sql = "bad::int8[] || (a || b)", .err = error.SqlInvalidTextRepresentation },
+        .{ .sql = "NULL::int8[] || a || NULL::int8[]" },
+        .{ .sql = "a || ARRAY[]::int8[] || NULL::int8[]" },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{ .{ .name = "a", .type = .array, .element_type = .int64 }, .{ .name = "b", .type = .array, .element_type = .int64 }, .{ .name = "bad", .type = .string } }, &.{}, .{});
+        defer program.deinit();
+        if (case.err) |err| {
+            try std.testing.expectError(err, program.evaluate(std.testing.failing_allocator, &.{ Datum.typedArray(&source), Datum.typedArray(&incompatible), Datum.json(.{ .string = "bad" }) }, &.{}, .{}));
+        } else {
+            const result = (try program.evaluate(std.testing.failing_allocator, &.{ Datum.typedArray(&source), Datum.typedArray(&incompatible), Datum.json(.{ .string = "bad" }) }, &.{}, .{})).array.?;
+            try std.testing.expect(result == &source);
+        }
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const numeric_source = (try @import("array_text.zig").decodeLeaky(arena.allocator(), .numeric, "{999}", .{})).value;
+        var compiled = try @import("compiler.zig").compileScalar(a, "(n || n)::numeric(2,0)[] || n || n", .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "n", .type = .array, .element_type = .numeric }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{Datum.typedArray(&numeric_source)}, &.{}, .{}));
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const text_source = (try @import("array_text.zig").decodeLeaky(arena.allocator(), .text, "{other}", .{ .compact = true })).value;
+        var compiled = try @import("compiler.zig").compileScalar(a, "s::text::text[] || t || t", .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{ .{ .name = "s", .type = .string }, .{ .name = "t", .type = .array, .element_type = .text } }, &.{}, .{});
+        defer program.deinit();
+        const result = (try program.evaluate(arena.allocator(), &.{ Datum.json(.{ .string = "{first}" }), Datum.typedArray(&text_source) }, &.{}, .{})).array.?;
+        try std.testing.expectEqual(@as(usize, 3), result.cardinality());
+        try std.testing.expectEqualStrings("first", result.flatCell(0).value.string);
+        try std.testing.expectEqualStrings("other", result.flatCell(2).value.string);
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const text_source = (try @import("array_text.zig").decodeLeaky(arena.allocator(), .text, "{other}", .{ .compact = true })).value;
+        // 128 leaves exceed the fixed plan. Bounded subtrees must still fuse
+        // correctly, and the ordinary parent must join their results.
+        var expression: []const u8 = "t";
+        for (0..7) |_| expression = try std.fmt.allocPrint(arena.allocator(), "({s} || {s})", .{ expression, expression });
+        var compiled = try @import("compiler.zig").compileScalar(a, expression, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "t", .type = .array, .element_type = .text }}, &.{}, .{});
+        defer program.deinit();
+        const result = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&text_source)}, &.{}, .{})).array.?;
+        try std.testing.expectEqual(@as(usize, 128), result.cardinality());
+        try std.testing.expectEqualStrings("other", result.flatCell(127).value.string);
+        _ = try @import("../common/sql_array_layout.zig").View.open(.text, result.stored.?.bytes, .{});
+    }
+    const Probe = struct {
+        fn run(backing: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            var compiled = try @import("compiler.zig").compileScalar(backing, "a || a || a", .{});
+            defer compiled.deinit();
+            var program = try bind(backing, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int64 }}, &.{}, .{});
+            defer program.deinit();
+            const cells: [32]Datum = @splat(.json(.{ .integer = 1 }));
+            const source_value = try arrays.Value.init(.int64, &.{.{ .length = 32 }}, &cells, .{});
+            const result = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&source_value)}, &.{}, .{})).array.?;
+            try std.testing.expectEqual(@as(usize, 96), result.cardinality());
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{});
+}
+
+test "SQL native primitive block casts match scalar codecs across widths NULLs rounding and errors" {
+    const a = std.testing.allocator;
+    const kinds = [_]arrays.ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64 };
+    const names = [_][]const u8{ "bool", "int2", "int4", "int8", "float4", "float8" };
+    for (kinds) |source_kind| for (kinds, names) |target, name| {
+        if (!builtin_cast.allowed(source_kind, target)) continue;
+        for (0..3) |pattern| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const region = arena.allocator();
+            const cells = try region.alloc(Datum, 129);
+            var present: usize = 0;
+            for (cells, 0..) |*cell, i| {
+                cell.* = if (pattern == 2 or (pattern == 1 and i % 7 != 0)) .{} else .json(switch (source_kind) {
+                    .boolean => .{ .bool = i % 2 == 0 },
+                    .float32, .float64 => .{ .float = if (pattern == 0 and i == 127) std.math.nan(f64) else if (i == 0) -0.0 else @as(f64, @floatFromInt(@as(i64, @intCast(i)) - 64)) + 0.5 },
+                    else => .{ .integer = @as(i64, @intCast(i)) - 64 },
+                });
+                present += @intFromBool(!cell.sql_null);
+            }
+            const prepared = try arrays.Value.init(source_kind, &.{.{ .length = 129, .lower = -7 }}, cells, .{});
+            var builder = try @import("array_compact.zig").CheckedBuilder.init(region, source_kind, prepared.dimensions, 129, present, 0, .{});
+            var work: arrays.Budget = .{};
+            for (cells) |cell| try builder.appendChecked(cell, source_kind, .{}, &work);
+            const native = try builder.finish(region, .{});
+            const sql = try std.fmt.allocPrint(region, "a::{s}[]", .{name});
+            var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = source_kind }}, &.{}, .{});
+            defer program.deinit();
+            const reference = program.evaluate(region, &.{Datum.typedArray(&prepared)}, &.{}, .{});
+            const result = program.evaluate(region, &.{Datum.typedArray(&native)}, &.{}, .{});
+            if (reference) |expected| {
+                const value = try result;
+                const expected_bytes = try @import("array_storage.zig").encodeAlloc(region, expected.array.?.*, .{});
+                const actual = try @import("array_storage.zig").encodeAlloc(region, value.array.?.*, .{});
+                try std.testing.expectEqualSlices(u8, expected_bytes, actual);
+                _ = try @import("../common/sql_array_layout.zig").View.open(target, actual, .{});
+            } else |err| try std.testing.expectError(err, result);
+        }
+    };
+    // Explicit float narrowing overflow/underflow and integer narrowing.
+    const edges = [_]struct { kind: arrays.ElementType, cell: Datum, sql: []const u8 }{
+        .{ .kind = .int64, .cell = .json(.{ .integer = std.math.maxInt(i64) }), .sql = "a::int2[]" },
+        .{ .kind = .float64, .cell = .json(.{ .float = 1e300 }), .sql = "a::float4[]" },
+        .{ .kind = .float64, .cell = .json(.{ .float = 1e-300 }), .sql = "a::float4[]" },
+        .{ .kind = .float64, .cell = .json(.{ .float = std.math.inf(f64) }), .sql = "a::int8[]" },
+    };
+    for (edges) |edge| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var builder = try @import("array_compact.zig").CheckedBuilder.init(arena.allocator(), edge.kind, &.{.{ .length = 64 }}, 64, 64, 0, .{});
+        var work: arrays.Budget = .{};
+        for (0..64) |_| try builder.appendChecked(edge.cell, edge.kind, .{}, &work);
+        const source = try builder.finish(arena.allocator(), .{});
+        var compiled = try @import("compiler.zig").compileScalar(a, edge.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = edge.kind }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{Datum.typedArray(&source)}, &.{}, .{}));
+    }
+}
+
+test "SQL fused native operation measurements retain identical canonical results" {
+    const a = std.testing.allocator;
+    for (0..3) |operation| {
+        const kind: arrays.ElementType = if (operation == 1) .text else .int64;
+        var source_arena = std.heap.ArenaAllocator.init(a);
+        defer source_arena.deinit();
+        const count = 8192;
+        const present: usize = if (operation == 1) count / 16 else count;
+        var builder = try @import("array_compact.zig").CheckedBuilder.init(source_arena.allocator(), kind, &.{.{ .length = count }}, count, present, if (kind == .text) present * 5 else 0, .{});
+        var source_work: arrays.Budget = .{};
+        for (0..count) |i| try builder.appendChecked(if (kind == .text and i % 16 != 0) .{} else if (kind == .text) .json(.{ .string = if (i == 64) "match" else "é☺" }) else .json(.{ .integer = @intCast(i) }), kind, .{}, &source_work);
+        const source = try builder.finish(source_arena.allocator(), .{});
+        var unproven_view = source.stored.?.*;
+        unproven_view.validation = null;
+        var unproven = source;
+        unproven.stored = &unproven_view;
+        const sql = switch (operation) {
+            0 => "a || a || a || a || a || a || a || a",
+            1 => "array_replace(a, 'match', 'new')",
+            else => "a::int4[]",
+        };
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = kind }}, &.{}, .{});
+        defer program.deinit();
+        var oracle: ?[]u8 = null;
+        defer if (oracle) |bytes| a.free(bytes);
+        for (0..2) |mode| {
+            var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+            var elapsed: i96 = 0;
+            for (0..20) |_| {
+                var arena = std.heap.ArenaAllocator.init(counter.allocator());
+                defer arena.deinit();
+                const region = arena.allocator();
+                const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+                const result = if (operation == 0 and mode == 0) unfused: {
+                    var value = source;
+                    var work: arrays.Budget = .{};
+                    for (0..7) |_| value = try value.concatenate(region, source, .{}, &work);
+                    break :unfused value;
+                } else (try program.evaluate(region, &.{Datum.typedArray(if (mode == 0) &unproven else &source)}, &.{}, .{ .steps = 1_048_576 })).array.?.*;
+                elapsed += @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start);
+                const bytes = try @import("array_storage.zig").encodeAlloc(a, result, .{});
+                defer a.free(bytes);
+                if (oracle) |expected| try std.testing.expectEqualSlices(u8, expected, bytes) else oracle = try a.dupe(u8, bytes);
+            }
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            std.debug.print("SQL_FUSED_NATIVE operation={s} native={} repetitions=20 peak={} elapsed_ns={} identical_canonical=true\n", .{ switch (operation) {
+                0 => "concat",
+                1 => "transform",
+                else => "cast",
+            }, mode == 1, counter.peak, elapsed });
+        }
     }
 }
