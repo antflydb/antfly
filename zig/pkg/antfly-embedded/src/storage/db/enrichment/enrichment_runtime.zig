@@ -35642,7 +35642,7 @@ test "model aware media retained source recipes own their immutable object refer
         }
     };
     try Fixture.qualify(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.qualify, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.qualify, .{});
 }
 
 test "model aware media fused reuse rejects a changed provider generation with the same alias" {

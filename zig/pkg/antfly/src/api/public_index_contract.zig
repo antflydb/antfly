@@ -69,6 +69,8 @@ pub const CreatedObjectShape = enum {
     chunker,
     chunker_text,
     chunker_audio,
+    chunker_embedding,
+    chunker_policy,
     index_execution,
     execution_policy,
     enrichment_neighbor_context,
@@ -249,6 +251,7 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .algebraic_aggregates => &.{},
         .algebraic_aggregate => &.{ "name", "op" },
         .provider, .chunker => &.{"provider"},
+        .chunker_embedding => &.{"model"},
         .enrichment => &.{ "name", "kind" },
         .artifact_source => &.{"artifact"},
         .full_text_source => &.{"artifact"},
@@ -266,7 +269,7 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .relational_keys, .relational_predicates => &.{},
         .graph_metrics, .graph_metric, .graph_metric_filter => &.{},
         .enrichment_neighbor_context => &.{"graph_index"},
-        .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_scorer_comparisons, .graph_scorer_levels, .graph_scorer_combine, .graph_scorer_decision, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
+        .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_scorer_comparisons, .graph_scorer_levels, .graph_scorer_combine, .graph_scorer_decision, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .chunker_policy, .index_execution, .execution_policy => &.{},
     };
     for (required_fields) |field| {
         const value = object.get(field) orelse return false;
@@ -293,6 +296,10 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
             .chunker_text
         else if (std.mem.eql(u8, field, "audio"))
             .chunker_audio
+        else if (std.mem.eql(u8, field, "embedding"))
+            .chunker_embedding
+        else if (std.mem.eql(u8, field, "policy"))
+            .chunker_policy
         else
             .unrestricted,
         .index_execution => if (isAllowedIndexExecutionField(field)) .execution_policy else .unrestricted,
@@ -363,6 +370,8 @@ pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8)
         .chunker => isAllowedChunkerField(field),
         .chunker_text => isAllowedChunkerTextField(field),
         .chunker_audio => isAllowedChunkerAudioField(field),
+        .chunker_embedding => isAllowedChunkEmbeddingField(field),
+        .chunker_policy => isAllowedMediaChunkPolicyField(field),
         .index_execution => isAllowedIndexExecutionField(field),
         .execution_policy => isAllowedExecutionPolicyField(field),
         .enrichment_neighbor_context => isAllowedEnrichmentNeighborContextField(field),
@@ -488,7 +497,8 @@ pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, va
         .graph_scorer_combine, .graph_scorer_decision => isNumber(value),
         .chunker => chunkerFieldValueMatches(field, value),
         .chunker_text => if (std.mem.eql(u8, field, "separator")) isString(value) else isInteger(value),
-        .chunker_audio => isInteger(value),
+        .chunker_audio, .chunker_policy => isInteger(value),
+        .chunker_embedding => if (std.mem.eql(u8, field, "dimensions")) isInteger(value) else if (std.mem.eql(u8, field, "execute") or std.mem.eql(u8, field, "allow_partial")) isBool(value) else isString(value),
         .index_execution => value == .object,
         .execution_policy => isInteger(value),
         .enrichment_neighbor_context => enrichmentNeighborContextFieldValueMatches(field, value),
@@ -640,7 +650,9 @@ fn chunkerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
     if (std.mem.eql(u8, field, "store_chunks")) return isBool(value);
     if (std.mem.eql(u8, field, "full_text_index") or
         std.mem.eql(u8, field, "text") or
-        std.mem.eql(u8, field, "audio")) return value == .object;
+        std.mem.eql(u8, field, "audio") or
+        std.mem.eql(u8, field, "embedding") or
+        std.mem.eql(u8, field, "policy")) return value == .object;
     if (std.mem.eql(u8, field, "max_chunks")) return isInteger(value);
     if (std.mem.eql(u8, field, "threshold")) return isNumber(value);
     return isString(value);
@@ -691,7 +703,21 @@ pub fn isAllowedChunkerField(field: []const u8) bool {
         std.mem.eql(u8, field, "max_chunks") or
         std.mem.eql(u8, field, "threshold") or
         std.mem.eql(u8, field, "text") or
-        std.mem.eql(u8, field, "audio");
+        std.mem.eql(u8, field, "audio") or
+        std.mem.eql(u8, field, "embedding") or
+        std.mem.eql(u8, field, "policy");
+}
+
+pub fn isAllowedChunkEmbeddingField(field: []const u8) bool {
+    inline for (.{ "model", "model_identity", "task_type", "dimensions", "execute", "allow_partial" }) |allowed|
+        if (std.mem.eql(u8, field, allowed)) return true;
+    return false;
+}
+
+pub fn isAllowedMediaChunkPolicyField(field: []const u8) bool {
+    inline for (.{ "max_text_bytes", "target_tokens", "overlap_tokens", "window_ns", "overlap_ns", "step_ns", "video_hold", "max_frames", "tile_width", "tile_height", "tile_overlap", "audio_pause_ns", "audio_pause_search_ns", "audio_silence_milli" }) |allowed|
+        if (std.mem.eql(u8, field, allowed)) return true;
+    return false;
 }
 
 pub fn isAllowedChunkerTextField(field: []const u8) bool {
