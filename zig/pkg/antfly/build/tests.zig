@@ -7158,12 +7158,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_compile_step.dependOn(&unit_storage_engine_tests.step);
     unit_storage_compile_step.dependOn(&unit_storage_db_core_tests.step);
 
-    // Zig 0.16's eager Group.async fallback can enter a long Run step while
-    // still dispatching ready compiler siblings. At -j2 this left DB-core
-    // uncompiled for the entire support run despite an idle build worker.
-    // Finish the existing compilation set before entering default unit runs.
-    if (storage_runtime_filter_is_default)
-        run_unit_storage_support_tests.step.dependOn(unit_storage_compile_step);
+    // Zig 0.17 schedules the native build graph concurrently. Test runs depend
+    // on their own artifacts, allowing execution to overlap sibling compilation
+    // within the same maxrss budget. The old 0.16 Group.async workaround imposed
+    // a compile-all barrier and delayed the longest runtime lanes unnecessarily.
 
     // Keep an explicit, opt-in equivalence check for future changes to these
     // groupings. It compiles the former seven-artifact layout and compares the
@@ -7234,7 +7232,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // one scheduler-visible step that launches both filtered DB processes,
         // preserving one compile while realizing the overlap.
         const run_db_core_partitioned_tests = b.addSystemCommand(&.{"python3"});
-        run_db_core_partitioned_tests.step.dependOn(unit_storage_compile_step);
         run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
         run_db_core_partitioned_tests.addFileArg2(b.path("tools/run_test_partitions.py"), .{ .make_absolute = true });
         run_db_core_partitioned_tests.addArg("--executable");
