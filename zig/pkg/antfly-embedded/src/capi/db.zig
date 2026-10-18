@@ -7657,10 +7657,11 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
             if (!std.mem.eql(u8, cfg.table, entity_table.bytes()) or !curation.keyInNamespace(cfg.key_template, entity_key.bytes())) continue;
             if (input.into) |target| if (!curation.keyInNamespace(cfg.key_template, target)) return capi.mapError(error.InvalidResolverCurationRequest);
             if (input.action == .redirects) {
-                const raw = curation.list(source.db, a, cfg.name) catch |err| return capi.mapError(err);
-                var value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err);
-                value.object.put(a, "source_table", .{ .string = source.name }) catch |err| return capi.mapError(err);
-                results.append(value) catch |err| return capi.mapError(err);
+                const state = pure.curation.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
+                const aliases = cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err);
+                const scoped = pure.curation.entityState(a, state, aliases, entity_key.bytes()) catch |err| return capi.mapError(err);
+                const raw = std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = scoped.redirects, .canonical_key = scoped.canonical_key, .curation = scoped.curation }, .{}) catch |err| return capi.mapError(err);
+                results.append(std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
                 continue;
             }
             const action: pure.curation.Action = switch (input.action) {

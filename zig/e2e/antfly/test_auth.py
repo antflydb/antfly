@@ -971,3 +971,84 @@ def test_system_catalog_exact_star_grant_is_not_global(auth_api):
     api.delete("/tables/%2A")
     api.delete("/tables/other")
     api.delete("/tables/%21")
+
+
+def test_resolver_entity_state_requires_source_scopes_on_api_keys(auth_api: AuthApi):
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    destination = "curation_entities"
+    sources = ["curation_notes", "curation_memory"]
+    auth_api.create_table(destination)
+    graph = {
+        "type": "graph",
+        "source": {
+            "artifact": "kg",
+            "format": "extraction_graph",
+            "mention_edge_type": "mentions",
+        },
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}],
+        "resolvers": [
+            {
+                "name": "concepts",
+                "table": destination,
+                "promote": False,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved",
+                "key_template": "concept/{{uslug _entity.text}}",
+            }
+        ],
+    }
+    for source in sources:
+        auth_api.create_table(
+            source, {"num_shards": 1, "indexes": {"knowledge": graph}}
+        )
+        auth_api.post(
+            f"/tables/{source}/resolvers/concepts/suppressions",
+            {
+                "keys": ["concept/noise", "concept/private"],
+                "texts": ["private source text"],
+            },
+        )
+    # The owner has broad access; the key's narrower scopes must survive fanout.
+    auth_api.post(
+        "/auth/v1/users/curator",
+        {
+            "password": "password123",
+            "initial_policies": [
+                {"resource": "*", "resource_type": "table", "type": "read"}
+            ],
+        },
+    )
+    keys = []
+    for resources in ([destination], [destination, *sources]):
+        keys.append(
+            auth_api.post(
+                "/auth/v1/users/curator/api-keys",
+                {
+                    "name": f"curation-{len(resources)}",
+                    "permissions": [
+                        {"resource": table, "resource_type": "table", "type": "read"}
+                        for table in resources
+                    ],
+                },
+            )["encoded"]
+        )
+    suffix = f"/tables/{destination}/entities/concept%2Fnoise/redirects"
+    for prefix in ("", "/databases/default/namespaces/public"):
+        auth_api.s.headers["Authorization"] = f"Bearer {keys[0]}"
+        denied = auth_api.s.get(f"{auth_api.url}{prefix}{suffix}", timeout=30)
+        assert denied.status_code == 403, denied.text
+        assert "private source text" not in denied.text
+        auth_api.s.headers["Authorization"] = f"Bearer {keys[1]}"
+        allowed = auth_api.get(prefix + suffix)
+        assert allowed["complete"] and len(allowed["results"]) == 2, allowed
+        for row in allowed["results"]:
+            assert row["curation"]["suppress"]["keys"] == ["concept/noise"]
+            assert row["curation"]["suppress"]["texts"] == []
+        assert "private source text" not in str(allowed)
+        assert "concept/private" not in str(allowed)

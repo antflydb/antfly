@@ -72,6 +72,30 @@ pub const RedirectIndex = struct {
         return self.canonical_keys.get(key) orelse key;
     }
 };
+/// Entity inspection is a projection of one redirect component, never an
+/// alternate endpoint for downloading the source's complete negative policy.
+/// Text rules cannot be attributed from an entity key; inspect those through
+/// the authorized source resolver suppression resource instead.
+pub const EntityState = struct { redirects: []const Redirect, canonical_key: []const u8, curation: State };
+pub fn entityState(a: std.mem.Allocator, state: State, aliases: []const Redirect, key: []const u8) !EntityState {
+    const index = try RedirectIndex.init(a, aliases);
+    const canonical = index.canonical(key);
+    var related: std.ArrayListUnmanaged(Redirect) = .empty;
+    for (aliases) |alias| if (std.mem.eql(u8, index.canonical(alias.key), canonical)) try related.append(a, alias);
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (state.suppress.keys) |suppressed| if (std.mem.eql(u8, index.canonical(suppressed), canonical)) try keys.append(a, suppressed);
+    var removed: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (state.removed_aliases) |alias| if (std.mem.eql(u8, index.canonical(alias), canonical)) try removed.append(a, alias);
+    var pairs: std.ArrayListUnmanaged(Pair) = .empty;
+    for (state.distinct) |pair| if (std.mem.eql(u8, index.canonical(pair.from), canonical) or std.mem.eql(u8, index.canonical(pair.to), canonical)) try pairs.append(a, pair);
+    return .{ .redirects = related.items, .canonical_key = canonical, .curation = .{
+        .version = state.version,
+        .suppress = .{ .keys = keys.items, .min_text_chars = state.suppress.min_text_chars },
+        .distinct = pairs.items,
+        .removed_aliases = removed.items,
+    } };
+}
+
 pub const Action = enum { merge, unmerge, suppress, unsuppress, suppressions };
 pub const Selection = struct { keys: []const []const u8 = &.{}, texts: []const []const u8 = &.{} };
 pub const Wait = struct { timeout_ms: u32 = 1000 };
@@ -375,4 +399,24 @@ test "curation repoint with a distinct pin is idempotent on retry" {
     const retry = try plan(a, try std.json.Stringify.valueAlloc(a, first.state, .{}), first.merges, first.merges, intent);
     try std.testing.expect(!retry.changed);
     try std.testing.expectEqual(@as(usize, 1), retry.state.distinct.len);
+}
+
+test "curation entity inspection scopes policy to the complete redirect component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const aliases = [_]Redirect{ .{ .key = "a", .target = "b" }, .{ .key = "c", .target = "b" }, .{ .key = "private", .target = "elsewhere" } };
+    const state: State = .{
+        .suppress = .{ .keys = &.{ "a", "private" }, .texts = &.{"private text"} },
+        .distinct = &.{ .{ .from = "c", .to = "d" }, .{ .from = "private", .to = "secret" } },
+        .removed_aliases = &.{ "b", "secret" },
+    };
+    const scoped = try entityState(a, state, &aliases, "a");
+    try std.testing.expectEqualStrings("b", scoped.canonical_key);
+    try std.testing.expectEqual(@as(usize, 2), scoped.redirects.len);
+    try std.testing.expectEqualSlices([]const u8, &.{"a"}, scoped.curation.suppress.keys);
+    try std.testing.expectEqual(@as(usize, 0), scoped.curation.suppress.texts.len);
+    try std.testing.expectEqual(@as(usize, 1), scoped.curation.distinct.len);
+    try std.testing.expectEqualStrings("d", scoped.curation.distinct[0].to);
+    try std.testing.expectEqualSlices([]const u8, &.{"b"}, scoped.curation.removed_aliases);
 }

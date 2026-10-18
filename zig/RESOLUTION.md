@@ -1657,6 +1657,13 @@ all matching policies and source-table write permissions, then commits one CAS
 per source table. It is not a transaction across unrelated source tables. HTTP
 207 reports partial acceptance with each resolver's accepted revision; retrying
 the same corrections is safe. Native fanout reports atomicity per resolver.
+Entity-state GET additionally requires read permission on every matching source
+table, using the ingress credential scopes and revision-fenced reverse catalog
+bindings rather than physical IDs. A denied source fails the complete read with
+403. Entity inspection returns redirects, key suppressions, distinct pins and
+unmerged keys for the requested redirect component; text suppressions and
+unrelated keys remain available only through the source resolver resources.
+HTTP and embedded entity inspection share this projection.
 Retired identities accept and retain policy without running resolution or
 promotion. Remote replay progress remains pending until an index declares
 execution again; waiting never reactivates a retired identity.
@@ -1666,7 +1673,10 @@ identities; native backup carries both policy and consumed deletion fences.
 A mutation returns the accepted revision and replay sequence immediately (HTTP
 202 while pending). `replay_sequence_kind` distinguishes a resolver revision
 from a source-journal review decision. `wait:{timeout_ms:...}` bounds observation
-of detached replay; a timeout leaves the accepted mutation intact. Resolver GET
+of detached replay; a timeout leaves the accepted mutation intact. The remaining
+observation budget bounds metadata reads and remote owner RPC timeouts; client
+cancellation and an earlier overall request deadline retain their own semantics.
+Resolver GET
 reports per-group revision, freshness, durable backfill and resolution/promotion
 watermarks. An idle watermark alone does not prove the new revision is applied.
 If cached/heartbeat status omits resolver diagnostics or lags an accepted revision,

@@ -456,6 +456,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     var pending: std.ArrayListUnmanaged(Pending) = .empty;
     var authorization: std.ArrayListUnmanaged(@import("distributed_txn.zig").TableCommitRequest) = .empty;
     var states = std.json.Array.init(a);
+    var read_sources: std.StringArrayHashMapUnmanaged(void) = .empty;
     const source_configs = try a.alloc([]const Config, snapshot.tables.len);
     var destinations: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (snapshot.tables, source_configs) |source, *all| {
@@ -492,10 +493,9 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             if (op == .entity_redirects) {
                 const state = try resolver.curation.parseState(a, cfg.curation_json);
                 const aliases = try cfg.effectiveAliasesAlloc(a);
-                const index = try resolver.curation.RedirectIndex.init(a, aliases);
-                var related: std.ArrayListUnmanaged(resolver.KeyAlias) = .empty;
-                for (aliases) |alias| if (std.mem.eql(u8, alias.key, key) or std.mem.eql(u8, index.canonical(alias.key), key)) try related.append(a, alias);
-                try states.append(try json(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = related.items, .canonical_key = index.canonical(key), .curation = state }));
+                const scoped = try resolver.curation.entityState(a, state, aliases, key);
+                try read_sources.put(a, source.name, {});
+                try states.append(try json(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = scoped.redirects, .canonical_key = scoped.canonical_key, .curation = scoped.curation }));
                 continue;
             }
             const action: resolver.curation.Action = switch (op) {
@@ -511,7 +511,10 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         try pending.append(a, .{ .table = source, .plan = try curation.planMetadataBatch(a, source.indexes_json, edits.items), .configs = all });
         try authorization.append(a, .{ .table_name = source.name, .deletes = &.{key} });
     }
-    if (op == .entity_redirects) return response(alloc, 200, .{ .entity_table = entity_table.name, .key = key, .complete = true, .atomicity = "source_table", .results = std.json.Value{ .array = states } });
+    if (op == .entity_redirects) {
+        try server.authorizeTableReads(a, request, read_sources.keys());
+        return response(alloc, 200, .{ .entity_table = entity_table.name, .key = key, .complete = true, .atomicity = "source_table", .results = std.json.Value{ .array = states } });
+    }
     if (pending.items.len == 0) return error.ResolverNotFound;
     try server.authorizeIntegrityMutations(request, authorization.items);
     var results = std.json.Array.init(a);
@@ -562,15 +565,20 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
         var iteration = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer iteration.deinit();
         const scratch = iteration.allocator();
-        var snapshot = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
+        var observation_request = try request.platformDeadline();
+        if (wait != null) observation_request.deadline_ns = @min(observation_request.deadline_ns orelse std.math.maxInt(u64), deadline);
+        var snapshot = (server.source.linearizableSnapshot(observation_request) catch |err| {
+            try request.ensureActive();
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
+            return err;
+        }) orelse return error.TableNotFound;
         const table = tableByName(&snapshot, table_name) catch |err| {
             server.source.freeAdminSnapshot(&snapshot);
             return err;
         };
-        var observation_request = request;
-        if (wait != null) observation_request.deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), deadline);
         const observation = sample(server, scratch, &snapshot, table, observation_request, wait != null) catch |err| {
             server.source.freeAdminSnapshot(&snapshot);
+            try request.ensureActive();
             if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{} };
             return err;
         };
@@ -594,7 +602,7 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
             return .{ .applied = progress.applied, .shards = rows };
         }
         var receiver = try borrow.?.receive();
-        try receiver.io().sleep(.fromMilliseconds(100), .awake);
+        try receiver.io().sleep(.fromNanoseconds(@intCast(@min(100 * std.time.ns_per_ms, deadline -| clock.monotonicNs()))), .awake);
     }
 }
 

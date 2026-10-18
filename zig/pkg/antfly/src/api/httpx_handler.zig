@@ -1946,6 +1946,16 @@ pub const AntflyApiHandler = struct {
     fn tableMutationContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
         var request = operationContext(ctx, identity.*);
         request.row_policy_credential = identity;
+        request.table_read_authorization = .{
+            .ptr = identity,
+            .allows = struct {
+                fn allowed(ptr: *const anyopaque, table: []const u8) bool {
+                    const admitted: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+                    const authenticated = admitted.* orelse return true;
+                    return http_server_mod.permissionsAllow(authenticated.permissions, .table, table, .read);
+                }
+            }.allowed,
+        };
         request.table_write_authorization = .{
             .ptr = identity,
             .allows = struct {

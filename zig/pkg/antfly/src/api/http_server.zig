@@ -13452,6 +13452,33 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    /// Authorize discovered read participants using the admitted credential,
+    /// never physical storage IDs. Reverse bindings are bounded and share a
+    /// catalog revision so a rename cannot mix authorization namespaces.
+    pub fn authorizeTableReads(self: *ApiHttpServer, alloc: std.mem.Allocator, request: api_operation.RequestContext, names: []const []const u8) !void {
+        if (!self.cfg.auth_enabled and request.principal == null) return;
+        const authority = request.table_read_authorization orelse return error.Forbidden;
+        if (self.source.vtable.system_catalog == null) {
+            for (names) |name| if (!authority.allows(authority.ptr, name)) return error.Forbidden;
+            return;
+        }
+        var revision: ?u64 = null;
+        var offset: usize = 0;
+        while (offset < names.len) {
+            try request.ensureActive();
+            const chunk = names[offset..@min(names.len, offset + 256)];
+            const reply = try self.source.systemCatalog(alloc, request, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision } });
+            const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, reply, .{});
+            if (resolved.logical_names.len != chunk.len) return error.UnsupportedOperation;
+            revision = resolved.revision;
+            for (chunk, resolved.logical_names) |physical, logical| {
+                const name = logical orelse if (std.mem.startsWith(u8, physical, "table:")) return error.TableNotFound else physical;
+                if (!authority.allows(authority.ptr, name)) return error.Forbidden;
+            }
+            offset += chunk.len;
+        }
+    }
+
     /// Authorize the logical resources actually mutated by FK expansion.
     /// Reverse bindings are point-indexed and revision-fenced across chunks;
     /// physical identifiers never become public authorization resources.
@@ -19643,7 +19670,8 @@ pub const ApiHttpServer = struct {
         return count;
     }
 
-    pub fn executeResolverOperation(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, body: []const u8, context: api_operation.RequestContext) ![]u8 {
+    pub fn executeResolverOperation(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, body: []const u8, input_context: api_operation.RequestContext) ![]u8 {
+        const context = try input_context.platformDeadline();
         try context.ensureActive();
         if (self.cfg.deployment_mode == .standalone) return (try (self.table_writes orelse return error.UnsupportedOperation).resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse return error.UnknownGroup;
         var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
@@ -19656,8 +19684,14 @@ pub const ApiHttpServer = struct {
                 var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
                 _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
                 var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
-                var reply = try client.fetchGroupResolverOperationWithCancellation(remote.base_uri, group_id, table_name, body, &cancellation);
+                var reply = client.fetchGroupResolverOperationWithControl(remote.base_uri, group_id, table_name, body, try context.remainingTimeoutMs(), &cancellation) catch |err| {
+                    // Classify an exhausted request budget separately from an
+                    // unrelated transport timeout, including after acceptance.
+                    try context.ensureActive();
+                    return err;
+                };
                 defer reply.deinit(alloc);
+                try context.ensureActive();
                 return alloc.dupe(u8, reply.body);
             },
         }
@@ -57835,11 +57869,17 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         },
         owned: ?[]u8 = null,
         commits: u64 = 0,
+        expire_wait: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn snapshot(ptr: *anyopaque, _: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+        fn snapshot(ptr: *anyopaque, context: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.expire_wait and context.deadline_ns != null) {
+                const remaining = (try context.remainingTimeoutMs()).?;
+                try std.testing.io.sleep(.fromMilliseconds(@as(i64, remaining) + 1), .awake);
+                try context.ensureActive();
+            }
             const tables = try std.testing.allocator.dupe(metadata_table_manager.TableRecord, &self.tables);
             for (tables) |*table| table.indexes_json = try std.testing.allocator.dupe(u8, table.indexes_json);
             return .{ .status = try status(ptr), .tables = tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
@@ -57897,6 +57937,36 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     defer denied.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), denied.status);
     try std.testing.expectEqual(before_denial, source.commits);
+    try Run.call(&server, .suppress, "source", "concepts", "", "{\"texts\":[\"private source text\"]}", 202);
+    var denied_read = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_read_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
+    defer denied_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_read.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied_read.body, "private source text") == null);
+    const ReadSource = struct {
+        fn allows(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "source");
+        }
+    };
+    var allowed_read = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "source-reader" }, .table_read_authorization = .{ .ptr = &authority_context, .allows = ReadSource.allows } });
+    defer allowed_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), allowed_read.status);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_read.body, "private source text") == null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_read.body, "concept/a") == null);
+    const scoped = try std.json.parseFromSlice(std.json.Value, alloc, allowed_read.body, .{});
+    defer scoped.deinit();
+    const keys = scoped.value.object.get("results").?.array.items[0].object.get("curation").?.object.get("suppress").?.object.get("keys").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings("concept/noise", keys[0].string);
+    // The authoritative CAS succeeds before the clipped observation expires.
+    source.expire_wait = true;
+    const before_wait = source.commits;
+    var timed_out = try resources.handle(&server, alloc, .merge, "source", "concepts", "", "{\"from\":\"concept/wait\",\"to\":\"concept/target\",\"wait\":{\"timeout_ms\":1}}", "", .{});
+    defer timed_out.deinit(alloc);
+    source.expire_wait = false;
+    try std.testing.expectEqual(@as(u16, 202), timed_out.status);
+    try std.testing.expectEqual(before_wait + 1, source.commits);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"changed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"applied\":false") != null);
     try Run.call(&server, .get, "source", "concepts", "", "", 200);
     const retired = (try indexes_api.removeIndexFromTableIndexesJson(alloc, source.tables[0].indexes_json, "knowledge")).?;
     defer alloc.free(retired);
@@ -57909,4 +57979,95 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try Run.call(&server, .drop, "source", "concepts", "", "", 202);
     try Run.call(&server, .drop, "source", "concepts", "", "", 202);
     try Run.call(&server, .get, "source", "concepts", "", "", 404);
+}
+
+test "resolver curation HTTP source reads reverse bind logical names in fenced batches" {
+    const Fixture = struct {
+        calls: usize = 0,
+        checked: usize = 0,
+        reject: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const batch = input.resolve_many;
+            try std.testing.expect(batch.storage_names.len <= 256);
+            try std.testing.expectEqual(if (self.calls == 0) @as(?u64, null) else @as(?u64, 7), batch.expected_revision);
+            self.calls += 1;
+            const logical = try a.alloc(?[]const u8, batch.storage_names.len);
+            for (logical) |*name| name.* = "private-db/namespace/source";
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = logical }, .{});
+        }
+        fn allows(ptr: *const anyopaque, name: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.checked += 1;
+            return !self.reject and std.mem.eql(u8, name, "private-db/namespace/source");
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .auth_enabled = true }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.call } }, null, null);
+    defer server.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const names: [257][]const u8 = @splat("table:physical-id");
+    const request: api_operation.RequestContext = .{ .principal = .{ .kind = .user, .subject = "key-user" }, .table_read_authorization = .{ .ptr = &fixture, .allows = Fixture.allows } };
+    try server.authorizeTableReads(arena.allocator(), request, &names);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 257), fixture.checked);
+    fixture.calls = 0;
+    fixture.reject = true;
+    try std.testing.expectError(error.Forbidden, server.authorizeTableReads(arena.allocator(), request, &names));
+    try std.testing.expectError(error.Forbidden, server.authorizeTableReads(arena.allocator(), .{}, &names));
+}
+
+test "resolver curation HTTP remote owner calls retain deadlines and cancellation" {
+    const Fixture = struct {
+        calls: usize = 0,
+        timeout: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn localNode(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+        fn leader(_: *anyopaque, _: u64) ?u64 {
+            return 2;
+        }
+        fn uri(_: *anyopaque, a: std.mem.Allocator, _: u64) !?[]u8 {
+            return try a.dupe(u8, "http://owner:8080");
+        }
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const budget = request.timeout_ms orelse return error.MissingTimeout;
+            try std.testing.expect(budget > 0 and budget <= 1000);
+            try std.testing.expect(request.cancellation != null);
+            try std.testing.expect(!request.cancellation.?.isCancelled());
+            if (self.timeout) {
+                try std.testing.io.sleep(.fromMilliseconds(@as(i64, budget) + 1), .awake);
+                return error.Timeout;
+            }
+            return .{ .status = 200, .body = try a.dupe(u8, "{\"resolvers\":[]}") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.localNode, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.uri } },
+        .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+    }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    const clock = @import("antfly_platform").time;
+    const body = "{\"operation\":\"progress\"}";
+    const response = try server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .deadline_ns = clock.monotonicNs() + std.time.ns_per_s });
+    std.testing.allocator.free(response);
+    fixture.timeout = true;
+    try std.testing.expectError(error.DeadlineExceeded, server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_ms }));
+    try std.testing.expectError(error.DeadlineExceeded, server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .deadline_ns = 0 }));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .cancellation = CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }

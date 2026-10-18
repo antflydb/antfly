@@ -52,7 +52,13 @@ def test_resolver_curation_round_trip(aflite_path):
         assert accepted["results"][0]["revision"] == 1
         assert db.render_resolver_key("concepts", {"text": "A", "label": "concept"})["key"] == "concept/b"
         db.unmerge_resolver_key("concepts", {"from": "concept/a", "pin_distinct": True})
-        db.suppress_resolver_keys("concepts", {"add": {"keys": ["concept/noise"]}})
+        db.suppress_resolver_keys("concepts", {"add": {"keys": ["concept/noise"], "texts": ["private source text"]}})
+        scoped = db.curate_entity("default", "concept/noise", {"action": "redirects"})["results"][0]
+        assert scoped["canonical_key"] == "concept/noise"
+        assert scoped["curation"]["suppress"]["keys"] == ["concept/noise"]
+        assert scoped["curation"]["suppress"]["texts"] == []
+        assert scoped["curation"]["distinct"] == []
+        assert "private source text" not in str(scoped)
         assert db.render_resolver_key("concepts", {"text": "Noise", "label": "concept"})["suppressed"]
         db.unsuppress_resolver_key("concepts", {"key": "concept/noise"})
         assert db.resolver_reviews({"operation": "reviews", "resolver": "concepts"})["reviews"] == []
