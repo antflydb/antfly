@@ -2434,12 +2434,12 @@ const Engine = struct {
     }
     fn boundedCallBody(self: *Engine, inner: []const ast.Clause, goal: usize) ![]const ast.Clause {
         const last = inner[inner.len - 1].operation;
-        if (last != .project or !last.project.final or goal > std.math.maxInt(i64)) return inner;
+        if (last != .project or !last.project.final or @as(u64, goal) > std.math.maxInt(i64)) return inner;
         var bound = goal;
         if (last.project.value.limit) |expression| {
             const existing = self.constant(expression, &.{}) orelse return inner;
             if (existing != .integer or existing.integer < 0) return inner;
-            bound = @min(bound, @as(u64, @intCast(existing.integer)));
+            bound = @intCast(@min(@as(u64, bound), @as(u64, @intCast(existing.integer))));
         }
         const copy = try self.a.dupe(ast.Clause, inner);
         const expression = try self.a.create(ast.Expr);
@@ -2595,7 +2595,7 @@ const Engine = struct {
                         if (goal) |bound| if (produced >= bound) break;
                         const body = if (goal) |bound| blk: {
                             const remaining = bound - produced;
-                            const parent = @max(1, weight.cap(remaining));
+                            const parent: usize = @intCast(@max(1, weight.cap(remaining)));
                             break :blk try self.boundedCallBody(inner, remaining / parent + @intFromBool(remaining % parent != 0));
                         } else inner;
                         const scope = PatternScope.enter(self);

@@ -932,7 +932,10 @@ pub const Context = struct {
                     try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
                 else
                     null;
-                if (!defer_projection and !statement.count_all and (top_k != null or (self.sink != null and self.sink.?.append_batch != null))) {
+                // Native batches represent individual rows. A weighted graph
+                // page must admit its bag count through addWeighted instead;
+                // ordinary batch admission would silently lose multiplicities.
+                if (!weighted_top and !defer_projection and !statement.count_all and (top_k != null or (self.sink != null and self.sink.?.append_batch != null))) {
                     const selection = try scratch.alloc(usize, selected_cells.items.len);
                     const ordinals = try scratch.alloc(u64, selected_cells.items.len);
                     var selected_count: usize = 0;

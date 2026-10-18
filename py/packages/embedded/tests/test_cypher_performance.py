@@ -2017,6 +2017,11 @@ def test_weighted_chains_goals_and_promoted_producers(graph_db):
     for tail in ("RETURN count(*)", "RETURN sum(1)"):
         with pytest.raises(af.GraphError, match="CypherNumericOverflow"):
             db.cypher_json("g", {"query": base + tail})
+    path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(3)) + "-[r3 IS R]->(b IS D)"
+    relation = f"GRAPH_TABLE(g MATCH {path} WHERE a.id='start' COLUMNS(b.score AS score)) q"
+    window = f"SELECT q.score FROM {relation} ORDER BY q.score LIMIT 3 OFFSET 2"
+    assert db.sql(window)["rows"] == [["4"]] * 3
+    assert db.sql(f"SELECT count(*),sum(score) FROM ({window}) d")["rows"] == [["3", "12"]]
 
     # Each stage has only two live endpoint bindings. Equal bags must merge
     # without discarding their multiplicities, including at clause boundaries
