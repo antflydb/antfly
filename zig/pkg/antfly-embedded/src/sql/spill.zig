@@ -1326,8 +1326,22 @@ pub const JoinPayloads = struct {
         const framed_length = std.mem.readInt(u64, header[0..8], .little);
         if (header[16] < 2 or header[16] > 3 or framed_length < 9 or framed_length - 9 > self.file.manager.max_record_bytes or framed_length > self.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
         const length = framed_length - 9;
-        if (frame[17] != key.kind or std.mem.readInt(u64, frame[18..26], .little) != key.bytes.len) return false;
-        if (key.kind == 1) return self.sameParts(offset + header.len + framed_length, &.{key.bytes});
+        // The descriptor's high bit selects a text-key trailer containing an
+        // eight-byte stored length and a Snappy block. Low bits retain the
+        // exact native representation; raw keys keep their original layout.
+        const compressed_key = frame[17] & 128 != 0;
+        const kind = frame[17] & 127;
+        if (kind < 1 or kind > 3 or (compressed_key and kind != 1)) return error.InvalidSqlSpill;
+        if (kind != key.kind or std.mem.readInt(u64, frame[18..26], .little) != key.bytes.len) return false;
+        if (key.kind == 1) {
+            const key_offset = offset + header.len + framed_length;
+            if (!compressed_key) return self.sameParts(key_offset, &.{key.bytes});
+            var size: [8]u8 = undefined;
+            try self.file.readRaw(key_offset, &size);
+            const stored_length = std.mem.readInt(u64, &size, .little);
+            if (stored_length > self.file.size -| (key_offset + size.len)) return error.InvalidSqlSpill;
+            return self.sameCompressedParts(key_offset + size.len, stored_length, &.{key.bytes});
+        }
         // This is the singleton mixed-column framing used by the shared v2
         // codec, followed by the exact borrowed frozen token stream.
         const prefix = singletonFrozenPrefix();
@@ -1335,6 +1349,9 @@ pub const JoinPayloads = struct {
             if (length != prefix.len + key.bytes.len) return false;
             return self.sameParts(offset + frame.len, &.{ &prefix, key.bytes });
         }
+        return self.sameCompressedParts(offset + frame.len, length, &.{ &prefix, key.bytes });
+    }
+    fn sameCompressedParts(self: *JoinPayloads, offset: u64, length: u64, parts: []const []const u8) !bool {
         const Input = struct {
             file: *File,
             offset: u64,
@@ -1345,7 +1362,7 @@ pub const JoinPayloads = struct {
                 try self_.file.readRaw(self_.offset + at, out);
             }
         };
-        return snappy.equalsFromReader(Input{ .file = &self.file, .offset = offset + frame.len, .length = length }, &.{ &prefix, key.bytes }) catch |err| switch (err) {
+        return snappy.equalsFromReader(Input{ .file = &self.file, .offset = offset, .length = length }, parts) catch |err| switch (err) {
             error.CorruptInput => error.InvalidSqlSpill,
             else => err,
         };
@@ -1796,7 +1813,9 @@ pub const JoinPayloads = struct {
         if (body_key == null) for (self.recent) |entry| if (entry) |cached| {
             if (cached.hash == hash and std.mem.eql(u8, cached.bytes, wire)) return cached.offset;
         };
-        const compressed = if (self.file.manager.compression == .snappy and wire.len >= 1024) try snappy.encode(a, wire) else null;
+        const work = @import("memory_budget.zig").reclaimingAllocator(a);
+        const compressed = if (self.file.manager.compression == .snappy and wire.len >= 1024) try snappy.encode(work, wire) else null;
+        defer if (compressed) |bytes| work.free(bytes);
         const use_compressed = compressed != null and compressed.?.len + 32 < wire.len;
         const stored = if (use_compressed) compressed.? else wire;
         self.disk_clock +|= 1;
@@ -1809,6 +1828,12 @@ pub const JoinPayloads = struct {
                 return cached.offset;
             }
         };
+        // Only miss publication compresses the exact source key. Scratch is
+        // reclaimed immediately; a match never stages compressed or decoded
+        // key-sized output. Incompressible/small keys retain their raw layout.
+        const compressed_key = if (body_key != null and body_key.?.kind == 1 and manager.compression == .snappy and body_key.?.bytes.len >= 1024) try snappy.encode(work, body_key.?.bytes) else null;
+        defer if (compressed_key) |bytes| work.free(bytes);
+        const use_compressed_key = compressed_key != null and compressed_key.?.len + 8 + 32 < body_key.?.bytes.len;
         var header: [17]u8 = undefined;
         const native_bytes: usize = if (body_key != null) 9 else 0;
         header[16] = @as(u8, if (body_key != null) 2 else 0) + @intFromBool(use_compressed);
@@ -1819,7 +1844,7 @@ pub const JoinPayloads = struct {
         try self.file.writeRaw(offset, &header);
         if (body_key) |key| {
             var native: [9]u8 = undefined;
-            native[0] = key.kind;
+            native[0] = key.kind | @as(u8, if (use_compressed_key) 128 else 0);
             std.mem.writeInt(u64, native[1..9], key.bytes.len, .little);
             try self.file.writeRaw(offset + header.len, &native);
         }
@@ -1828,7 +1853,14 @@ pub const JoinPayloads = struct {
             // Frozen keys already occur verbatim in the body. Text keys retain
             // exact spelling in quota-charged spill bytes, without a heap map
             // or a borrowed producer address surviving the append.
-            if (key.kind == 1) try self.file.writeRaw(self.file.size, key.bytes);
+            if (key.kind == 1) {
+                if (use_compressed_key) {
+                    var length: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &length, compressed_key.?.len, .little);
+                    try self.file.writeRaw(self.file.size, &length);
+                    try self.file.writeRaw(self.file.size, compressed_key.?);
+                } else try self.file.writeRaw(self.file.size, key.bytes);
+            }
             if (self.body_root != none) try self.indexBody(key.hash, key.bytes.len, offset);
         }
         self.file.manager.increment("compressed_records", @intFromBool(use_compressed));
@@ -3156,11 +3188,14 @@ pub const Sequential = struct {
             try self.decodeCompactBlock(owner, owner.arena.allocator(), offset);
             return owner;
         }
+        self.read_arena.child_allocator = scoped;
+        defer self.read_arena.child_allocator = a;
         const block = try self.readBatchBorrowed(offset, 256);
         // Typed block descriptors already belong to the transferred arena.
         // Only the legacy single-row descriptor lives inline in Sequential.
         const rows = if (self.read_rows.len != 0) block.rows else try self.read_arena.allocator().dupe(Row, block.rows);
         owner.* = .{ .a = a, .arena = self.read_arena, .rows = rows };
+        owner.arena.child_allocator = a;
         self.read_arena = .init(a);
         self.read_rows = &.{};
         self.read_single_offset = null;
@@ -3488,7 +3523,9 @@ pub const PayloadReader = struct {
         const selected = gathered.storage[0..gathered.count];
         errdefer for (selected) |payload| payload.release();
         for (selected) |payload| if (payload.block.width() != width) return error.InvalidSqlSpill;
-        const stable = self.pages.file.manager.allocator();
+        return ownPage(self.pages.file.manager.allocator(), selected, width);
+    }
+    fn ownPage(stable: Allocator, selected: []const Payload, width: usize) !Page {
         const payloads = try stable.dupe(Payload, selected);
         errdefer stable.free(payloads);
         const view = try stable.create(PageView);
@@ -4567,12 +4604,22 @@ pub const Sort = struct {
         return self.finishImpl(false);
     }
     fn finishImpl(self: *Sort, leased: bool) anyerror!void {
+        return self.finishImplWithPressure(leased, null);
+    }
+    fn finishDelivery(self: *Sort, reserve: usize) anyerror!void {
+        var pressure: CachePressure = .{ .manager = self.manager, .context = self, .evict = keepCollectedPayloads, .bounded = true, .reserve = reserve };
+        self.finishImplWithPressure(true, &pressure) catch |err| {
+            if (err == error.OutOfMemory and pressure.denied) return error.SqlProgramLimitExceeded;
+            return err;
+        };
+    }
+    fn finishImplWithPressure(self: *Sort, leased: bool, pressure: ?*CachePressure) anyerror!void {
         if (self.order_sort) |inner| {
             if (!self.finished) if (self.payloads) |payloads| {
                 try payloads.file.seal();
                 while (payloads.evictOne()) {}
             };
-            try inner.finishImpl(leased);
+            try inner.finishImplWithPressure(leased, pressure);
             self.parallel_runs_started = inner.parallel_runs_started;
             self.parallel_merges_started = inner.parallel_merges_started;
             self.radix_runs = inner.radix_runs;
@@ -4623,9 +4670,11 @@ pub const Sort = struct {
         errdefer for (self.head_arenas[0..self.output_count]) |*arena| arena.deinit();
         for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count], 0..) |*file, *arena, *head, index| {
             if (leased and file.*.?.size != 0) {
-                const block = try file.*.?.readOwnedBlock(0);
+                const block = try file.*.?.readOwnedBlockWithPressure(0, pressure);
                 self.owned_heads[index] = block;
                 self.owned_positions[index] = 0;
+                arena.child_allocator = if (pressure) |scope| scope.allocator() else self.a;
+                defer arena.child_allocator = self.a;
                 var row = try block.keyRowAlloc(arena.allocator(), 0);
                 row.normalized = try self.normalize(row.keys);
                 head.* = .{ .row = row, .next = none, .matched = false, .following = 1 };
@@ -4690,6 +4739,124 @@ pub const Sort = struct {
         lease.release();
         return true;
     }
+    /// Payload-only pages for ordinary sorts. Resident ranks borrow a constant
+    /// span descriptor; external ranks own compact (block,index) descriptors.
+    /// The enclosing cursor pins resident stores until all pages are released.
+    pub const ValuesPage = union(enum) {
+        blocks: PayloadReader.Page,
+        memory: struct { view: *ResidentView, a: Allocator },
+        pub fn batch(self: ValuesPage) @import("execution_batch.zig").Batch {
+            return switch (self) {
+                .blocks => |page| page.values,
+                .memory => |owner| owner.view.batch(),
+            };
+        }
+        pub fn release(self: ValuesPage) void {
+            switch (self) {
+                .blocks => |page| page.release(),
+                .memory => |owner| owner.a.destroy(owner.view),
+            }
+        }
+    };
+    const ResidentView = struct {
+        sort: *Sort,
+        begin: usize,
+        count: usize,
+        fn position(self: *const @This(), row: usize) usize {
+            return self.sort.rows.items[self.begin + row].position;
+        }
+        fn cell(raw: *anyopaque, a: Allocator, row: usize, column: usize) anyerror!Datum {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            return view.sort.values.cell(a, view.position(row), column);
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            return view.sort.values.frozenJson(view.position(row), column);
+        }
+        fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            return view.sort.values.encodedJson(view.position(row), column);
+        }
+        fn identity(raw: *anyopaque, row: usize, column: usize) anyerror!?u64 {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            return view.sort.values.dictionaryId(view.position(row), column);
+        }
+        fn dictionary(raw: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            const Batch = @import("execution_batch.zig").Batch;
+            const source = try a.create(Batch);
+            source.* = .{ .retained = .{ .store = &view.sort.values, .count = view.sort.values.len } };
+            const positions = try a.alloc(usize, view.count);
+            for (positions, 0..) |*out, row| out.* = view.position(row);
+            return (try source.select(a, positions)).dictionaryColumn(a, column);
+        }
+        fn batch(self: *@This()) @import("execution_batch.zig").Batch {
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .read_identity = identity, .read_dictionary = dictionary, .count = self.count, .width = self.sort.values.columns.len } };
+        }
+    };
+    pub fn nextValuesPage(self: *Sort, maximum: usize, byte_limit: usize) anyerror!ValuesPage {
+        if (maximum == 0 or self.order_sort != null) return error.InvalidSqlLimit;
+        try self.finishDelivery(@sizeOf(PayloadReader.Payload) + @sizeOf(PayloadReader.PageView));
+        const stable = self.manager.allocator();
+        if (self.output_count == 0) {
+            var pressure: CachePressure = .{ .manager = self.manager, .context = self, .evict = keepCollectedPayloads, .bounded = true };
+            if (!pressure.admit(@sizeOf(ResidentView))) return error.SqlProgramLimitExceeded;
+            const view = try stable.create(ResidentView);
+            errdefer stable.destroy(view);
+            view.* = .{ .sort = self, .begin = @intCast(self.offset), .count = @min(@min(64, maximum), self.rows.items.len - @as(usize, @intCast(self.offset))) };
+            var bytes: usize = 0;
+            const batch = view.batch();
+            var count: usize = 0;
+            while (count < batch.len()) {
+                for (0..batch.width()) |column| bytes +|= try self.values.cellBytes(stable, view.position(count), column);
+                count += 1;
+                if (bytes >= byte_limit) break;
+            }
+            view.count = count;
+            self.offset += count;
+            return .{ .memory = .{ .view = view, .a = stable } };
+        }
+        var payloads: [64]PayloadReader.Payload = undefined;
+        var count: usize = 0;
+        errdefer for (payloads[0..count]) |payload| payload.release();
+        var bytes: usize = 0;
+        var owners: [64]*Sequential.OwnedBlock = undefined;
+        var owner_count: usize = 0;
+        var retained: usize = 0;
+        while (count < @min(maximum, payloads.len)) {
+            var pressure: CachePressure = .{ .manager = self.manager, .context = self, .evict = keepCollectedPayloads, .bounded = true, .reserve = (count + 1) * @sizeOf(PayloadReader.Payload) + @sizeOf(PayloadReader.PageView) };
+            if (!pressure.admit(0)) {
+                if (count == 0) return error.SqlProgramLimitExceeded;
+                break;
+            }
+            const lease = (self.nextLeasedWithPressure(&pressure) catch |err| {
+                if (err != error.OutOfMemory or !pressure.denied) return err;
+                if (count == 0) return error.SqlProgramLimitExceeded;
+                break;
+            }) orelse break;
+            errdefer lease.release();
+            const block = lease.block orelse return error.InvalidSqlSpill;
+            for (0..block.width()) |column| {
+                const frozen = if (block.encoded) |encoded| try encoded.frozenJson(lease.index, column, false) else null;
+                const json = if (frozen == null and block.encoded != null) try block.encoded.?.encodedJson(lease.index, column, false) else null;
+                bytes +|= if (frozen) |value| value.bytes.len else if (json) |value| value.len else try operators.datumBytes(try lease.cell(column));
+            }
+            if (lease.key_block) |keys| keys.release();
+            const known = for (owners[0..owner_count]) |owner| {
+                if (owner == block) break true;
+            } else false;
+            if (!known) {
+                owners[owner_count] = block;
+                owner_count += 1;
+                retained +|= block.retainedBytes() +| @sizeOf(Sequential.OwnedBlock);
+            }
+            payloads[count] = .{ .block = block, .index = lease.index };
+            count += 1;
+            if (bytes >= byte_limit or retained +| (count * @sizeOf(PayloadReader.Payload) + @sizeOf(PayloadReader.PageView)) >= byte_limit) break;
+        }
+        const page = try PayloadReader.ownPage(stable, payloads[0..count], if (count == 0) 0 else payloads[0].block.width());
+        return .{ .blocks = page };
+    }
     /// Pull a bounded rank window, hydrate each distinct physical page once,
     /// and restore rank order. A bounded key backlog preserves unread lanes when
     /// physical allocation admission shortens the estimated window.
@@ -4705,7 +4872,7 @@ pub const Sort = struct {
     };
     pub fn nextPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
         if (maximum == 0) return error.InvalidSqlLimit;
-        try self.finishImpl(true);
+        try self.finishDelivery(@sizeOf(RowLease) + @sizeOf(PageView));
         const reader = try self.payloadReader();
         const limit = reader.target(byte_limit);
         var keys: [64]?RowLease = @splat(null);
@@ -8376,4 +8543,131 @@ test "SQL bounded native delivery content keys survive producer reuse text spell
         try Harness.run(std.testing.allocator, compressed);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{compressed});
     }
+}
+
+test "SQL compact delivery text key compression amplification" {
+    const Reader = struct {
+        text: []const u8,
+        frozen_value: @import("execution_batch.zig").FrozenJson,
+        frozen_mode: bool,
+        id: usize,
+        fn check(_: *anyopaque) !void {}
+        fn cell(raw: *anyopaque, _: Allocator, _: usize, column: usize) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (column == 0) return error.UnexpectedMaterialization;
+            return Datum.json(.{ .integer = @intCast(self.id) });
+        }
+        fn frozen(raw: *anyopaque, _: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (column == 0 and self.frozen_mode) self.frozen_value else null;
+        }
+        fn json(raw: *anyopaque, _: usize, column: usize) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (column == 0 and !self.frozen_mode) self.text else null;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| for ([_]bool{ false, true }) |repeated| for ([_]bool{ false, true }) |frozen_mode| {
+        var token: u8 = 0;
+        var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = Reader.check, .compression = if (compressed) .snappy else .none, .max_bytes = if (compressed) 256 * 1024 else 32 * 1024 * 1024, .async_writes = false, .buffer_bytes = 128 };
+        defer manager.deinit();
+        var pages = try JoinPayloads.init(&manager);
+        defer pages.close();
+        var last: u64 = 0;
+        for (0..32) |i| {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const body = try sa.alloc(u8, 65536);
+            @memset(body, 'x');
+            const id: usize = if (repeated) 0 else i;
+            body[0] = @as(u8, 'a') + @as(u8, @intCast(id / 26));
+            body[1] = @as(u8, 'a') + @as(u8, @intCast(id % 26));
+            const text = try std.fmt.allocPrint(sa, "{{\"body\":\"{s}\"}}", .{body});
+            var object: std.json.ObjectMap = .empty;
+            try object.put(sa, "body", .{ .string = body });
+            const wire = try encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(.{ .object = object })}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+            const block = try decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+            defer block.deinit();
+            var reader: Reader = .{ .text = text, .frozen_value = (try block.frozenJson(0, 0, false)).?, .frozen_mode = frozen_mode, .id = i };
+            last = try pages.appendBatch(.{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_json = Reader.json, .read_frozen = Reader.frozen, .count = 1, .width = 2 } });
+        }
+        if (compressed) try std.testing.expect(manager.written_bytes < 256 * 1024);
+        std.debug.print("COMPRESSED_TEXT_KEY compressed={} repeated={} frozen={} attempts={d} reads={d} calls={d} writes={d}\n", .{ compressed, repeated, frozen_mode, pages.encoded_pages, manager.read_bytes, manager.read_calls, manager.written_bytes });
+        try pages.file.seal();
+        var reader = PayloadReader.init(&pages);
+        defer reader.deinit();
+        const payload = try reader.read(.{ .offset = last, .index = 0 });
+        defer payload.release();
+        try std.testing.expectEqual(@as(i64, 31), (try payload.block.cell(0, 1)).value.integer);
+        const expected: []const u8 = if (repeated) "aa" else "bf";
+        const decoded = try payload.block.cell(0, 0);
+        const body = decoded.value.object.get("body").?.string;
+        try std.testing.expectEqualStrings(expected, body[0..2]);
+    };
+}
+
+test "SQL compact delivery compressed text keys verify with fixed headroom and reject corrupt frames" {
+    const Reader = struct {
+        text: []const u8,
+        fn check(_: *anyopaque) !void {}
+        fn cell(_: *anyopaque, _: Allocator, _: usize, _: usize) anyerror!Datum {
+            return error.UnexpectedMaterialization;
+        }
+        fn json(raw: *anyopaque, _: usize, _: usize) anyerror!?[]const u8 {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).text;
+        }
+    };
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const bytes = try source.allocator().alloc(u8, 65536);
+    @memset(bytes, 'x');
+    const text = try std.fmt.allocPrint(source.allocator(), "{{\"body\":\"{s}\"}}", .{bytes});
+    var reader: Reader = .{ .text = text };
+    var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    var token: u8 = 0;
+    var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &token, .checkpoint = Reader.check, .compression = .snappy, .async_writes = false, .buffer_bytes = 128 };
+    defer manager.deinit();
+    var pages = try JoinPayloads.init(&manager);
+    defer pages.close();
+    const key: JoinPayloads.BodyKey = .{ .bytes = text, .kind = 1, .hash = 17 };
+    const offset = try pages.appendNativeBody(.{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_json = Reader.json, .count = 1, .width = 1 } }, 0, 0, key);
+    try std.testing.expectEqual(offset, (try pages.lookupNativeBody(key)).?);
+    var frame: [26]u8 = undefined;
+    try pages.file.readRaw(offset, &frame);
+    try std.testing.expectEqual(@as(u8, 129), frame[17]);
+    const key_offset = offset + 17 + std.mem.readInt(u64, frame[0..8], .little);
+    var original: [8]u8 = undefined;
+    try pages.file.readRaw(key_offset, &original);
+    const stored_length = std.mem.readInt(u64, &original, .little);
+    try std.testing.expect(stored_length < text.len / 10);
+    const missing = try source.allocator().dupe(u8, text);
+    missing[text.len - 3] = 'y';
+    {
+        const limit = budget.limit;
+        budget.limit = budget.live + 32;
+        defer budget.limit = limit;
+        try std.testing.expectEqual(offset, (try pages.lookupNativeBody(key)).?);
+        try std.testing.expectEqual(@as(?u64, null), try pages.lookupNativeBody(.{ .bytes = missing, .kind = 1, .hash = 17 }));
+        try std.testing.expectEqual(@as(?u64, null), try pages.lookupNativeBody(.{ .bytes = text, .kind = 2, .hash = 17 }));
+        try std.testing.expect(!budget.isExhausted());
+    }
+    var corrupt: [8]u8 = undefined;
+    std.mem.writeInt(u64, &corrupt, pages.file.size + 1, .little);
+    try pages.file.writeRaw(key_offset, &corrupt);
+    try std.testing.expectError(error.InvalidSqlSpill, pages.lookupNativeBody(key));
+    try pages.file.writeRaw(key_offset, &original);
+    try std.testing.expectEqual(offset, (try pages.lookupNativeBody(key)).?);
+    // An invalid COPY tag after the valid decoded-size preamble cannot be
+    // treated as an equal key, even with an equal hash and length descriptor.
+    var encoded: [5]u8 = undefined;
+    try pages.file.readRaw(key_offset + 8, &encoded);
+    var prefix: usize = 0;
+    while (encoded[prefix] & 128 != 0) : (prefix += 1) {}
+    prefix += 1;
+    const bad_copy = [_]u8{ 1, 0 };
+    try pages.file.writeRaw(key_offset + 8 + prefix, &bad_copy);
+    try std.testing.expectError(error.InvalidSqlSpill, pages.lookupNativeBody(key));
 }

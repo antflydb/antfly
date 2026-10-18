@@ -525,7 +525,9 @@ pub const TopK = struct {
         for (@constCast(rows), 0..) |*row, index| row.* = try self.scalarRow(index);
         return rows;
     }
-    pub fn finishNative(self: *TopK, alloc: Allocator) ![]const Row {
+    /// Establish rank order without allocating a duplicate row-header vector.
+    /// Span consumers keep the heap owner alive and access entries directly.
+    pub fn finishOrder(self: *TopK) !void {
         if (self.released != 0) return error.InvalidSqlBackendResponse;
         if (!self.finished) {
             var end = self.count;
@@ -543,6 +545,9 @@ pub const TopK = struct {
             }
             self.finished = true;
         }
+    }
+    pub fn finishNative(self: *TopK, alloc: Allocator) ![]const Row {
+        try self.finishOrder();
         const rows = try alloc.alloc(Row, self.count);
         for (self.entries[0..self.count], rows) |entry, *row| row.* = entry.row;
         return rows;

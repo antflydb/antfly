@@ -31,7 +31,6 @@ pub const Cursor = struct {
     borrowed_sorted: ?usize = null,
     index: usize = 0,
     sorted: ?*@import("operators.zig").TopK = null,
-    sorted_rows: []const @import("operators.zig").Row = &.{},
     sorted_offset: usize = 0,
     sorted_count: usize = 0,
     memory_leased: bool = false,
@@ -51,28 +50,41 @@ pub const Cursor = struct {
         }
         return self.payload_reader.?;
     }
-    const Location = struct {
-        block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
-        index: usize = 0,
-        values: []const @import("scalar.zig").Datum = &.{},
-        typed: ?*const @import("typed_store.zig").Store = null,
-        fn cell(self: Location, a: std.mem.Allocator, column: usize) !@import("scalar.zig").Datum {
-            return if (self.block) |block| block.cell(self.index, column) else if (self.typed) |typed| typed.cell(a, self.index, column) else self.values[column];
+    const HeapView = struct {
+        top: *@import("operators.zig").TopK,
+        begin: usize,
+        count: usize,
+        fn cell(raw: *anyopaque, a: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            const position = view.begin + row;
+            return if (view.top.nativeStore(position)) |store| store.cell(a, 0, column) else view.top.entries[position].row.values[column];
         }
-        fn frozen(self: Location, column: usize) !?@import("execution_batch.zig").FrozenJson {
-            if (self.block) |block| return if (block.encoded) |encoded| encoded.frozenJson(self.index, column, false) else null;
-            return if (self.typed) |typed| typed.frozenJson(self.index, column) else null;
+        fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            return if (view.top.nativeStore(view.begin + row)) |store| store.frozenJson(0, column) else null;
         }
-        fn json(self: Location, column: usize) !?[]const u8 {
-            if (self.block) |block| return if (block.encoded) |encoded| encoded.encodedJson(self.index, column, false) else null;
-            return if (self.typed) |typed| typed.encodedJson(self.index, column) else null;
+        fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            return if (view.top.nativeStore(view.begin + row)) |store| store.encodedJson(0, column) else null;
         }
-        fn bytes(self: Location, a: std.mem.Allocator, column: usize) !usize {
-            if (try self.frozen(column)) |value| return value.bytes.len;
-            if (try self.json(column)) |text| return text.len;
-            return @import("operators.zig").datumBytes(try self.cell(a, column));
+        fn identity(raw: *anyopaque, _: usize, column: usize) anyerror!?u64 {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            if (view.count != 1) return null; // Heap rows own independent stores.
+            return if (view.top.nativeStore(view.begin)) |store| store.dictionaryId(0, column) else null;
+        }
+        fn dictionary(raw: *anyopaque, a: std.mem.Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            if (view.count != 1) return null;
+            const store = view.top.nativeStore(view.begin) orelse return null;
+            return (@import("execution_batch.zig").Batch{ .retained = .{ .store = store, .count = 1 } }).dictionaryColumn(a, column);
+        }
+        fn batch(self: *@This(), width: usize) @import("execution_batch.zig").Batch {
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .read_identity = identity, .read_dictionary = dictionary, .count = self.count, .width = width } };
         }
     };
+    fn heapAllocator(self: *Cursor) std.mem.Allocator {
+        return @import("memory_budget.zig").reclaimingAllocator(self.a);
+    }
     pub const Lease = struct {
         values: @import("execution_batch.zig").Batch,
         owner: ?*Cursor = null,
@@ -80,15 +92,19 @@ pub const Cursor = struct {
         blocks: []const *@import("spill.zig").Sequential.OwnedBlock = &.{},
         payload_page: ?@import("spill.zig").PayloadReader.Page = null,
         sorted_page: ?@import("spill.zig").Sort.Page = null,
+        ordinary_page: ?@import("spill.zig").Sort.ValuesPage = null,
+        heap_view: ?*HeapView = null,
         pub fn deinit(self: Lease) void {
             if (self.payload_page) |page| page.release();
             if (self.sorted_page) |page| page.release();
+            if (self.ordinary_page) |page| page.release();
+            if (self.heap_view) |view| self.owner.?.heapAllocator().destroy(view);
             if (self.block) |block| block.release();
             for (self.blocks) |block| block.release();
             if (self.owner) |owner| owner.close();
         }
     };
-    /// Native payload descriptors own exact admitted allocations; other views
+    /// Sorted/native delivery owns its admitted metadata; sequential views
     /// use caller scratch. Pages retain the cursor through terminal cleanup;
     /// release them before the statement allocator closes.
     pub fn nextLease(self: *Cursor, a: std.mem.Allocator, maximum: usize, byte_limit: usize) !Lease {
@@ -122,7 +138,17 @@ pub const Cursor = struct {
         if (self.sorted) |top| {
             if (top.external == null) self.memory_leased = true;
             const capacity = @min(64, @min(maximum, self.count() - self.index));
-            if (top.external) |sort| if (sort.order_sort != null) {
+            if (top.external) |sort| {
+                if (sort.order_sort == null) {
+                    while (self.sorted_offset != 0) : (self.sorted_offset -= 1) if (!try sort.skip()) return error.InvalidSqlSpill;
+                    const page = try sort.nextValuesPage(capacity, byte_limit);
+                    errdefer page.release();
+                    const values = page.batch();
+                    if (values.len() == 0) return error.InvalidSqlSpill;
+                    self.index += values.len();
+                    _ = self.refs.fetchAdd(1, .monotonic);
+                    return .{ .values = values, .ordinary_page = page, .owner = self };
+                }
                 while (self.sorted_offset != 0) : (self.sorted_offset -= 1) if (!try sort.skip()) return error.InvalidSqlSpill;
                 const page = try sort.nextPageLeased(capacity, byte_limit);
                 errdefer page.release();
@@ -138,84 +164,24 @@ pub const Cursor = struct {
                 self.index += page.rows.len;
                 _ = self.refs.fetchAdd(1, .monotonic);
                 return .{ .values = page.values, .sorted_page = page, .owner = self };
-            };
-            const rows = try a.alloc(Location, capacity);
-            const blocks = try a.alloc(*@import("spill.zig").Sequential.OwnedBlock, capacity);
-            var held: usize = 0;
-            errdefer for (blocks[0..held]) |block| block.release();
+            }
+            const stable = self.heapAllocator();
+            if (@import("memory_budget.zig").headroom(stable)) |available| if (available < @sizeOf(HeapView)) return error.SqlProgramLimitExceeded;
+            const view = try stable.create(HeapView);
+            errdefer stable.destroy(view);
+            view.* = .{ .top = top, .begin = self.sorted_offset + self.index, .count = capacity };
+            const values = view.batch(self.width);
             var count_rows: usize = 0;
             var bytes: usize = 0;
-            var leased_bytes: usize = capacity *| (@sizeOf(Location) + @sizeOf(*@import("spill.zig").Sequential.OwnedBlock));
             while (count_rows < capacity) {
-                if (top.external) |sort| {
-                    while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
-                        if (!try sort.skip()) return error.InvalidSqlSpill;
-                    }
-                    const lease = (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
-                    if (lease.key_block) |keys| keys.release();
-                    rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values, .typed = lease.values };
-                    if (lease.block) |block| {
-                        const existing = for (blocks[0..held]) |prior| {
-                            if (prior == block) break true;
-                        } else false;
-                        if (existing) block.release() else {
-                            blocks[held] = block;
-                            held += 1;
-                            leased_bytes +|= block.retainedBytes() +| @sizeOf(@import("spill.zig").Sequential.OwnedBlock);
-                        }
-                    }
-                } else {
-                    const position = self.sorted_offset + self.index;
-                    rows[count_rows] = if (top.nativeStore(position)) |typed| .{ .typed = typed, .index = 0 } else .{ .values = self.sorted_rows[position].values };
-                }
-                for (0..self.width) |column| bytes +|= try rows[count_rows].bytes(a, column);
-                self.index += 1;
+                for (0..self.width) |column| bytes +|= try values.cellBytes(a, count_rows, column);
                 count_rows += 1;
-                if (bytes >= byte_limit or leased_bytes >= byte_limit) break;
+                if (bytes >= byte_limit) break;
             }
-            const View = struct {
-                rows: []const Location,
-                shared: bool,
-                fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
-                    const view: *@This() = @ptrCast(@alignCast(raw));
-                    return view.rows[row].cell(alloc, column);
-                }
-                fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
-                    const view: *@This() = @ptrCast(@alignCast(raw));
-                    return view.rows[row].frozen(column);
-                }
-                fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
-                    const view: *@This() = @ptrCast(@alignCast(raw));
-                    return view.rows[row].json(column);
-                }
-                fn identity(raw: *anyopaque, row: usize, column: usize) anyerror!?u64 {
-                    const view: *@This() = @ptrCast(@alignCast(raw));
-                    if (!view.shared) return null;
-                    const location = view.rows[row];
-                    if (location.block) |block| return if (block.encoded) |encoded| encoded.dictionaryIdentity(location.index, column, false) else null;
-                    return if (location.typed) |typed| typed.dictionaryId(location.index, column) else null;
-                }
-                fn dictionary(raw: *anyopaque, alloc: std.mem.Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
-                    const view: *@This() = @ptrCast(@alignCast(raw));
-                    if (!view.shared) return null;
-                    const first = view.rows[0];
-                    const Batch = @import("execution_batch.zig").Batch;
-                    const source = try alloc.create(Batch);
-                    source.* = if (first.block) |block| try block.batch(alloc, false) else if (first.typed) |typed| .{ .retained = .{ .store = typed, .count = typed.len } } else return null;
-                    const selection = try alloc.alloc(usize, view.rows.len);
-                    for (selection, view.rows) |*index, location| index.* = location.index;
-                    const selected = try source.select(alloc, selection);
-                    return selected.dictionaryColumn(alloc, column);
-                }
-            };
-            const view = try a.create(View);
-            const first = rows[0];
-            const shared = for (rows[0..count_rows]) |row| {
-                if (row.block != first.block or row.typed != first.typed) break false;
-            } else first.block != null or first.typed != null;
-            view.* = .{ .rows = rows[0..count_rows], .shared = shared };
+            view.count = count_rows;
+            self.index += count_rows;
             _ = self.refs.fetchAdd(1, .monotonic);
-            return .{ .values = .{ .reader = .{ .ptr = view, .read = View.cell, .read_frozen = View.frozen, .read_json = View.json, .read_identity = View.identity, .read_dictionary = View.dictionary, .count = count_rows, .width = self.width } }, .blocks = blocks[0..held], .owner = self };
+            return .{ .values = view.batch(self.width), .heap_view = view, .owner = self };
         }
         try self.loadBlock();
         const block = self.block.?;
@@ -338,12 +304,12 @@ pub const Cursor = struct {
         if (implicit and available > limit) return error.SqlResultTooLarge;
         const owned = try self.a.create(@import("operators.zig").TopK);
         errdefer self.a.destroy(owned);
-        // Finish before moving: memory rows borrow the heap's stable arenas.
-        const memory_rows = if (top.external == null) try top.finishNative(self.a) else &.{};
+        // Span views access the finished heap directly, without a duplicate
+        // row-header snapshot. Its owner remains pinned by every output lease.
+        if (top.external == null) try top.finishOrder();
         owned.* = top.*;
         top.* = .{ .alloc = top.alloc, .entries = &.{}, .orders = &.{}, .max_bytes = 0, .retained_bytes = 0 };
         self.sorted = owned;
-        self.sorted_rows = memory_rows;
         self.sorted_offset = @min(offset, total);
         self.sorted_count = @min(available, limit);
         if (owned.external == null) for (0..self.sorted_offset) |index| owned.releaseFinishedRow(index);
@@ -423,7 +389,6 @@ pub const Cursor = struct {
             backing.destroy(pages);
         }
         if (self.sorted) |top| {
-            a.free(self.sorted_rows);
             top.deinit();
             a.destroy(top);
         }
@@ -484,11 +449,9 @@ pub const Cursor = struct {
                         _ = try self.rows.append(.{ .values = row.values, .keys = &.{}, .ordinal = ordinal }, @import("spill.zig").none);
                     }
                     try self.rows.seal();
-                    self.a.free(self.sorted_rows);
                     top.deinit();
                     self.a.destroy(top);
                     self.sorted = null;
-                    self.sorted_rows = &.{};
                 }
             }
             if (self.memory) |memory| try memory.finish() else try self.rows.seal();
@@ -771,7 +734,7 @@ test "SQL replay freezes resident sorted owners and seals external sort windows 
                     try std.testing.expectEqual(@as(usize, 1), manager.files);
                 } else try std.testing.expect(cursor.sorted != null);
                 const row = (try first.next()).?;
-                if (!disk) try std.testing.expect(row[1].array == cursor.sorted_rows[cursor.sorted_offset].values[1].array);
+                if (!disk) try std.testing.expect(row[1].array == cursor.sorted.?.entries[cursor.sorted_offset].row.values[1].array);
                 for (0..3) |_| {
                     second.rewind();
                     for (0..3) |ordinal| {
@@ -811,7 +774,7 @@ test "SQL forward borrowed sorted rows allocate nothing and retire before the ne
         // Any accidental per-row cloning is an immediate allocation failure.
         const row = (try cursor.nextBorrowed(std.testing.failing_allocator)).?;
         try std.testing.expectEqual(@as(usize, 1) + ordinal, cursor.sorted.?.released);
-        try std.testing.expect(row[0].array == cursor.sorted_rows[1 + ordinal].values[0].array);
+        try std.testing.expect(row[0].array == cursor.sorted.?.entries[1 + ordinal].row.values[0].array);
         try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
         try std.testing.expectEqual(@as(i32, -2), row[0].array.?.dimensions[0].lower);
         try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
@@ -1198,4 +1161,139 @@ test "SQL bounded native delivery sorted cursor owns exact pages across faults a
         try Harness.run(std.testing.allocator, compressed);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{compressed});
     }
+}
+
+test "SQL compact delivery narrow cursor admission" {
+    const a = std.testing.allocator;
+    const Datum = @import("scalar.zig").Datum;
+    const spill = @import("spill.zig");
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |external| for ([_]usize{ 1024, 2048, 4096 }) |available| for ([_]usize{ 1, 64 }) |maximum| {
+        var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+        defer std.debug.assert(budget.live == 0);
+        var token: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &token, .checkpoint = Hook.check, .compression = .none, .async_writes = false, .buffer_bytes = 128 };
+        defer manager.deinit();
+        const cursor = try Cursor.create(budget.allocator(), &manager, 1);
+        defer cursor.close();
+        var top = try @import("operators.zig").TopK.initWithSpill(budget.allocator(), 64, &.{.{}}, if (external) 8192 else 1024 * 1024, &manager);
+        defer top.deinit();
+        var source = std.heap.ArenaAllocator.init(a);
+        defer source.deinit();
+        var cells: [64]Datum = undefined;
+        var rows: [64][]const Datum = undefined;
+        var ordinals: [64]u64 = undefined;
+        for (0..64) |i| {
+            cells[i] = Datum.json(.{ .integer = @intCast(i) });
+            rows[i] = cells[i..][0..1];
+            ordinals[i] = i;
+        }
+        try top.addBatch(source.allocator(), .{ .rows = &rows }, &rows, &ordinals);
+        try std.testing.expectEqual(external, top.external != null);
+        try Cursor.takeSorted(cursor, &top, 0, 64, false);
+        {
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const warm = try cursor.nextLease(scratch.allocator(), 1, 128 * 1024);
+            defer warm.deinit();
+            try std.testing.expectEqual(@as(i64, 0), (try warm.values.cell(scratch.allocator(), 0, 0)).value.integer);
+        }
+        if (cursor.sorted.?.external) |sort| try std.testing.expect(sort.order_sort == null);
+        const ballast = try budget.allocator().alloc(u8, @import("memory_budget.zig").headroom(manager.alloc).? - available);
+        var ballast_live = true;
+        defer if (ballast_live) budget.allocator().free(ballast);
+        var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+        defer scratch.deinit();
+        var failure: ?anyerror = null;
+        var seen: usize = 0;
+        const lease = cursor.nextLease(scratch.allocator(), maximum, 128 * 1024) catch |err| blk: {
+            failure = err;
+            break :blk null;
+        };
+        if (lease) |value| {
+            defer value.deinit();
+            _ = scratch.reset(.free_all);
+            seen = value.values.len();
+            for (0..seen) |i| try std.testing.expectEqual(@as(i64, @intCast(i + 1)), (try value.values.cell(scratch.allocator(), i, 0)).value.integer);
+        }
+        try std.testing.expect(!budget.isExhausted());
+        if (external and available == 1024) try std.testing.expectEqual(error.SqlProgramLimitExceeded, failure.?);
+        if (available >= 2048 or !external) {
+            try std.testing.expect(failure == null);
+            try std.testing.expect(seen > 0);
+            try std.testing.expect(!budget.isExhausted());
+        }
+        budget.allocator().free(ballast);
+        ballast_live = false;
+        var expected: usize = seen + 1;
+        while (expected < 64 and failure == null) {
+            const next = try cursor.nextLease(scratch.allocator(), 64, 128 * 1024);
+            defer next.deinit();
+            try std.testing.expect(next.values.len() != 0);
+            for (0..next.values.len()) |i| {
+                try std.testing.expectEqual(@as(i64, @intCast(expected)), (try next.values.cell(scratch.allocator(), i, 0)).value.integer);
+                expected += 1;
+            }
+        }
+        if (failure == null) try std.testing.expectEqual(@as(usize, 64), expected);
+        std.debug.print("COMPACT_NARROW external={} available={d} maximum={d} seen={d} failure={?} exhausted={} peak={d}\n", .{ external, available, maximum, seen, failure, budget.isExhausted(), budget.peak });
+    };
+}
+
+test "SQL compact delivery heap resident sort and ordinary spill pages survive faults offsets scratch reset and early close" {
+    const Harness = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator, mode: u8, compressed: bool) !void {
+            const spill = @import("spill.zig");
+            const Datum = @import("scalar.zig").Datum;
+            var token: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false, .buffer_bytes = 128 };
+            defer manager.deinit();
+            var cursor: ?*Cursor = try Cursor.create(a, &manager, 2);
+            defer if (cursor) |owner| owner.close();
+            var top = try @import("operators.zig").TopK.initWithSpill(a, if (mode == 1) 1024 else 16, &.{.{}}, if (mode == 2) 1024 else if (mode == 1) 128 * 1024 else 1024 * 1024, &manager);
+            defer top.deinit();
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            var values: [16][2]Datum = undefined;
+            var rows: [16][]const Datum = undefined;
+            var keys: [16][]const Datum = undefined;
+            var ordinals: [16]u64 = undefined;
+            for (0..16) |i| {
+                values[i] = .{ Datum.json(.{ .integer = @intCast(15 - i) }), if (i % 2 == 0) Datum.json(.null) else .{} };
+                rows[i] = &values[i];
+                keys[i] = values[i][0..1];
+                ordinals[i] = i;
+            }
+            // Mode 1 exercises a resident ordinary Sort behind an external
+            // TopK; mode 2 forces physical runs; mode 0 stays in the heap.
+            try top.addBatch(source.allocator(), .{ .rows = &rows }, &keys, &ordinals);
+            try Cursor.takeSorted(cursor.?, &top, 3, 7, false);
+            if (cursor.?.sorted.?.external) |sort| {
+                try std.testing.expect(sort.order_sort == null);
+                try sort.finish();
+                try std.testing.expectEqual(mode == 2, sort.output_count != 0);
+            } else try std.testing.expect(mode == 0);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const first = try cursor.?.nextLease(scratch.allocator(), 2, 128 * 1024);
+            defer first.deinit();
+            const second = try cursor.?.nextLease(scratch.allocator(), 2, 128 * 1024);
+            defer second.deinit();
+            try std.testing.expect(first.values.len() != 0 and second.values.len() != 0);
+            const expected_second = 3 + first.values.len();
+            cursor.?.close();
+            cursor = null;
+            _ = scratch.reset(.free_all);
+            try std.testing.expectEqual(@as(i64, 3), (try first.values.cell(scratch.allocator(), 0, 0)).value.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(expected_second)), (try second.values.cell(scratch.allocator(), 0, 0)).value.integer);
+            try std.testing.expect(!(try first.values.cell(scratch.allocator(), 0, 1)).sql_null);
+        }
+    };
+    for ([_]u8{ 0, 1, 2 }) |mode| for ([_]bool{ false, true }) |compressed| {
+        try Harness.run(std.testing.allocator, mode, compressed);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ mode, compressed });
+    };
 }
