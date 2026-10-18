@@ -447,6 +447,9 @@ jobs:
             --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      - name: Prepare verified Zig source dependencies
+        run: python3 scripts/ci/prepare_zig_dependencies.py
+
       - name: Verify Zig version
         env:
           ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
@@ -530,6 +533,9 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      - name: Prepare verified Zig source dependencies
+        run: python3 scripts/ci/prepare_zig_dependencies.py
+
       - name: Verify Zig version
         run: zig version
 
@@ -568,6 +574,11 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: ts/package.json
+
+      - name: Verify Zig source cache round trip
+        env:
+          ANTFLY_TEST_ZIG: zig
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_dependencies.py
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -810,6 +821,9 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      - name: Prepare verified Zig source dependencies
+        run: python3 scripts/ci/prepare_zig_dependencies.py
+
       - name: Verify Zig version
         run: zig version
 
@@ -896,6 +910,9 @@ jobs:
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
+
+      - name: Prepare verified Zig source dependencies
+        run: python3 scripts/ci/prepare_zig_dependencies.py
 
       - name: Verify Zig version
         run: zig version
@@ -1031,8 +1048,16 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      - name: Prepare verified Zig source dependencies
+        run: python3 scripts/ci/prepare_zig_dependencies.py
+
       - name: Verify Zig version
         run: zig version
+
+      - name: Verify Zig source cache round trip
+        env:
+          ANTFLY_TEST_ZIG: zig
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_dependencies.py
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -1541,10 +1566,15 @@ jobs:
           mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
           cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
-          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
-          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
+          {
+            echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root"
+            echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local"
+            echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
+            echo "TMPDIR=$cache_root/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare verified Zig source dependencies
+        run: python3 scripts/ci/prepare_zig_dependencies.py
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2193,10 +2223,15 @@ jobs:
           mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
           cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
-          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
-          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
+          {
+            echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root"
+            echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local"
+            echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
+            echo "TMPDIR=$cache_root/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare verified Zig source dependencies
+        run: python3 scripts/ci/prepare_zig_dependencies.py
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2251,12 +2286,13 @@ jobs:
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
     needs: [admission, changes, e2e-base-build, e2e-full-build]
-    runs-on: ${{ matrix.suite != 'inference' && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
+    runs-on: ${{ !startsWith(matrix.suite, 'inference-') && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
+        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference-generation","inference-speech","inference-embedding"]' || '["inference-generation","inference-speech","inference-embedding","antfly"]') }}
     env:
       # Full Antfly E2E has the same multi-process groups as the base shards.
       # Keep one process-owning worker per runner while lightweight tests may
@@ -2352,7 +2388,7 @@ jobs:
           echo "ANTFLY_LIBRARY=${GITHUB_WORKSPACE}/zig/zig-out/lib/libantfly.so" >> "$GITHUB_ENV"
 
       - name: Report inference memory baseline
-        if: matrix.suite == 'inference'
+        if: startsWith(matrix.suite, 'inference-')
         run: |
           echo "memory.current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo unavailable)"
           echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unavailable)"
@@ -2383,10 +2419,11 @@ jobs:
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly inference full E2E
-        if: matrix.suite == 'inference'
+        if: startsWith(matrix.suite, 'inference-')
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_REPORT_DIR: ${{ runner.temp }}/inference-reports
           ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           # Gemma 4 covers ordinary, tool-calling, and multimodal generation;
@@ -2399,9 +2436,8 @@ jobs:
           # explicitly covering first-use paths opt into this hard bound.
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
-          # This Burstable pod has a 15000Mi request but no finite memory.max.
-          # Bound leaf-cgroup working set at 14000Mi so admission retains its
-          # emergency reserve and leaves another 1000Mi of pod-request margin.
+          # Keep the model process inside its existing 14GiB admission budget.
+          # Shards remain serial and use the existing heavy runner envelope.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
           # Bound the native hot set while allowing the measured 11173MiB 2B
           # decoder working set plus its scoped projector to complete. Keep
@@ -2413,10 +2449,11 @@ jobs:
           RUN_CLIPCLAP_CONTRACT_TESTS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+          shard="${{ matrix.suite }}"
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference python ../scripts/ci/inference_e2e_shards.py "${shard#inference-}"
 
       - name: Validate standalone inference resource composition
-        if: matrix.suite == 'inference'
+        if: matrix.suite == 'inference-generation'
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -2446,10 +2483,10 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
 
       - name: Retain full inference server logs
-        if: always() && matrix.suite == 'inference'
+        if: always() && startsWith(matrix.suite, 'inference-')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: antfly-inference-full-server-logs-${{ github.run_attempt }}
+          name: antfly-inference-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/inference-server-logs/*.log
           if-no-files-found: ignore
           retention-days: 7
@@ -2469,6 +2506,15 @@ jobs:
             ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/native-stacks.txt
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Retain inference timings
+        if: always() && startsWith(matrix.suite, 'inference-')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inference-timings-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inference-reports
+          if-no-files-found: warn
+          retention-days: 14
 
   e2e-full:
     if: >-
