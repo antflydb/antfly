@@ -43,6 +43,7 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
     if (policy.fused_backbone) hash.update("\x00vision-residual-v2");
     if (policy.spatial_pool) hash.update("\x00spatial-pool-v1");
     if (policy.tuned_gemm) hash.update("\x00tuned-bf16-output-v1");
+    if (policy.image_batch or policy.media_batch) hash.update("\x00batched-patches-v2");
     if (policy.graph_replay) hash.update("\x00media-graphs-v3");
     if (policy.native_vision) hash.update("\x00native-vision-bf16-v2");
     hash.update(&.{0});

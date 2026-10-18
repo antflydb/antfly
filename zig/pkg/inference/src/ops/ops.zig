@@ -2468,6 +2468,9 @@ pub const ComputeBackend = struct {
         /// Exact Pillow RGB8 resize and official 16x16 patch packing. Returns
         /// F32 `[patch_count, 768]` scaled pixels; decline before queueing work.
         preprocessEmbeddingGemma2ImagePatches: ?*const fn (ctx: *anyopaque, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!?CT = null,
+        /// Same preparation, written into caller-owned F32 patch rows. A
+        /// decline occurs before any write to the destination.
+        preprocessEmbeddingGemma2ImagePatchesInto: ?*const fn (ctx: *anyopaque, destination: CT, row_offset: usize, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!bool = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
         /// to scaledDotProductAttention with an all-ones mask, but lets
@@ -4424,6 +4427,14 @@ pub const ComputeBackend = struct {
     pub fn runEmbeddingGemma2VisionTower(self: *const ComputeBackend, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize) !?CT {
         const op = self.vtable.runEmbeddingGemma2VisionTower orelse return null;
         return op(self.ptr, input, sequence, grid_x, grid_y, batch, self.execution_control);
+    }
+
+    pub fn preprocessEmbeddingGemma2ImagePatchesInto(self: *const ComputeBackend, destination: CT, row_offset: usize, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !bool {
+        const op = self.vtable.preprocessEmbeddingGemma2ImagePatchesInto orelse return false;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, destination, row_offset, rgb, width, height, stride, target_width, target_height);
+        try self.checkExecutionControl();
+        return result;
     }
 
     pub fn preprocessEmbeddingGemma2ImagePatches(self: *const ComputeBackend, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !?CT {

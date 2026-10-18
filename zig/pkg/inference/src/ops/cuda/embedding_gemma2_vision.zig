@@ -45,6 +45,26 @@ pub const Plan = struct {
     }
 };
 
+/// Stable scratch ABI for both eager and captured towers. `a` never holds
+/// intermediate-width FFN rows; only b/c/d need the larger width.
+pub fn scratchSizes(rows: usize, want_packed: bool, rotary: bool) ![11]usize {
+    if (rows == 0) return error.InvalidEmbeddingGemma2VisionShape;
+    const hidden = try std.math.mul(usize, try std.math.mul(usize, rows, hidden_size), 2);
+    const intermediate = try std.math.mul(usize, try std.math.mul(usize, rows, intermediate_size), 2);
+    const positions = try std.math.mul(usize, rows, head_count * 2 * 3 * 4);
+    return .{ hidden, hidden, intermediate, intermediate, intermediate, if (want_packed) try std.math.mul(usize, intermediate, 2) else 0, if (rotary) hidden else 0, if (rotary) hidden else 0, positions, 0, 0 };
+}
+
+test "embeddinggemma2 vision scratch admits four 480 square frames without increasing the arena cap" {
+    const sizes = try scratchSizes(4 * 30 * 30, true, true);
+    var bytes: usize = 0;
+    for (sizes) |size| bytes += size;
+    try std.testing.expectEqual(@as(usize, 133747200), bytes);
+    try std.testing.expect(bytes <= 128 * 1024 * 1024);
+    try std.testing.expectEqual(sizes[0], sizes[1]);
+    try std.testing.expectError(error.Overflow, scratchSizes(std.math.maxInt(usize), true, true));
+}
+
 pub const LayerWeights = struct {
     input_norm: []const u8,
     q: []const u8,

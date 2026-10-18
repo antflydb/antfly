@@ -1368,3 +1368,40 @@ tails, multiple frames, merge sizes and standardization. Neither route downloads
 activations or constructs gather indices. The existing RMS reduction follows the
 fused merge/standardization so its numerical contract remains intact; supported
 model constant caches retain the no-scale RMS ones vector under bounded admission.
+
+Vision scratch sizes follow the lifetime of each buffer: `state` and `a` use
+768 channels per row; only `b`, `c` and `d` reserve 3072. Four 480×480 frames
+with packed projections and BF16 rotary require 133,747,200 arena bytes
+(127.55 MiB), so they fit the existing 128 MiB limit. The geometry helper checks
+arithmetic overflow and tests this exact envelope; no retention ceiling increases.
+
+CUDA model constants have a separate 8 MiB / 128-entry ceiling, including
+snapshots detached from the map but still borrowed by a request. Keys are bounded
+and restricted to model preparation. Each snapshot owns fresh device storage and
+shared admission, publishes after a completed copy, and returns independent
+request handles. Warm hits perform no upload, readback or barrier. Eviction drains
+readers' queued work and drops the cache reference; live borrowers keep storage
+and admission until their last release. Admission changes clear snapshots before
+rebinding, and lost-context teardown releases host metadata/admission without
+calling the destroyed driver context. Capture misses and budget declines retain
+uncached preparation. `--require-route audio_constants` requires actual cached
+per-layer query-scale hits, rather than hits on unrelated constants.
+
+The fixed 16-kHz, 320/512-point, 128-bin audio recipe uses less than 2 MiB of
+process-owned storage for its window, filterbank and CPU/GPU DFT layouts. It
+contains no clip/model data, has no dynamically growing key space, and initializes
+once under a mutex. Prepared clips borrow immutable tables; unusual configurations
+retain request-owned preparation. CPU BLAS keeps its previous matrix layout and
+arithmetic. GPU basis/filter copies use the bounded model-constant cache. Existing
+request estimates conservatively include the borrowed tables.
+
+Deferred CUDA image batches resize/pack into disjoint row spans of one admitted
+patch matrix, then execute one patch-projection GEMM. No progressively growing
+hidden concatenations remain. Declined device preparation uploads/copies only
+that item's rows; singleton preparation keeps its existing route. Destination
+bounds are checked before submission and cancellation/error cleanup preserves
+stream ownership. `--require-route patch_into` attests direct destination writes.
+`IMAGE_BATCH` and `MEDIA_BATCH` carry a `batched-patches-v2` identity marker;
+reload and qualify the resulting pins. NVIDIA tests compare batched projection
+against singletons and verify warm audio constants perform no query-scale
+readbacks. Compilation and counters still do not establish NVIDIA parity or speed.

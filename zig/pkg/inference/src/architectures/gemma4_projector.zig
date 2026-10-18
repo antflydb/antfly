@@ -1443,23 +1443,91 @@ const SubsampledAudio = struct {
     }
 };
 
+const AudioFrontendRecipe = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    ready: bool = false,
+    basis_ready: bool = false,
+    cpu_basis_ready: bool = false,
+    builds: usize = 0,
+    basis_builds: usize = 0,
+    window: [320]f32 = undefined,
+    filters: [128 * 257]f32 = undefined,
+    basis: [514 * 320]f32 = undefined,
+    cpu_basis: [320 * 514]f32 = undefined,
+    fn cpuBasis(self: *@This(), frame_length: usize, fft_length: usize) ?[]const f32 {
+        if (frame_length != 320 or fft_length != 512) return null;
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.basis_ready) {
+            fillAudioDftBasis(&self.basis, 320, 512);
+            self.basis_ready = true;
+            self.basis_builds += 1;
+        }
+        if (!self.cpu_basis_ready) {
+            for (0..320) |row| for (0..514) |col| {
+                self.cpu_basis[row * 514 + col] = self.basis[col * 320 + row];
+            };
+            self.cpu_basis_ready = true;
+        }
+        return &self.cpu_basis;
+    }
+    const View = struct { window: []const f32, filters: []const f32, basis: []const f32 };
+    fn get(self: *@This(), mel_bins: usize, want_basis: bool) ?View {
+        if (mel_bins != 128) return null;
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.ready) {
+            fillAudioWindow(&self.window);
+            var points: [130]f32 = undefined;
+            fillGemma4MelFilterbank(&self.filters, &points, 128, 512, 16000);
+            self.ready = true;
+            self.builds += 1;
+        }
+        if (want_basis and !self.basis_ready) {
+            fillAudioDftBasis(&self.basis, 320, 512);
+            self.basis_ready = true;
+            self.basis_builds += 1;
+        }
+        return .{ .window = &self.window, .filters = &self.filters, .basis = if (want_basis) &self.basis else &.{} };
+    }
+};
+// Less than 2 MiB of fixed process recipe storage. It contains no audio,
+// model weights, request pointers or dynamically extensible cache entries.
+var audio_frontend_recipe: AudioFrontendRecipe = .{};
+fn fillAudioWindow(window: []f32) void {
+    for (window, 0..) |*value, i| {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(window.len));
+        value.* = 0.5 - 0.5 * @cos(2.0 * std.math.pi * t);
+    }
+}
+fn fillAudioDftBasis(basis: []f32, frame_length: usize, fft_length: usize) void {
+    for (0..fft_length / 2 + 1) |bin| for (0..frame_length) |col| {
+        const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(bin * col)) / @as(f64, @floatFromInt(fft_length));
+        basis[(2 * bin) * frame_length + col] = @floatCast(@cos(angle));
+        basis[(2 * bin + 1) * frame_length + col] = @floatCast(-@sin(angle));
+    };
+}
+
 pub const PreparedAudio = struct {
     allocator: std.mem.Allocator,
     samples: []f32,
-    window: []f32,
-    filters: []f32,
+    window: []const f32,
+    filters: []const f32,
     mask: []bool,
     frames: usize,
     mel_bins: usize,
     packed_frames: []f32 = &.{},
-    basis: []f32 = &.{},
+    basis: []const f32 = &.{},
+    owns_frontend: bool = true,
     pub fn deinit(self: *PreparedAudio) void {
         self.allocator.free(self.samples);
-        self.allocator.free(self.window);
-        self.allocator.free(self.filters);
+        if (self.owns_frontend) {
+            self.allocator.free(self.window);
+            self.allocator.free(self.filters);
+            self.allocator.free(self.basis);
+        }
         self.allocator.free(self.mask);
         self.allocator.free(self.packed_frames);
-        self.allocator.free(self.basis);
     }
     pub fn retainedBytes(self: PreparedAudio) usize {
         return (self.samples.len + self.window.len + self.filters.len + self.packed_frames.len + self.basis.len) * 4 + self.mask.len;
@@ -1587,19 +1655,20 @@ fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel
     @memset(samples, 0.0);
     @memcpy(samples[pad_left..][0..real_samples], resampled[0..real_samples]);
 
-    const filters = try gemma4MelFilterbank(allocator, mel_bins, fft_length, target_rate);
-    errdefer allocator.free(filters);
-    const window = try allocator.alloc(f32, frame_length);
-    errdefer allocator.free(window);
-    for (window, 0..) |*value, i| {
-        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(frame_length));
-        value.* = 0.5 - 0.5 * @cos(2.0 * std.math.pi * t);
-    }
+    const recipe = audio_frontend_recipe.get(mel_bins, pack_gpu);
+    const filters = if (recipe) |plan| plan.filters else try gemma4MelFilterbank(allocator, mel_bins, fft_length, target_rate);
+    errdefer if (recipe == null) allocator.free(filters);
+    const window: []const f32 = if (recipe) |plan| plan.window else create: {
+        const values = try allocator.alloc(f32, frame_length);
+        fillAudioWindow(values);
+        break :create values;
+    };
+    errdefer if (recipe == null) allocator.free(window);
     for (0..frames) |frame| {
         const frame_end = frame * hop_length + frame_size_for_unfold - 1;
         mask[frame] = frame_end >= pad_left and frame_end < pad_left + real_samples;
     }
-    var prepared = PreparedAudio{ .allocator = allocator, .samples = samples, .window = window, .filters = filters, .mask = mask, .frames = frames, .mel_bins = mel_bins };
+    var prepared = PreparedAudio{ .allocator = allocator, .samples = samples, .window = window, .filters = filters, .mask = mask, .frames = frames, .mel_bins = mel_bins, .owns_frontend = recipe == null, .basis = if (recipe) |plan| plan.basis else &.{} };
     // The two stride-two subsampling layers retain every fourth mask row.
     // Padded frames alone do not guarantee any usable projected audio tokens.
     // Reject these clips before GPU execution so preparation can attribute the
@@ -1612,12 +1681,11 @@ fn prepareAudioPcmBounded(allocator: std.mem.Allocator, pcm: audio.PcmAudio, mel
             for (0..frame_length) |col| prepared.packed_frames[row * frame_length + col] = samples[row * hop_length + col] * window[col];
         }
         const bins = fft_length / 2 + 1;
-        prepared.basis = try allocator.alloc(f32, 2 * bins * frame_length);
-        for (0..bins) |bin| for (0..frame_length) |col| {
-            const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(bin * col)) / @as(f64, @floatFromInt(fft_length));
-            prepared.basis[(2 * bin) * frame_length + col] = @floatCast(@cos(angle));
-            prepared.basis[(2 * bin + 1) * frame_length + col] = @floatCast(-@sin(angle));
-        };
+        if (recipe == null) {
+            const basis = try allocator.alloc(f32, 2 * bins * frame_length);
+            fillAudioDftBasis(basis, frame_length, fft_length);
+            prepared.basis = basis;
+        }
     }
     return prepared;
 }
@@ -1665,14 +1733,23 @@ fn gemma4LogMelTensor(
     for (0..frames) |row| for (0..frame_length) |col| {
         packed_rows[row * frame_length + col] = samples[row * hop + col] * window[col];
     };
-    const basis = try allocator.alloc(f32, 2 * bins * frame_length);
-    defer allocator.free(basis);
-    for (0..bins) |bin| for (0..frame_length) |col| {
-        const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(bin * col)) / @as(f64, @floatFromInt(fft_length));
-        basis[(2 * bin) * frame_length + col] = @floatCast(@cos(angle));
-        basis[(2 * bin + 1) * frame_length + col] = @floatCast(-@sin(angle));
+    const recipe = if (frame_length == 320 and fft_length == 512) audio_frontend_recipe.get(mel_bins, true) else null;
+    const basis: []const f32 = if (recipe) |plan| plan.basis else create: {
+        const values = try allocator.alloc(f32, 2 * bins * frame_length);
+        fillAudioDftBasis(values, frame_length, fft_length);
+        break :create values;
     };
+    defer if (recipe == null) allocator.free(basis);
     return gemma4LogMelPacked(cb, allocator, packed_rows, basis, frames, frame_length, fft_length, filters, mel_bins, floor, mask);
+}
+
+fn audioFrontendConstant(cb: *const ComputeBackend, allocator: std.mem.Allocator, kind: []const u8, data: []const f32, shape: []const i32, fft_length: usize, frame_length: usize, mel_bins: usize) !CT {
+    _ = allocator;
+    var key_buf: [192]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.frontend.f32.v1.{s}.{d}.{d}.{d}", .{ kind, fft_length, frame_length, mel_bins });
+    if (try cb.modelConstant(key, null)) |hit| return hit;
+    const source = try deviceResidentFromFloat32(cb, data, shape);
+    return publishAudioConstant(cb, key, source, true);
 }
 
 fn gemma4LogMelPacked(cb: *const ComputeBackend, allocator: std.mem.Allocator, packed_rows: []const f32, basis: []const f32, frames: usize, frame_length: usize, fft_length: usize, filters: []const f32, mel_bins: usize, floor: f32, mask: []const bool) !CT {
@@ -1681,7 +1758,7 @@ fn gemma4LogMelPacked(cb: *const ComputeBackend, allocator: std.mem.Allocator, p
     try cb.checkExecutionControl();
     const input = try deviceResidentFromFloat32(cb, packed_rows, &.{ @intCast(frames), @intCast(frame_length) });
     defer cb.free(input);
-    const basis_ct = try deviceResidentFromFloat32(cb, basis, &.{ @intCast(2 * bins), @intCast(frame_length) });
+    const basis_ct = try audioFrontendConstant(cb, allocator, "basis", basis, &.{ @intCast(2 * bins), @intCast(frame_length) }, fft_length, frame_length, mel_bins);
     defer cb.free(basis_ct);
     const spectrum = try cb.primDotGeneral(input, basis_ct, &.{ @intCast(frames), @intCast(frame_length) }, &.{ @intCast(2 * bins), @intCast(frame_length) }, &.{1}, &.{1}, &.{}, &.{});
     defer cb.free(spectrum);
@@ -1696,7 +1773,7 @@ fn gemma4LogMelPacked(cb: *const ComputeBackend, allocator: std.mem.Allocator, p
     defer cb.free(magnitude);
     const rows = try cb.primReshape(magnitude, &.{ @intCast(frames), @intCast(bins) });
     defer cb.free(rows);
-    const filter_ct = try deviceResidentFromFloat32(cb, filters, &.{ @intCast(mel_bins), @intCast(bins) });
+    const filter_ct = try audioFrontendConstant(cb, allocator, "filters", filters, &.{ @intCast(mel_bins), @intCast(bins) }, fft_length, frame_length, mel_bins);
     defer cb.free(filter_ct);
     const mel = try cb.primDotGeneral(rows, filter_ct, &.{ @intCast(frames), @intCast(bins) }, &.{ @intCast(mel_bins), @intCast(bins) }, &.{1}, &.{1}, &.{}, &.{});
     defer cb.free(mel);
@@ -1757,15 +1834,19 @@ fn gemma4LogMelFrames(
         // DFT basis for the zero-padded transform [frame_length, 2 * n_freq]:
         // cos and -sin per bin, only the first `frame_length` rows matter.
         const basis_cols = 2 * n_freq;
-        const basis = try allocator.alloc(f32, frame_length * basis_cols);
-        defer allocator.free(basis);
-        for (0..frame_length) |i| {
-            for (0..n_freq) |k| {
-                const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(i * k)) / @as(f64, @floatFromInt(fft_length));
-                basis[i * basis_cols + 2 * k] = @floatCast(@cos(angle));
-                basis[i * basis_cols + 2 * k + 1] = @floatCast(-@sin(angle));
+        const cached_basis = audio_frontend_recipe.cpuBasis(frame_length, fft_length);
+        const basis: []const f32 = cached_basis orelse create: {
+            const values = try allocator.alloc(f32, frame_length * basis_cols);
+            for (0..frame_length) |i| {
+                for (0..n_freq) |k| {
+                    const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(i * k)) / @as(f64, @floatFromInt(fft_length));
+                    values[i * basis_cols + 2 * k] = @floatCast(@cos(angle));
+                    values[i * basis_cols + 2 * k + 1] = @floatCast(-@sin(angle));
+                }
             }
-        }
+            break :create values;
+        };
+        defer if (cached_basis == null) allocator.free(basis);
         const spectrum = try allocator.alloc(f32, frames * basis_cols);
         defer allocator.free(spectrum);
         audio.blas.cblas_sgemm(audio.blas.row_major, audio.blas.no_trans, audio.blas.no_trans, @intCast(frames), @intCast(basis_cols), @intCast(frame_length), 1.0, frame_matrix.ptr, @intCast(frame_length), basis.ptr, @intCast(basis_cols), 0.0, spectrum.ptr, @intCast(basis_cols));
@@ -2374,6 +2455,14 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
     if (deferred) {
         if (cb.kind() != .cuda or !store.huggingface or cb.vtable.concatRows2D == null) return error.UnsupportedResidentGemma4Vision;
         const sequence = geometry.grid_x * geometry.grid_y;
+        if (batch > 1 and cb.vtable.allocUninitF32Shape != null and cb.supportsCopyRows2D()) {
+            const patches = try prepareCudaBatchPatches(cb, allocator, cfg, prepared);
+            defer cb.free(patches);
+            const dim = cfg.patch_size * cfg.patch_size * 3;
+            const weight = try projectorLinearWeightCt(cb, allocator, store, "v.patch_embd.weight", dim, cfg.vision_hidden);
+            const hidden = try cb.linearNoBias(patches, weight, batch * sequence, dim, cfg.vision_hidden);
+            return encodeVisionHiddenResident(cb, allocator, store, cfg, hidden, geometry, batch);
+        }
         var combined: ?CT = null;
         errdefer if (combined) |tensor| cb.free(tensor);
         for (prepared, 0..) |item, index| {
@@ -2399,6 +2488,38 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
     }
     const hidden = try patchEmbedBatchTensor(cb, allocator, store, cfg, pixel_values, geometry, batch);
     return encodeVisionHiddenResident(cb, allocator, store, cfg, hidden, geometry, batch);
+}
+
+/// A single bounded patch matrix. The native resize kernel writes directly to
+/// final row spans. Declined preparation uploads/copies only that item's rows;
+/// no growing concatenations or per-item projection GEMMs remain.
+fn prepareCudaBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, prepared: []const PreparedImage) !CT {
+    if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
+    const geometry = prepared[0].geometry;
+    const sequence = geometry.grid_x * geometry.grid_y;
+    const dim = cfg.patch_size * cfg.patch_size * 3;
+    const destination = (try cb.allocUninitF32Shape(&.{ @intCast(prepared.len * sequence), @intCast(dim) })) orelse return error.ResidentImageOperationUnavailable;
+    errdefer cb.free(destination);
+    for (prepared, 0..) |item, index| {
+        try cb.checkExecutionControl();
+        if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
+        if (item.source) |view| {
+            if (try cb.preprocessEmbeddingGemma2ImagePatchesInto(destination, index * sequence, view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) continue;
+            if (try cb.preprocessEmbeddingGemma2ImagePatches(view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) |patches| {
+                defer cb.free(patches);
+                if (!try cb.copyRows2D(a, destination, index * sequence, patches, 0, sequence, dim)) return error.ResidentImageOperationUnavailable;
+                continue;
+            }
+        }
+        const pixels = if (item.source) |view| try image.preprocessImageViewRectScaledWithResample(a, view, @intCast(geometry.width), @intCast(geometry.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .pillow_bicubic) else try a.dupe(f32, item.pixels);
+        defer a.free(pixels);
+        const host = try hfPatchRows(a, pixels, cfg, geometry, 1);
+        defer a.free(host);
+        const patches = try deviceResidentFromFloat32(cb, host, &.{ @intCast(sequence), @intCast(dim) });
+        defer cb.free(patches);
+        if (!try cb.copyRows2D(a, destination, index * sequence, patches, 0, sequence, dim)) return error.ResidentImageOperationUnavailable;
+    }
+    return destination;
 }
 
 fn prepareCudaImageHidden(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: PreparedImage) !CT {
@@ -3332,6 +3453,13 @@ fn gemma4MelFilterbank(allocator: std.mem.Allocator, n_mels: usize, n_fft: usize
     const n_freq = n_fft / 2 + 1;
     const filters = try allocator.alloc(f32, n_mels * n_freq);
     errdefer allocator.free(filters);
+    const hz_points = try allocator.alloc(f32, n_mels + 2);
+    defer allocator.free(hz_points);
+    fillGemma4MelFilterbank(filters, hz_points, n_mels, n_fft, sample_rate);
+    return filters;
+}
+fn fillGemma4MelFilterbank(filters: []f32, hz_points: []f32, n_mels: usize, n_fft: usize, sample_rate: u32) void {
+    const n_freq = n_fft / 2 + 1;
     @memset(filters, 0.0);
 
     const sr_f: f32 = @floatFromInt(sample_rate);
@@ -3339,8 +3467,6 @@ fn gemma4MelFilterbank(allocator: std.mem.Allocator, n_mels: usize, n_fft: usize
     const mel_low = htkHzToMel(0.0);
     const mel_high = htkHzToMel(sr_f / 2.0);
     const points = n_mels + 2;
-    const hz_points = try allocator.alloc(f32, points);
-    defer allocator.free(hz_points);
     for (0..points) |i| {
         const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(points - 1));
         hz_points[i] = htkMelToHz(mel_low + t * (mel_high - mel_low));
@@ -3360,7 +3486,6 @@ fn gemma4MelFilterbank(allocator: std.mem.Allocator, n_mels: usize, n_fft: usize
                 0.0;
         }
     }
-    return filters;
 }
 
 fn htkHzToMel(hz: f32) f32 {
@@ -4149,6 +4274,16 @@ fn patchEmbedTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, sto
     return patchEmbedBatchTensor(cb, allocator, store, cfg, pixel_values, geometry, 1);
 }
 
+fn hfPatchRows(a: std.mem.Allocator, pixel_values: []const f32, cfg: Config, geometry: Geometry, batch: usize) ![]f32 {
+    const patch_dim = cfg.patch_size * cfg.patch_size * 3;
+    const patches = try a.alloc(f32, batch * geometry.grid_x * geometry.grid_y * patch_dim);
+    for (0..batch) |b| for (0..geometry.grid_y) |gy| for (0..geometry.grid_x) |gx| for (0..cfg.patch_size) |py| for (0..cfg.patch_size) |px| for (0..3) |c| {
+        const value = pixel_values[(b * 3 + c) * geometry.height * geometry.width + (gy * cfg.patch_size + py) * geometry.width + gx * cfg.patch_size + px];
+        patches[((b * geometry.grid_y * geometry.grid_x + gy * geometry.grid_x + gx) * patch_dim) + (py * cfg.patch_size + px) * 3 + c] = 2.0 * (value - 0.5);
+    };
+    return patches;
+}
+
 fn patchEmbedBatchTensor(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4158,21 +4293,14 @@ fn patchEmbedBatchTensor(
     geometry: Geometry,
     batch: usize,
 ) !CT {
-    const scaled_pixels = try allocator.dupe(f32, pixel_values);
-    defer allocator.free(scaled_pixels);
-    for (scaled_pixels) |*value| value.* = 2.0 * (value.* - 0.5);
-
     if (store.gguf == null) {
         // HF's patch linear flattens [patch_y, patch_x, channel]. GGUF's
         // convolution uses [channel, patch_y, patch_x]; preserve the source
         // layout instead of reinterpreting a same-size matrix.
         const patch_count = batch * geometry.grid_x * geometry.grid_y;
         const patch_dim = cfg.patch_size * cfg.patch_size * 3;
-        const pixels = try allocator.alloc(f32, patch_count * patch_dim);
+        const pixels = try hfPatchRows(allocator, pixel_values, cfg, geometry, batch);
         defer allocator.free(pixels);
-        for (0..batch) |b| for (0..geometry.grid_y) |gy| for (0..geometry.grid_x) |gx| for (0..cfg.patch_size) |py| for (0..cfg.patch_size) |px| for (0..3) |c| {
-            pixels[((b * geometry.grid_y * geometry.grid_x + gy * geometry.grid_x + gx) * patch_dim) + (py * cfg.patch_size + px) * 3 + c] = scaled_pixels[(b * 3 + c) * geometry.height * geometry.width + (gy * cfg.patch_size + py) * geometry.width + gx * cfg.patch_size + px];
-        };
         try embeddingGemma2Stage(allocator, "image_patches", pixels);
         const input = try deviceResidentFromFloat32(cb, pixels, &.{ @intCast(patch_count), @intCast(patch_dim) });
         defer cb.free(input);
@@ -4180,6 +4308,10 @@ fn patchEmbedBatchTensor(
         const projected = try cb.linearNoBias(input, w, patch_count, patch_dim, cfg.vision_hidden);
         return projected;
     }
+
+    const scaled_pixels = try allocator.dupe(f32, pixel_values);
+    defer allocator.free(scaled_pixels);
+    for (scaled_pixels) |*value| value.* = 2.0 * (value.* - 0.5);
 
     const patch_w = try store.cachedWeightCt("v.patch_embd.weight");
     const zero_bias = try allocator.alloc(f32, cfg.vision_hidden);
@@ -7188,4 +7320,128 @@ test "embeddinggemma2 Metal spatial projector preparation is bitwise and stays r
 test "embeddinggemma2 CUDA spatial projector preparation is bitwise and stays resident" {
     const fixture = @import("../ops/media_residency_test.zig");
     try fixture.onCuda(fixture.noWeights, checkSpatialPoolPreparation);
+}
+
+test "embeddinggemma2 audio frontend recipe builds once under concurrent preparation and preserves borrowed owners" {
+    const a = std.testing.allocator;
+    const recipe = try a.create(AudioFrontendRecipe);
+    defer a.destroy(recipe);
+    recipe.* = .{};
+    const Worker = struct {
+        fn run(plan: *AudioFrontendRecipe) void {
+            const view = plan.get(128, true).?;
+            std.debug.assert(view.window.len == 320 and view.filters.len == 128 * 257 and view.basis.len == 514 * 320);
+        }
+    };
+    {
+        var futures: [4]std.Io.Future(void) = undefined;
+        var started: usize = 0;
+        defer for (futures[0..started]) |*future| future.await(std.testing.io);
+        for (&futures) |*future| {
+            future.* = try std.testing.io.concurrent(Worker.run, .{recipe});
+            started += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), recipe.builds);
+    try std.testing.expectEqual(@as(usize, 1), recipe.basis_builds);
+    const reference_filters = try gemma4MelFilterbank(a, 128, 512, 16000);
+    defer a.free(reference_filters);
+    try std.testing.expectEqualSlices(f32, reference_filters, &recipe.filters);
+    try std.testing.expect(recipe.get(64, true) == null);
+    try std.testing.expect(@sizeOf(AudioFrontendRecipe) < 2 * 1024 * 1024);
+    const samples: [3200]f32 = @splat(0.25);
+    var first = try prepareEmbeddingGemma2AudioPcm(a, .{ .samples = &samples, .sample_rate = 16000 });
+    var second = try prepareEmbeddingGemma2AudioPcm(a, .{ .samples = &samples, .sample_rate = 16000 });
+    defer second.deinit();
+    try std.testing.expect(!first.owns_frontend and !second.owns_frontend);
+    try std.testing.expect(first.window.ptr == second.window.ptr and first.filters.ptr == second.filters.ptr and first.basis.ptr == second.basis.ptr);
+    first.deinit();
+    try std.testing.expectEqualSlices(f32, reference_filters, second.filters);
+    const reference_basis = try a.alloc(f32, second.basis.len);
+    defer a.free(reference_basis);
+    fillAudioDftBasis(reference_basis, 320, 512);
+    try std.testing.expectEqualSlices(f32, reference_basis, second.basis);
+}
+
+fn populateAudioScaleCacheWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const cfg = embeddingGemma2AudioConfig();
+    for (0..cfg.block_count) |layer| {
+        var buf: [128]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "a.blk.{d}.per_dim_scale.weight", .{layer});
+        const mapped = try @import("embedding_gemma2_media_weights.zig").name(store.allocator, name);
+        defer store.allocator.free(mapped);
+        try @import("../ops/media_residency_test.zig").putWeight(store, mapped, &.{@intCast(cfg.headDim())}, null);
+    }
+}
+fn checkAudioScaleCache(cb: ComputeBackend, _: ComputeBackend) !void {
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.capability_profile = .embedding_gemma2;
+    const a = std.testing.allocator;
+    var weights = ProjectorWeights.initHuggingFace(&cb, a);
+    defer weights.deinit();
+    const cfg = embeddingGemma2AudioConfig();
+    const valid: [17]bool = @splat(true);
+    var first = try AudioLayerInputs.initCached(&cb, a, &weights, cfg, &valid);
+    defer first.deinit(&cb);
+    const before = cb.trainingRuntimeStats().d2h_bytes;
+    var second = try AudioLayerInputs.initCached(&cb, a, &weights, cfg, &valid);
+    defer second.deinit(&cb);
+    try std.testing.expectEqual(before, cb.trainingRuntimeStats().d2h_bytes);
+    try std.testing.expectEqual(@as(u64, 12), compute.embedding_gemma2_audio_constant_hits);
+    for (first.scales, second.scales) |left, right| {
+        const x = try cb.toFloat32(left, a);
+        defer a.free(x);
+        const y = try cb.toFloat32(right, a);
+        defer a.free(y);
+        try std.testing.expectEqualSlices(f32, x, y);
+    }
+}
+test "embeddinggemma2 CUDA warm audio constants avoid all twelve query scale readbacks" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(populateAudioScaleCacheWeights, checkAudioScaleCache);
+}
+
+fn populateBatchedPatchWeight(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const mapped = try @import("embedding_gemma2_media_weights.zig").name(store.allocator, "v.patch_embd.weight");
+    defer store.allocator.free(mapped);
+    try @import("../ops/media_residency_test.zig").putWeight(store, mapped, &.{ 16, 768 }, null);
+}
+fn checkBatchedPatchPreparation(cb: ComputeBackend, _: ComputeBackend) !void {
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.capability_profile = .embedding_gemma2;
+    const a = std.testing.allocator;
+    var cfg = embeddingGemma2ImageConfig();
+    cfg.vision_hidden = 16;
+    const geometry = Geometry{ .width = 32, .height = 48, .grid_x = 2, .grid_y = 3, .pooled_x = 2, .pooled_y = 3 };
+    var pixels: [3][23 * 19 * 3]u8 = undefined;
+    var prepared: [3]PreparedImage = undefined;
+    for (&pixels, &prepared, 0..) |*data, *item, b| {
+        for (data, 0..) |*pixel, i| pixel.* = @truncate(i * 11 + b * 39);
+        item.* = .{ .allocator = a, .pixels = &.{}, .geometry = geometry, .source = .{ .data = data, .width = 23, .height = 19, .format = .rgb8 } };
+    }
+    var weights = ProjectorWeights.initHuggingFace(&cb, a);
+    defer weights.deinit();
+    const before = compute.embedding_gemma2_patch_rows_written;
+    const patches = try prepareCudaBatchPatches(&cb, a, cfg, &prepared);
+    defer cb.free(patches);
+    try std.testing.expectEqual(@as(usize, 18), compute.embedding_gemma2_patch_rows_written - before);
+    const weight = try projectorLinearWeightCt(&cb, a, &weights, "v.patch_embd.weight", 768, 16);
+    const batch = try cb.linearNoBias(patches, weight, 18, 768, 16);
+    defer cb.free(batch);
+    const actual = try cb.toFloat32(batch, a);
+    defer a.free(actual);
+    for (prepared, 0..) |item, i| {
+        const singleton = try prepareCudaImageHidden(&cb, a, &weights, cfg, item);
+        defer cb.free(singleton);
+        const expected = try cb.toFloat32(singleton, a);
+        defer a.free(expected);
+        for (actual[i * 6 * 16 ..][0 .. 6 * 16], expected) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
+    }
+    const destination = (try cb.allocUninitF32Shape(&.{ 18, 768 })).?;
+    defer cb.free(destination);
+    try std.testing.expectError(error.InvalidShape, cb.preprocessEmbeddingGemma2ImagePatchesInto(destination, 13, &pixels[0], 23, 19, 23 * 3, 32, 48));
+}
+test "embeddinggemma2 CUDA batch patches write final row spans and one projection matches singletons" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(populateBatchedPatchWeight, checkBatchedPatchPreparation);
 }

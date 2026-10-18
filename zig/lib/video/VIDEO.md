@@ -608,3 +608,13 @@ Spatial projector preparation has direct CUDA/Metal kernels for ordered patch
 merging and channel standardization, without host index tables or intermediate
 gathers. RMS keeps the backend's established reduction. CUDA `SPATIAL_POOL`
 remains a separately identified opt-in profile pending NVIDIA qualification.
+
+CUDA deferred frame/image cohorts resize into final patch row spans and share a
+single patch-projection GEMM. Bounds and per-item fallback preserve ordered,
+bounded preparation without growing concatenations. Vision `a` scratch is
+hidden-width, allowing four 480×480 frames to fit the unchanged graph arena cap.
+
+Audio preparation shares fixed immutable frontend tables. CUDA device constants
+have an 8 MiB / 128-entry admitted cache; warm query scales require no per-layer
+readback. Snapshot borrowers retain memory/admission through eviction. Neither
+cache stores clip data, and unusual frontend configurations retain private plans.

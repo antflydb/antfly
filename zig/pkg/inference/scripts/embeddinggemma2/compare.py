@@ -623,6 +623,8 @@ CUDA_ROUTES = {
     "vision_graph": "vision_graph_replays_total",
     "spatial_pool": "spatial_pool_launches_total",
     "short_attention": "short_cudnn_attention_launches_total",
+    "audio_constants": "audio_constant_hits_total",
+    "patch_into": "patch_rows_written_total",
     "fused_backbone": "fused_backbone_launches_total",
 }
 

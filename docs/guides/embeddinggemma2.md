@@ -1161,3 +1161,16 @@ reduction. CUDA qualification can require `--require-route spatial_pool`,
 images/video frames for vision replay and 16–63-token inputs for short attention.
 These gates attest execution, and still require pinned vector/ranking parity and
 completed timing on NVIDIA hardware before promotion.
+
+CUDA audio caches immutable relative-position/query-scale/RMS/frontend constants
+within an independently admitted 8 MiB / 128-entry budget. Warm query-scale
+preparation avoids all twelve per-layer weight readbacks. Borrowers retain their
+snapshots and admission across cache eviction. The fixed audio frontend recipe
+also reuses thread-safe process tables; CPU BLAS retains its established layout.
+
+CUDA image cohorts write patches directly into one bounded batch destination
+before a single projection GEMM. This versions the `IMAGE_BATCH` and `MEDIA_BATCH`
+pins with `batched-patches-v2`; reload and run NVIDIA qualification before use.
+The comparison harness can require `audio_constants` and `patch_into` execution.
+Vision scratch now fits four 480×480 frames with packed BF16 preparation into the
+existing 128 MiB graph arena, without raising the cache ceiling.
