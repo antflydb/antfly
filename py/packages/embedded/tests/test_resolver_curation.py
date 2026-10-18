@@ -60,3 +60,58 @@ def test_resolver_curation_round_trip(aflite_path):
     with antfly_embedded.open(aflite_path) as db:
         assert db.resolver_curation("concepts")["curation_revision"] == 4
         assert not db.render_resolver_key("concepts", {"text": "Noise", "label": "concept"})["suppressed"]
+
+
+def test_suppression_replays_mention_and_relation_edges(aflite_path):
+    options = antfly_embedded.OpenOptions(generated_enrichment_replay=True)
+    with antfly_embedded.create_with_options(aflite_path, options) as db:
+        db.add_index(
+            {
+                "name": "knowledge",
+                "type": "graph",
+                "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "edge_types": [{"name": "mentions"}, {"name": "uses"}],
+                "resolvers": [
+                    {
+                        "name": "concepts",
+                        "table": "default",
+                        "promote": False,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "concept/{{uslug _entity.text}}",
+                    }
+                ],
+            }
+        )
+        db.batch_json(
+            {
+                "inserts": {
+                    "source": {
+                        "kg": {
+                            "entities": [
+                                {"id": "a", "label": "concept", "text": "Alpha"},
+                                {"id": "b", "label": "concept", "text": "Beta"},
+                            ],
+                            "relations": [{"type": "uses", "source": "a", "target": "b"}],
+                        }
+                    }
+                }
+            }
+        )
+        db.run_until_idle()
+        assert len(db.edges("knowledge", "source", "mentions", 0)) == 2
+        assert len(db.edges("knowledge", "concept/alpha", "uses", 0)) == 1
+        db.suppress_resolver_keys("concepts", {"add": {"keys": ["concept/alpha"]}})
+        db.run_until_idle()
+        assert len(db.edges("knowledge", "source", "mentions", 0)) == 1
+        assert db.edges("knowledge", "concept/alpha", "uses", 0) == []
+        db.unsuppress_resolver_key("concepts", {"key": "concept/alpha"})
+        db.run_until_idle()
+        assert len(db.edges("knowledge", "source", "mentions", 0)) == 2
+        assert len(db.edges("knowledge", "concept/alpha", "uses", 0)) == 1

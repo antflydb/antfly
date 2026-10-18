@@ -2225,10 +2225,11 @@ test "capi resolver curation suppression replays mention and relation edge contr
     const api = @import("db.zig");
     var tmp = try api.TestDirectory.init("resolver-curation-edges");
     defer tmp.cleanup();
-    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
-    // This asset has no model producer; explicitly enable generated asset replay.
-    root.lite_generated_enrichment_replay = true;
-    const id = try api.publishHandle(root);
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}.aflite", .{tmp.path()}, 0);
+    defer std.testing.allocator.free(path);
+    const options: h.capi.OpenOptions = .{ .storage_kind = h.capi.storage_kind_lite, .profile = h.capi.profile_native, .flags = h.capi.open_flag_generated_enrichment_replay };
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_create_with_options(path, &options, &id));
     defer api.antfly_db_close(id);
     const config =
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"},{"name":"uses"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}"}]}
@@ -2241,7 +2242,7 @@ test "capi resolver curation suppression replays mention and relation edge contr
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(batch), &out));
     api.antfly_buffer_free(&out);
-    try runUntilIdle(root);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     const Edges = struct {
         fn count(db: ?*anyopaque, key: []const u8, edge_type: []const u8, expected: usize) !void {
             var buffer: h.capi.Buffer = .{};
@@ -2256,12 +2257,12 @@ test "capi resolver curation suppression replays mention and relation edge contr
     try Edges.count(id, "concept/alpha", "uses", 1);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_suppress_resolver_keys_json(id, .fromSlice("concepts"), .fromSlice("{\"add\":{\"keys\":[\"concept/alpha\"]}}"), &out));
     api.antfly_buffer_free(&out);
-    try runUntilIdle(root);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     try Edges.count(id, "source", "mentions", 1);
     try Edges.count(id, "concept/alpha", "uses", 0);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_unsuppress_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/alpha\"}"), &out));
     api.antfly_buffer_free(&out);
-    try runUntilIdle(root);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     try Edges.count(id, "source", "mentions", 2);
     try Edges.count(id, "concept/alpha", "uses", 1);
 }
