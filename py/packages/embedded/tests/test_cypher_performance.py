@@ -2686,6 +2686,34 @@ def test_late_qualified_windows_and_repeated_apply_keep_physical_work_bounded(gr
             },
         )
 
+    for tail in (
+        "MATCH (b) WHERE b.score=999 RETURN b.score LIMIT 1",
+        "CALL { WITH b MATCH (b) WHERE b.score=999 RETURN b.score AS qualified_score } RETURN qualified_score LIMIT 1",
+    ):
+        try:
+            result = db.cypher_json(
+                "g", {"query": base + tail, "limits": {"explored_edges": 1000, "intermediate_states": 20000}}
+            )
+        except af.GraphError as error:
+            pytest.fail(f"{base + tail}: {error}")
+        assert result["rows"] == [[{"type": "integer", "value": "999"}]]
+    result = db.cypher_json(
+        "g",
+        {
+            "query": base + "WITH DISTINCT b.score AS score RETURN score LIMIT 3",
+            "limits": {"explored_edges": 1000, "intermediate_states": 20000},
+        },
+    )
+    assert [row[0]["value"] for row in result["rows"]] == ["32", "999"]
+    for tail in (
+        "MATCH (b) WHERE CASE WHEN b.score=999 THEN 1/0 ELSE 0 END=1 RETURN b.score LIMIT 1",
+        "WITH DISTINCT CASE WHEN b.score=999 THEN 1/0 ELSE b.score END AS score RETURN score LIMIT 3",
+    ):
+        with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+            db.cypher_json(
+                "g", {"query": base + tail, "limits": {"explored_edges": 1000, "intermediate_states": 20000}}
+            )
+
 
 def test_row_local_continuations_and_certification_share_captured_work(graph_db):
     db = graph_db
@@ -2738,6 +2766,12 @@ def test_dense_dag_suffixes_collapse_nonbinding_hop_bounds(graph_db):
     match = "MATCH " + ",".join(f"(w{i}:D {{id:'wide{i}'}})" for i in range(size)) + " CREATE "
     for begin in range(0, len(edges), 200):
         db.cypher_json("g", {"query": match + ",".join(edges[begin : begin + 200])})
+    for pattern in ("[:R*1..63]", "[:R*1..63]->()-[:R*0..63]"):
+        query = f"MATCH (s:D {{id:'wide0'}})-{pattern}->(b:D) WHERE b.score+0<0 RETURN b.score LIMIT 1"
+        result = db.cypher_json(
+            "g", {"query": query, "limits": {"explored_edges": 10000, "intermediate_states": 50000}}
+        )
+        assert result["rows"] == []
     base = "MATCH (s:D {id:'wide0'})-[:R*1..63]->(b:D) "
     for tail in (
         "WHERE b.score+0<0 RETURN b.score LIMIT 1",
@@ -2822,3 +2856,46 @@ def test_completed_streamed_children_memoize_owned_intrinsic_rows(graph_db):
         [str(i), "10000"] for i in (1, 2) for _ in range(2)
     ]
     assert result["stats"]["explored_edges"] == 4
+
+
+def test_distinct_and_join_presence_bound_upstream_path_work(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    base = "MATCH (s:D {id:'start'})-[:R*32..32]->(b:D) "
+    for tail, expected in (
+        ("WITH DISTINCT b.score AS score RETURN score LIMIT 2", [[{"type": "integer", "value": "32"}]]),
+        ("WITH DISTINCT b.score AS score WITH DISTINCT score RETURN score SKIP 1 LIMIT 2", []),
+        ("MATCH (b)-[:R]->(c:D) WHERE c.score+0<0 RETURN c.score LIMIT 1", []),
+        ("WITH b MATCH (b) WHERE b.score+0<0 RETURN b.score LIMIT 1", []),
+        ("CALL { WITH b MATCH (b)-[:R]->(c:D) WHERE c.score+0<0 RETURN c } RETURN c.score LIMIT 1", []),
+        ("OPTIONAL MATCH (b)-[:R]->(c:D) WHERE c.score+0<0 WITH c WHERE c IS NOT NULL RETURN c LIMIT 1", []),
+        ("MATCH (b)-[:R]->(c:D) WHERE c.score=33 RETURN c.score LIMIT 1", [[{"type": "integer", "value": "33"}]]),
+    ):
+        result = db.cypher_json(
+            "g", {"query": base + tail, "limits": {"explored_edges": 1000, "intermediate_states": 20000}}
+        )
+        assert result["rows"] == expected, tail
+
+
+def test_unbounded_simple_cycles_use_finite_identity_bounds(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    layers = 12
+    parts = ["(s:D {id:'cycle-root',score:0})"] + [
+        f"(v{i}_{j}:D {{score:{i + 1}}})" for i in range(layers) for j in range(2)
+    ]
+    parts += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+    parts += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
+    parts += [f"(v{layers - 1}_{j})-[:R]->(s)" for j in range(2)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(parts)})
+    for bound in ("*1..", "*1..48"):
+        query = f"MATCH (s:D {{id:'cycle-root'}})-[:R{bound}]->(b:D) WHERE b.score+0<0 RETURN b.score LIMIT 1"
+        result = db.cypher_json(
+            "g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000, "path_depth": 48}}
+        )
+        assert result["rows"] == []
+    # Repeatable walks have no finite identity bound, and the statement's path
+    # depth failure must remain observable after adaptive admission is attempted.
+    query = "MATCH REPEATABLE ELEMENTS (s:D {id:'cycle-root'})-[:R*1..]->(b:D) WHERE b.score+0<0 RETURN b LIMIT 1"
+    with pytest.raises(af.GraphError, match="CypherPathBudgetExceeded"):
+        db.cypher_json("g", {"query": query, "limits": {"path_depth": 80}})

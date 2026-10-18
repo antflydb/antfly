@@ -1560,8 +1560,18 @@ filtered window builds a lazy suffix reachability memo over node, pattern
 segment and hop states. Admissibility follows pure row-local WITH projections,
 filters and UNWIND stages, including renamed columns and returning CALL scope
 merges. Child producers inherit finite demand from the enclosing continuation;
-they do not need an artificial LIMIT attached to their own RETURN. Consumer
-progress resets the stall counter; a later stall can still activate pruning.
+they do not need an artificial LIMIT attached to their own RETURN.
+Physical page demand follows the same continuation chain. A shortest-path
+frontier may stop at its first winner only when every enclosing stage preserves
+that row; selective, DISTINCT and presence-probe continuations retain the full
+winning-frontier search.
+Proved pure MATCH and returning CALL continuations can also run as presence
+probes in a private query scope. They stop at the first qualifying continuation,
+and a bounded memo keys possible/absent results by captured bindings and the
+current admission generation. Probes never update the parent's rows, weights,
+DISTINCT sets or completed-child cache. Unsupported child barriers stay unknown,
+and semantic errors remain observable only when ordinary DFS reaches them.
+Consumer progress resets the stall counter; a later stall can still activate pruning.
 Activation happens inside the suspended DFS, without restarting or duplicating
 previously emitted rows. OPTIONAL retains its separate MATCH success flag:
 before the first intrinsic match, only the MATCH predicate can prove absence;
@@ -1572,21 +1582,29 @@ one late branch qualifies after an exponentially large rejected branch. The
 reachability graph ignores trail/simple uniqueness as a conservative superset;
 DFS still enforces exact histories and output order. An explicit postorder
 stack avoids recursion proportional to graph depth. Unbounded segments require
-a finite domain-DAG depth proof before quotienting; cyclic unbounded trails keep
-the ordinary producer. Speculative predicate errors mark a suffix unknown
+a finite bound before quotienting. Speculative predicate errors mark a suffix unknown
 rather than exposing errors early. Constant residuals, read authority and
 statement budgets remain mandatory; unproved shapes retain
 the ordinary producer. First successful rows keep lazy traversal.
-Unordered DISTINCT windows use the same demand-triggered proof when their row
-goal remains unfilled. Already retained keys are inadmissible; negative suffix
+Unordered DISTINCT windows and intermediate WITH DISTINCT stages use the same
+demand-triggered proof when their row goal remains unfilled. Each projection
+evaluates before checking its already retained keys; probes only read these sets.
+Already retained keys are inadmissible; negative suffix
 entries remain reusable as keys grow, while positive entries carry a generation
 and are reconsidered after DISTINCT or OPTIONAL match-state changes. The proof
 does not replace DFS ordering or evaluate a projection error before DFS reaches it.
 Repeated product-state work can trigger a bounded DAG depth proof. When a
-single variable segment's lower bound is satisfied and its remaining upper
-bound covers the proved suffix depth, hop states share one reachability entry
-per node. Cycles and unknown adjacency at the read horizon retain exact hop
-states. The depth proof never treats an unloaded boundary as an empty suffix.
+segment's lower bound is satisfied and its remaining upper bound covers the
+proved suffix depth, hop states share one reachability entry per node and
+segment. Multiple segments prove their depths incrementally in postorder from
+complete captured domains, preserving segment boundaries and residuals without
+opening additional readers. Cycles and unknown adjacency at the read horizon
+retain exact hop states; an unloaded boundary never becomes an empty suffix.
+For unbounded simple paths, a fully captured cyclic domain can use distinct
+relationship identities as a finite trail bound, or node identities as a
+node-simple bound. Shared domains count physical index/key identities once.
+Bounds must prove that the statement's path-depth limit cannot truncate a valid
+path; repeatable cyclic walks retain ordinary depth-limited traversal.
 Returning CALL bodies inherit proven row goals through unfiltered projections,
 capped by their own existing limits; child SKIP and aggregate/sort barriers remain
 inside the child scope. An outer
