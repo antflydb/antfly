@@ -16,6 +16,8 @@
 pub const ExecutionControl = struct {
     cancellation: ?@import("antfly_cancellation").CancellationToken = null,
     deadline_ns: ?u64 = null,
+    pattern_programs: ?*@import("query.zig").PatternPrograms = null,
+    pattern_cache: ?*@import("query.zig").PatternMembership = null,
 
     pub fn check(self: @This()) !void {
         if (self.cancellation) |token| try token.check();

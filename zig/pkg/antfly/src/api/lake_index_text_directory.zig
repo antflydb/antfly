@@ -40,7 +40,11 @@ pub const Roots = struct {
 };
 pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
-const SegmentRecord = struct {
+pub const SegmentRecord = struct {
+    sources: []const corpus.source_spans.Span = &.{},
+    source_pages: []const Chunk = &.{},
+    source_count: u32 = 0,
+    members: []const corpus.Member = &.{},
     file: state.File,
     manifest: Chunk,
     physical: ?Chunk = null,
@@ -48,8 +52,20 @@ const SegmentRecord = struct {
     interval: Interval,
     route: corpus.SegmentRouting,
     rows: []const corpus.physical.Block,
-    members: []const corpus.Member = &.{},
 };
+fn parseSegment(a: A, bytes: []const u8, options: std.json.ParseOptions) !SegmentRecord {
+    var record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, options);
+    if (record.members.len != 0) {
+        if (record.sources.len != 0) return error.InvalidNativeLakeTextCorpus;
+        const scope = (try stores.uploadScopeFromArtifactId(record.manifest.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+        record.sources = try corpus.source_spans.fromMembers(a, record.members, scope.domain);
+        // v10 retained a physical wrapper for merged members. Actual physical
+        // lookups resolve the member manifests, independently of that wrapper.
+        record.physical = null;
+        record.members = &.{};
+    }
+    return record;
+}
 pub fn validateRef(ref: Chunk, domain: Id) !void {
     if (ref.byte_len == 0 or ref.byte_len > corpus.max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
@@ -69,18 +85,24 @@ fn put(a: A, store: *stores.ArtifactStore, value: anytype, token: Cancellation) 
     var upload = store.*;
     upload.allocator = a;
     const ref = try upload.putWithCancellation(bytes, token);
+    defer if (ref.provider_version) |version| upload.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 /// Descriptor payloads contain one segment's admission, and physical metadata
 /// contains no admissions. Neither hydration nor binding decodes a whole file.
 pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, token: Cancellation) !void {
+    if (group.sources.len > corpus.source_spans.page_spans and group.source_pages.len == 0) {
+        group.source_pages = try corpus.source_spans.publish(a, store, group.sources, token);
+        group.source_count = @intCast(group.sources.len);
+    }
     const descriptors = try a.alloc(Chunk, group.segments.len);
     for (descriptors, group.segments, group.admissions, group.summaries) |*ref, segment, admission, summary| {
         try token.check();
-        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
+        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = if (group.source_pages.len == 0) group.sources else &.{}, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
     }
     group.descriptors = descriptors;
-    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .members = group.members, .opening_packs = group.opening_packs }, token);
+    if (group.sources.len != 0) return;
+    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
 }
 const Reader = struct {
     store: stores.ArtifactStore,
@@ -120,19 +142,12 @@ const Segments = struct {
     first_block: usize = 0,
     blocks_examined: usize = 0,
     fn init(a: A, group: corpus.FileGroup, manifest: Chunk) !Segments {
-        _ = try corpus.physical.validate(group.rows);
+        if (group.sources.len == 0) _ = try corpus.physical.validate(group.rows);
         return .{ .group = group, .manifest = manifest, .routes = try @import("lake_index_serving_inventory.zig").compactRoutes(a, group) };
-    }
-    fn memberSlice(self: *Segments, lower: u32, upper: u32) ![]const corpus.Member {
-        if (self.group.members.len == 0) return &.{};
-        if (self.group.segments.len != 1 or lower != 0) return error.InvalidNativeLakeTextCorpus;
-        const last = self.group.members[self.group.members.len - 1];
-        if (upper != try std.math.add(u32, last.lower, last.count)) return error.InvalidNativeLakeTextCorpus;
-        return self.group.members;
     }
     fn next(self: *Segments) !?SegmentRecord {
         if (self.ordinal == self.routes.len) {
-            if (self.lower != (if (self.group.members.len != 0) try std.math.add(u32, self.group.members[self.group.members.len - 1].lower, self.group.members[self.group.members.len - 1].count) else try corpus.physical.validate(self.group.rows))) return error.InvalidNativeLakeTextCorpus;
+            if (self.group.sources.len == 0 and self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
             return null;
         }
         const route = self.routes[self.ordinal];
@@ -145,8 +160,7 @@ const Segments = struct {
         }
         var end = self.first_block;
         while (end < self.group.rows.len and self.group.rows[end].base < upper) : (end += 1) self.blocks_examined += 1;
-        const members = try self.memberSlice(self.lower, upper);
-        const result: SegmentRecord = .{ .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end], .members = members };
+        const result: SegmentRecord = .{ .sources = if (self.group.source_pages.len == 0) self.group.sources else &.{}, .source_pages = self.group.source_pages, .source_count = self.group.source_count, .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
         self.lower = upper;
         self.ordinal += 1;
         return result;
@@ -154,30 +168,31 @@ const Segments = struct {
 };
 /// Metadata construction streams one record at a time into bounded sorts and
 /// durable runs. Replacement tails and last-write ordering remain explicit.
-const Mutations = struct {
+pub const Mutations = struct {
     a: A,
     sort: local.sql_spill.Sort,
     forest: @import("lake_index_delta_runs.zig").Forest,
+    reduction: @FieldType(tree.Store, "reduce") = null,
     ordinal: u64 = 0,
-    fn init(a: A, manager: *local.sql_spill.Manager, storage: tree.Store) Mutations {
+    pub fn init(a: A, manager: *local.sql_spill.Manager, storage: tree.Store) Mutations {
         var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
         sort.shared_runs = true;
         sort.encoded_bytes = true;
         return .{ .a = a, .sort = sort, .forest = .{ .a = a, .store = storage, .policy = .latest } };
     }
-    fn deinit(self: *Mutations) void {
+    pub fn deinit(self: *Mutations) void {
         self.sort.deinit();
     }
     fn add(self: *Mutations, id: Id, value: ?[]const u8, previous_length: usize) !void {
         return self.addPrefix(&id, value, previous_length);
     }
-    fn addPrefix(self: *Mutations, prefix: []const u8, value: ?[]const u8, previous_length: usize) !void {
+    pub fn addPrefix(self: *Mutations, prefix: []const u8, value: ?[]const u8, previous_length: usize) !void {
         const length = if (value) |bytes| bytes.len else previous_length;
         if (length == 0 or length > corpus.max_root_bytes) return error.InvalidNativeLakeTextCorpus;
         var offset: usize = 0;
         while (offset < length) : (offset += chunk_bytes) {
-            var buffer: [40]u8 = undefined;
-            if (prefix.len > 36) return error.InvalidNativeLakeTextCorpus;
+            var buffer: [68]u8 = undefined;
+            if (prefix.len > 64) return error.InvalidNativeLakeTextCorpus;
             @memcpy(buffer[0..prefix.len], prefix);
             std.mem.writeInt(u32, buffer[prefix.len..][0..4], @intCast(offset), .big);
             const k = buffer[0 .. prefix.len + 4];
@@ -221,10 +236,11 @@ const Mutations = struct {
         self.sort.shared_runs = true;
         self.sort.encoded_bytes = true;
     }
-    fn finish(self: *Mutations, prior: ?tree.Ref) !?tree.Ref {
+    pub fn finish(self: *Mutations, prior: ?tree.Ref) !?tree.Ref {
         try self.flush();
         const changes = try self.forest.finish() orelse return prior;
-        const storage = self.forest.store;
+        var storage = self.forest.store;
+        if (self.reduction) |reduction| storage.reduce = reduction;
         var delta = try tree.Cursor.init(self.a, storage, changes, "", null);
         defer delta.deinit();
         if (prior != null and changes.records < @max(4096, prior.?.records / 4)) {
@@ -292,6 +308,33 @@ pub fn publish(a: A, store: *stores.ArtifactStore, groups: []const corpus.FileGr
     var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
     return update(a, pages.store(), groups, refs, removed, removed_refs, old, token, io);
 }
+/// Checkpoints need only compact file identities, never segment/routing trees.
+/// Changes are paged and applied to the previous immutable delta inventory.
+pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const FileRecord, removed: []const FileRecord, prior: ?tree.Ref, token: Cancellation, io: std.Io) !?tree.Ref {
+    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    var check = token;
+    const Check = struct {
+        fn call(raw: *anyopaque) !void {
+            try @as(*Cancellation, @ptrCast(@alignCast(raw))).check();
+        }
+    };
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
+    defer manager.deinit();
+    var mutations = Mutations.init(a, &manager, pages.store());
+    defer mutations.deinit();
+    for ([_]bool{ true, false }) |deleting| for (if (deleting) removed else records) |record| {
+        try token.check();
+        const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
+        defer a.free(bytes);
+        // GC admits a compact file record as one authenticated leaf value.
+        if (bytes.len > chunk_bytes) return error.InvalidNativeLakeTextCorpus;
+        try mutations.add(corpus.term_directory.identity(record.file.id), if (deleting) null else bytes, bytes.len);
+    };
+    return mutations.finish(prior);
+}
 fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []const Chunk, removed: []const corpus.FileGroup, removed_refs: []const Chunk, old: Roots, token: Cancellation, io: std.Io) !Roots {
     var check = token;
     const Check = struct {
@@ -332,6 +375,9 @@ const MetadataBuilder = struct {
         _ = self.record_arena.reset(.retain_capacity);
         var ca = self.record_arena.allocator();
         const file = try std.json.Stringify.valueAlloc(ca, FileRecord{ .file = fileState(group.file), .manifest = ref }, .{});
+        // New file records are independently decodable GC units. Segment
+        // descriptors retain their separate chunked encoding for large schemas.
+        if (file.len > chunk_bytes) return error.NativeLakeTextCorpusTooLarge;
         try self.files.add(corpus.term_directory.identity(group.file.id), if (deleting) null else file, file.len);
         var records = try Segments.init(self.group_arena.allocator(), group, ref);
         while (try records.next()) |record| {
@@ -411,13 +457,31 @@ fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
     if (bytes.items.len == 0) return error.InvalidNativeLakeTextCorpus;
     return bytes.toOwnedSlice(a);
 }
-fn appendFile(a: A, result: *std.ArrayList(FileRecord), id: Id, bytes: []const u8, domain: Id) !void {
+fn segmentPlanningBytes(record: SegmentRecord) u64 {
+    var metadata = corpus.source_spans.metadataBytes(record.sources, record.source_pages) +| record.manifest.byte_len;
+    if (record.route.descriptor) |descriptor| metadata +|= descriptor.byte_len;
+    return corpus.source_spans.planningBytes(record.route.bytes, metadata);
+}
+/// Authenticate a selected leaf's size without admitting its inventory.
+pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
+    const bytes = try get(a, storage, root.directories.segments, id);
+    defer a.free(bytes);
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
+    if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+    try validateRouting(record, root.domain);
+    return segmentPlanningBytes(record);
+}
+
+pub fn decodeFileRecord(a: A, id: Id, bytes: []const u8, domain: Id) !FileRecord {
     const file = try std.json.parseFromSliceLeaky(FileRecord, a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(file.file.id))) return error.InvalidNativeLakeTextCorpus;
     try validateRef(file.manifest, domain);
     try state.validate(&.{file.file}, domain);
-    if (result.items.len >= 16384) return error.InvalidNativeLakeTextCorpus;
-    try result.append(a, file);
+    return file;
+}
+fn appendFile(a: A, result: *std.ArrayList(FileRecord), id: Id, bytes: []const u8, domain: Id) !void {
+    if (result.items.len >= corpus.max_segments) return error.InvalidNativeLakeTextCorpus;
+    try result.append(a, try decodeFileRecord(a, id, bytes, domain));
 }
 pub fn fileRecords(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation) ![]const FileRecord {
     var budget: u64 = 128 * 1024 * 1024;
@@ -450,7 +514,10 @@ pub fn fileRecordsBudget(a: A, root: corpus.Root, store: stores.ArtifactStore, c
     return result.items;
 }
 pub fn lookupFile(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, file_id: []const u8) !FileRecord {
-    var read: Reader = .{ .store = store, .cached = cached, .token = token };
+    return lookupFileBudget(a, root, store, cached, token, file_id, null);
+}
+pub fn lookupFileBudget(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, file_id: []const u8, budget: ?*u64) !FileRecord {
+    var read: Reader = .{ .store = store, .cached = cached, .token = token, .external_budget = budget };
     read.init(root.domain);
     try read.check();
     const bytes = try get(a, read.pages.store(), root.directories.files, corpus.term_directory.identity(file_id));
@@ -489,9 +556,15 @@ fn validateRouting(record: SegmentRecord, domain: Id) !void {
     }
 }
 fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
-    if (record.members.len != 0) {
-        if (record.rows.len != 0) return error.InvalidNativeLakeTextCorpus;
-        return corpus.validateMembers(record.members, domain, record.interval.lower, record.interval.count);
+    if (record.source_pages.len != 0) {
+        if (record.source_count == 0 or record.source_count > corpus.source_spans.max_spans or record.source_pages.len > record.source_count or record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        for (record.source_pages) |page| try validateRef(page, domain);
+        if (record.sources.len == 0) return;
+        if (record.sources.len != record.source_count) return error.InvalidNativeLakeTextCorpus;
+    }
+    if (record.sources.len != 0) {
+        if (record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        return corpus.source_spans.validate(record.sources, record.interval.count, domain);
     }
     var covered = record.interval.lower;
     for (record.rows, 0..) |block, i| {
@@ -518,10 +591,11 @@ pub fn loadSelected(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactS
         try read.check();
         const bytes = try get(scratch, read.pages.store(), root.directories.segments, id);
         defer scratch.free(bytes);
-        record.* = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+        record.* = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
         if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
         try validateSegment(record.*, root.domain);
     }
+    try hydrateSources(a, root, store, cached, token, records, &read.reads);
     return assemble(a, root, records, true);
 }
 /// Compact routing is already in immutable file/segment order. Decode pages
@@ -551,13 +625,14 @@ fn loadRouting(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore,
     }
     if (previous) |last| try appendRouting(a, &records, root.domain, last, bytes.items);
     if (root.segment_count != 0 and records.items.len != root.segment_count) return error.InvalidNativeLakeTextCorpus;
+    try hydrateSources(a, root, store, cached, token, records.items, &read.reads);
     return assembleOrdered(a, root, records.items, false);
 }
 fn appendRouting(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, expected: [36]u8, bytes: []const u8) !void {
     if (records.items.len >= corpus.max_segments) return error.InvalidNativeLakeTextCorpus;
-    const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     const file_id = corpus.term_directory.identity(record.file.id);
-    if (!std.mem.eql(u8, expected[0..32], &file_id) or std.mem.readInt(u32, expected[32..36], .big) != record.ordinal or record.rows.len != 0 or record.physical == null) return error.InvalidNativeLakeTextCorpus;
+    if (!std.mem.eql(u8, expected[0..32], &file_id) or std.mem.readInt(u32, expected[32..36], .big) != record.ordinal or record.rows.len != 0 or (record.physical == null and record.sources.len == 0 and record.source_pages.len == 0)) return error.InvalidNativeLakeTextCorpus;
     try validateRouting(record, domain);
     try records.append(a, record);
 }
@@ -599,6 +674,7 @@ pub fn loadAll(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore,
         try bytes.appendSlice(scratch, record.value);
     }
     if (id) |last| try appendSegment(a, &records, root.domain, last, bytes.items);
+    try hydrateSources(a, root, store, cached, token, records.items, &read.reads);
     return assemble(a, root, records.items, false);
 }
 /// Stream the authenticated retained serving closure with one record decoded.
@@ -628,16 +704,22 @@ pub fn walkSegments(a: A, root: corpus.Root, store: stores.ArtifactStore, token:
 fn visitSegment(a: A, domain: Id, id: Id, bytes: []const u8, visitor: anytype) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const record = try std.json.parseFromSliceLeaky(SegmentRecord, arena.allocator(), bytes, .{});
+    const record = try parseSegment(arena.allocator(), bytes, .{});
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateSegment(record, domain);
     try visitor.record(record);
 }
 fn appendSegment(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, id: Id, bytes: []const u8) !void {
-    const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateSegment(record, domain);
     try records.append(a, record);
+}
+fn hydrateSources(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, records: []SegmentRecord, reads: *u64) !void {
+    for (records) |*record| if (record.source_pages.len != 0) {
+        record.sources = try corpus.source_spans.load(a, store, record.source_pages, record.source_count, root.domain, token, cached, reads);
+        try validateSegment(record.*, root.domain);
+    };
 }
 fn assemble(a: A, root: corpus.Root, records: []SegmentRecord, partial: bool) !corpus.Root {
     std.mem.sort(SegmentRecord, records, {}, struct {
@@ -667,7 +749,6 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
         const routing = try a.alloc(corpus.SegmentRouting, selected.len);
         const intervals = try a.alloc(Interval, selected.len);
         var blocks: std.ArrayList(corpus.physical.Block) = .empty;
-        var members: std.ArrayList(corpus.Member) = .empty;
         for (selected, refs, summaries, routing, intervals, 0..) |record, *ref, *summary, *route, *interval, i| {
             if (i != 0 and (selected[i - 1].ordinal >= record.ordinal or @as(u64, intervals[i - 1].lower) + intervals[i - 1].count > record.interval.lower)) return error.InvalidNativeLakeTextCorpus;
             if (!std.mem.eql(u8, &selected[0].file.digest, &record.file.digest) or !std.mem.eql(u8, selected[0].manifest.artifact_id, record.manifest.artifact_id)) return error.InvalidNativeLakeTextCorpus;
@@ -677,13 +758,12 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
             summary.* = record.route.summary;
             route.* = record.route;
             interval.* = record.interval;
-            try members.appendSlice(a, record.members);
             for (record.rows) |block| {
                 if (blocks.items.len != 0 and blocks.items[blocks.items.len - 1].base == block.base) continue;
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .members = members.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);
@@ -750,6 +830,16 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     var windows = try RoutingCursor.create(a, window_root, store, cached, .none);
     defer windows.deinit();
     var window_ids: [2]Id = undefined;
+    const subset = [_]Id{ corpus.term_directory.identity(segments[0].artifact_id), corpus.term_directory.identity(segments[8].artifact_id) };
+    const selected_windows = try SelectedCursor.create(a, window_root, store, cached, .none, &subset);
+    defer selected_windows.deinit();
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, selected_windows.nextBounded(&window_ids, 0));
+    for (subset) |id| {
+        const selected_window = (try selected_windows.nextBounded(&window_ids, max_segment_bytes)).?;
+        try std.testing.expectEqual(@as(usize, 1), selected_window.identities.len);
+        try std.testing.expectEqual(id, selected_window.identities[0]);
+    }
+    try std.testing.expect(try selected_windows.nextBounded(&window_ids, max_segment_bytes) == null);
     var visited: usize = 0;
     while (try windows.next(&window_ids)) |window| {
         try std.testing.expectEqual(@as(u64, visited), window.doc_offset);
@@ -778,6 +868,60 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     defer invalid_cursor.deinit();
     for (0..4) |_| _ = try invalid_cursor.next(&window_ids);
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, invalid_cursor.next(&window_ids));
+    // Best-first batches use the same authenticated byte envelope and carry
+    // an overflowing leaf without opening descriptors or dropping coverage.
+    {
+        var reads: u64 = 8 * 1024 * 1024;
+        var writes: u64 = 8 * 1024 * 1024;
+        var pages: pages_mod.PageStore = .{ .domain = root.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const term = try corpus.statistics.keyAlloc(ca, "body", "common");
+        const prefix = try corpus.term_directory.prefixAlloc(ca, term);
+        var ordered: [9]Id = undefined;
+        for (&ordered, segments) |*id, ref| id.* = corpus.term_directory.identity(ref.artifact_id);
+        std.mem.sort(Id, &ordered, {}, struct {
+            fn less(_: void, l: Id, r: Id) bool {
+                return std.mem.order(u8, &l, &r) == .lt;
+            }
+        }.less);
+        const Source = struct {
+            prefix: []const u8,
+            ids: []const Id,
+            position: usize = 0,
+            key_: [256]u8 = undefined,
+            value: [corpus.statistics.Summary.max_bytes]u8 = undefined,
+            pub fn next(self: *@This()) !?tree.Cursor.Record {
+                if (self.position == self.ids.len) return null;
+                @memcpy(self.key_[0..self.prefix.len], self.prefix);
+                @memcpy(self.key_[self.prefix.len..][0..32], &self.ids[self.position]);
+                self.position += 1;
+                const summary: corpus.statistics.Summary = .{ .frequency = 1, .max_frequency = 1, .min_norm = 1 };
+                return .{ .key = self.key_[0 .. self.prefix.len + 32], .value = summary.encode(&self.value) };
+            }
+        };
+        var source: Source = .{ .prefix = prefix, .ids = &ordered };
+        var reduced = pages.store();
+        reduced.reduce = corpus.term_directory.reduce;
+        var frontier_root = window_root;
+        frontier_root.term_directory = .{ .version = 2, .leaves = try tree.buildSorted(a, reduced, &source) };
+        var frequency: [8]u8 = undefined;
+        std.mem.writeInt(u64, &frequency, 9, .big);
+        frontier_root.term_statistics = try tree.apply(a, pages.store(), null, &.{.{ .key = term, .value = &frequency }});
+        for ([_]u64{ max_segment_bytes, 32 * 1024 * 1024 }) |target| {
+            const frontier = (try @import("lake_index_text_frontier.zig").create(a, frontier_root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
+            defer frontier.deinit();
+            var output: [3]Id = undefined;
+            var seen: usize = 0;
+            while (try frontier.nextWindow(&output, null, target)) |batch| {
+                try std.testing.expectEqual(@min(if (target == max_segment_bytes) @as(usize, 1) else output.len, ordered.len - seen), batch.len);
+                for (batch) |id| {
+                    try std.testing.expectEqual(ordered[seen], id);
+                    seen += 1;
+                }
+            }
+            try std.testing.expectEqual(ordered.len, seen);
+            try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - frontier.reads + (8 * 1024 * 1024 - frontier.prefetch_reads), frontier.charged_bytes);
+        }
+    }
     // Broad admission reads only the compact routing tree. Physical metadata
     // and admissions stay behind authenticated references until consumed.
     var routing_only = root;
@@ -792,7 +936,7 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     defer full_snapshot.release();
     const full_ids = try @import("lake_index_text_predicate.zig").Identities.init(ca, full, full_snapshot);
     try store.delete(group.physical_manifest.?.artifact_id);
-    var missing_rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+    var missing_rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
     defer missing_rows.deinit(a);
     try std.testing.expectError(error.FileNotFound, full_ids.physicalRow(a, &missing_rows, store, cached, 8, "source", "snapshot"));
     // A precise seek needs neither a file catalog nor any maintenance manifest.
@@ -811,7 +955,7 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     const snapshot = writer.acquireSnapshot();
     defer snapshot.release();
     const identities = try @import("lake_index_text_predicate.zig").Identities.init(ca, selected, snapshot);
-    var rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+    var rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
     defer rows.deinit(a);
     for (0..9) |i| {
         const physical: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = group.file.id, .row_group_ordinal = 0, .row_ordinal = 10 + i } };
@@ -932,13 +1076,13 @@ pub const RoutingCursor = struct {
     }
     fn emit(self: *RoutingCursor, key_: [36]u8) !Id {
         _ = self.scratch.reset(.retain_capacity);
-        const record = try std.json.parseFromSliceLeaky(SegmentRecord, self.scratch.allocator(), self.bytes.items, .{ .allocate = .alloc_always });
+        const record = try parseSegment(self.scratch.allocator(), self.bytes.items, .{ .allocate = .alloc_always });
         const file = corpus.term_directory.identity(record.file.id);
         if (!std.mem.eql(u8, key_[0..32], &file) or std.mem.readInt(u32, key_[32..36], .big) != record.ordinal) return error.InvalidNativeLakeTextCorpus;
-        if (record.rows.len != 0 or record.physical == null) return error.InvalidNativeLakeTextCorpus;
+        if (record.rows.len != 0 or (record.physical == null and record.sources.len == 0 and record.source_pages.len == 0)) return error.InvalidNativeLakeTextCorpus;
         try validateRouting(record, self.root.domain);
         const manifest_id = corpus.term_directory.identity(record.manifest.artifact_id);
-        const physical_id = corpus.term_directory.identity(record.physical.?.artifact_id);
+        const physical_id = corpus.term_directory.identity((record.physical orelse record.manifest).artifact_id);
         const same_file = if (self.last_file) |last| std.mem.eql(u8, &file, &last) else false;
         if (record.ordinal != (if (same_file) std.math.add(u32, self.last_ordinal, 1) catch return error.InvalidNativeLakeTextCorpus else @as(u32, 0)) or
             record.interval.lower != (if (same_file) self.last_upper else @as(u32, 0))) return error.InvalidNativeLakeTextCorpus;
@@ -950,7 +1094,7 @@ pub const RoutingCursor = struct {
         self.last_physical = physical_id;
         self.last_ordinal = record.ordinal;
         self.last_upper = try std.math.add(u32, record.interval.lower, record.interval.count);
-        self.last_segment_bytes = record.route.bytes;
+        self.last_segment_bytes = segmentPlanningBytes(record);
         self.last_segment_docs = record.route.doc_count;
         self.emitted = std.math.add(u32, self.emitted, 1) catch return error.InvalidNativeLakeTextCorpus;
         self.documents = std.math.add(u64, self.documents, record.route.doc_count) catch return error.InvalidNativeLakeTextCorpus;
@@ -1010,5 +1154,60 @@ pub const RoutingCursor = struct {
         if (self.emitted != self.root.segment_count or self.documents != self.root.collection.?.documents) return error.InvalidNativeLakeTextCorpus;
         self.done = true;
         return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = offset };
+    }
+};
+
+/// Logical position stays independent of admission/traversal order. This compact
+/// pair has the same order as a full immutable routing walk, without summing all
+/// earlier files' documents or admitting their inventories.
+pub const Position = struct { file: Id, rank: u32, recent: bool = false };
+
+/// A proved subset can span many windows. Never widen it to the full archive
+/// or admit every selected segment simply because it is a small percentage.
+pub const SelectedCursor = struct {
+    a: A,
+    budget: local.sql_memory_budget,
+    scratch: std.heap.ArenaAllocator = undefined,
+    reader: Reader,
+    root: corpus.Root,
+    identities: []const Id,
+    position: usize = 0,
+    pending_bytes: ?u64 = null,
+    pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, identities: []const Id) !*SelectedCursor {
+        const self = try a.create(SelectedCursor);
+        self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .reader = .{ .store = store, .cached = cached, .token = token }, .root = root, .identities = identities };
+        self.scratch = .init(self.budget.allocator());
+        self.reader.init(root.domain);
+        return self;
+    }
+    pub fn deinit(self: *SelectedCursor) void {
+        const a = self.a;
+        self.scratch.deinit();
+        a.destroy(self);
+    }
+    pub fn nextBounded(self: *SelectedCursor, output: []Id, max_bytes: u64) !?RoutingCursor.Window {
+        if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
+        try self.reader.check();
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        while (count < output.len and self.position < self.identities.len) {
+            try self.reader.check();
+            const id = self.identities[self.position];
+            const size = self.pending_bytes orelse blk: {
+                _ = self.scratch.reset(.retain_capacity);
+                break :blk try segmentBytes(self.scratch.allocator(), self.reader.pages.store(), self.root, id);
+            };
+            if (count != 0 and size > max_bytes -| bytes) {
+                self.pending_bytes = size;
+                break;
+            }
+            self.pending_bytes = null;
+            output[count] = id;
+            count += 1;
+            self.position += 1;
+            bytes +|= size;
+            if (bytes >= max_bytes) break;
+        }
+        return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = 0 };
     }
 };

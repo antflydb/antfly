@@ -346,7 +346,7 @@ fn appendBatchGroupBy(
     options: AlgebraicGroupBySidecarBuildOptions,
 ) !void {
     const group_column = batch.findColumn(options.group_column) orelse return error.RowSourceColumnNotFound;
-    if (group_column.kind() != .bytes and group_column.kind() != .dictionary_bytes) return error.UnsupportedAlgebraicGroupColumnKind;
+    if (group_column.kind().logical() != .bytes) return error.UnsupportedAlgebraicGroupColumnKind;
     const value_column = if (options.op == .count) null else batch.findColumn(options.value_column) orelse return error.RowSourceColumnNotFound;
     if (value_column) |column| {
         if (column.kind() != .i64 and column.kind() != .dictionary_i64) return error.UnsupportedAlgebraicValueColumnKind;
@@ -354,7 +354,8 @@ fn appendBatchGroupBy(
 
     for (0..batch.rowCount()) |row_idx| {
         if (group_column.nulls.isNull(row_idx)) continue;
-        const key = try group_column.bytesAt(row_idx);
+        var key_scratch: [rowsource.Decimal128.max_text_bytes]u8 = undefined;
+        const key = try group_column.bytesAtScratch(row_idx, &key_scratch);
         if (key.len == 0) continue;
         const next_value = (try rowAggregateValue(options.op, value_column, row_idx)) orelse continue;
         const owned_key = try alloc.dupe(u8, key);

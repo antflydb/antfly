@@ -713,6 +713,8 @@ fn Engine(comptime Context: type) type {
         visited: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
+        planning_budget: @import("memory_budget.zig") = undefined,
+        planning_arena: ?std.heap.ArenaAllocator = null,
         static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
         static_hashes: std.AutoHashMapUnmanaged(*const binding.Node, *operators.HashJoin) = .empty,
         static_memberships: std.AutoHashMapUnmanaged(*const binding.Node, *operators.TupleMembership) = .empty,
@@ -740,6 +742,10 @@ fn Engine(comptime Context: type) type {
             var rows = self.static_rows.valueIterator();
             while (rows.next()) |replay| replay.*.deinit();
             self.cache_arena.deinit();
+            if (self.planning_arena) |*arena| {
+                arena.deinit();
+                std.debug.assert(self.planning_budget.live == 0);
+            }
         }
 
         fn clearOuter(self: *Self, id: usize) void {
@@ -831,7 +837,7 @@ fn Engine(comptime Context: type) type {
 
         fn estimate(self: *Self, node: *const binding.Node) ?u64 {
             return switch (node.operation) {
-                .scan => |scan| self.cursors[scan.index].estimated_rows,
+                .scan => |scan| self.cursors[scan.index].estimated_filtered_rows orelse self.cursors[scan.index].estimated_rows orelse if (self.cursors[scan.index].estimated_bytes) |bytes| bytes / @max(@as(u64, 16), @as(u64, @intCast(node.columns.len)) * 8) else null,
                 .singleton => 1,
                 .literal_rows => |rows| rows.len,
                 .values => |arms| total: {
@@ -841,7 +847,7 @@ fn Engine(comptime Context: type) type {
                 },
                 .prepared_rows => if (self.context.returning_cursor) |cursor| cursor.count() else self.context.returning_rows.len,
                 .query => |query| blk: {
-                    const source = self.estimate(query.source);
+                    const source = if (self.estimate(query.source)) |rows| (if (query.binding.scalars.predicate) |predicate| binding.JoinPlanning.filteredRows(rows, predicate) else rows) else null;
                     if (query.statement.limit) |limit| {
                         const count = query.statement.capRows(self.context.count(limit, std.math.maxInt(usize)) catch break :blk source);
                         break :blk if (source) |rows| @min(rows, count) else count;
@@ -849,12 +855,73 @@ fn Engine(comptime Context: type) type {
                     break :blk source;
                 },
                 .materialized_ref => |source| self.estimate(source),
+                .join => |join| join.estimated_rows,
                 else => null,
             };
         }
-        fn preferLeftBuild(self: *Self, left: *const binding.Node, right: *const binding.Node) bool {
+        fn columnStatistics(self: *Self, node: *const binding.Node, position: usize) ?catalog.ColumnStatistics {
+            const lineage = binding.scanColumn(node, position) orelse return null;
+            for (self.cursors[lineage.scan_index].column_statistics) |statistics| if (std.mem.eql(u8, statistics.name, lineage.name)) return statistics;
+            if (std.mem.eql(u8, lineage.name, "_id")) return .{ .name = lineage.name, .unique = true };
+            return null;
+        }
+        fn estimateBytes(self: *Self, node: *const binding.Node) ?u64 {
+            const row_count = self.estimate(node) orelse return null;
+            var width: u64 = 0;
+            for (node.columns, 0..) |column, i| {
+                const statistics = self.columnStatistics(node, i);
+                width +|= if (statistics != null and statistics.?.average_bytes != null) statistics.?.average_bytes.? else switch (column.type) {
+                    .boolean => @as(u64, 1),
+                    .integer, .datetime => 8,
+                    .number => if (column.element_type == .numeric) @as(u64, 16) else 8,
+                    .string => 32,
+                    else => 64,
+                };
+            }
+            return row_count *| @max(8, width);
+        }
+        fn probeColumns(_: *Self, node: *const binding.Node, programs: []const scalar.Program, columns: []@import("dynamic_filter.zig").Column) ?usize {
+            if (programs.len == 0 or columns.len != programs.len) return null;
+            var scan_index: ?usize = null;
+            for (programs, columns) |program, *column| {
+                if (program.instructions.len != 1 or program.root != 0 or program.instructions[0].operation != .column) return null;
+                const instruction = program.instructions[0];
+                const lineage = binding.scanColumn(node, instruction.operation.column) orelse return null;
+                if (scan_index != null and scan_index.? != lineage.scan_index) return null;
+                scan_index = lineage.scan_index;
+                const kind = instruction.type.kind orelse return null;
+                switch (kind) {
+                    .integer, .number, .string, .boolean => {},
+                    else => return null,
+                }
+                column.* = .{ .name = lineage.name, .type = kind, .element_type = instruction.type.element_type };
+            }
+            return scan_index;
+        }
+        fn exactProbe(self: *Self, node: *const binding.Node, keys_: []const scalar.Program) !bool {
+            if (keys_.len > 64) return false;
+            var columns: [64]@import("dynamic_filter.zig").Column = undefined;
+            const index = self.probeColumns(node, keys_, columns[0..keys_.len]) orelse return false;
+            const cursor = self.cursors[index];
+            const wants = cursor.wants_exact_filter orelse return false;
+            if (cursor.set_dynamic_filter == null) return false;
+            return wants(cursor.ptr, columns[0..keys_.len]);
+        }
+        fn preferLeftBuild(self: *Self, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) !bool {
+            const left = join.left;
+            const right = join.right;
+            // A native exact probe avoids opening source pages altogether.
+            // Preserve that access path before comparing scan/build sizes;
+            // scan-only estimates do not price index seeks or covering payloads.
+            const left_probe = join.kind != .left and join.kind != .full and try self.exactProbe(left, join.left_keys);
+            const right_probe = join.kind != .right and join.kind != .full and try self.exactProbe(right, join.right_keys);
+            if (left_probe != right_probe) return right_probe;
             if (self.estimate(left)) |l| {
-                if (self.estimate(right)) |r| return l < r;
+                if (self.estimate(right)) |r| {
+                    const left_bytes = (self.estimateBytes(left) orelse l *| @as(u64, @intCast(@max(16, left.columns.len * 16)))) +| l *| 32;
+                    const right_bytes = (self.estimateBytes(right) orelse r *| @as(u64, @intCast(@max(16, right.columns.len * 16)))) +| r *| 32;
+                    return left_bytes < right_bytes;
+                }
                 // A compiler-owned singleton/constant frame is a bounded
                 // build even when a physical source has no row estimate.
                 // Building the unknown side would eagerly consume the entire
@@ -876,6 +943,7 @@ fn Engine(comptime Context: type) type {
             node: *const binding.Node,
             arena: std.heap.ArenaAllocator,
             scratch: std.heap.ArenaAllocator,
+            projection_arena: std.heap.ArenaAllocator,
             left: ?*Iterator = null,
             right: ?*Iterator = null,
             page: ?catalog.Page = null,
@@ -899,6 +967,7 @@ fn Engine(comptime Context: type) type {
             probe_input_error: ?anyerror = null,
             probe_source_exhausted: bool = false,
             scan_filter: ?*@import("dynamic_filter.zig").Filter = null,
+            scan_filter_cursor: ?usize = null,
             left_values: ?[]const Datum = null,
             left_matched: bool = false,
             unmatched_index: usize = 0,
@@ -945,7 +1014,7 @@ fn Engine(comptime Context: type) type {
             fn createContext(engine: *Self, node: *const binding.Node, recursive_id: ?usize, apply_mode: bool) anyerror!*Iterator {
                 const alloc = engine.context.alloc;
                 const self = try alloc.create(Iterator);
-                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
+                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .projection_arena = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
                 errdefer self.deinit();
                 if (recursive_id) |id| if (!dependsOn(node, id)) {
                     self.cached_reader = try (try engine.staticRows(node)).openReader();
@@ -960,7 +1029,7 @@ fn Engine(comptime Context: type) type {
                     .join => |join| {
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
-                        self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else engine.preferLeftBuild(join.left, join.right);
+                        self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else try engine.preferLeftBuild(join);
                         self.left = try createContext(engine, if (self.flipped_join) join.right else join.left, recursive_id, apply_mode);
                         self.right = try createContext(engine, if (self.flipped_join) join.left else join.right, recursive_id, apply_mode);
                     },
@@ -997,6 +1066,7 @@ fn Engine(comptime Context: type) type {
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
+                self.projection_arena.deinit();
                 self.engine.context.alloc.destroy(self);
             }
             pub fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
@@ -1052,13 +1122,14 @@ fn Engine(comptime Context: type) type {
                 if (self.partition_join) |owner| if (owner.evaluation != null) {
                     const source = try a.create(@import("execution_batch.zig").Batch);
                     source.* = try owner.nextBatch(a, maximum, failure);
-                    if (!self.flipped_join or source.len() == 0) return source.*;
+                    if ((!self.flipped_join and self.node.operation.join.output_order == null) or source.len() == 0) return source.*;
                     const ordinals = try a.alloc(usize, self.node.columns.len);
                     const types = try a.alloc(scalar.Type, self.node.columns.len);
                     const selection = try a.alloc(usize, source.len());
                     const width = self.node.operation.join.left.columns.len;
                     for (ordinals, types, self.node.columns, 0..) |*ordinal, *type_, column, index| {
-                        ordinal.* = if (index < width) self.node.operation.join.right.columns.len + index else index - width;
+                        const original = if (self.node.operation.join.output_order) |order| order[index] else index;
+                        ordinal.* = if (!self.flipped_join) original else if (original < width) self.node.operation.join.right.columns.len + original else original - width;
                         type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
                     }
                     for (selection, 0..) |*index, i| index.* = i;
@@ -1257,7 +1328,7 @@ fn Engine(comptime Context: type) type {
                             if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                             const values = try alloc.alloc(Datum, self.node.columns.len);
                             for (scan.source_columns, self.node.columns, values) |name, column, *out| {
-                                const cell = try page.cell(alloc, index, name);
+                                const cell = try page.typedCell(alloc, index, name, column.element_type == .numeric);
                                 // Values borrow the current page until the next pull.
                                 // Retaining operators own typed copies at admission.
                                 out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
@@ -1411,8 +1482,7 @@ fn Engine(comptime Context: type) type {
 
             fn batchProgram(self: *Iterator, a: Allocator, context: @TypeOf(self.engine.context), program: *const scalar.Program, batch: @import("execution_batch.zig").Batch, errors: []?anyerror) ![]const Datum {
                 const vector = @import("vector_eval.zig").evaluateBatch(a, program, batch, context.parameters) catch |err| switch (err) {
-                    error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.InvalidSqlDateTime, error.SqlCardinalityViolation => null,
-                    else => return err,
+                    else => if (@import("errors.zig").isRowEvaluationError(err)) null else return err,
                 };
                 if (vector) |values| return values;
                 const values = try a.alloc(Datum, batch.len());
@@ -1424,6 +1494,93 @@ fn Engine(comptime Context: type) type {
                     };
                 }
                 return values;
+            }
+            // Keep primitive projections encoded across CTE/subquery boundaries.
+            // Errors decline to the scalar prefix path below so LIMIT and lazy
+            // per-row failures keep their existing delivery contract.
+            fn queryEncodedColumns(self: *Iterator, a: Allocator, context: @TypeOf(self.engine.context), query: anytype, bound: *const @import("execution_batch.zig").Batch, input: *const @import("execution_batch.zig").Batch, selected: []const usize) !?@import("execution_batch.zig").Batch {
+                const Batch = @import("execution_batch.zig").Batch;
+                // JSON forwarding requires the same bound identity proof as
+                // the hybrid path. Expressions/casts retain scalar evaluation.
+                for (context.binding.columns, self.query_plan.?.outputs.ordinals) |definition, ordinal| {
+                    if (definition.type == .json and ordinal == std.math.maxInt(usize)) return null;
+                }
+                const columns = try a.alloc(Batch, self.query_fields.?.len);
+                const names = try a.alloc([]const u8, context.binding.scalars.columns.len);
+                for (names, context.binding.scalars.columns) |*name, definition| name.* = definition.name;
+                const identity = try a.alloc(usize, selected.len);
+                for (identity, 0..) |*index, i| index.* = i;
+                const stable_bound = try a.create(Batch);
+                stable_bound.* = bound.*;
+                const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = stable_bound, .names = names }, .selection = identity };
+                var programs: std.ArrayList(*const scalar.Program) = .empty;
+                var slots: std.ArrayList(usize) = .empty;
+                const null_indices = try a.alloc(u32, selected.len);
+                @memset(null_indices, 0);
+                const null_column: Batch = .{ .dictionary = .{ .values = &.{Datum{}}, .indices = null_indices } };
+                for (self.query_fields.?, 0..) |field, column| {
+                    if (query.output_needed != null and !query.output_needed.?[column]) {
+                        columns[column] = null_column;
+                        continue;
+                    }
+                    const forwarded = self.query_plan.?.outputs.ordinals[column];
+                    if (forwarded != std.math.maxInt(usize)) {
+                        const source = try a.create(Batch);
+                        source.* = try input.select(a, selected);
+                        columns[column] = try source.project(a, forwarded);
+                        continue;
+                    }
+                    if (column < context.binding.scalars.projections.len and context.binding.scalars.projections[column] != null) {
+                        const program = &context.binding.scalars.projections[column].?;
+                        // Kernel dispatch owns capability checks, including exact
+                        // decimals. Unsupported and lazy programs decline intact.
+                        try programs.append(a, program);
+                        try slots.append(a, column);
+                    } else {
+                        const ordinal = for (query.source.columns, 0..) |source, index| {
+                            if (std.mem.eql(u8, source.internal, field)) break index;
+                        } else return error.InvalidSqlBackendResponse;
+                        const source = try a.create(Batch);
+                        source.* = try input.select(a, selected);
+                        columns[column] = try source.project(a, ordinal);
+                    }
+                }
+                const outputs = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, programs.items, page, context.binding.scalars.columns, context.parameters, context.backend.execution_io);
+                for (outputs, slots.items) |output, slot| {
+                    if (output) |encoded| columns[slot] = encoded else {
+                        const errors = try a.alloc(?anyerror, selected.len);
+                        @memset(errors, null);
+                        const values = try self.batchProgram(a, context, &context.binding.scalars.projections[slot].?, bound.*, errors);
+                        for (errors) |cause| if (cause) |err| return err;
+                        const vectors = try a.alloc([]const Datum, 1);
+                        vectors[0] = values;
+                        columns[slot] = .{ .vectors = .{ .values = vectors, .count = selected.len } };
+                    }
+                }
+                for (columns, context.binding.columns, 0..) |*column, definition, index| {
+                    if (query.output_needed != null and !query.output_needed.?[index]) continue;
+                    const source = try a.create(Batch);
+                    source.* = column.*;
+                    const types = try a.alloc(scalar.Type, 1);
+                    types[0] = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
+                    column.* = .{ .mapped = .{ .source = source, .ordinals = &.{0}, .types = types, .selection = identity } };
+                    if (definition.type == .json) continue;
+                    if (try column.physicalColumn(a, 0) == null and try column.decimalColumnSelected(a, 0, null) == null) {
+                        if (try column.dictionaryColumn(a, 0)) |dictionary| {
+                            column.* = dictionary;
+                        } else {
+                            // Normalize exact scalar outputs before publication
+                            // so errors still use the scalar prefix path. Reuse
+                            // evaluated vectors instead of repeating expressions.
+                            const values = if (source.* == .vectors) @constCast(source.vectors.values[0]) else try a.alloc(Datum, selected.len);
+                            for (values, 0..) |*value, row| value.* = try column.cell(a, row, 0);
+                            const vectors = try a.alloc([]const Datum, 1);
+                            vectors[0] = values;
+                            column.* = .{ .vectors = .{ .values = vectors, .count = values.len } };
+                        }
+                    }
+                }
+                return try Batch.combine(a, columns, selected.len);
             }
             /// Names/types are immutable for this iterator. Bind once in
             /// linear time, including simple column expressions and aliases.
@@ -1520,6 +1677,7 @@ fn Engine(comptime Context: type) type {
                 }
                 if (self.query_plan == null) self.query_plan = try self.planQuery(query);
                 while (self.query_remaining != 0) {
+                    _ = self.projection_arena.reset(.free_all);
                     _ = self.scratch.reset(.free_all);
                     const a = self.scratch.allocator();
                     const input = try a.create(Batch);
@@ -1579,10 +1737,28 @@ fn Engine(comptime Context: type) type {
                         self.query_remaining -= selected.items.len;
                         return .{ .mapped = .{ .source = input, .ordinals = plan.ordinals, .types = plan.types, .selection = selected.items } };
                     }
+                    const encoded = self.queryEncodedColumns(self.projection_arena.allocator(), context, query, &bound, input, selected.items) catch |err| switch (err) {
+                        else => if (@import("errors.zig").isRowEvaluationError(err)) null else return err,
+                    };
+                    if (encoded) |output| {
+                        if (selected.items.len == self.query_remaining) upstream_error = null;
+                        if (upstream_error) |err| {
+                            if (failure) |out| out.* = err else return err;
+                        }
+                        self.query_remaining -= selected.items.len;
+                        return output;
+                    }
+                    _ = self.projection_arena.reset(.free_all);
                     const output_errors = try a.alloc(?anyerror, selected.items.len);
                     @memset(output_errors, null);
                     const columns = try a.alloc([]const Datum, self.query_fields.?.len);
                     for (self.query_fields.?, context.binding.columns, columns, 0..) |field, definition, *values, column| {
+                        if (query.output_needed != null and !query.output_needed.?[column]) {
+                            const nulls = try a.alloc(Datum, selected.items.len);
+                            @memset(nulls, .{});
+                            values.* = nulls;
+                            continue;
+                        }
                         if (self.query_plan.?.outputs.ordinals[column] != std.math.maxInt(usize)) {
                             values.* = &.{};
                             continue;
@@ -1687,7 +1863,7 @@ fn Engine(comptime Context: type) type {
                         try selected_rows.append(scratch, row);
                         try selected_cells.append(scratch, row_cells);
                     }
-                    self.query_buffer = try context.projectValuesBatch(scratch, selected_rows.items, self.query_fields.?, selected_cells.items);
+                    self.query_buffer = try context.projectValuesBatchDemand(scratch, selected_rows.items, self.query_fields.?, selected_cells.items, query.output_needed);
                 }
                 const values = self.query_buffer[self.query_buffer_index];
                 const owned = try alloc.alloc(Datum, values.len);
@@ -1930,6 +2106,11 @@ fn Engine(comptime Context: type) type {
                 @memset(values, .{});
                 if (if (self.flipped_join) right else left) |cells| @memcpy(values[0..width], cells);
                 if (if (self.flipped_join) left else right) |cells| @memcpy(values[width..], cells);
+                if (self.node.operation.join.output_order) |order| {
+                    const logical = try alloc.alloc(Datum, values.len);
+                    for (logical, order) |*value, ordinal| value.* = values[ordinal];
+                    return logical;
+                }
                 return values;
             }
             fn nextPartitionJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
@@ -1978,23 +2159,12 @@ fn Engine(comptime Context: type) type {
                 return distinct.count() * 4 <= batch.len() * 3;
             }
             pub fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
-                const probe = self.left.?;
-                if (probe.node.operation != .scan or programs.len == 0) return;
-                const scan = probe.node.operation.scan;
-                const cursor = self.engine.cursors[scan.index];
-                if (cursor.set_dynamic_filter == null) return;
                 const columns = try self.engine.context.alloc.alloc(@import("dynamic_filter.zig").Column, programs.len);
                 defer self.engine.context.alloc.free(columns);
-                for (programs, columns) |program, *column| {
-                    if (program.instructions.len != 1 or program.instructions[program.root].operation != .column) return;
-                    const instruction = program.instructions[program.root];
-                    const kind = instruction.type.kind orelse return;
-                    switch (kind) {
-                        .integer, .number, .string, .boolean => {},
-                        else => return,
-                    }
-                    column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind, .element_type = instruction.type.element_type };
-                }
+                const index = self.engine.probeColumns(self.left.?.node, programs, columns) orelse return;
+                const cursor = self.engine.cursors[index];
+                if (cursor.set_dynamic_filter == null) return;
+                self.scan_filter_cursor = index;
                 const exact = if (cursor.wants_exact_filter) |wants| try wants(cursor.ptr, columns) else false;
                 self.scan_filter = try @import("dynamic_filter.zig").Filter.createWithSpill(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32, if (exact) self.engine.context.spill else null);
             }
@@ -2056,13 +2226,15 @@ fn Engine(comptime Context: type) type {
                 left_width: usize,
                 width: usize,
                 flipped: bool,
+                output_order: ?[]const usize = null,
                 probe_complete: bool = true,
                 build_complete: bool = true,
                 const Location = struct { build: bool, index: ?usize, column: usize };
                 fn locate(self: @This(), row: usize, column: usize) !Location {
                     if (row >= self.rows.len or column >= self.width) return error.InvalidSqlBackendResponse;
-                    const build = (column < self.left_width) == self.flipped;
-                    return .{ .build = build, .index = if (build) self.rows[row].build else self.rows[row].probe, .column = if (column < self.left_width) column else column - self.left_width };
+                    const original = if (self.output_order) |order| order[column] else column;
+                    const build = (original < self.left_width) == self.flipped;
+                    return .{ .build = build, .index = if (build) self.rows[row].build else self.rows[row].probe, .column = if (original < self.left_width) original else original - self.left_width };
                 }
                 fn cell(raw: *anyopaque, a: Allocator, row: usize, column: usize) anyerror!Datum {
                     const self: *@This() = @ptrCast(@alignCast(raw));
@@ -2101,8 +2273,35 @@ fn Engine(comptime Context: type) type {
                     }
                     return total;
                 }
+                fn physical(raw: *anyopaque, a: Allocator, column: usize, selected: ?[]const usize) anyerror!?@import("execution_batch.zig").PhysicalColumn {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const count = if (selected) |indices| indices.len else self.rows.len;
+                    if (count == 0) return null;
+                    const source = try self.locate(if (selected) |indices| indices[0] else 0, column);
+                    const positions = try a.alloc(usize, count);
+                    for (positions, 0..) |*position, lane| {
+                        const location = try self.locate(if (selected) |indices| indices[lane] else lane, column);
+                        position.* = location.index orelse return null;
+                    }
+                    if (!source.build) return self.probe.physicalColumnSelected(a, source.column, positions);
+                    const retained_batch: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = self.build, .begin = 0, .count = self.build.len } };
+                    return retained_batch.physicalColumnSelected(a, source.column, positions);
+                }
+                fn decimal(raw: *anyopaque, a: Allocator, column: usize, selected: ?[]const usize) anyerror!?@import("execution_batch.zig").DecimalColumn {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const count = if (selected) |indices| indices.len else self.rows.len;
+                    if (count == 0) return null;
+                    const source = try self.locate(if (selected) |indices| indices[0] else 0, column);
+                    const positions = try a.alloc(usize, count);
+                    for (positions, 0..) |*position, lane| {
+                        const location = try self.locate(if (selected) |indices| indices[lane] else lane, column);
+                        position.* = location.index orelse return null;
+                    }
+                    const build: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = self.build, .begin = 0, .count = self.build.len } };
+                    return (if (source.build) build else self.probe).decimalColumnSelected(a, source.column, positions);
+                }
                 fn batch(self: *@This()) @import("execution_batch.zig").Batch {
-                    return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_identity = identity, .count = self.rows.len, .width = self.width } };
+                    return .{ .reader = .{ .ptr = self, .read = cell, .read_json = json, .read_frozen = frozen, .read_identity = identity, .read_decimal_selected = decimal, .read_physical_selected = physical, .count = self.rows.len, .width = self.width } };
                 }
             };
             fn nextJoinRow(self: *Iterator, join: JoinPlan, may_advance: bool) anyerror!?JoinRow {
@@ -2117,19 +2316,16 @@ fn Engine(comptime Context: type) type {
                         while (try probe.next()) |match| {
                             try self.engine.checkpoint();
                             const pair: JoinRow = .{ .probe = self.probe_index - 1, .build = match.index };
-                            if (join.condition) |program| {
-                                _ = self.scratch.reset(.retain_capacity);
-                                var candidate: JoinBatch = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = &.{pair}, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join };
-                                const values = try self.scalar_row.fill(self.engine.context.alloc, self.scratch.allocator(), &program, candidate.batch(), 0);
-                                const accepted = try self.engine.context.evaluate(self.scratch.allocator(), program, values);
-                                if (accepted.sql_null) continue;
-                                if (accepted.value != .bool) return error.SqlTypeMismatch;
-                                if (!accepted.value.bool) continue;
+                            if (join.condition == null) {
+                                self.left_matched = true;
+                                try self.hash_join.?.markMatched(match.index);
                             }
-                            self.left_matched = true;
-                            try self.hash_join.?.markMatched(match.index);
                             return pair;
                         }
+                        // Residual admission must run before deciding whether
+                        // this probe needs an outer NULL row. Keep the probe
+                        // cohort pinned until its staged candidates are checked.
+                        if (join.condition != null and !may_advance) return null;
                         self.probe = null;
                         if (!self.left_matched and (kind == .left or kind == .full))
                             return .{ .probe = self.probe_index - 1, .build = null };
@@ -2155,36 +2351,73 @@ fn Engine(comptime Context: type) type {
                 }
             }
             fn nextHashJoinBatch(self: *Iterator, a: Allocator, maximum: usize, join: JoinPlan, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
-                var rows: std.ArrayList(JoinRow) = .empty;
-                var bytes: usize = 0;
-                while (rows.items.len < maximum) {
-                    const pair = (self.nextJoinRow(join, rows.items.len == 0) catch |err| blk: {
-                        if (failure) |out| {
-                            out.* = err;
+                while (true) {
+                    _ = self.projection_arena.reset(.retain_capacity);
+                    const work = self.projection_arena.allocator();
+                    var rows: std.ArrayList(JoinRow) = .empty;
+                    var upstream_error: ?anyerror = null;
+                    while (rows.items.len < maximum) {
+                        const pair = (self.nextJoinRow(join, rows.items.len == 0) catch |err| blk: {
+                            upstream_error = err;
                             break :blk null;
+                        }) orelse break;
+                        try rows.append(work, pair);
+                        // Only pair descriptors are retained. Borrowed payloads
+                        // remain charged to the pinned probe/build owners.
+                        if (rows.items.len * @sizeOf(JoinRow) >= self.engine.context.limits.retained_bytes / 32) break;
+                    }
+                    const staged = rows.items.len;
+                    var candidate: JoinBatch = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = rows.items, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join, .output_order = join.output_order };
+                    for (candidate.rows) |pair| {
+                        if (pair.probe == null) candidate.probe_complete = false;
+                        if (pair.build == null) candidate.build_complete = false;
+                    }
+                    if (join.condition) |*program| if (staged != 0) {
+                        var inner: std.ArrayList(usize) = .empty;
+                        for (candidate.rows, 0..) |pair, row| if (pair.probe != null and pair.build != null) try inner.append(work, row);
+                        const errors = try work.alloc(?anyerror, inner.items.len);
+                        @memset(errors, null);
+                        const input = try candidate.batch().select(work, inner.items);
+                        const accepted = if (inner.items.len != 0) try self.batchProgram(work, self.engine.context, program, input, errors) else &.{};
+                        var lane: usize = 0;
+                        var count: usize = 0;
+                        for (rows.items) |pair| {
+                            // Null-extended rows never evaluate ON expressions.
+                            if (pair.probe != null and pair.build != null) {
+                                const cause = errors[lane];
+                                const value = accepted[lane];
+                                lane += 1;
+                                if (cause) |err| {
+                                    upstream_error = err;
+                                    break;
+                                }
+                                if (value.sql_null) continue;
+                                if (value.value != .bool) {
+                                    upstream_error = error.SqlTypeMismatch;
+                                    break;
+                                }
+                                if (!value.value.bool) continue;
+                                self.left_matched = true;
+                                try self.hash_join.?.markMatched(pair.build.?);
+                            }
+                            rows.items[count] = pair;
+                            count += 1;
                         }
-                        return err;
-                    }) orelse break;
-                    _ = self.scratch.reset(.retain_capacity);
-                    const candidate: JoinBatch = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = &.{pair}, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join };
-                    const cost = candidate.bytes(self.scratch.allocator(), 0) catch |err| {
-                        if (failure) |out| {
-                            out.* = err;
-                            break;
-                        }
-                        return err;
+                        rows.items.len = count;
                     };
-                    try rows.append(a, pair);
-                    bytes +|= cost;
-                    if (bytes >= self.engine.context.limits.retained_bytes / 32) break;
+                    if (upstream_error) |err| {
+                        if (failure) |out| out.* = err else return err;
+                    }
+                    if (rows.items.len == 0 and staged != 0 and upstream_error == null) continue;
+                    const view = try a.create(JoinBatch);
+                    view.* = candidate;
+                    view.rows = try a.dupe(JoinRow, rows.items);
+                    for (view.rows) |row| {
+                        if (row.probe == null) view.probe_complete = false;
+                        if (row.build == null) view.build_complete = false;
+                    }
+                    return view.batch();
                 }
-                const view = try a.create(JoinBatch);
-                view.* = .{ .probe = self.probe_payload, .build = &self.hash_join.?.value_columns, .rows = rows.items, .left_width = join.left.columns.len, .width = self.node.columns.len, .flipped = self.flipped_join };
-                for (rows.items) |row| {
-                    if (row.probe == null) view.probe_complete = false;
-                    if (row.build == null) view.build_complete = false;
-                }
-                return view.batch();
             }
             const JoinPlan = @FieldType(@FieldType(binding.Node, "operation"), "join");
             fn prepareJoin(self: *Iterator, join: JoinPlan) anyerror!void {
@@ -2242,8 +2475,7 @@ fn Engine(comptime Context: type) type {
                     }
                     if (self.scan_filter) |filter| {
                         filter.sealed = true;
-                        const scan = self.left.?.node.operation.scan;
-                        const cursor = self.engine.cursors[scan.index];
+                        const cursor = self.engine.cursors[self.scan_filter_cursor.?];
                         _ = try cursor.set_dynamic_filter.?(cursor.ptr, filter);
                     }
                     if (self.partition_join) |owner| {
@@ -2254,6 +2486,7 @@ fn Engine(comptime Context: type) type {
                             .left_width = self.left.?.node.columns.len,
                             .right_width = self.right.?.node.columns.len,
                             .flipped = self.flipped_join,
+                            .output_order = join.output_order,
                         };
                         while (true) {
                             _ = scratch.reset(.retain_capacity);
@@ -2480,7 +2713,37 @@ fn Source(comptime Context: type) type {
                     self.engine.cursors = &self.single_list;
                 } else return error.SqlStatementSnapshotRequired;
             }
-            self.iterator = try Engine(Context).Iterator.create(&self.engine, relation.root);
+            const Estimate = struct {
+                fn rows(raw: *anyopaque, node: *const binding.Node) ?u64 {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    return engine.estimate(node);
+                }
+                fn column(raw: *anyopaque, node: *const binding.Node, position: usize) ?catalog.ColumnStatistics {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    return engine.columnStatistics(node, position);
+                }
+                fn bytes(raw: *anyopaque, node: *const binding.Node) ?u64 {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    return engine.estimateBytes(node);
+                }
+                fn indexed(raw: *anyopaque, node: *const binding.Node, position: usize) bool {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    const lineage = binding.scanColumn(node, position) orelse return false;
+                    const cursor = engine.cursors[lineage.scan_index];
+                    const wants = cursor.wants_exact_filter orelse return false;
+                    if (cursor.set_dynamic_filter == null) return false;
+                    const kind = node.columns[position];
+                    return wants(cursor.ptr, &.{.{ .name = lineage.name, .type = kind.type, .element_type = kind.element_type }}) catch false;
+                }
+            };
+            self.engine.planning_budget = .{ .backing = context.alloc, .limit = @min(512 * 1024, context.limits.retained_bytes / 16) };
+            self.engine.planning_arena = .init(self.engine.planning_budget.allocator());
+            const root = binding.JoinPlanning.optimize(self.engine.planning_arena.?.allocator(), relation.root, .{ .ptr = &self.engine, .rows = Estimate.rows, .column = Estimate.column, .bytes = Estimate.bytes, .indexed = Estimate.indexed, .memory_bytes = context.limits.retained_bytes / 4 }) catch |err| fallback: {
+                if (err != error.OutOfMemory or !self.engine.planning_budget.isExhausted()) return err;
+                _ = self.engine.planning_arena.?.reset(.free_all);
+                break :fallback relation.root;
+            };
+            self.iterator = try Engine(Context).Iterator.create(&self.engine, root);
             self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table };
             return self;
         }
@@ -2558,6 +2821,310 @@ test "external lake native NUMERIC scan declarations survive exact hash joins" {
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
         for (result.output.rows) |row| try std.testing.expectEqualStrings("9007199254740993", if (row[0] == .number_string) row[0].number_string else row[0].string);
     }
+}
+
+fn derivedEncodedScenario(a: Allocator) !void {
+    var backend: SetTestBackend = .{};
+    var compiled = try @import("compiler.zig").compile(a, "SELECT x,y,arr FROM (SELECT a+1 AS x,b*2 AS y,ARRAY[a,b]::int8[] AS arr FROM (VALUES(1,3),(2,4),(3,5)) t(a,b)) d", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const bound = try @import("describe.zig").bind(alloc, backend.backend(), &compiled, &.{});
+    const context: @import("runtime.zig").Context = .{ .alloc = a, .arena = alloc, .backend = backend.backend(), .binding = bound, .parameters = &.{}, .limits = .{} };
+    const cursor = try openCursor(context);
+    defer cursor.close(cursor.ptr);
+    const next = cursor.next_columns.?;
+    for (0..3) |i| {
+        const page = try next(cursor.ptr, alloc, 1);
+        try std.testing.expectEqual(@as(usize, 1), page.selection.len);
+        const batch = page.native.?.values.*;
+        const x = (try batch.physicalColumn(alloc, 0)).?;
+        const y = (try batch.physicalColumn(alloc, 1)).?;
+        try std.testing.expectEqual(@as(i64, @intCast(i + 2)), (try x.cell(0)).value.integer);
+        try std.testing.expectEqual(@as(i64, @intCast(2 * (i + 3))), (try y.cell(0)).value.integer);
+        const array = (try batch.cell(alloc, 0, 2)).array.?;
+        try std.testing.expectEqual(@as(usize, 2), array.cardinality());
+        try std.testing.expectEqual(@as(i64, @intCast(i + 1)), array.flatCell(0).value.integer);
+        try std.testing.expect(try batch.physicalColumn(alloc, 2) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try next(cursor.ptr, alloc, 1)).selection.len);
+}
+test "SQL derived primitive projections retain native payloads across pulls and allocation failures" {
+    try derivedEncodedScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, derivedEncodedScenario, .{});
+}
+
+test "SQL derived encoded projections preserve lazy errors limits and sparse aggregates" {
+    const cases = [_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "SELECT v FROM (SELECT 10/x AS v FROM (VALUES(2),(0)) t(x)) d LIMIT 1", .expected = "[[5]]" },
+        .{ .sql = "SELECT x,y FROM (SELECT a+1 AS x,b*2 AS y FROM (VALUES(1,3),(2,4),(3,5)) t(a,b)) d WHERE x>2", .expected = "[[3,8],[4,10]]" },
+        .{ .sql = "SELECT SUM(v) FILTER (WHERE v>2),SUM(1/0) FILTER (WHERE false) FROM (SELECT x+1 AS v FROM (VALUES(1),(2),(3)) t(x)) d", .expected = "[[7,null]]" },
+    };
+    for (cases) |case| {
+        var backend: SetTestBackend = .{};
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        var expected = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.expected, .{});
+        defer expected.deinit();
+        const rows = result.output.native_rows.?;
+        try std.testing.expectEqual(expected.value.array.items.len, rows.len);
+        for (expected.value.array.items, rows) |wanted, actual| {
+            try std.testing.expectEqual(wanted.array.items.len, actual.len);
+            for (wanted.array.items, actual) |value, cell| {
+                if (value == .null) try std.testing.expect(cell.sql_null) else try std.testing.expectEqualDeep(value, cell.value);
+            }
+        }
+    }
+}
+
+test "SQL derived mixed projections fit a bounded working memory budget" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fields: std.ArrayList(u8) = .empty;
+    for (0..48) |index| {
+        if (index != 0) try fields.appendSlice(alloc, ",");
+        try fields.appendSlice(alloc, try std.fmt.allocPrint(alloc, "x+{d} AS c{d}", .{ index, index }));
+    }
+    try fields.appendSlice(alloc, ",ARRAY[x,x+1]::int8[] AS arr");
+    const sql = try std.fmt.allocPrint(alloc, "SELECT SUM(c0),COUNT(arr) FROM (SELECT {s} FROM (VALUES(1),(2),(3),(4)) t(x)) d", .{fields.items});
+    var backend: SetTestBackend = .{};
+    var compiled = try @import("compiler.zig").compile(a, sql, .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, backend.backend(), &compiled, &.{}, .{ .native_result = true, .retained_bytes = 448 * 1024 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 10), result.output.native_rows.?[0][0].value.integer);
+    try std.testing.expectEqual(@as(i64, 4), result.output.native_rows.?[0][1].value.integer);
+}
+test "SQL derived demand prunes unused expressions and preserves shared positional domains" {
+    const cases = [_]struct { sql: []const u8, expected: []const i64 }{
+        .{ .sql = "SELECT a FROM (SELECT x AS a,1/0 AS unused FROM (VALUES(1),(2)) t(x)) d", .expected = &.{ 1, 2 } },
+        .{ .sql = "WITH d AS MATERIALIZED (SELECT x AS a,x+2 AS b FROM (VALUES(1),(2)) t(x)) SELECT a FROM d UNION ALL SELECT b FROM d", .expected = &.{ 1, 2, 3, 4 } },
+        .{ .sql = "SELECT a FROM (SELECT x AS a,x+2 AS b FROM (VALUES(1),(2)) t(x) UNION SELECT x AS a,x+3 AS b FROM (VALUES(1),(2)) t(x)) d ORDER BY a", .expected = &.{ 1, 1, 2, 2 } },
+    };
+    for (cases) |case| {
+        var backend: SetTestBackend = .{};
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        try std.testing.expectEqual(case.expected.len, result.output.native_rows.?.len);
+        for (case.expected, result.output.native_rows.?) |expected, row| try std.testing.expectEqual(expected, row[0].value.integer);
+    }
+}
+
+test "SQL derived demand reaches physical scan planning before opening readers" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{
+                .{ .name = "n", .path = "n", .type = .integer },
+                .{ .name = "cold", .path = "cold", .type = .string },
+            } };
+        }
+    };
+    var fixture: u8 = 0;
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.check } };
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compile(a, "SELECT v FROM (SELECT n+1 AS v,upper(cold) AS unused FROM physical_source WHERE n>0) d", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bound = try describe.bind(arena.allocator(), backend, &compiled, &.{});
+    const scans = bound.relation.?.scans;
+    try std.testing.expectEqual(@as(usize, 1), scans.len);
+    try std.testing.expectEqual(@as(usize, 1), scans[0].request.fields.len);
+    try std.testing.expectEqualStrings("n", scans[0].request.fields[0]);
+}
+
+test "SQL derived projection errors preserve valid prefixes before invalid text casts" {
+    const a = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    var compiled = try @import("compiler.zig").compile(a, "SELECT v FROM (SELECT x::BIGINT AS v FROM (VALUES('1'),('bad')) t(x)) d", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const bound = try @import("describe.zig").bind(alloc, backend.backend(), &compiled, &.{});
+    const context: @import("runtime.zig").Context = .{ .alloc = a, .arena = alloc, .backend = backend.backend(), .binding = bound, .parameters = &.{}, .limits = .{} };
+    const cursor = try openCursor(context);
+    defer cursor.close(cursor.ptr);
+    const next = cursor.next_columns.?;
+    const page = try next(cursor.ptr, alloc, 2);
+    try std.testing.expectEqual(@as(usize, 1), page.selection.len);
+    try std.testing.expectEqual(@as(i64, 1), (try page.native.?.values.cell(alloc, 0, 0)).value.integer);
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, next(cursor.ptr, alloc, 2));
+}
+
+test "SQL costed inner join execution preserves aliases duplicate keys NULLs and selected output order" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        var indexed_installs: usize = 0;
+        const Captured = struct {
+            a: Allocator,
+            arena: std.heap.ArenaAllocator,
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.arena.deinit();
+                self.a.destroy(self);
+            }
+        };
+        const Scan = struct {
+            table: usize,
+            done: bool = false,
+            installed: bool = false,
+            fn wants(raw: *anyopaque, _: []const @import("dynamic_filter.zig").Column) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.table == 0;
+            }
+            fn install(raw: *anyopaque, filter: *const @import("dynamic_filter.zig").Filter) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.table != 0) return false;
+                try std.testing.expect(filter.sealed);
+                self.installed = true;
+                indexed_installs += 1;
+                return true;
+            }
+            fn close(_: *anyopaque) void {}
+            fn next(raw: *anyopaque, alloc: Allocator, _: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.done) return .{ .rows = &.{} };
+                if (self.table == 0 and !self.installed) return error.InvalidSqlBackendResponse;
+                self.done = true;
+                const count: usize = 3 - self.table;
+                const rows = try alloc.alloc(catalog.Row, count);
+                for (rows, 0..) |*row, index| {
+                    var object = std.json.ObjectMap.empty;
+                    try object.put(alloc, "k", if (index + 1 == count and self.table != 2) .null else .{ .integer = 1 });
+                    try object.put(alloc, "v", .{ .integer = @intCast((self.table + 1) * 10 + index) });
+                    row.* = .{ .id = "row", .version = 1, .value = .{ .object = object } };
+                }
+                return .{ .rows = rows };
+            }
+        };
+        fn checkpoint(_: *anyopaque) !void {}
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = name.table[0] - 'a' + 1, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "k", .path = "k", .type = .integer }, .{ .name = "v", .path = "v", .type = .integer } } };
+        }
+        fn capture(_: *anyopaque, alloc: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self = try alloc.create(Captured);
+            self.* = .{ .a = alloc, .arena = .init(alloc) };
+            errdefer Captured.close(self);
+            const ca = self.arena.allocator();
+            const cursors = try ca.alloc(catalog.Cursor, scans.len);
+            for (cursors, scans) |*cursor, scan| {
+                const source = try ca.create(Scan);
+                source.* = .{ .table = @intCast(scan.table.id - 1) };
+                cursor.* = .{ .ptr = source, .next = Scan.next, .close = Scan.close, .estimated_rows = if (source.table == 2) 1 else (source.table + 1) * 1_000_000, .set_dynamic_filter = Scan.install, .wants_exact_filter = Scan.wants };
+            }
+            return .{ .ptr = self, .cursors = cursors, .close = Captured.close };
+        }
+    };
+    Fixture.indexed_installs = 0;
+    var state: u8 = 0;
+    const backend: catalog.Backend = .{ .ptr = &state, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .open_statement = Fixture.capture, .checkpoint = Fixture.checkpoint } };
+    var compiled = try @import("compiler.zig").compile(a, "SELECT a.v,b.v,c.v FROM a JOIN b ON a.k=b.k JOIN c ON b.k=c.k ORDER BY a.v", .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    const text = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+    defer a.free(text);
+    try std.testing.expectEqualStrings("[[\"10\",\"20\",\"30\"],[\"11\",\"20\",\"30\"]]", text);
+    var aggregate = try @import("compiler.zig").compile(a, "SELECT SUM(a.v),SUM(b.v),SUM(c.v),COUNT(*) FROM a JOIN b ON a.k=b.k JOIN c ON b.k=c.k", .{});
+    defer aggregate.deinit();
+    var sums = try @import("runtime.zig").execute(a, backend, &aggregate, &.{}, .{});
+    defer sums.deinit();
+    const aggregate_text = try std.json.Stringify.valueAlloc(a, sums.output.rows, .{});
+    defer a.free(aggregate_text);
+    try std.testing.expectEqualStrings("[[\"21\",\"40\",\"60\",\"2\"]]", aggregate_text);
+    var pair = try @import("compiler.zig").compile(a, "SELECT a.v,b.v FROM a JOIN b ON a.k=b.k ORDER BY a.v", .{});
+    defer pair.deinit();
+    var paired = try @import("runtime.zig").execute(a, backend, &pair, &.{}, .{});
+    defer paired.deinit();
+    const pair_text = try std.json.Stringify.valueAlloc(a, paired.output.rows, .{});
+    defer a.free(pair_text);
+    try std.testing.expectEqualStrings("[[\"10\",\"20\"],[\"11\",\"20\"]]", pair_text);
+    for ([_][]const u8{
+        "SELECT a.v,b.v FROM (SELECT v,k AS join_key FROM a WHERE v>0) a JOIN b ON a.join_key=b.k ORDER BY a.v",
+        "SELECT a.v,b.v FROM (SELECT v,join_key FROM (SELECT v,k AS join_key FROM a WHERE v>0) inner_a WHERE v<100) a JOIN b ON a.join_key=b.k ORDER BY a.v",
+    }) |sql| {
+        var derived = try @import("compiler.zig").compile(a, sql, .{});
+        defer derived.deinit();
+        var filtered = try @import("runtime.zig").execute(a, backend, &derived, &.{}, .{});
+        defer filtered.deinit();
+        const derived_text = try std.json.Stringify.valueAlloc(a, filtered.output.rows, .{});
+        defer a.free(derived_text);
+        try std.testing.expectEqualStrings("[[\"10\",\"20\"],[\"11\",\"20\"]]", derived_text);
+    }
+    try std.testing.expectEqual(@as(usize, 5), Fixture.indexed_installs);
+    for ([_]struct { sql: []const u8, transparent: bool }{
+        .{ .sql = "SELECT k FROM a WHERE v>0", .transparent = true },
+        .{ .sql = "SELECT k FROM a LIMIT 1", .transparent = false },
+        .{ .sql = "SELECT k FROM a ORDER BY v", .transparent = false },
+        .{ .sql = "SELECT k+1 FROM a", .transparent = false },
+        .{ .sql = "SELECT CAST(k AS TEXT) FROM a", .transparent = false },
+        .{ .sql = "SELECT k FROM a WHERE 1/0=0", .transparent = false },
+        .{ .sql = "SELECT COUNT(*) FROM a", .transparent = false },
+    }) |case| {
+        const sql = try std.fmt.allocPrint(a, "SELECT * FROM ({s}) AS derived", .{case.sql});
+        defer a.free(sql);
+        var statement = try @import("compiler.zig").compile(a, sql, .{});
+        defer statement.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const bound = try describe.bind(arena.allocator(), backend, &statement, &.{});
+        try std.testing.expectEqual(case.transparent, binding.scanColumn(bound.relation.?.root, 0) != null);
+    }
+}
+
+fn derivedDecimalScenario(a: Allocator) !void {
+    const Fixture = struct {
+        offset: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn columns(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(@as(usize, 2), self.offset + limit);
+            const selection = try alloc.alloc(usize, end - self.offset);
+            for (selection, 0..) |*value, index| value.* = self.offset + index;
+            self.offset = end;
+            return .{ .batch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" } }, .columns = &.{.{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 123, 234 }, .precision = 38, .scale = 2 } } }} }, .selection = selection, .after = if (end < 2) "more" else null };
+        }
+        fn rows(_: *anyopaque, _: Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedRowAdapter;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            @as(*@This(), @ptrCast(@alignCast(raw))).offset = 0;
+            return .{ .ptr = raw, .next = rows, .next_columns = columns, .close = close };
+        }
+    };
+    var fixture: Fixture = .{};
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint, .open_scan = Fixture.open } };
+    var compiled = try @import("compiler.zig").compile(a, "SELECT v FROM (SELECT n+1.25 AS v FROM native_decimal) d", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const bound = try @import("describe.zig").bind(owned, backend, &compiled, &.{});
+    const context: @import("runtime.zig").Context = .{ .alloc = a, .arena = owned, .backend = backend, .binding = bound, .parameters = &.{}, .limits = .{} };
+    const cursor = try openCursor(context);
+    defer cursor.close(cursor.ptr);
+    const page = try cursor.next_columns.?(cursor.ptr, owned, 2);
+    const decimal = (try page.native.?.values.decimalColumnSelected(owned, 0, null)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), decimal.physical.len());
+    try std.testing.expectEqual(@as(i128, 248), decimal.physical.vector.values.decimal128.values[decimal.physical.rowAt(0)]);
+    try std.testing.expectEqual(@as(u16, 2), try decimal.scaleAt(0));
+}
+test "lake SQL derived decimal expressions retain coefficient capabilities through the relational cursor" {
+    try derivedDecimalScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, derivedDecimalScenario, .{});
 }
 
 test "SQL prepared native batches avoid row matrices across memory and spill blocks" {
