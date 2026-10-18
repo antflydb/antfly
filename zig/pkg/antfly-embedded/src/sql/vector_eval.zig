@@ -200,6 +200,7 @@ fn decimalComparison(a: std.mem.Allocator, program: *const scalar.Program, page:
         break :number integer.view();
     } else return null;
     const coefficients = view.vector.values.decimal128;
+    const maximum = try @import("../common/decimal128.zig").coefficientLimit(coefficients.precision, coefficients.scale);
     const constant_coefficient = if (number) |value| numeric.coefficientAtScale(value, @intCast(coefficients.scale)) else null;
     const values = try a.alloc(bool, view.len());
     errdefer a.free(values);
@@ -211,7 +212,7 @@ fn decimalComparison(a: std.mem.Allocator, program: *const scalar.Program, page:
         flag.* = @intFromBool(number == null or view.vector.nulls.isNull(row));
         value.* = false;
         if (flag.* != 0) continue;
-        try @import("../common/decimal128.zig").validateCoefficient(coefficients.values[row], coefficients.precision, coefficients.scale);
+        if (@abs(coefficients.values[row]) >= maximum) return error.InvalidDecimal128;
         const order = if (constant_coefficient) |fixed| std.math.order(coefficients.values[row], fixed) else general: {
             const fixed = try numeric.ScaledInteger.init(coefficients.values[row], @intCast(coefficients.scale));
             break :general try numeric.order(&context, fixed.view(), number.?);
@@ -227,6 +228,170 @@ fn decimalComparison(a: std.mem.Allocator, program: *const scalar.Program, page:
         };
     }
     return try Batch.fromBoolean(a, values, nulls);
+}
+
+/// Bounded instruction-major decimal arithmetic. Coefficients and SQL NULL
+/// remain vectors across projection, hashing and reduction. Unsupported scale,
+/// specials, rounding and overflow decline the complete expression intact.
+const DecimalArithmetic = struct {
+    const Vector = struct { values: []i128, nulls: []u8, scale: u16 };
+    a: std.mem.Allocator,
+    program: *const scalar.Program,
+    source: @import("execution_batch.zig").Batch,
+    parameters: []const std.json.Value,
+    remaining: usize = 64,
+    fn allocate(self: *@This(), scale: u16) !Vector {
+        const values = try self.a.alloc(i128, self.source.len());
+        const nulls = try self.a.alloc(u8, self.source.len());
+        @memset(values, 0);
+        @memset(nulls, 0);
+        return .{ .values = values, .nulls = nulls, .scale = scale };
+    }
+    fn scaled(value: i128, from: u16, to: u16) ?i128 {
+        var result = value;
+        for (from..to) |_| result = std.math.mul(i128, result, 10) catch return null;
+        return result;
+    }
+    fn quotient(left: i128, right: i128, exponent: i32) ?i128 {
+        if (right == 0) return null;
+        var numerator: u256 = @abs(left);
+        var denominator: u256 = @abs(right);
+        for (0..@intCast(@abs(exponent))) |_| {
+            if (exponent >= 0) numerator = std.math.mul(u256, numerator, 10) catch return null else denominator = std.math.mul(u256, denominator, 10) catch return null;
+        }
+        var coefficient = numerator / denominator;
+        const remainder = numerator % denominator;
+        if (remainder >= denominator - remainder) coefficient = std.math.add(u256, coefficient, 1) catch return null;
+        const magnitude = std.math.cast(i128, coefficient) orelse return null;
+        return if ((left < 0) != (right < 0)) -magnitude else magnitude;
+    }
+    fn run(self: *@This(), index: u32, depth: usize) anyerror!?Vector {
+        if (depth == 32 or self.remaining == 0) return null;
+        self.remaining -= 1;
+        const instruction = self.program.instructions[index];
+        const number = @import("numeric_value.zig");
+        if (constantOperand(self.program, index, 0)) {
+            var constant = self.program.*;
+            constant.root = index;
+            const datum = try constant.evaluate(self.a, &.{}, self.parameters, .{});
+            const scale: u16 = if (datum.numeric) |value| value.scale else 0;
+            if (scale > 38) return null;
+            const value = if (datum.sql_null) @as(i128, 0) else if (datum.numeric) |value| number.coefficientAtScale(value.*, scale) orelse return null else if (datum.value == .integer) @as(i128, datum.value.integer) else return null;
+            const result = try self.allocate(scale);
+            @memset(result.values, value);
+            @memset(result.nulls, @intFromBool(datum.sql_null));
+            return result;
+        }
+        switch (instruction.operation) {
+            .column => |ordinal| {
+                if (try self.source.decimalColumnSelected(self.a, ordinal, null)) |decimal| {
+                    const coefficients = decimal.physical.vector.values.decimal128;
+                    const maximum = try @import("../common/decimal128.zig").coefficientLimit(coefficients.precision, coefficients.scale);
+                    const result = try self.allocate(@intCast(coefficients.scale));
+                    for (result.values, result.nulls, 0..) |*value, *flag, row| {
+                        const physical = decimal.physical.rowAt(row);
+                        flag.* = @intFromBool(decimal.physical.vector.nulls.isNull(physical));
+                        if (flag.* != 0) continue;
+                        value.* = coefficients.values[physical];
+                        if (@abs(value.*) >= maximum) return error.InvalidDecimal128;
+                    }
+                    return result;
+                }
+                const physical = (try self.source.physicalColumn(self.a, ordinal)) orelse return null;
+                if (physical.kind != .integer) return null;
+                const result = try self.allocate(0);
+                for (result.values, result.nulls, 0..) |*value, *flag, row| {
+                    const datum = try physical.cell(row);
+                    flag.* = @intFromBool(datum.sql_null);
+                    if (!datum.sql_null) value.* = datum.value.integer;
+                }
+                return result;
+            },
+            .cast => |cast| {
+                if (cast.type != .number or cast.element_type != .numeric or cast.numeric_modifier != null) return null;
+                return self.run(cast.operand, depth + 1);
+            },
+            .unary => |part| {
+                if (instruction.type.element_type != .numeric or (part.op != .positive and part.op != .negative)) return null;
+                const result = (try self.run(part.operand, depth + 1)) orelse return null;
+                if (part.op == .negative) for (result.values, result.nulls) |*value, flag| {
+                    if (flag == 0) value.* = std.math.negate(value.*) catch return null;
+                };
+                return result;
+            },
+            .binary => |part| {
+                if (instruction.type.element_type != .numeric) return null;
+                switch (part.op) {
+                    .add, .subtract, .multiply, .divide, .modulo => {},
+                    else => return null,
+                }
+                const left = (try self.run(part.left, depth + 1)) orelse return null;
+                const right = (try self.run(part.right, depth + 1)) orelse return null;
+                var scale = if (part.op == .multiply) left.scale + right.scale else @max(left.scale, right.scale);
+                if (part.op == .divide) {
+                    var selected: ?u16 = null;
+                    for (left.values, right.values, left.nulls, right.nulls) |l, r, ln, rn| {
+                        if (ln != 0 or rn != 0) continue;
+                        if (r == 0) return error.SqlDivisionByZero;
+                        const lf = try number.ScaledInteger.init(l, left.scale);
+                        const rf = try number.ScaledInteger.init(r, right.scale);
+                        const required = number.divisionScale(lf.view(), rf.view());
+                        if (selected != null and selected.? != required) return null;
+                        selected = required;
+                    }
+                    scale = selected orelse 0;
+                }
+                if (scale > 38) return null;
+                const result = try self.allocate(scale);
+                const maximum = try @import("../common/decimal128.zig").coefficientLimit(38, scale);
+                for (result.values, result.nulls, left.values, right.values, left.nulls, right.nulls) |*value, *flag, l_, r_, ln, rn| {
+                    flag.* = @intFromBool(ln != 0 or rn != 0);
+                    if (flag.* != 0) continue;
+                    const l = if (part.op == .multiply or part.op == .divide) l_ else scaled(l_, left.scale, scale) orelse return null;
+                    const r = if (part.op == .multiply or part.op == .divide) r_ else scaled(r_, right.scale, scale) orelse return null;
+                    value.* = switch (part.op) {
+                        .add => std.math.add(i128, l, r) catch return null,
+                        .subtract => std.math.sub(i128, l, r) catch return null,
+                        .multiply => std.math.mul(i128, l, r) catch return null,
+                        .divide => quotient(l, r, @as(i32, scale) + right.scale - left.scale) orelse return null,
+                        .modulo => if (r == 0) return error.SqlDivisionByZero else if (l == std.math.minInt(i128) and r == -1) 0 else @rem(l, r),
+                        else => unreachable,
+                    };
+                    if (@abs(value.*) >= maximum) return null;
+                }
+                return result;
+            },
+            else => return null,
+        }
+    }
+};
+fn decimalArithmetic(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) !?@import("execution_batch.zig").Batch {
+    if (program.output_type.element_type != .numeric or page.selection.len == 0 or program.required_columns.len == 0) return null;
+    // No eager constant subtree may cross an empty/NULL input boundary.
+    // All-NULL source cohorts keep the scalar evaluator's existing laziness.
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const Batch = @import("execution_batch.zig").Batch;
+    const source: Batch = .{ .columns = .{ .page = page, .definitions = columns } };
+    var has_decimal = false;
+    for (program.required_columns) |ordinal| if (try source.decimalColumnSelected(sa, ordinal, null)) |decimal| {
+        var present = false;
+        for (0..decimal.physical.len()) |row| if (!decimal.physical.vector.nulls.isNull(decimal.physical.rowAt(row))) {
+            present = true;
+            break;
+        };
+        if (!present) return null;
+        has_decimal = true;
+    };
+    if (!has_decimal) return null;
+    var kernel: DecimalArithmetic = .{ .a = sa, .program = program, .source = source, .parameters = parameters };
+    const result = (try kernel.run(program.root, 0)) orelse return null;
+    const values = try a.dupe(i128, result.values);
+    errdefer a.free(values);
+    const nulls = try a.dupe(u8, result.nulls);
+    errdefer a.free(nulls);
+    return try Batch.fromDecimal(a, values, nulls, result.scale);
 }
 
 /// Retain expression dictionaries across projection instead of expanding them
@@ -263,6 +428,11 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
     }
     for (programs, 0..) |program, index| {
         if (visited[index]) continue;
+        if (try decimalArithmetic(a, program, page, columns, parameters)) |native_arithmetic| {
+            outputs[index] = native_arithmetic;
+            visited[index] = true;
+            continue;
+        }
         if (try decimalComparison(a, program, page, columns, parameters)) |native_comparison| {
             outputs[index] = native_comparison;
             visited[index] = true;
@@ -1391,4 +1561,46 @@ fn decimalComparisonScenario(a: std.mem.Allocator) !void {
 test "lake SQL coefficient comparison vectors preserve selected NULL lanes exact fractions and specials with allocation safety" {
     try decimalComparisonScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, decimalComparisonScenario, .{});
+}
+
+fn decimalArithmeticScenario(a: std.mem.Allocator) !void {
+    const definitions = [_]scalar.Column{ .{ .name = "n", .type = .number, .element_type = .numeric }, .{ .name = "m", .type = .number, .element_type = .numeric }, .{ .name = "i", .type = .integer } };
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" } }, .columns = &.{
+        .{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 12300, -12301, std.math.minInt(i128) }, .precision = 38, .scale = 4 } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } },
+        .{ .name = "m", .values = .{ .decimal128 = .{ .values = &.{ -20, 31, 55 }, .precision = 4, .scale = 2 } } },
+        .{ .name = "i", .values = .{ .i64 = &.{ 3, -2, 1 } } },
+    } }, .selection = &.{ 1, 0, 2, 1 } };
+    for ([_][]const u8{ "n+1.25", "n-m", "-(n*m)+n", "n*i", "n % m", "n / 3.00", "(n+1.25)*(m-2.00)" }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+        defer program.deinit();
+        const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
+        defer freeEncodedMany(a, outputs);
+        const output = outputs[0] orelse return error.TestUnexpectedResult;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        try std.testing.expect(try output.decimalColumnSelected(sa, 0, null) != null);
+        for (0..page.selection.len) |row| {
+            const inputs = [_]Datum{ try page.typedCell(sa, row, "n", true), try page.typedCell(sa, row, "m", true), try page.typedCell(sa, row, "i", false) };
+            const expected = try program.evaluate(sa, &inputs, &.{}, .{});
+            const actual = try output.cell(sa, row, 0);
+            try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+            if (expected.sql_null) continue;
+            var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
+            try std.testing.expectEqualStrings(try @import("numeric_value.zig").format(&context, expected.numeric.?.*), try @import("numeric_value.zig").format(&context, actual.numeric.?.*));
+        }
+    }
+    for ([_][]const u8{ "n*99999999999999999999999999999999999999", "n+CAST('NaN' AS NUMERIC)", "n/0.00000000000000000000000000000000000001" }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect(try decimalArithmetic(a, &program, page, &definitions, &.{}) == null);
+    }
+}
+test "lake SQL coefficient arithmetic retains exact scales nulls nested expressions and overflow fallback" {
+    try decimalArithmeticScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, decimalArithmeticScenario, .{});
 }

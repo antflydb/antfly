@@ -469,11 +469,27 @@ pub const ColumnPage = struct {
 
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
+/// Borrowed snapshot-local costing evidence. Providers never perform I/O for
+/// optimizer statistics; absent fields remain unknown. Frequencies and hashes
+/// describe semantic equality keys, and are advisory rather than pruning proof.
+pub const ColumnStatistics = struct {
+    pub const Frequency = struct { hash: u64, rows: u64 };
+    name: []const u8,
+    distinct_count: ?u64 = null,
+    population_rows: ?u64 = null,
+    average_bytes: ?u32 = null,
+    non_null_rows: ?u64 = null,
+    unique: bool = false,
+    min_integer: ?i64 = null,
+    max_integer: ?i64 = null,
+    frequencies: []const Frequency = &.{},
+};
 pub const Cursor = struct {
     /// True only when this cursor preserves every requested Scan.order key.
     order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
     /// Optional estimate after the captured Scan.conditions, never an execution cap.
+    column_statistics: []const ColumnStatistics = &.{},
     estimated_filtered_rows: ?u64 = null,
     estimated_rows: ?u64 = null,
     estimated_bytes: ?u64 = null,

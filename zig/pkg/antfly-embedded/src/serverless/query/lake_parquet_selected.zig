@@ -29,7 +29,7 @@ budget: @import("../../sql/memory_budget.zig"),
 arena: std.heap.ArenaAllocator = undefined,
 chunk: Chunk,
 kind: enum { integer, number, boolean, bytes },
-positions: []u32 = &.{},
+definitions: ?page.DefinitionIndex = null,
 indices: ?page.HybridIndex = null,
 offsets: []u32 = &.{},
 data: []const u8 = &.{},
@@ -75,16 +75,10 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
     var data: []const u8 = payload.bytes;
     var present: usize = 0;
     if (chunk.nullable) {
-        self.positions = try alloc.alloc(u32, self.count);
         const flat = try page.flatOptionalPage(header, data);
         if (flat.header.definition_level_bytes == 0 or flat.header.data_payload_offset > flat.payload.len) return error.InvalidParquetPage;
-        const levels = try page.decodeHybridLevelsAlloc(alloc, flat.payload[0..flat.header.definition_level_bytes], 1, self.count);
-        defer alloc.free(levels);
-        for (levels, self.positions) |level, *position| {
-            if (level > 1) return error.InvalidParquetPage;
-            position.* = if (level == 0) absent else @intCast(present);
-            present += level;
-        }
+        self.definitions = try page.DefinitionIndex.init(alloc, flat.payload[0..flat.header.definition_level_bytes], self.count);
+        present = self.definitions.?.present;
         data = flat.payload[flat.header.data_payload_offset..];
     } else {
         present = self.count;
@@ -136,7 +130,7 @@ pub fn destroy(self: *Self) void {
     a.destroy(self);
 }
 fn lanePosition(self: *const Self, row: usize) u32 {
-    return if (self.positions.len == 0) @intCast(row) else self.positions[row];
+    return if (self.definitions) |index| index.position(row) orelse absent else @intCast(row);
 }
 fn integer(self: *Self, position: usize) !i64 {
     if (self.dictionary) |dictionary| return switch (dictionary) {
@@ -231,11 +225,14 @@ fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, 
         if (!keep[lane]) continue;
         const position = self.lanePosition(begin + lane);
         if (position == absent) {
-            keep[lane] = false;
+            const end = @min(keep.len, self.definitions.?.intervalEnd(begin + lane) - begin);
+            @memset(keep[lane..end], false);
+            lane = end - 1;
             continue;
         }
-        if (self.positions.len == 0) if (self.indices) |index| if (index.runAt(position)) |run| if (run.repeated != null) {
-            const end = @min(keep.len, run.first + run.count - begin);
+        if (self.indices) |index| if (index.runAt(position)) |run| if (run.repeated != null) {
+            const definition_end = if (self.definitions) |definitions| definitions.intervalEnd(begin + lane) - begin else keep.len;
+            const end = @min(definition_end, @min(keep.len, lane + run.first + run.count - position));
             const matches = comparePredicate(T, op, try self.predicateValue(T, position), literal);
             if (!matches) @memset(keep[lane..end], false);
             lane = end - 1;
@@ -474,7 +471,7 @@ test "lake SQL encoded numeric predicate runs preserve exact integers selections
 test "lake SQL repeated dictionary predicate masks need no expanded page ID vector" {
     const a = std.testing.allocator;
     const payload = [_]u8{ 1, 0x80, 0x80, 8, 1 };
-    const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = payload.len, .uncompressed_page_size = payload.len, .value_count = 65536, .encoding = .rle_dictionary };
+    const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = @intCast(payload.len), .uncompressed_page_size = @intCast(payload.len), .value_count = 65536, .encoding = .rle_dictionary };
     const chunk: Chunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = payload.len, .physical_type = @constCast("int64") };
     var dictionary_values = [_]i64{ 7, 99 };
     const selected = (try create(a, chunk, header, &payload, .{ .i64 = &dictionary_values }, 16 * 1024)).?;
@@ -488,4 +485,25 @@ test "lake SQL repeated dictionary predicate masks need no expanded page ID vect
     try std.testing.expect(try encodedMask(selected, 60000, &mask, .{ .integer = 7 }, .eq));
     for (mask) |active| try std.testing.expect(!active);
     try std.testing.expectEqual(@as(usize, 0), selected.converted);
+}
+
+test "lake SQL nullable repeated pages retain native masks within a tiny decode budget" {
+    const a = std.testing.allocator;
+    var dictionary_values = [_]i64{ 7, 99 };
+    for ([_]bool{ false, true }) |mixed| {
+        const full = [_]u8{ 4, 0, 0, 0, 0x80, 0x80, 8, 1, 1, 0x80, 0x80, 8, 1 };
+        const half = [_]u8{ 8, 0, 0, 0, 0x80, 0x80, 4, 0, 0x80, 0x80, 4, 1, 1, 0x80, 0x80, 4, 1 };
+        const payload: []const u8 = if (mixed) &half else &full;
+        const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = @intCast(payload.len), .uncompressed_page_size = @intCast(payload.len), .value_count = 65536, .encoding = .rle_dictionary };
+        const chunk: Chunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = payload.len, .physical_type = @constCast("int64"), .nullable = true };
+        const selected = (try create(a, chunk, header, payload, .{ .i64 = &dictionary_values }, 16 * 1024)).?;
+        defer selected.destroy();
+        try std.testing.expectEqual(@as(usize, if (mixed) 2 else 0), selected.definitions.?.runs.len);
+        try std.testing.expectEqual(@as(usize, 0), selected.definitions.?.bitmap.len);
+        var mask: [1024]bool = @splat(true);
+        mask[1000] = false;
+        try std.testing.expect(try encodedMask(selected, 32000, &mask, .{ .integer = 99 }, .eq));
+        for (mask, 0..) |active, lane| try std.testing.expectEqual(lane != 1000 and (!mixed or lane >= 768), active);
+        try std.testing.expectEqual(@as(usize, 0), selected.converted);
+    }
 }

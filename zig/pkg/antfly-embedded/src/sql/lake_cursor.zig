@@ -186,6 +186,10 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
     var filter_columns: std.ArrayList([]const u8) = .empty;
     for (conditions) |condition| try appendColumn(owned, &filter_columns, table, condition.column);
     if (source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |name| try filter_columns.append(owned, name);
+    const column_statistics = try ownedStatistics(owned, source, table, request.fields);
+    const metadata_rows: ?u64 = for (column_statistics) |statistics| {
+        if (statistics.population_rows) |count| break count;
+    } else null;
     // Transfer the arena only after its final allocation. Growing it through
     // the local allocator after copying would leave new buffers unowned.
     owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key, .mask_arena = .init(alloc) };
@@ -223,7 +227,91 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         }
         if (known) filtered_rows = if (filtered_rows) |rows_| @min(rows_, candidates) else candidates;
     }
-    return .{ .estimated_filtered_rows = filtered_rows, .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .split_ordered_batch = if (stream.iterator != null and stream.selection == null and source.scanner.shared_reader != null) Owner.splitOrderedBatch else null, .close = Owner.close };
+    return .{ .column_statistics = column_statistics, .estimated_filtered_rows = filtered_rows, .estimated_rows = metadata_rows orelse (if (source.inventory.format == .iceberg) estimated_rows else null), .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .split_ordered_batch = if (stream.iterator != null and stream.selection == null and source.scanner.shared_reader != null) Owner.splitOrderedBatch else null, .close = Owner.close };
+}
+
+/// Cost only metadata already resident in the captured file view. Never open
+/// a footer for planning. Large inventories decline this optional preparation.
+fn ownedStatistics(a: Allocator, source: anytype, table: catalog.Table, fields: []const []const u8) ![]const catalog.ColumnStatistics {
+    if (source.inventory.files.len > 512 or fields.len > 256) return &.{};
+    var chunks: usize = 0;
+    for (source.inventory.files) |file| for (file.row_groups) |group| {
+        chunks +|= group.column_chunks.len;
+        if (chunks > 8192) return &.{};
+    };
+    const statistics = try a.alloc(catalog.ColumnStatistics, fields.len);
+    for (fields, statistics) |field, *out| {
+        out.* = .{ .name = field };
+        const column = table.column(field) catch continue;
+        var known = source.inventory.files.len != 0;
+        var bounded = column.type == .integer or column.type == .boolean;
+        var minimum: i64 = std.math.maxInt(i64);
+        var maximum: i64 = std.math.minInt(i64);
+        var row_estimate: u64 = 0;
+        var null_count: ?u64 = 0;
+        var distinct_count: ?u64 = 0;
+        var bytes: ?u64 = 0;
+        var frequencies: std.ArrayList(catalog.ColumnStatistics.Frequency) = .empty;
+        for (source.inventory.files) |file| {
+            if (file.row_groups.len == 0) {
+                known = false;
+                break;
+            }
+            for (file.row_groups) |group| {
+                const chunk = for (group.column_chunks) |candidate| {
+                    if (std.mem.eql(u8, candidate.column_id, column.path)) break candidate;
+                } else {
+                    known = false;
+                    break;
+                };
+                row_estimate +|= group.row_count;
+                const nulls: ?u64 = if (!chunk.nullable) 0 else chunk.stats_null_count;
+                if (nulls != null and nulls.? > group.row_count) {
+                    known = false;
+                    break;
+                }
+                null_count = if (null_count != null and nulls != null) null_count.? +| nulls.? else null;
+                distinct_count = if (distinct_count != null and chunk.stats_distinct_count != null) distinct_count.? +| chunk.stats_distinct_count.? else null;
+                bytes = if (bytes != null and chunk.uncompressed_len != 0) bytes.? +| chunk.uncompressed_len else null;
+                if (nulls == group.row_count) continue;
+                const low = if (column.type == .boolean) (if (chunk.stats_min_bool) |value| @as(i64, @intFromBool(value)) else null) else chunk.stats_min_i64;
+                const high = if (column.type == .boolean) (if (chunk.stats_max_bool) |value| @as(i64, @intFromBool(value)) else null) else chunk.stats_max_i64;
+                if (bounded and low != null and high != null and low.? <= high.?) {
+                    minimum = @min(minimum, low.?);
+                    maximum = @max(maximum, high.?);
+                    if (low.? == high.? and nulls != null) {
+                        const datum = @import("scalar.zig").Datum.fromJson(if (column.type == .boolean) .{ .bool = low.? != 0 } else .{ .integer = low.? });
+                        const hash = try @import("scalar.zig").semanticHashDatum(datum);
+                        const found = for (frequencies.items) |*frequency| {
+                            if (frequency.hash == hash) {
+                                frequency.rows +|= group.row_count - nulls.?;
+                                break true;
+                            }
+                        } else false;
+                        if (!found and frequencies.items.len < 32) try frequencies.append(a, .{ .hash = hash, .rows = group.row_count - nulls.? });
+                    }
+                } else bounded = false;
+            }
+            if (!known) break;
+        }
+        if (!known or row_estimate == 0) {
+            frequencies.deinit(a);
+            continue;
+        }
+        out.population_rows = row_estimate;
+        out.non_null_rows = if (null_count) |n| row_estimate - n else null;
+        out.average_bytes = if (bytes) |n| @intCast(@min(std.math.maxInt(u32), @max(1, n / row_estimate))) else null;
+        out.distinct_count = if (distinct_count) |n| @min(n, out.non_null_rows orelse row_estimate) else null;
+        if (bounded and minimum <= maximum) {
+            const domain: u128 = @intCast(@as(i128, maximum) - minimum + 1);
+            out.min_integer = minimum;
+            out.max_integer = maximum;
+            const estimate: u64 = @intCast(@min(@as(u128, out.non_null_rows orelse row_estimate), domain));
+            out.distinct_count = if (out.distinct_count) |n| @min(n, estimate) else estimate;
+        }
+        out.frequencies = try frequencies.toOwnedSlice(a);
+    }
+    return statistics;
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {

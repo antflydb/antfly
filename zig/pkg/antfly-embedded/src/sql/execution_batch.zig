@@ -400,6 +400,46 @@ pub const Batch = union(enum) {
         view.* = .{ .values = values, .nulls = nulls };
         return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical_selected = View.physical, .free_owned = View.free, .count = values.len, .width = 1 } };
     }
+    /// Transfer exact coefficient vectors; primitive/floating consumers do not
+    /// implicitly acquire this trait. Scalar boundaries allocate canonical limbs
+    /// only for values they actually consume.
+    pub fn fromDecimal(a: A, values: []i128, nulls: []u8, scale: u16) !Batch {
+        if (values.len != nulls.len or scale > 38) return error.InvalidSqlBackendResponse;
+        const View = struct {
+            values: []i128,
+            nulls: []u8,
+            scale: u16,
+            fn column(self: *@This()) DecimalColumn {
+                return .{ .physical = .{ .vector = .{ .name = "", .values = .{ .decimal128 = .{ .values = self.values, .precision = 38, .scale = self.scale } }, .nulls = .{ .bytes = self.nulls } }, .range = .{ .count = self.values.len }, .kind = .number, .element = .numeric } };
+            }
+            fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.nulls[row_index] != 0) return .{};
+                const number = @import("numeric_value.zig");
+                var context: number.Context = .{ .alloc = alloc };
+                var value = try number.fromScaledInteger(&context, self.values[row_index], self.scale);
+                errdefer value.deinit();
+                const owned = try alloc.create(number.Value);
+                owned.* = value.value;
+                return scalar.Datum.typedNumeric(owned);
+            }
+            fn decimal(raw: *anyopaque, alloc: A, _: usize, selection: ?[]const usize) !?DecimalColumn {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var column_ = self.column();
+                if (selection) |selected| column_.physical = try column_.physical.select(alloc, selected);
+                return column_;
+            }
+            fn free(raw: *anyopaque, alloc: A) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                alloc.free(self.values);
+                alloc.free(self.nulls);
+                alloc.destroy(self);
+            }
+        };
+        const view = try a.create(View);
+        view.* = .{ .values = values, .nulls = nulls, .scale = scale };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_decimal_selected = View.decimal, .free_owned = View.free, .count = values.len, .width = 1 } };
+    }
     pub fn decimalColumnSelected(self: Batch, a: A, column: usize, selection: ?[]const usize) anyerror!?DecimalColumn {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
         if (selection) |rows| for (rows) |row_index| if (row_index >= self.len()) return error.InvalidSqlBackendResponse;

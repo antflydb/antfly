@@ -1135,11 +1135,7 @@ fn divideMode(ctx: *Context, left: Value, right: Value, integer: bool) !Owned {
         return special(ctx.alloc, if (negative) .negative_infinity else .positive_infinity);
     }
     if (right.kind != .finite) return zero(ctx.alloc, 0);
-    const first_left = if (left.isZero()) 0 else left.digits[0];
-    const estimate_weight = left.weight - right.weight - @as(i32, @intFromBool(first_left <= right.digits[0]));
-    // PostgreSQL selects at least sixteen significant digits from the leading
-    // base-10000 groups and clamps division display scale to one thousand.
-    const scale: u16 = if (integer) 0 else @intCast(std.math.clamp(@max(16 - estimate_weight * 4, @max(left.scale, right.scale)), 0, 1000));
+    const scale: u16 = if (integer) 0 else divisionScale(left, right);
     if (left.isZero()) return zero(ctx.alloc, scale);
     // One entire guard group proves the final decimal rounding digit exactly.
     const fractional_groups: i32 = if (integer) 0 else @divTrunc(@as(i32, scale) + 3, 4) + 1;
@@ -1150,6 +1146,14 @@ fn divideMode(ctx: *Context, left: Value, right: Value, integer: bool) !Owned {
     if (integer) return quotient;
     defer quotient.deinit();
     return quantize(ctx, quotient.value, scale, .half_away);
+}
+
+/// Shared finite division display-scale rule. Callers prove a nonzero finite
+/// divisor before using it; both coefficient and limb kernels round half away.
+pub fn divisionScale(left: Value, right: Value) u16 {
+    const first_left = if (left.isZero()) 0 else left.digits[0];
+    const estimate_weight = left.weight - right.weight - @as(i32, @intFromBool(first_left <= right.digits[0]));
+    return @intCast(std.math.clamp(@max(16 - estimate_weight * 4, @max(left.scale, right.scale)), 0, 1000));
 }
 
 pub fn remainder(ctx: *Context, left: Value, right: Value) !Owned {

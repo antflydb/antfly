@@ -1981,15 +1981,64 @@ pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, tab
     return (try builder.lower(&source, .{ .table = name, .columns = projections })).columns;
 }
 
+/// Identity lineage through total, effect-free selection/projection frames.
+/// Ordering, cardinality, aggregation and invocation boundaries are opaque.
+pub const ScanColumn = struct { scan_index: usize, position: usize, name: []const u8 };
+pub fn scanColumn(node_: *const Node, position_: usize) ?ScanColumn {
+    var node = node_;
+    var position = position_;
+    for (0..32) |_| {
+        if (position >= node.columns.len) return null;
+        switch (node.operation) {
+            .scan => |scan| return if (position < scan.source_columns.len) .{ .scan_index = scan.index, .position = position, .name = scan.source_columns[position] } else null,
+            .query => |query| {
+                if (query.statement.limit != null or query.statement.offset != null or query.statement.scalar_cardinality_limit or query.binding.aggregate != null or query.binding.window != null or query.binding.order_keys.len != 0 or query.constant_refs.len != 0) return null;
+                // Every output must be safe, including columns beside the key.
+                for (query.binding.scalars.projections) |program| if (program) |value| if (JoinPlanning.identity(value) == null) return null;
+                if (query.binding.scalars.predicate) |predicate| if (!JoinPlanning.purePredicate(predicate)) return null;
+                if (position >= query.statement.columns.len) return null;
+                if (position < query.binding.scalars.projections.len and query.binding.scalars.projections[position] != null) {
+                    position = JoinPlanning.identity(query.binding.scalars.projections[position].?) orelse return null;
+                } else {
+                    position = JoinPlanning.ordinal(query.source.columns, query.statement.columns[position].field) orelse return null;
+                }
+                node = query.source;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
 /// Snapshot-local estimates guide bounded left-deep enumeration. Unknown
 /// estimates decline reordering; estimates never become execution row limits.
 pub const JoinPlanning = struct {
-    pub const Estimate = struct { ptr: *anyopaque, rows: *const fn (*anyopaque, *const Node) ?u64 };
-    const Edge = struct { left: []const u8, right: []const u8, ltype: scalar.Type, rtype: scalar.Type };
+    pub const Estimate = struct {
+        ptr: *anyopaque,
+        rows: *const fn (*anyopaque, *const Node) ?u64,
+        column: ?*const fn (*anyopaque, *const Node, usize) ?catalog.ColumnStatistics = null,
+        bytes: ?*const fn (*anyopaque, *const Node) ?u64 = null,
+        indexed: ?*const fn (*anyopaque, *const Node, usize) bool = null,
+        memory_bytes: u64 = 64 * 1024 * 1024,
+    };
+    const Edge = struct {
+        left: []const u8,
+        right: []const u8,
+        ltype: scalar.Type,
+        rtype: scalar.Type,
+        left_statistics: ?catalog.ColumnStatistics = null,
+        right_statistics: ?catalog.ColumnStatistics = null,
+        left_indexed: bool = false,
+        right_indexed: bool = false,
+    };
     leaves: [8]*const Node = undefined,
     count: usize = 0,
     edges: [64]Edge = undefined,
     edge_count: usize = 0,
+    estimate: Estimate = undefined,
+    cardinality: []const u64 = &.{},
+    prepared: bool = false,
+    leaf_widths: [8]f64 = @splat(0),
     fn ordinal(columns: []const Column, name: []const u8) ?usize {
         for (columns, 0..) |column, i| if (std.mem.eql(u8, column.internal, name)) return i;
         return null;
@@ -2008,6 +2057,17 @@ pub const JoinPlanning = struct {
             else => return null,
         };
         return count;
+    }
+    fn purePredicate(program: scalar.Program) bool {
+        for (program.instructions) |instruction| switch (instruction.operation) {
+            .column, .literal => {},
+            .binary => |part| switch (part.op) {
+                .eq, .neq, .lt, .lte, .gt, .gte, .@"and", .@"or" => {},
+                else => return false,
+            },
+            else => return false,
+        };
+        return true;
     }
     fn collect(self: *JoinPlanning, node: *const Node) bool {
         if (node.operation == .join) {
@@ -2062,14 +2122,94 @@ pub const JoinPlanning = struct {
         }
         return count;
     }
-    fn originalCost(self: *const JoinPlanning, node: *const Node, estimates: []const u64) struct { rows: u64, cost: f64 } {
+    fn statistics(self: *const JoinPlanning, name: []const u8) ?catalog.ColumnStatistics {
+        if (self.prepared) {
+            for (self.edges[0..self.edge_count]) |edge| {
+                if (std.mem.eql(u8, edge.left, name)) return edge.left_statistics;
+                if (std.mem.eql(u8, edge.right, name)) return edge.right_statistics;
+            }
+            return null;
+        }
+        const callback = self.estimate.column orelse return null;
+        const index = self.leaf(name);
+        return callback(self.estimate.ptr, self.leaves[index], ordinal(self.leaves[index].columns, name).?);
+    }
+    fn number(rows: f64) u64 {
+        return @intFromFloat(@min(@as(f64, @floatFromInt(std.math.maxInt(u64) - 2048)), @max(0, @ceil(rows))));
+    }
+    fn joinedRows(self: *const JoinPlanning, left_mask: usize, right_mask: usize, left_rows: u64, right_rows: u64) u64 {
+        var result: ?u64 = null;
+        for (self.edges[0..self.edge_count]) |edge_| {
+            var edge = edge_;
+            if (left_mask & (@as(usize, 1) << @intCast(self.leaf(edge.left))) == 0 or right_mask & (@as(usize, 1) << @intCast(self.leaf(edge.right))) == 0) {
+                std.mem.swap([]const u8, &edge.left, &edge.right);
+                if (left_mask & (@as(usize, 1) << @intCast(self.leaf(edge.left))) == 0 or right_mask & (@as(usize, 1) << @intCast(self.leaf(edge.right))) == 0) continue;
+            }
+            const l = self.statistics(edge.left) orelse continue;
+            const r = self.statistics(edge.right) orelse continue;
+            if (l.min_integer != null and l.max_integer != null and r.min_integer != null and r.max_integer != null and (l.min_integer.? > r.max_integer.? or r.min_integer.? > l.max_integer.?)) return 0;
+            const lbase = l.population_rows orelse self.cardinality[self.leaf(edge.left)];
+            const rbase = r.population_rows orelse self.cardinality[self.leaf(edge.right)];
+            const lrows = @as(f64, @floatFromInt(left_rows)) * (if (l.non_null_rows) |n| @min(1.0, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(@max(1, lbase)))) else 1.0);
+            const rrows = @as(f64, @floatFromInt(right_rows)) * (if (r.non_null_rows) |n| @min(1.0, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(@max(1, rbase)))) else 1.0);
+            const ldistinct: f64 = if (l.unique) lrows else if (l.distinct_count) |n| @floatFromInt(@min(left_rows, n)) else continue;
+            const rdistinct: f64 = if (r.unique) rrows else if (r.distinct_count) |n| @floatFromInt(@min(right_rows, n)) else continue;
+            var hot: f64 = 0;
+            var lhot: f64 = 0;
+            var rhot: f64 = 0;
+            var matched: f64 = 0;
+            // Providers cap this list; cap again at the planner boundary.
+            for (l.frequencies[0..@min(32, l.frequencies.len)]) |lf| for (r.frequencies[0..@min(32, r.frequencies.len)]) |rf| {
+                if (lf.hash != rf.hash) continue;
+                const lc = @min(lrows, @as(f64, @floatFromInt(lf.rows)) * lrows / @as(f64, @floatFromInt(@max(1, lbase))));
+                const rc = @min(rrows, @as(f64, @floatFromInt(rf.rows)) * rrows / @as(f64, @floatFromInt(@max(1, rbase))));
+                lhot += lc;
+                rhot += rc;
+                hot += lc * rc;
+                matched += 1;
+                break;
+            };
+            const rows = number(hot + @max(0, lrows - lhot) * @max(0, rrows - rhot) / @max(1, @max(ldistinct, rdistinct) - matched));
+            result = if (result) |old| @min(old, rows) else rows;
+        }
+        return result orelse @min(left_rows, right_rows);
+    }
+    fn width(self: *const JoinPlanning, mask: usize) f64 {
+        var bytes: f64 = 0;
+        for (self.leaves[0..self.count], 0..) |node, i| if (mask & (@as(usize, 1) << @intCast(i)) != 0) {
+            if (self.prepared) {
+                bytes += self.leaf_widths[i];
+                continue;
+            }
+            const known = if (self.estimate.bytes) |callback| callback(self.estimate.ptr, node) else null;
+            bytes += if (known) |n| @max(8.0, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(@max(1, self.cardinality[i])))) else @as(f64, @floatFromInt(@max(16, node.columns.len * 16)));
+        };
+        return bytes;
+    }
+    fn transitionCost(self: *const JoinPlanning, lmask: usize, rmask: usize, lrows: u64, rrows: u64, output: u64) f64 {
+        const lb = @as(f64, @floatFromInt(lrows)) * self.width(lmask);
+        const rb = @as(f64, @floatFromInt(rrows)) * self.width(rmask);
+        var cost = lb + rb + @as(f64, @floatFromInt(output)) * self.width(lmask | rmask);
+        // Account for hash metadata and serialized state; crossing the memory
+        // grant adds write/read traffic instead of treating spill as free.
+        const build_bytes = @min(lb + @as(f64, @floatFromInt(lrows)) * 32, rb + @as(f64, @floatFromInt(rrows)) * 32);
+        if (build_bytes > @as(f64, @floatFromInt(self.estimate.memory_bytes))) cost += build_bytes * 2;
+        for (self.edges[0..self.edge_count]) |edge| {
+            const l = self.leaf(edge.left);
+            const r = self.leaf(edge.right);
+            if (lmask & (@as(usize, 1) << @intCast(l)) != 0 and rmask == @as(usize, 1) << @intCast(r) and edge.right_indexed) cost = @min(cost, lb + @as(f64, @floatFromInt(lrows)) * 64 + @as(f64, @floatFromInt(output)) * self.width(lmask | rmask));
+            if (rmask & (@as(usize, 1) << @intCast(r)) != 0 and lmask == @as(usize, 1) << @intCast(l) and edge.left_indexed) cost = @min(cost, rb + @as(f64, @floatFromInt(rrows)) * 64 + @as(f64, @floatFromInt(output)) * self.width(lmask | rmask));
+        }
+        return cost;
+    }
+    fn originalCost(self: *const JoinPlanning, node: *const Node, estimates: []const u64) struct { rows: u64, cost: f64, mask: usize } {
         if (node.operation == .join) {
             const left = self.originalCost(node.operation.join.left, estimates);
             const right = self.originalCost(node.operation.join.right, estimates);
-            const rows = @min(left.rows, right.rows);
-            return .{ .rows = rows, .cost = left.cost + right.cost + @as(f64, @floatFromInt(rows)) };
+            const rows = self.joinedRows(left.mask, right.mask, left.rows, right.rows);
+            return .{ .rows = rows, .cost = left.cost + right.cost + self.transitionCost(left.mask, right.mask, left.rows, right.rows, rows), .mask = left.mask | right.mask };
         }
-        for (self.leaves[0..self.count], estimates) |leaf_, rows| if (leaf_ == node) return .{ .rows = rows, .cost = @floatFromInt(rows) };
+        for (self.leaves[0..self.count], estimates, 0..) |leaf_, rows, i| if (leaf_ == node) return .{ .rows = rows, .cost = 0, .mask = @as(usize, 1) << @intCast(i) };
         unreachable;
     }
     fn key(a: Allocator, template: scalar.Program, position: usize, type_: scalar.Type) !scalar.Program {
@@ -2084,6 +2224,7 @@ pub const JoinPlanning = struct {
         const template = original.operation.join.condition.?;
         var left = self.leaves[order[0]];
         var rows = estimates[order[0]];
+        var mask = @as(usize, 1) << @intCast(order[0]);
         for (order[1..], 1..) |next, stage| {
             const right = self.leaves[next];
             const columns = try a.alloc(Column, left.columns.len + right.columns.len);
@@ -2128,7 +2269,9 @@ pub const JoinPlanning = struct {
                 for (logical, permutation.?) |column, *position| position.* = ordinal(columns, column.internal).?;
             }
             const node = try a.create(Node);
-            rows = @min(rows, estimates[next]);
+            const bit = @as(usize, 1) << @intCast(next);
+            rows = self.joinedRows(mask, bit, rows, estimates[next]);
+            mask |= bit;
             node.* = .{ .columns = logical, .operation = .{ .join = .{ .kind = .inner, .left = left, .right = right, .condition = condition, .left_keys = try left_keys.toOwnedSlice(a), .right_keys = try right_keys.toOwnedSlice(a), .output_order = permutation, .estimated_rows = rows } } };
             left = node;
         }
@@ -2168,16 +2311,30 @@ pub const JoinPlanning = struct {
             node.operation.query.source = child;
             return node;
         }
-        var plan: JoinPlanning = .{};
+        var plan: JoinPlanning = .{ .estimate = estimate };
         if (!plan.collect(original) or plan.count < 3) return original;
         var cardinality: [8]u64 = undefined;
         for (plan.leaves[0..plan.count], cardinality[0..plan.count]) |leaf_, *rows| rows.* = estimate.rows(estimate.ptr, leaf_) orelse return original;
+        plan.cardinality = cardinality[0..plan.count];
+        // Negotiate immutable evidence once, outside the DP's subset loops.
+        for (0..plan.count) |i| plan.leaf_widths[i] = plan.width(@as(usize, 1) << @intCast(i));
+        for (plan.edges[0..plan.edge_count]) |*edge| {
+            edge.left_statistics = plan.statistics(edge.left);
+            edge.right_statistics = plan.statistics(edge.right);
+            if (estimate.indexed) |callback| {
+                const l = plan.leaf(edge.left);
+                const r = plan.leaf(edge.right);
+                edge.left_indexed = callback(estimate.ptr, plan.leaves[l], ordinal(plan.leaves[l].columns, edge.left).?);
+                edge.right_indexed = callback(estimate.ptr, plan.leaves[r], ordinal(plan.leaves[r].columns, edge.right).?);
+            }
+        }
+        plan.prepared = true;
         var costs: [256]f64 = @splat(std.math.inf(f64));
         var sizes: [256]u64 = @splat(0);
         var last: [256]u8 = undefined;
         for (cardinality[0..plan.count], 0..) |rows, leaf_| {
             const mask = @as(usize, 1) << @intCast(leaf_);
-            costs[mask] = @floatFromInt(rows);
+            costs[mask] = 0;
             sizes[mask] = rows;
             last[mask] = @intCast(leaf_);
         }
@@ -2187,8 +2344,8 @@ pub const JoinPlanning = struct {
             for (0..plan.count) |next| {
                 const bit = @as(usize, 1) << @intCast(next);
                 if (mask & bit != 0 or plan.crossing(mask, next) == 0) continue;
-                const rows = @min(sizes[mask], cardinality[next]);
-                const cost = costs[mask] + @as(f64, @floatFromInt(cardinality[next])) + @as(f64, @floatFromInt(rows));
+                const rows = plan.joinedRows(mask, bit, sizes[mask], cardinality[next]);
+                const cost = costs[mask] + plan.transitionCost(mask, bit, sizes[mask], cardinality[next], rows);
                 if (cost < costs[mask | bit]) {
                     costs[mask | bit] = cost;
                     sizes[mask | bit] = rows;
@@ -2227,6 +2384,12 @@ test "SQL snapshot join planning reduces connected intermediates and preserves l
         fn rows(_: *anyopaque, node: *const Node) ?u64 {
             return if (node.operation == .scan) (if (node.operation.scan.index == 2) @as(u64, 1) else 1_000_000) else null;
         }
+        fn skewRows(_: *anyopaque, node: *const Node) ?u64 {
+            return if (node.operation.scan.index == 2) 100000 else 1000;
+        }
+        fn statistics(_: *anyopaque, node: *const Node, _: usize) ?catalog.ColumnStatistics {
+            return .{ .name = node.columns[0].name, .distinct_count = if (node.operation.scan.index == 2) 100000 else 1 };
+        }
     };
     var leaves: [3]Node = undefined;
     const names = [_][]const u8{ "a", "b", "c" };
@@ -2245,10 +2408,58 @@ test "SQL snapshot join planning reduces connected intermediates and preserves l
     const first = optimized.operation.join.left.operation.join;
     try std.testing.expect(first.left == &leaves[2] or first.right == &leaves[2]);
     try std.testing.expectEqual(@as(?u64, 1), optimized.operation.join.estimated_rows);
+    // A/B both contain one hot key. Joining the larger distinct C relation
+    // first avoids constructing the million-row A/B intermediate.
+    const skewed = try JoinPlanning.optimize(a, &abc, .{ .ptr = &context, .rows = Helper.skewRows, .column = Helper.statistics });
+    try std.testing.expect(skewed != &abc);
+    const skew_first = skewed.operation.join.left.operation.join;
+    try std.testing.expect(skew_first.left == &leaves[2] or skew_first.right == &leaves[2]);
+    try std.testing.expectEqual(@as(?u64, 1000000), skewed.operation.join.estimated_rows);
     var outer = abc;
     outer.operation.join.kind = .left;
     try std.testing.expectEqual(&outer, try JoinPlanning.optimize(a, &outer, .{ .ptr = &context, .rows = Helper.rows }));
     const conjunction = try Helper.program(a, "a=1 AND a=2", &.{"a"});
     const disjunction = try Helper.program(a, "a=1 OR a=2", &.{"a"});
     try std.testing.expect(JoinPlanning.filteredRows(1024, conjunction) < JoinPlanning.filteredRows(1024, disjunction));
+}
+
+test "SQL join costing accounts for heavy keys nulls unique domains widths and spill" {
+    const Fixture = struct {
+        fn rows(_: *anyopaque, _: *const Node) ?u64 {
+            return 10000;
+        }
+        fn column(raw: *anyopaque, node: *const Node, _: usize) ?catalog.ColumnStatistics {
+            const statistics: *[2]catalog.ColumnStatistics = @ptrCast(@alignCast(raw));
+            return statistics[node.operation.scan.index];
+        }
+        fn bytes(_: *anyopaque, _: *const Node) ?u64 {
+            return 10000 * 1024;
+        }
+    };
+    const lcol = [_]Column{.{ .name = "l", .internal = "l", .qualifier = "l", .type = .integer, .nullable = true }};
+    const rcol = [_]Column{.{ .name = "r", .internal = "r", .qualifier = "r", .type = .integer, .nullable = true }};
+    const left: Node = .{ .columns = &lcol, .operation = .{ .scan = .{ .index = 0, .source_columns = &.{"l"} } } };
+    const right: Node = .{ .columns = &rcol, .operation = .{ .scan = .{ .index = 1, .source_columns = &.{"r"} } } };
+    var statistics = [_]catalog.ColumnStatistics{ .{ .name = "l", .distinct_count = 100 }, .{ .name = "r", .distinct_count = 100 } };
+    var plan: JoinPlanning = .{ .count = 2, .edge_count = 1, .cardinality = &.{ 10000, 10000 }, .estimate = .{ .ptr = &statistics, .rows = Fixture.rows, .column = Fixture.column, .bytes = Fixture.bytes } };
+    plan.leaves[0..2].* = .{ &left, &right };
+    plan.edges[0] = .{ .left = "l", .right = "r", .ltype = .{ .kind = .integer }, .rtype = .{ .kind = .integer } };
+    try std.testing.expectEqual(@as(u64, 1000000), plan.joinedRows(1, 2, 10000, 10000));
+    statistics[0].frequencies = &.{.{ .hash = 7, .rows = 5000 }};
+    statistics[1].frequencies = &.{.{ .hash = 7, .rows = 5000 }};
+    try std.testing.expect(plan.joinedRows(1, 2, 10000, 10000) > 25000000);
+    statistics[0].frequencies = &.{};
+    statistics[1].frequencies = &.{};
+    statistics[0].unique = true;
+    try std.testing.expectEqual(@as(u64, 10000), plan.joinedRows(1, 2, 10000, 10000));
+    statistics[0].non_null_rows = 5000;
+    try std.testing.expectEqual(@as(u64, 10000), plan.joinedRows(1, 2, 10000, 10000));
+    statistics[0].min_integer = 1;
+    statistics[0].max_integer = 4;
+    statistics[1].min_integer = 5;
+    statistics[1].max_integer = 9;
+    try std.testing.expectEqual(@as(u64, 0), plan.joinedRows(1, 2, 10000, 10000));
+    const resident = plan.transitionCost(1, 2, 10000, 10000, 100);
+    plan.estimate.memory_bytes = 4096;
+    try std.testing.expect(plan.transitionCost(1, 2, 10000, 10000, 100) > resident);
 }

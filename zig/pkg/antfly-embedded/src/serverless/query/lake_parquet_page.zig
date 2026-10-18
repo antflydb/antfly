@@ -1131,6 +1131,135 @@ pub fn decodeHybridLevelsAlloc(
     return levels;
 }
 
+/// Null coordinates retain long definition runs and borrow packed membership.
+/// Rank checkpoints bound random gathers to one packed machine word. Fragmented
+/// runs switch to a compact bitmap; no row-sized definition/position array exists.
+pub const DefinitionIndex = struct {
+    const Run = struct { first: usize, count: usize, before: u32, present: ?bool, bytes: []const u8 = &.{}, ranks: []u32 = &.{} };
+    runs: []Run = &.{},
+    bitmap: []u8 = &.{},
+    ranks: []u32 = &.{},
+    count: usize,
+    present: usize,
+    fn bits(bytes: []const u8, begin: usize, end: usize) u32 {
+        var sum: u32 = 0;
+        var i = begin;
+        while (i < end and i % 8 != 0) : (i += 1) sum += (bytes[i / 8] >> @as(u3, @intCast(i % 8))) & 1;
+        while (i + 64 <= end) : (i += 64) sum += @popCount(std.mem.readInt(u64, bytes[i / 8 ..][0..8], .little));
+        while (i + 8 <= end) : (i += 8) sum += @popCount(bytes[i / 8]);
+        while (i < end) : (i += 1) sum += (bytes[i / 8] >> @as(u3, @intCast(i % 8))) & 1;
+        return sum;
+    }
+    fn checkpoints(a: Allocator, bytes: []const u8, count: usize) ![]u32 {
+        const ranks = try a.alloc(u32, (count + 63) / 64);
+        var before: u32 = 0;
+        for (ranks, 0..) |*rank, i| {
+            rank.* = before;
+            before += bits(bytes, i * 64, @min(count, (i + 1) * 64));
+        }
+        return ranks;
+    }
+    pub fn init(a: Allocator, bytes: []const u8, count: usize) !DefinitionIndex {
+        if (count > max_values_per_page) return error.ParquetPageTooLarge;
+        var reader: LevelReader = .{ .bytes = bytes };
+        var first: usize = 0;
+        var total: usize = 0;
+        var n: usize = 0;
+        var packed_checkpoints: usize = 0;
+        while (first < count) {
+            const run = try HybridIndex.next(&reader, first, count - first, 1);
+            if (run.repeated) |value| {
+                if (value > 1) return error.InvalidParquetPage;
+                if (value == 1) total += run.count;
+            } else {
+                total += bits(run.packed_bytes, 0, run.count);
+                packed_checkpoints += (run.count + 63) / 64;
+            }
+            first += run.count;
+            n += 1;
+        }
+        if (reader.cursor != bytes.len) return error.InvalidParquetPage;
+        var self: DefinitionIndex = .{ .count = count, .present = total };
+        if (total == 0 or total == count) return self;
+        errdefer self.deinit(a);
+        reader.cursor = 0;
+        first = 0;
+        if (n * @sizeOf(Run) + packed_checkpoints * 4 > (count + 7) / 8 + ((count + 63) / 64) * 4) {
+            self.bitmap = try a.alloc(u8, (count + 7) / 8);
+            @memset(self.bitmap, 0);
+            while (first < count) {
+                const run = try HybridIndex.next(&reader, first, count - first, 1);
+                for (0..run.count) |i| {
+                    const value = run.repeated orelse ((run.packed_bytes[i / 8] >> @as(u3, @intCast(i % 8))) & 1);
+                    self.bitmap[(first + i) / 8] |= @as(u8, @intCast(value)) << @as(u3, @intCast((first + i) % 8));
+                }
+                first += run.count;
+            }
+            self.ranks = try checkpoints(a, self.bitmap, count);
+        } else {
+            self.runs = try a.alloc(Run, n);
+            // Initialize every rank owner before any fallible allocation.
+            for (self.runs) |*run| run.* = .{ .first = 0, .count = 0, .before = 0, .present = false };
+            var before: u32 = 0;
+            for (self.runs) |*out| {
+                const run = try HybridIndex.next(&reader, first, count - first, 1);
+                out.* = .{ .first = first, .count = run.count, .before = before, .present = if (run.repeated) |value| value == 1 else null, .bytes = run.packed_bytes };
+                if (out.present) |value| {
+                    if (value) before += @intCast(run.count);
+                } else {
+                    out.ranks = try checkpoints(a, run.packed_bytes, run.count);
+                    before += bits(run.packed_bytes, 0, run.count);
+                }
+                first += run.count;
+            }
+        }
+        return self;
+    }
+    pub fn deinit(self: DefinitionIndex, a: Allocator) void {
+        for (self.runs) |run| a.free(run.ranks);
+        a.free(self.runs);
+        a.free(self.bitmap);
+        a.free(self.ranks);
+    }
+    fn runAt(self: DefinitionIndex, row: usize) Run {
+        var lo: usize = 0;
+        var hi = self.runs.len;
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.runs[mid].first <= row) lo = mid else hi = mid;
+        }
+        return self.runs[lo];
+    }
+    fn packedPosition(bytes: []const u8, ranks: []const u32, row: usize) ?u32 {
+        const offset = row / 64 * 8;
+        const word = if (bytes.len - offset >= 8) std.mem.readInt(u64, bytes[offset..][0..8], .little) else tail: {
+            var buffer: [8]u8 = @splat(0);
+            @memcpy(buffer[0 .. bytes.len - offset], bytes[offset..]);
+            break :tail std.mem.readInt(u64, &buffer, .little);
+        };
+        const bit = @as(u64, 1) << @as(u6, @intCast(row % 64));
+        if (word & bit == 0) return null;
+        return ranks[row / 64] + @popCount(word & (bit - 1));
+    }
+    pub fn position(self: DefinitionIndex, row: usize) ?u32 {
+        std.debug.assert(row < self.count);
+        if (self.present == self.count) return @intCast(row);
+        if (self.present == 0) return null;
+        if (self.bitmap.len != 0) return packedPosition(self.bitmap, self.ranks, row);
+        const run = self.runAt(row);
+        const relative = row - run.first;
+        if (run.present) |value| return if (value) run.before + @as(u32, @intCast(relative)) else null;
+        return run.before + (packedPosition(run.bytes, run.ranks, relative) orelse return null);
+    }
+    /// End of a known all-present/all-absent interval, otherwise one lane.
+    pub fn intervalEnd(self: DefinitionIndex, row: usize) usize {
+        if (self.present == self.count or self.present == 0) return self.count;
+        if (self.bitmap.len != 0) return row + 1;
+        const run = self.runAt(row);
+        return if (run.present != null) run.first + run.count else row + 1;
+    }
+};
+
 /// Validated dictionary IDs retain hybrid runs when that is smaller than a
 /// flat vector. Packed payloads borrow their enclosing immutable page.
 pub const HybridIndex = struct {
@@ -4441,4 +4570,45 @@ test "lake SQL packed dictionary byte kernels agree with bitwise decoding at eve
     }
     try std.testing.expectError(error.InvalidParquetPage, readPackedValueU32(&.{0}, 0, 9));
     try std.testing.expectError(error.InvalidParquetPage, readPackedValueU32(&encoded, std.math.maxInt(usize), 32));
+}
+
+fn definitionRankScenario(a: Allocator) !void {
+    const full = try DefinitionIndex.init(a, &.{ 0x80, 0x20, 1 }, 2048);
+    defer full.deinit(a);
+    try std.testing.expect(full.runs.len == 0 and full.bitmap.len == 0);
+    try std.testing.expectEqual(@as(?u32, 2047), full.position(2047));
+    const half = try DefinitionIndex.init(a, &.{ 0x80, 0x10, 0, 0x80, 0x10, 1 }, 2048);
+    defer half.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), half.runs.len);
+    try std.testing.expectEqual(@as(?u32, null), half.position(1023));
+    try std.testing.expectEqual(@as(?u32, 0), half.position(1024));
+    try std.testing.expectEqual(@as(?u32, 1023), half.position(2047));
+    var encoded: [66]u8 = undefined;
+    encoded[0..2].* = .{ 0x81, 1 };
+    for (encoded[2..], 0..) |*byte, i| byte.* = @truncate(i *% 73 +% 151);
+    const mixed = try DefinitionIndex.init(a, &encoded, 509);
+    defer mixed.deinit(a);
+    var present: u32 = 0;
+    for (0..509) |row| {
+        const is_present = (encoded[2 + row / 8] >> @as(u3, @intCast(row % 8))) & 1 != 0;
+        try std.testing.expectEqual(if (is_present) @as(?u32, present) else null, mixed.position(row));
+        present += @intFromBool(is_present);
+    }
+    try std.testing.expectEqual(present, mixed.present);
+    var fragmented: [200]u8 = undefined;
+    for (0..100) |i| {
+        fragmented[i * 2] = 2;
+        fragmented[i * 2 + 1] = @intCast(i % 2);
+    }
+    const dense = try DefinitionIndex.init(a, &fragmented, 100);
+    defer dense.deinit(a);
+    try std.testing.expect(dense.bitmap.len < 20 and dense.runs.len == 0);
+    for (0..100) |row| try std.testing.expectEqual(if (row % 2 == 0) @as(?u32, null) else @as(?u32, @intCast(row / 2)), dense.position(row));
+}
+test "lake SQL nullable definition ranks retain runs compact packed bits and unwind allocations" {
+    try definitionRankScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, definitionRankScenario, .{});
+    try std.testing.expectError(error.InvalidParquetPage, DefinitionIndex.init(std.testing.allocator, &.{ 2, 2 }, 1));
+    try std.testing.expectError(error.InvalidParquetPage, DefinitionIndex.init(std.testing.allocator, &.{0x80}, 2048));
+    try std.testing.expectError(error.InvalidParquetPage, DefinitionIndex.init(std.testing.allocator, &.{ 2, 1, 0 }, 1));
 }

@@ -1343,6 +1343,7 @@ pub const Adapter = struct {
                 .split_scan = if (child.split_scan != null) splitScan else null,
                 .split_ordered = if (child.split_ordered != null) splitOrdered else null,
                 .order_satisfied = child.order_satisfied,
+                .column_statistics = child.column_statistics,
                 .estimated_filtered_rows = child.estimated_filtered_rows,
                 .estimated_rows = child.estimated_rows,
                 .estimated_bytes = child.estimated_bytes,

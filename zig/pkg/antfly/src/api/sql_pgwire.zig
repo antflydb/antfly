@@ -1263,6 +1263,7 @@ const GuardedCatalog = struct {
         }
         fn cursor(self: *@This(), release: *const fn (*anyopaque) void) catalog.Cursor {
             return .{
+                .column_statistics = self.inner.column_statistics,
                 .estimated_filtered_rows = self.inner.estimated_filtered_rows,
                 .estimated_rows = self.inner.estimated_rows,
                 .estimated_bytes = self.inner.estimated_bytes,

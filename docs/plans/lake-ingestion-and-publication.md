@@ -1786,3 +1786,27 @@ the run. Formatting, Python lint, whitespace, staged license headers and the
 Apache boundary (2,076 sources) passed. Latest fetched origin/main `968f037c9a`
 is included. Representative archive-scale latency/RSS and live-provider retention
 qualification remain deferred.
+
+
+### Advisory SQL statistics and native page/expression ownership
+
+SQL planning reads only statistics already owned by the captured publication or
+scan cursor. Parquet footer null/distinct counts persist in inventory v19, with
+backward reads of supported older inventories. A bounded metadata pass exposes
+key domains, observed constant-group frequencies and row-width estimates; no planner
+operation opens a source footer or enumerates a lazy inventory. Costing accounts
+for equality fanout, NULLs, uniqueness, skew, retained build size and spill I/O.
+Unknown NDV remains advisory, including estimates formed by merging group counts.
+These statistics have no source-authority or row-pruning role.
+
+Runtime join filters follow identity lineage across total projection/filter
+frames. Both access-path selection and filter installation use the same physical
+column mapping. Ordering, cardinality, invocation, aggregation/window and fallible
+expression boundaries stop that mapping. Indexed probes can therefore serve safe
+renamed derived tables while preserving the original producer's evaluation rules.
+
+Nullable page coordinates retain RLE runs or packed membership/rank directories;
+they do not require a page-sized ordinal vector. Native decimal expression results
+own checked coefficient vectors and SQL-null flags until the downstream operator
+releases them. Unsupported rounding/scale/precision cases retain exact scalar
+execution, and scalar delivery owns any materialized canonical numeric values.

@@ -4309,8 +4309,15 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
                 },
             },
         )
+        derived_statement = "SELECT p.v,p.join_key FROM (SELECT v,k AS join_key FROM join_probe WHERE v>=0) p JOIN (VALUES(0),(0),(8191),(NULL)) b(k) ON p.join_key=b.k ORDER BY p.v,p.join_key"
         large_statement = "SELECT COUNT(*) FROM join_probe p JOIN (SELECT k FROM join_build) b ON p.k=b.k"
         assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
+        assert (
+            call("POST", "/sql", {"statement": derived_statement, "limit": 2048})[
+                "rows"
+            ]
+            == expected
+        )
         server.pause()
         if covering:
             # Preserve object identity/footer while making every physical data
@@ -4329,6 +4336,12 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
             == expected
         )
         assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
+        assert (
+            call("POST", "/sql", {"statement": derived_statement, "limit": 2048})[
+                "rows"
+            ]
+            == expected
+        )
         failed = False
     finally:
         server.stop(test_failed=failed)
@@ -5627,6 +5640,41 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
         divisible = [i for i in expected if i % 3 == 0]
         first_order = None
         first_ids = None
+        # Inference preserves the existing decimal-as-string read contract.
+        # Explicit NUMERIC selects native coefficients for arithmetic execution.
+        call(
+            "POST",
+            "/tables/skew_numeric",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "skew-numeric",
+                        "format": "parquet",
+                        "object_mutability": "immutable",
+                        "uri": root.as_uri(),
+                    },
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "amount": {"type": "integer"},
+                                    "amount_decimal": {
+                                        "type": "number",
+                                        "x-antfly-sql-type": "numeric",
+                                    },
+                                },
+                                "additionalProperties": False,
+                            }
+                        }
+                    },
+                },
+            },
+        )
         for _ in range(2):
             server.restart()
             with (
@@ -5669,6 +5717,17 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                     "statement": "SELECT amount_decimal = '2.50' FROM skew_scan WHERE amount >= 250 AND amount <= 252 ORDER BY amount"
                 },
             )["rows"] == [[True], [False], [False]]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount_decimal + 1.25, -(amount_decimal * 2.00), amount_decimal * amount, amount_decimal % 2.00, amount_decimal / 2.00 FROM skew_numeric WHERE amount >= 250 AND amount <= 252 ORDER BY amount"
+                },
+            )["rows"] == [
+                ["3.75", "-5.0000", "625.00", "0.50", "1.25000000000000000000"],
+                ["3.76", "-5.0200", "630.01", "0.51", "1.25500000000000000000"],
+                ["3.77", "-5.0400", "635.04", "0.52", "1.26000000000000000000"],
+            ]
             delivered = []
             with (
                 psycopg.connect(

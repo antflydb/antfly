@@ -859,24 +859,52 @@ fn Engine(comptime Context: type) type {
                 else => null,
             };
         }
-        fn exactProbe(self: *Self, node: *const binding.Node, keys_: []const scalar.Program) !bool {
-            if (node.operation != .scan or keys_.len == 0 or keys_.len > 64) return false;
-            const scan = node.operation.scan;
-            const cursor = self.cursors[scan.index];
-            const wants = cursor.wants_exact_filter orelse return false;
-            if (cursor.set_dynamic_filter == null) return false;
-            var columns: [64]@import("dynamic_filter.zig").Column = undefined;
-            for (keys_, columns[0..keys_.len]) |program, *column| {
-                if (program.instructions.len != 1 or program.root != 0 or program.instructions[0].operation != .column) return false;
+        fn columnStatistics(self: *Self, node: *const binding.Node, position: usize) ?catalog.ColumnStatistics {
+            const lineage = binding.scanColumn(node, position) orelse return null;
+            for (self.cursors[lineage.scan_index].column_statistics) |statistics| if (std.mem.eql(u8, statistics.name, lineage.name)) return statistics;
+            if (std.mem.eql(u8, lineage.name, "_id")) return .{ .name = lineage.name, .unique = true };
+            return null;
+        }
+        fn estimateBytes(self: *Self, node: *const binding.Node) ?u64 {
+            const row_count = self.estimate(node) orelse return null;
+            var width: u64 = 0;
+            for (node.columns, 0..) |column, i| {
+                const statistics = self.columnStatistics(node, i);
+                width +|= if (statistics != null and statistics.?.average_bytes != null) statistics.?.average_bytes.? else switch (column.type) {
+                    .boolean => @as(u64, 1),
+                    .integer, .datetime => 8,
+                    .number => if (column.element_type == .numeric) @as(u64, 16) else 8,
+                    .string => 32,
+                    else => 64,
+                };
+            }
+            return row_count *| @max(8, width);
+        }
+        fn probeColumns(_: *Self, node: *const binding.Node, programs: []const scalar.Program, columns: []@import("dynamic_filter.zig").Column) ?usize {
+            if (programs.len == 0 or columns.len != programs.len) return null;
+            var scan_index: ?usize = null;
+            for (programs, columns) |program, *column| {
+                if (program.instructions.len != 1 or program.root != 0 or program.instructions[0].operation != .column) return null;
                 const instruction = program.instructions[0];
-                const kind = instruction.type.kind orelse return false;
+                const lineage = binding.scanColumn(node, instruction.operation.column) orelse return null;
+                if (scan_index != null and scan_index.? != lineage.scan_index) return null;
+                scan_index = lineage.scan_index;
+                const kind = instruction.type.kind orelse return null;
                 switch (kind) {
                     .integer, .number, .string, .boolean => {},
-                    else => return false,
+                    else => return null,
                 }
-                if (instruction.operation.column >= scan.source_columns.len) return false;
-                column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind, .element_type = instruction.type.element_type };
+                column.* = .{ .name = lineage.name, .type = kind, .element_type = instruction.type.element_type };
             }
+            return scan_index;
+        }
+        fn exactProbe(self: *Self, node: *const binding.Node, keys_: []const scalar.Program) !bool {
+            if (keys_.len > 64) return false;
+            var columns: [64]@import("dynamic_filter.zig").Column = undefined;
+            const index = self.probeColumns(node, keys_, columns[0..keys_.len]) orelse return false;
+            const cursor = self.cursors[index];
+            const wants = cursor.wants_exact_filter orelse return false;
+            if (cursor.set_dynamic_filter == null) return false;
             return wants(cursor.ptr, columns[0..keys_.len]);
         }
         fn preferLeftBuild(self: *Self, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) !bool {
@@ -889,7 +917,11 @@ fn Engine(comptime Context: type) type {
             const right_probe = join.kind != .right and join.kind != .full and try self.exactProbe(right, join.right_keys);
             if (left_probe != right_probe) return right_probe;
             if (self.estimate(left)) |l| {
-                if (self.estimate(right)) |r| return l < r;
+                if (self.estimate(right)) |r| {
+                    const left_bytes = (self.estimateBytes(left) orelse l *| @as(u64, @intCast(@max(16, left.columns.len * 16)))) +| l *| 32;
+                    const right_bytes = (self.estimateBytes(right) orelse r *| @as(u64, @intCast(@max(16, right.columns.len * 16)))) +| r *| 32;
+                    return left_bytes < right_bytes;
+                }
                 // A compiler-owned singleton/constant frame is a bounded
                 // build even when a physical source has no row estimate.
                 // Building the unknown side would eagerly consume the entire
@@ -934,6 +966,7 @@ fn Engine(comptime Context: type) type {
             probe_input_error: ?anyerror = null,
             probe_source_exhausted: bool = false,
             scan_filter: ?*@import("dynamic_filter.zig").Filter = null,
+            scan_filter_cursor: ?usize = null,
             left_values: ?[]const Datum = null,
             left_matched: bool = false,
             unmatched_index: usize = 0,
@@ -1955,23 +1988,12 @@ fn Engine(comptime Context: type) type {
                 return distinct.count() * 4 <= batch.len() * 3;
             }
             pub fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
-                const probe = self.left.?;
-                if (probe.node.operation != .scan or programs.len == 0) return;
-                const scan = probe.node.operation.scan;
-                const cursor = self.engine.cursors[scan.index];
-                if (cursor.set_dynamic_filter == null) return;
                 const columns = try self.engine.context.alloc.alloc(@import("dynamic_filter.zig").Column, programs.len);
                 defer self.engine.context.alloc.free(columns);
-                for (programs, columns) |program, *column| {
-                    if (program.instructions.len != 1 or program.instructions[program.root].operation != .column) return;
-                    const instruction = program.instructions[program.root];
-                    const kind = instruction.type.kind orelse return;
-                    switch (kind) {
-                        .integer, .number, .string, .boolean => {},
-                        else => return,
-                    }
-                    column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind, .element_type = instruction.type.element_type };
-                }
+                const index = self.engine.probeColumns(self.left.?.node, programs, columns) orelse return;
+                const cursor = self.engine.cursors[index];
+                if (cursor.set_dynamic_filter == null) return;
+                self.scan_filter_cursor = index;
                 const exact = if (cursor.wants_exact_filter) |wants| try wants(cursor.ptr, columns) else false;
                 self.scan_filter = try @import("dynamic_filter.zig").Filter.createWithSpill(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32, if (exact) self.engine.context.spill else null);
             }
@@ -2079,8 +2101,7 @@ fn Engine(comptime Context: type) type {
                     }
                     if (self.scan_filter) |filter| {
                         filter.sealed = true;
-                        const scan = self.left.?.node.operation.scan;
-                        const cursor = self.engine.cursors[scan.index];
+                        const cursor = self.engine.cursors[self.scan_filter_cursor.?];
                         _ = try cursor.set_dynamic_filter.?(cursor.ptr, filter);
                     }
                     if (self.partition_join) |owner| {
@@ -2312,10 +2333,27 @@ fn Source(comptime Context: type) type {
                     const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
                     return engine.estimate(node);
                 }
+                fn column(raw: *anyopaque, node: *const binding.Node, position: usize) ?catalog.ColumnStatistics {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    return engine.columnStatistics(node, position);
+                }
+                fn bytes(raw: *anyopaque, node: *const binding.Node) ?u64 {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    return engine.estimateBytes(node);
+                }
+                fn indexed(raw: *anyopaque, node: *const binding.Node, position: usize) bool {
+                    const engine: *Engine(Context) = @ptrCast(@alignCast(raw));
+                    const lineage = binding.scanColumn(node, position) orelse return false;
+                    const cursor = engine.cursors[lineage.scan_index];
+                    const wants = cursor.wants_exact_filter orelse return false;
+                    if (cursor.set_dynamic_filter == null) return false;
+                    const kind = node.columns[position];
+                    return wants(cursor.ptr, &.{.{ .name = lineage.name, .type = kind.type, .element_type = kind.element_type }}) catch false;
+                }
             };
             self.engine.planning_budget = .{ .backing = context.alloc, .limit = @min(512 * 1024, context.limits.retained_bytes / 16) };
             self.engine.planning_arena = .init(self.engine.planning_budget.allocator());
-            const root = binding.JoinPlanning.optimize(self.engine.planning_arena.?.allocator(), relation.root, .{ .ptr = &self.engine, .rows = Estimate.rows }) catch |err| fallback: {
+            const root = binding.JoinPlanning.optimize(self.engine.planning_arena.?.allocator(), relation.root, .{ .ptr = &self.engine, .rows = Estimate.rows, .column = Estimate.column, .bytes = Estimate.bytes, .indexed = Estimate.indexed, .memory_bytes = context.limits.retained_bytes / 4 }) catch |err| fallback: {
                 if (err != error.OutOfMemory or !self.engine.planning_budget.isExhausted()) return err;
                 _ = self.engine.planning_arena.?.reset(.free_all);
                 break :fallback relation.root;
@@ -2625,5 +2663,35 @@ test "SQL costed inner join execution preserves aliases duplicate keys NULLs and
     const pair_text = try std.json.Stringify.valueAlloc(a, paired.output.rows, .{});
     defer a.free(pair_text);
     try std.testing.expectEqualStrings("[[\"10\",\"20\"],[\"11\",\"20\"]]", pair_text);
-    try std.testing.expectEqual(@as(usize, 3), Fixture.indexed_installs);
+    for ([_][]const u8{
+        "SELECT a.v,b.v FROM (SELECT v,k AS join_key FROM a WHERE v>0) a JOIN b ON a.join_key=b.k ORDER BY a.v",
+        "SELECT a.v,b.v FROM (SELECT v,join_key FROM (SELECT v,k AS join_key FROM a WHERE v>0) inner_a WHERE v<100) a JOIN b ON a.join_key=b.k ORDER BY a.v",
+    }) |sql| {
+        var derived = try @import("compiler.zig").compile(a, sql, .{});
+        defer derived.deinit();
+        var filtered = try @import("runtime.zig").execute(a, backend, &derived, &.{}, .{});
+        defer filtered.deinit();
+        const derived_text = try std.json.Stringify.valueAlloc(a, filtered.output.rows, .{});
+        defer a.free(derived_text);
+        try std.testing.expectEqualStrings("[[\"10\",\"20\"],[\"11\",\"20\"]]", derived_text);
+    }
+    try std.testing.expectEqual(@as(usize, 5), Fixture.indexed_installs);
+    for ([_]struct { sql: []const u8, transparent: bool }{
+        .{ .sql = "SELECT k FROM a WHERE v>0", .transparent = true },
+        .{ .sql = "SELECT k FROM a LIMIT 1", .transparent = false },
+        .{ .sql = "SELECT k FROM a ORDER BY v", .transparent = false },
+        .{ .sql = "SELECT k+1 FROM a", .transparent = false },
+        .{ .sql = "SELECT CAST(k AS TEXT) FROM a", .transparent = false },
+        .{ .sql = "SELECT k FROM a WHERE 1/0=0", .transparent = false },
+        .{ .sql = "SELECT COUNT(*) FROM a", .transparent = false },
+    }) |case| {
+        const sql = try std.fmt.allocPrint(a, "SELECT * FROM ({s}) AS derived", .{case.sql});
+        defer a.free(sql);
+        var statement = try @import("compiler.zig").compile(a, sql, .{});
+        defer statement.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const bound = try describe.bind(arena.allocator(), backend, &statement, &.{});
+        try std.testing.expectEqual(case.transparent, binding.scanColumn(bound.relation.?.root, 0) != null);
+    }
 }

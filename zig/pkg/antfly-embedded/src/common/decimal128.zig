@@ -18,11 +18,14 @@ const std = @import("std");
 pub fn validate(precision: i32, scale: i32) !void {
     if (precision < 1 or precision > 38 or scale < 0 or scale > precision) return error.UnsupportedDecimal128;
 }
-pub fn validateCoefficient(value: i128, precision: i32, scale: i32) !void {
+pub fn coefficientLimit(precision: i32, scale: i32) !u128 {
     try validate(precision, scale);
     var maximum: u128 = 1;
     for (0..@intCast(precision)) |_| maximum *= 10;
-    if (@abs(value) >= maximum) return error.InvalidDecimal128;
+    return maximum;
+}
+pub fn validateCoefficient(value: i128, precision: i32, scale: i32) !void {
+    if (@abs(value) >= try coefficientLimit(precision, scale)) return error.InvalidDecimal128;
 }
 pub fn formatAlloc(a: std.mem.Allocator, unscaled: i128, precision: i32, scale: i32) ![]u8 {
     try validate(precision, scale);

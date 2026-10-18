@@ -5616,3 +5616,71 @@ provider fixture, production-linked ABI probe and localhost TLS fixtures.
 Post-merge source/error catalog and Apache boundary checks passed. Real-provider
 retention qualification and representative archive-scale latency/RSS remain
 deferred.
+
+
+## Native planning and nullable/decimal kernel refinements
+
+Identity join-key lineage now crosses bounded, effect-free projection/filter
+frames, including nested aliases and reordered output columns. Exact-index
+capability negotiation and runtime-filter installation share the same lineage.
+LIMIT/OFFSET, cardinality checks, ordering, aggregates, windows, invocation
+references and computed or fallible projections/predicates remain opaque.
+The filter stays borrowed until the statement closes; no source is pulled to
+negotiate it. Existing join-kind rules still protect preserved outer rows.
+Cold covering-index E2Es also join a filtered, renamed derived table after the
+original Parquet data pages have been made unreadable.
+
+Snapshot cursors can expose advisory column statistics: distinct/non-null counts,
+population, uniqueness, integer domains, average width and up to 32 semantic
+key frequencies. Captured resident Parquet metadata supplies these without
+additional object requests; optional preparation declines above 512 files,
+8,192 column chunks or 256 requested columns. Footer null/distinct counts now
+survive inventory format v19; v18 and earlier supported inventories still read.
+Absent global NDV sketches, merged per-group distinct counts and integer domains
+remain estimates. Constant row groups contribute bounded heavy-key observations.
+The bounded join enumerator caches metadata/capabilities once, costs equality
+fanout and hot keys, row-width estimates, indexed probes and spill write/read traffic.
+Build orientation compares estimated retained bytes while preserving an available
+exact probe. Statistics never limit rows, prove pruning, or replace exact matches.
+
+Nullable Parquet pages retain repeated definition runs or packed membership plus
+64-lane rank checkpoints. Homogeneous present/absent pages need no per-row
+coordinate storage; fragmented streams use a compact bitmap. Gathers use one
+machine-word popcount instead of scanning definition bytes. Predicate masks can
+skip whole null intervals and intersect repeated dictionary-ID runs with present
+intervals. All framing and logical IDs are still validated before publication.
+
+Decimal expression kernels support nested addition, subtraction, multiplication,
+remainder, division and signs over native coefficients, integer columns and
+constant operands. Scale alignment and arithmetic are checked. Division shares
+the exact kernel's PostgreSQL display-scale rule and rounds half away using
+bounded integer quotient/remainder operations. A cohort needing different
+per-row division scales, wider precision/scale, special values, type modifiers
+or intermediate overflow retains the exact scalar path. Owned coefficient
+outputs keep their native decimal trait through projection, hashing and reduction;
+scalar/wire boundaries materialize canonical limbs only for consumed cells.
+Metadata precision limits are validated once per vector.
+
+Archive-scale latency/RSS measurements and real-provider retention qualification
+remain deferred. These refinements do not claim a measured archive speedup.
+
+Qualification after merging origin/main `1b4b255aae`: all 1,024 SQL tests passed
+(798 core and 226 API; three opt-in benchmarks skipped), and all 529 native lake
+tests passed (211 shared and 318 API), without failures or leaks. The runtime I/O
+ABI gate passed, as did all 40 runtime error/native ABI checks. Five focused
+inventory compatibility, statistics, definition-rank allocation-failure and
+nullable dictionary budget checks passed; a 65,536-row optional dictionary page
+fits the 16 KiB decode grant without expanded definition/ordinal arrays.
+
+The real-file suite passed 55 cases in its full run. Its new arithmetic fixture
+initially used an inferred string column; retaining that coverage and adding an
+explicit NUMERIC attachment over the same files fixed the fixture. The corrected
+streaming/arithmetic case passed across two cold restarts in 14.07 seconds, so
+all 56 Parquet/Iceberg cases are covered. All six credential-rejection startup
+cases also passed after the main merge. The CLI SHA-256 stayed
+`372501d99c8dd1c7506817979826c5f3dd906239a0e454a0a0e8ab5232763a26`
+through these runs. Zig/Python formatting, lint, source/error catalogs, license
+headers, whitespace and the Apache boundary passed. Repository cache GC completed
+and preserved active build output; uv pruning timed out on the shared cache lock
+without interrupting its owner. Archive benchmarks and live retention qualification
+remain deferred.
