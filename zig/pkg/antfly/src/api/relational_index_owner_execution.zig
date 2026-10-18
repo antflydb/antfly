@@ -56,7 +56,7 @@ pub const Request = struct {
         try self.lookup(.permission).validate();
     }
 
-    fn lookup(self: Request, projection: @FieldType(publication.OwnerRequest, "projection")) publication.OwnerRequest {
+    pub fn lookup(self: Request, projection: @FieldType(publication.OwnerRequest, "projection")) publication.OwnerRequest {
         return .{
             .table_id = self.table_id,
             .group_id = self.group_id,
@@ -80,6 +80,7 @@ pub const Request = struct {
 /// outcome without a receipt is durable progress, not a fenced/reserved ACK.
 pub const Result = union(enum) {
     acknowledged,
+    raft: RaftControlResponse,
     recovered: struct {
         /// Copied from the lease that recovered the committed physical cut;
         /// never substitute a later current-root observation when signing.
@@ -109,7 +110,7 @@ pub const Result = union(enum) {
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
-            .acknowledged => {},
+            .acknowledged, .raft => {},
             .recovered => |value| value.deinit(),
             .applied => |value| value.deinit(),
             .controlled => |value| value.outcome.deinit(),
@@ -125,7 +126,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .building, .source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .building, .source, .installing, .releasing, .canceling => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -136,6 +137,7 @@ pub const Result = union(enum) {
     /// for signing from current routing after this result's lease was released.
     pub fn rootGeneration(self: *const Result) ?u64 {
         return switch (self.*) {
+            .raft => |value| value.root_generation,
             .recovered => |value| value.root_generation,
             .controlled => |value| value.root_generation,
             .building => |value| value.root_generation,
@@ -155,7 +157,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .applied, .building, .source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .applied, .building, .source, .installing, .releasing, .canceling => null,
         };
     }
 
@@ -277,6 +279,7 @@ pub const Result = union(enum) {
     pub fn response(self: *const Result) !ControlResponse {
         return switch (self.*) {
             .acknowledged => .acknowledged,
+            .raft => |value| .{ .raft = value },
             .applied => |value| .{ .admitted = value.value },
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
@@ -424,8 +427,33 @@ const InstallationResult = struct {
 
 /// Internal progress only. Neither the applying-root generation nor an unsigned
 /// logical receipt grants metadata publication authority to a remote caller.
+/// A Raft receipt is never projected into a native clock or native outcome.
+/// The observation owns no slices and remains valid after the owner lease ends.
+pub const RaftControlResponse = struct {
+    root_generation: u64,
+    observation: local.storage_db_relational_index_raft_contract.Observation,
+    signed_ack: ?publication.Ack = null,
+    signing_failure: ?SigningFailure = null,
+
+    pub fn validate(self: @This(), request: Request) !void {
+        try request.validate(request.group_id);
+        if ((request.operation != .fence and request.operation != .reserve) or self.root_generation == 0) return error.InvalidControlReceiptPosition;
+        const binding = self.observation.binding orelse return error.PrivateIndexRootRecoveryRequired;
+        if (binding.fence.namespace.table_id != request.table_id) return error.PrivateIndexOwnerJobChanged;
+        try self.observation.validate(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id });
+        const receipt = if (request.operation == .fence) self.observation.fenced else self.observation.reserved;
+        if (self.signed_ack) |ack| {
+            if (self.signing_failure != null or ack.table_id != request.table_id or ack.signed.proof.authority != .raft or
+                ack.signed.proof.root_generation != self.root_generation or !std.meta.eql(ack.signed.receipt, receipt orelse return error.InvalidControlReceiptPosition)) return error.InvalidControlReceiptPosition;
+            try ack.validate();
+        }
+        if (self.signing_failure != null and receipt == null) return error.InvalidControlReceiptPosition;
+    }
+};
+
 pub const ControlResponse = union(enum) {
     acknowledged,
+    raft: RaftControlResponse,
     admitted: native.Outcome,
     controlled: RootedOutcome,
     recovered: RootedOutcome,
@@ -476,6 +504,7 @@ pub const ControlResponse = union(enum) {
         try request.validate(request.group_id);
         const outcome: native.Outcome = switch (self) {
             .acknowledged => return,
+            .raft => |value| return value.validate(request),
             .source => |value| return value.validate(request),
             .installing => |value| return value.validate(request),
             .releasing => |value| return value.validate(request),
@@ -1373,6 +1402,14 @@ fn requireCancellationProgress(result: native.CleanupOutcome, expected: ?jobs.Bi
 }
 
 fn decision(alloc: std.mem.Allocator, metadata: anytype, request: publication.OwnerRequest, context: operation.RequestContext) !std.json.Parsed(publication.OwnerDecision) {
+    return decisionForAuthority(alloc, metadata, request, context, .native);
+}
+
+pub fn raftDecision(alloc: std.mem.Allocator, metadata: anytype, request: publication.OwnerRequest, context: operation.RequestContext) !std.json.Parsed(publication.OwnerDecision) {
+    return decisionForAuthority(alloc, metadata, request, context, .raft);
+}
+
+fn decisionForAuthority(alloc: std.mem.Allocator, metadata: anytype, request: publication.OwnerRequest, context: operation.RequestContext, expected: local.storage_db_relational_index_publication_progress.Authority) !std.json.Parsed(publication.OwnerDecision) {
     try context.ensureActive();
     var authority = context;
     authority.index_publication_authority = true;
@@ -1382,7 +1419,7 @@ fn decision(alloc: std.mem.Allocator, metadata: anytype, request: publication.Ow
     var parsed = try std.json.parseFromSlice(publication.OwnerDecision, alloc, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     errdefer parsed.deinit();
     try parsed.value.requireRequest(request);
-    if (parsed.value.owner.owner.authority != .native) return error.UnsupportedNativeIndexOwner;
+    if (parsed.value.owner.owner.authority != expected) return error.UnsupportedNativeIndexOwner;
     return parsed;
 }
 

@@ -412,6 +412,14 @@ const DataRaftBatchRoute = struct {
     /// Exact private bootstrap for an unpublished initial FK child. Only the
     /// metadata-authorized initial-child control path may supply this.
     initial_child_bootstrap: ?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap = null,
+    /// Process-local permission fetched by the authenticated owner receiver.
+    /// Never serialized or inherited by an ordinary/forwarded batch request.
+    index_owner_permission: ?struct {
+        decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision,
+        request: @import("../metadata/relational_index_publication.zig").OwnerRequest,
+        root_generation: u64,
+        context: antfly.public_api.operation.RequestContext,
+    } = null,
 };
 
 const DataRaftBatchForwardState = struct {
@@ -11643,6 +11651,8 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         try request.validate(group_id);
+        if (self.api_server_cfg.deployment_mode == .distributed and self.data_raft != null)
+            return self.raftIndexOwnerControl(alloc, table_name, group_id, request, context);
         // This native receiver cannot borrow a data-Raft leader's authority.
         if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
         const owners = try self.ensureKernelOwnerSource();
@@ -11651,6 +11661,89 @@ pub const DataServer = struct {
         // must not turn that progress into an apparent failed mutation.
         if (result.needsSigning()) self.signNativeIndexOwnerResult(alloc, &result);
         return result;
+    }
+
+    fn raftIndexOwnerControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
+        const execution = antfly.public_api.relational_index_owner_execution;
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        if (request.operation != .fence and request.operation != .reserve) return error.UnsupportedNativeIndexOwner;
+        const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
+        try self.waitDataReadSafeWithCancellation(group_id, "index-owner-control", 30_000, context.cancellation);
+        var lookup = request.lookup(.permission);
+        lookup.raft_reporter = .{ .node_id = registration.node_id, .store_id = registration.store_id };
+        var permission = try execution.raftDecision(alloc, &self.status_source, lookup, context);
+        defer permission.deinit();
+        if (permission.value.disposition == .acknowledged) return .acknowledged;
+        const identity = try permission.value.raftExecutionIdentity(lookup);
+        const dispatch = permission.value.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+        const owners = try self.ensureKernelOwnerSource();
+        var session = try owners.acquireRaftIndexOwnerSession(group_id, table_name, identity, context);
+        defer session.deinit();
+        var rooted = try session.observe(alloc);
+        const scope = try self.raftIndexLocalScope(group_id, rooted, context);
+        const remaining_ns = if (context.deadline_ns) |deadline| remaining: {
+            const now = (antfly.public_api.table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
+            if (now >= deadline) return error.DeadlineExceeded;
+            break :remaining deadline - now;
+        } else 30 * std.time.ns_per_s;
+        var route: DataRaftBatchRoute = .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = &permission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context } };
+        // Require current enrollment and reporter/root identity before any
+        // effect, not merely when attempting post-commit decoration.
+        try (try permission.value.raftSigningView(lookup)).requireLocal(scope);
+        const already = if (request.operation == .fence) rooted.observation.fenced else rooted.observation.reserved;
+        if (already == null) {
+            if (rooted.observation.binding) |binding| {
+                const command = try permission.value.raftControl(lookup, binding);
+                try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .control = command } }, route);
+            } else {
+                if (request.operation != .fence) return error.GenerationAdmissionPending;
+                // Fetch immutable schema-sized inputs only for a genuinely
+                // absent job, then compile against this same leased owner.
+                lookup.projection = .admission;
+                var admission = try execution.raftDecision(alloc, &self.status_source, lookup, context);
+                defer admission.deinit();
+                if (admission.value.disposition == .acknowledged) return .acknowledged;
+                if (!std.meta.eql(identity, try admission.value.raftExecutionIdentity(lookup))) return error.GenerationPublicationChanged;
+                try (try admission.value.raftSigningView(lookup)).requireLocal(scope);
+                const header = try admission.value.raftAdmission();
+                const input = admission.value.inputs orelse return error.InvalidGenerationPublication;
+                var manifest = try input.prepareManifest(alloc, admission.value.head);
+                defer manifest.deinit();
+                const prepared = try session.prepare(alloc, header, manifest.bytes);
+                try prepared.validate(header, @import("antfly_local_sources").storage_db_relational_index_inputs.digest(manifest.bytes));
+                const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(manifest.bytes.len));
+                defer alloc.free(b64);
+                _ = std.base64.standard.Encoder.encode(b64, manifest.bytes);
+                const command: contract.Control = .{ .effect = .admitted, .binding = prepared.binding, .inputs_b64 = b64 };
+                route.index_owner_permission = .{ .decision = &admission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context };
+                try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .control = command } }, route);
+            }
+            rooted = try session.recoverCommitted(alloc);
+        }
+        var response: execution.RaftControlResponse = .{ .root_generation = rooted.root_generation, .observation = rooted.observation };
+        const receipt = if (request.operation == .fence) rooted.observation.fenced else rooted.observation.reserved;
+        if (receipt != null) {
+            // An already committed effect survives signing failure. Recovery
+            // uses this retained lease, never a replacement current route.
+            response.signed_ack = self.signRaftIndexOwnerControl(alloc, group_id, &permission.value, request.lookup(.permission), rooted, context) catch |err| failure: {
+                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+                break :failure null;
+            };
+        }
+        try response.validate(request);
+        return .{ .raft = response };
+    }
+
+    fn signRaftIndexOwnerControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, request_: @import("../metadata/relational_index_publication.zig").OwnerRequest, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").Ack {
+        var request = request_;
+        const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
+        request.raft_reporter = .{ .node_id = registration.node_id, .store_id = registration.store_id };
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
+        const scope = try self.raftIndexLocalScope(group_id, rooted, context);
+        return decision.signRaftControl(request, rooted.observation, scope, root);
     }
 
     /// Bind a leased owner observation to actual local Raft leadership and the
@@ -12952,7 +13045,13 @@ pub const DataServer = struct {
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
         // A decoded Raft command is not metadata permission. A dedicated
         // receiver must independently obtain the live owner decision first.
-        if (req.relational_index_owner_control != null) return error.UnsupportedNativeIndexOwner;
+        if (req.relational_index_owner_control) |command| {
+            const permission = route.index_owner_permission orelse return error.UnsupportedNativeIndexOwner;
+            try permission.context.ensureActive();
+            if (route.required_local_term == null or route.allow_remote_forward or permission.root_generation == 0 or
+                permission.request.group_id != group_id or command != .control) return error.InvalidGenerationPublication;
+            try permission.decision.requireRaftProposal(alloc, table_name, permission.request, command.control);
+        } else if (route.index_owner_permission != null) return error.InvalidGenerationPublication;
         // Do not allow a private/direct batch route to bypass the metadata
         // admission policy. This happens before a protocol barrier or a data
         // entry can be appended, so rejection is never an ambiguous outcome.
@@ -13137,6 +13236,9 @@ pub const DataServer = struct {
                             try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
                         else
                             try owner_source.loadDescriptor(alloc, group_id, table_name);
+                        if (route.index_owner_permission) |permission| {
+                            if (storage_owner_descriptor.?.generation != permission.root_generation) return error.PrivateIndexRootRecoveryRequired;
+                        }
                     }
                 }
             }
@@ -13219,6 +13321,7 @@ pub const DataServer = struct {
                             }
                         }
                         if (active_protocol_version < required_protocol_version) {
+                            if (req.relational_index_owner_control != null) return error.UnsupportedNativeIndexOwner;
                             // Bulk ACKs have a compatible single-command path.
                             // This is a feature rejection before ACK admission,
                             // never a classification of an accepted write.
@@ -13823,6 +13926,7 @@ pub const DataServer = struct {
     }
 
     fn ensureDataRaftBatchRouteActive(route: DataRaftBatchRoute) !void {
+        if (route.index_owner_permission) |permission| try permission.context.ensureActive();
         if (route.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
@@ -42256,6 +42360,15 @@ fn consumerTests() type {
             defer apply_sm.deinit();
             apply_sm.attachKernelOwnerSource(linked_owner.owner);
             const rooted = try linked_owner.owner.raftIndexOwnerObservationAtRoot(a, group, "items", .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .namespace = .{ .table_id = 101, .shard_id = group, .range_id = group }, .owner_group_id = group }, .{});
+            var canceled_session = std.atomic.Value(bool).init(false);
+            var owner_session = try linked_owner.owner.acquireRaftIndexOwnerSession(group, "items", rooted.identity, .{ .cancellation = .fromAtomic(&canceled_session) });
+            defer owner_session.deinit();
+            try std.testing.expectEqualDeep(rooted, try owner_session.observe(a));
+            canceled_session.store(true, .release);
+            try std.testing.expectError(error.Canceled, owner_session.observe(a));
+            // Retained-cut recovery has no routing or metadata IO and cannot
+            // turn a completed ordered effect into request cancellation.
+            try std.testing.expectEqualDeep(rooted, try owner_session.recoverCommitted(a));
             var storage = raft_engine.core.MemoryStorage.init(a);
             defer storage.deinit();
             var factory = DataDescriptorFactory.init(a, &storage);
@@ -42397,6 +42510,13 @@ fn consumerTests() type {
             var server: DataServer = undefined;
             for ([_]antfly.db.types.BatchRequest{ request, mixed }) |batch_request| {
                 try std.testing.expectError(error.UnsupportedNativeIndexOwner, server.proposeRaftBatchGroupWithLeaderWait(std.testing.allocator, 11, "docs", batch_request, .{ .discovery = .cached }, 0));
+            }
+            var canceled = std.atomic.Value(bool).init(true);
+            inline for (.{ antfly.public_api.operation.RequestContext{ .cancellation = .fromAtomic(&canceled) }, antfly.public_api.operation.RequestContext{ .deadline_ns = 0 } }) |context| {
+                const expected = if (context.deadline_ns != null) error.DeadlineExceeded else error.Canceled;
+                // Even a local permit must not decode metadata/manifests or
+                // consult a host after its request has expired.
+                try std.testing.expectError(expected, server.proposeRaftBatchGroupWithLeaderWait(std.testing.allocator, 11, "docs", request, .{ .discovery = .cached, .required_local_term = 1, .allow_remote_forward = false, .index_owner_permission = .{ .decision = undefined, .request = .{ .table_id = 101, .group_id = 11, .id = @splat(1), .operation = .fence }, .root_generation = 1, .context = context } }, 0));
             }
         }
 

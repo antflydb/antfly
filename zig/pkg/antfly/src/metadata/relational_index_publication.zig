@@ -1144,6 +1144,34 @@ pub const OwnerDecision = struct {
         return command;
     }
 
+    /// Local proposal admission consumes an independently fetched decision,
+    /// not the command's ability to pass a decoder. Recheck the exact immutable
+    /// manifest on cold admission; hot controls need no schema-sized copy.
+    pub fn requireRaftProposal(self: OwnerDecision, alloc: Allocator, table_name: []const u8, request: OwnerRequest, command: raft_control.Control) !void {
+        _ = try self.raftExecutionIdentity(request);
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+        try command.validate();
+        if (command.effect != .admitted) {
+            if (!std.meta.eql(command, try self.raftControl(request, command.binding))) return error.PrivateIndexOwnerJobChanged;
+            return;
+        }
+        if (request.operation != .fence or request.projection != .admission) return error.InvalidGenerationPublication;
+        const header = try self.raftAdmission();
+        if (!header.eql(raft_control.Admission.fromBinding(command.binding))) return error.PrivateIndexOwnerJobChanged;
+        const input = self.inputs orelse return error.InvalidGenerationPublication;
+        var manifest = try input.prepareManifest(alloc, self.head);
+        defer manifest.deinit();
+        if (!std.mem.eql(u8, &command.binding.inputs_digest, &local.storage_db_relational_index_inputs.digest(manifest.bytes))) return error.InvalidPrivateIndexInputs;
+        const encoded = command.inputs_b64 orelse return error.InvalidPrivateIndexInputs;
+        const length = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidPrivateIndexInputs;
+        if (length != manifest.bytes.len) return error.InvalidPrivateIndexInputs;
+        const decoded = try alloc.alloc(u8, length);
+        defer alloc.free(decoded);
+        std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidPrivateIndexInputs;
+        if (!std.mem.eql(u8, decoded, manifest.bytes)) return error.InvalidPrivateIndexInputs;
+    }
+
     pub fn nativeCancellationControl(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding, effect: CancellationControlEffect) !native_control.Command {
         return self.boundNativeControl(.{
             .table_id = self.head.table_id,
@@ -1284,6 +1312,7 @@ pub const OwnerDecision = struct {
             .id = self.head.plan_id,
             .operation = if (canceling) .cancel else .fence,
             .projection = .admission,
+            .raft_reporter = if (self.raft_signing) |view| .{ .node_id = view.identity.node_id, .store_id = view.identity.store_id } else null,
         }, authority);
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         const inputs = self.inputs orelse return error.InvalidGenerationPublication;
@@ -2642,6 +2671,41 @@ test "relational index publication Raft decisions bind immutable admission and e
     const observation: raft_control.Observation = .{ .format_version = 1, .binding = binding, .applied = cut, .fenced = .{ .owner = decision.owner.owner, .action = .fenced, .position = cut, .candidate_digest = decision.head.candidate_digest, .reservation_digest = decision.head.reservation_digest, .evidence_digest = try raft_control.effectEvidence(binding, .fenced, cut) } };
     const signed = try signing.signRaftControl(sign_request, observation, actual, root);
     try signed.signed.verifySignature();
+    try signing.requireRaftProposal(a, dispatch.value.table_name, sign_request, fence);
+    try std.testing.expectError(error.GenerationPublicationChanged, signing.requireRaftProposal(a, "another-table", sign_request, fence));
+    var wrong_effect = fence;
+    wrong_effect.effect = .reserved;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, signing.requireRaftProposal(a, dispatch.value.table_name, sign_request, wrong_effect));
+    // A signing projection must not make cold admission reject its own
+    // locally selected reporter. Its manifest remains independently bound.
+    signing.inputs = inputs.value;
+    var admit_request = sign_request;
+    admit_request.projection = .admission;
+    const encoded_manifest = try a.alloc(u8, std.base64.standard.Encoder.calcSize(manifest.bytes.len));
+    defer a.free(encoded_manifest);
+    _ = std.base64.standard.Encoder.encode(encoded_manifest, manifest.bytes);
+    const admit_command: raft_control.Control = .{ .effect = .admitted, .binding = binding, .inputs_b64 = encoded_manifest };
+    try signing.requireRaftProposal(a, dispatch.value.table_name, admit_request, admit_command);
+    try std.testing.expectError(error.InvalidGenerationPublication, signing.requireRaftProposal(a, dispatch.value.table_name, sign_request, admit_command));
+    const first = encoded_manifest[0];
+    encoded_manifest[0] = if (first == 'A') 'B' else 'A';
+    try std.testing.expectError(error.InvalidPrivateIndexInputs, signing.requireRaftProposal(a, dispatch.value.table_name, admit_request, admit_command));
+    encoded_manifest[0] = first;
+    const execution = @import("../api/relational_index_owner_execution.zig");
+    const control_request: execution.Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .fence };
+    const response: execution.ControlResponse = .{ .raft = .{ .root_generation = actual.root_generation, .observation = observation, .signed_ack = signed } };
+    try response.validate(control_request);
+    const response_json = try std.json.Stringify.valueAlloc(a, response, .{});
+    defer a.free(response_json);
+    var roundtrip = try std.json.parseFromSlice(execution.ControlResponse, a, response_json, .{ .ignore_unknown_fields = false });
+    defer roundtrip.deinit();
+    try roundtrip.value.validate(control_request);
+    var wrong_response = response;
+    wrong_response.raft.root_generation += 1;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, wrong_response.validate(control_request));
+    wrong_response = response;
+    wrong_response.raft.signing_failure = .authority_changed;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, wrong_response.validate(control_request));
     try std.testing.expectEqual(decision.head.revision, signed.expected_revision);
     try std.testing.expectEqual(@as(u64, 5), signed.signed.proof.authority.raft);
     try std.testing.expectEqualDeep(cut, signed.signed.receipt.position);

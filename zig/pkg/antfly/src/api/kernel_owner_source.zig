@@ -91,6 +91,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
     inline for (.{ cancelled, expired }) |context| {
         const expected = if (context.deadline_ns != null) error.DeadlineExceeded else error.Canceled;
         try std.testing.expectError(expected, source.raftIndexOwnerObservationAtRoot(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.acquireRaftIndexOwnerSession(7, "rows", identity, context));
         try std.testing.expectError(expected, source.raftIndexOwnerPreparationAtRoot(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeSchemaOwnerObservationAtRoot(7, "rows", undefined, context));
@@ -3705,6 +3706,58 @@ pub const ProvisionedKernelOwnerSource = struct {
         root_generation: u64,
         observation: raft_index_control.Observation,
     };
+
+    /// Retain the exact physical owner across preparation, ordered proposal,
+    /// receipt recovery and signing. A second route lookup is not provenance.
+    pub const RaftIndexOwnerSession = struct {
+        lease: Lease,
+        table_name: []const u8,
+        identity: raft_index_control.Identity,
+        context: request_operation.RequestContext,
+
+        pub fn deinit(self: *@This()) void {
+            self.lease.deinit();
+            self.* = undefined;
+        }
+
+        pub fn observe(self: *@This(), alloc: std.mem.Allocator) !RootedRaftIndexOwnerObservation {
+            return self.observeWithContext(alloc, self.context);
+        }
+
+        /// Once ordered apply succeeded, request cancellation must not hide
+        /// its durable outcome. This performs only the bounded retained-cut
+        /// lookup on the lease already held, with no routing or metadata IO.
+        pub fn recoverCommitted(self: *@This(), alloc: std.mem.Allocator) !RootedRaftIndexOwnerObservation {
+            return self.observeWithContext(alloc, .{});
+        }
+
+        fn observeWithContext(self: *@This(), alloc: std.mem.Allocator, context: request_operation.RequestContext) !RootedRaftIndexOwnerObservation {
+            const normalized = try platformDeadlineContext(context);
+            var cancellation = normalized.cancellation;
+            const result = try self.lease.owner().raftIndexOwnerObservation(alloc, self.table_name, self.identity, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+            try context.ensureActive();
+            return .{ .identity = self.identity, .root_generation = self.lease.entry.generation, .observation = result };
+        }
+
+        pub fn prepare(self: *@This(), alloc: std.mem.Allocator, header: raft_index_control.Admission, manifest: []const u8) !raft_index_control.AdmissionPreparation {
+            try header.validate();
+            const identity = self.identity;
+            if (!std.mem.eql(u8, &header.id, &identity.id) or !std.mem.eql(u8, &header.plan_digest, &identity.plan_digest) or
+                !std.mem.eql(u8, &header.owner_digest, &identity.owner_digest) or header.ordinal != identity.ordinal or
+                header.fence.owner_group_id != identity.owner_group_id or !header.fence.namespace.eql(identity.namespace)) return error.PrivateIndexOwnerJobChanged;
+            if (manifest.len == 0 or manifest.len > raft_index_control.AdmissionPreparation.max_manifest_bytes) return error.InvalidPrivateIndexInputs;
+            const normalized = try platformDeadlineContext(self.context);
+            var cancellation = normalized.cancellation;
+            return self.lease.owner().raftIndexOwnerAdmissionPreparation(alloc, self.table_name, header, manifest, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        }
+    };
+
+    pub fn acquireRaftIndexOwnerSession(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, identity: raft_index_control.Identity, context: request_operation.RequestContext) !RaftIndexOwnerSession {
+        var lease = try self.acquireIndexOwner(group_id, table_name, identity, context);
+        errdefer lease.deinit();
+        if (lease.entry.generation == 0) return error.PrivateIndexRootRecoveryRequired;
+        return .{ .lease = lease, .table_name = table_name, .identity = identity, .context = context };
+    }
 
     /// Root provenance belongs to the exact leased owner that returned these
     /// facts, not a subsequent route lookup. This is not enrollment, leadership,

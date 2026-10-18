@@ -335,6 +335,7 @@ const Job = struct {
                         return;
                     },
                     .admitted => null,
+                    .raft => |value| value.signed_ack,
                     .controlled => |value| value.signed_ack,
                     .recovered => |value| value.signed_ack,
                     else => return error.InvalidPrivateIndexNativeReceipt,

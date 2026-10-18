@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `206f116db3` (2026-10-17). Earlier implementation and
+at `408644a861` (2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -86,8 +86,17 @@ prepared execution paths. Borrowed JSON is size-checked before typed duplication
 the command supplies no execution cut. Dispatch joins actual group/namespace
 identity, skips old replay before preparation and rechecks replay after a raced
 preparation failure. Earlier branch-local flat control envelopes are unsupported.
-This is committed-entry dispatch, not the public metadata-authorized producer:
-claim delivery and publication are not yet mounted through that public receiver.
+The authenticated data receiver now connects Raft admission/fence/reserve to
+fresh metadata decisions, an enrolled reporter and one retained physical-owner
+lease through preparation, term-bound proposal, recovery and signing. Ordinary
+and forwarded batches cannot supply this process-local permission. The proposal
+uses the existing all-member decoder barrier and rechecks the descriptor's root
+generation. Responses retain explicit Raft positions; the shared worker can
+decode their ACKs. Cold admission also preserves the signing reporter in its
+internal metadata request. This is not complete public activation: the worker's
+Raft cohort guard, build/claim transport and later publication receiver paths
+remain unfinished, and public CREATE remains guarded. No original case is
+closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's
 first entry or an owner that has not visited the job. Ordinary work stays closed;
 explicit cancellation controls drain and burn the exact generation. Cleanup
