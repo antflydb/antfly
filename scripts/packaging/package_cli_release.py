@@ -354,6 +354,11 @@ def main() -> int:
         default=Path("dist/cli-packages"),
         help="Output directory",
     )
+    parser.add_argument(
+        "--skip-python",
+        action="store_true",
+        help="Package npm only; CLI PyPI publication is paused",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -386,7 +391,7 @@ def main() -> int:
             extract_archive(archive_dir, version, platform, extracted)
             copy_antfarm(repo_root, extracted)
             populate_npm_package(repo_root, platform, extracted)
-            if platform.wheel_platform:
+            if platform.wheel_platform and not args.skip_python:
                 wheel = package_python_wheel(
                     repo_root, py_out, python_version, platform, extracted
                 )

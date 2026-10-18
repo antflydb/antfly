@@ -1429,9 +1429,18 @@ def require_standalone_storage_headroom(root: Path) -> None:
 
 
 class StandaloneAntflyServer:
-    def __init__(self, binary: str, host: str, port: int, *, pgwire: bool = False):
+    def __init__(
+        self,
+        binary: str,
+        host: str,
+        port: int,
+        *,
+        pgwire: bool = False,
+        storage_engine: str | None = None,
+    ):
         self.binary = binary
         self.host = host
+        self.storage_engine = storage_engine
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -1469,6 +1478,10 @@ class StandaloneAntflyServer:
             root=self.root,
             pgwire_port=self.pgwire_port,
         )
+        if self.storage_engine is not None:
+            command.extend(["--storage-engine", self.storage_engine])
+            if self.storage_engine == "lite":
+                command.extend(["--storage-path", str(self.root / "db.aflite")])
         if self.pgwire_port is not None:
             command.extend(["--auth", "true"])
         self.proc = self.port_reservations.handoff_to(

@@ -139,8 +139,8 @@ credentials.
    exact scope membership, and every digest.
 5. Policy-selected package registries, the Homebrew formula, and the single
    multi-architecture container image consume those verified scopes. Stable
-   and RC releases publish npm and PyPI packages; nightly builds verify the same
-   package snapshot but publish it only to R2 and the container registries. The
+   and RC releases publish npm packages; CLI PyPI publication is paused. Nightly
+   builds verify the same package snapshot but publish it only to R2 and the container registries. The
    container publisher is callable
    only by this controller, checks out the recorded controller commit, and
    consumes the GNU runtime archives built from the source commit in step 2.
@@ -459,6 +459,9 @@ Run a snapshot for the current default-branch head with
 `gh workflow run antfly-nightly.yml`. To reproduce a snapshot from a specific
 default-branch commit, add `-f source_commit=<40-character-commit>`.
 
+CLI PyPI publication is paused in `scripts/release/channels.json`. New CLI
+snapshots contain npm packages only; legacy wheel snapshots remain verifiable.
+
 Stable releases publish:
 
 - GitHub Release artifacts
@@ -466,7 +469,6 @@ Stable releases publish:
 - the `latest` R2 metadata pointer and stable installer bootstrap
 - Zig Homebrew formula `antfly`
 - npm CLI packages with dist-tag `latest`
-- PyPI CLI wheels
 - container tags `<version>` and `latest`
 
 RC releases publish:
@@ -475,8 +477,6 @@ RC releases publish:
 - R2 release artifacts
 - the `next` R2 metadata pointer
 - npm CLI packages with dist-tag `next`
-- PyPI CLI wheels using PEP 440 prerelease versions, for example
-  `0.2.0-rc.1` becomes `0.2.0rc1`
 - container tags `<version>` and `next`
 
 RC releases do not update the `latest` R2 channel, Homebrew stable formula, or

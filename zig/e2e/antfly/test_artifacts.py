@@ -264,7 +264,16 @@ def test_malformed_pdf_reprocess_publishes_terminal_manifest(
     path = _document_artifact_path(table_name, "doc", DOCUMENT_UNITS_ARTIFACT)
     response = stateful_api.post(f"{path}/reprocess", {})
     assert response["reprocess"] == "triggered"
-    manifest = stateful_api.get(f"{path}?detail=raw")
+    # Reprocessing acknowledges durable submission. A fresh artifact can still
+    # be absent while the worker publishes its terminal failure manifest.
+    manifest = wait_until(
+        lambda: stateful_api.get(f"{path}?detail=raw"),
+        timeout_s=60,
+        ready_when=lambda value: (
+            value is not None and value.get("merge_status") == "failed"
+        ),
+        retry_not_found=True,
+    )
     assert manifest["merge_status"] == "failed"
     assert manifest["unit_count"] == 0
     failure = json.loads(manifest["manifest_json"])["last_error"]

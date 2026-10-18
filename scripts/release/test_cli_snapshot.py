@@ -68,6 +68,57 @@ def write_wheel(path: Path) -> None:
 
 
 class CLISnapshotTests(unittest.TestCase):
+    def test_npm_only_snapshot_is_strict_and_pypi_is_paused(self) -> None:
+        policy = load_module(
+            "paused_cli_channels", REPO_ROOT / "scripts/release/release_channels.py"
+        ).load_policy()
+        self.assertTrue(
+            all(not channel["publish_pypi"] for channel in policy["channels"].values())
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            npm = root / "npm"
+            npm.mkdir()
+            for filename, package in NPM_PACKAGES.items():
+                write_npm_package(npm / f"{filename}-{VERSION}.tgz", package)
+            snapshot = root / "snapshot"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(BUILD),
+                    "--version",
+                    VERSION,
+                    "--commit",
+                    COMMIT,
+                    "--npm-dir",
+                    str(npm),
+                    "--out-dir",
+                    str(snapshot),
+                ],
+                check=True,
+            )
+            manifest = json.loads((snapshot / "cli-snapshot.json").read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["registry_versions"], {"npm": VERSION})
+            self.assertEqual(len(manifest["artifacts"]), 4)
+            command = [
+                sys.executable,
+                str(VERIFY),
+                "--snapshot-dir",
+                str(snapshot),
+                "--version",
+                VERSION,
+                "--commit",
+                COMMIT,
+            ]
+            subprocess.run(command, check=True)
+            write_wheel(snapshot / "unexpected.whl")
+            result = subprocess.run(
+                command, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("file set mismatch", result.stderr)
+
     def test_python_registry_version_matches_packager(self) -> None:
         snapshot = load_module("cli_snapshot_builder", BUILD)
         packager = load_module(

@@ -23550,7 +23550,7 @@ pub fn long_term_synthesis(arg_win_seq: WINDOW_SEQUENCE, arg_sfb_per_win: Int, a
                     }
                     if (max != @as(UInt32, 0)) {
                         tmpInt = 0;
-                        while (@as(c_long, max) < @as(c_long, 1073741824)) {
+                        while (max < @as(UInt32, 1073741824)) {
                             max <<= @intCast(@as(UInt32, 1));
                             tmpInt += 1;
                         }
@@ -23880,7 +23880,7 @@ pub fn long_term_synthesis(arg_win_seq: WINDOW_SEQUENCE, arg_sfb_per_win: Int, a
                             }
                             if (max != @as(UInt32, 0)) {
                                 tmpInt = 0;
-                                while (@as(c_long, max) < @as(c_long, 1073741824)) {
+                                while (max < @as(UInt32, 1073741824)) {
                                     max <<= @intCast(@as(UInt32, 1));
                                     tmpInt += 1;
                                 }

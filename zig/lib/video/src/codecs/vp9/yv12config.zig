@@ -221,7 +221,7 @@ pub export fn antfly_vp9_vpx_realloc_frame_buffer(arg_ybf: [*c]YV12_BUFFER_CONFI
         if (antfly_codec_afz_vp9_failed() != 0) {
             return 0;
         }
-        if (frame_size > @as(u64, 18446744073709551615)) {
+        if (frame_size > @as(u64, @import("std").math.maxInt(usize))) {
             if (antfly_codec_afz_vp9_failed() != 0) {
                 return 0;
             }
@@ -404,11 +404,11 @@ pub export fn antfly_vp9_vpx_realloc_frame_buffer(arg_ybf: [*c]YV12_BUFFER_CONFI
         if (antfly_codec_afz_vp9_failed() != 0) {
             return 0;
         }
-        ybf.*.u_buffer = @ptrCast(@alignCast(@as(?*anyopaque, @ptrFromInt((@as(usize, @intCast(@intFromPtr(((buf + yplane_size) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_h * uv_stride))))) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_w))))))) +% @as(usize, @bitCast(@as(c_long, vp9_byte_align - @as(c_int, 1))))) & @as(usize, @bitCast(@as(c_long, -vp9_byte_align)))))));
+        ybf.*.u_buffer = @ptrCast(@alignCast(@as(?*anyopaque, @ptrFromInt((@as(usize, @intCast(@intFromPtr(((buf + @as(usize, @intCast(yplane_size))) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_h * uv_stride))))) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_w))))))) +% @as(usize, @bitCast(@as(c_long, vp9_byte_align - @as(c_int, 1))))) & @as(usize, @bitCast(@as(c_long, -vp9_byte_align)))))));
         if (antfly_codec_afz_vp9_failed() != 0) {
             return 0;
         }
-        ybf.*.v_buffer = @ptrCast(@alignCast(@as(?*anyopaque, @ptrFromInt((@as(usize, @intCast(@intFromPtr((((buf + yplane_size) + uvplane_size) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_h * uv_stride))))) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_w))))))) +% @as(usize, @bitCast(@as(c_long, vp9_byte_align - @as(c_int, 1))))) & @as(usize, @bitCast(@as(c_long, -vp9_byte_align)))))));
+        ybf.*.v_buffer = @ptrCast(@alignCast(@as(?*anyopaque, @ptrFromInt((@as(usize, @intCast(@intFromPtr((((buf + @as(usize, @intCast(yplane_size))) + @as(usize, @intCast(uvplane_size))) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_h * uv_stride))))) + @as(usize, @bitCast(@as(isize, @intCast(uv_border_w))))))) +% @as(usize, @bitCast(@as(c_long, vp9_byte_align - @as(c_int, 1))))) & @as(usize, @bitCast(@as(c_long, -vp9_byte_align)))))));
         if (antfly_codec_afz_vp9_failed() != 0) {
             return 0;
         }

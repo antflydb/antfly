@@ -333,7 +333,12 @@ def main() -> int:
         release_registry_versions = release_spec["registry_versions"]
         assert isinstance(release_registry_versions, dict)
         expected_cli_registry_versions = {
-            key: release_registry_versions[key] for key in ("npm", "python")
+            key: release_registry_versions[key]
+            for key in (
+                ("npm",)
+                if cli_manifest.get("schema_version") == 2
+                else ("npm", "python")
+            )
         }
         if cli_registry_versions != expected_cli_registry_versions:
             raise SystemExit("CLI registry versions do not match the release spec")

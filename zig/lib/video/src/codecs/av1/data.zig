@@ -92,7 +92,7 @@ pub export fn antfly_av1_dav1d_data_create_internal(buf: [*c]Dav1dData, sz: usiz
         }
         return null;
     }
-    if (sz > (@as(c_ulong, 18446744073709551615) / @as(c_ulong, 2))) return null;
+    if (sz > (@import("std").math.maxInt(usize) / @as(c_ulong, 2))) return null;
     buf.*.ref = antfly_av1_dav1d_ref_create(sz);
     if (!(buf.*.ref != null)) return null;
     buf.*.data = @ptrCast(@alignCast(buf.*.ref.*.const_data));

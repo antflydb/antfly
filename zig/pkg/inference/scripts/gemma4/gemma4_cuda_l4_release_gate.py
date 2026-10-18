@@ -47,6 +47,12 @@ import subprocess
 import sys
 from typing import Any
 
+REQUIRED_ZIG_VERSION = json.loads(
+    (
+        pathlib.Path(__file__).resolve().parents[5] / "scripts/ci/toolchain-policy.json"
+    ).read_text()
+)["zig"]["version"]
+
 
 RELEASE_SCHEMA = "antfly.gemma4_cuda_l4_release_gate.v2"
 RELEASE_SCOPE = "target_only"
@@ -726,8 +732,8 @@ def provenance_errors(provenance: dict[str, Any]) -> list[str]:
         ):
             errors.append(f"{name} toolchain provenance is unavailable")
     zig_version = (toolchains.get("zig") or {}).get("version")
-    if zig_version and zig_version.strip() != "0.17.0":
-        errors.append(f"expected Zig 0.17.0, got {zig_version!r}")
+    if zig_version and zig_version.strip() != REQUIRED_ZIG_VERSION:
+        errors.append(f"expected Zig {REQUIRED_ZIG_VERSION}, got {zig_version!r}")
     nvcc_version = (toolchains.get("nvcc") or {}).get("version")
     if nvcc_version and "release 13.2" not in nvcc_version:
         errors.append("expected CUDA toolkit 13.2 in nvcc provenance")

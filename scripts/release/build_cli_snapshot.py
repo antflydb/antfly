@@ -76,7 +76,11 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--npm-dir", type=Path, required=True)
-    parser.add_argument("--python-dir", type=Path, required=True)
+    parser.add_argument(
+        "--python-dir",
+        type=Path,
+        help="Legacy all-in-one PyPI wheels; omit for an npm-only snapshot",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
 
@@ -86,12 +90,12 @@ def main() -> int:
     python_version = python_version_from_release(version)
 
     npm_files = sorted(args.npm_dir.glob("*.tgz"))
-    wheels = sorted(args.python_dir.glob("*.whl"))
+    wheels = sorted(args.python_dir.glob("*.whl")) if args.python_dir else []
     if len(npm_files) != len(NPM_PACKAGES):
         raise SystemExit(
             f"expected {len(NPM_PACKAGES)} npm tarballs, found {len(npm_files)}"
         )
-    if len(wheels) != 3:
+    if args.python_dir is not None and len(wheels) != 3:
         raise SystemExit(f"expected 3 Python wheels, found {len(wheels)}")
 
     artifacts: list[dict[str, object]] = []
@@ -144,10 +148,13 @@ def main() -> int:
         raise SystemExit(f"npm package set mismatch: {sorted(seen_npm)}")
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 1 if args.python_dir is not None else 2,
         "version": version,
         "commit": args.commit,
-        "registry_versions": {"npm": version, "python": python_version},
+        "registry_versions": {
+            "npm": version,
+            **({"python": python_version} if args.python_dir is not None else {}),
+        },
         "artifacts": sorted(artifacts, key=lambda artifact: str(artifact["name"])),
     }
     manifest_path = args.out_dir / "cli-snapshot.json"

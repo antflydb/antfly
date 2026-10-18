@@ -21,10 +21,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import io
 import json
+import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -67,6 +71,131 @@ class NpmPromotionTests(unittest.TestCase):
         }
         (root / "cli-snapshot.json").write_text(json.dumps(manifest))
         return root
+
+    def test_built_snapshots_pass_npm_promotion(self) -> None:
+        module = load_module()
+        scripts = SCRIPT.parent
+        commit = "0123456789abcdef0123456789abcdef01234567"
+        for version, tag in (("1.2.3", "latest"), ("1.2.3-rc.1", "next")):
+            for legacy in (False, True):
+                with self.subTest(version=version, legacy=legacy):
+                    root = Path(self.tmp.name) / f"{version}-{legacy}"
+                    npm = root / "npm"
+                    npm.mkdir(parents=True)
+                    for package, stem in module.NPM_PACKAGES.items():
+                        payload = json.dumps(
+                            {"name": package, "version": version}
+                        ).encode()
+                        info = tarfile.TarInfo("package/package.json")
+                        info.size = len(payload)
+                        with tarfile.open(
+                            npm / f"{stem}-{version}.tgz", "w:gz"
+                        ) as archive:
+                            archive.addfile(info, io.BytesIO(payload))
+                    snapshot = root / "snapshot"
+                    build = [
+                        sys.executable,
+                        str(scripts / "build_cli_snapshot.py"),
+                        "--version",
+                        version,
+                        "--commit",
+                        commit,
+                        "--npm-dir",
+                        str(npm),
+                        "--out-dir",
+                        str(snapshot),
+                    ]
+                    if legacy:
+                        from release_channels import python_version_from_release
+
+                        wheels = root / "wheels"
+                        wheels.mkdir()
+                        python_version = python_version_from_release(version)
+                        for platform in (
+                            "macosx_15_0_arm64",
+                            "manylinux_2_28_aarch64",
+                            "manylinux_2_28_x86_64",
+                        ):
+                            wheel = (
+                                wheels
+                                / f"antfly_cli-{python_version}-py3-none-{platform}.whl"
+                            )
+                            with zipfile.ZipFile(wheel, "w") as archive:
+                                archive.writestr(
+                                    f"antfly_cli-{python_version}.dist-info/METADATA",
+                                    f"Name: antfly-cli\nVersion: {python_version}\n",
+                                )
+                        build.extend(["--python-dir", str(wheels)])
+                    subprocess.run(build, check=True, capture_output=True, text=True)
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(scripts / "verify_cli_snapshot.py"),
+                            "--snapshot-dir",
+                            str(snapshot),
+                            "--version",
+                            version,
+                            "--commit",
+                            commit,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    preflight_package = module.preflight_package
+
+                    def preflight(package, release_version, release_tag, tarball):
+                        preflight_package(
+                            package,
+                            release_version,
+                            release_tag,
+                            tarball,
+                            integrity_reader=lambda _package, _version: (
+                                module.npm_integrity(tarball)
+                            ),
+                            tag_reader=lambda _package, _tag: version,
+                        )
+
+                    with (
+                        mock.patch.object(
+                            sys,
+                            "argv",
+                            [
+                                str(SCRIPT),
+                                "--snapshot-dir",
+                                str(snapshot),
+                                "--version",
+                                version,
+                                "--tag",
+                                tag,
+                            ],
+                        ),
+                        mock.patch.object(
+                            module, "preflight_package", side_effect=preflight
+                        ) as checked,
+                    ):
+                        self.assertEqual(module.main(), 0)
+                    self.assertEqual(checked.call_count, len(module.NPM_PACKAGES))
+                    self.assertEqual(
+                        {call.args[0] for call in checked.call_args_list},
+                        set(module.NPM_PACKAGES),
+                    )
+                    self.assertTrue(
+                        all(
+                            call.args[1:3] == (version, tag)
+                            for call in checked.call_args_list
+                        )
+                    )
+
+    def test_snapshot_rejects_unknown_schema(self) -> None:
+        module = load_module()
+        root = self.write_snapshot(module, "1.2.3")
+        manifest = root / "cli-snapshot.json"
+        document = json.loads(manifest.read_text())
+        document["schema_version"] = 3
+        manifest.write_text(json.dumps(document))
+        with self.assertRaisesRegex(SystemExit, "invalid npm release identity"):
+            module.snapshot_packages(root, "1.2.3")
 
     def test_missing_version_passes_without_reading_mutable_tag(self) -> None:
         module = load_module()
