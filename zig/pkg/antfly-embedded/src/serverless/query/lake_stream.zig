@@ -28,11 +28,12 @@ const Allocator = std.mem.Allocator;
 
 /// Conservative pruning contract. Unsupported physical comparisons remain
 /// residuals; no approximate numeric conversion can exclude matching rows.
+pub const FloatBound = struct { value: f64, domain: @import("../../common/float_domain.zig").Domain };
 pub const Predicate = struct {
     pub const Op = enum { eq, neq, lt, lte, gt, gte };
     column: []const u8,
     op: Op,
-    value: union(enum) { integer: i64, bytes: []const u8, boolean: bool },
+    value: union(enum) { number: FloatBound, integer: i64, bytes: []const u8, boolean: bool, decimal: struct { coefficient: i128, scale: u16, max_physical_scale: ?u16 = null }, timestamp: i128 },
 };
 pub const Limits = struct {
     max_examined_rows: u64 = 100_000_000,
@@ -85,8 +86,17 @@ pub const Stream = struct {
     context: Context,
     limits: Limits,
     stats: Stats = .{},
+    /// Statement-owned admission survives worker ranges and rolling windows.
+    examined: ?*std.atomic.Value(u64) = null,
     files: []usize,
     owns_files: bool = true,
+    iterator: ?serving.ServingSource.FileIterator = null,
+    iterator_parent: ?*serving.ServingSource = null,
+    iterator_started: bool = false,
+    enumerated_files: usize = 0,
+    enumeration_lookahead: ?*EnumerationLookahead = null,
+    enumeration_prefetch_tasks: usize = 0,
+    enumeration_prefetch_files: usize = 0,
     selection: ?@import("lake_row_selection.zig").Selection = null,
     resume_at: ?struct { group: u32, row: u64 } = null,
     active_file: usize = 0,
@@ -123,6 +133,92 @@ pub const Stream = struct {
     lookahead_names: []const []const u8 = &.{},
     lookahead_required: []const bool = &.{},
 
+    /// One independently owned navigation cursor warms the next bounded file
+    /// window while current row groups execute. Required enumeration remains
+    /// untouched: speculative metadata errors are observed only on demand.
+    const EnumerationLookahead = struct {
+        backing: Allocator,
+        budget: @import("../../sql/memory_budget.zig"),
+        stream: Stream = undefined,
+        io: std.Io,
+        task: ?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = null,
+        target: usize = 0,
+        width: usize = 1,
+        warmed: usize = 0,
+        ended: bool = false,
+        disabled: bool = false,
+        fn run(self: *@This()) anyerror!void {
+            // Catch up only descriptors when earlier speculative admission was
+            // denied. A cursor advances monotonically, never rescans a prefix.
+            const iterator = self.stream.iterator.?;
+            while (self.stream.enumerated_files < self.target) {
+                try self.stream.context.ensureActive();
+                var file = (try iterator.next(iterator.ptr, self.stream.alloc, self.stream.context)) orelse {
+                    self.ended = true;
+                    return;
+                };
+                file.deinit(self.stream.alloc);
+                self.stream.enumerated_files += 1;
+            }
+            if (!try self.stream.nextEnumerationWindow(self.width)) {
+                self.ended = true;
+                return;
+            }
+            for (self.stream.files) |index| {
+                try self.stream.context.ensureActive();
+                if (!self.stream.fileMatches(self.stream.source.inventory.files[index])) continue;
+                try self.stream.pinFileVersion(index);
+                const reader = self.stream.source.scanner.shared_reader.?;
+                const footer = try reader.footer(self.stream.source.fileAt(index));
+                footer.release();
+                self.warmed += 1;
+            }
+        }
+        fn deinit(self: *@This()) void {
+            if (self.task) |*task| task.cancel(self.io) catch {};
+            self.stream.deinit();
+            std.debug.assert(self.budget.live == 0);
+            self.backing.destroy(self);
+        }
+    };
+    fn joinEnumerationLookahead(self: *Stream) void {
+        const warm = self.enumeration_lookahead orelse return;
+        if (warm.task) |*task| {
+            // Speculation never gates required progress. Required readers
+            // coalesce through the shared footer cache when they catch up.
+            if (!task.isComplete()) return;
+            task.await(warm.io) catch {
+                warm.disabled = true;
+            };
+            warm.task = null;
+            self.enumeration_prefetch_files = warm.warmed;
+        }
+    }
+    pub fn prefetchEnumeration(self: *Stream, width: usize) void {
+        if (self.iterator == null or self.iterator_parent == null) return;
+        const reader = self.source.scanner.shared_reader orelse return;
+        const io = reader.context.io orelse return;
+        if (self.enumeration_lookahead == null) {
+            const backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator);
+            const warm = backing.create(EnumerationLookahead) catch return;
+            warm.* = .{ .backing = backing, .budget = .{ .backing = backing, .limit = 16 * 1024 * 1024 }, .io = io };
+            warm.stream = initEnumerated(warm.budget.allocator(), self.iterator_parent.?, self.columns, self.predicates, self.context, self.limits) catch {
+                backing.destroy(warm);
+                return;
+            };
+            warm.stream.schema_contract = self.schema_contract;
+            self.enumeration_lookahead = warm;
+        }
+        const warm = self.enumeration_lookahead.?;
+        // Worker-owned fields are read only after the task has joined. In
+        // particular, EOF can race with another required window advancing.
+        if (warm.task != null) return;
+        if (warm.disabled or warm.ended) return;
+        warm.target = self.enumerated_files;
+        warm.width = @max(1, @min(4, width));
+        warm.task = @import("../../sql/parallel_scheduler.zig").global().submitIoTransient(io, 16 * 1024 * 1024, EnumerationLookahead.run, .{warm});
+        if (warm.task != null) self.enumeration_prefetch_tasks += 1;
+    }
     fn lookaheadCanceled(raw: *const anyopaque) bool {
         const self: *const Stream = @ptrCast(@alignCast(raw));
         if (self.lookahead_cancelled.load(.acquire)) return true;
@@ -210,6 +306,9 @@ pub const Stream = struct {
         // Avoid recursively reserving scheduler slots from an admitted task.
         worker_reader.context.io = null;
         cursor.shared_reader = &worker_reader;
+        if (self.filter) |filter| {
+            if (filter.encoded) cursor.filter = filter;
+        }
         for (cursor.columns, required) |*column, needed| column.required = needed;
         try worker_reader.context.ensureActive();
         try cursor.prepareEvidence();
@@ -275,6 +374,12 @@ pub const Stream = struct {
         return filter.any_match(filter.ptr, try self.logicalBatch(batch));
     }
 
+    fn selectMask(raw: *anyopaque, batch: types.ColumnBatch) anyerror![]const bool {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        const filter = self.filter.?;
+        return filter.select.?(filter.ptr, try self.logicalBatch(batch));
+    }
+
     fn pageMayMatch(raw: *anyopaque, chunk: external.ColumnChunk, page: @import("lake_parquet_metadata.zig").IndexedPage) bool {
         const self: *Stream = @ptrCast(@alignCast(raw));
         if (self.selection) |selection| {
@@ -284,6 +389,14 @@ pub const Stream = struct {
         for (self.groupPredicates()) |predicate| {
             if (!std.mem.eql(u8, predicate.column, chunk.column_id)) continue;
             if (page.all_null) return false;
+            if (predicate.value == .number) {
+                if (!floatBytesMayMatch(chunk, page.min, page.max, predicate.value.number, predicate.op)) return false;
+                continue;
+            }
+            if (predicate.value == .decimal or predicate.value == .timestamp) {
+                if (!typedBoundsMayMatch(chunk, page.min, page.max, predicate)) return false;
+                continue;
+            }
             if (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string") and !std.mem.startsWith(u8, chunk.logical_type, "int")) continue;
             const min = page.min orelse continue;
             const max = page.max orelse continue;
@@ -301,6 +414,7 @@ pub const Stream = struct {
                     if (std.mem.order(u8, min, max) == .gt) continue;
                     break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
                 },
+                .number, .decimal, .timestamp => unreachable,
                 .boolean => |value| blk: {
                     if (min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
                     break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
@@ -350,10 +464,122 @@ pub const Stream = struct {
     pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, parent: Context, limits: Limits) !Stream {
         const context = source.protectContext(parent);
         try context.ensureActive();
+        if (source.canEnumerate()) return initEnumerated(alloc, source, columns, predicates, context, limits);
+        try source.ensureInventory(context);
+        try source.ensureCanonicalPlan(context);
         const cached_order = source.canonicalOrder();
         if (cached_order == null) try source.inventory.validate();
         const files = cached_order orelse try serving.ServingSource.canonicalFileOrder(alloc, source.inventory);
         return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .owns_files = cached_order == null, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
+    }
+    fn initEnumerated(a: Allocator, parent: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
+        const navigation = parent.file_navigation.?;
+        const iterator = try navigation.enumerate.?(navigation.ptr, a, context);
+        errdefer iterator.close(iterator.ptr);
+        const view = try a.create(serving.ServingSource);
+        errdefer a.destroy(view);
+        view.* = try parent.parallelView(a);
+        errdefer view.closeParallelView(parent);
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = &.{};
+        view.scanner.inventory = view.inventory;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = &.{};
+        view.pinned_files_owned = false;
+        const files = try a.dupe(usize, &.{0});
+        return .{ .alloc = a, .source = view, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .file_index = 1, .iterator = iterator, .iterator_parent = parent, .schema_contract = if (parent.iceberg_schema) |schema| schema.columns else &.{} };
+    }
+    /// A tiny authenticated inventory can reuse native row-group scheduling.
+    /// Construction uses an independent iterator, so failure leaves this cursor
+    /// untouched for serial fallback. Large inventories remain streamed.
+    pub fn freezeSmallEnumeration(self: *Stream, maximum_files: usize) !bool {
+        const iterator = self.iterator orelse return false;
+        if (self.iterator_started) return false;
+        const parent = self.iterator_parent.?;
+        const count = parent.fileCount();
+        if (count == 0 or count > @min(maximum_files, 8)) return false;
+        const split = iterator.split orelse return false;
+        const copy = try split(iterator.ptr, self.alloc, 0, 1, self.context);
+        defer copy.close(copy.ptr);
+        const entries = try self.alloc.alloc(external.FileEntry, count);
+        var owned: usize = 0;
+        errdefer {
+            for (entries[0..owned]) |*file| file.deinit(self.alloc);
+            self.alloc.free(entries);
+        }
+        const pinned = try self.alloc.alloc(bool, count);
+        errdefer self.alloc.free(pinned);
+        const order = try self.alloc.alloc(usize, count);
+        errdefer self.alloc.free(order);
+        var view = try parent.parallelView(self.alloc);
+        errdefer view.closeParallelView(parent);
+        for (entries, pinned, order, 0..) |*file, *pin, *index, i| {
+            file.* = (try copy.next(copy.ptr, self.alloc, self.context)) orelse return error.InvalidExternalSourceInventory;
+            owned += 1;
+            pin.* = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+            index.* = i;
+        }
+        if (try copy.next(copy.ptr, self.alloc, self.context)) |extra_| {
+            var extra = extra_;
+            extra.deinit(self.alloc);
+            return error.InvalidExternalSourceInventory;
+        }
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = entries;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        if (self.owns_files) self.alloc.free(self.files);
+        self.files = order;
+        self.owns_files = true;
+        self.file_index = 0;
+        iterator.close(iterator.ptr);
+        self.iterator = null;
+        return true;
+    }
+    fn nextEnumeratedFile(self: *Stream) !bool {
+        const iterator = self.iterator.?;
+        self.iterator_started = true;
+        var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse return false;
+        self.enumerated_files += 1;
+        errdefer file.deinit(self.alloc);
+        const files = try self.alloc.alloc(external.FileEntry, 1);
+        errdefer self.alloc.free(files);
+        const pinned = try self.alloc.alloc(bool, 1);
+        errdefer self.alloc.free(pinned);
+        const parent = self.iterator_parent.?;
+        var view = try parent.parallelView(self.alloc);
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        files[0] = file;
+        view.inventory.files = files;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        pinned[0] = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        self.file_index = 0;
+        return true;
     }
     /// A contribution scan keeps the parent snapshot and delete applicability,
     /// but schedules only one pinned object. All footer offsets remain file-local.
@@ -395,7 +621,13 @@ pub const Stream = struct {
         self.owns_files = true;
         self.selection = selection;
     }
+    pub fn enumeratedHasMore(self: *Stream) !bool {
+        const iterator = self.iterator orelse return false;
+        const check = iterator.has_more orelse return true;
+        return check(iterator.ptr, self.context);
+    }
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
+        if (self.iterator != null) return 1;
         if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
         if (self.work) |work| return @min(maximum, work.units.len);
         const planning_io = self.source.scanner.shared_reader.?.context.io orelse self.context.io;
@@ -513,7 +745,7 @@ pub const Stream = struct {
             source.delete_lease = null;
             source.versions = .empty;
             defer source.clearVersions();
-            if (parent.source.versions.get(job.index)) |pinned| {
+            if (parent.source.pinnedVersion(job.index)) |pinned| {
                 var owned = pinned;
                 owned.etag = try job.alloc.dupe(u8, pinned.etag);
                 errdefer job.alloc.free(owned.etag);
@@ -537,17 +769,118 @@ pub const Stream = struct {
             job.stats = worker.stats;
         }
     };
-    pub fn deinit(self: *Stream) void {
+    /// All children of the previous file must be closed before advancing.
+    /// Only one footer's work census is retained by the rolling scheduler.
+    pub fn nextEnumerationWork(self: *Stream) !bool {
+        self.joinEnumerationLookahead();
         self.clearFile();
-        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+        self.releaseWork();
+        if (self.iterator == null) return false;
+        return self.nextEnumeratedFile();
+    }
+    /// Unordered work keeps a small rolling window so tiny files can overlap
+    /// while a large file still shares all its row groups among workers.
+    pub fn nextEnumerationWindow(self: *Stream, maximum: usize) !bool {
+        self.joinEnumerationLookahead();
+        self.clearFile();
+        self.releaseWork();
+        const iterator = self.iterator orelse return false;
+        const parent = self.iterator_parent.?;
+        var entries: std.ArrayList(external.FileEntry) = .empty;
+        var moved = false;
+        defer {
+            if (!moved) for (entries.items) |*file| file.deinit(self.alloc);
+            entries.deinit(self.alloc);
+        }
+        self.iterator_started = true;
+        for (0..@min(maximum, 4)) |_| {
+            var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse break;
+            errdefer file.deinit(self.alloc);
+            try entries.append(self.alloc, file);
+            self.enumerated_files += 1;
+        }
+        if (entries.items.len == 0) return false;
+        const pinned = try self.alloc.alloc(bool, entries.items.len);
+        errdefer self.alloc.free(pinned);
+        const order = try self.alloc.alloc(usize, entries.items.len);
+        errdefer self.alloc.free(order);
+        var view = try parent.parallelView(self.alloc);
+        errdefer view.closeParallelView(parent);
+        const files = try entries.toOwnedSlice(self.alloc);
+        moved = true;
+        for (files, pinned, order, 0..) |file, *pin, *index, i| {
+            pin.* = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+            index.* = i;
+        }
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = files;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        if (self.owns_files) self.alloc.free(self.files);
+        self.files = order;
+        self.owns_files = true;
+        self.file_index = 0;
+        return true;
+    }
+    /// Transfer a planned window to a stable owner while the producer keeps
+    /// the same monotonic enumeration cursor. Children borrow this window's
+    /// descriptors and work census until its last claim closes.
+    pub fn detachWork(self: *Stream) !Stream {
+        std.debug.assert(self.iterator != null and self.work != null);
+        var following = try initEnumerated(self.alloc, self.iterator_parent.?, self.columns, self.predicates, self.context, self.limits);
+        // Initialization is the only fallible step; the original remains
+        // intact on allocation failure, including all borrowed child plans.
+        following.iterator.?.close(following.iterator.?.ptr);
+        following.iterator = self.iterator;
+        following.iterator_started = self.iterator_started;
+        following.enumerated_files = self.enumerated_files;
+        following.enumeration_lookahead = self.enumeration_lookahead;
+        following.enumeration_prefetch_tasks = self.enumeration_prefetch_tasks;
+        following.enumeration_prefetch_files = self.enumeration_prefetch_files;
+        following.schema_contract = self.schema_contract;
+        following.identity_only = self.identity_only;
+        following.examined = self.examined;
+        following.filter = self.filter;
+        following.filter_columns = self.filter_columns;
+        self.iterator = null;
+        self.enumeration_lookahead = null;
+        const window = self.*;
+        self.* = following;
+        return window;
+    }
+    fn releaseWork(self: *Stream) void {
         if (self.owns_work) if (self.work) |work| {
             for (work.plans) |*plan| if (plan.*) |*owned| owned.deinit(self.alloc);
             self.alloc.free(work.plans);
             self.alloc.free(work.units);
             self.alloc.destroy(work);
         };
+        self.work = null;
+        self.owns_work = false;
+    }
+    pub fn deinit(self: *Stream) void {
+        if (self.enumeration_lookahead) |warm| warm.deinit();
+        self.enumeration_lookahead = null;
+        self.clearFile();
+        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+        self.releaseWork();
         if (self.owns_files) self.alloc.free(self.files);
         self.mapped_columns.deinit(self.alloc);
+        if (self.iterator_parent) |parent| {
+            self.source.closeParallelView(parent);
+            self.alloc.destroy(self.source);
+        }
+        if (self.iterator) |iterator| iterator.close(iterator.ptr);
         self.* = undefined;
     }
     fn clearBatch(self: *Stream) void {
@@ -586,6 +919,17 @@ pub const Stream = struct {
         self.group_index = 0;
         self.bloom_next_input = 0;
         self.lookahead_next_input = 0;
+    }
+    fn admitRows(self: *Stream, rows: u64) !void {
+        const counter = self.examined orelse {
+            if (rows > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
+            return;
+        };
+        var used = counter.load(.monotonic);
+        while (true) {
+            if (rows > self.limits.max_examined_rows -| used) return error.LakeRowsScanBudgetExceeded;
+            if (counter.cmpxchgWeak(used, used + rows, .monotonic, .monotonic)) |current| used = current else return;
+        }
     }
     /// The returned vectors remain valid until the next pull or close.
     pub fn next(self: *Stream) !?types.ColumnBatch {
@@ -632,7 +976,7 @@ pub const Stream = struct {
                         self.stats.bloom_groups_pruned += 1;
                         continue;
                     }
-                    if (group.row_count > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
+                    try self.admitRows(group.row_count);
                     self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.identity_only) &.{} else if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
                         .max_rows = self.limits.max_row_group_rows,
                         .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
@@ -668,7 +1012,7 @@ pub const Stream = struct {
                         // A driver supplies row ordinals for ID-only or missing
                         // nullable predicates; other columns remain deferred.
                         if (required == 0 and self.page_cursor.?.columns.len != 0) self.page_cursor.?.columns[0].required = true;
-                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch };
+                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch, .select = if (self.filter.?.select != null) selectMask else null, .encoded = self.filter.?.encoded };
                     }
                     const batch = try self.page_cursor.?.next();
                     if (batch == null) {
@@ -700,7 +1044,9 @@ pub const Stream = struct {
                 self.group_index = unit.group_index;
                 continue;
             } else blk: {
-                if (self.file_index == self.files.len) return null;
+                if (self.file_index == self.files.len) {
+                    if (self.iterator == null or !try self.nextEnumeratedFile()) return null;
+                }
                 const index = self.files[self.file_index];
                 self.file_index += 1;
                 if (self.partition_count > 1 and self.files.len > 1 and (self.file_index - 1) * self.partition_count / self.files.len != self.partition_index) continue;
@@ -768,7 +1114,7 @@ pub const Stream = struct {
             return;
         }
     }
-    fn loadFile(self: *Stream, index: usize) !void {
+    fn pinFileVersion(self: *Stream, index: usize) !void {
         // Metadata and partition pruning happen before statting data objects.
         // Pin each surviving file once, before any footer or payload read.
         if (self.source.lazy_versions and !self.source.isFilePinned(index)) {
@@ -801,19 +1147,29 @@ pub const Stream = struct {
                 self.source.alloc.free(entry.version_id);
                 entry.etag = etag;
                 entry.version_id = version;
+            } else if (self.source.immutable_objects and self.source.verified_selector != null) {
+                const selector = self.source.verified_selector.?;
+                const versions = try selector.read(selector.ptr, self.source.alloc, entry, self.context);
+                self.source.alloc.free(entry.etag);
+                self.source.alloc.free(entry.version_id);
+                entry.etag = versions.etag;
+                entry.version_id = versions.version_id;
             } else try iceberg.pinInventoryDataFileObjectVersions(self.source.alloc, self.source.scanner.object_reader.client, &single);
             if (sparse) try self.source.versions.put(self.source.alloc, index, entry) else {
                 self.source.inventory.files[index] = entry;
                 self.source.pinned_files[index] = true;
             }
         }
+    }
+    fn loadFile(self: *Stream, index: usize) !void {
+        try self.pinFileVersion(index);
         // Candidate hydration windows share immutable projected file readers.
         // Fresh version pinning above and delete preparation below remain
         // request-owned; cached plans contain only fully owned metadata.
         if (self.selection != null and self.source.scanner.shared_reader != null) {
             const reader = self.source.scanner.shared_reader.?;
             const file = self.source.fileAt(index);
-            const interpretation = try std.json.Stringify.valueAlloc(self.alloc, .{ .version = "hydration-file-plan-v1", .file = file.file_id, .format = self.source.inventory.format, .source = self.source.inventory.source_id, .source_uri = self.source.inventory.source_uri, .snapshot = self.source.inventory.snapshot_id, .schema = self.source.inventory.schema_fingerprint, .columns = self.columns, .contract = self.schema_contract, .predicates = self.predicates, .limits = self.limits }, .{});
+            const interpretation = try std.json.Stringify.valueAlloc(self.alloc, .{ .version = "hydration-file-plan-v1", .row_identity_version = self.source.inventory.row_identity_version, .file = file.file_id, .format = self.source.inventory.format, .source = self.source.inventory.source_id, .source_uri = self.source.inventory.source_uri, .snapshot = self.source.inventory.snapshot_id, .schema = self.source.inventory.schema_fingerprint, .columns = self.columns, .contract = self.schema_contract, .predicates = self.predicates, .limits = self.limits }, .{});
             defer self.alloc.free(interpretation);
             const key = try reader.objectKey(self.alloc, .{ .object = try @import("lake_range_io.zig").objectRefForExternalFileUri(file), .range = .{ .offset = 0, .len = file.byte_len }, .purpose = .parquet_footer }, interpretation);
             const ready_plan = reader.cache.decoded.lookup(key);
@@ -977,6 +1333,7 @@ pub const Stream = struct {
                     .coalesce_options = self.source.scanner.coalesce_options,
                     .materialization_limits = .{ .max_struct_allocation_bytes = self.limits.max_decoded_bytes, .max_input_bytes = self.limits.max_input_bytes, .max_decoded_bytes = self.limits.max_decoded_bytes },
                 };
+                const qualified = try self.source.qualifiedDeletes(self.context);
                 if (self.source.scanner.shared_reader) |reader| {
                     var hash = std.crypto.hash.sha2.Sha256.init(.{});
                     hash.update(&reader.scope);
@@ -990,13 +1347,15 @@ pub const Stream = struct {
                     var versions = std.crypto.hash.sha2.Sha256.init(.{});
                     const index_identity = if (self.source.plan_identity) |plan_key|
                         try std.json.Stringify.valueAlloc(self.alloc, plan_key, .{})
+                    else if (qualified) |evidence|
+                        try std.json.Stringify.valueAlloc(self.alloc, .{ .delete_recipe = evidence.recipe, .inventory = self.source.inventory }, .{})
                     else
                         try std.json.Stringify.valueAlloc(self.alloc, .{ .deletes = delete_plan, .inventory = self.source.inventory }, .{});
                     defer self.alloc.free(index_identity);
                     hash.update(index_identity);
                     var cacheable = true;
                     var delete_client = request.client.?;
-                    for (delete_plan.files) |file| {
+                    if (qualified) |evidence| cacheable = evidence.cacheable else for (delete_plan.files) |file| {
                         const location = try @import("lake_range_io.zig").objectLocationForUri(file.file_path);
                         var meta = try delete_client.statObject(location.bucket, location.key);
                         defer meta.deinit(request.client.?.allocator);
@@ -1005,21 +1364,23 @@ pub const Stream = struct {
                         // An unversioned provider cannot safely reuse an index.
                         if (meta.etag == null and meta.version_id == null) cacheable = false;
                     }
-                    const version_key = versions.finalResult();
+                    const version_key = if (qualified) |evidence| evidence.digest else versions.finalResult();
                     hash.update(&version_key);
                     const key = hash.finalResult();
                     const cached = if (cacheable) reader.cache.decoded.lookup(key) else null;
                     const lease = cached orelse blk: {
                         const owned = try reader.cache.decoded.create(64 * 1024 * 1024);
                         errdefer owned.release();
-                        owned.item.payload = .{ .prepared = try @import("lake_prepared_deletes.zig").Prepared.create(owned.item.budget.allocator(), request) };
+                        const decoded = try @import("lake_prepared_deletes.zig").Prepared.createQualified(owned.item.budget.allocator(), request, &reader.cache.delete_files, reader.scope, self.context, qualified);
+                        owned.item.payload = .{ .prepared = decoded };
+                        owned.item.foreign_bytes = owned.item.payload.prepared.foreignBytes();
                         try self.context.ensureActive();
                         if (cacheable and std.mem.eql(u8, &version_key, &owned.item.payload.prepared.object_versions)) reader.cache.decoded.publish(key, owned);
                         break :blk owned;
                     };
                     self.source.delete_lease = lease;
                     self.source.prepared_deletes = lease.item.payload.prepared;
-                } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, request);
+                } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.createQualified(self.source.alloc, request, null, @splat(0), self.context, qualified);
             }
         }
     }
@@ -1039,6 +1400,18 @@ pub const Stream = struct {
         return starts;
     }
     pub fn countAll(self: *Stream) !?u64 {
+        if (self.iterator != null) {
+            if (self.iterator_started or self.predicates.len != 0) return null;
+            var total: u64 = 0;
+            while (try self.nextEnumeratedFile()) {
+                try self.context.ensureActive();
+                try self.loadFile(0);
+                if (self.discovered) |plan| total = std.math.add(u64, total, plan.inventory.files[0].row_count) catch return error.LakeRowsScanBudgetExceeded;
+                self.clearFile();
+                self.file_index = self.files.len;
+            }
+            return total;
+        }
         if (self.file_index != 0 or self.predicates.len != 0) return null;
         var total: u64 = 0;
         for (self.files) |index| {
@@ -1051,14 +1424,14 @@ pub const Stream = struct {
         return total;
     }
     pub fn deleteMask(self: Stream, a: Allocator, batch: types.ColumnBatch, selected: []bool) !void {
-        for (batch.row_refs, selected) |ref, *keep| if (keep.* and self.isDeleted(ref)) {
-            keep.* = false;
-        };
+        for (selected, 0..) |*keep, index| {
+            if (keep.* and self.isDeleted(batch.rowRef(index))) keep.* = false;
+        }
         if (self.source.prepared_deletes) |prepared|
             try prepared.maskPositions(a, self.discovered.?.inventory.files[0], batch, selected, self.position_starts);
     }
     pub fn isDeletedBatch(self: Stream, a: Allocator, batch: types.ColumnBatch, index: usize) !bool {
-        if (self.isDeleted(batch.row_refs[index])) return true;
+        if (self.isDeleted(batch.rowRef(index))) return true;
         if (self.source.prepared_deletes) |prepared|
             return prepared.matchesPositions(a, self.discovered.?.inventory.files[0], batch, index, self.position_starts);
         return false;
@@ -1098,15 +1471,119 @@ fn rangeMayMatch(comptime T: type, min: T, max: T, value: T, op: Predicate.Op) b
         .gte => high != .lt,
     };
 }
+fn orderMayMatch(low: std.math.Order, high: std.math.Order, op: Predicate.Op) bool {
+    return switch (op) {
+        .eq => low != .gt and high != .lt,
+        .neq => low != .eq or high != .eq,
+        .lt => low == .lt,
+        .lte => low != .gt,
+        .gt => high == .gt,
+        .gte => high != .lt,
+    };
+}
+fn metricFloat(bytes: []const u8, physical: []const u8) ?f64 {
+    if (std.mem.eql(u8, physical, "float") and bytes.len == 4) return @as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], .little)));
+    if (std.mem.eql(u8, physical, "double") and bytes.len == 8) return @as(f64, @bitCast(std.mem.readInt(u64, bytes[0..8], .little)));
+    return null;
+}
+/// Statistics exclude NaNs. Upper-side predicates must therefore retain the
+/// group unless separate evidence proves NaN absence. Narrowed extrema are
+/// monotone, but failed conversions and underflow-crossing ranges stay residual.
+pub fn floatBoundsMayMatch(minimum: f64, maximum: f64, bound: FloatBound, op: Predicate.Op) bool {
+    const floating = @import("../../common/float_domain.zig");
+    if (!std.math.isFinite(bound.value) or std.math.isNan(minimum) or std.math.isNan(maximum) or minimum > maximum) return true;
+    if (op == .gt or op == .gte or op == .neq or bound.domain == .finite) return true;
+    if (bound.domain == .float32 and ((!std.math.isFinite(minimum) or !std.math.isFinite(maximum)) or (minimum <= 0 and maximum >= 0 and minimum != maximum))) return true;
+    const low = floating.normalize(minimum, bound.domain) catch return true;
+    const high = floating.normalize(maximum, bound.domain) catch return true;
+    return orderMayMatch(floating.order(low, bound.value), floating.order(high, bound.value), op);
+}
+fn floatBytesMayMatch(chunk: external.ColumnChunk, minimum: ?[]const u8, maximum: ?[]const u8, bound: FloatBound, op: Predicate.Op) bool {
+    if (chunk.logical_type.len != 0) return true;
+    const low = metricFloat(minimum orelse return true, chunk.physical_type) orelse return true;
+    const high = metricFloat(maximum orelse return true, chunk.physical_type) orelse return true;
+    return floatBoundsMayMatch(low, high, bound, op);
+}
+fn floatBloomBytes(bound: FloatBound, physical: []const u8, buffer: *[8]u8) ?[]const u8 {
+    if (!std.math.isFinite(bound.value) or bound.value == 0 or bound.domain == .finite) return null;
+    if (std.mem.eql(u8, physical, "float")) {
+        const value: f32 = @floatCast(bound.value);
+        if (@as(f64, value) != bound.value) return null;
+        std.mem.writeInt(u32, buffer[0..4], @bitCast(value), .little);
+        return buffer[0..4];
+    }
+    if (std.mem.eql(u8, physical, "double") and bound.domain == .float64) {
+        std.mem.writeInt(u64, buffer, @bitCast(bound.value), .little);
+        return buffer;
+    }
+    return null;
+}
+fn typedBoundsMayMatch(chunk: external.ColumnChunk, minimum: ?[]const u8, maximum: ?[]const u8, predicate: Predicate) bool {
+    const min = minimum orelse return true;
+    const max = maximum orelse return true;
+    const decimal = @import("../../common/decimal128.zig");
+    const is_decimal = std.mem.eql(u8, chunk.logical_type, "decimal");
+    const is_integer = chunk.logical_type.len == 0 or std.mem.startsWith(u8, chunk.logical_type, "int");
+    if (predicate.value == .decimal) {
+        if (!is_decimal and !is_integer) return true;
+        const scale: u16 = if (is_decimal) std.math.cast(u16, chunk.decimal_scale) orelse return true else 0;
+        if (scale > 38 or predicate.value.decimal.scale > 38) return true;
+        const bytes = std.mem.eql(u8, chunk.physical_type, "byte_array") or std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array");
+        const integers = std.mem.eql(u8, chunk.physical_type, "int32") or std.mem.eql(u8, chunk.physical_type, "int64");
+        if ((!is_decimal and bytes) or (!bytes and !integers)) return true;
+        const low: i128 = if (bytes) decimal.signedBigEndian(min) catch return true else metricInteger(min) orelse return true;
+        const high: i128 = if (bytes) decimal.signedBigEndian(max) catch return true else metricInteger(max) orelse return true;
+        if (low > high) return true;
+        if (is_decimal) {
+            decimal.validateCoefficient(low, chunk.decimal_precision, scale) catch return true;
+            decimal.validateCoefficient(high, chunk.decimal_precision, scale) catch return true;
+        }
+        const bound = predicate.value.decimal;
+        // A declared NUMERIC scale may round physical values. Only use raw
+        // extrema when every value remains exact under the declared scale.
+        if (bound.max_physical_scale) |limit| if (scale > limit) return true;
+        return orderMayMatch(decimal.order(low, scale, bound.coefficient, bound.scale), decimal.order(high, scale, bound.coefficient, bound.scale), predicate.op);
+    }
+    if (predicate.value == .timestamp) {
+        if (!std.mem.eql(u8, chunk.physical_type, "int64")) return true;
+        const multiplier: i128 = if (std.mem.eql(u8, chunk.logical_type, "timestamp_millis")) 1000000 else if (std.mem.eql(u8, chunk.logical_type, "timestamp_micros")) 1000 else if (std.mem.eql(u8, chunk.logical_type, "timestamp_nanos")) 1 else return true;
+        const low: i128 = metricInteger(min) orelse return true;
+        const high: i128 = metricInteger(max) orelse return true;
+        if (low > high) return true;
+        return rangeMayMatch(i128, low * multiplier, high * multiplier, predicate.value.timestamp, predicate.op);
+    }
+    return true;
+}
 pub fn groupMayMatch(group: external.RowGroup, predicates: []const Predicate) bool {
     for (predicates) |predicate| for (group.column_chunks) |chunk| {
         if (!std.mem.eql(u8, chunk.column_id, predicate.column)) continue;
+        if (predicate.value == .number) {
+            if (chunk.logical_type.len == 0 and (std.mem.eql(u8, chunk.physical_type, "float") or std.mem.eql(u8, chunk.physical_type, "double"))) {
+                if (!floatBoundsMayMatch(chunk.stats_min_f64 orelse continue, chunk.stats_max_f64 orelse continue, predicate.value.number, predicate.op)) return false;
+            }
+            continue;
+        }
+        if (predicate.value == .decimal or predicate.value == .timestamp) {
+            var low: [8]u8 = undefined;
+            var high: [8]u8 = undefined;
+            const min: ?[]const u8 = if (chunk.stats_min_i64) |n| blk: {
+                std.mem.writeInt(i64, &low, n, .little);
+                break :blk &low;
+            } else chunk.stats_min_bytes;
+            const max: ?[]const u8 = if (chunk.stats_max_i64) |n| blk: {
+                std.mem.writeInt(i64, &high, n, .little);
+                break :blk &high;
+            } else chunk.stats_max_bytes;
+            if (!typedBoundsMayMatch(chunk, min, max, predicate)) return false;
+            continue;
+        }
         // Decimal/timestamp annotations change comparison semantics relative
         // to their physical statistics. Keep those predicates residual.
         if (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string")) continue;
         const matches = switch (predicate.value) {
             .integer => |value| if (chunk.stats_min_i64) |min| if (chunk.stats_max_i64) |max| rangeMayMatch(i64, min, max, value, predicate.op) else true else true,
             .bytes => |value| if (chunk.stats_min_bytes) |min| if (chunk.stats_max_bytes) |max| rangeMayMatch([]const u8, min, max, value, predicate.op) else true else true,
+            .number, .decimal, .timestamp => unreachable,
             .boolean => |value| if (chunk.stats_min_bool) |min| if (chunk.stats_max_bool) |max| rangeMayMatch(u8, @intFromBool(min), @intFromBool(max), @intFromBool(value), predicate.op) else true else true,
         };
         if (!matches) return false;
@@ -1132,6 +1609,27 @@ pub fn icebergFileMayMatch(file: external.FileEntry, schema: []const @import("la
         const id = column.field_id orelse continue;
         const min = metricValue(file.lower_bounds, id) orelse continue;
         const max = metricValue(file.upper_bounds, id) orelse continue;
+        if (predicate.value == .number) {
+            if (!std.mem.eql(u8, column.kind, "number")) continue;
+            const low = metricFloat(min, column.iceberg_type) orelse continue;
+            const high = metricFloat(max, column.iceberg_type) orelse continue;
+            if (!floatBoundsMayMatch(low, high, predicate.value.number, predicate.op)) return false;
+            continue;
+        }
+        if (predicate.value == .decimal or predicate.value == .timestamp) {
+            var chunk: external.ColumnChunk = .{ .column_id = @constCast(predicate.column), .file_offset = 0, .compressed_len = 1, .physical_type = @constCast("int64") };
+            const kind = column.iceberg_type;
+            if (std.mem.startsWith(u8, kind, "decimal(") and std.mem.endsWith(u8, kind, ")")) {
+                var parts = std.mem.splitScalar(u8, kind[8 .. kind.len - 1], ',');
+                chunk.decimal_precision = std.fmt.parseInt(i32, std.mem.trim(u8, parts.next() orelse continue, " "), 10) catch continue;
+                chunk.decimal_scale = std.fmt.parseInt(i32, std.mem.trim(u8, parts.next() orelse continue, " "), 10) catch continue;
+                if (parts.next() != null) continue;
+                chunk.logical_type = @constCast("decimal");
+                chunk.physical_type = @constCast("byte_array");
+            } else if (std.mem.eql(u8, kind, "timestamp") or std.mem.eql(u8, kind, "timestamptz")) chunk.logical_type = @constCast("timestamp_micros") else if (!std.mem.eql(u8, column.kind, "integer")) continue;
+            if (!typedBoundsMayMatch(chunk, min, max, predicate)) return false;
+            continue;
+        }
         const matches = switch (predicate.value) {
             .integer => |value| blk: {
                 // Timestamp and decimal bounds require their original Iceberg
@@ -1146,6 +1644,7 @@ pub fn icebergFileMayMatch(file: external.FileEntry, schema: []const @import("la
                 if (!std.mem.eql(u8, column.iceberg_type, "string") or std.mem.order(u8, min, max) == .gt) continue;
                 break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
             },
+            .number, .decimal, .timestamp => unreachable,
             .boolean => |value| blk: {
                 if (!std.mem.eql(u8, column.kind, "boolean") or min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
                 break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
@@ -1234,7 +1733,11 @@ fn bloomProbeUseful(chunk: external.ColumnChunk, predicate: Predicate) bool {
         .bytes => |value| std.mem.eql(u8, chunk.physical_type, "byte_array") and
             (chunk.logical_type.len == 0 or std.mem.eql(u8, chunk.logical_type, "string")) and
             !(chunk.stats_min_bytes != null and chunk.stats_max_bytes != null and std.mem.eql(u8, chunk.stats_min_bytes.?, value) and std.mem.eql(u8, chunk.stats_max_bytes.?, value)),
-        .boolean => false,
+        .number => |value| blk: {
+            var buffer: [8]u8 = undefined;
+            break :blk chunk.logical_type.len == 0 and floatBloomBytes(value, chunk.physical_type, &buffer) != null;
+        },
+        .boolean, .decimal, .timestamp => false,
     };
 }
 
@@ -1265,7 +1768,8 @@ fn bloomGroupMayMatch(alloc: Allocator, reader: parquet.ObjectRangeReader, file:
                         (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string"))) continue;
                     break :text value;
                 },
-                .boolean => continue,
+                .number => |value| if (chunk.logical_type.len == 0) floatBloomBytes(value, chunk.physical_type, &value_bytes) orelse continue else continue,
+                .boolean, .decimal, .timestamp => continue,
             };
             if (offset >= file.byte_len) continue;
             const available = if (chunk.bloom_filter_length) |len| @min(file.byte_len - offset, len) else file.byte_len - offset;
@@ -1362,4 +1866,48 @@ test "external lake Bloom pruning reads only metadata and one block with legacy 
     chunk.logical_type = @constCast("");
     fake.bytes[8] = 0x2c;
     try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &absent, .{}, &stats));
+}
+
+test "lake SQL typed decimal and timestamp metrics prune only semantically compatible bounds" {
+    var low: [16]u8 = undefined;
+    var high: [16]u8 = undefined;
+    std.mem.writeInt(i128, &low, -100, .big);
+    std.mem.writeInt(i128, &high, 100, .big);
+    const chunk: external.ColumnChunk = .{ .column_id = @constCast("v"), .file_offset = 0, .compressed_len = 16, .physical_type = @constCast("fixed_len_byte_array"), .logical_type = @constCast("decimal"), .decimal_precision = 38, .decimal_scale = 2, .stats_min_bytes = &low, .stats_max_bytes = &high };
+    var chunks = [_]external.ColumnChunk{chunk};
+    const group: external.RowGroup = .{ .ordinal = 0, .row_count = 2, .column_chunks = &chunks };
+    try chunks[0].validate(16);
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .eq, .value = .{ .decimal = .{ .coefficient = -1000, .scale = 3 } } }}));
+    try std.testing.expect(!groupMayMatch(group, &.{.{ .column = "v", .op = .gte, .value = .{ .decimal = .{ .coefficient = 1001, .scale = 3 } } }}));
+    // Declared scale rounding can make a raw out-of-range value match.
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .gte, .value = .{ .decimal = .{ .coefficient = 1001, .scale = 3, .max_physical_scale = 1 } } }}));
+    // The same bytes cannot prove a numeric predicate over a string column.
+    chunks[0].logical_type = @constCast("string");
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .gte, .value = .{ .decimal = .{ .coefficient = 1001, .scale = 3 } } }}));
+    chunks[0] = .{ .column_id = @constCast("v"), .file_offset = 0, .compressed_len = 16, .physical_type = @constCast("int64"), .logical_type = @constCast("timestamp_micros"), .stats_min_i64 = -1, .stats_max_i64 = 1 };
+    try std.testing.expect(groupMayMatch(group, &.{.{ .column = "v", .op = .eq, .value = .{ .timestamp = -1 } }}));
+    try std.testing.expect(!groupMayMatch(group, &.{.{ .column = "v", .op = .gt, .value = .{ .timestamp = 1000 } }}));
+}
+
+test "external lake floating pruning preserves REAL normalization NaNs and Bloom equivalence" {
+    const rounded: f64 = @as(f32, 0.1);
+    try std.testing.expect(floatBoundsMayMatch(0.1, 0.1, .{ .value = rounded, .domain = .float32 }, .eq));
+    try std.testing.expect(!floatBoundsMayMatch(0.1, 0.1, .{ .value = 0.1, .domain = .float32 }, .eq));
+    try std.testing.expect(!floatBoundsMayMatch(5, 10, .{ .value = 3, .domain = .float64 }, .lt));
+    // NaN values are absent from Parquet extrema and compare above all finite numbers.
+    try std.testing.expect(floatBoundsMayMatch(5, 10, .{ .value = 20, .domain = .float64 }, .gt));
+    try std.testing.expect(floatBoundsMayMatch(5, 5, .{ .value = 5, .domain = .float64 }, .neq));
+    try std.testing.expect(floatBoundsMayMatch(1e-300, 1e-300, .{ .value = 1, .domain = .float32 }, .eq));
+    var buffer: [8]u8 = undefined;
+    try std.testing.expect(floatBloomBytes(.{ .value = rounded, .domain = .float32 }, "double", &buffer) == null);
+    try std.testing.expect(floatBloomBytes(.{ .value = -0.0, .domain = .float64 }, "double", &buffer) == null);
+    try std.testing.expect(floatBloomBytes(.{ .value = rounded, .domain = .float32 }, "float", &buffer) != null);
+    try std.testing.expect(floatBloomBytes(.{ .value = 0.1, .domain = .float64 }, "double", &buffer) != null);
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(u64, &lo, @bitCast(@as(f64, 5)), .little);
+    std.mem.writeInt(u64, &hi, @bitCast(@as(f64, 10)), .little);
+    const chunk: external.ColumnChunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = 1, .physical_type = @constCast("double"), .stats_min_f64 = 5, .stats_max_f64 = 10 };
+    try std.testing.expect(!groupMayMatch(.{ .ordinal = 0, .row_count = 1, .file_offset = 0, .total_byte_len = 1, .column_chunks = @constCast(&[_]external.ColumnChunk{chunk}) }, &.{.{ .column = "n", .op = .eq, .value = .{ .number = .{ .value = 3, .domain = .float64 } } }}));
+    try std.testing.expect(!floatBytesMayMatch(chunk, &lo, &hi, .{ .value = 3, .domain = .float64 }, .eq));
 }

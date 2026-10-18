@@ -14466,7 +14466,13 @@ export interface components {
             table_id: string;
             /** @enum {string} */
             format: "parquet" | "iceberg";
+            /** @description Parquet prefix, Iceberg table, or an explicit Parquet snapshot head ending in .parquet-manifest.json. Snapshot heads name immutable checksummed file-list chunks; each query revalidates the head without listing the data prefix. */
             uri: string;
+            /**
+             * @description Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
+             * @enum {integer}
+             */
+            readonly row_identity_version?: 1 | 2;
             /** @default auto */
             schema_fingerprint?: string;
             /**

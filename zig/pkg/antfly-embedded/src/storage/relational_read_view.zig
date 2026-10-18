@@ -55,6 +55,7 @@ pub const View = struct {
         /// original page and every output reference release independently.
         lease: ?*Lease = null,
         retained_pages: []Page = &.{},
+        columnar_blocks: []const @import("../sql/spill.zig").ColumnarBlock = &.{},
         const Lease = struct { alloc: std.mem.Allocator, refs: std.atomic.Value(usize), page: Page };
         pub fn retain(self: *Page, alloc: std.mem.Allocator) !Page {
             const lease = self.lease orelse blk: {
@@ -74,6 +75,7 @@ pub const View = struct {
                 }
             } else {
                 for (self.retained_pages) |*page| page.deinit();
+                for (self.columnar_blocks) |block| block.deinit();
                 self.arena.deinit();
             }
             self.* = undefined;

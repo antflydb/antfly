@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
             .tolerance = tolerance,
             .qualification = false,
             .timing_boundary = "prepared_cpu_input_upload+encoder+classifier+completed_cpu_readback",
-            .cuda_stats = factory.getCudaRuntimeStats(session),
+            .cuda_stats = if (comptime factory.CudaRuntimeStats != void) factory.getCudaRuntimeStats(session) else null,
         }, .{});
         defer a.free(ready);
         try std.Io.File.stdout().writeStreamingAll(init.io, ready);
@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
                 .core_ms = invocation.core_ms,
                 .max_logit_error = invocation.max_logit_error,
                 .logits = invocation.logits,
-                .cuda_stats = factory.getCudaRuntimeStats(session),
+                .cuda_stats = if (comptime factory.CudaRuntimeStats != void) factory.getCudaRuntimeStats(session) else null,
             }, .{});
             try std.Io.File.stdout().writeStreamingAll(init.io, response);
             try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
         report.* = .{ .id = case.id, .tokens = case.input_ids.len, .median_ms = if (reps % 2 == 0) (sorted[reps / 2 - 1] + sorted[reps / 2]) / 2 else sorted[reps / 2], .p95_ms = sorted[@min(reps - 1, (reps * 95 + 99) / 100 - 1)], .core_median_ms = if (reps % 2 == 0) (core_sorted[reps / 2 - 1] + core_sorted[reps / 2]) / 2 else core_sorted[reps / 2], .max_logit_error = max_error, .logits = last_rows, .samples_ms = samples, .core_samples_ms = core_samples };
         std.debug.print("{s} {s}: {d:.3} ms, error {d:.6}\n", .{ backend, case.id, report.median_ms, max_error });
     }
-    const result = try std.json.Stringify.valueAlloc(a, .{ .scope = "offline loaded pipeline: schema compile, tokenization, encoder, classifier and completed readback; excludes HTTP, model load, and output presentation", .core_scope = "prepared encoder, classifier and completed CPU readback; excludes schema compilation and tokenization", .build_mode = @tagName(@import("builtin").mode), .backend = backend, .model_dir = directory, .load_ms = load_ms, .warmups = warmups, .reps = reps, .validation_preflights = 1, .tolerance = tolerance, .reports = reports, .cuda_stats = factory.getCudaRuntimeStats(session) }, .{});
+    const result = try std.json.Stringify.valueAlloc(a, .{ .scope = "offline loaded pipeline: schema compile, tokenization, encoder, classifier and completed readback; excludes HTTP, model load, and output presentation", .core_scope = "prepared encoder, classifier and completed CPU readback; excludes schema compilation and tokenization", .build_mode = @tagName(@import("builtin").mode), .backend = backend, .model_dir = directory, .load_ms = load_ms, .warmups = warmups, .reps = reps, .validation_preflights = 1, .tolerance = tolerance, .reports = reports, .cuda_stats = if (comptime factory.CudaRuntimeStats != void) factory.getCudaRuntimeStats(session) else null }, .{});
     defer a.free(result);
     try std.Io.File.stdout().writeStreamingAll(init.io, result);
     try std.Io.File.stdout().writeStreamingAll(init.io, "\n");

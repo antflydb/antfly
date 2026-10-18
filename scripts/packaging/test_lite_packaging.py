@@ -106,8 +106,37 @@ class LitePackagingTests(unittest.TestCase):
                     for item in stage.iterdir():
                         tar.add(item, arcname=item.name)
 
+            # Run the existing source packaging contract in the same detached
+            # worktree arrangement used by the controller. Its manifest writes
+            # must never invalidate the active workspace's frozen lockfile.
+            lock = root / "ts/pnpm-lock.yaml"
+            lock.write_bytes((ROOT / "ts/pnpm-lock.yaml").read_bytes())
+            manifests = list(root.glob("ts/packages/*/package.json")) + [
+                root / "py/packages/embedded/pyproject.toml",
+                lock,
+            ]
+            originals = {path: path.read_bytes() for path in manifests}
+            commands = (
+                ["init", "-q"],
+                ["add", "ts", "py", "LICENSES"],
+                [
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "Source fixture",
+                ],
+                ["worktree", "add", "--detach", "dist/embedded-package-source", "HEAD"],
+            )
+            for command in commands:
+                subprocess.run(
+                    ["git", *command], cwd=root, check=True, capture_output=True
+                )
+            staged = root / "dist/embedded-package-source"
             with (
-                mock.patch.object(package, "ROOT", root),
+                mock.patch.object(package, "ROOT", staged),
                 mock.patch.object(
                     sys,
                     "argv",
@@ -124,9 +153,12 @@ class LitePackagingTests(unittest.TestCase):
             ):
                 self.assertEqual(0, package.main())
 
+            for path, original in originals.items():
+                self.assertEqual(original, path.read_bytes(), str(path))
+
             for platform in package.PACKAGE_PLATFORMS:
                 suffix = platform.npm_package_dir.replace("cli-", "embedded-")
-                npm = root / "ts/packages" / suffix
+                npm = staged / "ts/packages" / suffix
                 self.assertEqual(
                     "1.2.3", json.loads((npm / "package.json").read_text())["version"]
                 )
@@ -222,7 +254,7 @@ class LitePackagingTests(unittest.TestCase):
                         "--ignore-scripts",
                         "--pack-destination",
                         str(npm_dir),
-                        str(root / "ts/packages" / name),
+                        str(staged / "ts/packages" / name),
                     ],
                     check=True,
                     capture_output=True,
@@ -255,6 +287,50 @@ class LitePackagingTests(unittest.TestCase):
             snapshot.verify(sealed, "1.2.3", commit)
             manifest_path = sealed / "lite-snapshot.json"
             manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                set(manifest["wheel_platforms"]),
+                {platform.wheel_platform for platform in package.PACKAGE_PLATFORMS},
+            )
+            with mock.patch.object(
+                snapshot,
+                "source_wheel_platforms",
+                return_value=["a changed future policy"],
+            ):
+                snapshot.verify(sealed, "1.2.3", commit)
+            legacy = root / "legacy-snapshot"
+            shutil.copytree(sealed, legacy)
+            legacy_manifest = json.loads(manifest_path.read_text())
+            legacy_manifest["schema_version"] = 1
+            legacy_manifest.pop("wheel_platforms")
+            for item in legacy_manifest["artifacts"]:
+                if "macosx_" not in item["name"]:
+                    continue
+                original = legacy / item["name"]
+                old_tag = item["name"].split("py3-none-", 1)[1].removesuffix(".whl")
+                item["name"] = item["name"].replace(old_tag, "macosx_11_0_arm64")
+                destination = legacy / item["name"]
+                with (
+                    zipfile.ZipFile(original) as source,
+                    zipfile.ZipFile(destination, "w") as wheel,
+                ):
+                    for name in source.namelist():
+                        content = source.read(name)
+                        if name.endswith(".dist-info/WHEEL"):
+                            content = content.replace(
+                                old_tag.encode(), b"macosx_11_0_arm64"
+                            )
+                        wheel.writestr(name, content)
+                original.unlink()
+                item["size"] = destination.stat().st_size
+                item["sha256"] = snapshot.sha256(destination)
+            (legacy / "lite-snapshot.json").write_text(json.dumps(legacy_manifest))
+            snapshot.verify(legacy, "1.2.3", commit)
+            bad_platforms = {**manifest, "wheel_platforms": ["../escape", "x", "y"]}
+            manifest_path.write_text(json.dumps(bad_platforms))
+            with self.assertRaisesRegex(ValueError, "wheel platform set differs"):
+                snapshot.verify(sealed, "1.2.3", commit)
+            manifest_path.write_text(json.dumps(manifest))
             manifest["artifacts"].append(manifest["artifacts"][0])
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "artifact set differs"):

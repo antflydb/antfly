@@ -9751,8 +9751,8 @@ pub const Node = struct {
         };
         if (!spanV2BackendSupported(config, backend)) return error.UnsupportedExtractionBackend;
         // The executor's generic DeBERTa default is 512. An exact qualified
-        // identity supplies its own measured ceiling, including FP32 1B's
-        // 1024-token budget; Q8 retains its separate 198-token contract.
+        // identity supplies its own measured ceiling. FP32 and Q8 evidence
+        // independently cover the 1B's 1024-token budget.
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;

@@ -156,6 +156,26 @@ if [ "$apple_providers" = true ]; then
   esac
 fi
 
+# Ubuntu installs the Mach-O linker under LLVM's versioned bindir. Resolve
+# it before compiling so a missing cross-link tool fails in seconds, not hours.
+case "$target" in
+  *macos*)
+    if [ "$(uname -s)" != Darwin ]; then
+      if ! command -v ld64.lld >/dev/null 2>&1; then
+        llvm_bin="$(llvm-config --bindir 2>/dev/null || true)"
+        if [ -n "$llvm_bin" ] && [ -x "$llvm_bin/ld64.lld" ]; then
+          export PATH="$llvm_bin:$PATH"
+        fi
+      fi
+      if ! command -v ld64.lld >/dev/null 2>&1 || ! command -v llvm-nm >/dev/null 2>&1; then
+        echo "macOS cross builds require ld64.lld and llvm-nm; install LLVM/lld and put LLVM's bin directory on PATH" >&2
+        exit 2
+      fi
+      ld64.lld --version
+    fi
+    ;;
+esac
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
 if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then
@@ -167,7 +187,10 @@ export SOURCE_DATE_EPOCH="$source_date_epoch"
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${product}-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
-local_cache="${work_root}/zig-cache"
+# Keep project objects outside product scratch so server, embedded, standalone
+# inference and repeated archive builds can reuse compatible compile results.
+# Zig keys these objects by source, toolchain, target and compile options.
+local_cache="$repo_root/.zig-cache/release"
 cache_root="${ANTFLY_ZIG_CACHE_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache}"
 
 if [ -z "${ANTFLY_ZIG_CACHE_ROOT:-}" ] && [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
@@ -228,19 +251,15 @@ zig_install_args=(
 )
 
 run_zig_build_steps() {
-  # Darwin storage reserves 28 GiB and API reserves 24 GiB. Use the bounded
-  # runner's 80% host/cgroup budget for Darwin rather than an arbitrary cap
-  # that rejects these units or prevents safe overlap on larger CI hosts.
+  # Use the bounded runner's host/cgroup budget on every target. A fixed cap
+  # left larger release runners idle by preventing independent units from
+  # overlapping even when their reservations fit within 80% of container RAM.
   local -a command=(
     python3
     "$repo_root/zig/tools/run_bounded_zig_build.py"
     --zig
     zig
   )
-  case "$target" in
-    *macos*) ;;
-    *) command+=(--max-rss-cap 21474836480) ;;
-  esac
   command+=(-- build --summary all)
 
   if [[ "$product" = lite || "$product" = embedded ]]; then

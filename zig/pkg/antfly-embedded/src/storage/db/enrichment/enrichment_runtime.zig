@@ -3085,6 +3085,90 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
 }
 
+// A transport failure can be repaired by a new runtime/software owner. Admit
+// pending replay through the existing durable no-progress budget, retaining all
+// diagnostics and request-owned retry/terminal debt. Ordinary fatal failures
+// and exhausted episodes still require explicit repair.
+fn boundaryFailureReadmission(status: enrichment_state.RuntimeStatus, applied: u64, limit: u32) ?enrichment_state.RuntimeStatus {
+    if (!status.worker_failed or status.target_sequence <= applied or
+        !std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure") or
+        status.consecutive_retry_count >= limit) return null;
+    var admitted = status;
+    admitted.worker_failed = false;
+    admitted.retrying = true;
+    admitted.next_retry_at_ms = 0;
+    admitted.consecutive_retry_count += 1;
+    return admitted;
+}
+
+fn restoreThreadedRuntimeStatus(runtime: *EnrichmentRuntime, status: enrichment_state.RuntimeStatus) void {
+    restorePersistedRuntimeStatus(runtime, boundaryFailureReadmission(status, runtime.applied_sequence, runtime.config.worker_retry_max_attempts) orelse status);
+}
+
+// Persist the reservation only after acquiring the replay lease. Keep the
+// failure latch durable until real replay progress: a crash during recovery
+// must consume this slot rather than silently forgiving the failed episode.
+fn boundaryFailureAdmissionStatus(status: enrichment_state.RuntimeStatus) ?enrichment_state.RuntimeStatus {
+    if (status.worker_failed or !status.retrying or status.consecutive_retry_count == 0 or
+        !std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure")) return null;
+    var durable = status;
+    durable.worker_failed = true;
+    durable.retrying = false;
+    durable.next_retry_at_ms = 0;
+    return durable;
+}
+
+test "enrichment boundary failure readmission preserves durable debt and bounds crash reopen" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(alloc, store);
+    defer erased.deinit();
+    const original: enrichment_state.RuntimeStatus = .{
+        .last_error_code = .init("RuntimeBoundaryFailure"),
+        .target_sequence = 14,
+        .worker_failed = true,
+        .error_count = 7,
+        .fatal_error_count = 2,
+        .retry_failure_fingerprint = 77,
+        .retry_failure_count = 4,
+        .terminal_failure_min_sequence = 8,
+        .terminal_failure_max_sequence = 9,
+    };
+    var status = original;
+    for (1..7) |attempt| {
+        const admitted = boundaryFailureReadmission(status, 1, 6) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(!admitted.worker_failed and admitted.retrying);
+        try std.testing.expectEqual(@as(u32, @intCast(attempt)), admitted.consecutive_retry_count);
+        try std.testing.expectEqual(original.target_sequence, admitted.target_sequence);
+        try std.testing.expectEqual(original.error_count, admitted.error_count);
+        try std.testing.expectEqual(original.fatal_error_count, admitted.fatal_error_count);
+        try std.testing.expectEqual(original.retry_failure_fingerprint, admitted.retry_failure_fingerprint);
+        try std.testing.expectEqual(original.retry_failure_count, admitted.retry_failure_count);
+        try std.testing.expectEqual(original.terminal_failure_min_sequence, admitted.terminal_failure_min_sequence);
+        try std.testing.expectEqual(original.terminal_failure_max_sequence, admitted.terminal_failure_max_sequence);
+        const reservation = boundaryFailureAdmissionStatus(admitted) orelse return error.TestUnexpectedResult;
+        try enrichment_state.saveRuntimeStatus(erased, scope_name, reservation);
+        status = try enrichment_state.loadRuntimeStatus(alloc, erased, scope_name);
+        try std.testing.expectEqual(@as(u32, @intCast(attempt)), status.consecutive_retry_count);
+        try std.testing.expect(status.worker_failed and !status.retrying);
+    }
+    try std.testing.expect(boundaryFailureReadmission(status, 1, 6) == null);
+    try std.testing.expect(boundaryFailureReadmission(original, 14, 6) == null);
+    try std.testing.expect(boundaryFailureReadmission(original, 1, 0) == null);
+    for ([_][]const u8{ "UnsupportedEmbeddingProvider", "InvalidEnrichmentState", "" }) |name| {
+        var terminal = original;
+        terminal.last_error_code = .init(name);
+        try std.testing.expect(boundaryFailureReadmission(terminal, 1, 6) == null);
+        terminal.worker_failed = false;
+        terminal.retrying = true;
+        terminal.consecutive_retry_count = 1;
+        try std.testing.expect(boundaryFailureAdmissionStatus(terminal) == null);
+    }
+}
+
 test "enrichment runtime restore preserves retry target across restart" {
     var runtime = struct {
         applied_sequence: u64 = 3,
@@ -5513,7 +5597,7 @@ const PlatformEnrichmentRuntime = struct {
         errdefer runtime.ownership.deinitPreserveLease(alloc);
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
-        restorePersistedRuntimeStatus(&runtime, persisted_status);
+        restoreThreadedRuntimeStatus(&runtime, persisted_status);
         return runtime;
     }
 
@@ -5524,7 +5608,7 @@ const PlatformEnrichmentRuntime = struct {
         if (self.future != null) return error.EnrichmentRuntimeStarted;
         self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
-        restorePersistedRuntimeStatus(self, persisted_status);
+        restoreThreadedRuntimeStatus(self, persisted_status);
         self.last_error_name = null;
         self.retry_error_has_request_identity = false;
     }
@@ -7668,6 +7752,11 @@ fn runForegroundCatchUpPassOwned(
     try replay_lease_guard.start();
     defer replay_lease_guard.stop();
 
+    try guard.check();
+    runtime.mutex.lockUncancelable(io);
+    const recovery_admission = boundaryFailureAdmissionStatus(runtimeStatusSnapshot(runtime));
+    runtime.mutex.unlock(io);
+    if (recovery_admission) |status| try saveRuntimeStatusWithRetry(runtime, scope_name, status);
     try scavengeGraphStagesPage(runtime);
     runtime.mutex.lockUncancelable(io);
     const already_failed = runtime.worker_failed or runtime.last_error_name != null;
@@ -35642,7 +35731,7 @@ test "model aware media retained source recipes own their immutable object refer
         }
     };
     try Fixture.qualify(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.qualify, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.qualify, .{});
 }
 
 test "model aware media fused reuse rejects a changed provider generation with the same alias" {

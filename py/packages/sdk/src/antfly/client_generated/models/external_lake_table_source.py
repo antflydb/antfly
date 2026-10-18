@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from ..models.external_lake_table_source_format import ExternalLakeTableSourceFormat
 from ..models.external_lake_table_source_kind import ExternalLakeTableSourceKind
 from ..models.external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
+from ..models.external_lake_table_source_row_identity_version import ExternalLakeTableSourceRowIdentityVersion
 from ..models.external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from ..types import UNSET, Unset
 
@@ -30,7 +31,11 @@ class ExternalLakeTableSource:
             kind (ExternalLakeTableSourceKind):
             table_id (str):
             format_ (ExternalLakeTableSourceFormat):
-            uri (str):
+            uri (str): Parquet prefix, Iceberg table, or an explicit Parquet snapshot head ending in .parquet-manifest.json.
+                Snapshot heads name immutable checksummed file-list chunks; each query revalidates the head without listing the
+                data prefix.
+            row_identity_version (ExternalLakeTableSourceRowIdentityVersion | Unset): Server-assigned public row identity
+                version, fixed when the source is attached and preserved across index creation and schema updates.
             schema_fingerprint (str | Unset):  Default: 'auto'.
             write_policy (ExternalLakeTableSourceWritePolicy | Unset): iceberg_writer authorizes explicit Iceberg catalog
                 commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
@@ -50,6 +55,7 @@ class ExternalLakeTableSource:
     table_id: str
     format_: ExternalLakeTableSourceFormat
     uri: str
+    row_identity_version: ExternalLakeTableSourceRowIdentityVersion | Unset = UNSET
     schema_fingerprint: str | Unset = "auto"
     write_policy: ExternalLakeTableSourceWritePolicy | Unset = ExternalLakeTableSourceWritePolicy.READ_ONLY
     object_mutability: ExternalLakeTableSourceObjectMutability | Unset = ExternalLakeTableSourceObjectMutability.MUTABLE
@@ -65,6 +71,10 @@ class ExternalLakeTableSource:
         format_ = self.format_.value
 
         uri = self.uri
+
+        row_identity_version: int | Unset = UNSET
+        if not isinstance(self.row_identity_version, Unset):
+            row_identity_version = self.row_identity_version.value
 
         schema_fingerprint = self.schema_fingerprint
 
@@ -98,6 +108,8 @@ class ExternalLakeTableSource:
                 "uri": uri,
             }
         )
+        if row_identity_version is not UNSET:
+            field_dict["row_identity_version"] = row_identity_version
         if schema_fingerprint is not UNSET:
             field_dict["schema_fingerprint"] = schema_fingerprint
         if write_policy is not UNSET:
@@ -127,6 +139,13 @@ class ExternalLakeTableSource:
         format_ = ExternalLakeTableSourceFormat(d.pop("format"))
 
         uri = d.pop("uri")
+
+        _row_identity_version = d.pop("row_identity_version", UNSET)
+        row_identity_version: ExternalLakeTableSourceRowIdentityVersion | Unset
+        if isinstance(_row_identity_version, Unset):
+            row_identity_version = UNSET
+        else:
+            row_identity_version = ExternalLakeTableSourceRowIdentityVersion(_row_identity_version)
 
         schema_fingerprint = d.pop("schema_fingerprint", UNSET)
 
@@ -170,6 +189,7 @@ class ExternalLakeTableSource:
             table_id=table_id,
             format_=format_,
             uri=uri,
+            row_identity_version=row_identity_version,
             schema_fingerprint=schema_fingerprint,
             write_policy=write_policy,
             object_mutability=object_mutability,

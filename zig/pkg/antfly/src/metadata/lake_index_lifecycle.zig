@@ -25,7 +25,7 @@ pub const max_readers = 256;
 pub const lease_ms: u64 = 10 * 60 * 1000;
 pub const grace_ms: u64 = 30 * 1000;
 pub const Reader = struct { token: catalog.Token, generation: u64, expires_ms: u64 };
-pub const StoreBinding = struct { identity: catalog.Digest, locator: catalog.StoreLocator };
+pub const StoreBinding = struct { identity: catalog.Digest, locator: catalog.StoreLocator, vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null };
 pub const Collection = struct {
     token: catalog.Token,
     store: catalog.Digest,
@@ -76,6 +76,10 @@ pub const State = struct {
         if (self.version != 1 or self.publications.len > max_publications or self.readers.len > max_readers or self.stores.len > 64) return error.InvalidLakeIndexLifecycle;
         for (self.stores, 0..) |store, index| {
             try store.locator.validate();
+            if (store.vacuum) |cut| {
+                try cut.validate();
+                if (cut.cutoff > self.generation +| 1) return error.InvalidLakeIndexLifecycle;
+            }
             if (std.mem.allEqual(u8, &store.identity, 0)) return error.InvalidLakeIndexLifecycle;
             for (self.stores[0..index]) |other| if (std.mem.eql(u8, &store.identity, &other.identity)) return error.InvalidLakeIndexLifecycle;
         }
@@ -261,6 +265,9 @@ pub const State = struct {
         return next;
     }
     pub fn finishCollection(self: State, a: A, token: catalog.Token, now: u64) !State {
+        return self.finishCollectionRetainingStore(a, token, now, false);
+    }
+    pub fn finishCollectionRetainingStore(self: State, a: A, token: catalog.Token, now: u64, retain_store: bool) !State {
         const collection = self.collection orelse return error.LakeIndexCollectionFenceChanged;
         if (now == 0 or now >= collection.expires_ms or !std.mem.eql(u8, &collection.token, &token)) return error.LakeIndexCollectionFenceChanged;
         var retained: std.ArrayList(catalog.Publication) = .empty;
@@ -280,7 +287,7 @@ pub const State = struct {
                 if (std.mem.eql(u8, &publication.signature.store, &store.identity)) break true;
             } else false;
             const has_pending = if (next.pending) |pending| std.mem.eql(u8, &pending.signature.store, &store.identity) else false;
-            if (!std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
+            if (retain_store or !std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
         }
         next.stores = try stores.toOwnedSlice(a);
         try next.validate();
@@ -293,7 +300,7 @@ pub const Mutation = union(enum) {
     release: catalog.Token,
     begin_collection: struct { token: catalog.Token, store: catalog.Digest, now_ms: u64 },
     checkpoint_collection: struct { token: catalog.Token, previous: ?[]const u8 = null, progress: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef, now_ms: u64 },
-    finish_collection: struct { token: catalog.Token, now_ms: u64 },
+    finish_collection: struct { token: catalog.Token, now_ms: u64, retain_store: bool = false, vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null },
     /// Receipt observation may see a later reader mutation. Unique tokens and
     /// monotonic deadlines prove this command's effect without replaying it.
     pub fn observed(self: Mutation, state: State) bool {
@@ -320,7 +327,24 @@ pub const Mutation = union(enum) {
             .release => |token| state.release(a, token),
             .begin_collection => |m| state.beginCollection(a, m.token, m.store, m.now_ms),
             .checkpoint_collection => |m| state.checkpointCollection(a, m.token, m.previous, m.progress, m.now_ms),
-            .finish_collection => |m| state.finishCollection(a, m.token, m.now_ms),
+            .finish_collection => |m| blk: {
+                var next = try state.finishCollectionRetainingStore(a, m.token, m.now_ms, m.retain_store);
+                if (m.vacuum) |cut| {
+                    const collection = state.collection orelse return error.InvalidLakeIndexLifecycle;
+                    try cut.validate();
+                    if (cut.floor != collection.upload_floor or cut.cutoff != collection.upload_cutoff) return error.InvalidLakeIndexLifecycle;
+                    const progress = collection.progress orelse return error.InvalidLakeIndexLifecycle;
+                    const scope = (try @import("../serverless/artifacts/store.zig").uploadScopeFromArtifactId(progress.artifact_id)) orelse return error.InvalidLakeIndexLifecycle;
+                    if (!std.mem.eql(u8, &scope.domain, &cut.domain)) return error.InvalidLakeIndexLifecycle;
+                    const bindings = try a.dupe(StoreBinding, next.stores);
+                    for (bindings) |*binding| if (std.mem.eql(u8, &binding.identity, &collection.store)) {
+                        binding.vacuum = cut;
+                    };
+                    next.stores = bindings;
+                    try next.validate();
+                }
+                break :blk next;
+            },
         };
     }
     /// Admission runs before any command is appended. A publication race is
@@ -443,7 +467,11 @@ test "external lake collection retains failed upload stores through DROP and rot
     state = try state.beginCollection(a, @splat(7), @splat(4), 3);
     try std.testing.expectEqual(@as(u64, 1), state.collection.?.upload_floor);
     try std.testing.expectEqual(@as(u64, 3), state.collection.?.upload_cutoff);
-    state = try state.finishCollection(a, @splat(7), 4);
+    state = try state.finishCollectionRetainingStore(a, @splat(7), 4, true);
+    try std.testing.expectEqual(@as(usize, 2), state.stores.len);
+    state = try parse(a, try encode(a, state));
+    state = try state.beginCollection(a, @splat(9), @splat(4), 4);
+    state = try state.finishCollection(a, @splat(9), 4);
     try std.testing.expectEqual(@as(usize, 1), state.stores.len);
     try std.testing.expectEqual(rotated_signature.store, state.stores[0].identity);
     state = try state.beginCollection(a, @splat(6), @splat(5), 5);

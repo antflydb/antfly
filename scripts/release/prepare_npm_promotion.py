@@ -73,7 +73,7 @@ def snapshot_packages(snapshot_dir: Path, version: str) -> dict[str, Path]:
         raise SystemExit(f"cannot read CLI snapshot manifest: {exc}") from exc
     if (
         not isinstance(document, dict)
-        or document.get("schema_version") != 1
+        or document.get("schema_version") not in (1, 2)
         or document.get("version") != version
         or not isinstance(document.get("artifacts"), list)
     ):

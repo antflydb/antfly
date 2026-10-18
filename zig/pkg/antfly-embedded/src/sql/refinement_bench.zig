@@ -817,3 +817,397 @@ test "native pipeline refinements benchmark dictionary spill decoding" {
         std.debug.print("native_refinement {{\"case\":\"dictionary_spill_decode\",\"rows\":4096,\"width\":32,\"sample\":{d},\"expanded_ns\":{d},\"compact_ns\":{d},\"expanded_peak_bytes\":{d},\"compact_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, compact.ns, expanded.peak, compact.peak });
     }
 }
+
+const ProjectionStats = struct { ns: i96, peak: usize, allocations: usize, checksum: u64 };
+const ProjectionCase = enum { document, columns, array, array_copy, array_wire, replay, replay_batch };
+const ProjectionFixture = struct {
+    projection: @import("document_row.zig").Projection,
+    layout: *const @import("catalog.zig").Row.TypedLayout,
+    root: std.json.Value,
+    array: @import("array_value.zig").Value,
+    output: []u8,
+    replay: *spill.Sequential,
+    counted: *CountingAllocator,
+    budget: *@import("memory_budget.zig"),
+    // Frozen primitive preparation from before the canonical-copy shortcut.
+    // Both paths retain the same admission proof, so the comparison isolates
+    // reconstruction rather than also removing cached validation from baseline.
+    fn reconstructArray(a: std.mem.Allocator, input: @import("array_value.zig").Value) !@import("array_storage.zig").Prepared {
+        const arrays = @import("array_value.zig");
+        std.debug.assert(input.element_type == .int64);
+        var work: arrays.Budget = .{ .remaining = (arrays.Limits{}).work };
+        try work.consume(0);
+        const value = try input.validateWithBudget(.{}, &work);
+        var non_null: usize = 0;
+        for (0..value.cardinality()) |index| {
+            try work.consume(1);
+            non_null += @intFromBool(!value.flatCell(index).sql_null);
+        }
+        const layout = @import("array_storage.zig").layout;
+        return .{ .value = value, .allocator = a, .jsonb = &.{}, .encoded_size = try layout.encodedSectionSize(value.element_type, value.dimensions.len, value.cardinality(), non_null), .compact = layout.usesCompact(value.element_type, value.cardinality(), non_null), .work = work };
+    }
+    fn measure(self: ProjectionFixture, case: ProjectionCase, direct: bool) !ProjectionStats {
+        var counted: CountingAllocator = .{};
+        var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 128 << 20 };
+        var result: ProjectionStats = .{ .ns = 0, .peak = 0, .allocations = 0, .checksum = 0 };
+        const started = now();
+        switch (case) {
+            .document => for (0..64) |_| {
+                var arena = std.heap.ArenaAllocator.init(budget.allocator());
+                defer arena.deinit();
+                const a = arena.allocator();
+                const row = if (direct) try self.projection.projectSearch(a, a, self.layout, "row", .{ .value = self.root }, .{}) else blk: {
+                    const document = try @import("../storage/typed_json.zig").clone(a, self.root);
+                    break :blk try self.projection.projectValue(a, "row", 0, document);
+                };
+                result.checksum += (try row.cell("body")).value.string.len;
+            },
+            .columns => {
+                const Source = struct {
+                    fn cell(_: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !Datum {
+                        return Datum.json(.{ .integer = @intCast(row * 1024 + column) });
+                    }
+                };
+                var dummy: u8 = 0;
+                const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &dummy, .read = Source.cell, .count = 256, .width = 1024 } };
+                var ordinals: [256]u64 = undefined;
+                for (&ordinals, 0..) |*ordinal, i| ordinal.* = i;
+                var arena = std.heap.ArenaAllocator.init(budget.allocator());
+                defer arena.deinit();
+                const a = arena.allocator();
+                const encoded = if (direct) try spill.encodeColumnarBatchVersionAlloc(a, batch, &ordinals, 32 << 20, .v2) else blk: {
+                    const rows = try a.alloc(operators.Row, batch.len());
+                    for (rows, 0..) |*row, r| {
+                        const values = try a.alloc(Datum, batch.width());
+                        for (values, 0..) |*value, c| value.* = try batch.cell(a, r, c);
+                        row.* = .{ .values = values, .keys = &.{}, .ordinal = r };
+                    }
+                    break :blk try spill.encodeColumnarBlockVersionAlloc(a, rows, 32 << 20, .v2);
+                };
+                result.checksum = std.hash.Wyhash.hash(0, encoded);
+            },
+            .array => {
+                var view = self.array.stored.?.*;
+                if (!direct) view.validation = null;
+                var input = self.array;
+                input.stored = &view;
+                for (0..64) |_| {
+                    _ = try input.validate(.{});
+                    var writer: std.Io.Writer = .fixed(self.output);
+                    try @import("array_binary.zig").encode(input, &writer, .{});
+                    result.checksum += writer.end;
+                }
+                result.checksum +%= std.hash.Wyhash.hash(0, self.output);
+            },
+            .array_wire => {
+                for (0..64) |_| {
+                    var writer: std.Io.Writer = .fixed(self.output);
+                    if (direct) try @import("array_binary.zig").encode(self.array, &writer, .{}) else try @import("array_binary.zig").encodeGeneric(self.array, &writer, .{});
+                    std.mem.doNotOptimizeAway(self.output.ptr);
+                    result.checksum += writer.end;
+                }
+                result.checksum +%= std.hash.Wyhash.hash(0, self.output);
+            },
+            .array_copy => {
+                const input = self.array;
+                const output = try budget.allocator().alloc(u8, input.stored.?.bytes.len);
+                defer budget.allocator().free(output);
+                for (0..64) |_| {
+                    var prepared = if (direct) try @import("array_storage.zig").Prepared.init(budget.allocator(), input, .{}) else try reconstructArray(budget.allocator(), input);
+                    defer prepared.deinit();
+                    try prepared.writeInto(output);
+                    std.mem.doNotOptimizeAway(output.ptr);
+                    result.checksum += output.len;
+                }
+                result.checksum +%= std.hash.Wyhash.hash(0, output);
+            },
+            .replay, .replay_batch => {
+                const base_live = self.budget.live;
+                self.budget.peak = base_live;
+                self.counted.allocations = 0;
+                var reader = try self.replay.openReader();
+                defer reader.deinit();
+                if (case == .replay_batch and direct) {
+                    var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+                    defer scratch.deinit();
+                    var offset: u64 = 0;
+                    while (offset < 256) {
+                        _ = scratch.reset(.free_all);
+                        const batch = try reader.readBatchCurrent(scratch.allocator(), offset, 256);
+                        for (0..batch.values.len()) |lane| result.checksum += @intCast((try batch.values.cell(scratch.allocator(), lane, 127)).value.integer);
+                        offset = batch.following;
+                    }
+                } else for (0..256) |r| {
+                    const row = if (direct) (try reader.readCurrent(r)).row else (try reader.readBorrowed(r)).row;
+                    result.checksum += @intCast(row.values[127].value.integer);
+                }
+                result.peak = self.budget.peak - base_live;
+                result.allocations = self.counted.allocations;
+            },
+        }
+        result.ns = now() - started;
+        if (case != .replay and case != .replay_batch) {
+            result.peak = budget.peak;
+            result.allocations = counted.allocations;
+        }
+        return result;
+    }
+};
+
+test "native projection refinements benchmark" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const sa = source.allocator();
+    const ignored = try sa.alloc(u8, 1024 * 1024);
+    @memset(ignored, 'x');
+    var root: std.json.Value = .{ .object = .empty };
+    try root.object.put(sa, "ignored", .{ .string = ignored });
+    try root.object.put(sa, "body", .{ .string = "retained" });
+    const table: @import("catalog.zig").Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "body", .path = "body", .type = .string }} };
+    const projection = try @import("document_row.zig").Projection.initSearch(sa, table, &.{"body"});
+    const layout = try @import("catalog.zig").Row.TypedLayout.init(sa, &.{"body"});
+    const arrays = @import("array_value.zig");
+    const cells = try sa.alloc(Datum, 32768);
+    for (cells, 0..) |*cell, i| cell.* = if (i % 7 == 0) .{} else Datum.json(.{ .integer = @intCast(i) });
+    const array = try arrays.Value.init(.int64, &.{.{ .length = 32768 }}, cells, .{});
+    const storage = try @import("array_storage.zig").encodeAlloc(sa, array, .{});
+    const compact = try @import("array_storage.zig").borrowLeaky(sa, .int64, storage, .{});
+    const output = try sa.alloc(u8, compact.stored.?.validation.?.binary_wire_bytes);
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var counted: CountingAllocator = .{};
+    var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 128 << 20 };
+    var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+    defer manager.deinit();
+    var file = try spill.Sequential.init(&manager, 8 << 20);
+    defer file.close();
+    var row_cells: [128]Datum = undefined;
+    for (0..256) |r| {
+        for (&row_cells, 0..) |*cell, c| cell.* = Datum.json(.{ .integer = @intCast(r * 128 + c) });
+        _ = try file.append(.{ .values = &row_cells, .keys = &.{}, .ordinal = r }, spill.none);
+    }
+    try file.seal();
+    const fixture: ProjectionFixture = .{ .projection = projection, .layout = layout, .root = root, .array = compact, .output = output, .replay = &file, .counted = &counted, .budget = &budget };
+    for (std.enums.values(ProjectionCase)) |case| {
+        _ = try fixture.measure(case, false);
+        _ = try fixture.measure(case, true);
+        for (0..5) |sample| {
+            const first = try fixture.measure(case, sample % 2 != 0);
+            const second = try fixture.measure(case, sample % 2 == 0);
+            const before = if (sample % 2 == 0) first else second;
+            const after = if (sample % 2 == 0) second else first;
+            try std.testing.expectEqual(before.checksum, after.checksum);
+            std.debug.print("projection_refinement case={s} sample={d} old_ns={d} new_ns={d} old_peak={d} new_peak={d} old_allocs={d} new_allocs={d}\n", .{ @tagName(case), sample, before.ns, after.ns, before.peak, after.peak, before.allocations, after.allocations });
+        }
+    }
+}
+
+test "native projection refinements benchmark physical dictionary encoding" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const sa = source.allocator();
+    var values: [6]Datum = undefined;
+    values[0] = .{};
+    values[1] = Datum.json(.null);
+    for (values[2..], 0..) |*value, i| {
+        const text = try sa.alloc(u8, 4096);
+        @memset(text, @as(u8, @intCast(i)) + 'a');
+        value.* = Datum.json(.{ .string = text });
+    }
+    var rows: [256]operators.Row = undefined;
+    var cells: [256]Datum = undefined;
+    var indices: [256]u32 = undefined;
+    var ordinals: [256]u64 = undefined;
+    for (&rows, &cells, &indices, &ordinals, 0..) |*row, *cell, *id, *ordinal, i| {
+        id.* = @intCast(i % values.len);
+        cell.* = values[id.*];
+        ordinal.* = i;
+        row.* = .{ .values = @as(*const Datum, cell)[0..1], .keys = &.{}, .ordinal = i };
+    }
+    const batch: @import("execution_batch.zig").Batch = .{ .dictionary = .{ .values = &values, .indices = &indices } };
+    const Fixture = struct {
+        fn measure(alloc: std.mem.Allocator, input: @import("execution_batch.zig").Batch, scalar_rows: []const operators.Row, order: []const u64, direct: bool) !ProjectionStats {
+            var counted: CountingAllocator = .{};
+            var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 8 << 20 };
+            var result: ProjectionStats = .{ .ns = 0, .peak = 0, .allocations = 0, .checksum = 0 };
+            _ = alloc;
+            const start = now();
+            for (0..64) |_| {
+                const encoded = if (direct) try spill.encodeColumnarBatchVersionAlloc(budget.allocator(), input, order, 1 << 20, .v2) else try spill.encodeColumnarBlockVersionAlloc(budget.allocator(), scalar_rows, 1 << 20, .v2);
+                result.checksum +%= std.hash.Wyhash.hash(0, encoded);
+                budget.allocator().free(encoded);
+            }
+            result.ns = now() - start;
+            result.peak = budget.peak;
+            result.allocations = counted.allocations;
+            return result;
+        }
+    };
+    _ = try Fixture.measure(a, batch, &rows, &ordinals, false);
+    _ = try Fixture.measure(a, batch, &rows, &ordinals, true);
+    for (0..5) |sample| {
+        const first = try Fixture.measure(a, batch, &rows, &ordinals, sample % 2 != 0);
+        const second = try Fixture.measure(a, batch, &rows, &ordinals, sample % 2 == 0);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("physical_dictionary sample={d} old_ns={d} new_ns={d} old_peak={d} new_peak={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak });
+    }
+}
+
+test "native projection refinements benchmark streaming selected arrays" {
+    const a = std.testing.allocator;
+    var fixture = std.heap.ArenaAllocator.init(a);
+    defer fixture.deinit();
+    const f = fixture.allocator();
+    const count = 8192;
+    const cells = try f.alloc(Datum, count);
+    for (cells, 0..) |*cell, i| cell.* = if (i % 17 == 0) .{} else Datum.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(i)) });
+    const array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = count, .lower = -3 }}, cells, .{});
+    const input = try @import("array_wire.zig").encodeAlloc(f, array, .{});
+    const Fixture = struct {
+        fn measure(bytes: []const u8, direct: bool) !ProjectionStats {
+            var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 64 << 20 };
+            var output = std.heap.ArenaAllocator.init(budget.allocator());
+            defer output.deinit();
+            var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+            defer scratch.deinit();
+            var checksum: u64 = 0;
+            var elapsed: i96 = 0;
+            for (0..16) |_| {
+                _ = output.reset(.free_all);
+                _ = scratch.reset(.free_all);
+                const begin = now();
+                const value = if (direct)
+                    (try @import("array_wire.zig").decodeBytesLeakyMeasured(output.allocator(), .int64, bytes, .{})).value
+                else blk: {
+                    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), bytes, .{ .parse_numbers = false });
+                    // Legacy document projection cloned the selected JSON
+                    // subtree before its native cells could borrow payloads.
+                    const owned = try @import("../storage/typed_json.zig").clone(output.allocator(), parsed);
+                    break :blk (try @import("array_wire.zig").decodeBorrowed(output.allocator(), .int64, owned, .{})).value;
+                };
+                elapsed += now() - begin;
+                for (0..value.cardinality()) |i| {
+                    const cell = value.flatCell(i);
+                    checksum +%= if (cell.sql_null) 1 else @as(u64, @bitCast(cell.value.integer));
+                }
+            }
+            return .{ .ns = elapsed, .peak = budget.peak, .allocations = 0, .checksum = checksum };
+        }
+    };
+    _ = try Fixture.measure(input, false);
+    _ = try Fixture.measure(input, true);
+    for (0..5) |sample| {
+        const first = try Fixture.measure(input, sample % 2 != 0);
+        const second = try Fixture.measure(input, sample % 2 == 0);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("STREAM_ARRAY sample={d} before_ns={d} after_ns={d} before_peak={d} after_peak={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak });
+    }
+}
+
+// Per-thread CPU time excludes scheduling gaps while independent worktrees
+// build on this host. Existing wall-clock fixtures retain their original clock.
+fn cpuNow() i96 {
+    if (comptime @import("builtin").link_libc and (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .linux)) {
+        var stamp: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("thread CPU clock unavailable");
+        return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
+    }
+    return now();
+}
+const BuilderMeasurement = struct { ns: i96, checksum: u64 };
+fn checkedBuilderTiming(checked: bool, cells: []const Datum) !BuilderMeasurement {
+    return if (checked) checkedBuilderMode(true, cells) else checkedBuilderMode(false, cells);
+}
+fn checkedBuilderMode(comptime checked: bool, cells: []const Datum) !BuilderMeasurement {
+    var elapsed: i96 = 0;
+    var checksum: u64 = 0;
+    for (0..512) |_| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var work: @import("array_value.zig").Budget = .{};
+        const started = cpuNow();
+        const Producer = if (checked) @import("array_compact.zig").CheckedBuilder else @import("array_compact.zig").Builder;
+        var builder = try Producer.init(arena.allocator(), .int64, &.{.{ .length = @intCast(cells.len) }}, cells.len, cells.len, 0, .{});
+        for (cells) |cell| {
+            if (checked) try builder.appendChecked(cell, .int64, .{}, &work) else {
+                _ = try @import("array_value.zig").Value.initWithBudget(.int64, &.{.{ .length = 1 }}, &.{cell}, .{}, &work);
+                try builder.append(cell);
+            }
+        }
+        const result = try builder.finish(arena.allocator(), .{});
+        elapsed += cpuNow() - started;
+        checksum +%= std.hash.Wyhash.hash(0, result.stored.?.bytes);
+    }
+    return .{ .ns = elapsed, .checksum = checksum };
+}
+test "native projection refinements benchmark checked builders" {
+    const a = std.testing.allocator;
+    const cells = try a.alloc(Datum, 8192);
+    defer a.free(cells);
+    for (cells, 0..) |*cell, i| cell.* = Datum.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(i)) });
+    _ = try checkedBuilderTiming(false, cells);
+    _ = try checkedBuilderTiming(true, cells);
+    for (0..5) |sample| {
+        const first = try checkedBuilderTiming(sample % 2 != 0, cells);
+        const second = try checkedBuilderTiming(sample % 2 == 0, cells);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("CHECKED_BUILDER sample={d} before_cpu_ns={d} after_cpu_ns={d} elements=8192 repetitions=512\n", .{ sample, before.ns, after.ns });
+    }
+}
+fn encodedJsonTiming(encoded: bool, projection: @import("document_row.zig").Projection, layout_: *const @import("catalog.zig").Row.TypedLayout, input: []const u8) !struct { ns: i96, peak: usize, checksum: u64 } {
+    const wire_bytes = try std.testing.allocator.alloc(u8, input.len * 2 + 1);
+    defer std.testing.allocator.free(wire_bytes);
+    var elapsed: i96 = 0;
+    var peak: usize = 0;
+    var checksum: u64 = 0;
+    for (0..8) |_| {
+        var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 256 << 20 };
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        var slots: [1]?[]const u8 = undefined;
+        const started = cpuNow();
+        const row = try projection.projectSearchEncoded(arena.allocator(), arena.allocator(), layout_, "key", .{ .fields = &.{.{ .name = "payload", .value = input }} }, .{}, if (encoded) &slots else null);
+        var wire: std.Io.Writer = .fixed(wire_bytes);
+        try wire.writeByte(1); // PostgreSQL binary JSONB version.
+        if (encoded) try wire.writeAll(slots[0].?) else try std.json.Stringify.value((try row.cell("payload")).value, .{}, &wire);
+        elapsed += cpuNow() - started;
+        peak = @max(peak, budget.peak);
+        checksum +%= std.hash.Wyhash.hash(0, wire.buffered());
+    }
+    return .{ .ns = elapsed, .peak = peak, .checksum = checksum };
+}
+test "native projection refinements benchmark encoded JSON" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try input.writer.writeByte('[');
+    for (0..4096) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"x\":9007199254740993,\"s\":\"abcdefghijklmnopqrstuvwxyz\\n\",\"nested\":[true,null,1e-3]}");
+    }
+    try input.writer.writeByte(']');
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const projection = try @import("document_row.zig").Projection.initSearch(arena.allocator(), .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "payload", .path = "payload", .type = .json }} }, &.{"payload"});
+    const layout_ = try @import("catalog.zig").Row.TypedLayout.init(arena.allocator(), &.{"payload"});
+    _ = try encodedJsonTiming(false, projection, layout_, input.written());
+    _ = try encodedJsonTiming(true, projection, layout_, input.written());
+    for (0..5) |sample| {
+        const first = try encodedJsonTiming(sample % 2 != 0, projection, layout_, input.written());
+        const second = try encodedJsonTiming(sample % 2 == 0, projection, layout_, input.written());
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("ENCODED_JSON projection_and_wire=true sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} input_bytes={d} repetitions=8\n", .{ sample, before.ns, after.ns, before.peak, after.peak, input.written().len });
+    }
+}

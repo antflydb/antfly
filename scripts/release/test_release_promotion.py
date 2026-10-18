@@ -52,6 +52,48 @@ def load_module(name: str, filename: str):
 
 
 class ReleasePromotionTests(unittest.TestCase):
+    def test_qualification_builds_use_the_production_archive_invocation(self) -> None:
+        root = RELEASE_DIR.parents[1]
+
+        def invocation(name):
+            text = (root / ".github/workflows" / name).read_text()
+            return (
+                text.split("      - name: Build source-declared runtime archives\n", 1)[
+                    1
+                ]
+                .split("        run: |\n", 1)[1]
+                .split("\n      - ", 1)[0]
+                .strip()
+            )
+
+        self.assertEqual(
+            invocation("antfly-artifact-build.yml"),
+            invocation("qualify-release-archives.yml"),
+        )
+
+    def test_release_qualification_matrix_selects_every_production_target(self) -> None:
+        platforms = load_module("qualification_platforms_test", "release_platforms.py")
+        policy = platforms.load_policy()
+        selected = []
+        for archive_os, count in (("Linux", 4), ("Darwin", 1)):
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RELEASE_DIR / "release_platforms.py"),
+                    "github-matrix",
+                    "--archive-os",
+                    archive_os,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            matrix = json.loads(result.stdout)["include"]
+            self.assertEqual(len(matrix), count)
+            self.assertTrue(all(entry["archive_os"] == archive_os for entry in matrix))
+            selected.extend(matrix)
+        self.assertCountEqual(selected, platforms.github_matrix(policy)["include"])
+
     def test_platform_policy_rejects_invalid_optimization_modes(self) -> None:
         platforms = load_module(
             "release_platform_optimization_test", "release_platforms.py"
@@ -1755,7 +1797,10 @@ class ReleasePromotionTests(unittest.TestCase):
         (root / "embedded-zig-source.json").write_text(json.dumps(manifest))
         return manifest
 
-    def assert_release_ledger(self, schema: int) -> None:
+    def test_npm_only_cli_snapshot_enters_the_ledger(self) -> None:
+        self.assert_release_ledger(5, npm_only=True)
+
+    def assert_release_ledger(self, schema: int, npm_only: bool = False) -> None:
         payload = load_module("build_release_payload_test", "build_release_payload.py")
         products = (
             ("antfly-lite", "antfly-inference") if schema == 2 else ("antfly-embedded",)
@@ -1780,11 +1825,12 @@ class ReleasePromotionTests(unittest.TestCase):
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(
                     {
+                        "schema_version": 2 if npm_only else 1,
                         "version": "0.2.1",
                         "commit": COMMIT,
                         "registry_versions": {
                             "npm": "0.2.1",
-                            "python": "0.2.1",
+                            **({} if npm_only else {"python": "0.2.1"}),
                         },
                     }
                 )

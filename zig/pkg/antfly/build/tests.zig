@@ -238,6 +238,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_http_runtime_test_mod, true, true);
     api_http_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
+    const schema_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/schema_contract_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, schema_contract_mod, true, true);
+    schema_contract_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const schema_contract_tests = b.addTest(.{
+        .root_module = schema_contract_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
+        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "created nested response allowlists cover generated schemas", "api http public sort capability gate" }),
+    });
+    const parser_source = schema_contract_mod.import_table.get("antfly_local_sources").?;
+    const parser_selection = b.addOptions();
+    parser_selection.addOption([]const []const u8, "names", &.{"schema_table_schema_impl"});
+    parser_source.addOptions("antfly_local_test_sources", parser_selection);
+    const schema_parser_tests = b.addTest(.{
+        .root_module = parser_source,
+        .filters = selectTestFilters(b, &.{"relational contract schema parsing uses bounded stack"}),
+    });
+    const schema_contract_step = b.step("antfly-schema-contract-test", "Run bounded schema parsing and public response/sort contracts");
+    schema_contract_step.dependOn(&b.addRunArtifact(schema_contract_tests).step);
+    const install_schema_contracts = b.step("install-schema-contract-tests", "Install schema contract regressions for cross-platform qualification");
+    install_schema_contracts.dependOn(&b.addInstallArtifact(schema_contract_tests, .{ .dest_sub_path = "schema-contract-tests" }).step);
+    install_schema_contracts.dependOn(&b.addInstallArtifact(schema_parser_tests, .{ .dest_sub_path = "schema-parser-tests" }).step);
+
     const api_graph_metric_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_graph_metric_test_root.zig"),
         .target = target,
@@ -965,6 +991,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, shard_ops_provider_mod, true, true);
     const shard_ops_provider = b.addLibrary(.{
         .name = "shard-ops-abi-test-provider",
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .linkage = .static,
         .root_module = shard_ops_provider_mod,
     });
@@ -973,10 +1000,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, shard_ops_test_mod, true, true);
+    // The provider owns the C implementation; the consumer needs only its
+    // declarations. Linking both copies duplicates LMDB's global symbols.
+    test_imports.configure(b, shard_ops_test_mod, false, true);
     shard_ops_test_mod.linkLibrary(shard_ops_provider);
     const shard_ops_tests = b.addTest(.{
         .root_module = shard_ops_test_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = &.{"shard adapter archive boundary"},
     });
     const run_shard_ops_tests = b.addRunArtifact(shard_ops_tests);
@@ -1016,6 +1046,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_abi_provider_mod.addImport("antfly_casbin", casbin_mod);
     const usermgr_abi_provider = b.addLibrary(.{
         .name = "usermgr-abi-test-provider",
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .root_module = usermgr_abi_provider_mod,
         .linkage = .static,
     });
@@ -1031,6 +1062,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_abi_test_mod.linkLibrary(usermgr_abi_provider);
     const usermgr_abi_tests = b.addTest(.{
         .root_module = usermgr_abi_test_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = &.{"usermgr archive boundary"},
     });
     const run_usermgr_abi_tests = b.addRunArtifact(usermgr_abi_tests);
@@ -2699,6 +2731,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const text_frontier_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_text_frontier_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, text_frontier_mod, true, true);
+    text_frontier_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const text_frontier_tests = b.addTest(.{
+        .root_module = text_frontier_mod,
+        .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL", "constant score" }),
+        // The combined real-file/cloud owner peaks near 10 GB under optimized
+        // codegen; declare headroom instead of compiling twice on RSS retry.
+        .max_rss = @as(usize, if (optimize == .debug) 8 else 12) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
+        .dependOn(&addFilteredTestRunArtifact(b, text_frontier_tests).step);
     const filtered_topk_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
         .target = target,
@@ -4799,7 +4848,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // composition links it below rather than every standalone runtime
     // consumer (standalone_restore_tests and the separately linked catalog root).
     const lib_standalone_runtime_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_owner_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -6974,12 +7023,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_compile_step.dependOn(&unit_storage_engine_tests.step);
     unit_storage_compile_step.dependOn(&unit_storage_db_core_tests.step);
 
-    // Zig 0.16's eager Group.async fallback can enter a long Run step while
-    // still dispatching ready compiler siblings. At -j2 this left DB-core
-    // uncompiled for the entire support run despite an idle build worker.
-    // Finish the existing compilation set before entering default unit runs.
-    if (storage_runtime_filter_is_default)
-        run_unit_storage_support_tests.step.dependOn(unit_storage_compile_step);
+    // Zig 0.17 schedules the native build graph concurrently. Test runs depend
+    // on their own artifacts, allowing execution to overlap sibling compilation
+    // within the same maxrss budget. The old 0.16 Group.async workaround imposed
+    // a compile-all barrier and delayed the longest runtime lanes unnecessarily.
 
     // Keep an explicit, opt-in equivalence check for future changes to these
     // groupings. It compiles the former seven-artifact layout and compares the
@@ -7050,7 +7097,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // one scheduler-visible step that launches both filtered DB processes,
         // preserving one compile while realizing the overlap.
         const run_db_core_partitioned_tests = b.addSystemCommand(&.{"python3"});
-        run_db_core_partitioned_tests.step.dependOn(unit_storage_compile_step);
         run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
         run_db_core_partitioned_tests.addFileArg2(b.path("tools/run_test_partitions.py"), .{ .make_absolute = true });
         run_db_core_partitioned_tests.addArg("--executable");
