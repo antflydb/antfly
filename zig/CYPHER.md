@@ -1516,7 +1516,7 @@ subsequent projections, filters, UNWIND, wildcard DISTINCT, MATCH, OPTIONAL MATC
 and reductions. Pure correlated EXISTS and pattern-comprehension expressions
 run once per weighted binding, preserving their own aggregate scopes; writes
 and procedure calls remain execution barriers. Expression evaluation isolates
-nested profiling buffers from retained execution state.
+nested profiling buffers and weighted continuations from retained execution state.
 Each subsequent match negotiates a seed-aware weighted child producer. Binding
 liveness follows WITH scopes, including wildcard observation, match constraints
 and eager expression dependencies. Endpoint-only children retain compressed

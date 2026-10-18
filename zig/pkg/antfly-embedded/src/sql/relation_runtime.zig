@@ -2618,43 +2618,44 @@ fn Engine(comptime Context: type) type {
                             } else if (!join.factor_only) {
                                 self.join_hash = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes / 16, .spill = self.engine.context.spill });
                             }
+                            var page_arena = std.heap.ArenaAllocator.init(self.engine.context.alloc);
+                            defer page_arena.deinit();
                             var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                             defer scratch.deinit();
                             while (true) {
-                                _ = scratch.reset(.free_all);
-                                const temporary = scratch.allocator();
-                                var build_page = try self.right.?.next(temporary, 1);
+                                _ = page_arena.reset(.free_all);
+                                var build_page = try self.right.?.next(page_arena.allocator(), @min(self.engine.context.limits.page_rows, 256));
                                 defer build_page.deinit();
-                                if (build_page.rows.len == 0) {
-                                    if (build_page.after == null) break;
-                                    continue;
+                                for (build_page.rows, build_page.multiplicities.?) |build_row, build_weight| {
+                                    _ = scratch.reset(.free_all);
+                                    const temporary = scratch.allocator();
+                                    const values = try temporary.alloc(Datum, join.singleton.columns.len);
+                                    for (join.singleton.columns, values) |column, *value| value.* = try build_row.cell(column.internal);
+                                    try self.engine.checkpoint();
+                                    if (self.side_count >= self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                                    self.side_count += 1;
+                                    if (join.factor_only) self.side_weight = try self.combineWeight(self.side_weight, build_weight, true, self.slots);
+                                    if (join.factor_only) continue;
+                                    const programs = if (join.graph_left) operation.right_keys else operation.left_keys;
+                                    const keys = try temporary.alloc(Datum, programs.len);
+                                    for (programs, keys) |program, *key| key.* = try self.engine.context.evaluate(temporary, program, values);
+                                    if (self.membership_index) |index| {
+                                        const correlations = operation.membership.?.correlations;
+                                        const null_correlation = for (keys[0..correlations]) |key| {
+                                            if (key.sql_null) break true;
+                                        } else false;
+                                        if (!null_correlation) try index.add(keys);
+                                    } else {
+                                        // Two unsigned 32-bit limbs survive Datum's signed
+                                        // integer codec, including the overflow sentinel.
+                                        const payload = try temporary.alloc(Datum, values.len + 2);
+                                        @memcpy(payload[0..values.len], values);
+                                        payload[values.len] = Datum.json(.{ .integer = @intCast(build_weight >> 32) });
+                                        payload[values.len + 1] = Datum.json(.{ .integer = @intCast(build_weight & 0xffffffff) });
+                                        try self.join_hash.?.add(payload, keys);
+                                    }
                                 }
-                                const values = try temporary.alloc(Datum, join.singleton.columns.len);
-                                for (join.singleton.columns, values) |column, *value| value.* = try build_page.rows[0].cell(column.internal);
-                                const build_weight = build_page.multiplicities.?[0];
-                                try self.engine.checkpoint();
-                                if (self.side_count >= self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                                self.side_count += 1;
-                                if (join.factor_only) self.side_weight = try self.combineWeight(self.side_weight, build_weight, true, self.slots);
-                                if (join.factor_only) continue;
-                                const programs = if (join.graph_left) operation.right_keys else operation.left_keys;
-                                const keys = try temporary.alloc(Datum, programs.len);
-                                for (programs, keys) |program, *key| key.* = try self.engine.context.evaluate(temporary, program, values);
-                                if (self.membership_index) |index| {
-                                    const correlations = operation.membership.?.correlations;
-                                    const null_correlation = for (keys[0..correlations]) |key| {
-                                        if (key.sql_null) break true;
-                                    } else false;
-                                    if (!null_correlation) try index.add(keys);
-                                } else {
-                                    // Two unsigned 32-bit limbs survive Datum's signed
-                                    // integer codec, including the overflow sentinel.
-                                    const payload = try temporary.alloc(Datum, values.len + 2);
-                                    @memcpy(payload[0..values.len], values);
-                                    payload[values.len] = Datum.json(.{ .integer = @intCast(build_weight >> 32) });
-                                    payload[values.len + 1] = Datum.json(.{ .integer = @intCast(build_weight & 0xffffffff) });
-                                    try self.join_hash.?.add(payload, keys);
-                                }
+                                if (build_page.after == null) break;
                             }
                             if (self.membership_index) |index| try index.seal();
                             self.right.?.deinit();

@@ -2063,9 +2063,12 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "WITH b ORDER BY b.rank LIMIT 3 OPTIONAL MATCH (b)<-[:CITES*0..3]-(d:Document) WHERE d.rank<0 RETURN count(*),count(d)",
         "WITH b ORDER BY b.rank LIMIT 3 MATCH p=(b)<-[:CITES*0..3]-(d:Document) RETURN count(*),sum(length(p))",
         "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)<-[:CITES*0..3]-(d:Document) WITH DISTINCT * RETURN count(*)",
+        "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)<-[:CITES*0..3]-(d:Document) WITH d ORDER BY d.rank SKIP 1 WITH DISTINCT d RETURN count(*)",
         "WITH b ORDER BY b.rank LIMIT 3 WITH b WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) } RETURN count(*),sum(b.rank)",
         "WITH b ORDER BY b.rank LIMIT 3 RETURN count(EXISTS { MATCH (b)-[:CITES]->(d:Document) RETURN count(*) })",
         "WITH b ORDER BY b.rank LIMIT 3 WITH b,[(b)-[:CITES]->(d:Document) | d.rank] AS xs UNWIND xs AS x RETURN count(*),sum(x)",
+        "WITH b ORDER BY b.rank LIMIT 3 RETURN [(b)-[:CITES]->(d:Document) | d.rank]",
+        "WITH b ORDER BY b.rank LIMIT 3 RETURN EXISTS { MATCH (b)-[:CITES]->(d:Document) }",
     }) |tail| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();

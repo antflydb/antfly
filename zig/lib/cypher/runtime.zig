@@ -1284,7 +1284,7 @@ const Engine = struct {
             if (fold.record_rows) fold.matched.* +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
-                if (fold.projection.order.len == 0 and top.total == top.capacity) return error.CypherStreamComplete;
+                if (fold.projection.limit != null and fold.projection.order.len == 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
             var key: std.ArrayList(v.Value) = .empty;
@@ -2112,6 +2112,9 @@ const Engine = struct {
                     } else 0;
                     return if (skip + @as(u64, @intCast(limit.value.literal.integer)) <= @as(u64, std.math.maxInt(i64)) + 1) .capped else .exact;
                 }
+                // An unbounded OFFSET still observes duplicate counts even
+                // if a later DISTINCT only needs presence.
+                if (!calls and p.value.skip != null) return .exact;
                 // COUNT can consume the overflow sentinel. Numeric folds
                 // need exact weights, including their eager error behavior.
                 if (calls) {
@@ -5225,12 +5228,18 @@ const Engine = struct {
         reads: @FieldType(Engine, "read_nodes"),
         cache_reads: bool,
         stages: @FieldType(Engine, "stages"),
+        retain_windows: bool,
+        match_weight_demand: ?Multiplicity,
+        pending_window: ?WeightedRows,
         fn enter(engine: *Engine, a: A) EvalScope {
-            const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads, .stages = engine.stages };
+            const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .pending_window = engine.pending_window };
             // Correlated expression subplans use this scope's allocator.
             // Never let their temporary stage buffers replace the owner's
             // retained buffer; it must survive when this arena is reset.
             engine.stages = .empty;
+            engine.retain_windows = false;
+            engine.match_weight_demand = null;
+            engine.pending_window = null;
             engine.a = a;
             engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork };
             engine.strings = .{ .a = a, .ptr = engine, .charge = chargeWork };
@@ -5248,6 +5257,9 @@ const Engine = struct {
             engine.read_nodes = scope.reads;
             engine.cache_reads = scope.cache_reads;
             engine.stages = scope.stages;
+            engine.retain_windows = scope.retain_windows;
+            engine.match_weight_demand = scope.match_weight_demand;
+            engine.pending_window = scope.pending_window;
         }
     };
     const Pick = struct { arena: std.heap.ArenaAllocator, value: Projected };
@@ -5327,7 +5339,7 @@ const Engine = struct {
             for (self.projection.order, keys) |order, *key| key.* = try engine.eval(order.expression, context, null);
             const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence, .weight = @intCast(@min(@as(u128, weight), self.capacity)) };
             if (self.capacity == 0 or weight == 0) return;
-            if (self.total == self.capacity and try engine.compareProjected(candidate, self.picks.items[0].value, self.projection.order) != .lt) return;
+            if (self.projection.limit != null and self.total == self.capacity and try engine.compareProjected(candidate, self.picks.items[0].value, self.projection.order) != .lt) return;
             var pick = try engine.clonePick(candidate);
             var owned = true;
             defer if (owned) pick.arena.deinit();
@@ -5358,7 +5370,7 @@ const Engine = struct {
                     }
                 }
             }
-            self.total = if (engine.match_weight_demand != null) @intCast(@min(total, std.math.maxInt(usize))) else std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
+            self.total = if (scope.match_weight_demand != null) @intCast(@min(total, std.math.maxInt(usize))) else std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
         }
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;

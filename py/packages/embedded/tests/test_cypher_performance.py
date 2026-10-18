@@ -2018,6 +2018,11 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
             "rows"
         ] == [["123", "7872"]]
         assert time.monotonic() - started < 5
+    # Overflow sentinels on both inputs must survive the private build/spill
+    # weight codec and multiplication before the finite consumer clips them.
+    other = relation.replace("b.score AS score)) q", "b.score AS k)) d")
+    joined = f"SELECT q.score FROM {relation} JOIN {other} ON q.score=d.k ORDER BY q.score LIMIT 3 OFFSET 5"
+    assert db.sql(f"SELECT count(*),sum(score) FROM ({joined}) t")["rows"] == [["3", "192"]]
     for order in ("", "ORDER BY b.score DESC"):
         result = db.cypher_json(
             "g",
@@ -2057,6 +2062,7 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
         ("MATCH (b)<-[:R*24..24]-(c:D) RETURN sum(c.score)", ["3355443200000000"]),
         ("OPTIONAL MATCH (b)<-[:R*24..24]-(c:D) RETURN count(*),count(c)", ["83886080000000", "83886080000000"]),
         ("MATCH (b)<-[:R*64..64]-(c:D) WITH DISTINCT c RETURN count(*)", ["1"]),
+        ("MATCH (b)<-[:R*0..64]-(c:D) RETURN count(DISTINCT CASE WHEN c.score=0 THEN 1 END)", ["1"]),
     ):
         result = db.cypher_json(
             "g", {"query": window + tail, "limits": {"intermediate_states": 15000, "explored_edges": 1000}}
