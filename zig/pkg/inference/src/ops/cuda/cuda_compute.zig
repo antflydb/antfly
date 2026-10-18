@@ -2824,6 +2824,7 @@ pub const CudaCompute = struct {
             try self.embedding_gemma2_execution.arena(&self.ctx, batch, encoder_sequence, mask_kind, .{ rows * 8, batch * 4, rows * hidden * 2, rows * hidden * 2, arena_row_bytes, arena_row_bytes, arena_row_bytes, arena_row_bytes, if (self.embedding_gemma2_policy.packed_projections) joined_bytes else 0, batch * config.outputDim() * 4, if (self.embedding_gemma2_policy.packed_projections) rows * hidden * embeddingGemma2PleGroup(rows, hidden, config.num_hidden_layers) * 2 else 0 })
         else
             null;
+        defer if (arena) |entry| entry.noteUse(&self.ctx);
         const mask = if (arena) |entry| entry.buffers[0] else try allocBuf(&owned, allocator, self, rows * 8);
         try copyFromHostTracked(self, mask, std.mem.sliceAsBytes(encoder_attention_mask));
         // cuDNN's padding descriptors consume one INT32 valid-prefix length
@@ -12171,6 +12172,41 @@ fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
     return allocator.dupe(i64, tensorFromCt(tensor).shape);
 }
 
+fn supportsLinearPackedNamedOp(ctx: *anyopaque) bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.packed_projections;
+}
+fn audioChannelNormOp(ctx: *anyopaque, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) anyerror!?CT {
+    const result = (try audioFrontendOp(ctx, input, weight, .{ .mode = 3, .rows = std.math.cast(u32, positions) orelse return error.InvalidShape, .width = std.math.cast(u32, channels) orelse return error.InvalidShape, .floor = eps })) orelse return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    errdefer freeTensor(ctx, result);
+    const shape = try self.allocator.dupe(i64, tensorFromCt(input).shape);
+    const output = tensorFromCt(result);
+    self.allocator.free(output.shape);
+    output.shape = shape;
+    return result;
+}
+fn audioFlattenOp(ctx: *anyopaque, input: CT, time: usize, freq: usize, channels: usize) anyerror!?CT {
+    return audioFrontendOp(ctx, input, null, .{ .mode = 4, .rows = std.math.cast(u32, time) orelse return error.InvalidShape, .width = std.math.cast(u32, freq) orelse return error.InvalidShape, .hop = std.math.cast(u32, channels) orelse return error.InvalidShape });
+}
+fn audioFrontendOp(ctx: *anyopaque, input: CT, auxiliary: ?CT, params: ops.AudioFrontendParams) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .embedding_gemma2) return null;
+    const n = try params.counts();
+    const x = tensorFromCt(input);
+    try ensureF32(x);
+    const aux = if (auxiliary) |ct| tensorFromCt(ct) else null;
+    if (x.elem_count < n.input or (n.auxiliary != 0 and (aux == null or aux.?.elem_count != n.auxiliary))) return error.InvalidTensorShape;
+    if (aux) |t| try ensureF32(t);
+    const shape = try allocShape2(self.allocator, if (params.mode == 3) params.width else params.rows, if (params.mode == 3) params.rows else if (params.mode == 4) @as(usize, params.width) * params.hop else params.width);
+    errdefer self.allocator.free(shape);
+    var output = try allocDeviceBuffer(self, n.output * 4);
+    errdefer releaseDeviceBuffer(self, &output);
+    errdefer self.ctx.synchronize() catch {};
+    try (try self.embeddingGemma2Module()).launchAudioFrontend(&self.ctx, output, x.buffer, if (aux) |t| t.buffer else .{}, params);
+    return createTensor(self, output, shape, n.output);
+}
+
 fn gemma4AudioLocalAttentionOp(
     ctx: *anyopaque,
     q: CT,
@@ -20523,6 +20559,7 @@ fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usiz
         try self.embedding_gemma2_execution.visionArena(&self.ctx, batch, grid_x, grid_y, sizes)
     else
         null;
+    defer if (arena) |entry| entry.noteUse(&self.ctx);
     var buffers: [9]buffer_mod.DeviceBuffer = undefined;
     for (&buffers, sizes[0..9], 0..) |*buffer, bytes, i|
         buffer.* = if (arena) |entry| entry.buffers[i] else try allocBuf(&owned, self.allocator, self, bytes);
@@ -25578,6 +25615,10 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
 const vtable = ops.ComputeBackend.VTable{
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
+    .audioFrontend = &audioFrontendOp,
+    .channelLayerNormRelu = &audioChannelNormOp,
+    .flattenChannelsTimeFreq = &audioFlattenOp,
+    .supportsLinearPackedNamed = &supportsLinearPackedNamedOp,
     .deinitBackend = &deinitBackend,
     .freeTensor = &freeTensor,
     .immutableResidentScalarF32 = &immutableResidentScalarF32Op,

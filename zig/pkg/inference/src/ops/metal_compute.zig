@@ -15659,6 +15659,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.data.scalar_bounds.access(self.data.allocator, key, value);
     }
 
+    fn audioFrontendOp(ctx: *anyopaque, input: CT, auxiliary: ?CT, params: ops.AudioFrontendParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise() or params.mode > 2) return null;
+        const n = try params.counts();
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer x.deinit();
+        var aux = if (auxiliary) |ct| (try self.gemma4AudioDeviceOperand(ct)) orelse return null else null;
+        defer if (aux) |*t| t.deinit();
+        if (x.elemCount() < n.input or (n.auxiliary != 0 and (aux == null or aux.?.elemCount() != n.auxiliary))) return error.InvalidTensorShape;
+        const output = (try metal_runtime.decoderRuntimeAudioFrontend(self.provider_impl, x, aux, params)) orelse return null;
+        return self.ctFromOwnedMetalTensor(output);
+    }
     fn spatialPoolPrepareOp(ctx: *anyopaque, input: CT, bias: ?CT, scale: ?CT, params: ops.SpatialPoolParams) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
@@ -33322,6 +33334,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.modelScalarBounds = modelScalarBoundsOp;
         vt.clampSilu = clampSiluOp;
         vt.spatialPoolPrepare = spatialPoolPrepareOp;
+        vt.audioFrontend = audioFrontendOp;
         vt.layerNorm = layerNormOp;
         // The inherited NativeCompute op would read a MetalCompute tensor as
         // its own; the interpreter falls back to layerNorm without it.

@@ -43,6 +43,31 @@ pub const Arena = struct {
     eager_ns: u64 = 0,
     replay_ns: u64 = 0,
     timed_uses: u64 = 0,
+    last_used: u64 = 0,
+    uses: u64 = 0,
+    completion: driver.CUevent = null,
+    pending: bool = false,
+    fence_valid: bool = false,
+    pub fn noteUse(self: *Arena, ctx: *Context) void {
+        self.pending = true;
+        self.fence_valid = false;
+        if (self.completion == null) self.completion = ctx.createStreamEvent() catch return;
+        ctx.recordEvent(self.completion) catch return;
+        self.fence_valid = true;
+    }
+    fn drain(self: *Arena, ctx: *Context) !void {
+        if (!self.pending) return;
+        if (self.fence_valid) {
+            try ctx.makeCurrent();
+            try ctx.driver.check(ctx.driver.fns.cuEventSynchronize(self.completion));
+        } else try ctx.synchronize();
+        self.pending = false;
+    }
+    fn bytes(self: *const Arena) usize {
+        var total: usize = 0;
+        for (self.buffers) |b| total += b.len;
+        return total;
+    }
     pub fn preferReplay(self: *const Arena) bool {
         if (self.replay_samples < 2) return true;
         if (self.eager_samples < 2) return false;
@@ -73,6 +98,7 @@ pub const Arena = struct {
         self.disabled = err != error.Cancelled and err != error.Timeout;
     }
     fn deinit(self: *Arena, ctx: *Context) void {
+        if (self.completion != null) ctx.destroyEvent(self.completion);
         if (self.graph != null) ctx.destroyGraphExec(self.graph);
         for (&self.buffers) |*buffer| buffer.free(ctx);
         if (self.lease) |*lease| lease.release();
@@ -84,7 +110,8 @@ pub const Cache = struct {
     weights: std.StringHashMapUnmanaged(Packed) = .empty,
     packed_bytes: usize = 0,
     weight_generation: usize = 0,
-    arenas: [4]Arena = @splat(.{}),
+    arenas: [8]Arena = @splat(.{}),
+    clock: u64 = 0,
     next_arena: usize = 0,
 
     pub fn clear(self: *Cache, allocator: std.mem.Allocator, ctx: *Context) !void {
@@ -160,18 +187,50 @@ pub const Cache = struct {
         return self.arenaFor(ctx, batch, sequence, 0, grid_x, grid_y, sizes);
     }
 
+    fn victim(self: *Cache) *Arena {
+        for (&self.arenas) |*slot| if (slot.bytes() == 0) return slot;
+        return self.oldestOccupied(null).?;
+    }
+    fn oldestOccupied(self: *Cache, exclude: ?*Arena) ?*Arena {
+        var best: ?*Arena = null;
+        for (&self.arenas) |*slot| {
+            if (slot == exclude or slot.bytes() == 0) continue;
+            if (best == null or slot.last_used < best.?.last_used) best = slot;
+        }
+        return best;
+    }
+
     fn arenaFor(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
         const kind: @FieldType(Arena, "kind") = if (grid_x == 0) .encoder else .vision;
         if (batch == 0 or batch > (if (kind == .encoder) @as(usize, 4) else 8) or sequence == 0 or sequence > 8192 or batch > graph_rows_limit / sequence) return null;
+        self.clock +|= 1;
         for (&self.arenas) |*entry| if (entry.kind == kind and entry.grid_x == grid_x and entry.grid_y == grid_y and entry.sequence == sequence and entry.batch == batch and entry.mask_kind == mask_kind) {
             for (entry.buffers, sizes) |buffer, size| if (buffer.len != size) return error.InvalidCudaState;
+            entry.last_used = self.clock;
+            entry.uses +|= 1;
             return entry;
         };
         var bytes: usize = 0;
         for (sizes) |size| bytes = try std.math.add(usize, bytes, size);
         if (bytes > arena_limit) return null;
-        const entry = &self.arenas[self.next_arena % self.arenas.len];
-        try ctx.synchronize();
+        // Empty descriptors require no barrier. Retention is byte bounded,
+        // not just descriptor bounded; protect hot stages from one-off shapes.
+        const entry = self.victim();
+        if (entry.bytes() != 0 and entry.uses >= 2 and self.clock -| entry.last_used < 4) return null;
+        var retained: usize = 0;
+        for (&self.arenas) |*slot| retained += slot.bytes();
+        while (retained - entry.bytes() + bytes > 4 * arena_limit) {
+            const victim_slot = self.oldestOccupied(entry) orelse break;
+            if (victim_slot.uses >= 2 and self.clock -| victim_slot.last_used < 4) return null;
+            const released = victim_slot.bytes();
+            try victim_slot.drain(ctx);
+            victim_slot.deinit(ctx);
+            retained -= released;
+        }
+        // If the budget cannot retain this candidate without displacing a
+        // protected hot shape, eager execution keeps the warmed cache intact.
+        if (retained - entry.bytes() + bytes > 4 * arena_limit) return null;
+        try entry.drain(ctx);
         entry.deinit(ctx);
         var lease = acquire(ctx, bytes) catch return null;
         errdefer if (lease) |*active| active.release();
@@ -184,6 +243,8 @@ pub const Cache = struct {
                 return null;
             };
         }
+        candidate.last_used = self.clock;
+        candidate.uses = 1;
         candidate.lease = lease;
         entry.* = candidate;
         self.next_arena += 1;
@@ -196,7 +257,7 @@ fn acquire(ctx: *Context, bytes: usize) !?memory.AdmissionLease {
 }
 
 test "embeddinggemma2 execution cache bounds cohort graph buckets and packed retention" {
-    try std.testing.expectEqual(@as(usize, 4), @as(Cache, .{}).arenas.len);
+    try std.testing.expectEqual(@as(usize, 8), @as(Cache, .{}).arenas.len);
     try std.testing.expect(arena_limit * 4 + packed_limit <= 1024 * 1024 * 1024);
 }
 
@@ -322,4 +383,76 @@ test "embeddinggemma2 graph selection measures completed warm routes with bounde
     entry.recordCompleted(false, 100);
     entry.recordCompleted(false, 100);
     try std.testing.expect(entry.preferReplay());
+}
+
+test "embeddinggemma2 graph retention keeps mixed stages and fences only replaced arenas" {
+    const Mock = struct {
+        var next: usize = 256;
+        var barriers: usize = 0;
+        var waits: usize = 0;
+        fn current(_: driver.CUcontext) callconv(.c) driver.CUresult {
+            return 0;
+        }
+        fn sync(_: driver.CUstream) callconv(.c) driver.CUresult {
+            barriers += 1;
+            return 0;
+        }
+        fn alloc(p: *driver.CUdeviceptr, _: usize) callconv(.c) driver.CUresult {
+            p.* = next;
+            next += 256;
+            return 0;
+        }
+        fn free(_: driver.CUdeviceptr) callconv(.c) driver.CUresult {
+            return 0;
+        }
+        fn event(p: *driver.CUevent, _: c_uint) callconv(.c) driver.CUresult {
+            p.* = @ptrFromInt(next);
+            next += 256;
+            return 0;
+        }
+        fn record(_: driver.CUevent, _: driver.CUstream) callconv(.c) driver.CUresult {
+            return 0;
+        }
+        fn wait(_: driver.CUevent) callconv(.c) driver.CUresult {
+            waits += 1;
+            return 0;
+        }
+        fn destroy(_: driver.CUevent) callconv(.c) driver.CUresult {
+            return 0;
+        }
+    };
+    Mock.next = 256;
+    Mock.barriers = 0;
+    Mock.waits = 0;
+    var ctx: Context = undefined;
+    ctx.ctx = @ptrFromInt(1);
+    ctx.stream = @ptrFromInt(2);
+    ctx.stats = .{};
+    ctx.device_allocations = .{ .limit = 1024 * 1024 };
+    ctx.video_cache_budget = .{};
+    ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+    ctx.driver.fns.cuMemAlloc = Mock.alloc;
+    ctx.driver.fns.cuMemFree = Mock.free;
+    ctx.driver.fns.cuEventCreate = Mock.event;
+    ctx.driver.fns.cuEventRecord = Mock.record;
+    ctx.driver.fns.cuEventSynchronize = Mock.wait;
+    ctx.driver.fns.cuEventDestroy = Mock.destroy;
+    var cache = Cache{};
+    defer cache.clear(std.testing.allocator, &ctx) catch unreachable;
+    var sizes: [11]usize = @splat(0);
+    sizes[0] = 16;
+    var first: usize = 0;
+    for (1..9) |seq| {
+        const slot = (try cache.arena(&ctx, 1, seq, 0, sizes)).?;
+        if (seq == 1) first = slot.buffers[0].ptr;
+        slot.noteUse(&ctx);
+    }
+    try std.testing.expectEqual(@as(usize, 0), Mock.barriers);
+    try std.testing.expectEqual(@as(usize, 0), Mock.waits);
+    try std.testing.expectEqual(first, (try cache.arena(&ctx, 1, 1, 0, sizes)).?.buffers[0].ptr);
+    _ = try cache.visionArena(&ctx, 1, 3, 3, sizes);
+    try std.testing.expectEqual(@as(usize, 1), Mock.waits);
+    try std.testing.expectEqual(@as(usize, 0), Mock.barriers);
+    try std.testing.expectEqual(first, (try cache.arena(&ctx, 1, 1, 0, sizes)).?.buffers[0].ptr);
 }

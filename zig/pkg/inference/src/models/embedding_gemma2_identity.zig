@@ -22,7 +22,7 @@ const receipt = @import("../registry/managed_receipt.zig");
 pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
 /// CUDA also uses BF16-specific token scaling and media preparation. Version
 /// this complete execution recipe independently of the qualified F32 route.
-pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v1";
+pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v2-audio-frontend";
 
 pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
     if (backend != .cuda) return artifact_identity;
@@ -44,6 +44,7 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
     if (policy.spatial_pool) hash.update("\x00spatial-pool-v1");
     if (policy.tuned_gemm) hash.update("\x00tuned-bf16-output-v1");
     if (policy.image_batch or policy.media_batch) hash.update("\x00batched-patches-v2");
+    if (policy.media_batch) hash.update("\x00audio-subsample-batch-v2");
     if (policy.graph_replay) hash.update("\x00media-graphs-v3");
     if (policy.native_vision) hash.update("\x00native-vision-bf16-v2");
     hash.update(&.{0});

@@ -1405,3 +1405,31 @@ stream ownership. `--require-route patch_into` attests direct destination writes
 reload and qualify the resulting pins. NVIDIA tests compare batched projection
 against singletons and verify warm audio constants perform no query-scale
 readbacks. Compilation and counters still do not establish NVIDIA parity or speed.
+
+
+Audio QKV packing checks backend eligibility before resolving clamp bounds.
+CUDA uses the immutable scalar cache and Metal uses the model-bound cache;
+a warmed twelve-layer traversal performs no clamp-weight readbacks, even when
+packing is declined. Unsupported backends retain their existing scalar path.
+
+Audio frontend device kernels window one PCM upload, calculate complex
+magnitudes without squared/reduction/reshape temporaries, and fuse log-floor
+with row masking. They preserve explicit multiply/add ordering and use the
+precise Metal library. CUDA channel normalization and NCHW flattening remain
+on device. Equal-length clips share both subsampling convolutions and their
+projection; incompatible lengths form separate cohorts without extra padding.
+A conservative 128-MiB optional batch envelope counts retained convolution and
+transpose storage; large clips retain the singleton route. Per-clip time masks,
+channel statistics, cancellation and caller ordering remain
+unchanged. The CUDA recipe is `embeddinggemma2-cuda-bf16-mean-v2-audio-frontend`;
+reload qualification pins before serving it. `MEDIA_BATCH` additionally versions
+the subsampling GEMM geometry with `audio-subsample-batch-v2`.
+
+Graph retention has eight lightweight descriptors under the prior aggregate
+512 MiB arena ceiling; each arena remains limited to 128 MiB. Hits refresh
+recency and reuse counts. Empty slots need no drain, recent reused shapes resist
+one-off misses, and replacement waits for the victim's last-use event rather
+than the entire stream. Failed event creation/recording conservatively falls
+back to a stream drain. Event recording covers successful and failed execution
+exits, including final output reads. Model unload and lost-context cleanup retain
+their existing admission and ownership contracts.

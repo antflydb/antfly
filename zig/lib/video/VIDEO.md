@@ -618,3 +618,11 @@ Audio preparation shares fixed immutable frontend tables. CUDA device constants
 have an 8 MiB / 128-entry admitted cache; warm query scales require no per-layer
 readback. Snapshot borrowers retain memory/admission through eviction. Neither
 cache stores clip data, and unusual frontend configurations retain private plans.
+
+
+Accelerator audio preparation uploads PCM once and windows on device, with
+fused magnitude and log/mask operations. Equal-length audio clips batch through
+subsampling without temporal padding; masks and output order remain clip-local.
+CUDA clamp metadata uses immutable scalar lookups before packed projection.
+CUDA graph retention shares the existing memory ceiling across reuse-aware
+vision/backbone descriptors and fences only evicted storage by completion event.

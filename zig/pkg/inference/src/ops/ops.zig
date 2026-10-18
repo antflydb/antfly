@@ -266,6 +266,30 @@ pub const DotGeneral2DManyResult = struct {
     outputs: []CT,
 };
 
+/// Checked device frontend ABI shared by accelerator implementations.
+pub const AudioFrontendParams = extern struct {
+    // 0: window PCM; 1: complex magnitude; 2: log floor and row mask.
+    // 3: channel norm/ReLU (rows=positions, width=channels, floor=eps).
+    // 4: NCHW flatten (rows=time, width=freq, hop=channels).
+    mode: u32,
+    rows: u32,
+    width: u32,
+    hop: u32 = 0,
+    floor: f32 = 0,
+    pub fn counts(p: @This()) !struct { input: usize, auxiliary: usize, output: usize } {
+        if (p.mode > 4 or p.rows == 0 or p.width == 0 or ((p.mode == 0 or p.mode == 4) and p.hop == 0) or ((p.mode == 2 or p.mode == 3) and (!std.math.isFinite(p.floor) or p.floor <= 0))) return error.InvalidTensorShape;
+        const n = try std.math.mul(usize, try std.math.mul(usize, p.rows, p.width), if (p.mode == 4) p.hop else 1);
+        if (n > std.math.maxInt(u32) or (p.mode == 1 and n > std.math.maxInt(u32) / 2)) return error.InvalidTensorShape;
+        const input = switch (p.mode) {
+            0 => try std.math.add(usize, try std.math.mul(usize, p.rows - 1, p.hop), p.width),
+            1 => try std.math.mul(usize, n, 2),
+            else => n,
+        };
+        if (input > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        return .{ .input = input, .auxiliary = if (p.mode == 0 or p.mode == 3) p.width else if (p.mode == 2) p.rows else 0, .output = n };
+    }
+};
+
 /// Spatial merge in row-major dy/dx addition order, followed by optional
 /// per-channel (pooled-bias)*scale. RMS stays on the backend's qualified route.
 pub const SpatialPoolParams = struct {
@@ -2029,6 +2053,8 @@ pub const ComputeBackend = struct {
         /// position bias; see `Gemma4AudioLocalAttentionParams`.
         /// Starts has one exact F32 clip start index per row; no cross-clip taps.
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+        audioFrontend: ?*const fn (ctx: *anyopaque, input: CT, auxiliary: ?CT, params: AudioFrontendParams) anyerror!?CT = null,
+        supportsLinearPackedNamed: ?*const fn (ctx: *anyopaque) bool = null,
         gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers
@@ -4725,6 +4751,20 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, weight, channels, positions, eps);
     }
 
+    pub fn audioFrontend(self: *const ComputeBackend, input: CT, auxiliary: ?CT, params: AudioFrontendParams) !?CT {
+        _ = try params.counts();
+        try self.checkExecutionControl();
+        const op = self.vtable.audioFrontend orelse return null;
+        const result = try op(self.ptr, input, auxiliary, params);
+        errdefer if (result) |tensor| self.free(tensor);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn supportsLinearPackedNamed(self: *const ComputeBackend) bool {
+        if (self.vtable.linearPackedNamed == null) return false;
+        return if (self.vtable.supportsLinearPackedNamed) |op| op(self.ptr) else true;
+    }
+
     pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
         const op = self.vtable.gemma4AudioLocalAttention orelse return null;
         return op(self.ptr, q, k, v, rel, q_dim_scales, valid, params);
@@ -6195,4 +6235,14 @@ test "packed boundary QKV releases all outputs and cancels its owned scope on re
         try std.testing.expectEqual(@as(usize, if (case == .pre_cancel) 0 else 1), fake.calls);
         try std.testing.expectEqual(@as(usize, if (case == .post_cancel or case == .success) 3 else 0), fake.frees);
     }
+}
+
+test "embeddinggemma2 audio frontend bounds every kernel index and ABI" {
+    try std.testing.expectEqual(@as(usize, 20), @sizeOf(AudioFrontendParams));
+    try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 0, .rows = 2, .width = 4, .hop = std.math.maxInt(u32) }).counts());
+    try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 4, .rows = 2, .width = 4 }).counts());
+    try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 3, .rows = 2, .width = 4, .floor = std.math.nan(f32) }).counts());
+    const window = try (AudioFrontendParams{ .mode = 0, .rows = 3, .width = 4, .hop = 2 }).counts();
+    try std.testing.expectEqual(@as(usize, 8), window.input);
+    try std.testing.expectEqual(@as(usize, 12), window.output);
 }

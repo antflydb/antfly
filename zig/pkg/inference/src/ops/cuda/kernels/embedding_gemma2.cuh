@@ -1409,3 +1409,23 @@ extern "C" __global__ void termite_gemma4_audio_depthwise_causal_conv1d_f32(
     }
     out[i] = sum;
 }
+
+extern "C" __global__ void antfly_audio_frontend_f32(const float *input, const float *aux, float *out, unsigned mode, unsigned rows, unsigned width, unsigned hop, float floor) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    unsigned long long total=(unsigned long long)rows*width*(mode==4 ? hop : 1);
+    if ((unsigned long long)i >= total) return;
+    if (mode == 0) out[i]=__fmul_rn(input[(i/width)*hop+i%width],aux[i%width]);
+    else if (mode == 1) { float re=input[2*i], im=input[2*i+1]; out[i]=sqrtf(__fadd_rn(__fmul_rn(re,re),__fmul_rn(im,im))); }
+    else if (mode == 2) out[i]=__fmul_rn(logf(__fadd_rn(input[i],floor)),aux[i/width]);
+    else if (mode == 3) {
+        if (i>=rows) return;
+        float mean=0.f;
+        for (unsigned c=0;c<width;c++) mean=__fadd_rn(mean,input[c*rows+i]);
+        mean=__fdiv_rn(mean,(float)width);
+        float var=0.f;
+        for (unsigned c=0;c<width;c++) { float d=__fsub_rn(input[c*rows+i],mean); var=__fadd_rn(var,__fmul_rn(d,d)); }
+        var=__fdiv_rn(var,(float)width);
+        float scale=__fdiv_rn(1.f,sqrtf(__fadd_rn(var,floor)));
+        for (unsigned c=0;c<width;c++) out[c*rows+i]=fmaxf(0.f,__fmul_rn(__fmul_rn(__fsub_rn(input[c*rows+i],mean),scale),aux[c]));
+    } else out[i]=input[((i%hop)*rows+i/(width*hop))*width+(i/hop)%width];
+}

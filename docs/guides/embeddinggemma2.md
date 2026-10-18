@@ -1174,3 +1174,12 @@ pins with `batched-patches-v2`; reload and run NVIDIA qualification before use.
 The comparison harness can require `audio_constants` and `patch_into` execution.
 Vision scratch now fits four 480×480 frames with packed BF16 preparation into the
 existing 128 MiB graph arena, without raising the cache ceiling.
+
+
+Audio acceleration also batches compatible subsampling lengths and keeps window,
+magnitude, log/mask, channel normalization and flatten preparation on device.
+CUDA QKV packing reuses immutable clamp metadata. The CUDA frontend recipe is
+now version 2; existing CUDA qualification pins must be regenerated. Graph
+retention uses completion-event eviction under the unchanged total memory cap.
+These routes require NVIDIA vector/ranking parity and completed-device timing
+before performance promotion.

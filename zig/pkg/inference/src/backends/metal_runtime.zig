@@ -10328,6 +10328,16 @@ pub fn decoderRuntimeRmsNormResidual(self: anytype, input: MetalTensor, residual
 
 pub extern fn termite_metal_decode_runtime_norm_residual_device(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, output: ?*anyopaque, output_offset: usize) c_int;
 
+pub fn decoderRuntimeAudioFrontend(self: anytype, input: MetalTensor, auxiliary: ?MetalTensor, params: @import("../ops/ops.zig").AudioFrontendParams) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    const n = try params.counts();
+    var output = try MetalTensor.deviceAllocate(runtime, n.output * 4, .private, &.{ @intCast(params.rows), @intCast(params.width) });
+    errdefer output.deinit();
+    const rc = antfly_metal_audio_frontend(runtime, input.deviceHandle(), input.deviceByteOffset(), if (auxiliary) |t| t.deviceHandle() else input.deviceHandle(), if (auxiliary) |t| t.deviceByteOffset() else input.deviceByteOffset(), &params, output.deviceHandle(), output.deviceByteOffset());
+    return finishDeviceOutput(&output, rc);
+}
+extern fn antfly_metal_audio_frontend(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, aux: ?*anyopaque, aux_offset: usize, params: *const @import("../ops/ops.zig").AudioFrontendParams, output: ?*anyopaque, output_offset: usize) c_int;
+
 pub fn decoderRuntimeSpatialPoolPrepare(self: anytype, input: MetalTensor, bias: ?MetalTensor, scale: ?MetalTensor, batch: u32, gx: u32, gy: u32, merge: u32, dim: u32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     const rows = @as(usize, batch) * (gx / merge) * (gy / merge);

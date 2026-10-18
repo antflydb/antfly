@@ -81,6 +81,7 @@ pub const Module = struct {
     audio_attention: driver.CUfunction,
     audio_clamp: driver.CUfunction,
     audio_glu_rows: driver.CUfunction,
+    audio_frontend: driver.CUfunction,
     audio_depthwise_conv: driver.CUfunction,
     pillow_horizontal: driver.CUfunction,
     pillow_vertical_patches: driver.CUfunction,
@@ -150,6 +151,7 @@ pub const Module = struct {
             .audio_attention = try function(ctx, m, "termite_gemma4_audio_local_attention_f32"),
             .audio_clamp = try function(ctx, m, "termite_gemma4_audio_clamp_f32"),
             .audio_glu_rows = try function(ctx, m, "termite_gemma4_audio_glu_rows_f32"),
+            .audio_frontend = try function(ctx, m, "antfly_audio_frontend_f32"),
             .audio_depthwise_conv = try function(ctx, m, "termite_gemma4_audio_depthwise_causal_conv1d_f32"),
             .pillow_horizontal = try function(ctx, m, "termite_embedding_gemma2_pillow_horizontal_rgb8"),
             .pillow_vertical_patches = try function(ctx, m, "termite_embedding_gemma2_pillow_vertical_patches_f32"),
@@ -350,6 +352,22 @@ pub const Module = struct {
         try self.launch1d(ctx, self.audio_clamp, &args, count);
     }
 
+    pub fn launchAudioFrontend(self: *Module, ctx: *Context, out: Buffer, input: Buffer, auxiliary: Buffer, params: @import("../ops.zig").AudioFrontendParams) !void {
+        const n = try params.counts();
+        try require(out, n.output * 4);
+        try require(input, n.input * 4);
+        try require(auxiliary, n.auxiliary * 4);
+        var op = out.ptr;
+        var ip = input.ptr;
+        var ap = auxiliary.ptr;
+        var mode = params.mode;
+        var rows = params.rows;
+        var width = params.width;
+        var hop = params.hop;
+        var floor = params.floor;
+        var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&ap), @ptrCast(&op), @ptrCast(&mode), @ptrCast(&rows), @ptrCast(&width), @ptrCast(&hop), @ptrCast(&floor) };
+        try self.launch1d(ctx, self.audio_frontend, &args, if (params.mode == 3) params.rows else n.output);
+    }
     pub fn launchAudioGluRows(self: *Module, ctx: *Context, out: Buffer, input: Buffer, rows: u32, dim: u32) !void {
         if (rows == 0 or dim == 0) return error.InvalidEmbeddingGemma2Shape;
         const count = try std.math.mul(usize, rows, dim);
