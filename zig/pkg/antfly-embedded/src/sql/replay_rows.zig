@@ -30,6 +30,7 @@ pub const Replay = struct {
     memory: Budget,
     arena: std.heap.ArenaAllocator,
     rows: std.ArrayList([]const Datum) = .empty,
+    weights: std.ArrayList(u64) = .empty,
     manager: ?*spill.Manager,
     disk: ?spill.Sequential = null,
     count: usize = 0,
@@ -49,38 +50,47 @@ pub const Replay = struct {
         std.debug.assert(self.readers == 0);
         if (self.disk) |*run| run.close();
         self.rows.deinit(self.memory.allocator());
+        self.weights.deinit(self.memory.allocator());
         self.arena.deinit();
         std.debug.assert(self.memory.live == 0);
         const a = self.a;
         a.destroy(self);
     }
 
-    fn appendMemory(self: *Replay, values: []const Datum) !void {
+    fn appendMemory(self: *Replay, values: []const Datum, weight: u64) !void {
         try self.rows.ensureUnusedCapacity(self.memory.allocator(), 1);
+        try self.weights.ensureUnusedCapacity(self.memory.allocator(), 1);
         const a = self.arena.allocator();
         const row = try a.alloc(Datum, values.len);
         for (values, row) |value, *out| out.* = try operators.cloneDatum(a, value);
         self.rows.appendAssumeCapacity(row);
+        self.weights.appendAssumeCapacity(weight);
     }
 
     fn startSpill(self: *Replay) !void {
         const manager = self.manager orelse return error.SqlProgramLimitExceeded;
         self.disk = try spill.Sequential.init(manager, @max(128, manager.buffer_bytes *| 2));
-        for (self.rows.items, 0..) |row, ordinal| _ = try self.disk.?.append(.{ .values = row, .keys = &.{}, .ordinal = ordinal }, spill.none);
+        for (self.rows.items, self.weights.items) |row, weight| _ = try self.disk.?.append(.{ .values = row, .keys = &.{}, .ordinal = weight }, spill.none);
         self.rows.clearAndFree(self.memory.allocator());
+        self.weights.clearAndFree(self.memory.allocator());
         _ = self.arena.reset(.free_all);
         std.debug.assert(self.memory.live == 0);
     }
 
     pub fn append(self: *Replay, values: []const Datum) !void {
+        return self.appendWeighted(values, 1);
+    }
+
+    pub fn appendWeighted(self: *Replay, values: []const Datum, weight: u64) !void {
+        if (weight == 0) return error.InvalidSqlBackendResponse;
         if (self.failed or self.finished or values.len != self.width) return error.InvalidSqlBackendResponse;
         errdefer self.failed = true;
         if (self.count == std.math.maxInt(usize)) return error.SqlProgramLimitExceeded;
-        if (self.disk == null) self.appendMemory(values) catch |err| {
+        if (self.disk == null) self.appendMemory(values, weight) catch |err| {
             if (err != error.OutOfMemory or !self.memory.exhausted) return err;
             try self.startSpill();
         };
-        if (self.disk) |*run| _ = try run.append(.{ .values = values, .keys = &.{}, .ordinal = self.count }, spill.none);
+        if (self.disk) |*run| _ = try run.append(.{ .values = values, .keys = &.{}, .ordinal = weight }, spill.none);
         self.count += 1;
     }
 
@@ -104,18 +114,38 @@ pub const Replay = struct {
         owner: *Replay,
         disk: ?spill.Sequential.ReplayReader,
         index: usize = 0,
+        remaining: u64 = 0,
+        current: []const Datum = &.{},
+
+        pub const Weighted = struct { values: []const Datum, weight: u64 };
+        pub fn nextWeighted(self: *Reader) !?Weighted {
+            if (self.remaining != 0) return error.InvalidSqlBackendResponse;
+            if (self.index == self.owner.count) return null;
+            const result: Weighted = if (self.disk) |*run| blk: {
+                const record = (try run.readBorrowed(self.index)).row;
+                break :blk .{ .values = record.values, .weight = record.ordinal };
+            } else .{ .values = self.owner.rows.items[self.index], .weight = self.owner.weights.items[self.index] };
+            if (result.weight == 0 or result.values.len != self.owner.width) return error.InvalidSqlBackendResponse;
+            self.index += 1;
+            return result;
+        }
 
         /// A borrowed row survives other readers, but not this reader's next
         /// block load or close. Retaining operators copy at their boundary.
         pub fn next(self: *Reader) !?[]const Datum {
-            if (self.index == self.owner.count) return null;
-            const values = if (self.disk) |*run| (try run.readBorrowed(self.index)).row.values else self.owner.rows.items[self.index];
-            self.index += 1;
-            return values;
+            if (self.remaining == 0) {
+                const bag = try self.nextWeighted() orelse return null;
+                self.current = bag.values;
+                self.remaining = bag.weight;
+            }
+            self.remaining -= 1;
+            return self.current;
         }
 
         pub fn rewind(self: *Reader) void {
             self.index = 0;
+            self.remaining = 0;
+            self.current = &.{};
         }
 
         pub fn close(self: *Reader) void {
@@ -181,7 +211,7 @@ test "SQL replay rows preserve arrays and unwind every memory and spill allocati
                 defer replay.deinit();
                 const arrays = @import("array_value.zig");
                 const value = try arrays.Value.init(.int64, &.{.{ .length = 3, .lower = -1 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.{ .integer = 3 }) }, .{});
-                try replay.append(&.{Datum.typedArray(&value)});
+                try replay.appendWeighted(&.{Datum.typedArray(&value)}, 3);
                 try replay.finish();
                 const reader = try replay.openReader();
                 defer reader.close();
@@ -260,5 +290,37 @@ test "SQL replay readers own JSON allocators and fail closed on quota cancellati
             return;
         };
         try std.testing.expectError(error.SqlProgramLimitExceeded, replay.finish());
+    }
+}
+
+test "SQL weighted replay preserves exact bags across spill and independent expanding readers" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]usize{ 1, 65536 }) |memory_bytes| {
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+        defer manager.deinit();
+        const replay = try Replay.create(a, 1, memory_bytes, &manager);
+        defer replay.deinit();
+        try replay.appendWeighted(&.{Datum.json(.{ .integer = 7 })}, 3);
+        try replay.appendWeighted(&.{.{}}, std.math.maxInt(u64));
+        try replay.finish();
+        const compact = try replay.openReader();
+        defer compact.close();
+        const expanded = try replay.openReader();
+        defer expanded.close();
+        const first = (try compact.nextWeighted()).?;
+        try std.testing.expectEqual(@as(u64, 3), first.weight);
+        try std.testing.expectEqual(@as(i64, 7), first.values[0].value.integer);
+        for (0..3) |_| try std.testing.expectEqual(@as(i64, 7), (try expanded.next()).?[0].value.integer);
+        try std.testing.expect((try expanded.next()).?[0].sql_null);
+        const second = (try compact.nextWeighted()).?;
+        try std.testing.expectEqual(std.math.maxInt(u64), second.weight);
+        try std.testing.expect(second.values[0].sql_null);
+        try std.testing.expect((try compact.nextWeighted()) == null);
+        expanded.rewind();
+        try std.testing.expectEqual(@as(i64, 7), (try expanded.next()).?[0].value.integer);
     }
 }

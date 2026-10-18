@@ -2037,11 +2037,11 @@ const Engine = struct {
         if (clauses.len == 0) return false;
         for (clauses) |clause| switch (clause.operation) {
             .project => |p| {
-                if (p.value.distinct and p.value.wildcard) return false;
                 for (p.value.items) |item| if (@import("expressions.zig").containsPattern(item.expression)) return false;
                 for (p.value.order) |order| if (@import("expressions.zig").containsPattern(order.expression)) return false;
                 if (p.value.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return false;
             },
+            .match => {},
             .unwind => |u| if (@import("expressions.zig").containsPattern(u.expression)) return false,
             else => return false,
         };
@@ -2063,6 +2063,23 @@ const Engine = struct {
             try self.checkpoint();
             const before = bags.count();
             switch (clause.operation) {
+                .match => |operation| {
+                    // match() returns ordinary bindings for this one input.
+                    // Its internal collector must not publish a pending
+                    // window belonging to the enclosing weighted pipeline.
+                    const retain = self.retain_windows;
+                    self.retain_windows = false;
+                    defer self.retain_windows = retain;
+                    var rows: std.ArrayList(Row) = .empty;
+                    var weights: std.ArrayList(u64) = .empty;
+                    for (bags.rows, bags.weights) |input, weight| {
+                        for (try self.match(&.{input}, operation)) |output| {
+                            try rows.append(self.a, output);
+                            try weights.append(self.a, weight);
+                        }
+                    }
+                    bags = .{ .rows = rows.items, .weights = weights.items };
+                },
                 .unwind => |u| {
                     var rows: std.ArrayList(Row) = .empty;
                     var weights: std.ArrayList(u64) = .empty;
@@ -2079,7 +2096,23 @@ const Engine = struct {
                     bags = .{ .rows = rows.items, .weights = weights.items };
                 },
                 .project => |p| {
-                    const projection = p.value;
+                    var projection = p.value;
+                    // Resolve DISTINCT * against the complete current scope,
+                    // before reducing multiplicities. Explicit items follow
+                    // the wildcard prefix just as in ordinary projection.
+                    if (projection.distinct and projection.wildcard) {
+                        for (projection.items) |item| if (aggregates(item.expression)) return error.CypherAggregateWildcard;
+                        const shape: Row = if (bags.rows.len == 0) &.{} else bags.rows[0];
+                        const items = try self.a.alloc(ast.Item, shape.len + projection.items.len);
+                        for (shape, items[0..shape.len]) |entry, *item| {
+                            const expression = try self.a.create(ast.Expr);
+                            expression.* = .{ .span = clause.span, .value = .{ .variable = entry.name } };
+                            item.* = .{ .expression = expression, .alias = entry.name };
+                        }
+                        @memcpy(items[shape.len..], projection.items);
+                        projection.items = items;
+                        projection.wildcard = false;
+                    }
                     var calls: std.ArrayList(*const ast.Expr) = .empty;
                     for (projection.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return error.CypherInvalidAggregate;
                     for (projection.order) |order| if (!try self.collectStreamingAggregates(order.expression, &calls)) return error.CypherInvalidAggregate;
@@ -2093,9 +2126,11 @@ const Engine = struct {
                         state_value.arena.deinit();
                         state_value.distinct_arena.deinit();
                     };
-                    var has_keys = false;
+                    // DISTINCT over an empty binding still has one empty
+                    // key per input, and no group at all for empty input.
+                    var has_keys = projection.distinct and calls.items.len == 0;
                     for (projection.items) |item| has_keys = has_keys or !aggregates(item.expression);
-                    if (grouped and !has_keys) try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, calls.items));
+                    if (calls.items.len != 0 and !has_keys) try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, calls.items));
                     var matched: usize = 0;
                     var counts = [_]usize{0};
                     var fold: StreamFold = .{ .retained = self.a, .middle = &.{}, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = &counts, .matched = &matched, .distinct = &.{} };

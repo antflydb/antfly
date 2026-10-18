@@ -2056,6 +2056,9 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "WITH b.rank AS score ORDER BY score DESC LIMIT 4 RETURN score",
         "WITH b ORDER BY b.missing,b.rank DESC LIMIT 4 RETURN b.rank",
         "WITH b ORDER BY b.rank LIMIT 0 RETURN count(*)",
+        "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)-[:CITES]->(d:Document) RETURN count(*),sum(d.rank)",
+        "WITH b ORDER BY b.rank LIMIT 3 OPTIONAL MATCH (b)-[:CITES]->(d:Document) RETURN count(*),count(d)",
+        "WITH b ORDER BY b.rank LIMIT 3 WITH DISTINCT * RETURN count(*),sum(b.rank)",
     }) |tail| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -2490,4 +2493,10 @@ test "branch factorization preserves externally bound relationship aliases" {
     var expected = try runtime.execute(a, fixture.backend(), graph, &exact, &.{}, .{});
     defer expected.deinit();
     try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, actual.rows, .{}));
+}
+
+test "weighted continuation distinguishes an empty binding from an empty input" {
+    try check("MATCH (:Document) WITH * LIMIT 5 WITH DISTINCT * RETURN count(*)", "[[1]]");
+    try check("MATCH (:Document) WITH * LIMIT 0 WITH DISTINCT * RETURN count(*)", "[[0]]");
+    try check("MATCH (n:Document) WITH n LIMIT 5 MATCH (n)-[:CITES]->(m:Document) WITH DISTINCT * RETURN count(*)", "[[3]]");
 }

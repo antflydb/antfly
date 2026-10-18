@@ -1367,15 +1367,16 @@ computations run in their assigned pass, and unused computations that could fail
 retain their error dependencies. Projected rows carry explicit aligned weights
 and active aggregate slots through filtering and pagination. A bounded operator
 tree concatenates UNION ALL contributions and carries them through cross joins
-with a proven finite, repeatable side relation (at most 4,096 rows). The normal
-SQL iterator captures that side once under the statement memory budget, including
-its errors and empty inputs. Unobserved side columns permit direct multiplication
-of contribution weights; observed columns use a paged Cartesian product with one
-retained graph page. Repeatable conditional inner joins and graph-preserving
-left/right outer joins use the existing typed hash join. Predicate dependencies
-remain live in every producer pass; duplicate keys multiply matches, NULL keys
-retain SQL semantics, and rejected ON residuals still produce the required
-unmatched graph row. Each unsupported child retains
+with a repeatable side relation. Pinned table scans, literal relations and
+repeatable aggregate summaries are captured once before graph production;
+builds use the statement's scan and memory quotas and the typed hash join's
+spill path. Unobserved side columns permit direct multiplication of contribution
+weights. Conditional inner, left/right and full outer joins preserve duplicate
+keys, SQL NULLs and ON residuals. Full and side-preserving outer joins track
+matched build entries and emit each unmatched dimension row once to every
+aggregate consumer. Membership lowering retains its NULL-aware summaries and
+repeatable builds rather than expanding the graph input.
+Each unsupported child retains
 ordinary production with unit weights, so negotiation never requires advancing a
 producer or rolling back another child's capability. A tree with no weighted
 producer declines negotiation and retains the ordinary columnar execution path.
@@ -1383,9 +1384,18 @@ Positional set coercions,
 NULLs and DISTINCT state stay in the typed SQL machinery. Pure direct
 sort keys can be omitted when no pagination observes their order and the consumer
 has negotiated duplicate/order-insensitive typed reduction. Other joins, set
-operators, materialized relations, analytic windows, ordered/error-producing sort keys and
+operators, analytic windows, ordered/error-producing sort keys and
 cardinality-changing stages retain ordinary production. No aggregate expression
 is algebraically rewritten.
+
+Materialized CTEs capture complete typed tuples with exact multiplicities in a
+shared memory/spill replay. Every reference has an independent reader; aggregate
+consumers retain weights, and row consumers expand them only when requested.
+Capture evaluates the source once and retains every output field, including
+error dependencies, so consumers with different field demands share the same
+snapshot and values. Order-observable sources retain ordinary capture when the
+aggregate-only proof would discard their ordering. Saturated producer counts
+are never stored as exact replay weights.
 
 SQL top-N negotiates endpoint bags only for repeatable predicates, projections
 and order programs. The typed heap and spill codec retain one record per
@@ -1498,7 +1508,10 @@ projections, predicates and sort keys are provably total and no pagination
 observes their order. Ordered finite windows retain compressed endpoint bags in
 a weighted TopK heap: excess multiplicities are trimmed at the worst key, SKIP
 consumes weights, and intermediate WITH windows pass the clipped exact bags to
-subsequent projections, filters, UNWIND, DISTINCT and reductions. Expansion is
+subsequent projections, filters, UNWIND, wildcard DISTINCT, MATCH, OPTIONAL MATCH
+and reductions. Each subsequent match expands one selected binding per bag and
+carries its exact input multiplicity onto the resulting bindings; trail scope
+and optional null extension remain clause-local. Expansion is
 reserved for external rows and consumers such as non-DISTINCT collect that need
 individual elements. Saturated path
 counts remain sufficient for a finite window. Other ordering, aggregation,
@@ -1585,7 +1598,8 @@ point reads/writes with a one-anchor ceiling, shared-label counts, bounded-memor
 terminal operators, SQL graph composition, shortest paths on a dense acyclic
 graph, and lazy incident-edge deletion. Weighted regression cases include
 indexed and unindexed root/endpoint predicates, computed derived-table and CTE
-projections, SQL ordering/UNION ALL/bounded side joins, saturated SQL top-N windows,
+projections, SQL ordering/UNION ALL/persisted dimension joins, spillable full
+outer joins, NULL-aware membership, shared materialized replay, saturated SQL top-N windows,
 selective indexed ranges,
 connected multi-pattern and multi-clause components, factorized branches,
 independent 100-hop SQL

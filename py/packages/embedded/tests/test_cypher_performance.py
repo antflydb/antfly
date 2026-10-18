@@ -2031,6 +2031,10 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
         assert [cell["value"] for cell in result["rows"][0]] == ["246", "15744", "369"]
     for tail, expected in (
         ("RETURN DISTINCT b.score", ["64"]),
+        ("MATCH (b)-[:R]->(c:D) RETURN count(*)", ["0"]),
+        ("OPTIONAL MATCH (b)-[:R]->(c:D) RETURN count(*),count(c)", ["5000000", "0"]),
+        ("WITH DISTINCT * RETURN sum(b.score)", ["64"]),
+        ("MATCH (b)-[:R]->(c:D) WITH DISTINCT * RETURN count(*)", ["0"]),
         ("WITH DISTINCT b.score AS score RETURN count(*),sum(score)", ["1", "64"]),
         ("WITH b.score AS score WHERE score=64 RETURN count(*),sum(score)", ["5000000", "320000000"]),
     ):
@@ -2042,6 +2046,11 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
             },
         )
         assert [cell["value"] for cell in result["rows"][0]] == expected
+    empty_binding = db.cypher_json(
+        "g",
+        {"query": "MATCH (:D {id:'start'})-[:R*64..64]->(:D) WITH * LIMIT 5000000 WITH DISTINCT * RETURN count(*)"},
+    )
+    assert empty_binding["rows"] == [[{"type": "integer", "value": "1"}]]
     collected = db.cypher_json(
         "g",
         {
@@ -2049,3 +2058,102 @@ def test_intermediate_windows_preserve_graph_bags(graph_db):
         },
     )
     assert collected["rows"] == [[{"type": "list", "value": [{"type": "integer", "value": "64"}] * 7}]]
+
+
+def test_persisted_dimensions_membership_and_outer_joins_keep_weights(graph_db):
+    import time
+    from math import comb
+
+    db = graph_db
+    size = 18
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(size) for j in range(i + 1, size)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    db.sql("CREATE TABLE dim(k BIGINT)")
+    db.sql("INSERT INTO dim(k) VALUES(16),(17),(17),(NULL),(99)")
+    path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(5)) + "-[r5 IS R]->(b IS D)"
+    relation = f"GRAPH_TABLE(g MATCH {path} COLUMNS(b.score AS score)) q"
+    matched_count = comb(16, 6) + 2 * comb(17, 6)
+    matched_sum = 16 * comb(16, 6) + 34 * comb(17, 6)
+    full_count = comb(18, 7)
+    full_sum = sum(i * comb(i, 6) for i in range(6, 18))
+    cases = (
+        (f"{relation} JOIN dim d ON q.score=d.k", matched_count, matched_sum, matched_sum),
+        (f"dim d JOIN {relation} ON q.score=d.k", matched_count, matched_sum, matched_sum),
+        (
+            f"{relation} FULL JOIN dim d ON q.score=d.k",
+            full_count + comb(17, 6) + 2,
+            full_sum + 17 * comb(17, 6),
+            matched_sum + 99,
+        ),
+        (f"dim d LEFT JOIN {relation} ON q.score=d.k", matched_count + 2, matched_sum, matched_sum + 99),
+        (
+            f"{relation} RIGHT JOIN dim d ON q.score=d.k AND q.score<17",
+            comb(16, 6) + 4,
+            16 * comb(16, 6),
+            16 * comb(16, 6) + 133,
+        ),
+    )
+    for source, count, total, dimension_total in cases:
+        started = time.monotonic()
+        assert db.sql(f"SELECT count(*),sum(q.score),sum(d.k) FROM {source}")["rows"] == [
+            [str(count), str(total), str(dimension_total)]
+        ]
+        assert time.monotonic() - started < 5
+    for predicate, count in (
+        ("IN (SELECT k FROM dim)", comb(16, 6) + comb(17, 6)),
+        ("NOT IN (SELECT k FROM dim)", 0),
+        ("NOT IN (SELECT k FROM dim WHERE k IS NOT NULL)", full_count - comb(16, 6) - comb(17, 6)),
+    ):
+        started = time.monotonic()
+        assert db.sql(f"SELECT count(*) FROM {relation} WHERE q.score {predicate}")["rows"] == [[str(count)]]
+        assert time.monotonic() - started < 5
+    empty_graph = f"(SELECT q.score FROM {relation} WHERE q.score<0) q"
+    assert db.sql(f"SELECT count(*),count(q.score),sum(d.k) FROM {empty_graph} FULL JOIN dim d ON q.score=d.k")[
+        "rows"
+    ] == [["5", "0", "149"]]
+    db.sql("DELETE FROM dim")
+    assert db.sql(f"SELECT count(*) FROM {relation} FULL JOIN dim d ON q.score=d.k")["rows"] == [[str(full_count)]]
+    for operator, expected in (("IN", 0), ("NOT IN", full_count)):
+        assert db.sql(f"SELECT count(*) FROM {relation} WHERE q.score {operator}(SELECT k FROM dim)")["rows"] == [
+            [str(expected)]
+        ]
+
+
+def test_materialized_graph_ctes_share_exact_weighted_replay(graph_db):
+    import time
+    from math import comb
+
+    db = graph_db
+    patterns = [f"(n{i}:D {{score:{i}}})" for i in range(18)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(18) for j in range(i + 1, 18)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(5)) + "-[r5 IS R]->(b IS D)"
+    source = f"SELECT q.s,q.e FROM GRAPH_TABLE(g MATCH {path} COLUMNS(a.score AS s,b.score AS e)) q"
+    count = comb(18, 7)
+    total = sum(i * comb(i, 6) for i in range(6, 18))
+    start_total = sum(i * comb(17 - i, 6) for i in range(12))
+    for directive in ("MATERIALIZED", "NOT MATERIALIZED"):
+        started = time.monotonic()
+        prefix = f"WITH paths AS {directive} ({source}) "
+        assert db.sql(prefix + "SELECT count(*),sum(s),sum(e) FROM paths")["rows"] == [
+            [str(count), str(start_total), str(total)]
+        ]
+        assert time.monotonic() - started < 5
+    # Automatic multi-reference capture and explicit capture both preserve
+    # independent reader state and the union of consumers' dependencies.
+    for directive in ("", "MATERIALIZED"):
+        started = time.monotonic()
+        prefix = f"WITH paths AS {directive} ({source}) "
+        result = db.sql(prefix + "SELECT sum(s) AS n FROM paths UNION ALL SELECT sum(e) AS n FROM paths")
+        assert result["rows"] == [[str(start_total)], [str(total)]]
+        assert time.monotonic() - started < 5
+    # A row consumer expands only what its own LIMIT demands.
+    assert len(db.sql(f"WITH paths AS MATERIALIZED ({source}) SELECT * FROM paths LIMIT 7")["rows"]) == 7
+
+    # A shared replay also serves ordinary consumers. Preserve ordering in
+    # captures whose aggregate-only proof would otherwise omit the sort.
+    ordered = (
+        "SELECT q.e FROM GRAPH_TABLE(g MATCH (a IS D)-[r IS R]->(b IS D) COLUMNS(b.score AS e)) q ORDER BY q.e DESC"
+    )
+    assert db.sql(f"WITH paths AS MATERIALIZED({ordered}) SELECT e FROM paths LIMIT 7")["rows"] == [["17"]] * 7

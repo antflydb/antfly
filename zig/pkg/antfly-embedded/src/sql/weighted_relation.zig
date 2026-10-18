@@ -28,6 +28,7 @@ pub const Plan = struct {
     pub const Terminal = union(enum) {
         scan,
         ordinary,
+        replay: struct { child: *Plan },
         window: struct { child: *Plan },
         union_all: struct { left: *Plan, right: *Plan },
         cross: struct { child: *Plan, singleton: *const binding.Node, graph_left: bool, factor_only: bool },
@@ -39,7 +40,7 @@ pub const Plan = struct {
     physical: []const catalog.AggregateWeight,
     width: usize,
 
-    pub fn init(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight) anyerror!?Plan {
+    pub fn init(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor) anyerror!?Plan {
         // Adapters may negotiate with a temporary request descriptor. The
         // operator tree retains it across pulls, so own both descriptors and
         // field vectors before returning to the caller.
@@ -49,9 +50,9 @@ pub const Plan = struct {
             for (request.fields, fields) |field, *name| name.* = try a.dupe(u8, field);
             out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
         }
-        return initDepth(a, root, owned, 0);
+        return initDepth(a, root, owned, cursors, 0);
     }
-    fn initDepth(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, depth: usize) anyerror!?Plan {
+    fn initDepth(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, depth: usize) anyerror!?Plan {
         if (depth >= 64 or requests.len == 0) return null;
         var node = root;
         var mapped = requests;
@@ -79,7 +80,7 @@ pub const Plan = struct {
                 for (query.binding.order_keys) |key| if (key.source == .column) try needed.put(a, key.source.column.path, {});
                 const input = try a.alloc(catalog.AggregateWeight, 1);
                 input[0] = .{ .fields = try names(a, needed), .multiplicity = .capped };
-                const nested = try child(a, query.source, input, depth + stages.items.len + 1);
+                const nested = try child(a, query.source, input, cursors, depth + stages.items.len + 1);
                 return .{ .source = node, .terminal = .{ .window = .{ .child = nested } }, .requests = requests, .stages = stages.items, .physical = &.{}, .width = width + node.columns.len + nested.width };
             }
             if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or
@@ -136,22 +137,32 @@ pub const Plan = struct {
         }
         const terminal: Terminal = switch (node.operation) {
             .scan => .scan,
+            .materialized_ref => |source| blk: {
+                // Capture one complete exact tuple for every reader, never a
+                // consumer-specific dependency partition or presence count.
+                const fields = try a.alloc([]const u8, source.columns.len);
+                for (source.columns, fields) |column, *field| field.* = column.internal;
+                const input = try a.alloc(catalog.AggregateWeight, 1);
+                input[0] = .{ .fields = fields, .multiplicity = .exact };
+                const nested = try child(a, source, input, cursors, depth + 1);
+                width += nested.width;
+                break :blk .{ .replay = .{ .child = nested } };
+            },
             .set => |set| blk: {
                 if (set.kind != .@"union" or !set.all) return null;
-                const left = try child(a, set.left, try positional(a, node, set.left, mapped), depth + stages.items.len + 1);
-                const right = try child(a, set.right, try positional(a, node, set.right, mapped), depth + stages.items.len + 1);
+                const left = try child(a, set.left, try positional(a, node, set.left, mapped), cursors, depth + stages.items.len + 1);
+                const right = try child(a, set.right, try positional(a, node, set.right, mapped), cursors, depth + stages.items.len + 1);
                 width += @max(left.width, right.width);
                 break :blk .{ .union_all = .{ .left = left, .right = right } };
             },
             .join => |join| blk: {
-                if (join.correlation or join.membership != null) return null;
+                if (join.correlation) return null;
                 if (join.condition) |program| if (!program.repeatable()) return null;
-                const graph_left = boundedRepeatable(join.right, 0) != null;
-                const graph = if (graph_left) join.left else if (boundedRepeatable(join.left, 0) != null) join.right else return null;
+                const graph_left = captureSafe(join.right, cursors, 0);
+                const graph = if (graph_left) join.left else if (captureSafe(join.left, cursors, 0)) join.right else return null;
                 const single = if (graph_left) join.right else join.left;
-                if (join.kind != .inner and join.kind != .cross and
-                    !(join.kind == .left and graph_left) and !(join.kind == .right and !graph_left)) return null;
-                var factor_only = join.condition == null and join.kind != .left and join.kind != .right;
+                if (join.membership != null and !graph_left) return null;
+                var factor_only = join.condition == null and join.membership == null and (join.kind == .inner or join.kind == .cross);
                 for (mapped) |request| for (request.fields) |field| if (columnIndex(single, field) != null) {
                     factor_only = false;
                 };
@@ -164,9 +175,13 @@ pub const Plan = struct {
                         const name = node.columns[ordinal].internal;
                         if (columnIndex(graph, name) != null) try fields.put(a, name, {});
                     };
+                    if (join.membership != null) for (join.left_keys) |program| for (program.required_columns) |ordinal| {
+                        if (ordinal >= graph.columns.len) return error.InvalidSqlBackendResponse;
+                        try fields.put(a, graph.columns[ordinal].internal, {});
+                    };
                     out.* = .{ .fields = try names(a, fields), .multiplicity = request.multiplicity };
                 }
-                const nested = try child(a, graph, input, depth + stages.items.len + 1);
+                const nested = try child(a, graph, input, cursors, depth + stages.items.len + 1);
                 width += nested.width + single.columns.len;
                 break :blk .{ .cross = .{ .child = nested, .singleton = single, .graph_left = graph_left, .factor_only = factor_only } };
             },
@@ -185,9 +200,9 @@ pub const Plan = struct {
         return .{ .source = node, .requests = requests, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
     }
 
-    fn child(a: A, node: *const binding.Node, requests: []const catalog.AggregateWeight, depth: usize) !*Plan {
+    fn child(a: A, node: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, depth: usize) !*Plan {
         const result = try a.create(Plan);
-        result.* = (try initDepth(a, node, requests, depth)) orelse .{ .source = node, .terminal = .ordinary, .requests = requests, .stages = &.{}, .physical = &.{}, .width = node.columns.len };
+        result.* = (try initDepth(a, node, requests, cursors, depth)) orelse .{ .source = node, .terminal = .ordinary, .requests = requests, .stages = &.{}, .physical = &.{}, .width = node.columns.len };
         return result;
     }
     fn positional(a: A, parent: *const binding.Node, nested: *const binding.Node, requests: []const catalog.AggregateWeight) ![]const catalog.AggregateWeight {
@@ -199,34 +214,58 @@ pub const Plan = struct {
         }
         return result;
     }
-    /// Finite, repeatable side relations can be captured once under the
-    /// statement memory budget. Never consume a scan to guess cardinality.
-    fn boundedRepeatable(node: *const binding.Node, depth: usize) ?usize {
-        if (depth >= 64) return null;
-        const bound: usize = switch (node.operation) {
-            .singleton => 1,
-            .literal_rows => |rows| rows.len,
+    /// Ordinary pinned scans may be captured into a bounded, spillable build.
+    /// Capability inspection never advances a graph producer. Repeated or
+    /// correlated evaluation and volatile expressions remain barriers.
+    fn captureSafe(node: *const binding.Node, cursors: []const catalog.Cursor, depth: usize) bool {
+        if (depth >= 64) return false;
+        return switch (node.operation) {
+            .singleton, .literal_rows => true,
+            .scan => |scan| cursors[scan.index].enable_weights == null and cursors[scan.index].enable_aggregate_weights == null,
+            .materialized_ref => |source| captureSafe(source, cursors, depth + 1),
             .query => |q| blk: {
-                if (q.binding.aggregate != null or q.binding.window != null or q.constant_refs.len != 0) return null;
-                if (q.binding.scalars.predicate) |p| if (!p.repeatable()) return null;
-                for (q.binding.scalars.projections) |p| if (p) |program| if (!program.repeatable()) return null;
-                for (q.binding.scalars.orders) |p| if (p) |program| if (!program.repeatable()) return null;
-                break :blk boundedRepeatable(q.source, depth + 1) orelse return null;
+                if (q.constant_refs.len != 0) break :blk false;
+                if (q.binding.scalars.predicate) |p| if (!p.repeatable()) break :blk false;
+                for (q.binding.scalars.projections) |p| if (p) |program| if (!program.repeatable()) break :blk false;
+                for (q.binding.scalars.orders) |p| if (p) |program| if (!program.repeatable()) break :blk false;
+                if (q.binding.window != null) break :blk false;
+                if (q.binding.aggregate) |aggregate| {
+                    if (aggregate.constant_count != 0 or !repeatableScalars(aggregate.input)) break :blk false;
+                    for (aggregate.specs) |spec| if (spec.kind == .pattern_set) break :blk false;
+                    for (aggregate.outputs) |program| if (!program.repeatable()) break :blk false;
+                    for (aggregate.orders) |program| if (!program.repeatable()) break :blk false;
+                    if (aggregate.having) |program| if (!program.repeatable()) break :blk false;
+                    for (aggregate.ordered) |ordered| if (ordered.direct) |program| if (!program.repeatable()) break :blk false;
+                }
+                break :blk captureSafe(q.source, cursors, depth + 1);
             },
-            .set => |set| blk: {
-                if (set.kind != .@"union" or !set.all) return null;
-                const left = boundedRepeatable(set.left, depth + 1) orelse return null;
-                const right = boundedRepeatable(set.right, depth + 1) orelse return null;
-                break :blk std.math.add(usize, left, right) catch return null;
-            },
-            .values => |arms| blk: {
-                var total: usize = 0;
-                for (arms) |arm| total = std.math.add(usize, total, boundedRepeatable(arm, depth + 1) orelse return null) catch return null;
-                break :blk total;
-            },
-            else => return null,
+            .set => |set| captureSafe(set.left, cursors, depth + 1) and captureSafe(set.right, cursors, depth + 1),
+            .values => |arms| for (arms) |arm| {
+                if (!captureSafe(arm, cursors, depth + 1)) break false;
+            } else true,
+            else => false,
         };
-        return if (bound <= 4096) bound else null;
+    }
+    fn repeatableScalars(bound: @import("bound_scalars.zig").Bound) bool {
+        if (bound.predicate) |program| if (!program.repeatable()) return false;
+        for (bound.projections) |optional| if (optional) |program| if (!program.repeatable()) return false;
+        for (bound.orders) |optional| if (optional) |program| if (!program.repeatable()) return false;
+        return true;
+    }
+
+    /// Captures can feed ordinary row consumers, which may observe a source's
+    /// ordering. Aggregate-only projection proofs may discard that ordering;
+    /// shared replay must use ordinary capture when that proof would do so.
+    pub fn replayOrderSafe(node: *const binding.Node, depth: usize) bool {
+        if (depth >= 64) return false;
+        return switch (node.operation) {
+            .query => |q| (q.binding.order_keys.len == 0 or q.statement.limit != null) and replayOrderSafe(q.source, depth + 1),
+            .join => |j| replayOrderSafe(j.left, depth + 1) and replayOrderSafe(j.right, depth + 1),
+            .set => |set| replayOrderSafe(set.left, depth + 1) and replayOrderSafe(set.right, depth + 1),
+            .materialized_ref => true, // Its own shared capture enforces this boundary.
+            .scan, .singleton, .literal_rows => true,
+            else => false,
+        };
     }
     fn totalOrderProgram(program: scalar.Program) bool {
         const root = program.instructions[program.root];
