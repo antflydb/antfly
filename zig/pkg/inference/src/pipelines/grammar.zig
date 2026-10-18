@@ -1674,19 +1674,21 @@ const JsonSchemaGrammarBuilder = struct {
         const minimum = schemaIntegerBound(schema_obj, "minimum");
         const maximum = schemaIntegerBound(schema_obj, "maximum");
         if (minimum != null and maximum != null and maximum.? >= minimum.?) {
-            const width = maximum.? - minimum.? + 1;
+            const width = @as(i128, maximum.?) - @as(i128, minimum.?) + 1;
             if (width <= 256) {
                 const rule_name = try self.nextRuleName("schema_integer");
                 try self.out.appendSlice(self.allocator, rule_name);
                 try self.out.appendSlice(self.allocator, " ::= ");
                 var value = minimum.?;
                 var first = true;
-                while (value <= maximum.?) : (value += 1) {
+                while (true) {
                     if (!first) try self.out.appendSlice(self.allocator, " | ");
                     first = false;
                     var buf: [32]u8 = undefined;
                     const text = try std.fmt.bufPrint(&buf, "{d}", .{value});
                     try self.appendGrammarLiteral(text);
+                    if (value == maximum.?) break;
+                    value += 1;
                 }
                 try self.out.append(self.allocator, '\n');
                 return rule_name;
@@ -1792,12 +1794,81 @@ const JsonSchemaGrammarBuilder = struct {
             }
         }
 
-        const additional = schema_obj.get("additionalProperties");
-        const allow_precise = additional == null or (additional.? == .bool and !additional.?.bool);
-        if (allow_precise and properties.items.len <= 4) {
-            return self.emitPreciseObjectRule(properties.items);
+        // A generator may choose a subset of the schema's language, but it
+        // must never drop the declared properties' constraints. Enumerating
+        // permutations is useful for small objects; larger schemas use a
+        // flat sequence in schema order instead of factorial expansion.
+        for (required_names.items) |required| {
+            var found = false;
+            for (properties.items) |property| {
+                if (std.mem.eql(u8, property.key, required)) found = true;
+            }
+            if (!found) return error.UnsupportedSchema;
         }
-        return "json_object_generic";
+        if (properties.items.len <= 4) return self.emitPreciseObjectRule(properties.items);
+        return self.emitOrderedObjectRule(properties.items);
+    }
+
+    fn emitOrderedObjectRule(self: *JsonSchemaGrammarBuilder, properties: []const PropertySpec) ![]const u8 {
+        // Anchor on the first required field. Earlier optional fields own a
+        // trailing comma; later fields own a leading comma. Individual member
+        // rules return immediately, keeping the grammar stack flat for wide
+        // schemas rather than recursing once per property.
+        const members = try self.allocator.alloc([2][]const u8, properties.len);
+        defer self.allocator.free(members);
+        var anchor: ?usize = null;
+        for (properties, 0..) |property, i| {
+            if (anchor == null and property.required) anchor = i;
+            members[i] = .{ try self.nextRuleName("member_before"), try self.nextRuleName("member_after") };
+            try self.out.appendSlice(self.allocator, members[i][0]);
+            try self.out.appendSlice(self.allocator, " ::= ");
+            try self.appendOrderedProperty(property);
+            try self.out.appendSlice(self.allocator, " ws \",\" ws\n");
+            try self.out.appendSlice(self.allocator, members[i][1]);
+            try self.out.appendSlice(self.allocator, " ::= ws \",\" ws ");
+            try self.appendOrderedProperty(property);
+            try self.out.append(self.allocator, '\n');
+        }
+        const rule = try self.nextRuleName("schema_object");
+        try self.out.appendSlice(self.allocator, rule);
+        try self.out.appendSlice(self.allocator, " ::= ");
+        if (anchor) |required| {
+            try self.out.appendSlice(self.allocator, "\"{\" ws ");
+            for (members[0..required]) |member| {
+                try self.out.appendSlice(self.allocator, member[0]);
+                try self.out.appendSlice(self.allocator, "? ");
+            }
+            try self.appendOrderedProperty(properties[required]);
+            try self.appendOrderedPropertyTail(properties[required + 1 ..], members[required + 1 ..]);
+            try self.out.appendSlice(self.allocator, " ws \"}\"");
+        } else {
+            // All fields optional: select the first present field, then append
+            // optional comma-prefixed fields. Bound the quadratic expansion.
+            if (properties.len > 64) return error.UnsupportedSchema;
+            try self.out.appendSlice(self.allocator, "\"{\" ws \"}\"");
+            for (properties, 0..) |property, i| {
+                try self.out.appendSlice(self.allocator, " | \"{\" ws ");
+                try self.appendOrderedProperty(property);
+                try self.appendOrderedPropertyTail(properties[i + 1 ..], members[i + 1 ..]);
+                try self.out.appendSlice(self.allocator, " ws \"}\"");
+            }
+        }
+        try self.out.append(self.allocator, '\n');
+        return rule;
+    }
+
+    fn appendOrderedProperty(self: *JsonSchemaGrammarBuilder, property: PropertySpec) !void {
+        try self.appendJsonStringToken(property.key);
+        try self.out.appendSlice(self.allocator, " ws \":\" ws ");
+        try self.out.appendSlice(self.allocator, property.rule_name);
+    }
+
+    fn appendOrderedPropertyTail(self: *JsonSchemaGrammarBuilder, properties: []const PropertySpec, members: []const [2][]const u8) !void {
+        for (properties, members) |property, member| {
+            try self.out.append(self.allocator, ' ');
+            try self.out.appendSlice(self.allocator, member[1]);
+            if (!property.required) try self.out.append(self.allocator, '?');
+        }
     }
 
     fn emitPreciseObjectRule(self: *JsonSchemaGrammarBuilder, properties: []const PropertySpec) anyerror![]const u8 {
@@ -2039,6 +2110,69 @@ test "json schema grammar: bounded array and integer range" {
     var grammar = try GbnfGrammar.parse(allocator, source);
     defer grammar.deinit();
     grammar.advance("[1,2]");
+    try std.testing.expect(grammar.isComplete());
+}
+
+test "json schema grammar: large objects retain required fields and enum constraints" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"type":"object","properties":{"a":{"enum":["yes"]},"b":{"type":"boolean"},"c":{"type":"string"},"d":{"type":"string"},"e":{"type":"string"}},"required":["a","e"],"additionalProperties":false}
+    , .{});
+    defer parsed.deinit();
+    const source = try buildJsonSchemaGrammar(a, parsed.value);
+    defer a.free(source);
+    for ([_][]const u8{ "{\"a\":\"yes\",\"e\":\"ok\"}", "{\"a\":\"yes\",\"b\":true,\"c\":\"c\",\"d\":\"d\",\"e\":\"e\"}" }) |valid| {
+        var grammar = try GbnfGrammar.parse(a, source);
+        defer grammar.deinit();
+        grammar.advance(valid);
+        try std.testing.expect(grammar.isComplete());
+    }
+    for ([_][]const u8{ "{}", "{\"a\":\"no\",\"e\":\"ok\"}", "{\"a\":\"yes\"}", "{,\"a\":\"yes\",\"e\":\"ok\"}", "{\"a\":\"yes\",\"e\":\"ok\",}" }) |invalid| {
+        var grammar = try GbnfGrammar.parse(a, source);
+        defer grammar.deinit();
+        grammar.advance(invalid);
+        try std.testing.expect(!grammar.isComplete());
+    }
+}
+
+test "json schema grammar: optional fields before the anchor and entirely optional objects" {
+    const a = std.testing.allocator;
+    for (0..2) |all_optional| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"type":"object","properties":{"a":{"type":"boolean"},"b":{"type":"boolean"},"c":{"type":"boolean"},"d":{"type":"boolean"},"e":{"type":"boolean"}},"required":["e"],"additionalProperties":false}
+        , .{});
+        defer parsed.deinit();
+        if (all_optional == 1) _ = parsed.value.object.swapRemove("required");
+        const source = try buildJsonSchemaGrammar(a, parsed.value);
+        defer a.free(source);
+        for ([_][]const u8{ "{\"e\":true}", "{\"a\":false,\"e\":true}", "{\"b\":true,\"d\":false,\"e\":true}" }) |valid| {
+            var grammar = try GbnfGrammar.parse(a, source);
+            defer grammar.deinit();
+            grammar.advance(valid);
+            try std.testing.expect(grammar.isComplete());
+        }
+        var empty = try GbnfGrammar.parse(a, source);
+        defer empty.deinit();
+        empty.advance("{}");
+        try std.testing.expectEqual(all_optional == 1, empty.isComplete());
+        var trailing = try GbnfGrammar.parse(a, source);
+        defer trailing.deinit();
+        trailing.advance("{\"e\":true,}");
+        try std.testing.expect(!trailing.isComplete());
+    }
+}
+
+test "json schema grammar: bounded integers include i64 maximum without overflow" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"type":"integer","minimum":9223372036854775806,"maximum":9223372036854775807}
+    , .{});
+    defer parsed.deinit();
+    const source = try buildJsonSchemaGrammar(a, parsed.value);
+    defer a.free(source);
+    var grammar = try GbnfGrammar.parse(a, source);
+    defer grammar.deinit();
+    grammar.advance("9223372036854775807");
     try std.testing.expect(grammar.isComplete());
 }
 
