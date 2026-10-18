@@ -1993,6 +1993,84 @@ def test_sibling_branch_counts_do_not_enumerate_assignments(graph_db):
     assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
 
 
+def test_weighted_chains_goals_and_promoted_producers(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    layers = 68
+    patterns = ["(s:D {id:'start',score:0})"] + [
+        f"(v{i}_{j}:D {{score:{i + 1}}})" for i in range(layers) for j in range(2)
+    ]
+    patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+    patterns += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    base = "MATCH (s:D {id:'start'})-[:R*66..66]->(b:D) "
+    for tail, expected in (
+        ("RETURN avg(b.score),sum(0),count(b.missing)", [66.0, "0", "0"]),
+        ("RETURN sum(1e-30)", [pytest.approx(2**66 * 1e-30, rel=1e-12, abs=0)]),
+        ("WITH b RETURN avg(b.score)", [66.0]),
+        ("CALL { WITH b RETURN b.score AS score } RETURN avg(score)", [66.0]),
+    ):
+        result = db.cypher_json(
+            "g", {"query": base + tail, "limits": {"intermediate_states": 10000, "explored_edges": 1000}}
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == expected, tail
+    for tail in ("RETURN count(*)", "RETURN sum(1)"):
+        with pytest.raises(af.GraphError, match="CypherNumericOverflow"):
+            db.cypher_json("g", {"query": base + tail})
+
+    # Each stage has only two live endpoint bindings. Equal bags must merge
+    # without discarding their multiplicities, including at clause boundaries
+    # which reset relationship uniqueness.
+    for weighted in (False, True):
+        query = "MATCH (s:D {id:'start'})-[:R*4..4]->(b:D) "
+        if weighted:
+            query += "WITH b LIMIT 5000000 "
+        for _ in range(9):
+            query += "WITH b MATCH (b)-[:R*4..4]->(c:D) WITH c AS b "
+        result = db.cypher_json(
+            "g",
+            {
+                "query": query + "RETURN count(*),min(b.score),count(DISTINCT b)",
+                "limits": {"intermediate_states": 10000, "explored_edges": 1000},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == [str(2**40), "40", "2"]
+
+    for values, expression in (("[1,1.0]", "x/2"), ("[{k:[1]},{k:[1.0]}]", "x.k[0]/2")):
+        query = (
+            f"UNWIND {values} AS x MATCH (s:D {{id:'start'}}) WITH x "
+            f"MATCH (s:D {{id:'start'}}) RETURN count(DISTINCT {expression})"
+        )
+        assert db.cypher_json("g", {"query": query})["rows"] == [[{"type": "integer", "value": "2"}]]
+    ordered = "UNWIND [1,2,1] AS k MATCH (s:D {id:'start'}) WITH k MATCH (s:D {id:'start'}) "
+    result = db.cypher_json("g", {"query": ordered + "RETURN collect(k)"})
+    assert [cell["value"] for cell in result["rows"][0][0]["value"]] == ["1", "2", "1"]
+    bounded = ordered.replace("WITH k MATCH", "WITH k SKIP 1 LIMIT 1 MATCH")
+    assert db.cypher_json("g", {"query": bounded + "RETURN count(*),min(k)"})["rows"] == [
+        [{"type": "integer", "value": "1"}, {"type": "integer", "value": "2"}]
+    ]
+
+    short = base.replace("66..66", "64..64")
+    for query, expected in (
+        ("CALL { " + short + "RETURN b } RETURN b.score LIMIT 1", [[{"type": "integer", "value": "64"}]]),
+        ("CALL { " + short + "RETURN b LIMIT 1 } RETURN b.score LIMIT 1", [[{"type": "integer", "value": "64"}]]),
+        ("RETURN EXISTS { CALL { " + short + "RETURN b } RETURN b }", [[{"type": "boolean", "value": True}]]),
+        (
+            "CALL { " + short + "RETURN b SKIP 2 LIMIT 3 } RETURN b.score SKIP 1 LIMIT 1",
+            [[{"type": "integer", "value": "64"}]],
+        ),
+    ):
+        result = db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 10000, "explored_edges": 150}})
+        assert result["rows"] == expected
+    # A filter after CALL cannot use an input row goal: earlier child rows
+    # may all be rejected. Child ordering likewise remains a full-input barrier.
+    filtered = "CALL { " + short + "RETURN b } WITH b WHERE b.score<0 RETURN b LIMIT 1"
+    assert db.cypher_json("g", {"query": filtered})["rows"] == []
+    sorted_child = "CALL { " + short + "RETURN b ORDER BY b.score LIMIT 3 } RETURN b.score LIMIT 1"
+    with pytest.raises(af.GraphError, match="CypherEdgeBudgetExceeded"):
+        db.cypher_json("g", {"query": sorted_child, "limits": {"explored_edges": 150}})
+
+
 def test_intermediate_windows_preserve_graph_bags(graph_db):
     import time
 

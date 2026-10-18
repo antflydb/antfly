@@ -1526,6 +1526,18 @@ Nested calls isolate projection metadata, aggregate demand and profiling buffers
 variable conflicts and recursion limits follow ordinary subquery semantics.
 Pure CALL queries enter this pipeline from a weighted unit input, so an initial
 CALL does not need an earlier MATCH or finite window to retain child bags.
+Pure MATCH chains separated by WITH or UNWIND enter weighted execution directly.
+Before another MATCH, equivalent complete bindings can be consolidated when a
+downstream COUNT/MIN/MAX reduction makes their interleaving unobservable. Counts
+are combined without changing bag multiplicity; representation-sensitive binding
+keys keep integer/float distinctions, including inside containers. Pagination,
+ordering, correlated calls and order-sensitive reductions block this regrouping.
+Weighted MATCH fuses row-local stages into their actual finite window or
+reduction, carrying parent multiplicities through the fold. Small unordered
+windows retain demand-driven traversal. Returning CALL bodies inherit proven
+row goals through unfiltered projections, capped by their own existing limits;
+child SKIP and aggregate/sort barriers remain inside the child scope. An outer
+filter, DISTINCT, sort, aggregation or expanding stage prevents this propagation.
 Pattern dependency analysis follows query WITH scopes and lexical shadowing;
 only captured outer bindings stay live. Unobserved path aliases therefore do
 not force route production merely because a later expression contains a pattern.
@@ -1544,14 +1556,17 @@ weights. Demand analysis visits aggregate calls inside scalar expressions:
 MIN/MAX and DISTINCT aggregates require only presence, COUNT needs capped counts,
 and non-DISTINCT SUM/AVG/COLLECT need exact multiplicity. Proof-only constant
 folding accepts bound parameters and constant arithmetic in finite row goals
-without moving invalid-goal errors ahead of their projection. Native path counts
+without moving invalid-goal errors ahead of their projection. Bounded path counts
 saturate at maxInt(u64), strictly above every legal signed SKIP+LIMIT sum, so even
 large-offset windows retain sufficient prefix counts. Unordered finite windows
 request prefix counts when their proven row goal exceeds remaining route-work
 capacity; small goals keep demand-driven first-route production. Exact consumers
-reject that producer sentinel; finite consumers clip it to their requested window.
-Native continuation products remain inline u64 when possible and promote to
-immutable, arena-owned arbitrary-precision counts on overflow. Unbounded
+in the SQL cursor protocol reject that producer sentinel; finite consumers clip
+it to their requested window. Native exact producers use adaptive counts for
+frontier additions, branch factors and products, so exceeding u64 does not force
+route enumeration. Counts remain inline u64 when possible and promote to
+immutable, arena-owned arbitrary-precision counts on overflow. Retained windows
+own any promoted producer counts after the producer's scratch arena ends. Unbounded
 projections retain those counts and SKIP subtracts exactly; finite windows clip
 before any row expansion. COUNT and integer SUM check their result ranges,
 including zero sums over promoted counts. Floating SUM uses a wide intermediate,

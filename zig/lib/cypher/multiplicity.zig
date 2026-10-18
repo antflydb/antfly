@@ -31,8 +31,30 @@ pub const Count = struct {
     pub fn exact(self: Count) ?u64 {
         return if (self.big == null) self.small else null;
     }
+    pub fn clone(self: Count, a: std.mem.Allocator) !Count {
+        const big = self.big orelse return self;
+        const owned = try a.create(Big);
+        owned.* = try big.cloneWithDifferentAllocator(a);
+        return .{ .small = self.small, .big = owned };
+    }
     pub fn isOne(self: Count) bool {
         return self.big == null and self.small == 1;
+    }
+    pub fn add(self: Count, a: std.mem.Allocator, other: Count) !Count {
+        if (self.exact()) |left| if (other.exact()) |right| {
+            if (std.math.add(u64, left, right)) |sum| return init(sum) else |_| {}
+        };
+        if (self.cap(1) == 0) return other;
+        if (other.cap(1) == 0) return self;
+        var left = if (self.big) |p| p.* else try Big.initSet(a, self.small);
+        defer if (self.big == null) left.deinit();
+        var right = if (other.big) |p| p.* else try Big.initSet(a, other.small);
+        defer if (other.big == null) right.deinit();
+        const result = try a.create(Big);
+        result.* = try Big.initSet(a, 0);
+        errdefer result.deinit();
+        try result.add(&left, &right);
+        return .{ .small = std.math.maxInt(u64), .big = result };
     }
     pub fn multiply(self: Count, a: std.mem.Allocator, other: Count) !Count {
         if ((self.big == null and self.small == 0) or (other.big == null and other.small == 0)) return init(0);
@@ -115,6 +137,9 @@ test "promoted counts preserve products, windows and normalized ratios" {
     const a = arena.allocator();
     const large = try Count.init(@as(u64, 1) << 63).multiply(a, Count.init(2));
     try std.testing.expect(large.exact() == null);
+    const added = try Count.init(@as(u64, 1) << 63).add(a, Count.init(@as(u64, 1) << 63));
+    try std.testing.expectEqual(large.scaled().fraction, added.scaled().fraction);
+    try std.testing.expectEqual(large.scaled().exponent, added.scaled().exponent);
     const clipped = try large.subtract(a, std.math.maxInt(i64));
     try std.testing.expectEqual(@as(u64, 1) << 63 | 1, clipped.exact().?);
     var enormous = Count.one;
@@ -130,8 +155,11 @@ test "promoted count allocation failures leave arena ownership intact" {
             defer arena.deinit();
             const a = arena.allocator();
             const large = try Count.init(std.math.maxInt(u64)).multiply(a, Count.init(2));
-            const reduced = try large.subtract(a, std.math.maxInt(u64));
-            try std.testing.expectEqual(std.math.maxInt(u64), reduced.exact().?);
+            const owned = try large.clone(a);
+            const sum = try owned.add(a, Count.init(1));
+            const reduced = try sum.subtract(a, std.math.maxInt(u64));
+            const normalized = try reduced.subtract(a, 1);
+            try std.testing.expectEqual(std.math.maxInt(u64), normalized.exact().?);
             try std.testing.expectEqual(@as(u64, 0), (try large.multiply(a, Count.init(0))).exact().?);
         }
     };

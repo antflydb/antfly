@@ -27,6 +27,10 @@ pub const Work = struct {
     a: A,
     ptr: *anyopaque,
     charge: *const fn (*anyopaque, usize) anyerror!void,
+    // Execution bindings must preserve representation: 1 and 1.0 compare equal
+    // in Cypher but behave differently in integer division and nested values.
+    // This mode has its own Work/cache and never changes GROUP BY semantics.
+    binding_identity: bool = false,
     cache: std.AutoHashMapUnmanaged(Key, Info) = .empty,
     fields: std.AutoHashMapUnmanaged(Key, std.StringHashMapUnmanaged(usize)) = .empty,
 
@@ -95,7 +99,7 @@ pub const Work = struct {
             if (depth + cached.depth > 64) return error.CypherValueDepthExceeded;
             return cached;
         };
-        var result: Info = .{ .hash = v.Value.rank(value) };
+        var result: Info = .{ .hash = if (self.binding_identity) @backingInt(std.meta.activeTag(value)) else v.Value.rank(value) };
         switch (value) {
             .null => result.unknown = true,
             .boolean => |item| result.hash = mix(result.hash, @intFromBool(item)),
@@ -104,7 +108,9 @@ pub const Work = struct {
                 // Canonicalize exactly integral, in-range floats to INTEGER.
                 // Casting every integer to f64 would collapse 512+ distinct
                 // values near i64's boundary into each bucket.
-                if (number >= -9223372036854775808.0 and number < 9223372036854775808.0 and @trunc(number) == number) {
+                if (self.binding_identity) {
+                    result.hash = mix(result.hash, @bitCast(number));
+                } else if (number >= -9223372036854775808.0 and number < 9223372036854775808.0 and @trunc(number) == number) {
                     const integer: i64 = @intFromFloat(number);
                     result.hash = mix(result.hash, @bitCast(integer));
                 } else result.hash = mix(mix(result.hash, 1), @bitCast(number));
@@ -224,6 +230,10 @@ pub const Work = struct {
     }
     fn equalInner(self: *Work, a: v.Value, b: v.Value, nulls_equal: bool) anyerror!?bool {
         try self.charge(self.ptr, 1);
+        if (self.binding_identity) {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            if (a == .number) return @as(u64, @bitCast(a.number)) == @as(u64, @bitCast(b.number));
+        }
         if (a == .null or b == .null) return if (nulls_equal) a == .null and b == .null else null;
         if (a == .map and b == .map) {
             if (a.map.len != b.map.len) return false;
@@ -293,6 +303,24 @@ pub const Index = struct {
         try self.heads.put(a, hash, position);
     }
 };
+
+test "binding identity preserves nested numeric representations independently of Cypher equality" {
+    const Noop = struct {
+        fn charge(_: *anyopaque, _: usize) !void {}
+    };
+    var state: u8 = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const integer: v.Value = .{ .map = &.{.{ .name = "x", .value = .{ .list = &.{.{ .integer = 1 }} } }} };
+    const number: v.Value = .{ .map = &.{.{ .name = "x", .value = .{ .list = &.{.{ .number = 1 }} } }} };
+    var semantic: Work = .{ .a = arena.allocator(), .ptr = &state, .charge = Noop.charge };
+    var bindings: Work = .{ .a = arena.allocator(), .ptr = &state, .charge = Noop.charge, .binding_identity = true };
+    try std.testing.expect(try semantic.eql(integer, number));
+    try std.testing.expect(!try bindings.eql(integer, number));
+    try std.testing.expect((try bindings.info(integer)).hash != (try bindings.info(number)).hash);
+    try std.testing.expect(try bindings.eql(integer, try integer.clone(arena.allocator())));
+    try std.testing.expect(!try bindings.eql(.{ .number = -0.0 }, .{ .number = 0.0 }));
+}
 
 test "cached comparisons and hash collision checks still honor cancellation" {
     const Counter = struct {

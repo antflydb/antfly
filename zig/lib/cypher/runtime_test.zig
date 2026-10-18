@@ -1649,7 +1649,7 @@ test "weighted endpoint reductions agree with exact cyclic and acyclic route bag
     };
 }
 
-test "saturated path counts never become approximate SUM or AVG weights" {
+test "promoted path counts preserve exact SUM and normalized AVG weights" {
     for ([_][]const u8{ "sum(1e-30)", "avg(1e-30)" }) |reduction| {
         const text = try std.fmt.allocPrint(std.testing.allocator, "MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN {s}", .{reduction});
         defer std.testing.allocator.free(text);
@@ -1657,7 +1657,18 @@ test "saturated path counts never become approximate SUM or AVG weights" {
         var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
         defer compiled.deinit();
         var fixture: Fixture = .{};
-        try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 20000 }));
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 20000 });
+        defer result.deinit();
+        // Independent adjacency-matrix oracle: three undirected parallel a/b
+        // edges and one b/c edge, starting once from each document.
+        var counts = [_]u128{ 1, 1, 1 };
+        for (0..63) |_| {
+            const next = [_]u128{ counts[1] * 3, counts[0] * 3 + counts[2], counts[1] };
+            counts = next;
+        }
+        const total: f128 = @floatFromInt(counts[0] + counts[1] + counts[2]);
+        const expected: f64 = if (std.mem.eql(u8, reduction, "sum(1e-30)")) @floatCast(total * 1e-30) else 1e-30;
+        try std.testing.expectApproxEqRel(expected, result.rows[0][0].number, 1e-14);
     }
     try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN min(1),max(1),count(DISTINCT b)", "[[1,1,3]]");
     try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN size(collect(DISTINCT b.rank))", "[[3]]");
@@ -2060,6 +2071,7 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "WITH b ORDER BY b.rank LIMIT 3 MATCH (b)<-[:CITES*0..3]-(d:Document) RETURN min(d.rank)+max(d.rank),sum(DISTINCT d.rank)",
         "WITH b ORDER BY b.rank RETURN min(b.rank)+max(b.rank)",
         "WITH b ORDER BY b.rank RETURN count(DISTINCT b)+1",
+        "WITH b MATCH (b)-[:CITES*0..2]->(d:Document) WITH d AS b MATCH (b)-[:CITES*0..2]->(e:Document) RETURN count(*),min(e.rank),count(DISTINCT e)",
         "RETURN sum(size([(b)-[:CITES*0..2]->(d:Document) | d.rank]))",
         "RETURN sum(size([p=(b)-[:CITES*0..2]->(d:Document) | length(p)]))",
         "CALL { WITH b MATCH (b)-[:CITES]->(d:Document) RETURN d } RETURN count(*),sum(d.rank)",
