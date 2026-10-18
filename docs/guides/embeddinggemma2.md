@@ -1257,10 +1257,14 @@ shape/flags entry compares the fused F32 matrix route with staged MPS using
 completed GPU times, three warmups and five timed iterations. Fusion requires a
 5% win. Bounds values reuse the same geometry decision; no request tensor is
 retained. Optional tuning scratch is admitted separately and capped at 32 MiB.
-Short clips can therefore keep MPS while longer clips use fusion.
+MPS remains the default for unfamiliar shapes. Qualification requires three
+separate audio requests, admits at most one probe per request and eight per
+provider lifetime, and stops issuing probe commands after an 8 ms time budget
+or cancellation. One already submitted GPU command must still complete.
+The 32-entry decision cache cannot reset the provider-wide probe allowance.
 
-Private audio scratch can survive command frames under a separately admitted
-128 MiB model reservation. Producer completion fences protect reuse, pressure
+Private audio scratch can survive command frames in an optional cache with a
+128 MiB ceiling. Page-rounded buffer allocations are admitted individually. Producer completion fences protect reuse, pressure
 reclamation returns the reservation, and cancellation does not publish scratch.
 Batch feature preparation submits one frame for the cohort. Context-parallel
 attention retains the established dimension-reduction order and keeps narrow
@@ -1309,3 +1313,39 @@ similarity is 0.999999997 (maximum absolute error 0.000008732); forced fusion is
 parallel attention and retained-buffer hits; forced qualification records 398
 fused projections. These checks preserve the tested PyTorch F32 vectors and do
 not establish broader retrieval quality or full-pipeline speed parity.
+
+Metal audio retention charges page-rounded buffer allocations when they enter
+retained storage, rather than reserving the entire ceiling per model. Borrowing
+and eviction return their charges; releases reconcile at safe residency-lock
+boundaries. Retention declines on admission or lock contention, preserving eager
+execution. Completion fences, cancellation cleanup, and model pressure reclamation
+remain mandatory.
+
+Nearby Metal audio lengths can share subsampling convolutions with at most
+12.5% geometry padding. Device-only NCHW padding zeros artificial rows after the
+first normalization, preserving the shorter clip's second-convolution boundary.
+Compaction uses the padded batch stride and returns each clip's original rows
+and mask. Existing exact-length CUDA batching is preserved.
+
+A bounded Metal host instruction schedule binds current request inputs and
+immutable model entries by name. It stores no request tensors or weight pins;
+last-use tracking releases replay intermediates, and every node checks the
+current request control. Schedule metadata uses host-tier admission after recurrence. Four geometry
+entries preserve hot plans during shape churn and yield to pressure.
+Unsupported captures use eager execution; replay can decline when host encoding
+is slower. This is host schedule reuse: GPU commands are still encoded on each
+execution. Audio cohorts retain their existing pipelined frame groups. Transposed depthwise
+coefficients use the model preparation cache across weight-source paths.
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
+
+The optional `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN=1` ordered-media oracle
+run repeats singleton audio embeddings, checks each vector against the pinned
+checkpoint oracle, and rejects unsupported schedule capture. Route counters
+must demonstrate replay before treating the run as replay qualification.
+
+An M4 Max Debug qualification run recorded 492 instructions, 216 immutable
+bindings and seven actual replays, with all repeated audio vectors passing the
+pretrained oracle. The schedule occupied 818,240 host bytes. Observed host
+encoding was 6.516 ms for the warm eager sample and 5.176 ms median for replay;
+completed replay embeddings were 30.9–33.9 ms. This is an illustrative
+qualification run, not a paired full-pipeline throughput or PyTorch comparison.

@@ -654,8 +654,9 @@ staged MPS, excludes three warmups, and requires a 5% win; denied or unsupported
 qualification preserves staged execution. Cold tuning uses separately admitted
 scratch of at most 32 MiB and never consumes an unsubmitted request activation.
 
-Audio execution can retain private Metal scratch across frames under an optional
-128 MiB model-tier reservation, with 128 bounded buffer descriptors. Each retired
+Audio execution can retain private Metal scratch across frames in an optional
+cache with 128 buffer descriptors and a 128 MiB ceiling. Page-rounded buffer
+allocations are admitted individually. Each retired
 buffer retains its producer command buffer; reuse and eviction require completion.
 Cancellation publishes no storage, pressure reclamation drains the cache, and
 model teardown returns the reservation. In-frame reuse remains the first choice.
@@ -674,3 +675,27 @@ fused-linear, norm/clamp, parallel-attention and retained-storage route counts.
 F32 device-weight RMS normalization also shares this SIMD4 row reduction when
 no input bounds are requested, preserving the reference fallback for other
 layouts and arithmetic policies.
+
+Metal audio retention charges page-rounded buffer allocations when they enter
+retained storage, rather than reserving the entire ceiling per model. Borrowing
+and eviction return their charges; releases reconcile at safe residency-lock
+boundaries. Retention declines on admission or lock contention, preserving eager
+execution. Completion fences, cancellation cleanup, and model pressure reclamation
+remain mandatory.
+
+Nearby Metal audio lengths can share subsampling convolutions with at most
+12.5% geometry padding. Device-only NCHW padding zeros artificial rows after the
+first normalization, preserving the shorter clip's second-convolution boundary.
+Compaction uses the padded batch stride and returns each clip's original rows
+and mask. Existing exact-length CUDA batching is preserved.
+
+A bounded Metal host instruction schedule binds current request inputs and
+immutable model entries by name. It stores no request tensors or weight pins;
+last-use tracking releases replay intermediates, and every node checks the
+current request control. Schedule metadata uses host-tier admission after recurrence. Four geometry
+entries preserve hot plans during shape churn and yield to pressure.
+Unsupported captures use eager execution; replay can decline when host encoding
+is slower. This is host schedule reuse: GPU commands are still encoded on each
+execution. Audio cohorts retain their existing pipelined frame groups. Transposed depthwise
+coefficients use the model preparation cache across weight-source paths.
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.

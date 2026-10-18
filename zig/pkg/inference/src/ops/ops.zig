@@ -2056,7 +2056,9 @@ pub const ComputeBackend = struct {
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
+        audioPad: ?*const fn (ctx: *anyopaque, input: CT, p: AudioPadParams) anyerror!?CT = null,
         audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT = null,
         audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
@@ -4775,6 +4777,10 @@ pub const ComputeBackend = struct {
     pub fn clippedLinear(self: *const ComputeBackend, input: CT, weight: CT, p: ClippedLinearParams) !?CT {
         try p.validate();
         const op = self.vtable.clippedLinear orelse return null;
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
         try self.checkExecutionControl();
         const result = try op(self.ptr, input, weight, p);
         errdefer if (result) |t| self.free(t);
@@ -4785,8 +4791,25 @@ pub const ComputeBackend = struct {
         const op = self.vtable.audioStorage orelse return false;
         return op(self.ptr, begin);
     }
+    pub fn audioPad(self: *const ComputeBackend, input: CT, p: AudioPadParams) !?CT {
+        const op = self.vtable.audioPad orelse return null;
+        try self.checkExecutionControl();
+        if (p.batch == 0 or p.batch > 4 or p.channels == 0 or p.rows == 0 or p.width == 0 or p.output_rows < p.rows) return error.InvalidTensorShape;
+        for (p.valid_rows[0..p.batch]) |n| if (n > p.rows) return error.InvalidTensorShape;
+        var total: u64 = p.batch;
+        for ([_]u32{ p.channels, p.output_rows, p.width }) |factor| total = std.math.mul(u64, total, factor) catch return error.InvalidTensorShape;
+        if (total > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const out = try op(self.ptr, input, p);
+        errdefer if (out) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return out;
+    }
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
         const op = self.vtable.audioExecution orelse return null;
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
         try self.checkExecutionControl();
         const result = try op(self.ptr, key, inputs, context, run);
         errdefer if (result) |ct| self.free(ct);
@@ -6368,3 +6391,13 @@ test "embeddinggemma2 clipped projection bounds every Metal index before backend
 }
 
 pub const NormClampParams = extern struct { rows: u32, dim: u32, flags: u32, reserved: u32 = 0, eps: f32, lo: f32, hi: f32, padding: f32 = 0 };
+
+/// NCHW geometry padding; valid rows are geometry, independent of model masks.
+pub const AudioPadParams = extern struct {
+    batch: u32,
+    channels: u32,
+    rows: u32,
+    width: u32,
+    output_rows: u32,
+    valid_rows: [4]u32,
+};

@@ -1251,7 +1251,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
         if (pipelined) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
     }
 
-    const planned = try tryAudioExecution(cb, allocator, store, cfg, hidden, &layer_inputs);
+    const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecution(cb, allocator, store, cfg, hidden, &layer_inputs);
     if (planned) |next| {
         cb.free(hidden);
         hidden = next;
@@ -2132,10 +2132,18 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
         var indices: [4]usize = undefined;
         var cohort: [4]*AudioFeatures = undefined;
         var count: usize = 0;
+        var padded_frames = feature.frames;
+        var min_frames = feature.frames;
         const capacity = if (can_batch) subsampleBatchCapacityFor(cfg, feature.frames, features.len, cb.supportsAudioBatchLayouts(), store.huggingface and cb.kind() == .cuda) else 1;
         for (features, 0..) |candidate, i| {
             if (count == capacity) break;
-            if (done[i] or (i != first and (!can_batch or candidate.frames != feature.frames or candidate.mel_bins != feature.mel_bins))) continue;
+            if (done[i] or (i != first and (!can_batch or candidate.mel_bins != feature.mel_bins))) continue;
+            const next_frames = @max(padded_frames, candidate.frames);
+            const next_min = @min(min_frames, candidate.frames);
+            if (candidate.frames != feature.frames and (cb.vtable.audioPad == null or next_frames - next_min > next_min / 8)) continue;
+            if (count > 0 and subsampleBatchCapacityFor(cfg, next_frames, features.len, cb.supportsAudioBatchLayouts(), false) < count + 1) continue;
+            padded_frames = next_frames;
+            min_frames = next_min;
             indices[count] = i;
             cohort[count] = candidate;
             count += 1;
@@ -2156,7 +2164,7 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
         for (indices[0..count], 0..) |index, slot| {
             const span = segments[index];
             for (0..span) |t| valid[offsets[index] + t] = features[index].mask[t * 4];
-            if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * span, span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
+            if (!try cb.copyRows2D(a, hidden, offsets[index], batch_hidden, slot * ((padded_frames + 3) / 4), span, cfg.audio_hidden)) return error.UnsupportedResidentGemma4Audio;
         }
         if (frame) {
             try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -2169,21 +2177,27 @@ fn audioSubsampleCohort(cb: *const ComputeBackend, a: std.mem.Allocator, store: 
 
 fn audioSubsampleBatch(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features: []const *AudioFeatures) !CT {
     const batch = features.len;
-    const time = features[0].frames;
+    var time: usize = 0;
+    for (features) |f| time = @max(time, f.frames);
+    const ragged = for (features) |f| {
+        if (f.frames != time) break true;
+    } else false;
     const packed_features = (try cb.allocUninitF32Shape(&.{ @intCast(batch * time), @intCast(cfg.mel_bins) })) orelse return error.UnsupportedResidentGemma4Audio;
     defer cb.free(packed_features);
     for (features, 0..) |f, i| {
-        if (f.frames != time or f.mel_bins != cfg.mel_bins) return error.InvalidTensorShape;
+        if (f.mel_bins != cfg.mel_bins) return error.InvalidTensorShape;
         const tensor = f.resident orelse upload: {
             const masked = try a.dupe(f32, f.data);
             defer a.free(masked);
             for (f.mask, 0..) |flag, row| if (!flag) {
                 @memset(masked[row * cfg.mel_bins ..][0..cfg.mel_bins], 0);
             };
-            break :upload try deviceResidentFromFloat32(cb, masked, &.{ @intCast(time), @intCast(cfg.mel_bins) });
+            break :upload try deviceResidentFromFloat32(cb, masked, &.{ @intCast(f.frames), @intCast(cfg.mel_bins) });
         };
         defer if (f.resident == null) cb.free(tensor);
-        if (!try cb.copyRows2D(a, packed_features, i * time, tensor, 0, time, cfg.mel_bins)) return error.UnsupportedResidentGemma4Audio;
+        const padded = if (f.frames != time) (try cb.audioPad(tensor, .{ .batch = 1, .channels = 1, .rows = @intCast(f.frames), .width = @intCast(cfg.mel_bins), .output_rows = @intCast(time), .valid_rows = .{ @intCast(f.frames), 0, 0, 0 } })) orelse return error.UnsupportedResidentGemma4Audio else tensor;
+        defer if (padded != tensor) cb.free(padded);
+        if (!try cb.copyRows2D(a, packed_features, i * time, padded, 0, time, cfg.mel_bins)) return error.UnsupportedResidentGemma4Audio;
     }
     var hidden = try cb.primReshape(packed_features, &.{ @intCast(batch), 1, @intCast(time), @intCast(cfg.mel_bins) });
     var live = true;
@@ -2224,6 +2238,13 @@ fn audioSubsampleBatch(cb: *const ComputeBackend, a: std.mem.Allocator, store: *
         };
         cb.free(hidden);
         hidden = normalized;
+        if (ragged and layer == 0) {
+            var spans: [4]u32 = @splat(0);
+            for (features, 0..) |f, i| spans[i] = @intCast((f.frames + 1) / 2);
+            const trimmed = (try cb.audioPad(hidden, .{ .batch = @intCast(batch), .channels = @intCast(channels), .rows = @intCast(height), .width = @intCast(width), .output_rows = @intCast(height), .valid_rows = spans })) orelse return error.UnsupportedResidentGemma4Audio;
+            cb.free(hidden);
+            hidden = trimmed;
+        }
     }
     const flat = (try cb.flattenChannelsTimeFreqBatch(hidden, batch, height, width, channels)) orelse legacy: {
         if (cb.supportsAudioBatchLayouts()) return error.UnsupportedResidentGemma4Audio;
@@ -3336,7 +3357,7 @@ fn gemma4AudioEncoderFrameEnabled() bool {
 }
 
 fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs) !?CT {
-    if (cb.kind() != .cuda or cb.vtable.audioExecution == null or !store.huggingface or !std.meta.eql(audioHostOps(), AudioHostOps{}) or cfg.block_count != 12 or inputs.scales.len != 12 or inputs.segment_starts == null or inputs.segment_valid == null or platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") != null) return null;
+    if ((cb.kind() != .cuda and cb.kind() != .metal) or cb.vtable.audioExecution == null or !store.huggingface or !std.meta.eql(audioHostOps(), AudioHostOps{}) or cfg.block_count != 12 or inputs.scales.len != 12 or (cb.kind() == .cuda and (inputs.segment_starts == null or inputs.segment_valid == null)) or platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") != null) return null;
     const Run = struct {
         cb: *const ComputeBackend,
         a: std.mem.Allocator,
@@ -3348,8 +3369,8 @@ fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Pr
             var layer_inputs = self.inputs.*;
             layer_inputs.rel_in = values[1];
             layer_inputs.valid_ct = values[2];
-            layer_inputs.segment_starts = values[3];
-            layer_inputs.segment_valid = values[4];
+            layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[3] else null;
+            layer_inputs.segment_valid = if (self.inputs.segment_valid != null) values[4] else null;
             var scales: [12]CT = undefined;
             @memcpy(&scales, values[5..17]);
             layer_inputs.scales = &scales;
@@ -3371,11 +3392,12 @@ fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Pr
     values[0] = hidden;
     values[1] = inputs.rel_in;
     values[2] = inputs.valid_ct;
-    values[3] = inputs.segment_starts.?;
-    values[4] = inputs.segment_valid.?;
+    values[3] = inputs.segment_starts orelse inputs.valid_ct;
+    values[4] = inputs.segment_valid orelse inputs.valid_ct;
     @memcpy(values[5..17], inputs.scales);
     var key = std.hash.Wyhash.init(0x616e74666c796175);
     key.update(std.mem.sliceAsBytes(inputs.segments));
+    std.hash.autoHash(&key, .{ cfg.audio_hidden, cfg.intermediate_size, cfg.head_count, cfg.conv_kernel_size, @as(u32, @bitCast(cfg.layer_norm_eps)), @as(u32, @bitCast(cfg.residual_weight)), cfg.attention_chunk_size, cfg.attention_context_left, @as(u32, @bitCast(cfg.attention_logit_cap)), @as(u32, @bitCast(cfg.attention_invalid_logits_value)), cfg.exclude_farthest_key });
     return cb.audioExecution(key.final(), &values, &run, Run.call);
 }
 fn audioLayer(
@@ -4111,6 +4133,11 @@ fn depthwiseConvWeightCt(
         name: []const u8,
         kernel_size: usize,
         hidden: usize,
+        fn finish(self: @This(), data: []const f32, shape: []const i32, key: []const u8, cache: bool) !CT {
+            if (!cache) return self.cb.fromFloat32Shape(data, shape);
+            const resident = try deviceResidentFromFloat32(self.cb, data, shape);
+            return publishAudioConstant(self.cb, key, resident, true);
+        }
         fn call(self: @This()) !CT {
             var key_buf: [256]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.depthwise.v1.{s}.{d}.{d}", .{ self.name, self.kernel_size, self.hidden });
@@ -4140,13 +4167,13 @@ fn depthwiseConvWeightCt(
             if (self.store.gguf == null and weight.shape.len == 3 and d0 == self.hidden and d1 == 1 and weight.shape[2] == self.kernel_size) {
                 const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
                 defer self.allocator.free(transposed);
-                return self.cb.fromFloat32Shape(transposed, &shape);
+                return self.finish(transposed, &shape, key, cache);
             }
-            if (d0 == self.kernel_size and d1 == self.hidden) return self.cb.fromFloat32Shape(weight.data, &shape);
+            if (d0 == self.kernel_size and d1 == self.hidden) return self.finish(weight.data, &shape, key, cache);
             if (d0 == self.hidden and d1 == self.kernel_size) {
                 const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
                 defer self.allocator.free(transposed);
-                return self.cb.fromFloat32Shape(transposed, &shape);
+                return self.finish(transposed, &shape, key, cache);
             }
             return error.InvalidTensorShape;
         }
@@ -7826,7 +7853,13 @@ test "embeddinggemma2 Metal audio frontend windows PCM and fuses magnitudes and 
 test "embeddinggemma2 CUDA audio frontend windows PCM and fuses magnitudes and masks" {
     try @import("../ops/media_residency_test.zig").onCuda(@import("../ops/media_residency_test.zig").noWeights, checkAudioFrontend);
 }
-fn checkSubsampleBatch(cb: ComputeBackend, _: ComputeBackend) !void {
+fn checkSubsampleBatch(cb: ComputeBackend, reference: ComputeBackend) !void {
+    // 12/13 changes compacted row counts; 14/15 requires zeroing the
+    // artificial first-stage row before it reaches the second convolution.
+    try checkSubsampleBatchGeometry(cb, reference, 13);
+    try checkSubsampleBatchGeometry(cb, reference, 15);
+}
+fn checkSubsampleBatchGeometry(cb: ComputeBackend, _: ComputeBackend, base_frames: usize) !void {
     const a = std.testing.allocator;
     if (comptime @import("build_options").enable_cuda) if (cb.kind() == .cuda) {
         const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -7837,15 +7870,15 @@ fn checkSubsampleBatch(cb: ComputeBackend, _: ComputeBackend) !void {
         compute.require_f32_linears = true;
     };
     const cfg = AudioConfig{ .text_hidden = 8, .audio_hidden = 16, .output_hidden = 24, .intermediate_size = 32, .block_count = 8, .head_count = 2, .mel_bins = 8, .conv_channels0 = 4, .conv_channels1 = 2, .layer_norm_eps = 1e-6 };
-    var data: [4][13 * 8]f32 = undefined;
-    var masks: [4][13]bool = @splat(@splat(true));
+    var data: [4][15 * 8]f32 = undefined;
+    var masks: [4][15]bool = @splat(@splat(true));
     var features: [4]AudioFeatures = undefined;
     var pointers: [4]*AudioFeatures = undefined;
     for (&data, &features, &pointers, 0..) |*values, *f, *ptr, i| {
         for (values, 0..) |*x, j| x.* = @sin(@as(f32, @floatFromInt(j + i * 17)) * 0.13);
         masks[i][0] = false;
         masks[i][8] = i % 2 == 0;
-        const frames: usize = if (i == 1) 11 else 13;
+        const frames: usize = if (i == 1) base_frames - 1 else base_frames;
         f.* = .{ .allocator = a, .data = values[0 .. frames * 8], .resident = null, .frames = frames, .mel_bins = 8, .mask = masks[i][0..frames] };
         ptr.* = f;
     }

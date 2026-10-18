@@ -49505,7 +49505,7 @@ pub extern fn antfly_metal_audio_storage_hits(runtime: ?*RawMetalDecodeRuntime) 
 pub extern fn antfly_metal_audio_storage_bytes(runtime: ?*RawMetalDecodeRuntime) usize;
 
 pub extern fn antfly_metal_clipped_linear_choice(runtime: ?*RawMetalDecodeRuntime, params: *const @import("../ops/ops.zig").ClippedLinearParams) c_int;
-pub extern fn antfly_metal_clipped_linear_tune(runtime: ?*RawMetalDecodeRuntime, slot: usize, params: *const @import("../ops/ops.zig").ClippedLinearParams) c_int;
+pub extern fn antfly_metal_clipped_linear_tune(runtime: ?*RawMetalDecodeRuntime, slot: usize, params: *const @import("../ops/ops.zig").ClippedLinearParams, control: ?*anyopaque, cancelled: ?*const fn (?*anyopaque) callconv(.c) c_int) c_int;
 
 pub extern fn antfly_metal_audio_linear_tunes(runtime: ?*RawMetalDecodeRuntime) u64;
 
@@ -49520,3 +49520,7 @@ pub fn decoderRuntimeNormClamped(self: anytype, input: MetalTensor, weight: Meta
 }
 extern fn antfly_metal_norm_clamp(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, params: *const @import("../ops/ops.zig").NormClampParams, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn antfly_metal_audio_norm_clamp_launches(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn antfly_metal_audio_storage_admission(runtime: ?*RawMetalDecodeRuntime, context: ?*anyopaque, admit: ?*const fn (?*anyopaque, usize) callconv(.c) c_int, release: ?*const fn (?*anyopaque, usize) callconv(.c) void) void;
+
+pub extern fn antfly_metal_audio_pad(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, params: *const @import("../ops/ops.zig").AudioPadParams) c_int;

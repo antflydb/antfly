@@ -37276,6 +37276,20 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         try std.testing.expect(cos >= @as(f64, if (metal) 0.9999 else 0.99999));
         try std.testing.expect(max_abs <= @as(f64, if (metal) 1e-3 else 1e-4));
     }
+    // Repeated singleton calls qualify warmed host schedules across wrappers.
+    // This optional run reports completed full-embedding latency, including
+    // backbone execution, and checks every vector against the pinned oracle.
+    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN")) {
+        const reference = parsed.value.object.get("cases").?.array.items[1];
+        for (0..8) |iteration| {
+            const start = platform.time.monotonicNs();
+            const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            defer a.free(result.vector);
+            const elapsed = platform.time.monotonicNs() -| start;
+            for (reference.object.get("embedding").?.array.items, result.vector) |value, actual| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(value.float)), actual, 1e-3);
+            std.debug.print("embeddinggemma2 audio_schedule iteration={d} completed_ns={d}\n", .{ iteration, elapsed });
+        }
+    }
     // Qualify the resident conformer cohort and pooled backbone against the
     // same pretrained audio oracle, including Metal's bounded frame pipeline.
     const audio_groups: [2]grouped.Group = @splat(.{ .content = &.{.{ .audio = audio_bytes }} });

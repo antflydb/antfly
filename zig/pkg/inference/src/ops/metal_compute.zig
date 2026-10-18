@@ -47,6 +47,7 @@ const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const ocrLogitSummary = @import("../util/ocr_parity.zig").ocrLogitSummary;
 
 const WeightStore = gpu_hosted_store_mod.WeightStore;
+const audio_tape = @import("metal_audio_execution.zig");
 const NativeWeightStore = native_compute_mod.WeightStore;
 const CT = ops.CT;
 const MetalTensor = metal_tensor_mod.MetalTensor;
@@ -1147,6 +1148,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     allocator: std.mem.Allocator,
     require_f32_linears: bool = false,
+    audio_execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
+    audio_capture: ?*audio_tape.Capture = null,
     data: *WeightStore,
     provider: if (false) ?mlx_quant.Provider else void =
         if (false) null else {},
@@ -4804,7 +4807,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn computeBackend(self: *MetalCompute) ops.ComputeBackend {
-        return .{ .ptr = self, .vtable = &vtable_impl };
+        return .{ .ptr = self, .vtable = &vtable_impl, .execution_control = self.audio_execution_control };
     }
 
     /// Transfer an allocator-created context to the backend handle. Stack or
@@ -6903,6 +6906,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn freeOp(ctx: *anyopaque, tensor: CT) void {
+        const owner: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (owner.audio_capture) |capture| capture.forget(tensor);
         const buf = toBuf(tensor);
         if (buf.weight_handle_name) |name| {
             const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -15733,24 +15738,535 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(result);
     }
 
+    fn audioTapeRmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try rmsNormOp(ctx, input, weight, dim, eps);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            const output = result;
+            {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, weight) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 2;
+                node.args = .{ .rmsNorm = .{ .input = node.inputs[0], .weight = node.inputs[1], .dim = dim, .eps = eps } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeRmsNormClamped(ctx: *anyopaque, input: CT, weight: CT, p: ops.NormClampParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try rmsNormClampedOp(ctx, input, weight, p);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, weight) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 2;
+                node.args = .{ .rmsNormClamped = .{ .input = node.inputs[0], .weight = node.inputs[1], .p = p } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeRmsNormResidual(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try rmsNormResidualOp(ctx, input, weight, residual, dim, eps, norm_scale, output_scale);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, weight) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[2] = self.audioTapeInput(capture, residual) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 3;
+                node.args = .{ .rmsNormResidual = .{ .input = node.inputs[0], .weight = node.inputs[1], .residual = node.inputs[2], .dim = dim, .eps = eps, .norm_scale = norm_scale, .output_scale = output_scale } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeLinearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try linearNoBiasOp(ctx, input, weight, rows, in_dim, out_dim);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            const output = result;
+            {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, weight) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 2;
+                node.args = .{ .linearNoBias = .{ .input = node.inputs[0], .weight = node.inputs[1], .rows = rows, .in_dim = in_dim, .out_dim = out_dim } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeClippedLinear(ctx: *anyopaque, input: CT, weight: CT, p: ops.ClippedLinearParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try clippedLinearOp(ctx, input, weight, p);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, weight) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 2;
+                node.args = .{ .clippedLinear = .{ .input = node.inputs[0], .weight = node.inputs[1], .p = p } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeClampScalar(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try clampScalarOp(ctx, input, min_value, max_value);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 1;
+                node.args = .{ .clampScalar = .{ .input = node.inputs[0], .min_value = min_value, .max_value = max_value } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeClampSilu(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try clampSiluOp(ctx, input, min_value, max_value);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 1;
+                node.args = .{ .clampSilu = .{ .input = node.inputs[0], .min_value = min_value, .max_value = max_value } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeSilu(ctx: *anyopaque, input: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try siluOp(ctx, input);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            const output = result;
+            {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 1;
+                node.args = .{ .silu = .{ .input = node.inputs[0] } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeAdd(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try addOp(ctx, a, b);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            const output = result;
+            {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, a) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, b) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 2;
+                node.args = .{ .add = .{ .a = node.inputs[0], .b = node.inputs[1] } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeGluRows(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try gluRowsOp(ctx, input, rows, dim);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 1;
+                node.args = .{ .gluRows = .{ .input = node.inputs[0], .rows = rows, .dim = dim } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeDepthwiseCausalConv1d(ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try depthwiseCausalConv1dOp(ctx, input, weight, rows, dim, kernel_size);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, weight) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 2;
+                node.args = .{ .depthwiseCausalConv1d = .{ .input = node.inputs[0], .weight = node.inputs[1], .rows = rows, .dim = dim, .kernel_size = kernel_size } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeDepthwiseCausalConv1dSegmented(ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try depthwiseCausalConv1dSegmentedOp(ctx, input, weight, starts, rows, dim, kernel_size);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, weight) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[2] = self.audioTapeInput(capture, starts) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 3;
+                node.args = .{ .depthwiseCausalConv1dSegmented = .{ .input = node.inputs[0], .weight = node.inputs[1], .starts = node.inputs[2], .rows = rows, .dim = dim, .kernel_size = kernel_size } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeGemma4AudioLocalAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try gemma4AudioLocalAttentionOp(ctx, q, k, v, rel, q_dim_scales, valid, params);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, q) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[1] = self.audioTapeInput(capture, k) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[2] = self.audioTapeInput(capture, v) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[3] = self.audioTapeInput(capture, rel) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[4] = self.audioTapeInput(capture, q_dim_scales) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.inputs[5] = self.audioTapeInput(capture, valid) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 6;
+                node.args = .{ .gemma4AudioLocalAttention = .{ .q = node.inputs[0], .k = node.inputs[1], .v = node.inputs[2], .rel = node.inputs[3], .q_dim_scales = node.inputs[4], .valid = node.inputs[5], .params = params } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeSliceLastDim(ctx: *anyopaque, tensor: CT, start: usize, stop: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try sliceLastDimOp(ctx, tensor, start, stop);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            const output = result;
+            {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, tensor) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 1;
+                node.args = .{ .sliceLastDim = .{ .tensor = node.inputs[0], .start = start, .stop = stop } };
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeLinearPackedNamed(ctx: *anyopaque, input: CT, names: []const []const u8, widths: []const usize, rows: usize, in_dim: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const result = try linearPackedNamedOp(ctx, input, names, widths, rows, in_dim);
+        if (self.audio_capture) |capture| if (!capture.failed) {
+            if (result) |output| {
+                var node = audio_tape.Node{ .args = undefined };
+                node.inputs[0] = self.audioTapeInput(capture, input) catch {
+                    capture.failed = true;
+                    return result;
+                };
+                node.input_count = 1;
+                if (names.len == 0 or names.len > 3 or widths.len != names.len) {
+                    capture.failed = true;
+                    return result;
+                }
+                node.args = .{ .linearPackedNamed = .{ .input = node.inputs[0], .names_storage = undefined, .names_lengths = @splat(0), .name_count = @intCast(names.len), .widths = @splat(0), .rows = rows, .in_dim = in_dim } };
+                for (names, 0..) |name, i| {
+                    if (name.len > 192) {
+                        capture.failed = true;
+                        return result;
+                    }
+                    @memcpy(node.args.linearPackedNamed.names_storage[i][0..name.len], name);
+                    node.args.linearPackedNamed.names_lengths[i] = @intCast(name.len);
+                    node.args.linearPackedNamed.widths[i] = widths[i];
+                }
+                capture.append(node, output);
+            }
+        };
+        return result;
+    }
+    fn audioTapeInput(self: *MetalCompute, capture: *audio_tape.Capture, ct: CT) !u16 {
+        if (capture.find(ct)) |id| return id;
+        const buf = toBuf(ct);
+        if (buf.weight_handle_name) |full_name| {
+            const name = if (self.data.prefix.len > 0 and std.mem.startsWith(u8, full_name, self.data.prefix)) full_name[self.data.prefix.len + 1 ..] else full_name;
+            return capture.constant(ct, name, false);
+        }
+        if (buf.metal_tensor) |mt| if (mt.isDevice()) {
+            var it = self.provider_impl.embeddinggemma2_constant_cache.iterator();
+            while (it.next()) |entry| {
+                const other = entry.value_ptr.tensor;
+                if (mt.deviceHandle() == other.deviceHandle() and mt.deviceByteOffset() == other.deviceByteOffset() and mt.elemCount() == other.elemCount()) return capture.constant(ct, entry.key_ptr.*, true);
+            }
+        };
+        if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) {
+            std.debug.print("metal_audio_schedule unknown_operand elements={d} metal={} lazy={} host_elements={d} nodes={d}\n", .{ bufElemCount(buf), buf.metal_tensor != null, buf.lazy_entry != null, buf.data.len, capture.plan.count });
+            for (capture.plan.nodes[0..capture.plan.count]) |node| std.debug.print(" {s}", .{@tagName(node.args)});
+            std.debug.print("\n", .{});
+        }
+        return error.AudioScheduleUnknownOperand;
+    }
+    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.require_f32_linears or disableRuntimeElementwise() or self.shared_provider_lease_io == null or self.audio_capture != null or inputs.len == 0 or inputs.len > 20 or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN")) return null;
+        var hash = std.hash.Wyhash.init(key);
+        const policy: u8 = @as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR"))) |
+            (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR"))) << 1) |
+            (@as(u8, @intFromBool(audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_SERIAL_ATTENTION"))) << 2);
+        hash.update(std.mem.asBytes(&policy));
+
+        hash.update(std.mem.asBytes(&inputs.len));
+        for (inputs, 0..) |ct, i| {
+            const mt = denseDeviceF32(ct) orelse return null;
+            const rank = mt.shape().len;
+            hash.update(std.mem.asBytes(&rank));
+            hash.update(std.mem.sliceAsBytes(mt.shape()));
+            // A trace cannot distinguish aliased argument positions. Include
+            // alias relationships so a later independent binding gets its own plan.
+            for (inputs[0..i]) |previous| {
+                const same = previous == ct;
+                hash.update(std.mem.asBytes(&same));
+            }
+        }
+        const p = self.provider_impl;
+        p.audio_schedule_clock += 1;
+        const k = hash.final();
+        var entry: ?*audio_tape.Plan = null;
+        var victim: usize = 0;
+        for (p.audio_schedules, 0..) |candidate, i| {
+            if (candidate) |plan| {
+                if (plan.key == k) {
+                    entry = plan;
+                    break;
+                }
+            }
+            if (candidate == null or (p.audio_schedules[victim] != null and candidate.?.stamp < p.audio_schedules[victim].?.stamp)) victim = i;
+        }
+        const recurrent = p.audio_schedule_history.observe(k, p.audio_schedule_clock);
+        if (entry == null) {
+            if (!recurrent) return null;
+            if (p.audio_schedules[victim]) |old| {
+                if (!old.disabled and p.audio_schedule_clock - old.stamp < 8) return null;
+            }
+
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            const cache = if (self.data.tier_cache) |*v| v else return null;
+            if (p.embeddinggemma2_cache_admission) |bound| {
+                if (bound != cache) return null;
+            }
+            if (p.audio_schedules[victim]) |old| {
+                std.heap.c_allocator.destroy(old);
+                p.audio_schedules[victim] = null;
+                cache.noteRelease(.host, @sizeOf(audio_tape.Plan));
+            }
+            cache.reserve(.host, @sizeOf(audio_tape.Plan)) catch return null;
+            const plan = std.heap.c_allocator.create(audio_tape.Plan) catch {
+                cache.noteRelease(.host, @sizeOf(audio_tape.Plan));
+                return null;
+            };
+            plan.* = .{ .key = k, .warmed = true };
+            p.audio_schedules[victim] = plan;
+            p.embeddinggemma2_cache_admission = cache;
+            entry = plan;
+        }
+        const plan = entry.?;
+        plan.stamp = p.audio_schedule_clock;
+        if (plan.disabled) return null;
+        if (!plan.warmed) {
+            plan.warmed = true;
+            return null;
+        }
+        const cb = self.computeBackend();
+        const start = @import("antfly_platform").time.monotonicNs();
+        if (plan.eager_ns == 0) {
+            const out = try run(context, inputs);
+            plan.eager_ns = @import("antfly_platform").time.monotonicNs() -| start;
+            return out;
+        }
+        if (plan.ready) {
+            const out = try plan.replay(&cb, inputs);
+            const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
+            if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) std.debug.print("metal_audio_schedule replays={d} eager_encode_ns={d} replay_encode_ns={d}\n", .{ plan.replays, plan.eager_ns, elapsed });
+            plan.replay_ns = elapsed;
+            // This measures host encoding only; GPU work and arithmetic are
+            // unchanged. Stop replay if host scheduling loses substantially.
+            if (plan.replays >= 3 and elapsed > plan.eager_ns + plan.eager_ns / 4) plan.disabled = true;
+            return out;
+        }
+        var capture = audio_tape.Capture.init(plan, inputs);
+        self.audio_capture = &capture;
+        const out = run(context, inputs) catch |err| {
+            self.audio_capture = null;
+            plan.disabled = err != error.Cancelled and err != error.Timeout;
+            return err;
+        };
+        self.audio_capture = null;
+        capture.finish(out);
+        if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")) std.debug.print("metal_audio_schedule ready={} nodes={d} constants={d} bytes={d}\n", .{ plan.ready, plan.count, plan.constant_count, @sizeOf(audio_tape.Plan) });
+        if (!plan.ready and audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_AUDIO_PLAN")) {
+            freeOp(ctx, out);
+            return error.AudioScheduleUnqualified;
+        }
+        return out;
+    }
+    fn audioSetControlOp(ctx: *anyopaque, control: ?@import("../execution_control.zig").InferenceExecutionControl) ?@import("../execution_control.zig").InferenceExecutionControl {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const previous = self.audio_execution_control;
+        self.audio_execution_control = control;
+        return previous;
+    }
+    fn audioStorageAdmit(raw: ?*anyopaque, bytes: usize) callconv(.c) c_int {
+        const data: *WeightStore = @ptrCast(@alignCast(raw orelse return -1));
+        // Slot preparation can submit while owning residency synchronization.
+        // Optional retention declines rather than recursively locking it.
+        if (!data.prefetch.lockHandle().mutex.tryLock()) return -1;
+        defer data.prefetch.unlock();
+        const provider = data.shared_metal_native_provider orelse return -1;
+        audioStorageReconcile(data, provider);
+        const cache = if (data.tier_cache) |*value| value else return -1;
+        cache.reserve(.backend, bytes) catch return -1;
+        provider.embeddinggemma2_audio_storage_bytes += bytes;
+        return 0;
+    }
+    fn audioStorageRelease(raw: ?*anyopaque, bytes: usize) callconv(.c) void {
+        const data: *WeightStore = @ptrCast(@alignCast(raw orelse return));
+        // Callbacks are serialized by the provider execution lease. Keep
+        // releases conservative until a safe residency-lock boundary.
+        const provider = data.shared_metal_native_provider orelse return;
+        provider.embeddinggemma2_audio_pending_release += bytes;
+    }
+    fn audioStorageReconcile(data: *WeightStore, provider: *ProviderImpl) void {
+        const bytes = provider.embeddinggemma2_audio_pending_release;
+        if (bytes == 0) return;
+        if (data.tier_cache) |*cache| cache.noteRelease(.backend, bytes);
+        provider.embeddinggemma2_audio_storage_bytes -= bytes;
+        provider.embeddinggemma2_audio_pending_release = 0;
+    }
+
+    fn audioTuneCancelled(raw: ?*anyopaque) callconv(.c) c_int {
+        const self: *MetalCompute = @ptrCast(@alignCast(raw orelse return 1));
+        self.computeBackend().checkExecutionControl() catch return 1;
+        return 0;
+    }
+    fn audioPadOp(ctx: *anyopaque, input: CT, p: ops.AudioPadParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer x.deinit();
+        if (x.elemCount() != @as(usize, p.batch) * p.channels * p.rows * p.width) return error.InvalidTensorShape;
+        var out = try MetalTensor.deviceAllocate(runtime, @as(usize, p.batch) * p.channels * p.output_rows * p.width * 4, .private, &.{ @intCast(p.batch), @intCast(p.channels), @intCast(p.output_rows), @intCast(p.width) });
+        errdefer out.deinit();
+        if (metal_runtime.antfly_metal_audio_pad(runtime, x.deviceHandle(), x.deviceByteOffset(), out.deviceHandle(), out.deviceByteOffset(), &p) != 0) return error.MetalRuntimeUnavailable;
+        return self.ctFromOwnedMetalTensor(out);
+    }
     fn audioStorageOp(ctx: *anyopaque, begin: bool) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const p = self.provider_impl;
-        if (!begin) return metal_runtime.antfly_metal_audio_storage_scope(p.raw_decode_runtime, 0) == 0;
+        if (!begin) {
+            const ended = metal_runtime.antfly_metal_audio_storage_scope(p.raw_decode_runtime, 0) == 0;
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            audioStorageReconcile(self.data, p);
+            return ended;
+        }
         if (!self.require_f32_linears or self.shared_provider_lease_io == null or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_STORAGE")) return false;
         if (p.raw_decode_runtime == null) return false;
         self.data.prefetch.lock();
         defer self.data.prefetch.unlock();
-        if (p.embeddinggemma2_audio_storage_bytes == 0) {
-            const cache = if (self.data.tier_cache) |*value| value else return false;
-            if (p.embeddinggemma2_cache_admission) |bound| {
-                if (bound != cache) return false;
-            }
-            const cap = 128 * 1024 * 1024;
-            cache.reserve(.backend, cap) catch return false;
-            p.embeddinggemma2_cache_admission = cache;
-            p.embeddinggemma2_audio_storage_bytes = cap;
+        audioStorageReconcile(self.data, p);
+        const cache = if (self.data.tier_cache) |*value| value else return false;
+        if (p.embeddinggemma2_cache_admission) |bound| {
+            if (bound != cache) return false;
         }
+        p.embeddinggemma2_cache_admission = cache;
+        metal_runtime.antfly_metal_audio_storage_admission(p.raw_decode_runtime, self.data, audioStorageAdmit, audioStorageRelease);
         return metal_runtime.antfly_metal_audio_storage_scope(p.raw_decode_runtime, 1) == 0;
     }
     fn rmsNormClampedOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.NormClampParams) anyerror!?CT {
@@ -15793,7 +16309,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 cache.noteRelease(.backend, bytes);
                 self.data.prefetch.unlock();
             }
-            choice = metal_runtime.antfly_metal_clipped_linear_tune(runtime, slot, &p);
+            choice = metal_runtime.antfly_metal_clipped_linear_tune(runtime, slot, &p, self, audioTuneCancelled);
+            try self.computeBackend().checkExecutionControl();
         }
         if (choice != 1) return null;
         const out = (try metal_runtime.decoderRuntimeClippedLinear(self.provider_impl, x, slot, p)) orelse return null;
@@ -33312,7 +33829,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.tensorDType = tensorDTypeOp;
         vt.tensorShape = tensorShapeOp;
         vt.tensorShapeMatches = tensorShapeMatchesOp;
-        vt.sliceLastDim = sliceLastDimOp;
+        vt.sliceLastDim = audioTapeSliceLastDim;
         vt.evalTensor = evalTensorOp;
         vt.trainingOverwriteF32 = trainingOverwriteF32Op;
         vt.trainingZeroF32 = trainingZeroF32Op;
@@ -33426,30 +33943,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.addLayerNormSumCentered = addLayerNormSumCenteredOp;
         vt.geluNew = geluNewOp;
         vt.relu = reluOp;
-        vt.silu = siluOp;
+        vt.silu = audioTapeSilu;
         vt.quickGelu = quickGeluOp;
         vt.sigmoid = sigmoidOp;
         vt.tanh_act = tanhOp;
         vt.concat = concatOp;
-        vt.rmsNorm = rmsNormOp;
+        vt.rmsNorm = audioTapeRmsNorm;
         vt.rmsNormTriple = rmsNormTripleOp;
         vt.parallelFfnPostResidual = parallelFfnPostResidualOp;
         vt.addScalar = addScalarOp;
         vt.multiplyScalar = multiplyScalarOp;
-        vt.clampScalar = clampScalarOp;
-        vt.gluRows = gluRowsOp;
-        vt.depthwiseCausalConv1d = depthwiseCausalConv1dOp;
-        vt.depthwiseCausalConv1dSegmented = depthwiseCausalConv1dSegmentedOp;
+        vt.clampScalar = audioTapeClampScalar;
+        vt.gluRows = audioTapeGluRows;
+        vt.depthwiseCausalConv1d = audioTapeDepthwiseCausalConv1d;
+        vt.depthwiseCausalConv1dSegmented = audioTapeDepthwiseCausalConv1dSegmented;
         vt.flattenChannelsTimeFreq = flattenChannelsTimeFreqOp;
         vt.channelLayerNormRelu = channelLayerNormReluOp;
-        vt.gemma4AudioLocalAttention = gemma4AudioLocalAttentionOp;
+        vt.gemma4AudioLocalAttention = audioTapeGemma4AudioLocalAttention;
         vt.rmsNormAddTensor = rmsNormAddTensorOp;
-        vt.rmsNormResidual = rmsNormResidualOp;
+        vt.rmsNormResidual = audioTapeRmsNormResidual;
         vt.modelScalarBounds = modelScalarBoundsOp;
-        vt.clampSilu = clampSiluOp;
-        vt.clippedLinear = clippedLinearOp;
-        vt.rmsNormClamped = rmsNormClampedOp;
+        vt.clampSilu = audioTapeClampSilu;
+        vt.clippedLinear = audioTapeClippedLinear;
+        vt.rmsNormClamped = audioTapeRmsNormClamped;
+        vt.audioSetControl = audioSetControlOp;
         vt.audioStorage = audioStorageOp;
+        vt.audioExecution = audioExecutionOp;
+        vt.audioPad = audioPadOp;
         vt.spatialPoolPrepare = spatialPoolPrepareOp;
         vt.audioFrontend = audioFrontendOp;
         vt.audioLogMelEnabled = audioBatchLayoutsEnabledOp;
@@ -33483,7 +34003,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.denseMlp2 = denseMlp2Op;
         vt.denseFfnLayerNorm = denseFfnLayerNormOp;
         vt.linearPlanned = linearPlannedOp;
-        vt.linearNoBias = linearNoBiasOp;
+        vt.linearNoBias = audioTapeLinearNoBias;
         vt.linearNoBiasPlanned = linearNoBiasPlannedOp;
         vt.loraLinearBranch = loraLinearBranchOp;
         vt.loraLinearBackward = loraLinearBackwardOp;
@@ -33506,7 +34026,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.linearTripleNoBias = linearTripleNoBiasOp;
         vt.linearTripleNoBiasNamed = linearTripleNoBiasNamedOp;
         vt.modelConstant = modelConstantOp;
-        vt.linearPackedNamed = linearPackedNamedOp;
+        vt.linearPackedNamed = audioTapeLinearPackedNamed;
         vt.rmsNormHeadsRope = rmsNormHeadsRopeOp;
         vt.rope = ropeOp;
         vt.mrope = mropeOp;
@@ -33529,7 +34049,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runGatedFfnResidual = runGatedFfnResidualOp;
         vt.gatedFfnNoBias = gatedFfnNoBiasOp;
         vt.runGatedDecoderBlock = runGatedDecoderBlockOp;
-        vt.add = addOp;
+        vt.add = audioTapeAdd;
         vt.multiply = multiplyOp;
         // Consume packed gate/up rows on device without separate slice buffers.
         vt.packedGeluMultiply = packedGeluMultiplyOp;
@@ -43968,7 +44488,7 @@ test "embeddinggemma2 Metal audio storage admission survives wrappers and yields
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    for ([_]usize{ 16 * 1024 * 1024, 128 * 1024 * 1024 }) |limit| {
+    for ([_]usize{ 8192, 16 * 1024 * 1024, 128 * 1024 * 1024 }) |limit| {
         var controller = runtime_root.tier.memory.AdmissionController{};
         defer controller.deinit();
         var store = testMetalWeightStoreInit(a);
@@ -43986,15 +44506,24 @@ test "embeddinggemma2 Metal audio storage admission survives wrappers and yields
             compute.require_f32_linears = true;
             const cb = compute.computeBackend();
             const active = try cb.audioStorage(true);
-            try std.testing.expectEqual(limit == 128 * 1024 * 1024, active);
+            try std.testing.expect(active);
             if (active) {
                 try std.testing.expectError(error.MetalWorkspaceBusy, compute.provider_impl.reclaimEmbeddingGemma2Weights(.audio));
+                const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 }));
+                defer cb.free(x);
+                try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                const y = try cb.add(x, x);
+                cb.free(y);
+                try cb.decoderRuntimeSubmitAndWaitFrame();
                 try std.testing.expect(try cb.audioStorage(false));
-                try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), controller.snapshot().backend_weight_bytes);
+                const retained = metal_runtime_mod.antfly_metal_audio_storage_bytes(compute.provider_impl.raw_decode_runtime);
+                try std.testing.expect(if (limit < 16384) retained == 0 else retained > 0 and retained < limit);
+                try std.testing.expectEqual(retained, controller.snapshot().backend_weight_bytes);
+                try std.testing.expectEqual(retained, compute.provider_impl.embeddinggemma2_audio_storage_bytes);
             }
         }
         const provider = store.shared_metal_native_provider.?;
-        const expected: usize = if (limit == 128 * 1024 * 1024) 128 * 1024 * 1024 else 0;
+        const expected: usize = provider.embeddinggemma2_audio_storage_bytes;
         try std.testing.expectEqual(expected, try provider.reclaimEmbeddingGemma2Weights(.audio));
         try std.testing.expectEqual(@as(usize, 0), provider.embeddinggemma2_audio_storage_bytes);
     }
@@ -44037,11 +44566,13 @@ test "embeddinggemma2 Metal clipped linear selector reuses geometry across bound
     initPrefetchQueue(&store, a);
     defer deinitPrefetchQueue(&store);
     defer deinitSharedNativeProvider(&store);
-    for (0..2) |_| {
+    for (0..5) |request| {
         var compute = try MetalCompute.init(a, &store, null);
         defer compute.deinit();
         compute.require_f32_linears = true;
         const cb = compute.computeBackend();
+        try std.testing.expect(try cb.audioStorage(true));
+        defer _ = cb.audioStorage(false) catch false;
         const weight = try cb.getWeight(key);
         defer cb.free(weight);
         const values: [33 * 35]f32 = @splat(0.25);
@@ -44052,11 +44583,111 @@ test "embeddinggemma2 Metal clipped linear selector reuses geometry across bound
         const retained = store.tier_cache.?.backend_bytes;
         var p = ops.ClippedLinearParams{ .rows = 33, .in_dim = 35, .out_dim = 39, .flags = 31, .input_min = -1, .input_max = 1, .output_min = -1, .output_max = 1 };
         if (try cb.clippedLinear(input, weight, p)) |out| cb.free(out);
-        try std.testing.expectEqual(@as(u64, 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
+        try std.testing.expectEqual(@as(u64, if (request < 2) 0 else 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
         p.input_min = -0.5;
         p.input_max = 0.5;
         if (try cb.clippedLinear(input, weight, p)) |out| cb.free(out);
-        try std.testing.expectEqual(@as(u64, 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
+        try std.testing.expectEqual(@as(u64, if (request < 2) 0 else 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
         try std.testing.expectEqual(retained, store.tier_cache.?.backend_bytes);
     }
+}
+
+test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and reclaims metadata" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = 16 * 1024 * 1024 });
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    const Run = struct {
+        cb: *const ops.ComputeBackend,
+        fn call(raw: *anyopaque, inputs: []const CT) !CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const sum = try self.cb.add(inputs[0], inputs[1]);
+            defer self.cb.free(sum);
+            const act = try self.cb.silu(sum);
+            defer self.cb.free(act);
+            return self.cb.add(act, act);
+        }
+    };
+    for (0..8) |request| {
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        const cb = compute.computeBackend();
+        const value: f32 = @floatFromInt(request + 1);
+        const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ value, value }, &.{ 1, 2 }));
+        defer cb.free(x);
+        const y = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 1 }, &.{ 1, 2 }));
+        defer cb.free(y);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
+        var run = Run{ .cb = &cb };
+        const result = (try cb.audioExecution(42, &.{ x, y }, &run, Run.call)) orelse try Run.call(&run, &.{ x, y });
+        defer cb.free(result);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        const z = value + 1;
+        for (actual) |v| try std.testing.expectApproxEqAbs(2 * z / (1 + @exp(-z)), v, 1e-5);
+        if (request >= 3) {
+            var replays: u64 = 0;
+            for (compute.provider_impl.audio_schedules) |entry| if (entry) |plan| {
+                replays += plan.replays;
+            };
+            try std.testing.expect(replays > 0);
+        }
+    }
+    // Four geometries remain bounded and pressure returns every metadata byte.
+    {
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        const cb = compute.computeBackend();
+        const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 2, 2 }, &.{ 1, 2 }));
+        defer cb.free(x);
+        const y = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 1 }, &.{ 1, 2 }));
+        defer cb.free(y);
+        var run = Run{ .cb = &cb };
+        const Check = struct {
+            fn call(raw: ?*anyopaque) anyerror!void {
+                const n: *usize = @ptrCast(@alignCast(raw.?));
+                n.* += 1;
+                if (n.* >= 3) return error.Cancelled;
+            }
+        };
+        var checks: usize = 0;
+        for (compute.provider_impl.audio_schedules) |entry| if (entry) |plan| {
+            plan.disabled = false;
+        };
+        var cancelled = cb;
+        cancelled.execution_control = .{ .ptr = &checks, .check_fn = Check.call, .native_call_policy = .in_process };
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        try std.testing.expectError(error.Cancelled, cancelled.audioExecution(42, &.{ x, y }, &run, Run.call));
+        try cb.decoderRuntimeCancelFrame();
+        try std.testing.expect(compute.audio_execution_control == null);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        const retry = (try cb.audioExecution(42, &.{ x, y }, &run, Run.call)) orelse try Run.call(&run, &.{ x, y });
+        cb.free(retry);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        // Alias relationships are part of the learned schedule contract.
+        try std.testing.expect(try cb.audioExecution(42, &.{ x, x }, &run, Run.call) == null);
+        for (100..108) |key| try std.testing.expect(try cb.audioExecution(key, &.{ x, y }, &run, Run.call) == null);
+        for (100..108) |key| if (try cb.audioExecution(key, &.{ x, y }, &run, Run.call)) |out| cb.free(out);
+        var count: usize = 0;
+        for (compute.provider_impl.audio_schedules) |entry| if (entry != null) {
+            count += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 4), count);
+        try std.testing.expectEqual(4 * @sizeOf(audio_tape.Plan), store.tier_cache.?.host_bytes);
+    }
+    const p = store.shared_metal_native_provider.?;
+    try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.audio) > 0);
+    for (p.audio_schedules) |entry| try std.testing.expect(entry == null);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
+    try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
 }
