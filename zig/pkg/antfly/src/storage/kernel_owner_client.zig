@@ -680,6 +680,26 @@ pub const Owner = struct {
     }
 
     /// Advisory physical binding, not a reservation, receipt or permission.
+    pub fn raftIndexClaims(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, command: @import("antfly_local_sources").storage_db_relational_index_owner_control.ClaimCommand, options: QueryOptions) !std.json.Parsed(?@import("antfly_local_sources").storage_db_relational_index_owner_control.DeliveredClaims) {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        try command.validate();
+        if (command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > native.max_claim_wire_bytes) return error.TransactionTooLarge;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_claims_json(self.handle, &.{ .table_name = .fromSlice(table_name), .command_json = .fromSlice(encoded), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerClaimsRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index claims observation");
+        if (response.bytes().len == 0 or response.bytes().len > native.max_response_bytes) return error.InvalidPrivateIndexClaimReceipt;
+        var parsed = try std.json.parseFromSlice(?native.DeliveredClaims, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        if (parsed.value) |outcome| try outcome.validateFor(command);
+        return parsed;
+    }
+
     pub fn raftIndexClaimSource(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_owner_control.Identity, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire) {
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         try identity.validate();

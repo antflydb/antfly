@@ -103,8 +103,21 @@ checkpoint-verified owner snapshot, preserves original Raft producer/consumption
 positions, and binds its signature to fresh metadata permission, the retained
 root lease and the actual completed host prefix. The shared producer decodes
 the authenticated canonical body; native adapters/signers still reject Raft
-observations. This is not complete public activation: the worker's Raft cohort
-guard, claim acceptance/consumption and later publication paths
+observations. Target claim RPCs now independently authorize metadata scope,
+pin the physical owner, propose through the existing all-member/term barrier,
+and recover every member's exact value and original inventory cut. The bounded
+read-only observation adds no per-batch ledger or native-clock approximation;
+signed delivery records use explicit native/Raft positions. Live metadata proof
+verification checks either authority against its real current owner placement.
+The Raft source receiver reconstructs complete delivery from its leased,
+decoded batch and fresh metadata routes using the shared coverage verifier.
+Missing or duplicate byte-split partitions cannot produce a closure; signing
+also checks the actual completed Raft prefix at the retained physical root.
+Byte-split partitions for one target retain identical bindings and disjoint
+row masks. Metadata combines their inventory contributions in one target
+update, with one target-batch count and O(parts + destinations) work.
+This is not complete public activation: the worker's Raft cohort guard,
+metadata source acceptance/consumption and later publication paths
 remain unfinished, and public CREATE remains guarded. No original case is
 closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's

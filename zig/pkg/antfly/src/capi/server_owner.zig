@@ -4240,6 +4240,45 @@ pub fn storageOwnerRaftIndexSourceJson(owner: ?*anyopaque, request: *const kerne
     return .ok;
 }
 
+pub fn storageOwnerRaftIndexClaimsJson(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftIndexOwnerClaimsRequest, out_response: *kernel_owner_abi.OwnedBytes, out_failure: *kernel_owner_abi.FailureIdentity) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftIndexOwnerClaimsRequest.operation);
+            return out.status;
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.command_json.ptr == null or request.command_json.len == 0 or request.command_json.len > native.max_claim_wire_bytes or
+        request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    _ = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
+    defer if (budget) |*value| value.deinit();
+    const alloc = if (budget) |*value| value.allocator() else handle.alloc;
+    var parsed = std.json.parseFromSlice(native.ClaimCommand, alloc, request.command_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| {
+        if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
+        return Failure.result(if (err == error.OutOfMemory) err else error.InvalidArgument, out_failure);
+    };
+    defer parsed.deinit();
+    const result = handle.db.observeRaftIndexClaims(alloc, handle.storage_owner_group_id, parsed.value, context) catch |err| {
+        if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
+        return Failure.result(err, out_failure);
+    };
+    var response = BoundedOwnerJsonResponse(native.max_response_bytes).initSized(result) catch |err| return Failure.result(err, out_failure);
+    defer response.deinit();
+    const used = response.encode(result) catch |err| return Failure.result(err, out_failure);
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    out_response.* = response.detach(used);
+    return .ok;
+}
+
 const RaftSchemaPreparation = struct {
     owner_id: *anyopaque,
     owner: *Handle,

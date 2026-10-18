@@ -1636,6 +1636,40 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     try std.testing.expectEqual(@as(u64, 5), (try decoded_source.batch.?.header.orderedPosition()).raft.index);
     try std.testing.expectEqual(@as(u64, 5), (try handle.db.orderedApplyReceipt()).?.index);
     _ = try decoded_source.digest();
+    // Supplied-entry target qualification, not a complete source closure.
+    const native = local.storage_db_relational_index_owner_control;
+    const claim_command: native.ClaimCommand = .{ .binding = recovered.binding.?, .claims = &.{.{ .tuple = "target-tuple", .parent_table = "items", .parent_key = "row", .schema_version = 2 }} };
+    const claim_json = try std.json.Stringify.valueAlloc(a, claim_command, .{});
+    defer a.free(claim_json);
+    const Claims = struct {
+        fn call(owner: ?*anyopaque, input: kernel_owner_abi.RaftIndexOwnerClaimsRequest, expected: native.ClaimCommand) !?native.DeliveredClaims {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexClaimsJson(owner, &input, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            var parsed = try std.json.parseFromSlice(?native.DeliveredClaims, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            if (parsed.value) |outcome| try outcome.validateFor(expected);
+            return parsed.value;
+        }
+    };
+    const claim_input: kernel_owner_abi.RaftIndexOwnerClaimsRequest = .{ .table_name = .fromSlice("items"), .command_json = .fromSlice(claim_json) };
+    try std.testing.expect(try Claims.call(id, claim_input, claim_command) == null);
+    try std.testing.expectEqual(@as(u64, 5), (try handle.db.orderedApplyReceipt()).?.index);
+    var claims = try handle.db.prepareNativeIndexOwnerClaims(claim_command);
+    defer claims.deinit();
+    try handle.db.applyCommittedRaftIndexClaims(&claims, 11, .{ .term = 3, .index = 6 });
+    const delivered = (try Claims.call(id, claim_input, claim_command)).?;
+    try std.testing.expect(delivered.duplicate and delivered.claims_added == 0);
+    try std.testing.expectEqual(@as(u64, 6), delivered.position.raft.index);
+    try handle.db.applyCommittedRaftIndexClaims(&claims, 11, .{ .term = 4, .index = 7 });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    const retained_delivery = (try Claims.call(id, claim_input, claim_command)).?;
+    try std.testing.expectEqualDeep(delivered, retained_delivery);
+    try std.testing.expectEqual(@as(u64, 7), (try handle.db.orderedApplyReceipt()).?.index);
 }
 
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {

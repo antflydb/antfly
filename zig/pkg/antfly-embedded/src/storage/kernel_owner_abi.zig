@@ -1266,6 +1266,19 @@ pub extern fn antfly_storage_owner_raft_index_source_json(
     out_response: *OwnedBytes,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
+pub const RaftIndexOwnerClaimsRequest = extern struct {
+    pub const operation: u32 = 5;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    command_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_index_claims_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerClaimsRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
 pub const NativeIndexOwnerControlRequest = extern struct {
     version: u32 = abi_version,
     operation: NativeIndexOwnerOperation,

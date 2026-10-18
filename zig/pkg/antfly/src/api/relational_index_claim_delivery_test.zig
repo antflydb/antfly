@@ -55,7 +55,11 @@ fn testBinding(owner: progress.Owner) jobs.Binding {
 fn testHeader(prepared: *const Source.PreparedSource, binding: jobs.Binding) !Source.Header {
     var raw = prepared.header;
     std.mem.writeInt(u64, raw[104..112], 1, .little);
-    @memcpy(raw[112..145], &try (local.storage_db_receipt_position.Position{ .native = .{ .namespace = binding.fence.namespace, .sequence = 4 } }).encode());
+    const position: local.storage_db_receipt_position.Position = switch (binding.authority) {
+        .native => .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 4 } },
+        .raft => .{ .raft = .{ .term = 2, .index = 4 } },
+    };
+    @memcpy(raw[112..145], &try position.encode());
     std.crypto.hash.Blake3.hash(raw[0..288], raw[288..320], .{});
     return Source.Header.decode(&raw, binding, 1);
 }
@@ -94,8 +98,15 @@ test "relational index publication claim delivery cohort owns exact membership a
 }
 
 test "relational index publication claim delivery splits actual target bytes and proves exact coverage" {
+    try splitDelivery(.native);
+    try splitDelivery(.raft);
+}
+
+fn splitDelivery(authority: progress.Authority) !void {
     const alloc = std.testing.allocator;
-    var cohort = try Cohort.init(alloc, &.{.{ .owner = testOwner(0, 11) }});
+    var owner = testOwner(0, 11);
+    owner.authority = authority;
+    var cohort = try Cohort.init(alloc, &.{.{ .owner = owner }});
     defer cohort.deinit();
     const binding = testBinding(cohort.targets[0].owner);
     const scope: Source.Scope = .{ .table_name = "items", .generation = @splat(1), .schema_version = 2, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false };
@@ -129,22 +140,88 @@ test "relational index publication claim delivery splits actual target bytes and
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
     const native_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
+    var delivered: [2]@import("../metadata/relational_index_source_delivery.zig").Delivered = undefined;
     for (0..plan.group_count) |i| {
         const command: control.ClaimCommand = .{ .binding = binding, .claims = try plan.groupClaims(i) };
-        const outcome: control.ClaimOutcome = .{ .binding = binding, .claims_digest = try command.digest(), .position = .{ .namespace = binding.fence.namespace, .sequence = 8 + i }, .duplicate = false, .claims_added = 1 };
+        const outcome: control.DeliveredClaims = .{ .binding = binding, .claims_digest = try command.digest(), .position = switch (authority) {
+            .native => .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 8 + i } },
+            .raft => .{ .raft = .{ .term = 3, .index = 8 + i } },
+        }, .duplicate = false, .claims_added = 1 };
         const signed: publication.SignedClaimDelivery = .{ .outcome = outcome, .proof = try (publication.RootProof{
             .identity = .{ .metadata_incarnation = native_binding.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
             .reporter_incarnation = 4,
-            .authority = .{ .native = try native_binding.digest() },
+            .authority = switch (authority) {
+                .native => .{ .native = try native_binding.digest() },
+                .raft => .{ .raft = 17 },
+            },
             .root_generation = 9,
             .signature = undefined,
         }).sign(root, try outcome.deliveryDigest()) };
+        delivered[i] = .{ .index = @intCast(i), .signed = signed };
         try signed.verifyPartition(&plan, &cohort, i);
         // Both byte-split partitions have the same target. One target's valid
         // signature cannot acknowledge a different subset from that target.
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, signed.verifyPartition(&plan, &cohort, 1 - i));
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, signed.verifyPartition(&plan, &cohort, plan.group_count));
     }
+    const source_delivery = @import("../metadata/relational_index_source_delivery.zig");
+    var subset = try delivery.Subset.init(alloc, owner, 1, cohort.targets);
+    defer subset.deinit();
+    var read: control.SourceRead = .{ .binding = binding, .batch = try Source.OwnedBatch.takePayload(alloc, binding, view.header, try alloc.dupe(u8, prepared.payload)) };
+    defer read.deinit();
+    const closure: source_delivery.Request = .{ .ordinal = 1, .batch_digest = view.header.digest(), .targets = .{ .items = &delivered } };
+    var complete = try source_delivery.prepare(alloc, &read, &subset, closure, .{});
+    defer complete.deinit();
+    _ = try complete.data.digest();
+    if (authority == .native) {
+        // Qualify bounded inventory aggregation, not live owner enrollment;
+        // the metadata-store integration tests verify that independently.
+        const journal = @import("../metadata/relational_index_delivery_journal.zig");
+        const Reader = struct {
+            owner_key: []const u8,
+            owner_bytes: [progress.OwnerState.encoded_len]u8,
+            reads: usize = 0,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                self.reads += 1;
+                if (std.mem.eql(u8, key, self.owner_key)) return &self.owner_bytes;
+                return error.NotFound;
+            }
+        };
+        const Authority = struct {
+            pub fn verifyDelivery(_: @This(), _: anytype, _: u64, signed: source_delivery.Signed) !Digest {
+                try signed.verify();
+                return signed.proof.commitment(try signed.data.digest());
+            }
+            pub fn verifyConsumption(_: @This(), _: anytype, _: u64, _: jobs.Binding, _: journal.Consumed) !void {
+                return error.InvalidPrivateIndexClaimReceipt;
+            }
+        };
+        var state: progress.OwnerState = .{ .owner = owner, .flags = 3, .position = .{ .native = .{ .namespace = owner.namespace, .sequence = 3 } } };
+        state.receipts[0] = @splat(1);
+        state.receipts[1] = @splat(2);
+        var key_buf: [192]u8 = undefined;
+        var reader: Reader = .{ .owner_key = try publication.ownerKey(&key_buf, 13, owner.namespace.table_id, owner.ordinal), .owner_bytes = try state.encode() };
+        const signed: source_delivery.Signed = .{ .data = complete.data, .proof = try delivered[0].signed.proof.sign(root, try complete.data.digest()) };
+        var accepted = try journal.prepare(alloc, &reader, 13, .{ .signed = signed }, Authority{});
+        defer accepted.deinit();
+        try std.testing.expectEqual(@as(usize, 1), accepted.targets.len);
+        try std.testing.expectEqual(@as(usize, 3), reader.reads);
+        const inventory = (try journal.TargetRecord.decode(&accepted.targets[0].bytes)).inventory;
+        try std.testing.expectEqual(@as(u64, 2), inventory.rows);
+        try std.testing.expectEqual(@as(u64, 1), inventory.batches);
+        var expected: Digest = @splat(0);
+        for (complete.data.parts.items) |part| for (&expected, part.inventory_xor) |*byte, contribution| {
+            byte.* ^= contribution;
+        };
+        try std.testing.expectEqual(expected, inventory.inventory_xor);
+    }
+    var incomplete = closure;
+    incomplete.targets.items = delivered[0..1];
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, source_delivery.prepare(alloc, &read, &subset, incomplete, .{}));
+    var duplicate = delivered;
+    duplicate[1] = duplicate[0];
+    incomplete.targets.items = &duplicate;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, source_delivery.prepare(alloc, &read, &subset, incomplete, .{}));
     var wrong = binding;
     wrong.integrity_reserved[0] ^= 1;
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, plan.requireTarget(&cohort, 0, wrong));
@@ -266,7 +343,7 @@ test "relational index publication maximum typed delivery footprint fits its tra
     const binding = testBinding(testOwner(0, 1));
     const proof: publication.RootProof = .{ .identity = .{ .metadata_incarnation = @splat(1), .node_id = 1, .store_id = 1, .root_incarnation = 1, .public_key = @splat(1) }, .reporter_incarnation = 1, .authority = .{ .native = @splat(1) }, .root_generation = 1, .signature = @splat(1) };
     var parts: [complete.max_parts]complete.Part = undefined;
-    for (&parts) |*part| part.* = widestJson(complete.Part, .{ .index = 0, .rows = 1, .row_mask = @splat(0), .inventory_xor = @splat(1), .target = .{ .outcome = .{ .binding = binding, .claims_digest = @splat(1), .position = .{ .namespace = binding.fence.namespace, .sequence = 1 }, .duplicate = false, .claims_added = 1 }, .proof = proof } });
+    for (&parts) |*part| part.* = widestJson(complete.Part, .{ .index = 0, .rows = 1, .row_mask = @splat(0), .inventory_xor = @splat(1), .target = .{ .outcome = .{ .binding = binding, .claims_digest = @splat(1), .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 1 } }, .duplicate = false, .claims_added = 1 }, .proof = proof } });
     const signed = widestJson(complete.Signed, .{ .data = .{ .source = binding, .header = .{ .bytes = @splat(0) }, .routes_digest = @splat(1), .parts = .{ .items = &parts } }, .proof = proof });
     const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, signed, .{});
     defer std.testing.allocator.free(bytes);

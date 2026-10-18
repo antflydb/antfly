@@ -533,15 +533,21 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
     const source_bytes = try SourceRecord.encode(alloc, head, request.signed);
     errdefer alloc.free(source_bytes);
     source_owner.source_delivery = hash(source_bytes);
-    const targets = try alloc.alloc(TargetUpdate, data.parts.items.len);
+    // Parts are canonical and same-destination byte splits are adjacent.
+    // Update each owner once, regardless of how many partitions it received.
+    var target_count: usize = 0;
+    for (data.parts.items, 0..) |part, i| {
+        if (i == 0 or part.target.outcome.binding.ordinal != data.parts.items[i - 1].target.outcome.binding.ordinal) target_count += 1;
+    }
+    const targets = try alloc.alloc(TargetUpdate, target_count);
     errdefer alloc.free(targets);
-    const owners = try alloc.alloc(OwnerUpdate, data.parts.items.len + 1);
+    const owners = try alloc.alloc(OwnerUpdate, target_count + 1);
     errdefer alloc.free(owners);
-    var seen: [local.storage_db_relational_index_publication_progress.max_owners]bool = @splat(false);
-    for (data.parts.items, targets) |part, *target| {
-        const binding = part.target.outcome.binding;
-        if (seen[binding.ordinal]) return error.InvalidPrivateIndexClaimReceipt;
-        seen[binding.ordinal] = true;
+    var first: usize = 0;
+    for (targets, 0..) |*target, target_index| {
+        const binding = data.parts.items[first].target.outcome.binding;
+        var end = first + 1;
+        while (end < data.parts.items.len and data.parts.items[end].target.outcome.binding.ordinal == binding.ordinal) : (end += 1) {}
         const target_digest = try bindingDigest(binding);
         var owner = if (binding.ordinal == data.source.ordinal) source_owner else try progress.OwnerState.decode(try txn.get(try publication.ownerKey(&buf, group, data.source.fence.namespace.table_id, binding.ordinal)));
         var inventory: Inventory = if (try optional(txn, try targetKey(&buf, group, data.source.fence.namespace.table_id, binding.ordinal))) |bytes| blk: {
@@ -552,23 +558,26 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
             break :blk .{ .metadata_incarnation = incarnation, .binding_digest = target_digest, .rows = 0, .batches = 0, .inventory_xor = @splat(0), .provenance = @splat(0) };
         };
         if (!equal(inventory.metadata_incarnation, incarnation) or !equal(inventory.binding_digest, target_digest)) return error.PrivateIndexOwnerJobChanged;
-        inventory.rows = std.math.add(u64, inventory.rows, part.rows) catch return error.InvalidPrivateIndexClaimInventory;
         inventory.batches = std.math.add(u64, inventory.batches, 1) catch return error.InvalidPrivateIndexClaimInventory;
-        for (&inventory.inventory_xor, part.inventory_xor) |*byte, contribution| byte.* ^= contribution;
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly/private-unique-target-provenance/v1");
-        state.update(&inventory.provenance);
-        state.update(&head.decision_digest);
-        state.update(&try part.target.commitment());
-        state.update(&part.row_mask);
-        state.update(&part.inventory_xor);
-        state.final(&inventory.provenance);
+        for (data.parts.items[first..end]) |part| {
+            inventory.rows = std.math.add(u64, inventory.rows, part.rows) catch return error.InvalidPrivateIndexClaimInventory;
+            for (&inventory.inventory_xor, part.inventory_xor) |*byte, contribution| byte.* ^= contribution;
+            var state = std.crypto.hash.Blake3.init(.{});
+            state.update("antfly/private-unique-target-provenance/v1");
+            state.update(&inventory.provenance);
+            state.update(&head.decision_digest);
+            state.update(&try part.target.commitment());
+            state.update(&part.row_mask);
+            state.update(&part.inventory_xor);
+            state.final(&inventory.provenance);
+        }
         target.* = .{ .ordinal = binding.ordinal, .bytes = try (TargetRecord{ .binding = binding, .inventory = inventory }).encode() };
         owner.target_inventory = hash(&target.bytes);
         if (binding.ordinal == data.source.ordinal) source_owner = owner;
-        owners[part.index] = .{ .ordinal = binding.ordinal, .bytes = try owner.encode() };
+        owners[target_index] = .{ .ordinal = binding.ordinal, .bytes = try owner.encode() };
+        first = end;
     }
-    owners[data.parts.items.len] = .{ .ordinal = data.source.ordinal, .bytes = try source_owner.encode() };
+    owners[target_count] = .{ .ordinal = data.source.ordinal, .bytes = try source_owner.encode() };
     return .{ .alloc = alloc, .table_id = data.source.fence.namespace.table_id, .ordinal = data.source.ordinal, .head = head, .head_bytes = head_bytes, .source_bytes = source_bytes, .targets = targets, .owners = owners, .changed = true };
 }
 

@@ -2341,6 +2341,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     const first_claim: Integrity.Claim = .{ .tuple = first.command.candidates[0].unique_tuple.?, .parent_table = "usage_records", .parent_key = "a", .schema_version = binding.physical_candidate.schema_version };
     var target = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{first_claim} });
     defer target.deinit();
+    try std.testing.expect(try db.observeRaftIndexClaims(alloc, 11, target.command, .{}) == null);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Claims.allocations, .{ &db, target.command });
     try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .claims = target.command }).validate());
     try std.testing.expectError(error.InvalidControlReceiptPosition, target.preparePayload());
@@ -2372,6 +2373,9 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try std.testing.expectEqual(@as(u64, 70), (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
     }
     try Wire.apply(&db, .{ .claims = target.command }, .{ .term = 7, .index = 80 });
+    const observed_target = (try db.observeRaftIndexClaims(alloc, 11, target.command, .{})).?;
+    try observed_target.validateFor(target.command);
+    try std.testing.expectEqual(@as(u64, 80), observed_target.position.raft.index);
     const inventory_key = claim_store.inventoryKey(target.batch.entries[0].address);
     const original_inventory = try db.core.store.get(alloc, &inventory_key);
     defer alloc.free(original_inventory);
@@ -2392,6 +2396,9 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     try db.applyCommittedRaftIndexClaims(&second_target, 11, .{ .term = 8, .index = 95 });
     var regrouped = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{ second_claim, first_claim, first_claim } });
     defer regrouped.deinit();
+    const regrouped_read = (try db.observeRaftIndexClaims(alloc, 11, regrouped.command, .{})).?;
+    try regrouped_read.validateFor(regrouped.command);
+    try std.testing.expectEqual(@as(u64, 95), regrouped_read.position.raft.index);
     {
         var txn = try db.core.store.beginWriteTxn();
         defer txn.abort();

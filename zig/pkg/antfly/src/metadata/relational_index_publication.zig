@@ -246,9 +246,9 @@ pub const SignedSourceBatch = struct {
     /// accepting transaction need not hash the complete body a second time.
     pub fn verifiedDigest(self: SignedSourceBatch, read: *const native_control.SourceRead) !Digest {
         const batch = if (read.batch) |*value| value else return error.InvalidPrivateIndexClaimReceipt;
-        if (self.proof.authority != .native or !std.mem.eql(u8, &try self.binding.encode(), &try read.binding.encode()) or
+        if ((self.proof.authority == .native) != (read.binding.authority == .native) or !std.mem.eql(u8, &try self.binding.encode(), &try read.binding.encode()) or
             !std.mem.eql(u8, &self.header.bytes, &batch.header.bytes)) return error.InvalidPrivateIndexClaimReceipt;
-        (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
         const logical_digest = try read.digest();
         self.proof.verify(logical_digest) catch return error.InvalidPrivateIndexClaimReceipt;
         return logical_digest;
@@ -263,13 +263,13 @@ pub const SignedSourceBatch = struct {
 /// Verification must additionally read current enrollment, placement, root and
 /// observed cut in the transaction that will accept the delivery.
 pub const SignedClaimDelivery = struct {
-    outcome: native_control.ClaimOutcome,
+    outcome: native_control.DeliveredClaims,
     proof: RootProof,
 
     pub fn verifyFor(self: SignedClaimDelivery, command: native_control.ClaimCommand) !void {
         try self.outcome.validateFor(command);
-        if (self.proof.authority != .native) return error.InvalidPrivateIndexClaimReceipt;
-        (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch
+        if ((self.proof.authority == .native) != (self.outcome.binding.authority == .native)) return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch
             return error.InvalidPrivateIndexClaimReceipt;
         self.proof.verify(try self.outcome.deliveryDigest()) catch return error.InvalidPrivateIndexClaimReceipt;
     }
@@ -292,9 +292,9 @@ pub const SignedClaimDelivery = struct {
 
     pub fn validateRecordedShape(self: SignedClaimDelivery, logical_rows: usize) !void {
         if (logical_rows == 0 or logical_rows > local.storage_db_relational_index_owner_job.private_claims.max_claims or
-            self.outcome.claims_added > logical_rows or self.outcome.duplicate != (self.outcome.claims_added == 0) or self.proof.authority != .native)
+            self.outcome.claims_added > logical_rows or self.outcome.duplicate != (self.outcome.claims_added == 0) or (self.proof.authority == .native) != (self.outcome.binding.authority == .native))
             return error.InvalidPrivateIndexClaimReceipt;
-        (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority == .native) (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
         _ = try self.outcome.deliveryDigest();
     }
 };
@@ -1120,6 +1120,18 @@ pub const OwnerDecision = struct {
         return (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try wire.headerCommitment());
     }
 
+    /// Complete coverage is reconstructed from the leased source body before
+    /// signing. Metadata independently rechecks each target's live authority
+    /// when accepting this statement; a source signature cannot grant it.
+    pub fn signRaftClosure(self: OwnerDecision, request: OwnerRequest, data: @import("relational_index_source_delivery.zig").Data, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !RootProof {
+        _ = try self.raftBuild(request, data.source, .{});
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        const position = try data.header.orderedPosition();
+        if (position != .raft or position.raft.term > actual.leader_term or position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        return (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try data.digest());
+    }
+
     fn executionIdentity(self: OwnerDecision, request: OwnerRequest, authority: progress.Authority) !raft_control.Identity {
         if (self.disposition != .execute) return error.InvalidGenerationPublication;
         try self.requireRequest(request);
@@ -1233,6 +1245,28 @@ pub const OwnerDecision = struct {
         const identity = try self.raftExecutionIdentity(request);
         try self.requireRetainedBinding(observed, .raft);
         return raft_control.BuildRequest.initRaft(identity, observed, budget);
+    }
+
+    pub fn raftClaims(self: OwnerDecision, request: OwnerRequest, binding: local.storage_db_relational_index_owner_job.Binding, claims: @FieldType(native_control.ClaimCommand, "claims")) !native_control.ClaimCommand {
+        _ = try self.raftBuild(request, binding, .{});
+        const command: native_control.ClaimCommand = .{ .binding = binding, .claims = claims };
+        try command.validate();
+        return command;
+    }
+
+    pub fn requireRaftClaimsProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: native_control.ClaimCommand) !void {
+        _ = try self.raftClaims(request, command.binding, command.claims);
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+    }
+
+    pub fn signRaftClaims(self: OwnerDecision, request: OwnerRequest, command: native_control.ClaimCommand, outcome: native_control.DeliveredClaims, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !RootProof {
+        _ = try self.raftClaims(request, command.binding, command.claims);
+        try outcome.validateFor(command);
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        if (outcome.position != .raft or outcome.position.raft.term > actual.leader_term or outcome.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        return (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try outcome.deliveryDigest());
     }
 
     pub fn requireRaftBuildProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: local.storage_db_relational_index_jobs.Page.PrivateCommand) !void {
@@ -2876,6 +2910,33 @@ test "relational index publication Raft decisions bind immutable admission and e
     source_b64[0] = if (original_byte == 'A') 'B' else 'A';
     try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, source_response.raft_source.decodeSignedRaft(a, source_request));
     source_b64[0] = original_byte;
+    const claim_command = try source_permission.raftClaims(build_lookup, reserved, &.{.{ .tuple = "target-tuple", .parent_table = dispatch.value.table_name, .parent_key = "row", .schema_version = 2 }});
+    const delivered: native_control.DeliveredClaims = .{ .binding = reserved, .claims_digest = try claim_command.digest(), .position = .{ .raft = .{ .term = 7, .index = 4 } }, .duplicate = true };
+    source_scope.completed_index = 4;
+    const claim_proof = try source_permission.signRaftClaims(build_lookup, claim_command, delivered, source_scope, root);
+    const claim_request: execution.ClaimRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .claims = claim_command.claims };
+    const claim_response: execution.ClaimResponse = .{ .raft_applied = .{ .root_generation = source_scope.root_generation, .outcome = delivered, .signed_delivery = claim_proof } };
+    try claim_response.validate(claim_request);
+    try (try claim_response.requireSignedDelivery(claim_request)).verifyFor(claim_command);
+    var bad_claim = claim_response;
+    bad_claim.raft_applied.outcome.position = .{ .native = .{ .namespace = reserved.fence.namespace, .sequence = 4 } };
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, bad_claim.validate(claim_request));
+    source_scope.completed_index = 3;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, source_permission.signRaftClaims(build_lookup, claim_command, delivered, source_scope, root));
+    const source_delivery = @import("relational_index_source_delivery.zig");
+    var empty_routes = try local.storage_db_relational_index_owner_job.private_claims.delivery.Subset.init(a, source_permission.owner.owner, source_permission.head.owner_count, &.{});
+    defer empty_routes.deinit();
+    const closure: source_delivery.Request = .{ .ordinal = 1, .batch_digest = wire.header.?.digest(), .targets = .{ .items = &.{} } };
+    var closed = try source_delivery.prepare(a, &source_body, &empty_routes, closure, .{});
+    defer closed.deinit();
+    source_scope.completed_index = 4;
+    const closure_proof = try source_permission.signRaftClosure(build_lookup, closed.data, source_scope, root);
+    const closure_request: execution.ClaimRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .closure = closure };
+    const closure_response: execution.ClaimResponse = .{ .closed = .{ .root_generation = source_scope.root_generation, .data = closed.data, .proof = closure_proof } };
+    try closure_response.validate(closure_request);
+    try (source_delivery.Signed{ .data = closed.data, .proof = closure_proof }).verify();
+    source_scope.completed_index = 3;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, source_permission.signRaftClosure(build_lookup, closed.data, source_scope, root));
     decision.disposition = .acknowledged;
     try std.testing.expectError(error.InvalidGenerationPublication, decision.raftControl(reserve_request, reserved));
     try dispatch.value.requireBinding(decision.head, decision.owner.owner, reserved, .raft, decision.metadata_incarnation);

@@ -836,8 +836,16 @@ test "relational index publication native source consumption request excludes ca
 
 /// Borrowed wire view; the owning ClaimResult must outlive serialization.
 /// A physical progress response is never a signed build-completion receipt.
+pub const RaftClaimResponse = struct {
+    root_generation: u64,
+    outcome: native.DeliveredClaims,
+    signed_delivery: ?publication.RootProof = null,
+    signing_failure: ?SigningFailure = null,
+};
+
 pub const ClaimResponse = union(enum) {
     acknowledged,
+    raft_applied: RaftClaimResponse,
     consumed: struct { root_generation: u64, outcome: native.ConsumeOutcome, proof: ?publication.RootProof = null, signing_failure: ?SigningFailure = null },
     closed: struct { data: source_delivery.Data, root_generation: u64, proof: ?publication.RootProof = null, signing_failure: ?SigningFailure = null },
     applied: struct {
@@ -852,10 +860,11 @@ pub const ClaimResponse = union(enum) {
     /// consumer must still verify current metadata authority independently.
     pub fn requireSignedDelivery(self: ClaimResponse, request: ClaimRequest) !publication.SignedClaimDelivery {
         try self.validate(request);
+        if (self == .raft_applied) return .{ .outcome = self.raft_applied.outcome, .proof = self.raft_applied.signed_delivery orelse return error.InvalidPrivateIndexClaimReceipt };
         if (self != .applied) return error.InvalidPrivateIndexClaimReceipt;
         const value = self.applied;
         return .{
-            .outcome = value.outcome,
+            .outcome = try native.DeliveredClaims.fromNative(value.outcome),
             .proof = value.signed_delivery orelse return error.InvalidPrivateIndexClaimReceipt,
         };
     }
@@ -874,6 +883,17 @@ pub const ClaimResponse = union(enum) {
         try request.validate(request.group_id);
         switch (self) {
             .acknowledged => {},
+            .raft_applied => |value| {
+                const b = value.outcome.binding;
+                if (request.closure != null or request.consume != null or value.root_generation == 0 or b.authority != .raft or
+                    !std.mem.eql(u8, &b.id, &request.id) or b.fence.owner_group_id != request.group_id or b.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexClaimReceipt;
+                const command: native.ClaimCommand = .{ .binding = b, .claims = request.claims };
+                try value.outcome.validateFor(command);
+                if (value.signed_delivery) |proof| {
+                    if (value.signing_failure != null or proof.authority != .raft or proof.root_generation != value.root_generation) return error.InvalidPrivateIndexClaimReceipt;
+                    try (publication.SignedClaimDelivery{ .outcome = value.outcome, .proof = proof }).verifyFor(command);
+                }
+            },
             .consumed => |value| {
                 const wanted = request.consume orelse return error.InvalidPrivateIndexClaimReceipt;
                 const binding = value.outcome.binding;
@@ -909,7 +929,7 @@ pub const ClaimResponse = union(enum) {
                 if (value.signed_delivery) |proof| {
                     if (value.signing_failure != null or proof.root_generation != value.root_generation or proof.authority != .native)
                         return error.InvalidPrivateIndexClaimReceipt;
-                    try (publication.SignedClaimDelivery{ .outcome = value.outcome, .proof = proof }).verifyFor(.{ .binding = binding, .claims = request.claims });
+                    try (publication.SignedClaimDelivery{ .outcome = try native.DeliveredClaims.fromNative(value.outcome), .proof = proof }).verifyFor(.{ .binding = binding, .claims = request.claims });
                 } else try value.outcome.validateFor(.{ .binding = binding, .claims = request.claims });
             },
         }
@@ -935,6 +955,8 @@ pub const ClaimPort = struct {
 
 pub const ClaimResult = union(enum) {
     acknowledged,
+    raft_applied: RaftClaimResponse,
+    raft_closed: struct { root_generation: u64, owned: source_delivery.Owned, proof: ?publication.RootProof = null, signing_failure: ?SigningFailure = null },
     consumed: struct {
         root_generation: u64,
         pinned_root_generation: u64,
@@ -955,7 +977,7 @@ pub const ClaimResult = union(enum) {
 
     pub fn needsSigning(self: *const ClaimResult) bool {
         return switch (self.*) {
-            .acknowledged => false,
+            .acknowledged, .raft_applied, .raft_closed => false,
             .consumed => |value| value.expected_digest != null and value.proof == null and !value.outcome.value.replication_pending and value.outcome.value.error_name == null,
             .closed => |value| value.proof == null,
             .applied => |value| value.signing != null and value.signed_delivery == null and
@@ -1026,7 +1048,8 @@ pub const ClaimResult = union(enum) {
 
     pub fn deinit(self: *ClaimResult) void {
         switch (self.*) {
-            .acknowledged => {},
+            .acknowledged, .raft_applied => {},
+            .raft_closed => |*value| value.owned.deinit(),
             .closed => |*value| value.owned.deinit(),
             .consumed => |value| value.outcome.deinit(),
             .applied => |value| value.outcome.deinit(),
@@ -1037,6 +1060,8 @@ pub const ClaimResult = union(enum) {
     pub fn response(self: *const ClaimResult) ClaimResponse {
         return switch (self.*) {
             .acknowledged => .acknowledged,
+            .raft_applied => |value| .{ .raft_applied = value },
+            .raft_closed => |*value| .{ .closed = .{ .root_generation = value.root_generation, .data = value.owned.data, .proof = value.proof, .signing_failure = value.signing_failure } },
             .consumed => |value| .{ .consumed = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .proof = value.proof, .signing_failure = value.signing_failure } },
             .closed => |*value| .{ .closed = .{ .root_generation = value.root_generation, .data = value.owned.data, .proof = value.proof, .signing_failure = value.signing_failure } },
             .applied => |value| .{ .applied = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_delivery = value.signed_delivery, .signing_failure = value.signing_failure } },
@@ -2881,7 +2906,7 @@ test "relational index publication claim receiver binds fresh build permission w
             const row = decoded.batch.?.rows()[0];
             const target_command: native.ClaimCommand = .{ .binding = decoded.binding, .claims = &.{.{ .tuple = row.tuple, .parent_table = decoded.batch.?.scope.table_name, .parent_key = row.key, .schema_version = decoded.binding.physical_candidate.schema_version }} };
             const target_outcome: native.ClaimOutcome = .{ .binding = decoded.binding, .claims_digest = try target_command.digest(), .position = .{ .namespace = decoded.binding.fence.namespace, .sequence = 3 }, .duplicate = false, .claims_added = 1 };
-            const target_signed: publication.SignedClaimDelivery = .{ .outcome = target_outcome, .proof = try response.signed_source.?.sign(root, try target_outcome.deliveryDigest()) };
+            const target_signed: publication.SignedClaimDelivery = .{ .outcome = try native.DeliveredClaims.fromNative(target_outcome), .proof = try response.signed_source.?.sign(root, try target_outcome.deliveryDigest()) };
             const close_request: ClaimRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .closure = .{ .ordinal = 1, .batch_digest = decoded.batch.?.header.digest(), .targets = .{ .items = &.{.{ .index = 0, .signed = target_signed }} } } };
             const encoded_close = try std.json.Stringify.valueAlloc(alloc, close_request, .{});
             defer alloc.free(encoded_close);

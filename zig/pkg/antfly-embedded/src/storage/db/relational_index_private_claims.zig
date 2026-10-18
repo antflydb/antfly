@@ -1119,6 +1119,29 @@ pub const Prepared = struct {
         return .{ .position = result.position.native, .duplicate = result.duplicate, .claims_added = result.claims_added };
     }
 
+    /// Read-only delivery recovery. Every selected member must still have its
+    /// exact value and original inventory cut; absence grants no receipt.
+    pub fn observedPosition(self: *const Prepared, txn: anytype) !?Position {
+        try jobs.requireReserved(txn, self.binding);
+        const allocation = try requireRegistered(txn, self.binding);
+        const provenance = try Provenance.init(txn, self.binding);
+        var maximum: ?Position = null;
+        for (self.entries) |entry| {
+            if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
+            const actual = try optional(txn, &entry.address.claimKey());
+            if (actual) |value| {
+                if (!std.mem.eql(u8, value, entry.value)) return error.UniqueConstraintViolation;
+                const position = (try checkInventoryPosition(txn, entry.address, entry.value, provenance)).?;
+                if (maximum) |cut| if (positionNumber(position) == positionNumber(cut) and !std.meta.eql(position, cut)) return error.InvalidPrivateIndexClaimInventory;
+                if (maximum == null or positionNumber(position) > positionNumber(maximum.?)) maximum = position;
+            } else {
+                _ = try checkInventoryPosition(txn, entry.address, null, provenance);
+                return null;
+            }
+        }
+        return maximum orelse return error.InvalidPrivateIndexClaimInventory;
+    }
+
     pub fn stageAt(self: *const Prepared, txn: anytype, replay: ?Position) !struct { position: Position, duplicate: bool, claims_added: usize } {
         if (self.binding.authority == .raft and replay == null) return error.InvalidControlReceiptPosition;
         try jobs.requireReserved(txn, self.binding);

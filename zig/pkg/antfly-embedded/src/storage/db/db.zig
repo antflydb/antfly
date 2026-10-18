@@ -8685,6 +8685,27 @@ pub const DB = struct {
         return result;
     }
 
+    pub fn observeRaftIndexClaims(self: *DB, alloc: Allocator, owner_group: u64, command: native_index_control.ClaimCommand, context: @import("../../api/operation.zig").RequestContext) !?native_index_control.DeliveredClaims {
+        try context.ensureActive();
+        try command.validate();
+        const b = command.binding;
+        if (b.authority != .raft) return error.InvalidControlReceiptPosition;
+        const identity: NativeIndexOwnerIdentity = .{ .id = b.id, .plan_digest = b.plan_digest, .owner_digest = b.owner_digest, .ordinal = b.ordinal, .namespace = b.fence.namespace, .owner_group_id = b.fence.owner_group_id };
+        try self.requireRaftIndexOwnerIdentity(owner_group, identity);
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const actual = (try RaftIndexOwnerControl.inspect(&read, identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        if (!std.mem.eql(u8, &try actual.encode(), &try b.encode())) return error.PrivateIndexOwnerJobChanged;
+        var prepared = try native_index_control.PreparedClaims.init(alloc, &read, command);
+        defer prepared.deinit();
+        for (prepared.batch.entries) |entry| if (!self.core.byteRange().contains(&entry.address.routing)) return error.KeyOutOfRange;
+        const position = (try prepared.batch.observedPosition(&read)) orelse return null;
+        const outcome: native_index_control.DeliveredClaims = .{ .binding = b, .claims_digest = prepared.claims_digest, .position = position, .duplicate = true };
+        try outcome.validateFor(command);
+        try context.ensureActive();
+        return outcome;
+    }
+
     pub fn nativeIndexOwnerCancellationState(self: *DB, expected: NativeIndexOwnerIdentity) !NativeIndexOwnerCancellationState {
         try expected.validate();
         if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;

@@ -126,7 +126,7 @@ pub const Data = struct {
     /// The producer canonicalizes parts by index before hashing/signing.
     pub fn digest(self: Data) !Digest {
         _ = try Source.Header.decode(&self.header.bytes, self.source, std.mem.readInt(u64, self.header.bytes[104..112], .little));
-        if (self.source.authority != .native or self.source.phase != .reserved or self.header.bytes[184] == @backingInt(Source.State.failed) or
+        if (self.source.phase != .reserved or self.header.bytes[184] == @backingInt(Source.State.failed) or
             std.mem.allEqual(u8, &self.routes_digest, 0) or self.parts.items.len > max_parts) return error.InvalidPrivateIndexClaimReceipt;
         const rows = std.mem.readInt(u32, self.header.bytes[96..100], .little);
         var mask: u128 = 0;
@@ -140,14 +140,18 @@ pub const Data = struct {
             const target = part.target.outcome.binding;
             const bits = std.mem.readInt(u128, &part.row_mask, .little);
             if (part.index != i or part.rows == 0 or part.rows != @popCount(bits) or mask & bits != 0 or
-                target.authority != .native or target.phase != .reserved or !std.mem.eql(u8, &target.id, &self.source.id) or
+                target.authority != self.source.authority or target.phase != .reserved or !std.mem.eql(u8, &target.id, &self.source.id) or
                 !std.mem.eql(u8, &target.plan_digest, &self.source.plan_digest) or target.fence.namespace.table_id != self.source.fence.namespace.table_id or
                 !std.mem.eql(u8, &target.inputs_digest, &self.source.inputs_digest) or !std.mem.eql(u8, &target.schema_before, &self.source.schema_before) or
                 !std.mem.eql(u8, &target.integrity_candidate, &self.source.integrity_candidate) or !std.mem.eql(u8, &target.integrity_reserved, &self.source.integrity_reserved) or
                 target.physical_candidate.schema_version != self.source.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimReceipt;
             mask |= bits;
             try part.target.validateRecordedShape(part.rows);
-            if (destinations[target.ordinal]) return error.InvalidPrivateIndexClaimReceipt;
+            // Byte-bounded delivery can split one destination into adjacent
+            // partitions. Their bindings must be identical; each partition
+            // still proves its own disjoint row mask and claim commitment.
+            if (destinations[target.ordinal] and (i == 0 or
+                !std.mem.eql(u8, &try target.encode(), &try self.parts.items[i - 1].target.outcome.binding.encode()))) return error.InvalidPrivateIndexClaimReceipt;
             destinations[target.ordinal] = true;
             var counts: [4]u8 = undefined;
             std.mem.writeInt(u16, counts[0..2], part.index, .little);
@@ -209,8 +213,8 @@ pub const Signed = struct {
     data: Data,
     proof: publication.RootProof,
     pub fn verify(self: Signed) !void {
-        if (self.proof.authority != .native) return error.InvalidPrivateIndexClaimReceipt;
-        (publication.NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        if ((self.proof.authority == .native) != (self.data.source.authority == .native)) return error.InvalidPrivateIndexClaimReceipt;
+        if (self.proof.authority == .native) (publication.NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
         self.proof.verify(try self.data.digest()) catch return error.InvalidPrivateIndexClaimReceipt;
     }
 };

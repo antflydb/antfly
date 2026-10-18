@@ -552,6 +552,44 @@ pub const ClaimOutcome = struct {
     }
 };
 
+/// Shared signed-delivery shape. Native engine outcomes convert explicitly;
+/// recovery reads retain Raft term/index, never a native-clock alias.
+pub const DeliveredClaims = struct {
+    binding: jobs.Binding,
+    claims_digest: integrity.Digest,
+    position: @import("receipt_position.zig").Position,
+    duplicate: bool,
+    claims_added: usize = 0,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+
+    pub fn fromNative(value: ClaimOutcome) !@This() {
+        _ = try value.deliveryDigest();
+        return .{ .binding = value.binding, .claims_digest = value.claims_digest, .position = .{ .native = value.position }, .duplicate = value.duplicate, .claims_added = value.claims_added };
+    }
+    pub fn validateFor(self: @This(), command: ClaimCommand) !void {
+        const expected = try command.commitment();
+        if (!std.mem.eql(u8, &try self.binding.encode(), &try command.binding.encode()) or !std.mem.eql(u8, &self.claims_digest, &expected.digest) or
+            self.claims_added > expected.count or self.duplicate != (self.claims_added == 0)) return error.InvalidPrivateIndexClaimReceipt;
+        _ = try self.deliveryDigest();
+    }
+    pub fn deliveryDigest(self: @This()) !integrity.Digest {
+        _ = try self.binding.encode();
+        try self.position.validate();
+        try self.position.requireNamespace(self.binding.fence.namespace);
+        if ((self.position == .native) != (self.binding.authority == .native) or self.binding.phase != .reserved or
+            self.replication_pending or self.error_name != null or std.mem.allEqual(u8, &self.claims_digest, 0)) return error.InvalidPrivateIndexClaimReceipt;
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-delivery/v1");
+        state.update(&try self.binding.encode());
+        state.update(&self.claims_digest);
+        state.update(&try self.position.encode());
+        var result: integrity.Digest = undefined;
+        state.final(&result);
+        return result;
+    }
+};
+
 pub const ConsumeCommand = struct {
     binding: jobs.Binding,
     accepted: private_claims.SourceStream.Accepted,

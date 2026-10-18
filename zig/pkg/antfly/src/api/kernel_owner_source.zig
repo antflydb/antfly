@@ -3739,6 +3739,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             return .{ .identity = self.identity, .root_generation = self.lease.entry.generation, .observation = result };
         }
 
+        pub fn claims(self: *@This(), alloc: std.mem.Allocator, command: native_index_control.ClaimCommand, recover_committed: bool) !std.json.Parsed(?native_index_control.DeliveredClaims) {
+            const b = command.binding;
+            const identity = self.identity;
+            if (!std.mem.eql(u8, &b.id, &identity.id) or !std.mem.eql(u8, &b.plan_digest, &identity.plan_digest) or
+                !std.mem.eql(u8, &b.owner_digest, &identity.owner_digest) or b.ordinal != identity.ordinal or
+                b.fence.owner_group_id != identity.owner_group_id or !b.fence.namespace.eql(identity.namespace)) return error.PrivateIndexOwnerJobChanged;
+            const normalized = if (recover_committed) request_operation.RequestContext{} else try platformDeadlineContext(self.context);
+            var cancellation = normalized.cancellation;
+            return self.lease.owner().raftIndexClaims(alloc, self.table_name, command, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        }
+
         pub fn claimSource(self: *@This(), alloc: std.mem.Allocator) !std.json.Parsed(native_index_control.SourceWire) {
             const normalized = try platformDeadlineContext(self.context);
             var cancellation = normalized.cancellation;

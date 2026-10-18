@@ -11638,6 +11638,8 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         try request.validate(group_id);
+        if (self.api_server_cfg.deployment_mode == .distributed and self.data_raft != null)
+            return self.raftIndexClaimsControl(alloc, table_name, group_id, request, context);
         // Native ordered effects are not interchangeable with data-Raft
         // proposals. Never dispatch them through an unconfigured authority.
         if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
@@ -11645,6 +11647,87 @@ pub const DataServer = struct {
         var result = try antfly.public_api.relational_index_owner_execution.claimStep(alloc, owners, &self.status_source, table_name, request, context);
         if (result.needsSigning()) self.signNativeIndexOwnerResult(alloc, &result);
         return result;
+    }
+
+    fn raftIndexClaimsControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.ClaimRequest, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.ClaimResult {
+        const execution = antfly.public_api.relational_index_owner_execution;
+        const publication = @import("../metadata/relational_index_publication.zig");
+        if (request.consume != null) return error.UnsupportedNativeIndexOwner;
+        var groups: [@import("../metadata/relational_index_source_delivery.zig").max_parts]u64 = undefined;
+        var group_count: usize = 0;
+        if (request.closure) |closure| {
+            for (closure.targets.items, groups[0..closure.targets.items.len]) |target, *group| group.* = target.signed.outcome.binding.fence.owner_group_id;
+            std.mem.sort(u64, groups[0..closure.targets.items.len], {}, std.sort.asc(u64));
+            for (groups[0..closure.targets.items.len]) |group| if (group_count == 0 or groups[group_count - 1] != group) {
+                groups[group_count] = group;
+                group_count += 1;
+            };
+        }
+        const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
+        try self.waitDataReadSafeWithCancellation(group_id, "index-owner-claims", 30_000, context.cancellation);
+        const lookup: publication.OwnerRequest = .{ .table_id = request.table_id, .group_id = group_id, .id = request.id, .operation = .build, .claim_groups = if (request.closure != null) .{ .items = groups[0..group_count] } else null, .raft_reporter = .{ .node_id = registration.node_id, .store_id = registration.store_id } };
+        var permission = try execution.raftDecision(alloc, &self.status_source, lookup, context);
+        defer permission.deinit();
+        if (permission.value.disposition == .acknowledged) return .acknowledged;
+        const identity = try permission.value.raftExecutionIdentity(lookup);
+        const dispatch = permission.value.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+        const owners = try self.ensureKernelOwnerSource();
+        var session = try owners.acquireRaftIndexOwnerSession(group_id, table_name, identity, context);
+        defer session.deinit();
+        const rooted = try session.observe(alloc);
+        const scope = try self.raftIndexLocalScope(group_id, rooted, context);
+        try (try permission.value.raftSigningView(lookup)).requireLocal(scope);
+        if (request.closure) |closure| {
+            const delivery = @import("../metadata/relational_index_source_delivery.zig");
+            var wire = try session.claimSource(alloc);
+            defer wire.deinit();
+            var read = try wire.value.decodeRaft(alloc, identity);
+            defer read.deinit();
+            _ = try permission.value.raftBuild(lookup, read.binding, .{});
+            if (read.batch) |batch| if (!std.mem.eql(u8, batch.scope.table_name, table_name)) return error.PrivateIndexOwnerJobChanged;
+            const routes = permission.value.claim_routes orelse return error.InvalidCatalogRecord;
+            var subset = try @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Subset.init(alloc, permission.value.owner.owner, permission.value.head.owner_count, routes.items);
+            defer subset.deinit();
+            var result: execution.ClaimResult = .{ .raft_closed = .{ .root_generation = rooted.root_generation, .owned = try delivery.prepare(alloc, &read, &subset, closure, context) } };
+            errdefer result.deinit();
+            const runtime = try self.ensureBackendRuntime();
+            const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+            const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
+            const current_scope = try self.raftIndexLocalScope(group_id, rooted, context);
+            result.raft_closed.proof = try permission.value.signRaftClosure(lookup, result.raft_closed.owned.data, current_scope, root);
+            try result.response().validate(request);
+            return result;
+        }
+        const command = try permission.value.raftClaims(lookup, rooted.observation.binding orelse return error.PrivateIndexRootRecoveryRequired, request.claims);
+        var observed = try session.claims(alloc, command, false);
+        defer observed.deinit();
+        const outcome = observed.value orelse committed: {
+            const remaining_ns = if (context.deadline_ns) |deadline| remaining: {
+                const now = (antfly.public_api.table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
+                if (now >= deadline) return error.DeadlineExceeded;
+                break :remaining deadline - now;
+            } else 30 * std.time.ns_per_s;
+            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .claims = command } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = &permission.value, .request = lookup, .root_generation = rooted.root_generation, .context = context } });
+            var recovered = try session.claims(alloc, command, true);
+            defer recovered.deinit();
+            break :committed recovered.value orelse return error.InvalidPrivateIndexClaimReceipt;
+        };
+        var response: execution.RaftClaimResponse = .{ .root_generation = rooted.root_generation, .outcome = outcome };
+        response.signed_delivery = self.signRaftIndexClaims(alloc, group_id, &permission.value, lookup, command, outcome, rooted, context) catch |err| failure: {
+            response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+            break :failure null;
+        };
+        try (execution.ClaimResponse{ .raft_applied = response }).validate(request);
+        return .{ .raft_applied = response };
+    }
+
+    fn signRaftIndexClaims(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, request: @import("../metadata/relational_index_publication.zig").OwnerRequest, command: @import("antfly_local_sources").storage_db_relational_index_owner_control.ClaimCommand, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.DeliveredClaims, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RootProof {
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
+        const scope = try self.raftIndexLocalScope(group_id, rooted, context);
+        return decision.signRaftClaims(request, command, outcome, scope, root);
     }
 
     fn nativeIndexOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
@@ -13094,6 +13177,7 @@ pub const DataServer = struct {
             switch (command) {
                 .control => |control| try permission.decision.requireRaftProposal(alloc, table_name, permission.request, control),
                 .build => |build| try permission.decision.requireRaftBuildProposal(table_name, permission.request, build),
+                .claims => |claims| try permission.decision.requireRaftClaimsProposal(table_name, permission.request, claims),
                 else => return error.InvalidGenerationPublication,
             }
         } else if (route.index_owner_permission != null) return error.InvalidGenerationPublication;
