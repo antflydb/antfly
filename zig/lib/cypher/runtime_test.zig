@@ -1675,7 +1675,7 @@ test "promoted path counts preserve exact SUM and normalized AVG weights" {
     try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN DISTINCT b.rank ORDER BY b.rank", "[[1],[2],[3]]");
 }
 
-test "presence cursors retain saturated endpoints while exact cursors keep the route fallback" {
+test "presence cursors cap endpoints while exact cursors promote producer counts" {
     const Paged = struct {
         fn drain(cursor: *runtime.NodeCursor, a: std.mem.Allocator) !void {
             while (!cursor.done) _ = try cursor.next(a, 128);
@@ -1701,7 +1701,13 @@ test "presence cursors retain saturated endpoints while exact cursors keep the r
         defer cursor.close();
         try std.testing.expect(try cursor.enableWeights(multiplicity));
         if (multiplicity == .exact) {
-            try std.testing.expectError(error.CypherStateBudgetExceeded, Paged.drain(cursor, a));
+            var promoted = false;
+            while (!cursor.done) {
+                const rows = try cursor.next(a, 128);
+                try std.testing.expectEqual(rows.len, cursor.last_counts.items.len);
+                for (cursor.last_counts.items) |count| promoted = promoted or count.exact() == null;
+            }
+            try std.testing.expect(promoted);
         } else {
             var seen = [_]bool{ false, false, false };
             while (!cursor.done) {
@@ -2540,4 +2546,15 @@ test "weighted continuation distinguishes an empty binding from an empty input" 
     try check("MATCH (:Document) WITH * LIMIT 5 WITH DISTINCT * RETURN count(*)", "[[1]]");
     try check("MATCH (:Document) WITH * LIMIT 0 WITH DISTINCT * RETURN count(*)", "[[0]]");
     try check("MATCH (n:Document) WITH n LIMIT 5 MATCH (n)-[:CITES]->(m:Document) WITH DISTINCT * RETURN count(*)", "[[3]]");
+}
+
+test "MATCH continuations preserve rejected prefixes optional rows distinct and global windows" {
+    // The first producer binding need not survive the next MATCH. A row goal
+    // on that producer would return no result instead of resuming it.
+    try check("MATCH (a:Document) WITH a MATCH (b:Document) WHERE a.rank=b.rank AND b.rank=3 RETURN a.rank,b.rank LIMIT 1", "[[3,3]]");
+    try check("MATCH (a:Document) WITH a OPTIONAL MATCH (b:Document) WHERE a.rank=b.rank AND b.rank=3 WITH a,b WHERE b IS NULL RETURN a.rank LIMIT 2", "[[1],[2]]");
+    try check("MATCH (a:Document) WITH a MATCH (b:Document) WHERE a.rank=b.rank RETURN b.rank SKIP 1 LIMIT 1", "[[2]]");
+    try check("MATCH (a:Document) WITH a MATCH (b:Document) WITH DISTINCT b.rank AS k RETURN k LIMIT 2", "[[1],[2]]");
+    try check("UNWIND [1,2,1] AS k CALL { WITH k RETURN k AS n } RETURN collect(n)", "[[[1,2,1]]]");
+    try check("MATCH (a:Document) CALL { MATCH (a)-[:CITES]->(b) RETURN count(*) AS n } RETURN sum(n)", "[[4]]");
 }

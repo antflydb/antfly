@@ -19,6 +19,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 pub const graph_relation = @import("graph_relation.zig");
+pub const Count = @import("cypher").multiplicity.Count;
 pub const Multiplicity = @import("cypher").runtime.Multiplicity;
 
 pub const Column = struct {
@@ -430,6 +431,8 @@ pub const Page = struct {
     /// Optional bag weights, negotiated by aggregate consumers before pulling.
     /// Ordinary SQL rows carry no per-row storage overhead.
     multiplicities: ?[]const u64 = null,
+    /// Promoted exact counts override the compact weights for this page.
+    exact_multiplicities: ?[]const Count = null,
     /// Only after enable_aggregate_weights: this page contributes to these
     /// reducer slots, not to an ordinary logical SQL row stream.
     aggregate_slots: ?[]const usize = null,
@@ -439,6 +442,36 @@ pub const Page = struct {
     /// must not report a short filtered page as exhaustion without that proof.
     after: ?[]const u8 = null,
 
+    pub fn counted(a: std.mem.Allocator, rows: []const Row, counts: []const Count, slots: ?[]const usize, after: ?[]const u8) !Page {
+        if (rows.len != counts.len) return error.InvalidSqlBackendResponse;
+        const weights = try a.alloc(u64, counts.len);
+        var promoted = false;
+        for (counts, weights) |count, *out| {
+            out.* = count.cap(std.math.maxInt(u64));
+            promoted = promoted or count.exact() == null;
+        }
+        return .{ .rows = rows, .multiplicities = weights, .exact_multiplicities = if (promoted) counts else null, .aggregate_slots = slots, .after = after };
+    }
+    pub fn validateWeights(self: Page) !void {
+        if (self.multiplicities) |weights| {
+            if (weights.len != self.rows.len) return error.InvalidSqlBackendResponse;
+            for (weights) |weight_value| if (weight_value == 0) return error.InvalidSqlBackendResponse;
+        }
+        if (self.exact_multiplicities) |counts| {
+            const weights = self.multiplicities orelse return error.InvalidSqlBackendResponse;
+            if (counts.len != weights.len) return error.InvalidSqlBackendResponse;
+            for (counts, weights) |count, compact| if (count.cap(std.math.maxInt(u64)) != compact) return error.InvalidSqlBackendResponse;
+        }
+    }
+    pub fn weight(self: Page, index: usize) Count {
+        return if (self.exact_multiplicities) |weights| weights[index] else Count.init(if (self.multiplicities) |weights| weights[index] else 1);
+    }
+    pub fn cloneWeights(self: Page, a: std.mem.Allocator) !?[]const Count {
+        const counts = self.exact_multiplicities orelse return null;
+        const owned = try a.alloc(Count, counts.len);
+        for (owned, counts) |*out, count| out.* = try count.clone(a);
+        return owned;
+    }
     pub fn deinit(self: Page) void {
         if (self.storage_page) |owned| {
             var page = owned;

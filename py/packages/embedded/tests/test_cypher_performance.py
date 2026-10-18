@@ -2023,6 +2023,51 @@ def test_weighted_chains_goals_and_promoted_producers(graph_db):
     assert db.sql(window)["rows"] == [["4"]] * 3
     assert db.sql(f"SELECT count(*),sum(score) FROM ({window}) d")["rows"] == [["3", "12"]]
 
+    # A finite consumer suspends every upstream MATCH, including when the
+    # prefix path is observable and cannot be collapsed to endpoint counts.
+    prefix = "MATCH p=(s:D {id:'start'})-[:R*32..32]->(b:D) WITH p,b "
+    suffix = "MATCH (b)-[:R*32..32]->(c:D) RETURN p,c.score SKIP 1 LIMIT 2"
+    expected = db.cypher_json("g", {"query": prefix + "LIMIT 1 " + suffix})["rows"]
+    result = db.cypher_json(
+        "g", {"query": prefix + suffix, "limits": {"intermediate_states": 10000, "explored_edges": 150}}
+    )
+    assert result["rows"] == expected
+    assert result["stats"]["explored_edges"] < 150
+
+    # Pure independent apply executes once; unrelated outer bindings still
+    # flow into the result and preserve all one hundred contributions.
+    call = (
+        "UNWIND range(1,100) AS i CALL { MATCH (s:D {id:'start'})-[:R*32..32]->(b:D) "
+        "RETURN count(DISTINCT b) AS n } RETURN sum(n),sum(i)"
+    )
+    result = db.cypher_json("g", {"query": call, "limits": {"intermediate_states": 10000, "explored_edges": 1000}})
+    assert [cell["value"] for cell in result["rows"][0]] == ["200", "5050"]
+    assert result["stats"]["explored_edges"] == 126
+    for values, expression in (("[1,1.0,1]", "x/2"), ("[{k:[1]},{k:[1.0]},{k:[1]}]", "x.k[0]/2")):
+        rows = db.cypher_json(
+            "g", {"query": f"UNWIND {values} AS x CALL {{ RETURN {expression} AS y }} RETURN collect(y)"}
+        )["rows"]
+        assert [cell["value"] for cell in rows[0][0]["value"]] == ["0", 0.5, "0"]
+
+    # Promoted counts survive SQL projections, unions, materialized replay,
+    # both join orientations and finite windows without route enumeration.
+    path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(65)) + "-[r65 IS R]->(b IS D)"
+    relation = f"GRAPH_TABLE(g MATCH {path} WHERE a.id='start' COLUMNS(b.score AS score))"
+    sources = (
+        f"{relation} q",
+        f"(SELECT score+0 AS score FROM {relation} q) q",
+        f"(SELECT CAST(score AS BIGINT) AS score FROM {relation} q UNION ALL SELECT CAST(66 AS BIGINT) AS score) q",
+        f"{relation} q CROSS JOIN (VALUES (1),(2)) d(x)",
+        f"(VALUES (1),(2)) d(x) CROSS JOIN {relation} q",
+    )
+    for source in sources:
+        assert db.sql(f"SELECT avg(q.score),sum(0) FROM {source}")["rows"] == [[66.0, "0"]]
+    cte = f"WITH q AS MATERIALIZED (SELECT score FROM {relation} t) "
+    assert db.sql(cte + "SELECT avg(score),sum(0) FROM q")["rows"] == [[66.0, "0"]]
+    assert db.sql(f"SELECT avg(score),count(*) FROM (SELECT score FROM {relation} q LIMIT 3) t")["rows"] == [
+        [66.0, "3"]
+    ]
+
     # Each stage has only two live endpoint bindings. Equal bags must merge
     # without discarding their multiplicities, including at clause boundaries
     # which reset relationship uniqueness.

@@ -1534,10 +1534,19 @@ keys keep integer/float distinctions, including inside containers. Pagination,
 ordering, correlated calls and order-sensitive reductions block this regrouping.
 Weighted MATCH fuses row-local stages into their actual finite window or
 reduction, carrying parent multiplicities through the fold. Small unordered
-windows retain demand-driven traversal. Returning CALL bodies inherit proven
+windows retain demand-driven traversal across subsequent MATCH stages: each
+prefix binding runs its continuation before the producer advances, and consumer
+completion unwinds the enclosing producers. Filters and OPTIONAL null extension
+remain in their own MATCH scopes; no prefix is truncated before its continuation
+qualifies. Returning CALL bodies inherit proven
 row goals through unfiltered projections, capped by their own existing limits;
 child SKIP and aggregate/sort barriers remain inside the child scope. An outer
 filter, DISTINCT, sort, aggregation or expanding stage prevents this propagation.
+Pure returning CALL stages memoize child bags by captured bindings and the
+child row goal, within a bounded statement-local cache. Keys preserve binding
+representations and implicit prebound MATCH aliases. Cache admission can decline
+without failing the query; writes, procedures, volatile functions and unit CALL
+remain barriers. Cached children own their payloads and preserve parent weights.
 Pattern dependency analysis follows query WITH scopes and lexical shadowing;
 only captured outer bindings stay live. Unobserved path aliases therefore do
 not force route production merely because a later expression contains a pattern.
@@ -1560,9 +1569,9 @@ without moving invalid-goal errors ahead of their projection. Bounded path count
 saturate at maxInt(u64), strictly above every legal signed SKIP+LIMIT sum, so even
 large-offset windows retain sufficient prefix counts. Unordered finite windows
 request prefix counts when their proven row goal exceeds remaining route-work
-capacity; small goals keep demand-driven first-route production. Exact consumers
-in the SQL cursor protocol reject that producer sentinel; finite consumers clip
-it to their requested window. Native exact producers use adaptive counts for
+capacity; small goals keep demand-driven first-route production. Finite
+consumers clip prefix counts to their requested window. Exact native and SQL
+producers use adaptive counts for
 frontier additions, branch factors and products, so exceeding u64 does not force
 route enumeration. Counts remain inline u64 when possible and promote to
 immutable, arena-owned arbitrary-precision counts on overflow. Retained windows
@@ -1572,7 +1581,13 @@ before any row expansion. COUNT and integer SUM check their result ranges,
 including zero sums over promoted counts. Floating SUM uses a wide intermediate,
 and AVG normalizes count magnitudes before computing weight ratios, so even
 products beyond binary128's exponent range do not create spurious numeric errors.
-SQL weighted cursors retain their existing u64 count protocol. Trail scope and
+SQL pages retain compact u64 weights for ordinary consumers and carry promoted
+exact counts when needed. Projections, unions, joins and materialized replay
+preserve those counts; bounded windows clip before expansion. SUM/AVG promote
+reducer state only when compact counts cease to suffice. Exact NUMERIC totals
+and counts survive versioned partial interchange and spill, including cancellation
+and division of intermediates beyond the public NUMERIC exponent range. Final
+values still obey their declared SQL result ranges. Trail scope and
 optional null extension remain clause-local. Expansion is reserved for external
 rows and consumers such as non-DISTINCT collect that need individual elements.
 Saturated path counts remain sufficient for a finite window. Other ordering, aggregation,
@@ -1591,8 +1606,8 @@ have no shared prefixes to compress. Nullable arguments ignore NULL without disc
 tracks argument values independently of route multiplicities. Integer weighted
 sums use wide intermediates, floating sums preserve finite cancellation, and AVG
 combines weighted means. Saturated path counts cannot serve as approximate
-numeric weights: SUM/AVG retain exact route production when multiplicities are
-not representable. Expressions depending on intermediate entities, paths or
+numeric weights: exact SUM/AVG producers promote their counts instead of using
+an overflow sentinel or enumerating repeated routes. Expressions depending on intermediate entities, paths or
 unsupported consumers retain exact route production. The optimizer never substitutes shortest-path semantics for ALL.
 
 SQL pull cursors retain the selective interior anchor, traverse a reversed prefix,

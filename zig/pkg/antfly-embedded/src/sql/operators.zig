@@ -627,6 +627,7 @@ pub const Aggregate = struct {
     input_type: ?ast.ColumnType,
     input_element: ?@import("array_value.zig").ElementType = null,
     numeric: ?*@import("numeric_aggregate.zig").Reducer = null,
+    wide: ?*@import("wide_aggregate.zig").State = null,
     count: u64 = 0,
     integer_sum: i128 = 0,
     number_sum: f64 = 0,
@@ -668,6 +669,7 @@ pub const Aggregate = struct {
     }
 
     pub fn deinit(self: *Aggregate) void {
+        if (self.wide) |wide| wide.deinit();
         if (self.numeric) |reducer| {
             reducer.deinit();
             self.alloc.destroy(reducer);
@@ -684,6 +686,7 @@ pub const Aggregate = struct {
     }
 
     pub fn update(self: *Aggregate, value: Datum) !void {
+        if (self.wide) |wide| return wide.add(value, @import("catalog.zig").Count.one);
         if (value.sql_null) {
             if (self.patterns) |state| {
                 if (!state.has_null) {
@@ -792,6 +795,7 @@ pub const Aggregate = struct {
     }
 
     pub fn finish(self: *const Aggregate) !Datum {
+        if (self.wide) |wide| return wide.finish(self.kind, self.input_type == .integer, self.input_element == .numeric);
         if (self.kind == .count) return Datum.json(.{ .integer = std.math.cast(i64, self.count) orelse return error.SqlNumericOutOfRange });
         if (self.kind == .pattern_set) return Datum.json(.{ .array = self.patterns.?.values });
         if (self.count == 0) return .{};
@@ -1746,7 +1750,40 @@ pub const Grouped = struct {
             state.count = weight;
         }
         try self.importTypedPartialMapped(keys, states, null, self.source_ordinal orelse self.rows_seen);
-        self.rows_seen = std.math.add(u64, self.rows_seen, weight) catch return error.SqlNumericOutOfRange;
+        self.rows_seen +|= weight;
+    }
+
+    pub fn addCount(self: *Grouped, keys: []const Datum, inputs: []const Datum, count: @import("catalog.zig").Count) !void {
+        if (count.exact()) |weight| if (weight <= std.math.maxInt(i64)) return self.addWeighted(keys, inputs, weight);
+        if (self.failed or self.finished or inputs.len != self.specs.len or count.cap(1) == 0) return error.InvalidSqlBackendResponse;
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const states = try a.alloc(Aggregate, self.specs.len);
+        var initialized: usize = 0;
+        defer for (states[0..initialized]) |*state| state.deinit();
+        for (states, self.specs, inputs) |*state, spec, input| {
+            state.* = try Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+            initialized += 1;
+            state.distinct = spec.distinct;
+            if (input.sql_null) continue;
+            if (spec.distinct or spec.kind == .min or spec.kind == .max or spec.kind == .bool_and or spec.kind == .bool_or) {
+                try state.update(input);
+                continue;
+            }
+            if (spec.kind == .count) return error.SqlNumericOutOfRange;
+            if (spec.kind != .sum and spec.kind != .avg) return error.InvalidSqlBackendResponse;
+            if (state.numeric) |reducer| {
+                reducer.deinit();
+                a.destroy(reducer);
+                state.numeric = null;
+            }
+            state.wide = try @import("wide_aggregate.zig").State.create(a);
+            try state.wide.?.add(input, count);
+            state.count = 1; // presence marker; exact cardinality belongs to wide.
+        }
+        try self.importTypedPartialMapped(keys, states, null, self.source_ordinal orelse self.rows_seen);
+        self.rows_seen +|= 1;
     }
 
     /// Resolve a vector of group IDs once, then update state by aggregate
@@ -2004,6 +2041,7 @@ pub const Grouped = struct {
         self.key_count = keys.len;
         var state_bytes: usize = 0;
         for (states) |state| {
+            if (state.wide) |wide| state_bytes +|= (@sizeOf(@import("wide_aggregate.zig").State) + (wide.total.value.digits.len + wide.count.value.digits.len) *| @sizeOf(u16)) *| 8;
             if (state.numeric) |reducer| state_bytes +|= (reducer.state.buckets.items.len *| @sizeOf(i128) +| @sizeOf(@import("numeric_aggregate.zig").Reducer)) *| 4;
             if (state.selected) |selected| state_bytes +|= (try datumBytes(selected.row.values[0])) *| 4;
             for (state.distinct_values.items) |entry| state_bytes +|= (try datumBytes(entry.row.row.values[0]) +| @sizeOf(Aggregate)) *| 4;
@@ -4382,4 +4420,31 @@ test "SQL native hash join shares producer body preparation across physical page
         seen += 1;
     }
     try std.testing.expectEqual(@as(usize, 64), seen);
+}
+
+test "SQL promoted exact bags retain reducer states through partials spill and allocation failures" {
+    const Probe = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: Allocator, disk: bool) !void {
+            var count_arena = std.heap.ArenaAllocator.init(a);
+            defer count_arena.deinit();
+            const Count = @import("catalog.zig").Count;
+            const count = try Count.init(@as(u64, 1) << 63).multiply(count_arena.allocator(), Count.init(1 << 20));
+            var dummy: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = checkpoint, .async_writes = false };
+            defer manager.deinit();
+            const group = try Grouped.create(a, &.{ .{ .kind = .avg, .input_type = .integer }, .{ .kind = .sum, .input_type = .integer } }, .{ .groups = 10, .bytes = 2 << 20, .spill = if (disk) &manager else null });
+            defer group.deinit();
+            if (disk) try group.startSpill();
+            try group.addCount(&.{}, &.{ Datum.json(.{ .integer = 2 }), Datum.json(.{ .integer = 1 }) }, count);
+            try group.addCount(&.{}, &.{ Datum.json(.{ .integer = 4 }), Datum.json(.{ .integer = -1 }) }, count);
+            const result = (try group.nextResult(a)).?;
+            defer a.free(result.aggregates);
+            try std.testing.expectEqual(@as(f64, 3), result.aggregates[0].value.float);
+            try std.testing.expectEqual(@as(i64, 0), result.aggregates[1].value.integer);
+        }
+    };
+    try Probe.run(std.testing.allocator, false);
+    try Probe.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{false});
 }

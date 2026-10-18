@@ -296,6 +296,16 @@ pub const Column = struct {
     }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
+        if (self.values != .dynamic and state.wide == null and (self.spec.kind == .sum or self.spec.kind == .avg)) {
+            const prior_count = switch (self.values) {
+                .exact => |values| values.items[index].state.count,
+                .integers => |values| values.items[index].count,
+                .numbers => |values| values.items[index].count,
+                else => unreachable,
+            };
+            if (state.count > std.math.maxInt(i64) - prior_count) try self.promote(a);
+        }
+        if (state.wide != null and self.values != .dynamic) try self.promote(a);
         if (self.values == .exact) {
             const reducer = state.numeric orelse return error.InvalidSqlBackendResponse;
             if (reducer.state.count != state.count) return error.InvalidSqlBackendResponse;

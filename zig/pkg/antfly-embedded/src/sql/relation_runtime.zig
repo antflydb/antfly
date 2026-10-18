@@ -1049,11 +1049,12 @@ fn Engine(comptime Context: type) type {
                     defer page.deinit();
                     const slots = page.aggregate_slots orelse return error.InvalidSqlBackendResponse;
                     if (slots.len != 1 or slots[0] != 0) return error.InvalidSqlBackendResponse;
-                    for (page.rows, page.multiplicities.?) |row_value, weight| {
+                    for (page.rows, 0..) |row_value, weight_index| {
+                        const weight = page.weight(weight_index);
                         if (replay.count >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                         const values = try a.alloc(Datum, node.columns.len);
                         for (node.columns, values) |column, *value| value.* = try row_value.cell(column.internal);
-                        try replay.appendWeighted(values, weight);
+                        try replay.appendCount(values, weight);
                     }
                 }
             } else {
@@ -2630,7 +2631,7 @@ fn Engine(comptime Context: type) type {
             ordinary: ?*Iterator = null,
             fallback: bool = false,
             side_count: usize = 0,
-            side_weight: u64 = 0,
+            side_weight: catalog.Count = catalog.Count.init(0),
             replay_reader: ?*Replay.Reader = null,
             membership_index: ?*operators.TupleMembership = null,
             unmatched_index: usize = 0,
@@ -2731,16 +2732,21 @@ fn Engine(comptime Context: type) type {
                 if (self.cross_arena) |*arena| arena.deinit();
                 if (self.join_scratch) |*arena| arena.deinit();
             }
-            fn buildWeight(values: []const Datum) u64 {
-                return (@as(u64, @intCast(values[values.len - 2].value.integer)) << 32) |
-                    @as(u64, @intCast(values[values.len - 1].value.integer));
+            fn buildWeight(a: Allocator, values: []const Datum) !catalog.Count {
+                const cell = values[values.len - 2];
+                if (cell.sql_null) return error.InvalidSqlBackendResponse;
+                if (cell.value == .string) return catalog.Count.parse(a, cell.value.string);
+                const low = values[values.len - 1];
+                if (cell.value != .integer or low.sql_null or low.value != .integer or cell.value.integer < 0 or low.value.integer < 0 or cell.value.integer > 0xffffffff or low.value.integer > 0xffffffff) return error.InvalidSqlBackendResponse;
+                return catalog.Count.init((@as(u64, @intCast(cell.value.integer)) << 32) | @as(u64, @intCast(low.value.integer)));
             }
-            fn combineWeight(self: *WeightedReader, left: u64, right: u64, add: bool, active: []const usize) !u64 {
+            fn combineWeight(self: *WeightedReader, left: catalog.Count, right: catalog.Count, add: bool, active: []const usize) !catalog.Count {
                 const exact = for (active) |slot| {
                     if (self.plan.requests[slot].multiplicity == .exact) break true;
                 } else false;
-                if (exact) return if (add) std.math.add(u64, left, right) catch error.SqlNumericOutOfRange else std.math.mul(u64, left, right) catch error.SqlNumericOutOfRange;
-                return @min(@as(u64, std.math.maxInt(i64)) + 1, if (add) left +| right else left *| right);
+                if (exact) return if (add) left.add(self.engine.context.arena, right) else left.multiply(self.engine.context.arena, right);
+                const cap: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+                return catalog.Count.init(@min(cap, if (add) left.cap(cap) +| right.cap(cap) else left.cap(cap) *| right.cap(cap)));
             }
             fn cloneValues(a: Allocator, values: []const Datum) ![]const Datum {
                 const result = try a.alloc(Datum, values.len);
@@ -2759,19 +2765,21 @@ fn Engine(comptime Context: type) type {
                 try self.engine.context.checkpoint();
                 var page = try self.raw(a, limit);
                 defer page.deinit();
+                try page.validateWeights();
                 var rows: std.ArrayList(catalog.Row) = .empty;
-                var weights: std.ArrayList(u64) = .empty;
+                var weights: std.ArrayList(catalog.Count) = .empty;
                 const slots = page.aggregate_slots orelse return error.InvalidSqlBackendResponse;
                 const multiplicities = page.multiplicities orelse return error.InvalidSqlBackendResponse;
                 if (page.rows.len != multiplicities.len or page.rows.len > limit) return error.InvalidSqlBackendResponse;
-                for (page.rows, multiplicities) |input, weight| {
+                for (page.rows, 0..) |input, weight_index| {
+                    const weight = try page.weight(weight_index).clone(a);
                     try self.engine.context.checkpoint();
                     const projected = (try self.plan.project(a, self.engine.context, input, slots)) orelse continue;
                     try rows.append(a, projected);
                     try weights.append(a, weight);
                 }
                 self.done = page.after == null;
-                return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = try a.dupe(usize, slots), .after = if (self.done) null else "weighted" };
+                return catalog.Page.counted(a, rows.items, weights.items, try a.dupe(usize, slots), if (self.done) null else "weighted");
             }
             fn prepareWindow(self: *WeightedReader) !void {
                 const Cursor = @import("result_cursor.zig").Cursor;
@@ -2876,6 +2884,7 @@ fn Engine(comptime Context: type) type {
                         const cursor = self.engine.cursors[scan.index];
                         var page = try cursor.next(cursor.ptr, a, limit);
                         defer page.deinit();
+                        try page.validateWeights();
                         if (page.rows.len > limit or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
                         self.engine.visited += page.rows.len;
                         if ((page.aggregate_slots != null) != self.tagged) return error.InvalidSqlBackendResponse;
@@ -2889,17 +2898,17 @@ fn Engine(comptime Context: type) type {
                             }
                             output.* = try row(a, self.plan.source.columns, values);
                         }
-                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .aggregate_slots = try a.dupe(usize, page.aggregate_slots orelse self.slots), .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .exact_multiplicities = try page.cloneWeights(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots orelse self.slots), .after = if (page.after) |after| try a.dupe(u8, after) else null };
                     },
                     .replay => {
                         var rows: std.ArrayList(catalog.Row) = .empty;
-                        var weights: std.ArrayList(u64) = .empty;
+                        var weights: std.ArrayList(catalog.Count) = .empty;
                         while (rows.items.len < limit) {
                             const bag = try self.replay_reader.?.nextWeighted() orelse break;
                             try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, bag.values)));
-                            try weights.append(a, bag.weight);
+                            try weights.append(a, try bag.count.clone(a));
                         }
-                        return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = self.slots, .after = if (rows.items.len == limit) "replay" else null };
+                        return catalog.Page.counted(a, rows.items, weights.items, self.slots, if (rows.items.len == limit) "replay" else null);
                     },
                     .union_all => {
                         const child = if (!self.left.?.done) self.left.? else self.right.?;
@@ -2913,20 +2922,20 @@ fn Engine(comptime Context: type) type {
                             }
                             output.* = try row(a, self.plan.source.columns, values);
                         }
-                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (self.left.?.done and self.right.?.done) null else "union" };
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .exact_multiplicities = try page.cloneWeights(a), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (self.left.?.done and self.right.?.done) null else "union" };
                     },
                     .window => {
                         if (self.window_cursor == null) try self.prepareWindow();
                         var rows: std.ArrayList(catalog.Row) = .empty;
-                        var weights: std.ArrayList(u64) = .empty;
+                        var weights: std.ArrayList(catalog.Count) = .empty;
                         while (rows.items.len < limit) {
                             const values = try self.window_cursor.?.next(a) orelse break;
                             const weight = values[values.len - 1];
                             if (weight.sql_null or weight.value != .integer or weight.value.integer <= 0) return error.InvalidSqlBackendResponse;
                             try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values[0 .. values.len - 1])));
-                            try weights.append(a, @intCast(weight.value.integer));
+                            try weights.append(a, catalog.Count.init(@intCast(weight.value.integer)));
                         }
-                        return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = self.slots, .after = if (rows.items.len == limit) "window" else null };
+                        return catalog.Page.counted(a, rows.items, weights.items, self.slots, if (rows.items.len == limit) "window" else null);
                     },
                     .cross => |join| {
                         const operation = self.plan.source.operation.join;
@@ -2950,7 +2959,8 @@ fn Engine(comptime Context: type) type {
                                 _ = page_arena.reset(.free_all);
                                 var build_page = try self.right.?.next(page_arena.allocator(), @min(self.engine.context.limits.page_rows, 256));
                                 defer build_page.deinit();
-                                for (build_page.rows, build_page.multiplicities.?) |build_row, build_weight| {
+                                for (build_page.rows, 0..) |build_row, build_index| {
+                                    const build_weight = build_page.weight(build_index);
                                     _ = scratch.reset(.free_all);
                                     const temporary = scratch.allocator();
                                     const values = try temporary.alloc(Datum, join.singleton.columns.len);
@@ -2958,7 +2968,7 @@ fn Engine(comptime Context: type) type {
                                     try self.engine.checkpoint();
                                     if (self.side_count >= self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                                     self.side_count += 1;
-                                    if (join.factor_only) self.side_weight = try self.combineWeight(self.side_weight, build_weight, true, self.slots);
+                                    if (join.factor_only) self.side_weight = try (try self.combineWeight(self.side_weight, build_weight, true, self.slots)).clone(self.engine.context.arena);
                                     if (join.factor_only) continue;
                                     const programs = if (join.graph_left) operation.right_keys else operation.left_keys;
                                     const keys = try temporary.alloc(Datum, programs.len);
@@ -2974,8 +2984,13 @@ fn Engine(comptime Context: type) type {
                                         // integer codec, including the overflow sentinel.
                                         const payload = try temporary.alloc(Datum, values.len + 2);
                                         @memcpy(payload[0..values.len], values);
-                                        payload[values.len] = Datum.json(.{ .integer = @intCast(build_weight >> 32) });
-                                        payload[values.len + 1] = Datum.json(.{ .integer = @intCast(build_weight & 0xffffffff) });
+                                        if (build_weight.exact()) |small| {
+                                            payload[values.len] = Datum.json(.{ .integer = @intCast(small >> 32) });
+                                            payload[values.len + 1] = Datum.json(.{ .integer = @intCast(small & 0xffffffff) });
+                                        } else {
+                                            payload[values.len] = Datum.json(.{ .string = try build_weight.text(temporary) });
+                                            payload[values.len + 1] = .{};
+                                        }
                                         try self.join_hash.?.add(payload, keys);
                                     }
                                 }
@@ -2986,7 +3001,7 @@ fn Engine(comptime Context: type) type {
                             self.singleton_ready = true;
                         }
                         var rows: std.ArrayList(catalog.Row) = .empty;
-                        var weights: std.ArrayList(u64) = .empty;
+                        var weights: std.ArrayList(catalog.Count) = .empty;
                         if (self.graph_done) {
                             if (build_outer) while (rows.items.len < limit) {
                                 const match = try self.join_hash.?.unmatched(&self.unmatched_index) orelse break;
@@ -3000,9 +3015,9 @@ fn Engine(comptime Context: type) type {
                                     };
                                 }
                                 try rows.append(a, try row(a, self.plan.source.columns, values));
-                                try weights.append(a, buildWeight(side));
+                                try weights.append(a, try buildWeight(a, side));
                             };
-                            return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = self.slots, .after = if (rows.items.len == limit) "unmatched" else null };
+                            return catalog.Page.counted(a, rows.items, weights.items, self.slots, if (rows.items.len == limit) "unmatched" else null);
                         }
                         if (self.side_count == 0 and !graph_outer and operation.membership == null) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
                         if (self.cross_page == null) {
@@ -3035,7 +3050,7 @@ fn Engine(comptime Context: type) type {
                                     .unknown => .{},
                                 };
                                 try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values)));
-                                try weights.append(a, page.multiplicities.?[self.cross_row]);
+                                try weights.append(a, try page.weight(self.cross_row).clone(a));
                                 self.cross_row += 1;
                                 continue;
                             }
@@ -3078,10 +3093,10 @@ fn Engine(comptime Context: type) type {
                                 if (build_outer) try self.join_hash.?.markMatched(match_index.?);
                             }
                             try rows.append(a, try row(a, self.plan.source.columns, try cloneValues(a, values)));
-                            const weight = page.multiplicities.?[self.cross_row];
-                            const factor = if (join.factor_only) self.side_weight else if (single) |items| buildWeight(items) else 1;
+                            const weight = page.weight(self.cross_row);
+                            const factor = if (join.factor_only) self.side_weight else if (single) |items| try buildWeight(candidate, items) else catalog.Count.one;
                             const multiplied = try self.combineWeight(weight, factor, false, page.aggregate_slots.?);
-                            try weights.append(a, multiplied);
+                            try weights.append(a, try multiplied.clone(a));
                             if (single == null) {
                                 self.join_probe = null;
                                 self.join_matched = false;
@@ -3096,7 +3111,7 @@ fn Engine(comptime Context: type) type {
                             self.cross_page = null;
                         }
                         self.graph_done = done;
-                        return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = slots, .after = if (done and !build_outer) null else "cross" };
+                        return catalog.Page.counted(a, rows.items, weights.items, slots, if (done and !build_outer) null else "cross");
                     },
                 }
             }

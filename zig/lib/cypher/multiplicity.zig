@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Arena-owned, immutable native bag counts. Common counts stay inline; products promote
-//! through the statement allocator only when u64 is insufficient. SQL cursors
-//! continue to negotiate their existing bounded u64 protocol.
+//! Immutable statement-owned bag counts shared by native and SQL execution.
+//! Common counts stay inline; arithmetic promotes through the statement
+//! allocator only when u64 is insufficient.
 const std = @import("std");
 const Big = std.math.big.int.Managed;
 pub const Count = struct {
@@ -36,6 +36,20 @@ pub const Count = struct {
         const owned = try a.create(Big);
         owned.* = try big.cloneWithDifferentAllocator(a);
         return .{ .small = self.small, .big = owned };
+    }
+    pub fn text(self: Count, a: std.mem.Allocator) ![]u8 {
+        if (self.big) |big| return big.toString(a, 10, .lower);
+        return std.fmt.allocPrint(a, "{d}", .{self.small});
+    }
+    pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Count {
+        if (bytes.len == 0 or (bytes.len > 1 and bytes[0] == '0')) return error.InvalidBagCount;
+        for (bytes) |byte| if (byte < '0' or byte > '9') return error.InvalidBagCount;
+        if (std.fmt.parseUnsigned(u64, bytes, 10)) |small| return init(small) else |_| {}
+        const big = try a.create(Big);
+        big.* = try Big.initSet(a, 0);
+        errdefer big.deinit();
+        try big.setString(10, bytes);
+        return .{ .small = std.math.maxInt(u64), .big = big };
     }
     pub fn isOne(self: Count) bool {
         return self.big == null and self.small == 1;

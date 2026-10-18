@@ -201,6 +201,19 @@ const Decoder = struct {
 pub fn cell(a: A, state: operators.Aggregate) !Datum {
     var encoder: Encoder = .{ .a = a };
     errdefer encoder.bytes.deinit(a);
+    if (state.wide) |wide| {
+        try encoder.raw("AGW\x01");
+        try encoder.raw(&.{ kindId(state.kind), typeId(state.input_type), elementId(state.input_element) });
+        if (state.distinct or (state.kind != .sum and state.kind != .avg)) return error.InvalidSqlSpill;
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = a, .allow_wide_weight = true };
+        const count = try @import("numeric_value.zig").format(&ctx, wide.count.value);
+        defer a.free(count);
+        const total = try @import("numeric_value.zig").format(&ctx, wide.total.value);
+        defer a.free(total);
+        try encoder.text(count);
+        try encoder.text(total);
+        return Datum.json(.{ .string = try encoder.bytes.toOwnedSlice(a) });
+    }
     try encoder.raw(magic);
     try encoder.raw(&.{ kindId(state.kind), typeId(state.input_type), @intFromBool(state.distinct), @intFromBool(state.boolean), elementId(state.input_element) });
     try encoder.integer(u64, state.count);
@@ -235,7 +248,21 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     defer scratch.deinit();
     const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
     var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string, .sql_floating = sql_floating };
-    if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
+    const version = try decoder.raw(4);
+    if (std.mem.eql(u8, version, "AGW\x01")) {
+        const signature = try decoder.raw(3);
+        if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != elementId(spec.input_element) or spec.distinct or (spec.kind != .sum and spec.kind != .avg)) return error.InvalidSqlSpill;
+        var state: operators.Aggregate = .{ .alloc = a, .kind = spec.kind, .input_type = spec.input_type, .input_element = spec.input_element, .count = 1 };
+        state.wide = try @import("wide_aggregate.zig").State.create(a);
+        errdefer state.deinit();
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = a, .allow_wide_weight = true };
+        const wide = state.wide.?;
+        wide.count = try @import("numeric_value.zig").parse(&ctx, try decoder.text());
+        wide.total = try @import("numeric_value.zig").parse(&ctx, try decoder.text());
+        if (decoder.position != decoder.bytes.len or wide.count.value.kind != .finite or wide.count.value.negative or wide.count.value.isZero() or wide.count.value.scale != 0 or (wide.count.value.weight + 1 < wide.count.value.digits.len)) return error.InvalidSqlSpill;
+        return state;
+    }
+    if (!std.mem.eql(u8, version, magic)) return error.InvalidSqlSpill;
     const signature = try decoder.raw(5);
     if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != @intFromBool(spec.distinct) or signature[3] > 1 or signature[4] != elementId(spec.input_element)) return error.InvalidSqlSpill;
     const count = try decoder.integer(u64);
@@ -431,6 +458,21 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         if (source.patterns) |patterns| {
             for (patterns.values.items) |value| try target.update(if (value == .null) Datum{} else Datum.json(value));
         } else for (source.distinct_values.items) |entry| try target.update(entry.row.row.values[0]);
+        return;
+    }
+    if (target.wide != null or source.wide != null or ((target.kind == .sum or target.kind == .avg) and source.count > std.math.maxInt(i64) - target.count)) {
+        if (target.wide == null) {
+            target.wide = try @import("wide_aggregate.zig").State.fromPartial(target.alloc, target.*);
+            if (target.numeric) |reducer| {
+                reducer.deinit();
+                target.alloc.destroy(reducer);
+                target.numeric = null;
+            }
+        }
+        const incoming = try @import("wide_aggregate.zig").State.fromPartial(target.alloc, source);
+        defer incoming.deinit();
+        try target.wide.?.merge(incoming);
+        target.count = 1;
         return;
     }
     const total = std.math.add(u64, target.count, source.count) catch return error.SqlNumericOutOfRange;

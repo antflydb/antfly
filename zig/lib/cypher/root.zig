@@ -22,6 +22,7 @@ pub const value = @import("value.zig");
 pub const catalog = @import("catalog.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
+pub const multiplicity = @import("multiplicity.zig");
 pub const runtime = @import("runtime.zig");
 pub const request = @import("request.zig");
 pub const wire = @import("wire.zig");

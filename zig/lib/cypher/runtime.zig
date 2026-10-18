@@ -121,9 +121,11 @@ pub const NodeCursor = struct {
     fallback_seed: ?usize = null,
     weighted_arena: std.heap.ArenaAllocator,
     adjacency_cache: Engine.AdjacencyCache,
-    pending: std.ArrayList(struct { row: Row, weight: u64 }) = .empty,
+    pending: std.ArrayList(struct { row: Row, weight: Count }) = .empty,
     pending_position: usize = 0,
+    /// Compact prefix counts; exact consumers must read last_counts.
     last_weights: std.ArrayList(u64) = .empty,
+    last_counts: std.ArrayList(Count) = .empty,
     pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity };
     /// Plan a projected endpoint bag without advancing or rebinding the read
     /// cut. Plans and their AST storage belong to this cursor.
@@ -182,6 +184,7 @@ pub const NodeCursor = struct {
         self.pending = .empty;
         self.pending_position = 0;
         self.last_weights = .empty;
+        self.last_counts = .empty;
         self.started = false;
         self.done = false;
         const clauses = try self.engine.a.dupe(ast.Clause, self.query.clauses);
@@ -265,13 +268,13 @@ pub const NodeCursor = struct {
             self.fallback_seed = 0;
         }
     }
-    fn emitWeighted(ptr: *anyopaque, row: Row, weight: u64) !void {
+    fn emitWeighted(ptr: *anyopaque, row: Row, weight: Count) !void {
         const self: *NodeCursor = @ptrCast(@alignCast(ptr));
         const e = self.engine;
         for (try e.projectUnordered(&.{row}, self.query.clauses[1].operation.project.value, false)) |projected| {
             try e.values.output(.{ .map = projected });
             const a = self.weighted_arena.allocator();
-            try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = weight });
+            try self.pending.append(a, .{ .row = (try (v.Value{ .map = projected }).clone(a)).map, .weight = try weight.clone(a) });
         }
     }
 
@@ -413,6 +416,7 @@ pub const NodeCursor = struct {
         defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
         var output: std.ArrayList(Row) = .empty;
         self.last_weights = .empty;
+        self.last_counts = .empty;
         if (!self.started) {
             try self.pushScan(.{ .row = &.{} }, 0);
             self.started = true;
@@ -602,7 +606,8 @@ pub const NodeCursor = struct {
                 const pending = self.pending.items[self.pending_position];
                 self.pending_position += 1;
                 try output.append(a, (try (v.Value{ .map = pending.row }).clone(a)).map);
-                try self.last_weights.append(a, pending.weight);
+                try self.last_weights.append(a, pending.weight.cap(std.math.maxInt(u64)));
+                try self.last_counts.append(a, try pending.weight.clone(a));
                 continue;
             }
             const frame = self.frames.items[self.frames.items.len - 1];
@@ -648,7 +653,10 @@ pub const NodeCursor = struct {
                         if (accepted) for (try e.projectUnordered(&.{row}, self.query.clauses[1].operation.project.value, false)) |projected| {
                             try e.values.output(.{ .map = projected });
                             try output.append(a, (try (v.Value{ .map = projected }).clone(a)).map);
-                            if (self.weighted) try self.last_weights.append(a, 1);
+                            if (self.weighted) {
+                                try self.last_weights.append(a, 1);
+                                try self.last_counts.append(a, Count.one);
+                            }
                         };
                     }
                 }
@@ -953,7 +961,7 @@ const Engine = struct {
     match_weight_demand: ?Multiplicity = null,
     terminal_weight_demand: ?Multiplicity = null,
     pending_window: ?WeightedRows = null,
-    weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
+    weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, Count) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
     anchor_batch: ?*AnchorBatch = null,
     adjacency_cache: ?*AdjacencyCache = null,
@@ -1264,6 +1272,7 @@ const Engine = struct {
         weight: Count = Count.one,
         active_calls: ?[]const bool = null,
         record_rows: bool = true,
+        continuation: ?struct { parent: *StreamFold, index: usize } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             fold.had_match = true;
@@ -1289,6 +1298,29 @@ const Engine = struct {
                             try fold.expand(engine, try engine.replace(row, unwind.alias, item), index + 1);
                         }
                     },
+                    .match => |operation| {
+                        // Keep the upstream producer on the stack while the
+                        // continuation consumes this binding. Its LIMIT can
+                        // stop every enclosing producer without truncating a
+                        // prefix whose continuation has no qualifying rows.
+                        engine.recursion += 1;
+                        defer engine.recursion -= 1;
+                        if (engine.recursion > engine.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
+                        const columns = engine.columns;
+                        const stages = engine.stages.items.len;
+                        const saved_weight_demand = engine.match_weight_demand;
+                        const retention = engine.retain_windows;
+                        defer engine.columns = columns;
+                        defer engine.stages.shrinkRetainingCapacity(stages);
+                        defer engine.match_weight_demand = saved_weight_demand;
+                        defer engine.retain_windows = retention;
+                        engine.match_weight_demand = null;
+                        engine.retain_windows = false;
+                        if (try engine.streamMatchProjectionInto(&.{row}, &.{fold.weight}, operation, .{ .items = &.{}, .wildcard = true }, &.{}, clause.span, clause.span, .{ .parent = fold, .index = index + 1 })) |_| return;
+                        // Unproved shapes retain the regular per-binding
+                        // operator; no row has been emitted on a decline.
+                        for (try engine.match(&.{row}, operation)) |child| try fold.expand(engine, child, index + 1);
+                    },
                     .project => |step| {
                         const projected = try engine.projectUnordered(&.{row}, step.value, false);
                         if (projected.len == 0) return;
@@ -1302,6 +1334,13 @@ const Engine = struct {
                     else => unreachable,
                 }
                 return;
+            }
+            if (fold.continuation) |next| {
+                const weight = next.parent.weight;
+                next.parent.weight = fold.weight;
+                defer next.parent.weight = weight;
+                if (next.parent.record_rows) next.parent.stage_counts[next.index] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
+                return next.parent.expand(engine, row, next.index);
             }
             try engine.state();
             if (fold.record_rows) fold.matched.* +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
@@ -1720,6 +1759,9 @@ const Engine = struct {
         return self.streamMatchProjectionWeighted(input, null, operation, projection, original_middle, match_span, projection_span);
     }
     fn streamMatchProjectionWeighted(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
+        return self.streamMatchProjectionInto(input, input_weights, operation, projection, original_middle, match_span, projection_span, null);
+    }
+    fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation")) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
         if (original_middle.len > self.limits.recursion_depth -| self.recursion) return null;
@@ -1743,7 +1785,16 @@ const Engine = struct {
         }
         for (projection.order) |order| if (@import("expressions.zig").containsPattern(order.expression)) return null;
         if (projection.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
+        const has_match = for (middle) |clause| {
+            if (clause.operation == .match) break true;
+        } else false;
+        // Global reducers/order remain stage barriers. This continuation path
+        // is for finite unordered demand; it never enumerates a large count
+        // query that the weighted stage executor can reduce compactly.
+        if (has_match and (grouped or projection.order.len != 0 or self.windowGoal(projection) == null or !weightedExpression(middle))) return null;
+        if (has_match and self.windowGoal(projection).? > self.limits.intermediate_states -| self.stats.intermediate_states) return null;
         for (middle) |clause| {
+            if (clause.operation == .match) continue;
             if (clause.operation == .unwind) {
                 if (@import("expressions.zig").containsPattern(clause.operation.unwind.expression)) return null;
                 continue;
@@ -1827,6 +1878,18 @@ const Engine = struct {
                 try shape.appendSlice(self.a, next);
                 continue;
             }
+            if (clause.operation == .match) {
+                for (clause.operation.match.paths) |pattern| {
+                    for (pattern.nodes) |node| if (node.alias) |name| {
+                        shape.items = @constCast(try self.replace(shape.items, name, .null));
+                    };
+                    for (pattern.edges) |edge| if (edge.alias) |name| {
+                        shape.items = @constCast(try self.replace(shape.items, name, .null));
+                    };
+                    if (pattern.alias) |name| shape.items = @constCast(try self.replace(shape.items, name, .null));
+                }
+                continue;
+            }
             const p = clause.operation.project.value;
             var next_shape: std.ArrayList(v.Entry) = .empty;
             if (p.wildcard) try next_shape.appendSlice(self.a, shape.items);
@@ -1850,7 +1913,7 @@ const Engine = struct {
         @memset(stage_counts, 0);
         const distinct_stages = try retained.alloc(DistinctRows, middle.len);
         @memset(distinct_stages, .{});
-        var fold: StreamFold = .{ .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         if (projection.distinct and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) {
             fold.distinct_goal = try std.math.add(usize, if (projection.skip) |skip| try self.count(skip) else 0, try self.count(projection.limit.?));
         }
@@ -1924,11 +1987,11 @@ const Engine = struct {
                 self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(planned_path, row, planned, pass.projection, middle)) &batch else null;
                 defer self.anchor_batch = saved_batch;
                 self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |err| switch (err) {
-                    error.CypherStreamComplete => break :produce,
+                    error.CypherStreamComplete => if (continuation != null) return err else break :produce,
                     else => return err,
                 };
                 batch.flush(self, &ignored) catch |err| switch (err) {
-                    error.CypherStreamComplete => break :produce,
+                    error.CypherStreamComplete => if (continuation != null) return err else break :produce,
                     else => return err,
                 };
                 if (operation.optional and !fold.had_match) {
@@ -1937,7 +2000,7 @@ const Engine = struct {
                         extended = (try self.bind(extended, alias, .null)).?;
                     };
                     fold.add(self, extended) catch |err| switch (err) {
-                        error.CypherStreamComplete => break :produce,
+                        error.CypherStreamComplete => if (continuation != null) return err else break :produce,
                         else => return err,
                     };
                 }
@@ -1953,6 +2016,7 @@ const Engine = struct {
         }
         self.shortest_count = previous_count;
         self.stream_fold = previous_fold;
+        if (continuation != null) return &.{};
         const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, calls.items, projection);
         try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = input.len, .output_rows = stage_counts[0] });
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
@@ -2447,6 +2511,70 @@ const Engine = struct {
         copy[copy.len - 1].operation.project.value.limit = expression;
         return copy;
     }
+    // One apply stage owns one bounded, snapshot-local memo. Keys include
+    // only captured bindings and the child's row goal. Binding equality keeps
+    // numeric representation (including nested 1 versus 1.0) observable.
+    const CallMemo = struct {
+        const Entry = struct { key: Row, goal: ?usize, children: WeightedRows };
+        budget: Budget,
+        arena: ?std.heap.ArenaAllocator = null,
+        index: value_work.Index = .{},
+        entries: std.ArrayList(Entry) = .empty,
+        disabled: bool = false,
+        fn deinit(memo: *CallMemo) void {
+            if (memo.arena) |*arena| arena.deinit();
+        }
+        fn find(memo: *CallMemo, engine: *Engine, key: Row, goal: ?usize) !?WeightedRows {
+            if (memo.disabled) return null;
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            var work: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork, .binding_identity = true };
+            const hash = (try work.info(.{ .map = key })).hash;
+            var candidate = memo.index.head(hash);
+            while (candidate) |position| {
+                const link = memo.index.links.items[position];
+                const entry = memo.entries.items[link.index];
+                if (entry.goal == goal and try work.eql(.{ .map = key }, .{ .map = entry.key })) {
+                    const rows = try engine.a.alloc(Row, entry.children.rows.len);
+                    const weights = try engine.a.alloc(Count, rows.len);
+                    for (rows, weights, entry.children.rows, entry.children.weights) |*row, *weight, old_row, old_weight| {
+                        row.* = (try (v.Value{ .map = old_row }).clone(engine.a)).map;
+                        weight.* = try old_weight.clone(engine.a);
+                    }
+                    return .{ .rows = rows, .weights = weights };
+                }
+                candidate = link.next;
+            }
+            return null;
+        }
+        fn put(memo: *CallMemo, engine: *Engine, key: Row, goal: ?usize, children: WeightedRows) !void {
+            if (memo.disabled) return;
+            memo.capture(engine, key, goal, children) catch |err| {
+                if (err != error.OutOfMemory or !memo.budget.exhausted) return err;
+                // A cache admission failure must never fail an otherwise valid
+                // query or leave partially built entries available to readers.
+                memo.disabled = true;
+            };
+        }
+        fn capture(memo: *CallMemo, engine: *Engine, key: Row, goal: ?usize, children: WeightedRows) !void {
+            if (memo.arena == null) memo.arena = .init(memo.budget.allocator());
+            const a = memo.arena.?.allocator();
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            var work: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork, .binding_identity = true };
+            const hash = (try work.info(.{ .map = key })).hash;
+            const rows = try a.alloc(Row, children.rows.len);
+            const weights = try a.alloc(Count, rows.len);
+            for (rows, weights, children.rows, children.weights) |*row, *weight, old_row, old_weight| {
+                row.* = (try (v.Value{ .map = old_row }).clone(a)).map;
+                weight.* = try old_weight.clone(a);
+            }
+            const owned_key = (try (v.Value{ .map = key }).clone(a)).map;
+            try memo.entries.ensureUnusedCapacity(a, 1);
+            try memo.index.insert(a, hash, memo.entries.items.len);
+            memo.entries.appendAssumeCapacity(.{ .key = owned_key, .goal = goal, .children = .{ .rows = rows, .weights = weights } });
+        }
+    };
     fn runWeightedRows(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool, retain_final: bool) anyerror!WeightedRows {
         var bags = initial;
         const saved_retention = self.retain_windows;
@@ -2466,7 +2594,7 @@ const Engine = struct {
                     // can stop before capturing an otherwise unbounded closure.
                     var fused = false;
                     for (clauses[clause_index + 1 ..], clause_index + 1..) |following, index| {
-                        if (following.operation == .unwind) continue;
+                        if (following.operation == .unwind or following.operation == .match) continue;
                         if (following.operation != .project) break;
                         const projection = following.operation.project.value;
                         var reduction = false;
@@ -2591,19 +2719,34 @@ const Engine = struct {
                     const demand = try self.matchDemand(clauses[clause_index + 1 ..]);
                     const goal = if (unit) null else self.callRowGoal(clauses[clause_index + 1 ..]);
                     var produced: usize = 0;
+                    var memo: CallMemo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = !weightedExpression(inner) or unit };
+                    defer memo.deinit();
+                    var captures: Names = .empty;
+                    if (!memo.disabled and bags.rows.len != 0) try self.retainQueryReferences(&captures, bags.rows[0], inner);
                     for (bags.rows, bags.weights) |row, weight| {
                         if (goal) |bound| if (produced >= bound) break;
-                        const body = if (goal) |bound| blk: {
+                        const child_goal: ?usize = if (goal) |bound| blk: {
                             const remaining = bound - produced;
                             const parent: usize = @intCast(@max(1, weight.cap(remaining)));
-                            break :blk try self.boundedCallBody(inner, remaining / parent + @intFromBool(remaining % parent != 0));
-                        } else inner;
+                            break :blk remaining / parent + @intFromBool(remaining % parent != 0);
+                        } else null;
+                        const body = if (child_goal) |bound| try self.boundedCallBody(inner, bound) else inner;
+                        var key_arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+                        defer key_arena.deinit();
+                        var key: std.ArrayList(v.Entry) = .empty;
+                        if (!memo.disabled) for (row) |entry| if (captures.contains(entry.name)) {
+                            try key.append(key_arena.allocator(), entry);
+                        };
+                        const cached = try memo.find(self, key.items, child_goal);
                         const scope = PatternScope.enter(self);
-                        const children = blk: {
+                        const children = cached orelse blk: {
                             defer scope.leave(self);
                             self.terminal_weight_demand = if (unit) .presence else demand;
                             break :blk try self.runWeightedRows(body, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
                         };
+                        // A cache hit does not enter the child's pattern scope.
+                        if (cached != null) scope.leave(self);
+                        if (cached == null) try memo.put(self, key.items, child_goal, children);
                         if (unit) {
                             try rows.append(self.a, row);
                             try weights.append(self.a, weight);
@@ -3492,9 +3635,9 @@ const Engine = struct {
         return self.countAllPaths(input, path, mode, &.{start}, output);
     }
     fn countAllPaths(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
-        // Native exact consumers keep arbitrary-precision producer counts.
-        // Bounded/presence consumers and SQL cursors retain the compact u64 DP.
-        if (self.weighted_sink == null and self.exactPathWeights())
+        // Native and SQL exact consumers keep arbitrary-precision counts.
+        // Bounded and presence consumers retain the compact u64 DP.
+        if (if (self.weighted_sink) |sink| sink.multiplicity == .exact else self.exactPathWeights())
             return self.countAllPathsTyped(Count, input, path, mode, starts, output);
         return self.countAllPathsTyped(u64, input, path, mode, starts, output);
     }
@@ -3774,12 +3917,12 @@ const Engine = struct {
                 const row = (try self.bind(input.row, path.nodes[path.nodes.len - 1].alias, .{ .node = node })) orelse continue;
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
                 if (self.weighted_sink) |sink| {
-                    // SQL's cursor protocol keeps its signed-overflow cap;
-                    // native windows retain the wider internal prefix counts.
+                    // Finite SQL consumers need only the signed-overflow cap;
+                    // exact consumers retain the complete promoted count.
                     try sink.emit(sink.ptr, row, switch (sink.multiplicity) {
-                        .presence => 1,
-                        .capped => @min(waysCap(ways), @as(u64, std.math.maxInt(i64)) + 1),
-                        .exact => waysCap(ways),
+                        .presence => Count.one,
+                        .capped => Count.init(@min(waysCap(ways), @as(u64, std.math.maxInt(i64)) + 1)),
+                        .exact => if (W == Count) ways else Count.init(ways),
                     });
                     continue;
                 }

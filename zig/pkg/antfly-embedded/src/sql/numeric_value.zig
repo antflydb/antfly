@@ -35,6 +35,9 @@ pub const Context = struct {
     max_input_bytes: usize = 1024 * 1024,
     max_output_bytes: usize = 1024 * 1024,
     max_groups: usize = 73730,
+    /// Exact aggregate intermediates may exceed the public NUMERIC exponent
+    /// range before cancellation or division. Public values remain strict.
+    allow_wide_weight: bool = false,
     checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     ptr: ?*anyopaque = null,
     since_poll: u16 = 256,
@@ -143,9 +146,10 @@ fn normalized(storage: []u16, weight: i32, scale: u16, negative: bool) Value {
     return .{ .digits = storage[first..last], .weight = if (first == last) 0 else weight - @as(i32, @intCast(first)), .scale = scale, .negative = negative and first != last };
 }
 
-fn finish(a: A, storage: []u16, weight: i32, scale: u16, negative: bool) !Owned {
+fn finish(ctx: *Context, storage: []u16, weight: i32, scale: u16, negative: bool) !Owned {
+    const a = ctx.alloc;
     const value = normalized(storage, weight, scale, negative);
-    if (value.weight > maximum_weight or scale > maximum_scale) return error.InvalidSqlNumber;
+    if ((!ctx.allow_wide_weight and value.weight > maximum_weight) or scale > maximum_scale) return error.InvalidSqlNumber;
     return .{ .alloc = a, .allocation = storage, .value = value };
 }
 
@@ -200,7 +204,7 @@ pub fn fromGroups(ctx: *Context, source: anytype, weight: i16, scale: u16, negat
         const raw = source.at(i);
         digit.* = if (exponent == unit) raw / factor * factor else raw;
     }
-    return finish(ctx.alloc, storage, @as(i32, weight) - @as(i32, @intCast(start)), scale, negative);
+    return finish(ctx, storage, @as(i32, weight) - @as(i32, @intCast(start)), scale, negative);
 }
 
 /// Shared logical admission for physical codecs. Scale is display metadata,
@@ -214,7 +218,7 @@ pub fn validateCanonical(ctx: *Context, value: Value) !void {
         if (value.negative or value.weight != 0 or value.scale != 0 or value.digits.len != 0) return error.InvalidNumericRepresentation;
         return;
     }
-    if (value.scale > maximum_scale or std.math.cast(i16, value.weight) == null or value.digits.len > std.math.maxInt(u16)) return error.InvalidNumericRepresentation;
+    if (value.scale > maximum_scale or (!ctx.allow_wide_weight and (std.math.cast(i16, value.weight) == null or value.digits.len > std.math.maxInt(u16)))) return error.InvalidNumericRepresentation;
     if (value.digits.len == 0) {
         if (value.negative or value.weight != 0) return error.InvalidNumericRepresentation;
         return;
@@ -329,7 +333,7 @@ pub fn parse(ctx: *Context, input: []const u8) !Owned {
     const first = first_nonzero orelse return zero(ctx.alloc, @intCast(scale));
     const high: i64 = @divFloor(integral + exponent - 1 - first, 4);
     const low = @divFloor(integral + exponent - 1 - last_nonzero, 4);
-    if (high > maximum_weight) return error.InvalidSqlNumber;
+    if ((!ctx.allow_wide_weight and high > maximum_weight) or high > std.math.maxInt(i32)) return error.InvalidSqlNumber;
     const storage = try ctx.allocate(@intCast(high - low + 1));
     errdefer ctx.alloc.free(storage);
     @memset(storage, 0);
@@ -343,7 +347,7 @@ pub fn parse(ctx: *Context, input: []const u8) !Owned {
         }
         index += 1;
     }
-    return finish(ctx.alloc, storage, @intCast(high), @intCast(scale), negative);
+    return finish(ctx, storage, @intCast(high), @intCast(scale), negative);
 }
 
 fn radixDigit(byte: u8, radix: u8) ?u8 {
@@ -400,7 +404,7 @@ fn parseRadix(ctx: *Context, text: []const u8, radix: u8, negative: bool) !Owned
     }
     try radixChunk(ctx, storage, &used, multiplier, chunk);
     std.mem.reverse(u16, storage[0..used]);
-    return finish(ctx.alloc, storage, @as(i32, @intCast(used)) - 1, 0, negative);
+    return finish(ctx, storage, @as(i32, @intCast(used)) - 1, 0, negative);
 }
 
 fn radixChunk(ctx: *Context, storage: []u16, used: *usize, multiplier: u32, chunk: u32) !void {
@@ -603,7 +607,7 @@ pub fn add(ctx: *Context, left: Value, right: Value) !Owned {
         }
         storage[i] = @intCast(digit);
     }
-    return finish(ctx.alloc, storage, high, scale, large.negative);
+    return finish(ctx, storage, high, scale, large.negative);
 }
 
 pub fn subtract(ctx: *Context, left: Value, right: Value) !Owned {
@@ -681,7 +685,7 @@ pub fn quantize(ctx: *Context, value: Value, requested_scale: i32, mode: Roundin
         storage[index] = @intCast(total % base);
         carry = total / base;
     }
-    return finish(ctx.alloc, storage, high, display, value.negative);
+    return finish(ctx, storage, high, display, value.negative);
 }
 
 /// PostgreSQL float casts use FLT_DIG/DBL_DIG significant decimal digits,
@@ -796,7 +800,7 @@ pub fn multiply(ctx: *Context, left: Value, right: Value) !Owned {
         ctx.alloc.free(storage);
         return result;
     }
-    return finish(ctx.alloc, storage, weight, scale, left.negative != right.negative);
+    return finish(ctx, storage, weight, scale, left.negative != right.negative);
 }
 
 const DigitSequence = struct {
@@ -825,7 +829,7 @@ fn divideDigits(ctx: *Context, dividend: DigitSequence, divisor: DigitSequence, 
             try ctx.charge(1);
             digit.* = dividend.at(i);
         }
-        return finish(ctx.alloc, storage, @as(i32, @intCast(storage.len)) - 1 + result_low, scale, negative);
+        return finish(ctx, storage, @as(i32, @intCast(storage.len)) - 1 + result_low, scale, negative);
     }
     if (divisor.len() == 1) {
         return divideSingle(ctx, dividend, divisor.digits[0], result_low, scale, negative, result_kind);
@@ -852,7 +856,7 @@ fn divideSingle(ctx: *Context, dividend: DigitSequence, divisor: u16, result_low
         const output = try ctx.allocate(1);
         errdefer ctx.alloc.free(output);
         output[0] = @intCast(carry);
-        return finish(ctx.alloc, output, result_low, scale, negative);
+        return finish(ctx, output, result_low, scale, negative);
     }
     var tail: usize = 0;
     // Four base-10000 groups exhaust all factors of two/five in a one-limb
@@ -871,7 +875,7 @@ fn divideSingle(ctx: *Context, dividend: DigitSequence, divisor: u16, result_low
         digit.* = @intCast(total / divisor);
         carry = total % divisor;
     }
-    return finish(ctx.alloc, output, @as(i32, @intCast(dividend.len())) - 1 + result_low, scale, negative);
+    return finish(ctx, output, @as(i32, @intCast(dividend.len())) - 1 + result_low, scale, negative);
 }
 
 fn normalizeDigits(ctx: *Context, input: DigitSequence, output: []u16, factor: u32) !u16 {
@@ -905,7 +909,7 @@ fn divideGeneral(ctx: *Context, dividend: DigitSequence, divisor: DigitSequence,
         if (result_kind == .quotient) output[j] = digit;
     }
     if (result_kind == .quotient) {
-        const result = try finish(ctx.alloc, output, @as(i32, @intCast(output.len)) - 1 + result_low, scale, negative);
+        const result = try finish(ctx, output, @as(i32, @intCast(output.len)) - 1 + result_low, scale, negative);
         ctx.alloc.free(u);
         ctx.alloc.free(v);
         return result;
@@ -920,7 +924,7 @@ fn divideGeneral(ctx: *Context, dividend: DigitSequence, divisor: DigitSequence,
         carry = total % normalization;
     }
     std.debug.assert(carry == 0);
-    const result = try finish(ctx.alloc, v, @as(i32, @intCast(n)) - 1 + result_low, scale, negative);
+    const result = try finish(ctx, v, @as(i32, @intCast(n)) - 1 + result_low, scale, negative);
     ctx.alloc.free(u);
     return result;
 }

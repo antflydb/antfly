@@ -33,9 +33,9 @@ fn addWeightedRow(context: anytype, bound: *const binding.Bound, grouped: anytyp
 }
 
 fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: u64) !void {
-    return addCellsMasked(context, bound, grouped, alloc, cells, weight, null);
+    return addCellsMasked(context, bound, grouped, alloc, cells, catalog.Count.init(weight), null);
 }
-fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: u64, active: ?[]const usize) !void {
+fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: catalog.Count, active: ?[]const usize) !void {
     if (!try bound.input.matchesWithLimits(alloc, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
@@ -51,7 +51,7 @@ fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytyp
         }
         value.* = if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
     }
-    try grouped.addWeighted(values, inputs, weight);
+    try grouped.addCount(values, inputs, weight);
 }
 
 fn addRows(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const []const Datum) !void {
@@ -469,6 +469,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             };
             const page = try scan.page(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.page_rows });
             defer page.deinit();
+            try page.validateWeights();
             if (page.rows.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
             if (page.multiplicities) |weights| if (!weighted or weights.len != page.rows.len) return error.InvalidSqlBackendResponse;
             if (page.aggregate_slots) |slots| {
@@ -494,7 +495,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 visited += 1;
                 if (visited > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                 const cells = try bound.input.cells(arena.allocator(), row);
-                try addCellsMasked(context, bound, &collector, arena.allocator(), cells, if (page.multiplicities) |weights| weights[row_index] else 1, page.aggregate_slots);
+                try addCellsMasked(context, bound, &collector, arena.allocator(), cells, page.weight(row_index), page.aggregate_slots);
             }
             const next = page.after orelse break;
             if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;

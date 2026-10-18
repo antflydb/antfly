@@ -415,6 +415,7 @@ pub const Cursor = struct {
         const page_limit: u32 = @intCast(@max(1, @min(limit, self.request.row_goal orelse limit)));
         var output: std.ArrayList(catalog.Row) = .empty;
         var weights: std.ArrayList(u64) = .empty;
+        var counts: std.ArrayList(catalog.Count) = .empty;
         const names = try owned.alloc([]const u8, self.request.fields.len);
         for (self.request.fields, names) |name, *out| out.* = try owned.dupe(u8, name);
         const layout = try catalog.Row.TypedLayout.init(owned, names);
@@ -479,11 +480,14 @@ pub const Cursor = struct {
                 const cells = try owned.alloc(scalar.Datum, self.request.fields.len);
                 for (self.request.fields, cells) |field, *out| out.* = try @import("operators.zig").cloneDatum(owned, try row.cell(field));
                 try output.append(owned, try catalog.Row.fromDatums(owned, try owned.dupe(u8, row_id), layout, cells));
-                if (self.stream) |stream| if (stream.weighted) try weights.append(owned, stream.last_weights.items[row_index]);
+                if (self.stream) |stream| if (stream.weighted) {
+                    try weights.append(owned, stream.last_weights.items[row_index]);
+                    try counts.append(owned, try stream.last_counts.items[row_index].clone(owned));
+                };
             }
         }
         const more = if (self.weight_passes.len != 0) !self.stream.?.done or self.weight_pass + 1 < self.weight_passes.len else if (self.empty) false else if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
-        return .{ .rows = try output.toOwnedSlice(owned), .multiplicities = if (self.stream != null and self.stream.?.weighted) try weights.toOwnedSlice(owned) else null, .aggregate_slots = if (self.weight_passes.len != 0) try owned.dupe(usize, self.weight_passes[self.weight_pass].slots) else null, .owned_arena = arena, .after = if (!more) null else if (self.weight_passes.len != 0) try std.fmt.allocPrint(owned, "ag:{d}:{d}", .{ self.weight_pass, self.position }) else try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) };
+        return .{ .rows = try output.toOwnedSlice(owned), .exact_multiplicities = if (counts.items.len != 0) counts.items else null, .multiplicities = if (self.stream != null and self.stream.?.weighted) try weights.toOwnedSlice(owned) else null, .aggregate_slots = if (self.weight_passes.len != 0) try owned.dupe(usize, self.weight_passes[self.weight_pass].slots) else null, .owned_arena = arena, .after = if (!more) null else if (self.weight_passes.len != 0) try std.fmt.allocPrint(owned, "ag:{d}:{d}", .{ self.weight_pass, self.position }) else try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) };
     }
 
     fn close(ptr: *anyopaque) void {

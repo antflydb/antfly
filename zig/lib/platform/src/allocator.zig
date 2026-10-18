@@ -79,6 +79,8 @@ pub fn concurrentFallback() std.mem.Allocator {
 /// ability to resize or relocate a block on a particular iteration. SafeAllocator
 /// can remap blocks differently as its backing memory layout changes. Refusing
 /// remaps exercises the allocate/copy/free fallback and retains leak detection.
+/// Normalize base alignment too: mixed-alignment arena padding must not depend
+/// on a reused backing block's address and change the number of arena spills.
 pub fn checkAllAllocationFailures(backing: std.mem.Allocator, comptime test_fn: anytype, extra_args: anytype) !void {
     var stable: Stable = .{ .backing = backing };
     try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
@@ -89,9 +91,12 @@ const Stable = struct {
     fn allocator(self: *Stable) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
+    fn stableAlignment(alignment: std.mem.Alignment) std.mem.Alignment {
+        return @fromBackingInt(@intCast(@max(@backingInt(alignment), 6)));
+    }
     fn alloc(context: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Stable = @ptrCast(@alignCast(context));
-        return self.backing.rawAlloc(size, alignment, ra);
+        return self.backing.rawAlloc(size, stableAlignment(alignment), ra);
     }
     fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
         return false;
@@ -101,6 +106,6 @@ const Stable = struct {
     }
     fn free(context: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *Stable = @ptrCast(@alignCast(context));
-        self.backing.rawFree(bytes, alignment, ra);
+        self.backing.rawFree(bytes, stableAlignment(alignment), ra);
     }
 };

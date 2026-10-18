@@ -111,6 +111,11 @@ pub const Collector = struct {
         if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
         try self.grouped.addWeighted(keys, inputs, weight);
     }
+    pub fn addCount(self: *Collector, keys: []const Datum, inputs: []const Datum, count: @import("catalog.zig").Count) !void {
+        if (count.isOne()) return self.add(keys, inputs);
+        if (self.bound.ordered.len != 0) return error.InvalidSqlBackendResponse;
+        try self.grouped.addCount(keys, inputs, count);
+    }
     pub fn addGlobalBatch(self: *Collector, inputs: []const []const Datum) !void {
         try self.grouped.addGlobalBatch(inputs);
         for (inputs) |row| try self.capture(&.{}, row);
