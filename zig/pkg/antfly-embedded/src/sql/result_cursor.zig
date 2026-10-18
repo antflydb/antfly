@@ -78,15 +78,17 @@ pub const Cursor = struct {
         owner: ?*Cursor = null,
         block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
         blocks: []const *@import("spill.zig").Sequential.OwnedBlock = &.{},
+        payload_page: ?@import("spill.zig").PayloadReader.Page = null,
         pub fn deinit(self: Lease) void {
+            if (self.payload_page) |page| page.release();
             if (self.block) |block| block.release();
             for (self.blocks) |block| block.release();
             if (self.owner) |owner| owner.close();
         }
     };
-    /// Page descriptors use the caller's arena. Pages retain the cursor through
-    /// terminal cleanup; release them before the statement allocator or shared
-    /// spill owner closes. Payloads remain in decoded blocks or the sort owner.
+    /// Native payload descriptors own exact admitted allocations; other views
+    /// use caller scratch. Pages retain the cursor through terminal cleanup;
+    /// release them before the statement allocator closes.
     pub fn nextLease(self: *Cursor, a: std.mem.Allocator, maximum: usize, byte_limit: usize) !Lease {
         if (maximum == 0) return error.InvalidSqlLimit;
         if (self.replay_failed) return error.InvalidSqlBackendResponse;
@@ -97,11 +99,9 @@ pub const Cursor = struct {
             const input = try self.reference_reader.?.readBatchCurrent(a, self.index, @min(@min(64, maximum), @max(1, byte_limit / @max(1, self.reference_row_bytes))));
             const page = try (try self.payloadReader()).nativePage(a, input.values, self.width, byte_limit);
             errdefer page.release();
-            const blocks = try a.alloc(*@import("spill.zig").Sequential.OwnedBlock, page.payloads.len);
-            for (blocks, page.payloads) |*block, payload| block.* = payload.block;
             self.index += page.values.len();
             _ = self.refs.fetchAdd(1, .monotonic);
-            return .{ .values = page.values, .blocks = blocks, .owner = self };
+            return .{ .values = page.values, .payload_page = page, .owner = self };
         }
         if (if (self.sorted == null) self.memory else null) |memory| {
             try memory.finish();
@@ -124,31 +124,28 @@ pub const Cursor = struct {
             const blocks = try a.alloc(*@import("spill.zig").Sequential.OwnedBlock, capacity);
             var held: usize = 0;
             errdefer for (blocks[0..held]) |block| block.release();
-            var gathered: ?[]@import("spill.zig").Sort.RowLease = null;
+            var gathered: ?@import("spill.zig").Sort.Page = null;
             if (top.external) |sort| if (sort.order_sort != null) {
                 while (self.sorted_offset != 0) : (self.sorted_offset -= 1) if (!try sort.skip()) return error.InvalidSqlSpill;
-                gathered = try sort.nextPageLeased(a, capacity, byte_limit);
-                if (gathered.?.len == 0) {
-                    a.free(gathered.?);
+                gathered = try sort.nextPageLeased(capacity, byte_limit);
+                if (gathered.?.rows.len == 0) {
+                    gathered.?.release();
                     return error.InvalidSqlSpill;
                 }
             };
-            defer if (gathered) |leases| {
-                for (leases) |lease| lease.release();
-                a.free(leases);
-            };
+            defer if (gathered) |page| page.release();
             var count_rows: usize = 0;
             var bytes: usize = 0;
             var leased_bytes: usize = capacity *| (@sizeOf(Location) + @sizeOf(*@import("spill.zig").Sequential.OwnedBlock));
-            while (count_rows < (if (gathered) |leases| leases.len else capacity)) {
+            while (count_rows < (if (gathered) |page| page.rows.len else capacity)) {
                 if (top.external) |sort| {
                     while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
                         if (!try sort.skip()) return error.InvalidSqlSpill;
                     }
-                    const lease = if (gathered) |leases| leases[count_rows] else (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
-                    if (gathered) |leases| {
-                        leases[count_rows].block = null;
-                        leases[count_rows].key_block = null;
+                    const lease = if (gathered) |page| page.rows[count_rows] else (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
+                    if (gathered) |page| {
+                        page.rows[count_rows].block = null;
+                        page.rows[count_rows].key_block = null;
                     }
                     if (lease.key_block) |keys| keys.release();
                     rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values, .typed = lease.values };
@@ -515,8 +512,11 @@ pub const Cursor = struct {
         index: usize = 0,
         payload_reader: ?@import("spill.zig").PayloadReader = null,
         payload_blocks: [64]?*@import("spill.zig").Sequential.OwnedBlock = @splat(null),
+        payload_page: ?@import("spill.zig").PayloadReader.Page = null,
         payload_scratch: ?std.heap.ArenaAllocator = null,
         fn retirePayloads(self: *ReplayReader) void {
+            if (self.payload_page) |page| page.release();
+            self.payload_page = null;
             for (&self.payload_blocks) |*block| if (block.*) |owner| {
                 owner.release();
                 block.* = null;
@@ -566,7 +566,7 @@ pub const Cursor = struct {
                     const batch = try reader.readBatchCurrent(a, self.index, bound);
                     if (self.owner.payloads != null) {
                         const page = try self.payloadReader().nativePage(a, batch.values, self.owner.width, 128 * 1024);
-                        for (page.payloads, 0..) |payload, i| self.payload_blocks[i] = payload.block;
+                        self.payload_page = page;
                         self.index += page.values.len();
                         break :blk page.values;
                     }

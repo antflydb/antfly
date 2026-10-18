@@ -1088,9 +1088,8 @@ pub const HashJoin = struct {
         var identities: std.AutoHashMapUnmanaged(PayloadIdentity, Memo) = .empty;
         var native: [Payloads.page_rows]?usize = @splat(null);
         var positions: [Payloads.page_rows]usize = undefined;
-        var costs: [Payloads.page_rows]usize = undefined;
-        const Ref = struct { offset: u64, row: usize };
-        var refs: [Payloads.page_rows]Ref = undefined;
+        var ordinary_bytes: [Payloads.page_rows]usize = undefined;
+        var refs: [Payloads.page_rows]@import("spill.zig").PayloadReader.Reference = undefined;
         var unique: usize = 0;
         for (keys, 0..) |key, row| {
             if (key.len > 256 or key.len != keys[0].len) return error.InvalidSqlBackendResponse;
@@ -1098,7 +1097,7 @@ pub const HashJoin = struct {
             const identity = description.identity;
             const memo = if (identity) |id| identities.get(id) else null;
             const estimate = if (memo) |entry| entry.estimate else description.estimate orelse try PayloadEstimate.init(values, row, a);
-            if (try estimate.recordBytes(key, inline_budget)) |bytes| {
+            if (try estimate.recordBytes(key, inline_budget)) |_| {
                 if (identity) |id| {
                     const entry = try identities.getOrPut(a, id);
                     if (!entry.found_existing) entry.value_ptr.* = .{ .estimate = estimate };
@@ -1109,7 +1108,7 @@ pub const HashJoin = struct {
                     entry.value_ptr.native = unique;
                 }
                 positions[unique] = row;
-                costs[unique] = bytes;
+                ordinary_bytes[unique] = estimate.decoded;
                 native[row] = unique;
                 unique += 1;
             }
@@ -1120,21 +1119,8 @@ pub const HashJoin = struct {
             owner.* = try Payloads.init(manager);
             payloads.* = owner;
         }
-        var begin: usize = 0;
-        while (begin < unique) {
-            var end = begin;
-            var bytes: usize = 64;
-            const target = @min(Payloads.page_bytes, manager.max_record_bytes / 4);
-            while (end < unique) : (end += 1) {
-                if (end != begin and costs[end] > target -| bytes) break;
-                bytes +|= costs[end];
-            }
-            const selected = try values.select(a, positions[begin..end]);
-            const offset = try payloads.*.?.appendBatch(selected);
-            if (offset >= native_payload_bit) return error.SqlProgramLimitExceeded;
-            for (refs[begin..end], 0..) |*ref, row| ref.* = .{ .offset = offset, .row = row };
-            begin = end;
-        }
+        var body_reuse: Payloads.BodyReuse = .{};
+        if (unique != 0) try payloads.*.?.appendCohort(values, positions[0..unique], refs[0..unique], &body_reuse, Payloads.page_bytes, ordinary_bytes[0..unique]);
         // Only physical page/lane refs survive into key emission. Retire the
         // identity map and selection views before allocating key wire buffers.
         _ = arena.reset(.free_all);
@@ -1147,7 +1133,7 @@ pub const HashJoin = struct {
             const link = if (hashed != null) heads[bucket] else @import("spill.zig").none;
             const offset = if (native[row]) |id| blk: {
                 const ref = refs[id];
-                break :blk try file.appendWithPressure(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = @intCast(ref.row) }) }, .keys = key, .ordinal = ref.offset | native_payload_bit }, link, &pressure);
+                break :blk try file.appendWithPressure(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = @intCast(ref.index) }) }, .keys = key, .ordinal = ref.offset | native_payload_bit }, link, &pressure);
             } else try file.appendWithPressure(.{ .values = try values.row(row_scratch.allocator(), row), .keys = key, .ordinal = ordinal + row }, link, &pressure);
             if (hashed != null) heads[bucket] = offset;
         }
@@ -4158,4 +4144,55 @@ test "SQL native heap pooled bodies reclaim cached values during competitive chu
     try Harness.run(std.testing.allocator, 16, 32768);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ @as(usize, 8), @as(usize, 1024) });
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ @as(usize, 4), @as(usize, 32768) });
+}
+
+test "SQL native hash join shares producer body preparation across physical pages" {
+    const spill = @import("spill.zig");
+    const Frozen = @import("execution_batch.zig").FrozenJson;
+    const Reader = struct {
+        value: Frozen,
+        fn check(_: *anyopaque) !void {}
+        fn frozen(raw: *anyopaque, _: usize, column: usize) anyerror!?Frozen {
+            return if (column == 0) @as(*@This(), @ptrCast(@alignCast(raw))).value else null;
+        }
+        fn cell(_: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
+            if (column == 0) return error.UnexpectedMaterialization;
+            return Datum.json(.{ .integer = @intCast(row) });
+        }
+    };
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const sa = source.allocator();
+    const body = try sa.alloc(u8, 65536);
+    @memset(body, 'x');
+    var object: std.json.ObjectMap = .empty;
+    try object.put(sa, "body", .{ .string = body });
+    const wire = try spill.encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(.{ .object = object })}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+    const block = try spill.decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+    defer block.deinit();
+    var view: Reader = .{ .value = (try block.frozenJson(0, 0, false)).? };
+    var token: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = Reader.check, .compression = .none, .async_writes = false, .buffer_bytes = 128 };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 8192, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    const key = Datum.json(.{ .integer = 1 });
+    const keys: [64][]const Datum = @splat(&.{key});
+    try join.addBatch(sa, .{ .reader = .{ .ptr = &view, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 64, .width = 2 } }, &keys);
+    try std.testing.expectEqual(@as(usize, 2), join.disk_values.?.encoded_pages);
+    try std.testing.expect(manager.read_bytes < 8192);
+    std.debug.print("JOIN_BODY_PREPARATION frozen={d} encode_attempts={d} read_bytes={d} read_calls={d} written={d}\n", .{ view.value.bytes.len, join.disk_values.?.encoded_pages, manager.read_bytes, manager.read_calls, manager.written_bytes });
+    var seen: usize = 0;
+    var probe = try join.probe(&.{key});
+    while (try probe.next()) |match| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const batch = try match.valuesBatch(scratch.allocator());
+        try std.testing.expectEqual(@as(i64, @intCast(63 - seen)), (try batch.cell(scratch.allocator(), 0, 1)).value.integer);
+        try std.testing.expectEqualSlices(u8, view.value.bytes, (try batch.frozenJson(0, 0)).?.bytes);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), seen);
 }
