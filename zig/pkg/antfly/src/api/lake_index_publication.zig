@@ -124,6 +124,14 @@ const BuildProgress = struct {
             try self.cancellation.check();
             try self.remember(declaration);
         }
+        return self.persist();
+    }
+    fn saveNavigation(raw: *anyopaque, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.saved.source_navigation = ref;
+        try self.persist();
+    }
+    fn persist(self: *@This()) !void {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         const declarations = try scratch.allocator().alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, self.declarations.items.len);
@@ -319,7 +327,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
                 };
             };
     }
-    const navigation = try navigation_api.buildProven(a, na, &scoped, &provider, prior_navigation, cancellation, pinned.data);
+    var navigation = try navigation_api.buildProven(a, na, &scoped, &provider, prior_navigation, cancellation, pinned.data);
     provider.native_delta = navigation.delta;
     var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref } };
     defer progress.deinit();
@@ -366,7 +374,23 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     if (current.value.published) |previous| if (candidates.len != 0 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
         replay.only_files = try replay_api.changedFilesIndexed(a, na, &provider, scoped, candidates, previous_contributions, cancellation, &contribution_index);
     };
-    if (replay_columns.len != 0) provider.replay = &replay;
+    if (replay_columns.len != 0 and provider.replay_recommended) provider.replay = &replay;
+    var statistics_prior = prior_navigation;
+    if (current.value.checkpoint) |saved| if (std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) if (saved.source_navigation) |ref| {
+        const root: ?navigation_api.Root = navigation_api.load(na, scoped, ref, cancellation, null) catch |err| switch (err) {
+            error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable, error.LakeIndexArtifactUnavailable => null,
+            else => return err,
+        };
+        if (root) |value| if (value.coverage != null and std.mem.eql(u8, &value.coverage.?.data, &pinned.data)) {
+            statistics_prior = value;
+        };
+    };
+    var costing = try navigation_api.CostingBuilder.init(a, na, &scoped, &provider, navigation.ref, statistics_prior, replay_columns, cancellation);
+    defer costing.deinit();
+    try costing.start();
+    if (lease) |owner| {
+        if (owner.save_checkpoint != null) costing.checkpoint = .{ .ptr = &progress, .save = BuildProgress.saveNavigation };
+    }
     var legacy_indexes = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{ .allocate = .alloc_always });
     if (legacy_indexes != .object) return error.InvalidTableIndexMetadata;
     var index_position: usize = 0;
@@ -397,6 +421,8 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     @memcpy(declarations[manifest.artifacts.len + native_declarations.len + ordered.len ..][0..text.len], text);
     @memcpy(declarations[manifest.artifacts.len + native_declarations.len + ordered.len + text.len ..][0..sparse.len], sparse);
     @memcpy(declarations[manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len ..], dense);
+    navigation.ref = try costing.finish();
+    progress.saved.source_navigation = navigation.ref;
     try cancellation.check();
     const verified = try coverage.pin(source, context);
     if (!std.meta.eql(pinned, verified)) return error.ExternalLakeIndexSourceChanged;
@@ -524,6 +550,16 @@ test "external lake native publication builds scoped text artifacts and fences e
     try std.testing.expectEqual(@as(usize, 0), checkpoint_budget.live);
 
     const publication = parsed.value.published.?;
+    {
+        var statistics_arena = std.heap.ArenaAllocator.init(a);
+        defer statistics_arena.deinit();
+        const navigation_root = try @import("lake_source_navigation.zig").load(statistics_arena.allocator(), artifact_store, publication.source_navigation.?, .none, null);
+        try std.testing.expectEqual(@as(u8, 3), navigation_root.version);
+        try std.testing.expectEqual(@as(usize, 1), navigation_root.costing.len);
+        try std.testing.expectEqualStrings("body", navigation_root.costing[0].name);
+        try std.testing.expectEqual(@as(?u64, 2), navigation_root.costing[0].statistics.population_rows);
+        try std.testing.expectEqual(@as(?u64, 2), navigation_root.costing[0].statistics.non_null_rows);
+    }
     try std.testing.expect(parsed.value.pending == null);
     try std.testing.expect(publication.declarations.len > 0);
     for (publication.declarations) |declaration| {

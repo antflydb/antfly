@@ -5684,3 +5684,71 @@ headers, whitespace and the Apache boundary passed. Repository cache GC complete
 and preserved active build output; uv pruning timed out on the shared cache lock
 without interrupting its owner. Archive benchmarks and live retention qualification
 remain deferred.
+
+## Decimal continuity and durable planner statistics
+
+Exact coefficient batches now survive derived query projections, native joins,
+retained typed stores and SUM/AVG reduction. Kernel dispatch decides capability
+for all derived expressions, rather than excluding NUMERIC through the primitive
+kernel's type gate. Retained finite values with at most 38 coefficient digits
+use i128 coefficients and display-scale vectors; wide values and special values
+promote once to the general exact representation. Hashing and candidate equality
+borrow canonical stack views, and uniform-scale stores avoid a scale gather.
+SQL NULL remains a separate bitmap, including mixed/duplicate selections.
+Scalar cell materialization belongs to the retained store, with lazy canonical
+cells cached by row under its read lock. It does not leak allocations through a
+caller's reclaiming allocator. Physical hashing and exact reduction continue to
+borrow coefficient views without materializing those cells.
+
+A bounded decimal expression workspace shares pure subexpressions across the
+projection forest. Constants broadcast from one lane. Scale alignment and
+quotient rescaling use checked power-table multiplications. Division can retain
+per-lane PostgreSQL display scales, including across further arithmetic,
+subqueries, grouping and retained state; it no longer declines an entire cohort
+merely because magnitudes need different scales. The optional workspace admits
+at most 8 MiB (and at most one quarter of visible parent headroom). Exhausting
+its local grant declines acceleration; backing allocation failure, SQL errors,
+wide intermediates, constrained numeric modifiers and unsupported instructions
+retain their existing behavior. Required output allocations remain outside the
+optional fallback boundary.
+
+Native publication now builds advisory planner statistics from the same
+projected, delete-aware reads used by native indexes. Up to 64 primitive indexed
+column paths receive per-file sketches, each with 64 HLL registers, counts,
+retained-width observations, integer bounds and four weighted Misra-Gries
+heavy-key counters. Sketches are fixed, versioned 224-byte records and ordered
+page aggregates. They estimate distinct values and skew; they never prove
+uniqueness, prune data, limit rows or replace an exact predicate.
+
+Each column owns an immutable file-keyed tree. Refresh deletes removed/replaced
+leaves, replaces completely read files, and path-copies affected summaries.
+Unchanged complete trees need no source reads or file-by-file statistics census.
+Replay and ordinary streaming readers both capture sketches, so oversized files
+can retain streaming execution. Older publications backfill missing leaves once
+using the bounded projected source/replay path. Backfill checkpoints retain
+partial file trees every 64 completed files; a matching resumed build reuses
+those leaves. Partial summaries are never exposed to planning. Incomplete columns
+are omitted from final estimates.
+Only complete file coverage enters the published compact root summary, which
+SQL planning can consume without loading footers or flattening lazy inventories.
+The same estimates are exposed by physical and native ordered-index cursors.
+
+Source navigation v3 and reader protocol 50 fence these new references. All GC
+modes traverse the statistics trees, and cloud generation maps/certificates bind
+them through the published navigation root. Immutable metadata cache pins retain
+only costing data; they do not extend mutable reader authority. Iceberg lazy
+navigation and ordinary Parquet source opening both expose matching published
+statistics. There is no new SQL syntax, attachment option or result format.
+Archive-scale latency/RSS measurements and live-provider retention qualification
+remain deferred; these changes do not claim a measured archive speedup.
+
+Qualification of the native NUMERIC and durable-costing changes: all 1,028 SQL
+checks passed (three opt-in benchmarks skipped), including exhaustive allocator
+faults and retained-owner budget reclamation. The installed CLI passed all 56
+real Parquet/Iceberg E2Es in 658.75 seconds with an unchanged executable hash,
+including derived decimal aggregation across cold restarts.
+All 300 native lake API checks, both lake scaffold groups (466 and 151),
+the 213 shared focused lake checks, and the runtime I/O ABI gate passed.
+The combined SQL/lake/API/ABI/CLI build exited successfully with zero test
+failures or leaks. Source/error catalogs, license and Apache-boundary checks,
+Python lint/format and whitespace checks also passed.

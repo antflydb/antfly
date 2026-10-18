@@ -23,6 +23,7 @@ const A = std.mem.Allocator;
 /// Conservative physical payload estimate before cardinality is known.
 /// Allocation admission still accounts for actual vector/hash capacity growth.
 pub fn retainedCellBytes(value: Datum) !usize {
+    if (fixedCoefficient(value) != null) return 19;
     return 1 +| (if (value.patterns != null) @sizeOf(?*scalar.PatternSet) else @as(usize, 0)) +| switch (value.value) {
         .integer, .float => @as(usize, 8),
         .bool => @as(usize, 1),
@@ -179,6 +180,35 @@ fn Numeric(comptime T: type) type {
         }
     };
 }
+fn fixedCoefficient(value: Datum) ?struct { coefficient: i128, scale: u16 } {
+    const number = value.numeric orelse return null;
+    if (number.kind != .finite or number.scale > 38) return null;
+    const coefficient = @import("numeric_value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
+    if (@abs(coefficient) >= 100000000000000000000000000000000000000) return null;
+    return .{ .coefficient = coefficient, .scale = number.scale };
+}
+const Fixed = struct {
+    const Cells = std.AutoHashMapUnmanaged(usize, *const @import("numeric_value.zig").Value);
+    cells: *Cells,
+    values: std.ArrayList(i128) = .empty,
+    scales: std.ArrayList(u16) = .empty,
+    uniform: ?u16 = null,
+    mixed: bool = false,
+    fn deinit(self: *Fixed, a: A) void {
+        self.values.deinit(a);
+        self.scales.deinit(a);
+    }
+    fn cell(self: Fixed, a: A, row: usize) !Datum {
+        if (self.cells.get(row)) |number| return Datum.typedNumeric(number);
+        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+        var owned = try @import("numeric_value.zig").fromScaledInteger(&context, self.values.items[row], self.scales.items[row]);
+        errdefer owned.deinit();
+        const number = try a.create(@import("numeric_value.zig").Value);
+        number.* = owned.value;
+        try self.cells.put(a, row, number);
+        return Datum.typedNumeric(number);
+    }
+};
 const Column = struct {
     const Values = union(enum) {
         unknown,
@@ -190,11 +220,13 @@ const Column = struct {
         encoded: std.ArrayList(std.json.Value),
     };
     values: Values = .unknown,
+    fixed: ?Fixed = null,
     nulls: std.ArrayList(u64) = .empty,
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
     arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
     numerics: std.ArrayList(?*const @import("numeric_value.zig").Value) = .empty,
     fn deinit(self: *Column, a: A) void {
+        if (self.fixed) |*fixed| fixed.deinit(a);
         switch (self.values) {
             .unknown => {},
             inline else => |*values| values.deinit(a),
@@ -209,7 +241,7 @@ const Column = struct {
     }
     fn cell(self: Column, a: A, row: usize) !Datum {
         if (self.isNull(row)) return .{};
-        _ = a;
+        if (self.fixed) |fixed| return fixed.cell(a, row);
         const value: std.json.Value = switch (self.values) {
             .unknown => return error.InvalidSqlBackendResponse,
             .integers => |v| .{ .integer = v.get(row) },
@@ -222,7 +254,7 @@ const Column = struct {
         return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row], .array = if (self.arrays.items.len == 0) null else self.arrays.items[row], .numeric = if (self.numerics.items.len == 0) null else self.numerics.items[row] };
     }
     fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch) !bool {
-        if (batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
+        if (self.fixed != null or batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
         const source = batch.dictionary;
         for (source.indices) |id| if (id >= source.values.len) return error.InvalidSqlBackendResponse;
         const remap = try a.alloc(u32, source.values.len);
@@ -348,6 +380,40 @@ const Column = struct {
         return true;
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
+        const coefficient = fixedCoefficient(value);
+        if (self.fixed == null and self.values == .unknown and self.numerics.items.len == 0 and self.arrays.items.len == 0 and self.patterns.items.len == 0 and coefficient != null) {
+            const cells = try owned.create(Fixed.Cells);
+            cells.* = .empty;
+            self.fixed = .{ .cells = cells };
+            try self.fixed.?.values.resize(a, row);
+            @memset(self.fixed.?.values.items, 0);
+            try self.fixed.?.scales.resize(a, row);
+            @memset(self.fixed.?.scales.items, 0);
+        }
+        if (self.fixed) |*fixed| {
+            if (value.sql_null or (coefficient != null and value.array == null and value.patterns == null)) {
+                if (row % 64 == 0) try self.nulls.append(a, 0);
+                if (value.sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
+                if (!value.sql_null) if (coefficient) |c| {
+                    if (fixed.uniform != null and fixed.uniform.? != c.scale) fixed.mixed = true;
+                    fixed.uniform = c.scale;
+                };
+                try fixed.values.append(a, if (coefficient) |c| c.coefficient else 0);
+                try fixed.scales.append(a, if (coefficient) |c| c.scale else 0);
+                return;
+            }
+            // Widen once, retaining exact display scales and SQL NULLs.
+            try self.numerics.ensureTotalCapacity(a, row);
+            for (0..row) |i| {
+                const prior = if (self.isNull(i)) Datum{} else try fixed.cell(owned, i);
+                self.numerics.appendAssumeCapacity(if (prior.numeric != null) (try @import("operators.zig").cloneDatum(owned, prior)).numeric else null);
+            }
+            fixed.deinit(a);
+            self.fixed = null;
+            self.values = .{ .encoded = .empty };
+            try self.values.encoded.resize(a, row);
+            @memset(self.values.encoded.items, .null);
+        }
         if (self.numerics.items.len != 0 or value.numeric != null) {
             if (self.numerics.items.len == 0) {
                 try self.numerics.resize(a, row);
@@ -436,6 +502,10 @@ pub const Store = struct {
     len: usize = 0,
     initialized: bool = false,
     failed: bool = false,
+    /// Scalar materialization shares the retained owner's arena. Physical
+    /// consumers remain allocation-free; concurrent readers serialize only
+    /// the uncommon cache miss / canonical cell path.
+    reader_mutex: std.atomic.Mutex = .unlocked,
     pub fn init(a: A) Store {
         return .{ .a = a, .arena = .init(a) };
     }
@@ -448,6 +518,13 @@ pub const Store = struct {
     /// dictionary bytes. Capacity growth is still enforced by the allocator.
     /// Representation identity for expression reuse, including a distinct NULL
     /// lane. No semantic comparison or coercion is implied by dictionary IDs.
+    pub fn decimalColumn(self: *const Store, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").DecimalColumn {
+        if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
+        const stored = self.columns[column];
+        const fixed = stored.fixed orelse return null;
+        return .{ .scales = if (fixed.mixed) fixed.scales.items[begin..][0..count] else &.{}, .physical = .{ .vector = .{ .name = "", .values = .{ .decimal128 = .{ .values = fixed.values.items[begin..][0..count], .precision = 38, .scale = fixed.uniform orelse 0 } }, .nulls = .{ .bits = .{ .words = stored.nulls.items, .offset = begin } } }, .range = .{ .count = count }, .kind = .number, .element = .numeric } };
+    }
+
     pub fn physicalColumn(self: *const Store, _: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").PhysicalColumn {
         if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
@@ -523,6 +600,11 @@ pub const Store = struct {
             var repeated = false;
             if (!value.sql_null and index < self.columns.len) {
                 const column = self.columns[index];
+                if (column.fixed != null and fixedCoefficient(value) != null) {
+                    bytes +|= 19;
+                    continue;
+                }
+                if (column.fixed != null and fixedCoefficient(value) == null) bytes +|= self.len *| 256;
                 const compatible = switch (column.values) {
                     .unknown => false,
                     .integers => value.value == .integer,
@@ -568,6 +650,7 @@ pub const Store = struct {
             if (column.patterns.items.len != 0) bytes +|= listGrowth(column.patterns, additional);
             if (column.arrays.items.len != 0) bytes +|= listGrowth(column.arrays, additional);
             if (column.numerics.items.len != 0) bytes +|= listGrowth(column.numerics, additional);
+            if (column.fixed) |fixed| bytes +|= listGrowth(fixed.values, additional) +| listGrowth(fixed.scales, additional);
             switch (column.values) {
                 .unknown => {},
                 inline .booleans, .encoded => |values| bytes +|= listGrowth(values, additional),
@@ -618,6 +701,17 @@ pub const Store = struct {
         defer scratch.deinit();
         for (self.columns, 0..) |*column, ordinal| {
             _ = scratch.reset(.free_all);
+            if (column.fixed != null or (column.values == .unknown and column.numerics.items.len == 0 and column.arrays.items.len == 0 and column.patterns.items.len == 0)) {
+                if (try batch.decimalColumnSelected(scratch.allocator(), ordinal, null)) |decimal| {
+                    for (0..batch.len()) |index| {
+                        var coefficient: @import("numeric_value.zig").ScaledInteger = undefined;
+                        var number: @import("numeric_value.zig").Value = undefined;
+                        const value = try decimal.cell(index, &coefficient, &number);
+                        try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
+                    }
+                    continue;
+                }
+            }
             if (try batch.dictionaryColumn(scratch.allocator(), ordinal)) |encoded| {
                 if (encoded.len() != batch.len()) return error.InvalidSqlBackendResponse;
                 if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded)) continue;
@@ -673,6 +767,12 @@ pub const Store = struct {
     }
     pub fn cell(self: *const Store, a: A, index: usize, column: usize) !Datum {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
+        if (self.columns[column].fixed != null) {
+            const owner = @constCast(self);
+            while (!owner.reader_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer owner.reader_mutex.unlock();
+            return self.columns[column].cell(owner.arena.allocator(), index);
+        }
         return self.columns[column].cell(a, index);
     }
     pub fn row(self: *const Store, a: A, index: usize) ![]const Datum {
@@ -689,6 +789,12 @@ pub const Store = struct {
             const is_null = stored.isNull(row_index);
             if (is_null or value.sql_null) {
                 if (!null_equal or is_null != value.sql_null) return false;
+                continue;
+            }
+            if (stored.fixed) |fixed| {
+                var coefficient = try @import("numeric_value.zig").ScaledInteger.init(fixed.values.items[row_index], fixed.scales.items[row_index]);
+                const number = coefficient.view();
+                if ((try scalar.compareDatums(Datum.typedNumeric(&number), value)) != .eq) return false;
                 continue;
             }
             if (value.array != null or value.numeric != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null)) {
@@ -906,4 +1012,43 @@ fn dictionaryHandoffScenario(a: A) !void {
 test "SQL dictionary handoff remaps referenced entries preserves NULL prefixes and unwinds failures" {
     try dictionaryHandoffScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, dictionaryHandoffScenario, .{});
+}
+
+fn nativeFixedScenario(a: A) !void {
+    var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    var store = Store.init(budget.allocator());
+    defer {
+        store.deinit();
+        std.debug.assert(budget.live == 0);
+    }
+    const batch = blk: {
+        const values = try a.dupe(i128, &.{ 12300, -70000, 0 });
+        errdefer a.free(values);
+        const nulls = try a.dupe(u8, &.{ 0, 0, 1 });
+        errdefer a.free(nulls);
+        break :blk try @import("execution_batch.zig").Batch.fromDecimal(a, values, nulls, 4);
+    };
+    defer batch.reader.free_owned.?(batch.reader.ptr, a);
+    try store.appendBatch(batch);
+    try std.testing.expect(store.columns[0].fixed != null);
+    try std.testing.expectEqual(@as(usize, 0), store.columns[0].numerics.items.len);
+    const native = (try store.decimalColumn(0, 0, 3)).?;
+    try std.testing.expectEqual(@as(i128, 12300), native.physical.vector.values.decimal128.values[0]);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
+    const before = try store.cell(budget.allocator(), 0, 0);
+    try std.testing.expectEqualStrings("1.2300", try @import("numeric_value.zig").format(&context, before.numeric.?.*));
+    var work: @import("array_value.zig").Budget = .{};
+    const wide = try scalar.numericTextLeaky(sa, "1e100", &work);
+    _ = try store.append(&.{wide});
+    try std.testing.expect(store.columns[0].fixed == null);
+    try std.testing.expectEqualStrings("1.2300", try @import("numeric_value.zig").format(&context, (try store.cell(budget.allocator(), 0, 0)).numeric.?.*));
+    try std.testing.expect((try store.cell(budget.allocator(), 2, 0)).sql_null);
+    try std.testing.expectEqual(@as(usize, 4), store.len);
+}
+test "SQL retained decimal coefficients stay native then widen exact values without borrowing temporary limbs" {
+    try nativeFixedScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, nativeFixedScenario, .{});
 }

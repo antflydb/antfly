@@ -341,8 +341,9 @@ pub const Column = struct {
             for (ids, 0..) |id, lane| {
                 const row = view.rowAt(lane);
                 if (view.vector.nulls.isNull(row)) continue;
-                try @import("../common/decimal128.zig").validateCoefficient(coefficients.values[row], coefficients.precision, coefficients.scale);
-                const number = try @import("numeric_value.zig").ScaledInteger.init(coefficients.values[row], @intCast(coefficients.scale));
+                const scale = try decimal.scaleAt(lane);
+                try @import("../common/decimal128.zig").validateCoefficient(coefficients.values[row], coefficients.precision, scale);
+                const number = try @import("numeric_value.zig").ScaledInteger.init(coefficients.values[row], scale);
                 try self.values.exact.items[id].add(number.view());
             }
             return;

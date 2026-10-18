@@ -56,10 +56,16 @@ pub const Root = struct {
     public: ?tree.Ref = null,
     private: ?tree.Ref = null,
     delete_proof: ?DeleteProof = null,
+    costing: []const Costing = &.{},
 };
+pub const Costing = struct { name: []const u8, files: ?tree.Ref, statistics: local.sql_catalog.ColumnStatistics, complete: bool = true };
+pub const max_costing_columns = 64;
 /// Every GC mode traverses the same authenticated navigation edges.
-pub fn dependencies(root: Root) [4]?tree.Ref {
-    return .{ root.files, root.public, root.private, if (root.delete_proof) |proof| proof.versions else null };
+pub fn dependencies(root: Root) [4 + max_costing_columns]?tree.Ref {
+    var refs: [4 + max_costing_columns]?tree.Ref = @splat(null);
+    refs[0..4].* = .{ root.files, root.public, root.private, if (root.delete_proof) |proof| proof.versions else null };
+    for (root.costing, 0..) |column, i| refs[i + 4] = column.files;
+    return refs;
 }
 const Proof = struct { id: [32]u8, digest: [32]u8, index: usize };
 pub const Summary = struct {
@@ -152,7 +158,7 @@ fn key(bytes: []const u8) [32]u8 {
     return result;
 }
 pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != 2) or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
+    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != 2 and ref.metadata_version != 3) or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
@@ -169,6 +175,16 @@ pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?
             try value.validate();
             if (value.records != root.count) return error.InvalidNativeLakeFileState;
         }
+    }
+    if (root.costing.len > max_costing_columns or (root.costing.len != 0 and root.version < 3)) return error.InvalidNativeLakeFileState;
+    for (root.costing, 0..) |column, i| {
+        if (column.name.len == 0 or column.name.len > 512 or !std.mem.eql(u8, column.name, column.statistics.name) or column.statistics.frequencies.len > 4) return error.InvalidNativeLakeFileState;
+        if (column.files) |ref_| {
+            try ref_.validate();
+            if (ref_.records > root.count or (column.complete and ref_.records != root.count)) return error.InvalidNativeLakeFileState;
+        }
+        for (root.costing[0..i]) |prior| if (std.mem.eql(u8, prior.name, column.name)) return error.InvalidNativeLakeFileState;
+        if ((column.statistics.non_null_rows orelse 0) > (column.statistics.population_rows orelse 0)) return error.InvalidNativeLakeFileState;
     }
     if (root.file_summary) |summary| if (summary.count != root.count or std.mem.order(u8, &summary.first, &summary.last) == .gt) return error.InvalidNativeLakeFileState;
     return root;
@@ -451,6 +467,203 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     defer uploaded.deinit(store.allocator);
     return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .public_navigation = .{ .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
 }
+/// Incremental per-column, per-file sketches piggyback on native replay.
+/// Each changed leaf replaces its previous sketch; HLLs are never subtracted.
+pub const CostingBuilder = struct {
+    const Sketch = local.sql_catalog.StatisticsSketch;
+    a: A,
+    out: A,
+    arena: std.heap.ArenaAllocator,
+    store: *stores.ArtifactStore,
+    provider: *Provider,
+    root: Root,
+    token: Token,
+    current: Ref,
+    columns: []const []const u8,
+    costing: []Costing,
+    batches: []Batch,
+    seen: []bool,
+    reads: u64 = std.math.maxInt(u64),
+    writes: u64 = std.math.maxInt(u64),
+    mutex: std.Io.Mutex = .init,
+    same_files: bool = false,
+    checkpoint: ?struct { ptr: *anyopaque, save: *const fn (*anyopaque, Ref) anyerror!void } = null,
+    fn storage(self: *@This(), pages: *pages_mod.PageStore) tree.Store {
+        pages.* = .{ .domain = self.root.domain, .attempt = self.store.upload_scope.?.attempt, .artifacts = self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
+        var result = pages.store();
+        result.reduce = reduce;
+        return result;
+    }
+    fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
+        var result: Sketch = .{};
+        for (entries) |entry| result.merge(try Sketch.decode(if (height == 0) entry.value else entry.aggregate));
+        return a.dupe(u8, &result.encode());
+    }
+    pub fn init(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, current: Ref, previous: ?Root, columns: []const []const u8, token: Token) !@This() {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const ca = arena.allocator();
+        const root = try load(ca, store.*, current, token, null);
+        var selected: std.ArrayList([]const u8) = .empty;
+        var planned_bytes = (try std.json.Stringify.valueAlloc(ca, root, .{})).len;
+        for (columns) |name| {
+            if (selected.items.len == max_costing_columns) break;
+            if (name.len == 0 or name.len > 512) continue;
+            const summary_bytes = 1024 + name.len * 2;
+            if (summary_bytes > 64 * 1024 -| planned_bytes) continue;
+            const schema = if (provider.source.iceberg_schema) |schema_| schema_.columns else provider.schema_contract;
+            const kind = for (schema) |column| {
+                if (std.mem.eql(u8, name, column.name)) break column.kind;
+            } else continue;
+            if (!std.mem.eql(u8, kind, "integer") and !std.mem.eql(u8, kind, "number") and !std.mem.eql(u8, kind, "numeric") and !std.mem.eql(u8, kind, "string") and !std.mem.eql(u8, kind, "boolean") and !std.mem.eql(u8, kind, "datetime")) continue;
+            try selected.append(ca, name);
+            planned_bytes += summary_bytes;
+        }
+        const costing = try ca.alloc(Costing, selected.items.len);
+        const batches = try ca.alloc(Batch, selected.items.len);
+        const seen = try ca.alloc(bool, provider.source.inventory.files.len);
+        @memset(seen, false);
+        var initialized: usize = 0;
+        errdefer for (batches[0..initialized]) |*batch| batch.arena.deinit();
+        const reuse = if (previous) |prior| std.mem.eql(u8, prior.source, root.source) and std.mem.eql(u8, prior.schema, root.schema) and std.mem.eql(u8, &prior.domain, &root.domain) else false;
+        for (selected.items, costing, batches) |name, *column, *batch| {
+            column.* = .{ .name = name, .files = null, .statistics = .{ .name = name } };
+            batch.* = .{ .arena = .init(a) };
+            initialized += 1;
+            if (reuse) for (previous.?.costing) |prior| if (std.mem.eql(u8, name, prior.name)) {
+                column.files = prior.files;
+                break;
+            };
+        }
+        return .{ .a = a, .out = out, .arena = arena, .store = store, .provider = provider, .root = root, .token = token, .current = current, .columns = selected.items, .costing = costing, .batches = batches, .seen = seen, .same_files = reuse and previous.?.file_summary != null and std.meta.eql(previous.?.file_summary, root.file_summary) };
+    }
+    /// Called after moving this owner to its stable address.
+    pub fn start(self: *@This()) !void {
+        var pages: pages_mod.PageStore = undefined;
+        const store = self.storage(&pages);
+        const delta = self.provider.native_delta.?;
+        for (self.costing, self.batches) |*column, *batch| if (column.files != null and !self.same_files) {
+            for (delta.prior_changed) |old| {
+                try batch.add(&key(old.id), null);
+                if (batch.changes.items.len >= 64) try batch.flush(store, &column.files);
+            }
+            try batch.flush(store, &column.files);
+        };
+        self.provider.statistics = .{ .ptr = self, .columns = self.columns, .files = &self.provider.native_delta.?.by_id, .needed = needed, .save = save };
+    }
+    pub fn deinit(self: *@This()) void {
+        self.provider.statistics = null;
+        for (self.batches) |*batch| batch.arena.deinit();
+        self.arena.deinit();
+    }
+    fn needed(raw: *anyopaque, file: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.provider.context.io) |io| self.mutex.lockUncancelable(io);
+        defer if (self.provider.context.io) |io| self.mutex.unlock(io);
+        return self.columns.len != 0 and file < self.seen.len and !self.seen[file];
+    }
+    fn save(raw: *anyopaque, file: usize, sketches: []const Sketch) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.provider.context.io) |io| try self.mutex.lock(io);
+        defer if (self.provider.context.io) |io| self.mutex.unlock(io);
+        if (file >= self.seen.len or sketches.len != self.costing.len) return error.InvalidNativeLakeFileState;
+        if (self.seen[file]) return;
+        try self.provider.context.ensureActive();
+        try self.token.check();
+        var pages: pages_mod.PageStore = undefined;
+        const store = self.storage(&pages);
+        const id = key(self.provider.source.inventory.files[file].file_id);
+        for (sketches, self.costing, self.batches) |sketch, *column, *batch| {
+            try batch.add(&id, &sketch.encode());
+            if (batch.changes.items.len >= 64) try batch.flush(store, &column.files);
+        }
+        self.seen[file] = true;
+    }
+    fn saveCheckpoint(self: *@This()) !Ref {
+        var pages: pages_mod.PageStore = undefined;
+        const store = self.storage(&pages);
+        for (self.costing, self.batches) |*column, *batch| try batch.flush(store, &column.files);
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const columns = try a.alloc(Costing, self.costing.len);
+        for (self.costing, columns) |column, *saved| saved.* = .{ .name = column.name, .files = column.files, .statistics = .{ .name = column.name }, .complete = false };
+        var root = self.root;
+        root.version = 3;
+        root.costing = columns;
+        const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
+        if (bytes.len > 64 * 1024) return self.current;
+        var uploaded = try self.store.putWithCancellation(bytes, self.token);
+        defer uploaded.deinit(self.store.allocator);
+        return .{ .kind = .doc_values, .metadata_version = 3, .artifact_id = try self.out.dupe(u8, uploaded.artifact_id), .checksum = try self.out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+    }
+    pub fn finish(self: *@This()) !Ref {
+        if (self.columns.len == 0) return self.current;
+        var pages: pages_mod.PageStore = undefined;
+        const store = self.storage(&pages);
+        for (self.costing, self.batches) |*column, *batch| try batch.flush(store, &column.files);
+        // A legacy publication has no sketches. Backfill missing leaves once;
+        // ordinary refreshes reuse complete unchanged trees without source I/O.
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const needs_backfill = for (self.costing) |column| {
+            if ((if (column.files) |ref| ref.records else 0) != self.root.count) break true;
+        } else false;
+        var backfilled: usize = 0;
+        if (needs_backfill) for (self.provider.source.inventory.files, 0..) |file, index| {
+            try self.provider.context.ensureActive();
+            try self.token.check();
+            if (self.seen[index]) continue;
+            var missing = false;
+            for (self.costing) |column| {
+                _ = scratch.reset(.free_all);
+                const id = key(file.file_id);
+                var cursor = try tree.Cursor.init(scratch.allocator(), store, column.files, &id, null);
+                defer cursor.deinit();
+                const found = try cursor.next();
+                if (found == null or !std.mem.eql(u8, found.?.key, &id)) {
+                    missing = true;
+                    break;
+                }
+            }
+            if (!missing) continue;
+            _ = scratch.reset(.free_all);
+            var input = self.provider.*;
+            input.only_files = null;
+            input.only_file = index;
+            input.progress = null;
+            const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .text, .source_kind = if (self.provider.source.inventory.format == .iceberg) .external_iceberg else .external_parquet, .row_ref_kind = .external, .source_id = self.root.source, .snapshot_id = self.root.snapshot, .schema_fingerprint = self.root.schema, .column_bindings = self.columns, .index_config_hash = "native-planner-statistics-v1" };
+            const provider = input.provider();
+            const source = try provider.openWithCancellation(scratch.allocator(), binding, self.token);
+            defer source.deinit(scratch.allocator());
+            while (try source.next(scratch.allocator())) |_| {}
+            backfilled += 1;
+            if (self.checkpoint) |checkpoint| if (backfilled % 64 == 0) try checkpoint.save(checkpoint.ptr, try self.saveCheckpoint());
+        };
+        var complete: std.ArrayList(Costing) = .empty;
+        const ca = self.arena.allocator();
+        for (self.costing, self.batches) |*column, *batch| {
+            try batch.flush(store, &column.files);
+            if ((if (column.files) |ref| ref.records else 0) != self.root.count) continue;
+            var sketch: Sketch = .{};
+            if (column.files) |ref| {
+                var page = try tree.readPage(ca, store, ref);
+                defer page.deinit(ca);
+                sketch = try Sketch.decode(page.aggregate);
+            }
+            column.statistics = try sketch.estimate(ca, column.name);
+            try complete.append(ca, column.*);
+        }
+        if (complete.items.len == 0) return self.current;
+        self.root.version = 3;
+        self.root.costing = complete.items;
+        const bytes = try std.json.Stringify.valueAlloc(ca, self.root, .{});
+        if (bytes.len > 64 * 1024) return self.current;
+        var uploaded = try self.store.putWithCancellation(bytes, self.token);
+        defer uploaded.deinit(self.store.allocator);
+        return .{ .kind = .doc_values, .metadata_version = 3, .artifact_id = try self.out.dupe(u8, uploaded.artifact_id), .checksum = try self.out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+    }
+};
 /// The resolver borrows fresh publication authority. Only immutable root/page
 /// payloads enter shared caches; request contexts never escape this owner.
 pub const Resolver = struct {
@@ -881,4 +1094,78 @@ test "external lake metadata navigation durable delete selectors validate only r
     try std.testing.expect(collector.marked.count() >= 3);
     source.immutable_objects = false;
     try std.testing.expect((try publishDeleteProof(a, pages.store(), &provider, @splat(9))) == null);
+}
+
+test "external lake durable costing reuses unchanged leaves and removes replaced file sketches without source reads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-costing");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 3);
+    for (files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = try std.fmt.allocPrint(ca, "file:///source-{d}.parquet", .{i}), .etag = @constCast("exact"), .byte_len = 128, .row_count = 100, .row_groups = &.{} };
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.inventory = .{ .format = .iceberg, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("before"), .schema_fingerprint = @constCast("schema"), .files = files };
+    source.verified_files = null;
+    source.prepared_deletes = null;
+    source.scanner.iceberg_delete_plan = null;
+    source.iceberg_schema = null;
+    source.immutable_objects = true;
+    source.plan_identity = @splat(8);
+    var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .schema_contract = &.{.{ .name = "key", .kind = "integer", .required = true }} };
+    const initial = try buildProven(a, ca, &store, &provider, null, .none, @splat(9));
+    provider.native_delta = initial.delta;
+    var builder = try CostingBuilder.init(a, ca, &store, &provider, initial.ref, null, &.{"key"}, .none);
+    defer builder.deinit();
+    try builder.start();
+    var initial_sketch: local.sql_catalog.StatisticsSketch = .{};
+    for (0..100) |_| try initial_sketch.add(local.sql_scalar.Datum.fromJson(.{ .integer = 0 }), 8);
+    try CostingBuilder.save(&builder, 0, &.{initial_sketch});
+    const partial = try builder.saveCheckpoint();
+    const checkpoint = try load(ca, store, partial, .none, null);
+    try std.testing.expect(!checkpoint.costing[0].complete);
+    try std.testing.expectEqual(@as(u64, 1), checkpoint.costing[0].files.?.records);
+    var resumed = try CostingBuilder.init(a, ca, &store, &provider, initial.ref, checkpoint, &.{"key"}, .none);
+    defer resumed.deinit();
+    try resumed.start();
+    for (1..3) |file| {
+        var sketch: local.sql_catalog.StatisticsSketch = .{};
+        for (0..100) |_| try sketch.add(local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(file) }), 8);
+        try CostingBuilder.save(&resumed, file, &.{sketch});
+    }
+    const first = try resumed.finish();
+    const before = try load(ca, store, first, .none, null);
+    try std.testing.expectEqual(@as(u16, 3), first.metadata_version);
+    try std.testing.expectEqual(@as(usize, 1), before.costing.len);
+    try std.testing.expectEqual(@as(?u64, 300), before.costing[0].statistics.population_rows);
+    try std.testing.expectEqual(@as(u64, 3), before.costing[0].files.?.records);
+    source.inventory.files = files[0..2];
+    source.inventory.snapshot_id = @constCast("after");
+    files[0].etag = @constCast("replacement");
+    provider.native_delta = null;
+    const refreshed = try buildProven(a, ca, &store, &provider, before, .none, @splat(10));
+    provider.native_delta = refreshed.delta;
+    try std.testing.expect(refreshed.delta.changed[0]);
+    try std.testing.expect(!refreshed.delta.changed[1]);
+    var next = try CostingBuilder.init(a, ca, &store, &provider, refreshed.ref, before, &.{"key"}, .none);
+    defer next.deinit();
+    try next.start();
+    var replacement: local.sql_catalog.StatisticsSketch = .{};
+    try replacement.add(local.sql_scalar.Datum.fromJson(.{ .integer = 99 }), 8);
+    try CostingBuilder.save(&next, 0, &.{replacement});
+    const second = try next.finish();
+    const after = try load(ca, store, second, .none, null);
+    try std.testing.expectEqual(@as(?u64, 101), after.costing[0].statistics.population_rows);
+    try std.testing.expectEqual(@as(?i64, 1), after.costing[0].statistics.min_integer);
+    try std.testing.expectEqual(@as(?i64, 99), after.costing[0].statistics.max_integer);
+    try std.testing.expectEqual(@as(u64, 2), after.costing[0].files.?.records);
+    const retained = for (dependencies(after)) |ref| {
+        if (ref) |value| if (std.meta.eql(value, after.costing[0].files.?)) break true;
+    } else false;
+    try std.testing.expect(retained);
 }

@@ -170,7 +170,9 @@ const Factory = struct {
         const delete_proof: ?local.serverless_query_lake_serving.DeleteQualification.Proof = if (root.delete_proof) |proof| proven: {
             break :proven .{ .ptr = owner, .count = proof.count, .recipe = proof.recipe, .digest = proof.digest, .source = proof.source, .data = proof.data, .lookup = Owner.deleteVersion };
         } else null;
-        return .{ .ptr = owner, .count = root.count, .plan = root.coverage.?.plan.?, .lookup = Owner.lookup, .close = Owner.close, .delete_proof = delete_proof, .enumerate = if (root.rows != null and root.bytes != null) Owner.enumerate else null, .estimates = if (root.rows != null and root.bytes != null) .{ .rows = root.rows.?, .bytes = root.bytes.? } else null };
+        var statistics: std.ArrayList(local.sql_catalog.ColumnStatistics) = .empty;
+        for (owned_root.costing) |column| if (column.complete) try statistics.append(oa, column.statistics);
+        return .{ .statistics = statistics.items, .ptr = owner, .count = root.count, .plan = root.coverage.?.plan.?, .lookup = Owner.lookup, .close = Owner.close, .delete_proof = delete_proof, .enumerate = if (root.rows != null and root.bytes != null) Owner.enumerate else null, .estimates = if (root.rows != null and root.bytes != null) .{ .rows = root.rows.?, .bytes = root.bytes.? } else null };
     }
 };
 // Before navigation is adopted, an automatic SQL scan owes no native-index
@@ -183,12 +185,14 @@ fn optionalAdmission(context: Context, required: bool, err: anyerror) !void {
 /// borrow the temporary native lease; adopted navigation owns an independent pin.
 pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u64, catalog_json: []const u8, schema: local.storage_schema.TableSchema, options: anytype, context: Context, request: local.api_operation.RequestContext, reader: ?*Lease) !Source {
     const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
-    if (binding.format != .iceberg or binding.object_mutability != .immutable or catalog_json.len == 0)
+    if (catalog_json.len == 0)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     var state = try local.metadata_lake_index_catalog.parse(a, catalog_json);
     defer state.deinit();
     const publication = state.value.published orelse return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     if (publication.reader_protocol < 47 or publication.source_navigation == null)
+        return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+    if ((binding.format != .iceberg or binding.object_mutability != .immutable) and publication.source_navigation.?.metadata_version < 3)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     var store = Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir) catch |err| {
@@ -204,5 +208,56 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
     };
     defer if (reader == null) lease.deinit();
     var factory: Factory = .{ .store = &store, .publication = publication, .lease = lease, .cache = &server.lake_read_cache, .table_id = table_id, .required = reader != null };
+    if (binding.format != .iceberg or binding.object_mutability != .immutable) {
+        var source = try Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+        errdefer source.deinit();
+        attachStatistics(a, &factory, &source, context) catch |err| {
+            try context.ensureActive();
+            if (err == error.OutOfMemory) return err;
+            // Costing has no authority over required source reads.
+        };
+        return source;
+    }
     return Source.openLazyNavigated(a, schema, options, context, &server.lake_read_cache, .{ .ptr = &factory, .resolve = Factory.resolve });
+}
+
+/// The pin contains immutable costing data only. It performs no future reads
+/// and needs no publication lease after the verified root has been copied.
+fn attachStatistics(a: A, factory: *Factory, source: *Source, context: Context) !void {
+    const ref = factory.publication.source_navigation orelse return;
+    if (ref.metadata_version < 3) return;
+    const binding = source.inventory;
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = factory.cache, .scope = factory.store.identity, .context = context };
+    const token: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
+    try factory.store.bindPublication(factory.publication, token);
+    const pin = try @import("lake_index_decoded_metadata.zig").acquire(nav.Root, cached, factory.store.artifactStore(), ref, token, nav.load);
+    var retained = false;
+    defer if (!retained) pin.release();
+    const root = pin.value.*;
+    if (!std.mem.eql(u8, root.source, binding.source_id) or !std.mem.eql(u8, root.schema, binding.schema_fingerprint) or !std.mem.eql(u8, root.snapshot, binding.snapshot_id)) return;
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(factory.table_id, factory.store.identity, factory.publication.namespace);
+    if (!std.mem.eql(u8, &root.domain, &domain)) return;
+    const Owner_ = struct {
+        a: A,
+        pin: @TypeOf(pin),
+        statistics: []local.sql_catalog.ColumnStatistics,
+        fn close(raw: *anyopaque) void {
+            const owner: *@This() = @ptrCast(@alignCast(raw));
+            owner.pin.release();
+            owner.a.free(owner.statistics);
+            owner.a.destroy(owner);
+        }
+    };
+    const statistics = try a.alloc(local.sql_catalog.ColumnStatistics, root.costing.len);
+    errdefer a.free(statistics);
+    var count: usize = 0;
+    for (root.costing) |column| if (column.complete) {
+        statistics[count] = column.statistics;
+        count += 1;
+    };
+    const owner = try a.create(Owner_);
+    owner.* = .{ .a = a, .pin = pin, .statistics = statistics };
+    source.planner_statistics = statistics[0..count];
+    source.statistics_owner = .{ .ptr = owner, .close = Owner_.close };
+    retained = true;
 }

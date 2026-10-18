@@ -176,12 +176,25 @@ pub const PhysicalColumn = struct {
 /// physical contract, while exact kernels borrow coefficients and selected rows.
 pub const DecimalColumn = struct {
     physical: PhysicalColumn,
+    /// Empty means the vector's uniform scale; otherwise indexed in the
+    /// physical coordinate domain, including duplicate outer selections.
+    scales: []const u16 = &.{},
+    pub fn scaleAt(self: @This(), index: usize) !u16 {
+        const row_index = self.physical.rowAt(index);
+        const scale = if (self.scales.len == 0) (std.math.cast(u16, self.physical.vector.values.decimal128.scale) orelse return error.InvalidDecimal128) else scale: {
+            if (row_index >= self.scales.len) return error.InvalidSqlBackendResponse;
+            break :scale self.scales[row_index];
+        };
+        if (scale > 38) return error.InvalidDecimal128;
+        return scale;
+    }
     pub fn cell(self: @This(), index: usize, fixed: *@import("numeric_value.zig").ScaledInteger, value: *@import("numeric_value.zig").Value) !scalar.Datum {
         const row = self.physical.rowAt(index);
         if (self.physical.vector.nulls.isNull(row)) return .{};
         const decimal = self.physical.vector.values.decimal128;
-        try @import("../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, decimal.scale);
-        fixed.* = try @import("numeric_value.zig").ScaledInteger.init(decimal.values[row], @intCast(decimal.scale));
+        const scale = try self.scaleAt(index);
+        try @import("../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, scale);
+        fixed.* = try @import("numeric_value.zig").ScaledInteger.init(decimal.values[row], scale);
         value.* = fixed.view();
         return scalar.Datum.typedNumeric(value);
     }
@@ -404,20 +417,27 @@ pub const Batch = union(enum) {
     /// implicitly acquire this trait. Scalar boundaries allocate canonical limbs
     /// only for values they actually consume.
     pub fn fromDecimal(a: A, values: []i128, nulls: []u8, scale: u16) !Batch {
-        if (values.len != nulls.len or scale > 38) return error.InvalidSqlBackendResponse;
+        return fromDecimalScales(a, values, nulls, scale, &.{});
+    }
+    /// Per-lane display scales retain exact division results without limb cells.
+    /// Uniform selected cohorts still expose a borrowed decimal vector.
+    pub fn fromDecimalScales(a: A, values: []i128, nulls: []u8, scale: u16, scales: []const u16) !Batch {
+        if (values.len != nulls.len or scale > 38 or (scales.len != 0 and scales.len != values.len)) return error.InvalidSqlBackendResponse;
+        for (scales) |value| if (value > 38) return error.InvalidSqlBackendResponse;
         const View = struct {
             values: []i128,
             nulls: []u8,
             scale: u16,
+            scales: []const u16,
             fn column(self: *@This()) DecimalColumn {
-                return .{ .physical = .{ .vector = .{ .name = "", .values = .{ .decimal128 = .{ .values = self.values, .precision = 38, .scale = self.scale } }, .nulls = .{ .bytes = self.nulls } }, .range = .{ .count = self.values.len }, .kind = .number, .element = .numeric } };
+                return .{ .scales = self.scales, .physical = .{ .vector = .{ .name = "", .values = .{ .decimal128 = .{ .values = self.values, .precision = 38, .scale = self.scale } }, .nulls = .{ .bytes = self.nulls } }, .range = .{ .count = self.values.len }, .kind = .number, .element = .numeric } };
             }
             fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.nulls[row_index] != 0) return .{};
                 const number = @import("numeric_value.zig");
                 var context: number.Context = .{ .alloc = alloc };
-                var value = try number.fromScaledInteger(&context, self.values[row_index], self.scale);
+                var value = try number.fromScaledInteger(&context, self.values[row_index], if (self.scales.len == 0) self.scale else self.scales[row_index]);
                 errdefer value.deinit();
                 const owned = try alloc.create(number.Value);
                 owned.* = value.value;
@@ -433,17 +453,22 @@ pub const Batch = union(enum) {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 alloc.free(self.values);
                 alloc.free(self.nulls);
+                alloc.free(self.scales);
                 alloc.destroy(self);
             }
         };
         const view = try a.create(View);
-        view.* = .{ .values = values, .nulls = nulls, .scale = scale };
+        view.* = .{ .values = values, .nulls = nulls, .scale = scale, .scales = scales };
         return .{ .reader = .{ .ptr = view, .read = View.read, .read_decimal_selected = View.decimal, .free_owned = View.free, .count = values.len, .width = 1 } };
     }
     pub fn decimalColumnSelected(self: Batch, a: A, column: usize, selection: ?[]const usize) anyerror!?DecimalColumn {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
         if (selection) |rows| for (rows) |row_index| if (row_index >= self.len()) return error.InvalidSqlBackendResponse;
         return switch (self) {
+            .retained => |v| blk: {
+                const source = (try v.store.decimalColumn(column, v.begin, v.count)) orelse break :blk null;
+                break :blk if (selection) |rows| .{ .physical = try source.physical.select(a, rows), .scales = source.scales } else source;
+            },
             .reader => |v| if (v.read_decimal_selected) |read| read(v.ptr, a, column, selection) else null,
             .mapped => |v| blk: {
                 if (column >= v.types.len or v.types[column].kind != .number or v.types[column].element_type != .numeric or v.types[column].numeric_modifier != null or v.ordinals[column] == std.math.maxInt(usize)) break :blk null;

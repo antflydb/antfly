@@ -448,3 +448,16 @@ test "external source inventory rejects duplicate file ids with allocator-backed
 
     try std.testing.expectError(error.InvalidExternalSourceInventory, inventory.validateAlloc(alloc));
 }
+
+pub const ColumnStatistics = struct {
+    pub const Frequency = struct { hash: u64, rows: u64 };
+    name: []const u8,
+    distinct_count: ?u64 = null,
+    population_rows: ?u64 = null,
+    average_bytes: ?u32 = null,
+    non_null_rows: ?u64 = null,
+    unique: bool = false,
+    min_integer: ?i64 = null,
+    max_integer: ?i64 = null,
+    frequencies: []const Frequency = &.{},
+};

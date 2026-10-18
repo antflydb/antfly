@@ -1444,18 +1444,10 @@ fn Engine(comptime Context: type) type {
                     }
                     if (column < context.binding.scalars.projections.len and context.binding.scalars.projections[column] != null) {
                         const program = &context.binding.scalars.projections[column].?;
-                        if (@import("typed_kernel.zig").supported(program)) {
-                            try programs.append(a, program);
-                            try slots.append(a, column);
-                        } else {
-                            const errors = try a.alloc(?anyerror, selected.len);
-                            @memset(errors, null);
-                            const values = try self.batchProgram(a, context, program, bound.*, errors);
-                            for (errors) |cause| if (cause) |err| return err;
-                            const vectors = try a.alloc([]const Datum, 1);
-                            vectors[0] = values;
-                            columns[column] = .{ .vectors = .{ .values = vectors, .count = selected.len } };
-                        }
+                        // Kernel dispatch owns capability checks, including exact
+                        // decimals. Unsupported and lazy programs decline intact.
+                        try programs.append(a, program);
+                        try slots.append(a, column);
                     } else {
                         const ordinal = for (query.source.columns, 0..) |source, index| {
                             if (std.mem.eql(u8, source.internal, field)) break index;
@@ -1484,7 +1476,7 @@ fn Engine(comptime Context: type) type {
                     const types = try a.alloc(scalar.Type, 1);
                     types[0] = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
                     column.* = .{ .mapped = .{ .source = source, .ordinals = &.{0}, .types = types, .selection = identity } };
-                    if (try column.physicalColumn(a, 0) == null) {
+                    if (try column.physicalColumn(a, 0) == null and try column.decimalColumnSelected(a, 0, null) == null) {
                         if (try column.dictionaryColumn(a, 0)) |dictionary| {
                             column.* = dictionary;
                         } else {
@@ -2694,4 +2686,50 @@ test "SQL costed inner join execution preserves aliases duplicate keys NULLs and
         const bound = try describe.bind(arena.allocator(), backend, &statement, &.{});
         try std.testing.expectEqual(case.transparent, binding.scanColumn(bound.relation.?.root, 0) != null);
     }
+}
+
+fn derivedDecimalScenario(a: Allocator) !void {
+    const Fixture = struct {
+        offset: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn columns(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(@as(usize, 2), self.offset + limit);
+            const selection = try alloc.alloc(usize, end - self.offset);
+            for (selection, 0..) |*value, index| value.* = self.offset + index;
+            self.offset = end;
+            return .{ .batch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" } }, .columns = &.{.{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 123, 234 }, .precision = 38, .scale = 2 } } }} }, .selection = selection, .after = if (end < 2) "more" else null };
+        }
+        fn rows(_: *anyopaque, _: Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedRowAdapter;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            @as(*@This(), @ptrCast(@alignCast(raw))).offset = 0;
+            return .{ .ptr = raw, .next = rows, .next_columns = columns, .close = close };
+        }
+    };
+    var fixture: Fixture = .{};
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint, .open_scan = Fixture.open } };
+    var compiled = try @import("compiler.zig").compile(a, "SELECT v FROM (SELECT n+1.25 AS v FROM native_decimal) d", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const bound = try @import("describe.zig").bind(owned, backend, &compiled, &.{});
+    const context: @import("runtime.zig").Context = .{ .alloc = a, .arena = owned, .backend = backend, .binding = bound, .parameters = &.{}, .limits = .{} };
+    const cursor = try openCursor(context);
+    defer cursor.close(cursor.ptr);
+    const page = try cursor.next_columns.?(cursor.ptr, owned, 2);
+    const decimal = (try page.native.?.values.decimalColumnSelected(owned, 0, null)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), decimal.physical.len());
+    try std.testing.expectEqual(@as(i128, 248), decimal.physical.vector.values.decimal128.values[decimal.physical.rowAt(0)]);
+    try std.testing.expectEqual(@as(u16, 2), try decimal.scaleAt(0));
+}
+test "lake SQL derived decimal expressions retain coefficient capabilities through the relational cursor" {
+    try derivedDecimalScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, derivedDecimalScenario, .{});
 }

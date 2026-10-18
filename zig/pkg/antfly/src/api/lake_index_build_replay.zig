@@ -70,7 +70,8 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     const contract = try out.alloc(local.serverless_query_lake_schema.Column, schema.relational_columns.len);
     for (contract, schema.relational_columns) |*column, definition| column.* = .{ .name = try out.dupe(u8, definition.path), .kind = @tagName(definition.column_type), .required = definition.required and !definition.allows_null };
     provider.schema_contract = contract;
-    if (consumers < 2 or names.count() == 0) return &.{};
+    provider.replay_recommended = consumers >= 2;
+    if (consumers == 0 or names.count() == 0) return &.{};
     const columns = try out.alloc([]const u8, names.count());
     var iterator = names.keyIterator();
     for (columns) |*column| column.* = try out.dupe(u8, iterator.next().?.*);

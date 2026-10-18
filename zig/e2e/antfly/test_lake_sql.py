@@ -5728,6 +5728,19 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                 ["3.76", "-5.0200", "630.01", "0.51", "1.25500000000000000000"],
                 ["3.77", "-5.0400", "635.04", "0.52", "1.26000000000000000000"],
             ]
+            # Exact coefficient expressions must survive derived frames and
+            # retained grouped state across cold process restarts.
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT k, SUM(adjusted), MIN(adjusted), MAX(adjusted) FROM (SELECT amount AS k, (amount_decimal + 1.25) * 2.00 AS adjusted FROM skew_numeric WHERE amount >= 250 AND amount <= 252) AS d GROUP BY k ORDER BY k"
+                },
+            )["rows"] == [
+                ["250", "7.5000", "7.5000", "7.5000"],
+                ["251", "7.5200", "7.5200", "7.5200"],
+                ["252", "7.5400", "7.5400", "7.5400"],
+            ]
             delivered = []
             with (
                 psycopg.connect(
@@ -5890,6 +5903,6 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
             )["rows"] == [["4", "4"]]
         failed = False
     finally:
-        server.stop()
         if failed and server.log_path.exists():
             print(server.debug_logs())
+        server.stop(test_failed=failed)

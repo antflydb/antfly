@@ -1498,8 +1498,20 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             if (cost.* > scan_cost and candidates != 0) return null;
         }
     }
+    var statistics: std.ArrayList(catalog.ColumnStatistics) = .empty;
+    const published = if (source.file_navigation) |navigation| navigation.statistics else source.planner_statistics;
+    if (!source.selected_catalog_view) for (request.fields) |field| {
+        const column = table.column(field) catch continue;
+        for (published) |entry| if (std.mem.eql(u8, entry.name, column.path)) {
+            var value = entry;
+            value.name = field;
+            try statistics.append(ca, value);
+            break;
+        };
+    };
+    const estimates = source.estimates();
     keep = true;
-    return .{ .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
+    return .{ .column_statistics = statistics.items, .estimated_rows = if (estimates) |value| value.rows else if (root.page) |page| page.records else 0, .estimated_bytes = if (estimates) |value| value.bytes else null, .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
 }
 
 pub fn prefixSuccessor(a: A, prefix: []const u8) !?[]const u8 {

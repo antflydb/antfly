@@ -354,6 +354,7 @@ pub const ServingSource = struct {
     pub const Estimates = struct { rows: u64, bytes: u64 };
     pub const FileNavigation = struct {
         ptr: *anyopaque,
+        statistics: []const external_source_api.types.ColumnStatistics = &.{},
         count: usize,
         plan: [32]u8,
         lookup: *const fn (*anyopaque, std.mem.Allocator, []const u8, @import("lake_read_context.zig").Context) anyerror!external_source_api.FileEntry,
@@ -390,6 +391,8 @@ pub const ServingSource = struct {
         close: *const fn (*anyopaque) void,
     };
     file_navigation: ?FileNavigation = null,
+    planner_statistics: []const external_source_api.types.ColumnStatistics = &.{},
+    statistics_owner: ?struct { ptr: *anyopaque, close: *const fn (*anyopaque) void } = null,
     deferred_snapshot: ?DeferredSnapshot = null,
     catalog_files_owned: bool = false,
     alloc: std.mem.Allocator,
@@ -1083,6 +1086,7 @@ pub const ServingSource = struct {
         if (self.attachment_uri) |uri| self.alloc.free(uri);
         if (self.catalog_metadata) |*table| table.deinit(self.alloc);
         if (self.file_navigation) |value| value.close(value.ptr);
+        if (self.statistics_owner) |owner| owner.close(owner.ptr);
         if (self.deferred_snapshot) |value| value.deinit(self.alloc);
         if (self.private_snapshot_owned) if (self.private_snapshot) |snapshot| {
             snapshot.deinit(self.alloc);

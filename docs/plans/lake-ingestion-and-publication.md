@@ -1810,3 +1810,24 @@ they do not require a page-sized ordinal vector. Native decimal expression resul
 own checked coefficient vectors and SQL-null flags until the downstream operator
 releases them. Unsupported rounding/scale/precision cases retain exact scalar
 execution, and scalar delivery owns any materialized canonical numeric values.
+
+### Published costing and exact decimal continuity
+
+Native publication captures advisory column statistics during its existing
+projected, delete-aware reads. Per-file HLL and bounded heavy-key sketches live
+in immutable, per-column trees; refresh reuses unchanged leaves and replaces or
+removes changed files. An older publication backfills missing statistics once.
+A compact summary is published only when the column's file coverage is complete.
+Planning consumes that summary without footer requests or lazy-inventory scans.
+Source navigation v3 (reader protocol 50) binds these statistics to publication,
+and ordinary reader-safe GC and cloud generation proofs cover their trees.
+Statistics are bounded to 64 primitive indexed column paths and remain estimates,
+with no pruning or result-cardinality authority.
+
+SQL retains finite decimal coefficients and display scales through subqueries,
+retained join/group state, hashing and exact reduction. A bounded shared workspace
+reuses pure expression nodes and broadcasts constants; variable division display
+scales remain native. Wide/special values and unsupported expressions retain
+exact scalar behavior. Attachment syntax, query results and wire formats remain
+unchanged. Archive-scale benchmarks and live-provider retention qualification are
+separate, deferred qualification work.

@@ -233,6 +233,31 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
 /// Cost only metadata already resident in the captured file view. Never open
 /// a footer for planning. Large inventories decline this optional preparation.
 fn ownedStatistics(a: Allocator, source: anytype, table: catalog.Table, fields: []const []const u8) ![]const catalog.ColumnStatistics {
+    const published = if (source.file_navigation) |navigation| navigation.statistics else source.planner_statistics;
+    if (!source.selected_catalog_view and published.len != 0) {
+        var result: std.ArrayList(catalog.ColumnStatistics) = .empty;
+        for (fields) |field| {
+            const column = table.column(field) catch continue;
+            for (published) |statistics| if (std.mem.eql(u8, statistics.name, column.path)) {
+                var value = statistics;
+                value.name = field;
+                try result.append(a, value);
+                break;
+            };
+        }
+        if (result.items.len != fields.len and source.inventory.files.len != 0) {
+            for (try residentStatistics(a, source, table, fields)) |statistics| {
+                const present = for (result.items) |known| {
+                    if (std.mem.eql(u8, known.name, statistics.name)) break true;
+                } else false;
+                if (!present) try result.append(a, statistics);
+            }
+        }
+        return result.toOwnedSlice(a);
+    }
+    return residentStatistics(a, source, table, fields);
+}
+fn residentStatistics(a: Allocator, source: anytype, table: catalog.Table, fields: []const []const u8) ![]const catalog.ColumnStatistics {
     if (source.inventory.files.len > 512 or fields.len > 256) return &.{};
     var chunks: usize = 0;
     for (source.inventory.files) |file| for (file.row_groups) |group| {
