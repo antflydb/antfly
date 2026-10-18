@@ -168,6 +168,13 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             body: []const u8,
         ) anyerror!?[]u8 = null,
+        resolver_operation_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+        ) anyerror!?[]u8 = null,
         drop_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -794,6 +801,17 @@ pub const TableWriteSource = struct {
     ) !?[]u8 {
         const fn_ptr = self.vtable.graph_metric_maintenance_group_local orelse return null;
         return try BoundaryAbi.call("graph_metric_maintenance_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
+    }
+
+    pub fn resolverOperationGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.resolver_operation_group_local orelse return null;
+        return try BoundaryAbi.call("resolver_operation_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn dropTable(

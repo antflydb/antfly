@@ -40,10 +40,8 @@ recovery protocol is introduced.
 
 ## Non-Goals
 
-- No review queue or curation UI. The REVIEW decision band exists in the
-  scoring model, and a curator can record an override through the resolution
-  API (see "Sync and visibility contract"), but a queue / UI / label-capture
-  surface on top of that is not built.
+- No curation UI. Bounded review resources expose REVIEW mentions and accept
+  durable curator decisions; applications supply their own workflow.
 - No learned scorer weights. Optional model adjudication of REVIEW uses a frozen
   typed-decision policy; the deterministic matcher and its weights remain explicit.
 - No two-phase-commit coupling of entity writes and edge writes. Entity and
@@ -370,8 +368,8 @@ keys, reconsider every old mention after a new description, or merge a transitiv
 component of positive model pairs. Use the existing explicit key-merge API or an
 explicit corpus re-resolution for those operations. A rejected homonym still uses
 the configured key template: identical rendered keys are not disambiguated by a
-pairwise model rejection. Multi-candidate arbitration and a public curation queue
-remain separate extensions.
+pairwise model rejection. Multi-candidate arbitration remains a separate extension; the curation
+resources below expose unresolved REVIEW mentions.
 
 ### Why not a general scripting language
 
@@ -865,8 +863,9 @@ To merge an existing key after ingestion, call
 or Python `db.merge_resolver_keys(resolver, old, new)`, or Go
 `db.MergeResolverKeysJSON(resolver, requestJSON)`. This atomically persists the
 redirect and its corpus-backfill cursor, bumps the resolver generation, and
-returns before replay. Repeat requests are idempotent; replacing an existing
-redirect is rejected (merge its canonical target instead). `run_until_idle`
+returns before replay. Repeat requests are idempotent; re-pointing an existing
+redirect requires `replace:true`. Optional `pin_distinct:true` pins the former
+target apart from the corrected identity. `run_until_idle`
 then re-resolves stored extraction artifacts and replaces their mention and
 relation edge contributions. It retains unrelated graph contributors. Reopen
 resumes pending backfill from the durable catalog/cursor. Concurrent rendering
@@ -880,8 +879,8 @@ application references outside resolution artifacts need their own migration.
 Human-curated per-document overrides keep their existing precedence. Source
 artifacts must still exist for replay. Treat a template/helper change as an
 identity migration; aliases preserve old query seeds while replay converges.
-Reapplying an old inline resolver config can replace its alias list, so keep
-migration aliases in the application configuration too.
+Explicit unmerges mask an inline alias across configuration replay; update
+declarative aliases when deliberately migrating the namespace.
 
 ## Embedding merge recipe and ordering
 
@@ -1030,8 +1029,8 @@ Callers can keep reapplying declarative index configs on open without reading
 curated merges first. Replaying an identical native index config on an existing
 index is idempotent, including after close/reopen; a different physical config
 is rejected. Durable merges take precedence over an inline redirect of
-the same source. Removing a resolver deliberately removes its associated merge
-state; merely replacing its configuration does not. Splits and portable backups copy both catalogs. Memory/file restore and live
+the same source. Retiring a resolver retains its associated identity state; explicit identity
+deletion is allowed only after every declaring index has retired it. Splits and portable backups copy both catalogs. Memory/file restore and live
 import validate and preserve durable merge state. Once merges exist, changes to
 `table` or `key_template` are rejected with a namespace diagnostic; callers must
 explicitly reset or migrate the identities before changing their namespace
@@ -1055,7 +1054,8 @@ The namespace request contains `table`, `key_template`, and exactly one of:
   namespace; omitting it leaves no inline aliases. This is also the explicit
   way to change aliases after a namespace fence has been installed.
 - `key_map:[{"key":"concept/old","target":"topic/old"}, ...]`: map every
-  stored inline/durable alias source and target into the new namespace. Incomplete
+  stored inline/durable alias source and target, suppression key, unmerge mask
+  and distinct-pair endpoint into the new namespace. Incomplete
   maps, empty keys, duplicate sources, resulting duplicate aliases and cycles
   fail before mutation. Existing merges are transformed, preserving identity
   relationships rather than deleting the resolver.
@@ -1565,3 +1565,145 @@ Internal predecessor contracts remain retired so replay can recognize old
 resolution artifacts without executing the old resolver. They do not appear in
 public resolver or identity listings. Databases containing staged contracts
 require resolver reader version 3; older readers reject them before parsing.
+
+
+## Resolver curation resources
+
+Resolver curation is table-owned durable policy, independent of the graph indexes
+that declare execution. Unmerge removes only the selected *direct* redirect:
+`A → B → C`, followed by unmerge of `B`, leaves `A → B`. Unmerge of a missing
+redirect is a no-op. Re-point uses `replace:true`; it preserves the former
+survivor rather than turning that survivor into another redirect. Optional
+`pin_distinct:true` on unmerge or re-point forbids rejoining the separated
+components through another alias, candidate, or model adjudication. Redirect
+admission validates the entire graph before publication.
+
+An explicit unmerge also records restoration of the original rendered identity.
+Replay bypasses fuzzy matching and an old promotion tombstone for that identity,
+restores its canonical document, and replaces the source's mention/relation
+contributions. Other graph producers and other source tables keep their
+contributions. A subsequent explicit merge can redirect the restored identity.
+
+Declarative resolver configuration accepts:
+
+```json
+"suppress": {
+  "keys": ["concept/note", "concept/content"],
+  "texts": ["Note", "Content"],
+  "min_text_chars": 3
+}
+```
+
+Runtime additions/removals live separately from the declarative configuration.
+Text comparison uses the resolver's Unicode slug normalization; minimum length
+counts Unicode scalars after trimming ASCII whitespace. Text/length checks run
+before key rendering, embedding, candidate lookup, and adjudication. Rendered-key
+suppression runs before candidate lookup or minting. The resolution retains an
+explainable `decision:"suppressed"` and `suppression_reason`, but creates no
+canonical edge or entity. Suppressed existing mentions remove their former
+resolver-owned edge contributions on replay. Existing promoted originals receive
+a scoped `resolver_suppressed_by` marker; suppression never creates a document
+solely to hold that marker. Unsuppress removes runtime rules and replays under
+the remaining declarative policy. Suppressed keys cannot be redirect targets.
+
+Promotion records alias contributions by source resolver, rendered identity and
+spelling. Re-point/unmerge/suppression detach that contribution using conditional
+writes in the same atomic entity batch. Concurrent contributions survive; older
+curation intents cannot overwrite a newer correction. Aliases that predate
+ownership tracking remain conservative: un-attributable legacy aliases are
+preserved, while aliases introduced by a tracked correction can be removed.
+Destination reads are deduplicated and run with at most 16 concurrent lookups.
+They fence both content and absence; conflicts retry ordinary replay rather than
+advancing the source receipt with a partial promotion.
+
+The HTTP surface uses the following table resources. Every route also exists at
+`/databases/{database}/namespaces/{namespace}/tables/{table}/...`.
+
+| Resource under `/tables/{table}` | Operations |
+| --- | --- |
+| `/resolvers` | GET active and retired identities |
+| `/resolvers/{resolver}` | GET configuration, curation revision and replay progress; DELETE a retired identity |
+| `/resolvers/{resolver}:render` | POST a mention to preview its minted/canonical key and suppression |
+| `/resolvers/{resolver}:resolve` | POST text or extraction for ephemeral resolution through the serving policy |
+| `/resolvers/{resolver}:namespace` | POST an explicit namespace mapping/reset |
+| `/resolvers/{resolver}/redirects` | GET direct redirects and distinct pins; POST `{from,to,replace?,pin_distinct?}` |
+| `/resolvers/{resolver}/redirects/{key}` | DELETE a direct redirect; optional `?pin_distinct=true` |
+| `/resolvers/{resolver}/suppressions` | GET configured/runtime rules; POST `{keys,texts}` or atomic `{add,remove}` selections |
+| `/resolvers/{resolver}/suppressions/{key}` | DELETE runtime key suppression |
+| `/resolvers/{resolver}/reviews` | GET a bounded page; `cursor` and `limit` (1–256) |
+| `/resolvers/{resolver}/reviews/{id}` | POST `{decision:"match"|"new"|"suppressed",key?,table?}` |
+| `/entities/{key}/redirects` | GET resolver state targeting an entity table/key |
+| `/entities/{key}:merge` | POST `{into,replace?,pin_distinct?}` across matching resolver namespaces |
+| `/entities/{key}:unmerge`, `:suppress`, `:unsuppress` | POST corrections across those namespaces |
+
+Keys and review IDs are single URL-encoded path components. Review IDs bind the
+source key, mention ID and exact resolution artifact hash; a stale decision
+returns Conflict. Review operations use the owner's raw-artifact policy gate:
+tables with active row security fail closed until review paging supports bound
+row-policy evaluation. Review pages use keyset cursors, visit at most 256 storage keys
+per owner request, and never load the entire corpus. Empty pages can carry a
+continuation cursor. Decisions atomically append the override and ordinary
+source replay record. A curator's suppressed/rejected decision persists through
+replay and has `suppression_reason:"curator"`. A per-mention rejection removes
+that mention's graph contribution and preserves existing canonical aliases,
+which can still be used by other mentions; global key/text suppression owns
+destination alias cleanup and scoped retirement.
+
+Remote policy mutations publish through the source table's authoritative
+metadata CAS, in reserved `_resolver_curation` records. Owner reconciliation
+installs the policy through the ordinary resolver configuration/backfill path;
+public requests never patch individual shard catalogs. Entity fanout preflights
+all matching policies and source-table write permissions, then commits one CAS
+per source table. It is not a transaction across unrelated source tables. HTTP
+207 reports partial acceptance with each resolver's accepted revision; retrying
+the same corrections is safe. Native fanout reports atomicity per resolver.
+Retired identities accept and retain policy without running resolution or
+promotion. Remote replay progress remains pending until an index declares
+execution again; waiting never reactivates a retired identity.
+Durable deletion markers prevent offline owners from resurrecting dropped
+identities; native backup carries both policy and consumed deletion fences.
+
+A mutation returns the accepted revision and replay sequence immediately (HTTP
+202 while pending). `replay_sequence_kind` distinguishes a resolver revision
+from a source-journal review decision. `wait:{timeout_ms:...}` bounds observation
+of detached replay; a timeout leaves the accepted mutation intact. Resolver GET
+reports per-group revision, freshness, durable backfill and resolution/promotion
+watermarks. An idle watermark alone does not prove the new revision is applied.
+Busy is HTTP 429 with `Retry-After`; capacity and metadata unavailability are
+explicit retry states. Curation needs table-write authorization; namespace
+migration additionally requires administrative route admission and authority to
+write the destination before grants are resealed.
+
+Namespace migration remaps all key-valued negative policy too. Incomplete maps
+fail before publication. `reset_merges:true` requires `reset_curation:true` when
+key-valued curation exists; text suppression and minimum length remain meaningful
+and are preserved. Runtime curation, including namespace migration of negative policy, requires
+minimum reader epoch 6. Ordinary configurations without these features retain their
+existing reader requirement.
+
+C exposes `antfly_db_unmerge_resolver_key_json`,
+`antfly_db_suppress_resolver_keys_json` (atomic add/remove selections),
+`antfly_db_unsuppress_resolver_key_json`, `antfly_db_resolver_curation_json`,
+`antfly_db_resolver_reviews_json`, `antfly_db_curate_entity_json` and the named
+`antfly_db_entity_{merge,unmerge,suppress,unsuppress,redirects}_json` calls alongside the
+existing render/resolve/list/drop/namespace family. Native entity requests carry
+`action:"redirects"|"merge"|"unmerge"|"suppress"|"unsuppress"` and optional
+`into`; review requests carry `operation:"reviews"|"review"` and `resolver`.
+Go, Rust, Python and Node embedded bindings expose these JSON operations. Remote
+Go, TypeScript, Python and Rust clients share the generated public schemas and
+namespaced operations; successful accepted replay is returned without automatic
+mutation retries.
+
+
+The entity routes deliberately identify the destination entity table and key,
+rather than exposing source-table enumeration to clients. A future namespace-owned
+store (entity table plus key template) can replace the current fanout behind
+these routes. That change must register durable namespace dependencies during
+resolver admission/replacement/retirement, fence resolution artifacts with the
+namespace revision, and enqueue dependent source replay from the authoritative
+namespace commit. New source resolvers must inherit the current revision before
+processing their first document. Migration must coalesce identical legacy
+redirects and report conflicting targets before switching ownership. Resolver-local
+inline aliases remain configuration; namespace redirects apply after aliases.
+This release implements the first step: source-owned durable corrections and the
+stable entity API, with explicit per-source acceptance and replay progress.

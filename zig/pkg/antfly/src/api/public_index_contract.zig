@@ -575,7 +575,7 @@ fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool
         }
         return true;
     }
-    if (std.mem.eql(u8, field, "scorer") or std.mem.eql(u8, field, "adjudicate")) return value == .object;
+    if (std.mem.eql(u8, field, "scorer") or std.mem.eql(u8, field, "adjudicate") or std.mem.eql(u8, field, "suppress")) return value == .object;
     if (std.mem.eql(u8, field, "labels")) {
         if (value != .array) return false;
         for (value.array.items) |item| if (!isNonEmptyString(item)) return false;
@@ -766,6 +766,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "labels") or
         std.mem.eql(u8, field, "type_must_match") or
         std.mem.eql(u8, field, "adjudicate") or
+        std.mem.eql(u8, field, "suppress") or
         std.mem.eql(u8, field, "scorer") or
         std.mem.eql(u8, field, "scorer_json") or
         std.mem.eql(u8, field, "candidate_search") or

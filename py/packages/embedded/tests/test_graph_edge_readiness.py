@@ -771,9 +771,9 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
         reader_version = db.capabilities()["minimum_reader_version"]
-        # Inline graph resolver ownership uses the epoch-3 format; the fence
+        # Durable curation uses the epoch-6 format; the fence
         # must survive upgrades, retirement and reopening without weakening.
-        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 3
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 6
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
             db.drop_resolver_identity("concepts")
         upgraded = json.loads(json.dumps(config))

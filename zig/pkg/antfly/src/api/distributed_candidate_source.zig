@@ -40,6 +40,7 @@ const CandidateSource = db_mod.CandidateSource;
 pub const DistributedCandidateSource = struct {
     reads: table_reads.TableReadSource,
     io: ?std.Io = null,
+    request_context: ?@import("antfly_local_sources").storage_db_enrichment_asset_producer.InvocationContext = null,
     /// Consult current serving configuration at execution, including provider
     /// replacement, process-isolated inference endpoints and the keystore.
     producer_options: ?struct {
@@ -86,7 +87,10 @@ pub const DistributedCandidateSource = struct {
             a.destroy(runtime);
         }
         const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
-        return runtime.producer().withInvocationContext(.{ .io = io, .deadline_ns = deadline }).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
+        var context = self.request_context orelse @import("antfly_local_sources").storage_db_enrichment_asset_producer.InvocationContext{};
+        context.io = io;
+        context.deadline_ns = if (context.deadline_ns) |caller| @min(caller, deadline) else deadline;
+        return runtime.producer().withInvocationContext(context).produce(a, .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint });
     }
 
     const BoundBatch = struct {

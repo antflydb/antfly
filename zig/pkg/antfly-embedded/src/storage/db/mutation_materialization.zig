@@ -7059,6 +7059,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .new => "new",
                 .match => "match",
                 .review => "review",
+                .suppressed => "suppressed",
             };
         }
 
@@ -11518,7 +11519,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
             return switch (decision) {
                 .new, .match => true,
-                .review => false,
+                .review, .suppressed => false,
             };
         }
 

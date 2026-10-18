@@ -257,6 +257,7 @@ pub const EntityUpsert = struct {
     doc_json: []const u8 = "",
     /// Remove a prior pinned physical copy during an atomic destination move.
     delete: bool = false,
+    skip_if_missing: bool = false,
 };
 
 pub const MissingSinkPolicy = enum {
@@ -279,6 +280,7 @@ pub const EntitySink = struct {
         /// set of its entities. Optional: when absent, `upsertBatch` falls back
         /// to per-entity upserts.
         upsert_batch: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void = null,
+        supports_curation: ?*const fn (ptr: *anyopaque) anyerror!bool = null,
     };
 
     pub fn upsert(self: EntitySink, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
@@ -293,6 +295,11 @@ pub const EntitySink = struct {
         for (entries) |e| {
             try self.upsert(allocator, e.table, e.key, e.doc_json);
         }
+    }
+
+    pub fn supportsCuration(self: EntitySink) !bool {
+        const f = self.vtable.supports_curation orelse return false;
+        return NativeBoundary.call("supports_curation", self.callback_dispatch, f, .{self.ptr});
     }
 };
 

@@ -793,6 +793,10 @@ class AntflyClient:
                 httpx_args=httpx_args,
             )
         self.indexes = IndexOperations(self)
+        from .resolvers import ResolverOperations, EntityOperations
+
+        self.resolvers = ResolverOperations(self)
+        self.entities = EntityOperations(self)
 
     def _request(
         self,

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..models.graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
     from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
     from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
+    from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
 
 
 T = TypeVar("T", bound="GraphResolverConfig")
@@ -45,6 +46,10 @@ class GraphResolverConfig:
             typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained
             independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves
             mentions, not global key merges.
+        suppress (GraphResolverSuppressionConfig | Unset): Suppress mentions before candidate search, embedding,
+            adjudication and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no
+            canonical graph edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to
+            suppressed keys are rejected. Runtime suppressions are additive and outlive index versions.
         scorer_json (str | Unset):
         candidate_search (GraphResolverConfigCandidateSearch | Unset):
         candidate_ann_index (str | Unset):
@@ -74,6 +79,7 @@ class GraphResolverConfig:
     type_must_match: bool | Unset = True
     scorer: GraphResolverScorerConfig | Unset = UNSET
     adjudicate: GraphResolverAdjudicationConfig | Unset = UNSET
+    suppress: GraphResolverSuppressionConfig | Unset = UNSET
     scorer_json: str | Unset = UNSET
     candidate_search: GraphResolverConfigCandidateSearch | Unset = UNSET
     candidate_ann_index: str | Unset = UNSET
@@ -124,6 +130,10 @@ class GraphResolverConfig:
         adjudicate: dict[str, Any] | Unset = UNSET
         if not isinstance(self.adjudicate, Unset):
             adjudicate = self.adjudicate.to_dict()
+
+        suppress: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.suppress, Unset):
+            suppress = self.suppress.to_dict()
 
         scorer_json = self.scorer_json
 
@@ -178,6 +188,8 @@ class GraphResolverConfig:
             field_dict["scorer"] = scorer
         if adjudicate is not UNSET:
             field_dict["adjudicate"] = adjudicate
+        if suppress is not UNSET:
+            field_dict["suppress"] = suppress
         if scorer_json is not UNSET:
             field_dict["scorer_json"] = scorer_json
         if candidate_search is not UNSET:
@@ -210,6 +222,7 @@ class GraphResolverConfig:
         from ..models.graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
         from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
         from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
+        from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -258,6 +271,13 @@ class GraphResolverConfig:
         else:
             adjudicate = GraphResolverAdjudicationConfig.from_dict(_adjudicate)
 
+        _suppress = d.pop("suppress", UNSET)
+        suppress: GraphResolverSuppressionConfig | Unset
+        if isinstance(_suppress, Unset):
+            suppress = UNSET
+        else:
+            suppress = GraphResolverSuppressionConfig.from_dict(_suppress)
+
         scorer_json = d.pop("scorer_json", UNSET)
 
         _candidate_search = d.pop("candidate_search", UNSET)
@@ -305,6 +325,7 @@ class GraphResolverConfig:
             type_must_match=type_must_match,
             scorer=scorer,
             adjudicate=adjudicate,
+            suppress=suppress,
             scorer_json=scorer_json,
             candidate_search=candidate_search,
             candidate_ann_index=candidate_ann_index,

@@ -5236,6 +5236,28 @@ pub fn storageOwnerGraphMetricMaintenanceJson(
     return .ok;
 }
 
+pub fn storageOwnerResolverOperationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    _ = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const response = @import("antfly_local_sources").storage_db_resolver_curation.reviewOperation(&handle.db, handle.alloc, request.request_json.slice()) catch |err|
+        return storageOwnerQueryFailure(err, .graph_metric_maintenance, out_failure);
+    defer handle.alloc.free(response);
+    const owned = dupBytes(response) catch return storageOwnerQueryFailure(error.OutOfMemory, .encode_internal_response, out_failure);
+    out_response.* = .{ .ptr = owned.ptr, .len = @intCast(owned.len) };
+    return .ok;
+}
+
 pub fn storageOwnerPreflightJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,

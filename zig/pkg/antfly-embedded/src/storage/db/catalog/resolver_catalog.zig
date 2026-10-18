@@ -66,7 +66,8 @@ pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
 pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
 pub const graph_expiration_namespace_reader_version: u32 = 4;
 pub const adjudication_reader_version: u32 = 5;
-pub const supported_reader_version: u32 = adjudication_reader_version;
+pub const curation_reader_version: u32 = 6;
+pub const supported_reader_version: u32 = curation_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -75,6 +76,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         3 => "3",
         4 => "4",
         5 => "5",
+        6 => "6",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -98,6 +100,7 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     for (rows.array.items) |entry| {
         if (entry != .object) return error.InvalidResolverConfig;
         if (entry.object.contains("adjudicate_json")) required = @max(required, adjudication_reader_version);
+        if (entry.object.contains("suppress_json") or entry.object.contains("curation_json") or entry.object.contains("curation_revision")) required = @max(required, curation_reader_version);
         if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) required = @max(required, 3);
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
             if (entry.object.contains(field)) required = @max(required, 2);
@@ -206,6 +209,10 @@ pub const ResolverConfig = struct {
     scorer_json: []const u8 = "",
     /// Frozen, validated REVIEW adjudication policy; public spelling is adjudicate.
     adjudicate_json: []const u8 = "",
+    suppress_json: []const u8 = "",
+    /// Runtime identity state, preserved across graph replacement/retirement.
+    curation_json: []const u8 = "",
+    curation_revision: u64 = 0,
     /// Candidate blocking strategy: "" (none, deterministic mint) or
     /// "exact_key" (look up the rendered canonical key as a candidate so the
     /// scorer can link to an existing entity). ANN/prefix blocking over the
@@ -254,6 +261,10 @@ pub const ResolverConfig = struct {
         const scratch = arena.allocator();
         var normalized = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, value, .{}), .{});
         if (normalized != .object) return error.InvalidResolverConfig;
+        if (normalized.object.fetchSwapRemove("suppress")) |entry| if (entry.value != .null) {
+            if (normalized.object.contains("suppress_json")) return error.InvalidResolverConfig;
+            try normalized.object.put(scratch, "suppress_json", .{ .string = try std.json.Stringify.valueAlloc(scratch, entry.value, .{}) });
+        };
         if (normalized.object.fetchSwapRemove("adjudicate")) |entry| {
             if (entry.value != .null) {
                 if (normalized.object.contains("adjudicate_json")) return error.InvalidResolverConfig;
@@ -275,6 +286,9 @@ pub const ResolverConfig = struct {
     /// Public identity inspection never exposes a frozen provider credential.
     pub fn publicValue(self: ResolverConfig, a: Allocator) !std.json.Value {
         var value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, self, .{}), .{});
+        _ = value.object.swapRemove("curation_json");
+        if (value.object.fetchSwapRemove("suppress_json")) |entry|
+            try value.object.put(a, "suppress", try std.json.parseFromSliceLeaky(std.json.Value, a, entry.value.string, .{}));
         if (value.object.fetchSwapRemove("adjudicate_json")) |entry| {
             var policy = try std.json.parseFromSliceLeaky(std.json.Value, a, entry.value.string, .{});
             if (policy.object.getPtr("decider")) |decider| {
@@ -311,15 +325,16 @@ pub const ResolverConfig = struct {
 
     /// Borrowed strings, owned array. Durable curation wins over inline aliases.
     pub fn effectiveAliasesAlloc(self: ResolverConfig, alloc: Allocator) ![]const resolver_lib.KeyAlias {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const curation = try resolver_lib.curation.Index.init(arena.allocator(), self.suppress_json, self.curation_json);
+        var curated: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.merges) |alias| try curated.put(arena.allocator(), alias.key, {});
         var result: std.ArrayList(resolver_lib.KeyAlias) = .empty;
         errdefer result.deinit(alloc);
         for (self.aliases) |alias| {
-            var redirected = false;
-            for (self.merges) |merge| if (std.mem.eql(u8, alias.key, merge.key)) {
-                redirected = true;
-                break;
-            };
-            if (!redirected) try result.append(alloc, alias);
+            if (curation.removed_aliases.contains(alias.key)) continue;
+            if (!curated.contains(alias.key)) try result.append(alloc, alias);
         }
         try result.appendSlice(alloc, self.merges);
         return try result.toOwnedSlice(alloc);
@@ -332,7 +347,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "adjudicate_json")) self.adjudicate_json.len == 0 else if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
+                const omit = if (comptime (std.mem.eql(u8, field, "adjudicate_json") or std.mem.eql(u8, field, "suppress_json") or std.mem.eql(u8, field, "curation_json"))) @field(self, field).len == 0 else if (comptime std.mem.eql(u8, field, "curation_revision")) self.curation_revision == 0 else if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -429,6 +444,8 @@ pub const ResolverConfig = struct {
         if (self.labels.len > 0) alloc.free(self.labels);
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
         if (self.adjudicate_json.len > 0) alloc.free(self.adjudicate_json);
+        if (self.suppress_json.len > 0) alloc.free(self.suppress_json);
+        if (self.curation_json.len > 0) alloc.free(self.curation_json);
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
@@ -444,6 +461,25 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
+        if (self.suppress_json.len > 0 or self.curation_json.len > 0) {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const policy = try resolver_lib.curation.Index.init(a, self.suppress_json, self.curation_json);
+            const aliases = try self.effectiveAliasesAlloc(a);
+            const state = try resolver_lib.curation.parseState(a, self.curation_json);
+            const redirects = try resolver_lib.curation.RedirectIndex.init(a, aliases);
+            for (state.distinct) |pair| {
+                const from = redirects.canonical(pair.from);
+                const to = redirects.canonical(pair.to);
+                if (std.mem.eql(u8, from, to)) return error.ResolverDistinctPair;
+            }
+            for (aliases) |alias| {
+                const target = redirects.canonical(alias.target);
+                if (policy.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
+                if (try policy.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
+            }
+        }
         if (self.adjudicate_json.len > 0) {
             if (self.scorer_json.len == 0) return error.InvalidResolverConfig;
             try @import("../../../functions/resolver_adjudication.zig").validate(std.heap.page_allocator, self.adjudicate_json);

@@ -331,6 +331,8 @@ components:
           description: "Typed matcher scorer. Cannot be combined with scorer_json."
         adjudicate:
           $ref: "#/components/schemas/GraphResolverAdjudicationConfig"
+        suppress:
+          $ref: "#/components/schemas/GraphResolverSuppressionConfig"
         scorer_json:
           type: string
           deprecated: true
@@ -360,6 +362,32 @@ components:
             withheld. The cheap post-extraction junk filter for
             score-carrying extractors; 0 (the default) admits everything.
         config_generation: { type: integer, format: uint64, minimum: 0 }
+    GraphResolverSuppressionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Suppress mentions before candidate search, embedding, adjudication and
+        promotion. Suppressed mentions remain explainable in resolution artifacts
+        and contribute no canonical graph edges. Changes use the normal resolver
+        generation and bounded backfill lifecycle. Redirects to suppressed keys
+        are rejected. Runtime suppressions are additive and outlive index versions.
+      properties:
+        keys:
+          type: array
+          maxItems: 100000
+          items: {type: string, minLength: 1, maxLength: 16384}
+          description: Exact rendered canonical keys in this resolver namespace.
+        texts:
+          type: array
+          maxItems: 100000
+          items: {type: string, minLength: 1, maxLength: 16384}
+          description: Mention texts normalized with the resolver Unicode slug rules.
+        min_text_chars:
+          type: integer
+          format: uint32
+          minimum: 0
+          default: 0
+          description: Minimum Unicode scalar count after trimming surrounding ASCII whitespace.
     GraphResolverAdjudicationConfig:
       type: object
       additionalProperties: false

@@ -785,6 +785,22 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn resolverOperationJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_resolver_operation_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.buffer,
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner resolver operation");
+        return response;
+    }
+
     pub fn preflightJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};

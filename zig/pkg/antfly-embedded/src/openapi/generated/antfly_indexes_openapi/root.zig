@@ -140,6 +140,7 @@ pub const GraphResolverConfig = types.GraphResolverConfig;
 pub const GraphResolverScorerComparison = types.GraphResolverScorerComparison;
 pub const GraphResolverScorerConfig = types.GraphResolverScorerConfig;
 pub const GraphResolverScorerLevel = types.GraphResolverScorerLevel;
+pub const GraphResolverSuppressionConfig = types.GraphResolverSuppressionConfig;
 pub const GraphResult = types.GraphResult;
 pub const GraphResultBinding = types.GraphResultBinding;
 pub const GraphResultNode = types.GraphResultNode;

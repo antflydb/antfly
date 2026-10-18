@@ -467,7 +467,22 @@ antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resol
  * Promotion-enabled resolvers also reconcile entity documents. Arbitrary application
  * references and manually supplied graph edges are not rewritten.
  * May return ANTFLY_BUSY during replay/promotion; retry with bounded backoff. */
+// Merge accepts {from,to,replace?,pin_distinct?}; {key,target} remains supported.
 antfly_error_code antfly_db_merge_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice merge_json);
+// Durable, idempotent curation; responses include changed, revision and replay sequence.
+antfly_error_code antfly_db_unmerge_resolver_key_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out);
+// Atomic set edit: {add:{keys?,texts?},remove:{keys?,texts?},expected_revision?}.
+antfly_error_code antfly_db_suppress_resolver_keys_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_unsuppress_resolver_key_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out);
+// Empty resolver_name lists active and retired identities with curation state.
+antfly_error_code antfly_db_resolver_reviews_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_curate_entity_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_entity_merge_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_entity_unmerge_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_entity_suppress_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_entity_unsuppress_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_entity_redirects_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_resolver_curation_json(antfly_db *db, antfly_slice resolver_name, antfly_buffer *out);
 
 /* Lists active and retired identities, including durable merges. */
 antfly_error_code antfly_db_list_resolver_identities_json(antfly_db *db, antfly_buffer *out);

@@ -6764,7 +6764,7 @@ pub const ApiHttpServer = struct {
         return try self.localTableRuntimeStatusesWithSnapshot(table_name, null);
     }
 
-    fn localTableRuntimeStatusesWithSnapshot(
+    pub fn localTableRuntimeStatusesWithSnapshot(
         self: *ApiHttpServer,
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
@@ -19643,6 +19643,26 @@ pub const ApiHttpServer = struct {
         return count;
     }
 
+    pub fn executeResolverOperation(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, body: []const u8, context: api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        if (self.cfg.deployment_mode == .standalone) return (try (self.table_writes orelse return error.UnsupportedOperation).resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse return error.UnknownGroup;
+        var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
+        const router = self.cfg.session_router orelse fallback.router();
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => return (try (self.table_writes orelse return error.UnsupportedOperation).resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse return error.UnknownGroup,
+            .remote => |remote| {
+                var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+                _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+                var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+                var reply = try client.fetchGroupResolverOperationWithCancellation(remote.base_uri, group_id, table_name, body, &cancellation);
+                defer reply.deinit(alloc);
+                return alloc.dupe(u8, reply.body);
+            },
+        }
+    }
+
     pub fn executeRestoreOwner(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_owner.zig").Request, context: api_operation.RequestContext) !@import("restore_owner.zig").Response {
         try context.ensureActive();
         // Standalone has no replicated placement catalog. The local owner
@@ -27371,7 +27391,10 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
             .table => .table,
             .tablespace => .tablespace,
         };
-        const permission: usermgr.PermissionType = if (method == .GET or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate"))) .write else .admin;
+        const resolver_route = if (route.kind == .table) @import("resolvers.zig").matchSuffix(route.suffix) else null;
+        const resolver_read = if (resolver_route) |r| @import("resolvers.zig").readOnly(r.op) else false;
+        const resolver_write = if (resolver_route) |r| r.op != .namespace else false;
+        const permission: usermgr.PermissionType = if (method == .GET or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -27476,6 +27499,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
+    if (@import("resolvers.zig").matchTablePath(path)) |r| return try tablePermission(alloc, r.table_name, if (method == .GET or @import("resolvers.zig").readOnly(r.op)) .read else if (r.op == .namespace) .admin else .write);
     if (routes.Routes.matchTableGraphMetricAction(path)) |metric_action| return switch (method) {
         .POST => try tablePermission(alloc, metric_action.table_name, .admin),
         .GET, .PUT, .DELETE => null,
@@ -57799,4 +57823,90 @@ test "api http server serves status using control metadata without diagnostic tr
     defer denied.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), fake.control_reads);
     try std.testing.expectEqual(@as(usize, 0), fake.diagnostic_reads);
+}
+
+test "resolver curation HTTP resources share atomic metadata revisions and retired identity lifecycle" {
+    const alloc = std.testing.allocator;
+    const resources = @import("resolvers.zig");
+    const Source = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 1, .name = "source", .indexes_json = "{}", .placement_role = "data" },
+            .{ .table_id = 2, .name = "entities", .indexes_json = "{}", .placement_role = "data" },
+        },
+        owned: ?[]u8 = null,
+        commits: u64 = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(ptr: *anyopaque, _: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try std.testing.allocator.dupe(metadata_table_manager.TableRecord, &self.tables);
+            for (tables) |*table| table.indexes_json = try std.testing.allocator.dupe(u8, table.indexes_json);
+            return .{ .status = try status(ptr), .tables = tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, snapshot_value: *metadata_api.AdminSnapshot) void {
+            for (snapshot_value.tables) |table| std.testing.allocator.free(table.indexes_json);
+            std.testing.allocator.free(snapshot_value.tables);
+        }
+        fn replace(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, expected.indexes_json, self.tables[0].indexes_json)) return error.Conflict;
+            const bytes = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            if (self.owned) |old| std.testing.allocator.free(old);
+            self.owned = bytes;
+            self.tables[0].indexes_json = bytes;
+            self.commits += 1;
+            return .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .term = 1, .index = self.commits };
+        }
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .replace_table_definition_stamped = replace } };
+        }
+    };
+    var source: Source = .{};
+    defer if (source.owned) |bytes| alloc.free(bytes);
+    source.tables[0].indexes_json =
+        \\{"knowledge":{"name":"knowledge","type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false}]}}
+    ;
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, source.iface(), null, null);
+    defer server.deinit();
+    const Run = struct {
+        fn call(owner: *ApiHttpServer, op: resources.Operation, table: []const u8, name: []const u8, key: []const u8, body: []const u8, expected: u16) !void {
+            var result = try resources.handle(owner, std.testing.allocator, op, table, name, key, body, "", .{});
+            defer result.deinit(std.testing.allocator);
+            if (result.status != expected) std.debug.print("curation response {d}: {s}\n", .{ result.status, result.body });
+            try std.testing.expectEqual(expected, result.status);
+        }
+    };
+    try Run.call(&server, .list, "source", "", "", "", 200);
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try std.testing.expectEqual(@as(u64, 1), source.commits);
+    try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/b\"]}", 400);
+    try std.testing.expectEqual(@as(u64, 1), source.commits);
+    try Run.call(&server, .unmerge, "source", "concepts", "concept/a", "{\"pin_distinct\":true}", 202);
+    try Run.call(&server, .entity_merge, "entities", "", "concept/a", "{\"into\":\"concept/b\"}", 400);
+    try Run.call(&server, .entity_suppress, "entities", "", "concept/noise", "{}", 202);
+    const Denied = struct {
+        fn allows(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+    };
+    var authority_context: u8 = 0;
+    const before_denial = source.commits;
+    var denied = try resources.handle(&server, alloc, .entity_suppress, "entities", "", "concept/private", "{}", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_write_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
+    defer denied.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqual(before_denial, source.commits);
+    try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    const retired = (try indexes_api.removeIndexFromTableIndexesJson(alloc, source.tables[0].indexes_json, "knowledge")).?;
+    defer alloc.free(retired);
+    _ = try Source.replace(&source, source.tables[0], blk: {
+        var replacement = source.tables[0];
+        replacement.indexes_json = retired;
+        break :blk replacement;
+    });
+    try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    try Run.call(&server, .drop, "source", "concepts", "", "", 202);
+    try Run.call(&server, .drop, "source", "concepts", "", "", 202);
+    try Run.call(&server, .get, "source", "concepts", "", "", 404);
 }

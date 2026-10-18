@@ -11715,6 +11715,56 @@ pub const EnrichmentRuntimeStatus = struct {
     total_embed_ns: u64,
 };
 
+pub const EntityCurationResult = struct {
+    entity_table: []const u8,
+    key: []const u8,
+    complete: bool,
+    atomicity: []const u8,
+    results: []const std.json.Value,
+};
+
+pub const EntityMergeRequest = struct {
+    into: []const u8,
+    replace: ?bool = null,
+    pin_distinct: ?bool = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "into", "into", false },
+        .{ "replace", "replace", true },
+        .{ "pin_distinct", "pin_distinct", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("into");
+        try jw.write(self.into);
+        if (self.replace) |value| {
+            try jw.objectField("replace");
+            try jw.write(value);
+        }
+        if (self.pin_distinct) |value| {
+            try jw.objectField("pin_distinct");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const Error = struct {
     /// Optional stable machine-readable error code for programmatic handling.
     code: ?[]const u8 = null,
@@ -20729,6 +20779,7 @@ pub const GraphResolverConfig = struct {
     /// Typed matcher scorer. Cannot be combined with scorer_json.
     scorer: ?GraphResolverScorerConfig = null,
     adjudicate: ?GraphResolverAdjudicationConfig = null,
+    suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
@@ -20757,6 +20808,7 @@ pub const GraphResolverConfig = struct {
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
         .{ "adjudicate", "adjudicate", true },
+        .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
@@ -20817,6 +20869,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.adjudicate) |value| {
             try jw.objectField("adjudicate");
+            try jw.write(value);
+        }
+        if (self.suppress) |value| {
+            try jw.objectField("suppress");
             try jw.write(value);
         }
         if (self.scorer_json) |value| {
@@ -20948,6 +21004,48 @@ pub const GraphResolverScorerLevel = struct {
         }
         try jw.objectField("weight");
         try jw.write(self.weight);
+        try jw.endObject();
+    }
+};
+
+/// Suppress mentions before candidate search, embedding, adjudication and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no canonical graph edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to suppressed keys are rejected. Runtime suppressions are additive and outlive index versions.
+pub const GraphResolverSuppressionConfig = struct {
+    /// Exact rendered canonical keys in this resolver namespace.
+    keys: ?[]const []const u8 = null,
+    /// Mention texts normalized with the resolver Unicode slug rules.
+    texts: ?[]const []const u8 = null,
+    /// Minimum Unicode scalar count after trimming surrounding ASCII whitespace.
+    min_text_chars: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", true },
+        .{ "texts", "texts", true },
+        .{ "min_text_chars", "min_text_chars", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.texts) |value| {
+            try jw.objectField("texts");
+            try jw.write(value);
+        }
+        if (self.min_text_chars) |value| {
+            try jw.objectField("min_text_chars");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -38053,6 +38151,970 @@ pub const ResearchWriteStepConfig = struct {
         }
         if (self.outline) |value| {
             try jw.objectField("outline");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverAdjudicationEvidence = struct {
+    execution_hash: ?[]const u8 = null,
+    specification_hash: ?[]const u8 = null,
+    input_hash: ?[]const u8 = null,
+    candidate_hash: ?[]const u8 = null,
+    candidate_table: ?[]const u8 = null,
+    candidate_key: ?[]const u8 = null,
+    deterministic_probability: ?f64 = null,
+    status: ?[]const u8 = null,
+    response: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    failure: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "execution_hash", "execution_hash", true },
+        .{ "specification_hash", "specification_hash", true },
+        .{ "input_hash", "input_hash", true },
+        .{ "candidate_hash", "candidate_hash", true },
+        .{ "candidate_table", "candidate_table", true },
+        .{ "candidate_key", "candidate_key", true },
+        .{ "deterministic_probability", "deterministic_probability", true },
+        .{ "status", "status", true },
+        .{ "response", "response", false },
+        .{ "failure", "failure", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.execution_hash) |value| {
+            try jw.objectField("execution_hash");
+            try jw.write(value);
+        }
+        if (self.specification_hash) |value| {
+            try jw.objectField("specification_hash");
+            try jw.write(value);
+        }
+        if (self.input_hash) |value| {
+            try jw.objectField("input_hash");
+            try jw.write(value);
+        }
+        if (self.candidate_hash) |value| {
+            try jw.objectField("candidate_hash");
+            try jw.write(value);
+        }
+        if (self.candidate_table) |value| {
+            try jw.objectField("candidate_table");
+            try jw.write(value);
+        }
+        if (self.candidate_key) |value| {
+            try jw.objectField("candidate_key");
+            try jw.write(value);
+        }
+        if (self.deterministic_probability) |value| {
+            try jw.objectField("deterministic_probability");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        switch (self.response) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("response");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("response");
+                try jw.write(value);
+            },
+        }
+        switch (self.failure) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("failure");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("failure");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverCurationState = struct {
+    version: ?i64 = null,
+    suppress: ?GraphResolverSuppressionConfig = null,
+    distinct: ?[]const ResolverDistinctPair = null,
+    /// Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect.
+    removed_aliases: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", true },
+        .{ "suppress", "suppress", true },
+        .{ "distinct", "distinct", true },
+        .{ "removed_aliases", "removed_aliases", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.suppress) |value| {
+            try jw.objectField("suppress");
+            try jw.write(value);
+        }
+        if (self.distinct) |value| {
+            try jw.objectField("distinct");
+            try jw.write(value);
+        }
+        if (self.removed_aliases) |value| {
+            try jw.objectField("removed_aliases");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverDistinctPair = struct {
+    from: []const u8,
+    to: []const u8,
+};
+
+pub const ResolverGroupProgress = struct {
+    group_id: u64,
+    available: bool,
+    fresh: bool,
+    curation_revision: u64,
+    config_generation: u64,
+    effective_generation: u64,
+    backfill_pending: bool,
+    resolution: ResolverReplayStage,
+    promotion: ResolverReplayStage,
+};
+
+pub const ResolverList = struct {
+    resolvers: []const ResolverSummary,
+};
+
+pub const ResolverMergeRequest = struct {
+    from: []const u8,
+    to: []const u8,
+    replace: ?bool = null,
+    /// Pin the replaced former target distinct. Requires an existing different redirect and replace=true.
+    pin_distinct: ?bool = null,
+    expected_revision: ?u64 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "from", "from", false },
+        .{ "to", "to", false },
+        .{ "replace", "replace", true },
+        .{ "pin_distinct", "pin_distinct", true },
+        .{ "expected_revision", "expected_revision", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("from");
+        try jw.write(self.from);
+        try jw.objectField("to");
+        try jw.write(self.to);
+        if (self.replace) |value| {
+            try jw.objectField("replace");
+            try jw.write(value);
+        }
+        if (self.pin_distinct) |value| {
+            try jw.objectField("pin_distinct");
+            try jw.write(value);
+        }
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverMutationResult = struct {
+    resolver: []const u8,
+    changed: bool,
+    revision: u64,
+    replay_sequence: u64,
+    replay_sequence_kind: []const u8,
+    metadata_commit: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    applied: bool,
+    progress: ?ResolverReplayProgress = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "resolver", "resolver", false },
+        .{ "changed", "changed", false },
+        .{ "revision", "revision", false },
+        .{ "replay_sequence", "replay_sequence", false },
+        .{ "replay_sequence_kind", "replay_sequence_kind", false },
+        .{ "metadata_commit", "metadata_commit", false },
+        .{ "applied", "applied", false },
+        .{ "progress", "progress", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("resolver");
+        try jw.write(self.resolver);
+        try jw.objectField("changed");
+        try jw.write(self.changed);
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        try jw.objectField("replay_sequence");
+        try jw.write(self.replay_sequence);
+        try jw.objectField("replay_sequence_kind");
+        try jw.write(self.replay_sequence_kind);
+        switch (self.metadata_commit) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata_commit");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata_commit");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("applied");
+        try jw.write(self.applied);
+        if (self.progress) |value| {
+            try jw.objectField("progress");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Explicit namespace migration. Choose reset_merges=true or a complete key_map. Runtime suppressions and distinct pins must be remapped too, or explicitly reset with reset_curation=true.
+pub const ResolverNamespaceRequest = struct {
+    table: []const u8,
+    key_template: []const u8,
+    reset_merges: ?bool = null,
+    reset_curation: ?bool = null,
+    key_map: ?[]const ResolverRedirect = null,
+    aliases: ?[]const ResolverRedirect = null,
+    expected_revision: ?u64 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "key_template", "key_template", false },
+        .{ "reset_merges", "reset_merges", true },
+        .{ "reset_curation", "reset_curation", true },
+        .{ "key_map", "key_map", true },
+        .{ "aliases", "aliases", true },
+        .{ "expected_revision", "expected_revision", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("key_template");
+        try jw.write(self.key_template);
+        if (self.reset_merges) |value| {
+            try jw.objectField("reset_merges");
+            try jw.write(value);
+        }
+        if (self.reset_curation) |value| {
+            try jw.objectField("reset_curation");
+            try jw.write(value);
+        }
+        if (self.key_map) |value| {
+            try jw.objectField("key_map");
+            try jw.write(value);
+        }
+        if (self.aliases) |value| {
+            try jw.objectField("aliases");
+            try jw.write(value);
+        }
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverRedirect = struct {
+    key: []const u8,
+    target: []const u8,
+};
+
+pub const ResolverRedirectList = struct {
+    redirects: []const ResolverRedirect,
+    distinct: []const ResolverDistinctPair,
+    revision: u64,
+};
+
+pub const ResolverRenderRequest = struct {
+    text: []const u8,
+    label: []const u8,
+    local_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "label", "label", false },
+        .{ "local_id", "local_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("label");
+        try jw.write(self.label);
+        if (self.local_id) |value| {
+            try jw.objectField("local_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverRenderResponse = struct {
+    minted_key: []const u8,
+    key: []const u8,
+    table: []const u8,
+    config_generation: u64,
+    suppressed: bool,
+};
+
+pub const ResolverReplayProgress = struct {
+    applied: bool,
+    shards: []const ResolverGroupProgress,
+};
+
+pub const ResolverReplayStage = struct {
+    enabled: ?bool = null,
+    target_sequence: ?u64 = null,
+    applied_sequence: ?u64 = null,
+    catch_up_required: ?bool = null,
+    blocked: ?bool = null,
+    blocked_reason: ?[]const u8 = null,
+    error_count: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "target_sequence", "target_sequence", true },
+        .{ "applied_sequence", "applied_sequence", true },
+        .{ "catch_up_required", "catch_up_required", true },
+        .{ "blocked", "blocked", true },
+        .{ "blocked_reason", "blocked_reason", true },
+        .{ "error_count", "error_count", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.target_sequence) |value| {
+            try jw.objectField("target_sequence");
+            try jw.write(value);
+        }
+        if (self.applied_sequence) |value| {
+            try jw.objectField("applied_sequence");
+            try jw.write(value);
+        }
+        if (self.catch_up_required) |value| {
+            try jw.objectField("catch_up_required");
+            try jw.write(value);
+        }
+        if (self.blocked) |value| {
+            try jw.objectField("blocked");
+            try jw.write(value);
+        }
+        if (self.blocked_reason) |value| {
+            try jw.objectField("blocked_reason");
+            try jw.write(value);
+        }
+        if (self.error_count) |value| {
+            try jw.objectField("error_count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Supply exactly one of text or extraction. Text uses this resolver's configured extractor. Resolution is ephemeral and uses the serving policy, candidate namespace and typed adjudicator without publishing artifacts or entities.
+pub const ResolverResolveRequest = struct {
+    text: ?[]const u8 = null,
+    extraction: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", true },
+        .{ "extraction", "extraction", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.extraction) |value| {
+            try jw.objectField("extraction");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverResolveResponse = struct {
+    extraction: std.json.ArrayHashMap(std.json.Value),
+    resolution: std.json.Value,
+};
+
+pub const ResolverResolvedEntity = struct {
+    local_id: []const u8,
+    doc_ref: std.json.Value,
+    confidence: f64,
+    decision: []const u8,
+    label: ?[]const u8 = null,
+    canonical_name: ?[]const u8 = null,
+    surface_form: ?[]const u8 = null,
+    rendered_key: ?[]const u8 = null,
+    redirected_from: ?[]const u8 = null,
+    suppressed: ?bool = null,
+    suppression_reason: ?[]const u8 = null,
+    identity_restored: ?bool = null,
+    adjudication: ?ResolverAdjudicationEvidence = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "local_id", "local_id", false },
+        .{ "doc_ref", "doc_ref", false },
+        .{ "confidence", "confidence", false },
+        .{ "decision", "decision", false },
+        .{ "label", "label", true },
+        .{ "canonical_name", "canonical_name", true },
+        .{ "surface_form", "surface_form", true },
+        .{ "rendered_key", "rendered_key", true },
+        .{ "redirected_from", "redirected_from", true },
+        .{ "suppressed", "suppressed", true },
+        .{ "suppression_reason", "suppression_reason", true },
+        .{ "identity_restored", "identity_restored", true },
+        .{ "adjudication", "adjudication", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("local_id");
+        try jw.write(self.local_id);
+        try jw.objectField("doc_ref");
+        try jw.write(self.doc_ref);
+        try jw.objectField("confidence");
+        try jw.write(self.confidence);
+        try jw.objectField("decision");
+        try jw.write(self.decision);
+        if (self.label) |value| {
+            try jw.objectField("label");
+            try jw.write(value);
+        }
+        if (self.canonical_name) |value| {
+            try jw.objectField("canonical_name");
+            try jw.write(value);
+        }
+        if (self.surface_form) |value| {
+            try jw.objectField("surface_form");
+            try jw.write(value);
+        }
+        if (self.rendered_key) |value| {
+            try jw.objectField("rendered_key");
+            try jw.write(value);
+        }
+        if (self.redirected_from) |value| {
+            try jw.objectField("redirected_from");
+            try jw.write(value);
+        }
+        if (self.suppressed) |value| {
+            try jw.objectField("suppressed");
+            try jw.write(value);
+        }
+        if (self.suppression_reason) |value| {
+            try jw.objectField("suppression_reason");
+            try jw.write(value);
+        }
+        if (self.identity_restored) |value| {
+            try jw.objectField("identity_restored");
+            try jw.write(value);
+        }
+        if (self.adjudication) |value| {
+            try jw.objectField("adjudication");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverReview = struct {
+    /// Opaque revision-bound review identity; treat it as a single URL-encoded path component.
+    id: []const u8,
+    source_key: []const u8,
+    local_id: []const u8,
+    label: []const u8,
+    surface_form: []const u8,
+    key: []const u8,
+    table: ?[]const u8 = null,
+    confidence: f64,
+    config_generation: ?u64 = null,
+    adjudication: ?ResolverAdjudicationEvidence = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "source_key", "source_key", false },
+        .{ "local_id", "local_id", false },
+        .{ "label", "label", false },
+        .{ "surface_form", "surface_form", false },
+        .{ "key", "key", false },
+        .{ "table", "table", true },
+        .{ "confidence", "confidence", false },
+        .{ "config_generation", "config_generation", true },
+        .{ "adjudication", "adjudication", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("source_key");
+        try jw.write(self.source_key);
+        try jw.objectField("local_id");
+        try jw.write(self.local_id);
+        try jw.objectField("label");
+        try jw.write(self.label);
+        try jw.objectField("surface_form");
+        try jw.write(self.surface_form);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.objectField("confidence");
+        try jw.write(self.confidence);
+        if (self.config_generation) |value| {
+            try jw.objectField("config_generation");
+            try jw.write(value);
+        }
+        if (self.adjudication) |value| {
+            try jw.objectField("adjudication");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverReviewDecision = struct {
+    decision: []const u8,
+    key: ?[]const u8 = null,
+    table: ?[]const u8 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "decision", "decision", false },
+        .{ "key", "key", true },
+        .{ "table", "table", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("decision");
+        try jw.write(self.decision);
+        if (self.key) |value| {
+            try jw.objectField("key");
+            try jw.write(value);
+        }
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverReviewPage = struct {
+    reviews: []const ResolverReview,
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reviews");
+        try jw.write(self.reviews);
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverSummary = struct {
+    name: []const u8,
+    source_table: []const u8,
+    entity_table: []const u8,
+    key_template: ?[]const u8 = null,
+    declaring_indexes: []const []const u8,
+    retired: bool,
+    config: OpenApiOptionalNullable(GraphResolverConfig) = .absent,
+    revision: u64,
+    namespace_generation: ?u64 = null,
+    redirects: []const ResolverRedirect,
+    curation: ResolverCurationState,
+    progress: ?ResolverReplayProgress = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "source_table", "source_table", false },
+        .{ "entity_table", "entity_table", false },
+        .{ "key_template", "key_template", true },
+        .{ "declaring_indexes", "declaring_indexes", false },
+        .{ "retired", "retired", false },
+        .{ "config", "config", false },
+        .{ "revision", "revision", false },
+        .{ "namespace_generation", "namespace_generation", true },
+        .{ "redirects", "redirects", false },
+        .{ "curation", "curation", false },
+        .{ "progress", "progress", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("source_table");
+        try jw.write(self.source_table);
+        try jw.objectField("entity_table");
+        try jw.write(self.entity_table);
+        if (self.key_template) |value| {
+            try jw.objectField("key_template");
+            try jw.write(value);
+        }
+        try jw.objectField("declaring_indexes");
+        try jw.write(self.declaring_indexes);
+        try jw.objectField("retired");
+        try jw.write(self.retired);
+        switch (self.config) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("config");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("config");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        if (self.namespace_generation) |value| {
+            try jw.objectField("namespace_generation");
+            try jw.write(value);
+        }
+        try jw.objectField("redirects");
+        try jw.write(self.redirects);
+        try jw.objectField("curation");
+        try jw.write(self.curation);
+        if (self.progress) |value| {
+            try jw.objectField("progress");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverSuppressionList = struct {
+    configured: GraphResolverSuppressionConfig,
+    runtime: GraphResolverSuppressionConfig,
+    revision: u64,
+};
+
+/// Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression.
+pub const ResolverSuppressionRequest = struct {
+    keys: ?[]const []const u8 = null,
+    texts: ?[]const []const u8 = null,
+    add: ?ResolverSuppressionSelection = null,
+    remove: ?ResolverSuppressionSelection = null,
+    expected_revision: ?u64 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", true },
+        .{ "texts", "texts", true },
+        .{ "add", "add", true },
+        .{ "remove", "remove", true },
+        .{ "expected_revision", "expected_revision", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.texts) |value| {
+            try jw.objectField("texts");
+            try jw.write(value);
+        }
+        if (self.add) |value| {
+            try jw.objectField("add");
+            try jw.write(value);
+        }
+        if (self.remove) |value| {
+            try jw.objectField("remove");
+            try jw.write(value);
+        }
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverSuppressionSelection = struct {
+    keys: ?[]const []const u8 = null,
+    texts: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", true },
+        .{ "texts", "texts", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.texts) |value| {
+            try jw.objectField("texts");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ResolverUnmergeRequest = struct {
+    pin_distinct: ?bool = null,
+    expected_revision: ?u64 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "pin_distinct", "pin_distinct", true },
+        .{ "expected_revision", "expected_revision", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.pin_distinct) |value| {
+            try jw.objectField("pin_distinct");
+            try jw.write(value);
+        }
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Wait for observed replay completion up to this timeout. A timeout returns accepted state with applied=false; it does not undo the mutation.
+pub const ResolverWait = struct {
+    timeout_ms: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "timeout_ms", "timeout_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
             try jw.write(value);
         }
         try jw.endObject();

@@ -8114,6 +8114,7 @@ pub const GraphResolverConfig = struct {
     /// Typed matcher scorer. Cannot be combined with scorer_json.
     scorer: ?GraphResolverScorerConfig = null,
     adjudicate: ?GraphResolverAdjudicationConfig = null,
+    suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
@@ -8142,6 +8143,7 @@ pub const GraphResolverConfig = struct {
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
         .{ "adjudicate", "adjudicate", true },
+        .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
@@ -8202,6 +8204,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.adjudicate) |value| {
             try jw.objectField("adjudicate");
+            try jw.write(value);
+        }
+        if (self.suppress) |value| {
+            try jw.objectField("suppress");
             try jw.write(value);
         }
         if (self.scorer_json) |value| {
@@ -8333,6 +8339,48 @@ pub const GraphResolverScorerLevel = struct {
         }
         try jw.objectField("weight");
         try jw.write(self.weight);
+        try jw.endObject();
+    }
+};
+
+/// Suppress mentions before candidate search, embedding, adjudication and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no canonical graph edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to suppressed keys are rejected. Runtime suppressions are additive and outlive index versions.
+pub const GraphResolverSuppressionConfig = struct {
+    /// Exact rendered canonical keys in this resolver namespace.
+    keys: ?[]const []const u8 = null,
+    /// Mention texts normalized with the resolver Unicode slug rules.
+    texts: ?[]const []const u8 = null,
+    /// Minimum Unicode scalar count after trimming surrounding ASCII whitespace.
+    min_text_chars: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", true },
+        .{ "texts", "texts", true },
+        .{ "min_text_chars", "min_text_chars", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.texts) |value| {
+            try jw.objectField("texts");
+            try jw.write(value);
+        }
+        if (self.min_text_chars) |value| {
+            try jw.objectField("min_text_chars");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

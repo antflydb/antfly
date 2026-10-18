@@ -3326,6 +3326,776 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/resolvers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolvers */
+        get: operations["listResolvers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** get resolver */
+        get: operations["getResolver"];
+        put?: never;
+        post?: never;
+        /**
+         * drop resolver identity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["dropResolverIdentity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}:render": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * render resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["renderResolverKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}:resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * resolve resolver query
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["resolveResolverQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}:namespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * set resolver namespace
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["setResolverNamespace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver redirects */
+        get: operations["listResolverRedirects"];
+        put?: never;
+        /**
+         * merge resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["mergeResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/redirects/{key}": {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unmerge resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["unmergeResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver suppressions */
+        get: operations["listResolverSuppressions"];
+        put?: never;
+        /**
+         * suppress resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["suppressResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unsuppress resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["unsuppressResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/reviews": {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver reviews */
+        get: operations["listResolverReviews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * review resolver mention
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["reviewResolverMention"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /** list entity resolver state */
+        get: operations["listEntityResolverState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:merge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * merge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["mergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:unmerge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unmerge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["unmergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:suppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * suppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["suppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:unsuppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unsuppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["unsuppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolvers */
+        get: operations["namespaceListResolvers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** get resolver */
+        get: operations["namespaceGetResolver"];
+        put?: never;
+        post?: never;
+        /**
+         * drop resolver identity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["namespaceDropResolverIdentity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * render resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceRenderResolverKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * resolve resolver query
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceResolveResolverQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * set resolver namespace
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceSetResolverNamespace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver redirects */
+        get: operations["namespaceListResolverRedirects"];
+        put?: never;
+        /**
+         * merge resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceMergeResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}": {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unmerge resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["namespaceUnmergeResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver suppressions */
+        get: operations["namespaceListResolverSuppressions"];
+        put?: never;
+        /**
+         * suppress resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceSuppressResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unsuppress resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["namespaceUnsuppressResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews": {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver reviews */
+        get: operations["namespaceListResolverReviews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * review resolver mention
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceReviewResolverMention"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /** list entity resolver state */
+        get: operations["namespaceListEntityResolverState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * merge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceMergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unmerge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceUnmergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * suppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceSuppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unsuppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceUnsuppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/v1/me": {
         parameters: {
             query?: never;
@@ -14142,6 +14912,19 @@ export interface components {
             /** @default 10000 */
             timeout_ms?: number;
         };
+        /** @description Suppress mentions before candidate search, embedding, adjudication and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no canonical graph edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to suppressed keys are rejected. Runtime suppressions are additive and outlive index versions. */
+        GraphResolverSuppressionConfig: {
+            /** @description Exact rendered canonical keys in this resolver namespace. */
+            keys?: string[];
+            /** @description Mention texts normalized with the resolver Unicode slug rules. */
+            texts?: string[];
+            /**
+             * Format: uint32
+             * @description Minimum Unicode scalar count after trimming surrounding ASCII whitespace.
+             * @default 0
+             */
+            min_text_chars?: number;
+        };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
             name: string;
@@ -14171,6 +14954,7 @@ export interface components {
             /** @description Typed matcher scorer. Cannot be combined with scorer_json. */
             scorer?: components["schemas"]["GraphResolverScorerConfig"];
             adjudicate?: components["schemas"]["GraphResolverAdjudicationConfig"];
+            suppress?: components["schemas"]["GraphResolverSuppressionConfig"];
             /** @deprecated */
             scorer_json?: string;
             /** @enum {string} */
@@ -18746,6 +19530,288 @@ export interface components {
         };
         IndexMaintenanceResponse: {
             acknowledged_groups: string[];
+        };
+        ResolverRedirect: {
+            key: string;
+            target: string;
+        };
+        ResolverDistinctPair: {
+            from: string;
+            to: string;
+        };
+        ResolverCurationState: {
+            /** @enum {integer} */
+            version?: 1;
+            suppress?: components["schemas"]["GraphResolverSuppressionConfig"];
+            distinct?: components["schemas"]["ResolverDistinctPair"][];
+            /** @description Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect. */
+            removed_aliases?: string[];
+        };
+        ResolverReplayStage: {
+            enabled?: boolean;
+            /** Format: uint64 */
+            target_sequence?: number;
+            /** Format: uint64 */
+            applied_sequence?: number;
+            catch_up_required?: boolean;
+            blocked?: boolean;
+            blocked_reason?: string;
+            /** Format: uint64 */
+            error_count?: number;
+        };
+        ResolverGroupProgress: {
+            /** Format: uint64 */
+            group_id: number;
+            available: boolean;
+            fresh: boolean;
+            /** Format: uint64 */
+            curation_revision: number;
+            /** Format: uint64 */
+            config_generation: number;
+            /** Format: uint64 */
+            effective_generation: number;
+            backfill_pending: boolean;
+            resolution: components["schemas"]["ResolverReplayStage"];
+            promotion: components["schemas"]["ResolverReplayStage"];
+        };
+        ResolverReplayProgress: {
+            applied: boolean;
+            shards: components["schemas"]["ResolverGroupProgress"][];
+        };
+        ResolverSummary: {
+            name: string;
+            source_table: string;
+            entity_table: string;
+            key_template?: string;
+            declaring_indexes: string[];
+            retired: boolean;
+            config?: components["schemas"]["GraphResolverConfig"] | null;
+            /** Format: uint64 */
+            revision: number;
+            /** Format: uint64 */
+            namespace_generation?: number;
+            redirects: components["schemas"]["ResolverRedirect"][];
+            curation: components["schemas"]["ResolverCurationState"];
+            progress?: components["schemas"]["ResolverReplayProgress"];
+        };
+        ResolverList: {
+            resolvers: components["schemas"]["ResolverSummary"][];
+        };
+        ResolverMutationResult: {
+            resolver: string;
+            changed: boolean;
+            /** Format: uint64 */
+            revision: number;
+            /** Format: uint64 */
+            replay_sequence: number;
+            /** @enum {string} */
+            replay_sequence_kind: "resolver_revision" | "source_journal";
+            metadata_commit?: {
+                [key: string]: unknown;
+            } | null;
+            applied: boolean;
+            progress?: components["schemas"]["ResolverReplayProgress"];
+        };
+        ResolverRenderRequest: {
+            text: string;
+            label: string;
+            /** @default query */
+            local_id?: string;
+        };
+        ResolverRenderResponse: {
+            minted_key: string;
+            key: string;
+            table: string;
+            /** Format: uint64 */
+            config_generation: number;
+            suppressed: boolean;
+        };
+        /** @description Supply exactly one of text or extraction. Text uses this resolver's configured extractor. Resolution is ephemeral and uses the serving policy, candidate namespace and typed adjudicator without publishing artifacts or entities. */
+        ResolverResolveRequest: {
+            text?: string;
+            extraction?: {
+                [key: string]: unknown;
+            };
+        };
+        ResolverAdjudicationEvidence: {
+            execution_hash?: string;
+            specification_hash?: string;
+            input_hash?: string;
+            candidate_hash?: string;
+            candidate_table?: string;
+            candidate_key?: string;
+            /** Format: double */
+            deterministic_probability?: number;
+            /** @enum {string} */
+            status?: "accepted" | "rejected" | "abstained" | "failed" | "budget_exhausted";
+            response?: {
+                [key: string]: unknown;
+            } | null;
+            failure?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        ResolverResolvedEntity: {
+            local_id: string;
+            doc_ref: {
+                table: string;
+                key: string;
+                storage_table?: string;
+            };
+            /** Format: double */
+            confidence: number;
+            /** @enum {string} */
+            decision: "new" | "match" | "review" | "suppressed";
+            label?: string;
+            canonical_name?: string;
+            surface_form?: string;
+            rendered_key?: string;
+            redirected_from?: string;
+            suppressed?: boolean;
+            /** @enum {string} */
+            suppression_reason?: "key" | "text" | "min_text_chars" | "curator";
+            identity_restored?: boolean;
+            adjudication?: components["schemas"]["ResolverAdjudicationEvidence"];
+        };
+        ResolverResolveResponse: {
+            extraction: {
+                [key: string]: unknown;
+            };
+            resolution: {
+                /** Format: uint64 */
+                config_generation: number;
+                skipped_mentions?: number;
+                entities: components["schemas"]["ResolverResolvedEntity"][];
+                _resolution_work?: {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        /** @description Wait for observed replay completion up to this timeout. A timeout returns accepted state with applied=false; it does not undo the mutation. */
+        ResolverWait: {
+            /**
+             * Format: uint32
+             * @default 1000
+             */
+            timeout_ms?: number;
+        };
+        /** @description Explicit namespace migration. Choose reset_merges=true or a complete key_map. Runtime suppressions and distinct pins must be remapped too, or explicitly reset with reset_curation=true. */
+        ResolverNamespaceRequest: {
+            table: string;
+            key_template: string;
+            /** @default false */
+            reset_merges?: boolean;
+            /** @default false */
+            reset_curation?: boolean;
+            key_map?: components["schemas"]["ResolverRedirect"][];
+            aliases?: components["schemas"]["ResolverRedirect"][];
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverRedirectList: {
+            redirects: components["schemas"]["ResolverRedirect"][];
+            distinct: components["schemas"]["ResolverDistinctPair"][];
+            /** Format: uint64 */
+            revision: number;
+        };
+        ResolverMergeRequest: {
+            from: string;
+            to: string;
+            /** @default false */
+            replace?: boolean;
+            /**
+             * @description Pin the replaced former target distinct. Requires an existing different redirect and replace=true.
+             * @default false
+             */
+            pin_distinct?: boolean;
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverUnmergeRequest: {
+            /** @default false */
+            pin_distinct?: boolean;
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverSuppressionList: {
+            configured: components["schemas"]["GraphResolverSuppressionConfig"];
+            runtime: components["schemas"]["GraphResolverSuppressionConfig"];
+            /** Format: uint64 */
+            revision: number;
+        };
+        ResolverSuppressionSelection: {
+            keys?: string[];
+            texts?: string[];
+        };
+        /** @description Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression. */
+        ResolverSuppressionRequest: {
+            keys?: string[];
+            texts?: string[];
+            add?: components["schemas"]["ResolverSuppressionSelection"];
+            remove?: components["schemas"]["ResolverSuppressionSelection"];
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverReview: {
+            /** @description Opaque revision-bound review identity; treat it as a single URL-encoded path component. */
+            id: string;
+            source_key: string;
+            local_id: string;
+            label: string;
+            surface_form: string;
+            key: string;
+            table?: string;
+            /** Format: double */
+            confidence: number;
+            /** Format: uint64 */
+            config_generation?: number;
+            adjudication?: components["schemas"]["ResolverAdjudicationEvidence"];
+        };
+        ResolverReviewPage: {
+            reviews: components["schemas"]["ResolverReview"][];
+            next_cursor?: string | null;
+        };
+        ResolverReviewDecision: {
+            /** @enum {string} */
+            decision: "match" | "new" | "suppressed";
+            key?: string;
+            table?: string;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        EntityCurationResult: {
+            entity_table: string;
+            key: string;
+            complete: boolean;
+            /** @enum {string} */
+            atomicity: "source_table" | "resolver";
+            results: {
+                source_table: string;
+                resolver: string;
+                /** Format: uint64 */
+                revision?: number;
+                changed?: boolean;
+                /** Format: uint64 */
+                replay_sequence?: number;
+                applied?: boolean;
+                retired?: boolean;
+                error?: string;
+                redirects?: components["schemas"]["ResolverRedirect"][];
+                distinct?: components["schemas"]["ResolverDistinctPair"][];
+                configured_suppressed?: boolean;
+                runtime_suppressed?: boolean;
+            }[];
+        };
+        EntityMergeRequest: {
+            into: string;
+            /** @default false */
+            replace?: boolean;
+            /** @default false */
+            pin_distinct?: boolean;
+            wait?: components["schemas"]["ResolverWait"];
         };
         InferenceError: {
             /** @description Stable machine-readable error code */
@@ -28294,6 +29360,2210 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listResolvers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getResolver: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSummary"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropResolverIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    renderResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverRenderRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRenderResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resolveResolverQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverResolveResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    setResolverNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverNamespaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listResolverRedirects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRedirectList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mergeResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unmergeResolverKey: {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listResolverSuppressions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSuppressionList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    suppressResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverSuppressionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unsuppressResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listResolverReviews: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverReviewPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    reviewResolverMention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverReviewDecision"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listEntityResolverState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unmergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    suppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unsuppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolvers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceGetResolver: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSummary"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceDropResolverIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceRenderResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverRenderRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRenderResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceResolveResolverQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverResolveResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceSetResolverNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverNamespaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolverRedirects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRedirectList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceMergeResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnmergeResolverKey: {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolverSuppressions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSuppressionList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceSuppressResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverSuppressionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnsuppressResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolverReviews: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverReviewPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceReviewResolverMention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverReviewDecision"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListEntityResolverState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceMergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnmergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceSuppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnsuppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     getCurrentUser: {

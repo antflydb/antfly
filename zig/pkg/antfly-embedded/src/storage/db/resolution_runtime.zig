@@ -286,7 +286,10 @@ pub fn resolveExtraction(
     defer resolver.deinit();
     const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
     defer gpa.free(effective_aliases);
-    resolver.aliases = effective_aliases;
+    try resolver.installAliases(effective_aliases);
+    resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
+    resolver.curation_index = try resolver_lib.curation.Index.init(resolver.arena.allocator(), cfg.suppress_json, cfg.curation_json);
+    try resolver.curation_index.bindRedirects(resolver.arena.allocator(), resolver.alias_index.?);
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
@@ -371,7 +374,7 @@ fn siblingResolutionsJsonAlloc(
         var resolution = resolver_lib.parseResolution(gpa, raw orelse continue) catch continue;
         defer resolution.deinit();
         for (resolution.entities) |entity| {
-            if (entity.decision == .review) continue;
+            if (entity.decision == .review or entity.decision == .suppressed) continue;
             if (entity.doc_ref.key.len == 0) continue;
             var ref: std.json.ObjectMap = .empty;
             try ref.put(a, "key", .{ .string = try a.dupe(u8, entity.doc_ref.key) });
@@ -488,7 +491,10 @@ fn processChangedExtractionWithConfigOptions(
     defer resolver.deinit();
     const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
     defer gpa.free(effective_aliases);
-    resolver.aliases = effective_aliases;
+    try resolver.installAliases(effective_aliases);
+    resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
+    resolver.curation_index = try resolver_lib.curation.Index.init(resolver.arena.allocator(), cfg.suppress_json, cfg.curation_json);
+    try resolver.curation_index.bindRedirects(resolver.arena.allocator(), resolver.alias_index.?);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
@@ -832,6 +838,7 @@ fn decisionFromName(name: []const u8) ?resolver_lib.Decision {
     if (std.mem.eql(u8, name, "match")) return .match;
     if (std.mem.eql(u8, name, "review")) return .review;
     if (std.mem.eql(u8, name, "new")) return .new;
+    if (std.mem.eql(u8, name, "suppressed") or std.mem.eql(u8, name, "reject")) return .suppressed;
     return null;
 }
 

@@ -337,6 +337,10 @@ from .enrichment_neighbor_context_config_direction import EnrichmentNeighborCont
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
+from .entity_curation_result import EntityCurationResult
+from .entity_curation_result_atomicity import EntityCurationResultAtomicity
+from .entity_curation_result_results_item import EntityCurationResultResultsItem
+from .entity_merge_request import EntityMergeRequest
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -717,6 +721,7 @@ from .graph_resolver_scorer_config import GraphResolverScorerConfig
 from .graph_resolver_scorer_config_combine import GraphResolverScorerConfigCombine
 from .graph_resolver_scorer_config_decision import GraphResolverScorerConfigDecision
 from .graph_resolver_scorer_level import GraphResolverScorerLevel
+from .graph_resolver_suppression_config import GraphResolverSuppressionConfig
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
@@ -1287,6 +1292,45 @@ from .research_unsupported_claim import ResearchUnsupportedClaim
 from .research_usage import ResearchUsage
 from .research_verification import ResearchVerification
 from .research_write_step_config import ResearchWriteStepConfig
+from .resolver_adjudication_evidence import ResolverAdjudicationEvidence
+from .resolver_adjudication_evidence_response_type_0 import ResolverAdjudicationEvidenceResponseType0
+from .resolver_adjudication_evidence_status import ResolverAdjudicationEvidenceStatus
+from .resolver_curation_state import ResolverCurationState
+from .resolver_curation_state_version import ResolverCurationStateVersion
+from .resolver_distinct_pair import ResolverDistinctPair
+from .resolver_group_progress import ResolverGroupProgress
+from .resolver_list import ResolverList
+from .resolver_merge_request import ResolverMergeRequest
+from .resolver_mutation_result import ResolverMutationResult
+from .resolver_mutation_result_metadata_commit_type_0 import ResolverMutationResultMetadataCommitType0
+from .resolver_mutation_result_replay_sequence_kind import ResolverMutationResultReplaySequenceKind
+from .resolver_namespace_request import ResolverNamespaceRequest
+from .resolver_redirect import ResolverRedirect
+from .resolver_redirect_list import ResolverRedirectList
+from .resolver_render_request import ResolverRenderRequest
+from .resolver_render_response import ResolverRenderResponse
+from .resolver_replay_progress import ResolverReplayProgress
+from .resolver_replay_stage import ResolverReplayStage
+from .resolver_resolve_request import ResolverResolveRequest
+from .resolver_resolve_request_extraction import ResolverResolveRequestExtraction
+from .resolver_resolve_response import ResolverResolveResponse
+from .resolver_resolve_response_extraction import ResolverResolveResponseExtraction
+from .resolver_resolve_response_resolution import ResolverResolveResponseResolution
+from .resolver_resolve_response_resolution_resolution_work import ResolverResolveResponseResolutionResolutionWork
+from .resolver_resolved_entity import ResolverResolvedEntity
+from .resolver_resolved_entity_decision import ResolverResolvedEntityDecision
+from .resolver_resolved_entity_doc_ref import ResolverResolvedEntityDocRef
+from .resolver_resolved_entity_suppression_reason import ResolverResolvedEntitySuppressionReason
+from .resolver_review import ResolverReview
+from .resolver_review_decision import ResolverReviewDecision
+from .resolver_review_decision_decision import ResolverReviewDecisionDecision
+from .resolver_review_page import ResolverReviewPage
+from .resolver_summary import ResolverSummary
+from .resolver_suppression_list import ResolverSuppressionList
+from .resolver_suppression_request import ResolverSuppressionRequest
+from .resolver_suppression_selection import ResolverSuppressionSelection
+from .resolver_unmerge_request import ResolverUnmergeRequest
+from .resolver_wait import ResolverWait
 from .resource_type import ResourceType
 from .restore_job import RestoreJob
 from .restore_job_list import RestoreJobList
@@ -1888,6 +1932,10 @@ __all__ = (
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",
+    "EntityCurationResult",
+    "EntityCurationResultAtomicity",
+    "EntityCurationResultResultsItem",
+    "EntityMergeRequest",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -2262,6 +2310,7 @@ __all__ = (
     "GraphResolverScorerConfigCombine",
     "GraphResolverScorerConfigDecision",
     "GraphResolverScorerLevel",
+    "GraphResolverSuppressionConfig",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
@@ -2826,6 +2875,45 @@ __all__ = (
     "ResearchUsage",
     "ResearchVerification",
     "ResearchWriteStepConfig",
+    "ResolverAdjudicationEvidence",
+    "ResolverAdjudicationEvidenceResponseType0",
+    "ResolverAdjudicationEvidenceStatus",
+    "ResolverCurationState",
+    "ResolverCurationStateVersion",
+    "ResolverDistinctPair",
+    "ResolverGroupProgress",
+    "ResolverList",
+    "ResolverMergeRequest",
+    "ResolverMutationResult",
+    "ResolverMutationResultMetadataCommitType0",
+    "ResolverMutationResultReplaySequenceKind",
+    "ResolverNamespaceRequest",
+    "ResolverRedirect",
+    "ResolverRedirectList",
+    "ResolverRenderRequest",
+    "ResolverRenderResponse",
+    "ResolverReplayProgress",
+    "ResolverReplayStage",
+    "ResolverResolvedEntity",
+    "ResolverResolvedEntityDecision",
+    "ResolverResolvedEntityDocRef",
+    "ResolverResolvedEntitySuppressionReason",
+    "ResolverResolveRequest",
+    "ResolverResolveRequestExtraction",
+    "ResolverResolveResponse",
+    "ResolverResolveResponseExtraction",
+    "ResolverResolveResponseResolution",
+    "ResolverResolveResponseResolutionResolutionWork",
+    "ResolverReview",
+    "ResolverReviewDecision",
+    "ResolverReviewDecisionDecision",
+    "ResolverReviewPage",
+    "ResolverSummary",
+    "ResolverSuppressionList",
+    "ResolverSuppressionRequest",
+    "ResolverSuppressionSelection",
+    "ResolverUnmergeRequest",
+    "ResolverWait",
     "ResourceType",
     "RestoreJob",
     "RestoreJobList",

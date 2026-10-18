@@ -1,0 +1,726 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Table-owned resolver resources. Runtime policy changes use the metadata
+//! compare-and-swap contract; data owners consume them through reconciliation.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const resolver = @import("antfly_resolver");
+const curation = local.storage_db_resolver_curation;
+const Config = local.storage_db_catalog_resolver_catalog.ResolverConfig;
+const operation = local.api_operation;
+const public_contract = @import("public_index_contract.zig");
+const runtime_status = local.api_runtime_status;
+const types = local.storage_db_selected_root.db.types;
+
+pub const Operation = enum {
+    list,
+    get,
+    render,
+    resolve,
+    redirects,
+    merge,
+    unmerge,
+    suppressions,
+    suppress,
+    unsuppress,
+    reviews,
+    review,
+    namespace,
+    drop,
+    entity_redirects,
+    entity_merge,
+    entity_unmerge,
+    entity_suppress,
+    entity_unsuppress,
+};
+pub const Route = struct { table_name: []const u8 = "", resolver_name: []const u8 = "", key: []const u8 = "", op: Operation };
+
+pub fn matchTablePath(path: []const u8) ?Route {
+    const prefix = "/tables/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    if (slash == 0) return null;
+    var route = matchSuffix(rest[slash + 1 ..]) orelse return null;
+    route.table_name = rest[0..slash];
+    return route;
+}
+pub fn matchSuffix(suffix: []const u8) ?Route {
+    if (std.mem.eql(u8, suffix, "resolvers")) return .{ .op = .list };
+    if (std.mem.startsWith(u8, suffix, "resolvers/")) {
+        const rest = suffix["resolvers/".len..];
+        if (rest.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
+            if (slash == 0) return null;
+            const name = rest[0..slash];
+            const tail = rest[slash + 1 ..];
+            if (std.mem.eql(u8, tail, "redirects")) return .{ .resolver_name = name, .op = .redirects };
+            if (std.mem.eql(u8, tail, "suppressions")) return .{ .resolver_name = name, .op = .suppressions };
+            if (std.mem.eql(u8, tail, "reviews")) return .{ .resolver_name = name, .op = .reviews };
+            inline for (.{ .{ "redirects/", Operation.unmerge }, .{ "suppressions/", Operation.unsuppress }, .{ "reviews/", Operation.review } }) |entry| {
+                if (std.mem.startsWith(u8, tail, entry[0])) {
+                    const key = tail[entry[0].len..];
+                    if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
+                    return .{ .resolver_name = name, .key = key, .op = entry[1] };
+                }
+            }
+            return null;
+        }
+        if (std.mem.lastIndexOfScalar(u8, rest, ':')) |colon| {
+            if (colon == 0) return null;
+            const action = rest[colon + 1 ..];
+            const op: Operation = if (std.mem.eql(u8, action, "render")) .render else if (std.mem.eql(u8, action, "resolve")) .resolve else if (std.mem.eql(u8, action, "namespace")) .namespace else return null;
+            return .{ .resolver_name = rest[0..colon], .op = op };
+        }
+        return .{ .resolver_name = rest, .op = .get };
+    }
+    if (std.mem.startsWith(u8, suffix, "entities/")) {
+        const rest = suffix["entities/".len..];
+        if (std.mem.endsWith(u8, rest, "/redirects")) {
+            const key = rest[0 .. rest.len - "/redirects".len];
+            if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
+            return .{ .key = key, .op = .entity_redirects };
+        }
+        const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
+        if (colon == 0 or std.mem.indexOfScalar(u8, rest[0..colon], '/') != null) return null;
+        const action = rest[colon + 1 ..];
+        const op: Operation = if (std.mem.eql(u8, action, "merge")) .entity_merge else if (std.mem.eql(u8, action, "unmerge")) .entity_unmerge else if (std.mem.eql(u8, action, "suppress")) .entity_suppress else if (std.mem.eql(u8, action, "unsuppress")) .entity_unsuppress else return null;
+        return .{ .key = rest[0..colon], .op = op };
+    }
+    return null;
+}
+pub fn readOnly(op: Operation) bool {
+    return op == .render or op == .resolve;
+}
+pub const GroupProgress = struct {
+    group_id: u64,
+    available: bool = false,
+    fresh: bool = false,
+    curation_revision: u64 = 0,
+    config_generation: u64 = 0,
+    effective_generation: u64 = 0,
+    backfill_pending: bool = true,
+    resolution: types.ReplayStageStats = .{},
+    promotion: types.ReplayStageStats = .{},
+};
+pub const Progress = struct { applied: bool, shards: []const GroupProgress };
+const Sample = struct {
+    groups: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
+    observations: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(u64, GroupProgress)) = .empty,
+
+    fn progress(self: Sample, a: std.mem.Allocator, cfg: Config, revision: u64) !Progress {
+        const rows = try a.alloc(GroupProgress, self.groups.count());
+        var applied = rows.len > 0;
+        for (self.groups.keys(), rows) |id, *row| {
+            row.* = if (self.observations.get(cfg.name)) |by_group| by_group.get(id) orelse .{ .group_id = id } else .{ .group_id = id };
+            applied = applied and row.available and row.fresh and row.curation_revision >= revision and
+                row.config_generation >= cfg.config_generation and !row.backfill_pending and
+                row.resolution.enabled and !row.resolution.blocked and !row.resolution.catch_up_required and
+                row.resolution.applied_sequence >= row.resolution.target_sequence and
+                (!cfg.promote or (row.promotion.enabled and !row.promotion.blocked and !row.promotion.catch_up_required and row.promotion.applied_sequence >= row.promotion.target_sequence));
+        }
+        return .{ .applied = applied, .shards = rows };
+    }
+};
+
+fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype) !Sample {
+    var result: Sample = .{};
+    for (snapshot.ranges) |range| if (range.table_id == table.table_id) try result.groups.put(a, range.group_id, {});
+    var statuses = try server.localTableRuntimeStatusesWithSnapshot(table.name, snapshot);
+    defer if (statuses) |*value| value.deinit(server.alloc);
+    if (statuses) |values| for (values.items) |status| {
+        if (!result.groups.contains(status.group_id)) continue;
+        for (status.stats.resolver_replay.resolvers) |cfg| {
+            const slot = try result.observations.getOrPut(a, cfg.name);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            var resolution = status.stats.resolution;
+            resolution.blocked_reason = try a.dupe(u8, resolution.blocked_reason);
+            var promotion = status.stats.promotion;
+            promotion.blocked_reason = try a.dupe(u8, promotion.blocked_reason);
+            try slot.value_ptr.put(a, status.group_id, .{
+                .group_id = status.group_id,
+                .available = true,
+                .fresh = runtime_status.statusRuntimeFresh(status),
+                .curation_revision = cfg.curation_revision,
+                .config_generation = cfg.config_generation,
+                .effective_generation = cfg.effective_generation,
+                .backfill_pending = status.stats.resolver_replay.reresolve_pending,
+                .resolution = resolution,
+                .promotion = promotion,
+            });
+        }
+    };
+    return result;
+}
+
+fn tableByName(snapshot: anytype, name: []const u8) !@TypeOf(&snapshot.tables[0]) {
+    for (snapshot.tables) |*table| if (std.mem.eql(u8, table.name, name)) return table;
+    return error.TableNotFound;
+}
+
+fn configs(a: std.mem.Allocator, indexes_json: []const u8) ![]const Config {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
+    const metadata = try curation.metadataFromValue(a, root);
+    var out: std.ArrayListUnmanaged(Config) = .empty;
+    try local.metadata_local_index_reconcile.collectDesiredResolvers(a, root, &out);
+    for (out.items) |*cfg| for (metadata.identities) |identity| if (!identity.dropped and std.mem.eql(u8, cfg.name, identity.name)) {
+        cfg.* = try curation.overlayMetadata(a, cfg.*, identity);
+        break;
+    };
+    for (metadata.identities) |identity| {
+        if (identity.dropped) continue;
+        var found = false;
+        for (out.items) |cfg| if (std.mem.eql(u8, cfg.name, identity.name)) {
+            found = true;
+            break;
+        };
+        if (!found) try out.append(a, try curation.overlayMetadata(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .promote = false, .retired = true }, identity));
+    }
+    return out.items;
+}
+
+fn findConfig(all: []const Config, name: []const u8) !Config {
+    for (all) |cfg| if (std.mem.eql(u8, cfg.name, name)) return cfg;
+    return error.ResolverNotFound;
+}
+
+fn publicConfig(a: std.mem.Allocator, cfg: Config) !std.json.Value {
+    const value = try cfg.publicValue(a);
+    var out: std.json.ObjectMap = .empty;
+    var it = value.object.iterator();
+    while (it.next()) |entry| if (public_contract.isAllowedGraphResolverField(entry.key_ptr.*)) try out.put(a, entry.key_ptr.*, entry.value_ptr.*);
+    _ = out.swapRemove("scorer_json");
+    if (cfg.scorer_json.len > 0) try out.put(a, "scorer", try std.json.parseFromSliceLeaky(std.json.Value, a, cfg.scorer_json, .{}));
+    return .{ .object = out };
+}
+
+fn owners(a: std.mem.Allocator, indexes_json: []const u8, name: []const u8) ![]const []const u8 {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    try collectOwners(a, root, "", name, &names);
+    return names.items;
+}
+fn collectOwners(a: std.mem.Allocator, value: std.json.Value, parent: []const u8, name: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    switch (value) {
+        .object => |object| {
+            const index = if (object.get("name")) |v| if (v == .string) v.string else parent else parent;
+            if (object.get("resolvers")) |declarations| if (declarations == .array) {
+                for (declarations.array.items) |item| if (item == .object) if (item.object.get("name")) |v| if (v == .string and std.mem.eql(u8, v.string, name) and index.len > 0) try out.append(a, index);
+            };
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, curation.metadata_key) or std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                try collectOwners(a, entry.value_ptr.*, entry.key_ptr.*, name, out);
+            }
+        },
+        .array => |array| for (array.items) |item| try collectOwners(a, item, parent, name, out),
+        else => {},
+    }
+}
+
+fn summary(a: std.mem.Allocator, table: anytype, cfg: Config, observation: Sample) !std.json.Value {
+    const state = try resolver.curation.parseState(a, cfg.curation_json);
+    return json(a, .{
+        .name = cfg.name,
+        .source_table = table.name,
+        .entity_table = cfg.table,
+        .declaring_indexes = try owners(a, table.indexes_json, cfg.name),
+        .retired = cfg.retired,
+        .config = if (cfg.retired) std.json.Value.null else try publicConfig(a, cfg),
+        .revision = cfg.curation_revision,
+        .namespace_generation = cfg.namespace_generation,
+        .redirects = try cfg.effectiveAliasesAlloc(a),
+        .curation = state,
+        .progress = try observation.progress(a, cfg, cfg.curation_revision),
+    });
+}
+
+pub fn handle(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
+    return execute(server, alloc, op, table_name, resolver_name, key, body, query, request) catch |err| switch (err) {
+        error.Canceled, error.DeadlineExceeded => return err,
+        else => {
+            if (err == error.OutOfMemory) return err;
+            const status = failureStatus(err);
+            return .{ .status = status, .json = true, .retry_after_seconds = if (status == 429 or status == 503) 1 else null, .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err), .code = @errorName(err), .retryable = status == 429 or status == 503 or (status == 409 and err != error.ResolverCurationConflict) }, .{}) };
+        },
+    };
+}
+
+pub fn failureStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.TableNotFound, error.ResolverNotFound, error.NotFound => 404,
+        error.Forbidden, error.RowPolicyAuthenticationRequired, error.RowPolicyUnsupported, error.RowPolicyCatalogChanged => 403,
+        error.Busy, error.WriterLocked, error.CapacityExhausted, error.ResourceBudgetExceeded => 429,
+        error.Conflict, error.ResolverCurationConflict, error.TableGenerationChanged, error.TableTransitionActive, error.ObjectTableDefinitionConflict => 409,
+        error.GroupLeaderUnavailable, error.HttpExecutorUnavailable, error.MetadataMutationOutcomeUnknown, error.StorageUnavailable, error.UnknownGroup, error.NotLeader, error.LeaderUnavailable, error.ProposalDropped, error.Unavailable => 503,
+        error.ResolverIdentityActive => 409,
+        error.UnsupportedOperation, error.MethodNotAllowed => 405,
+        error.InvalidCharacter, error.InvalidPadding, error.InvalidLength, error.InvalidResolverDistinctPair, error.InvalidResolverCurationRequest, error.InvalidResolverSuppression, error.InvalidResolverCurationKey, error.ResolverCurationLimitExceeded, error.ResolverRedirectExists, error.SuppressedResolverRedirectTarget, error.ResolverDistinctPair, error.InvalidResolverAlias, error.InvalidResolverAliasCycle, error.ResolverMergeNamespaceChange, error.InvalidArgument, error.InvalidResolverCurationVersion, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.MissingField, error.InvalidNumber, error.Overflow, error.InvalidEnumTag => 400,
+        else => 500,
+    };
+}
+
+fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
+    try request.ensureActive();
+    if (body.len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var snapshot = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
+    defer server.source.freeAdminSnapshot(&snapshot);
+    const table = try tableByName(&snapshot, table_name);
+    if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress)
+        return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request);
+    const all = try configs(a, table.indexes_json);
+    if (op == .list) {
+        const observation = try sample(server, a, &snapshot, table);
+        var out = std.json.Array.init(a);
+        for (all) |cfg| try out.append(try summary(a, table, cfg, observation));
+        return response(alloc, 200, .{ .resolvers = std.json.Value{ .array = out } });
+    }
+    if (op == .drop) {
+        const plan = try curation.planDropMetadata(a, table.indexes_json, resolver_name);
+        var replacement = table.*;
+        replacement.indexes_json = plan.indexes_json;
+        const stamp = if (plan.changed) try server.source.replaceTableDefinitionStamped(table.*, replacement) else null;
+        return response(alloc, 202, .{ .resolver = resolver_name, .changed = plan.changed, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = false });
+    }
+    const cfg = try findConfig(all, resolver_name);
+    if (cfg.retired and (op == .render or op == .resolve or op == .reviews or op == .review)) return error.ResolverNotFound;
+    switch (op) {
+        .reviews, .review => return reviewsOperation(server, alloc, a, &snapshot, table, cfg, op, key, body, query, request),
+        .resolve => return resolveQuery(server, alloc, a, table, all, cfg, body, request),
+        .get => return response(alloc, 200, try summary(a, table, cfg, try sample(server, a, &snapshot, table))),
+        .redirects => {
+            const state = try resolver.curation.parseState(a, cfg.curation_json);
+            return response(alloc, 200, .{ .redirects = try cfg.effectiveAliasesAlloc(a), .distinct = state.distinct, .revision = cfg.curation_revision });
+        },
+        .suppressions => return response(alloc, 200, .{
+            .configured = if (cfg.suppress_json.len > 0) try std.json.parseFromSliceLeaky(resolver.curation.Suppression, a, cfg.suppress_json, .{}) else resolver.curation.Suppression{},
+            .runtime = (try resolver.curation.parseState(a, cfg.curation_json)).suppress,
+            .revision = cfg.curation_revision,
+        }),
+        .render => {
+            const Mention = struct { text: []const u8, label: []const u8, local_id: []const u8 = "query" };
+            const mention = try std.json.parseFromSliceLeaky(Mention, a, body, .{});
+            const routing = local.storage_db_resolution_runtime;
+            const excluded = try routing.siblingClaimedLabelsAlloc(a, all, &cfg);
+            var parsed = try resolver.Resolver.initFromParts(a, cfg.table, cfg.key_template, .{ .labels = cfg.labels, .exclude_labels = excluded, .min_confidence = cfg.min_confidence }, cfg.type_must_match, "");
+            defer parsed.deinit();
+            if (!parsed.consumesLabel(mention.label)) return error.InvalidArgument;
+            const minted = try parsed.renderKeyAlloc(a, .{ .text = mention.text, .label = mention.label, .local_id = mention.local_id });
+            const aliases = try cfg.effectiveAliasesAlloc(a);
+            const index = try resolver.curation.RedirectIndex.init(a, aliases);
+            const policy = try resolver.curation.Index.init(a, cfg.suppress_json, cfg.curation_json);
+            const suppressed = (try policy.textReason(a, mention.text)) != null or policy.keySuppressed(minted) or policy.keySuppressed(index.canonical(minted));
+            return response(alloc, 200, .{ .minted_key = minted, .key = index.canonical(minted), .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .suppressed = suppressed });
+        },
+        .namespace => {
+            const intent = try std.json.parseFromSliceLeaky(curation.NamespaceRequest, a, body, .{});
+            try server.authorizeIntegrityMutations(request, &.{.{ .table_name = intent.table, .deletes = &.{"resolver_namespace_authorization"} }});
+            const plan = try curation.planNamespaceMetadata(a, table.indexes_json, resolver_name, intent);
+            const grants = local.api_stored_destination_authorization;
+            const sealed = try grants.sealIndexesJsonForPrincipalAlloc(a, plan.indexes_json, table.name, request.destination_authorization_principal, .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled });
+            var replacement = table.*;
+            replacement.indexes_json = sealed;
+            const stamp = try server.source.replaceTableDefinitionStamped(table.*, replacement);
+            const next = try findConfig(try configs(a, sealed), resolver_name);
+            const progress = try observeUntil(server, a, table.name, next, plan.revision, intent.wait, request);
+            return response(alloc, if (progress.applied) 200 else 202, .{ .resolver = resolver_name, .changed = true, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = progress.applied, .progress = progress });
+        },
+        .merge, .unmerge, .suppress, .unsuppress => {
+            const intent = try mutationRequest(a, op, key, body, query);
+            const plan = try curation.planMetadata(a, table.indexes_json, resolver_name, intent);
+            const stamp = if (plan.changed) committed: {
+                var replacement = table.*;
+                replacement.indexes_json = plan.indexes_json;
+                try request.ensureActive();
+                break :committed try server.source.replaceTableDefinitionStamped(table.*, replacement);
+            } else null;
+            const progress = try observeUntil(server, a, table.name, cfg, plan.revision, intent.wait, request);
+            return response(alloc, if (progress.applied) 200 else 202, .{ .resolver = resolver_name, .changed = plan.changed, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = progress.applied, .progress = progress });
+        },
+        else => return error.UnsupportedOperation,
+    }
+}
+
+/// Discover and preflight every source before publishing any source-table CAS.
+/// Each table is atomic; the response preserves already accepted revisions if
+/// a later table races with another curator.
+fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, entity_table: anytype, op: Operation, key: []const u8, body: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
+    const Input = struct { into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null };
+    const input = try std.json.parseFromSliceLeaky(Input, a, if (body.len == 0) "{}" else body, .{});
+    if (key.len == 0 or (op == .entity_merge and input.into == null)) return error.InvalidResolverCurationRequest;
+    const Table = @TypeOf(snapshot.tables[0]);
+    const Pending = struct { table: Table, plan: curation.MetadataBatchPlan, configs: []const Config };
+    var pending: std.ArrayListUnmanaged(Pending) = .empty;
+    var authorization: std.ArrayListUnmanaged(@import("distributed_txn.zig").TableCommitRequest) = .empty;
+    var states = std.json.Array.init(a);
+    const source_configs = try a.alloc([]const Config, snapshot.tables.len);
+    var destinations: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    for (snapshot.tables, source_configs) |source, *all| {
+        all.* = try configs(a, source.indexes_json);
+        for (all.*) |cfg| try destinations.put(a, cfg.table, cfg.table);
+    }
+    // Resolver tables are public names while placement snapshots contain
+    // physical names. Bind all distinct destinations in bounded catalog reads.
+    if (server.source.vtable.system_catalog != null) {
+        const domain = local.system_catalog_domain;
+        var offset: usize = 0;
+        var revision: ?u64 = null;
+        while (offset < destinations.count()) {
+            const end = @min(destinations.count(), offset + 256);
+            const names = destinations.keys()[offset..end];
+            const targets = try a.alloc(domain.Target, names.len);
+            for (names, targets) |name, *target| target.* = try domain.Target.literal(name);
+            const reply = try server.source.systemCatalog(a, request, .{ .resolve_many = .{ .targets = targets, .expected_revision = revision } });
+            const bound = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, reply, .{});
+            if (bound.tables.len != names.len) return error.InvalidCatalogRecord;
+            revision = bound.revision;
+            for (bound.tables, destinations.values()[offset..end]) |target, *name| name.* = if (target) |table| table.name else "";
+            offset = end;
+        }
+    }
+    for (snapshot.tables, source_configs) |source, all| {
+        var edits: std.ArrayListUnmanaged(curation.NamedRequest) = .empty;
+        for (all) |cfg| {
+            if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name)) continue;
+            // Key templates can include dynamic text, but all accepted keys
+            // must belong to the resolver's static namespace prefix/suffix.
+            if (!curation.keyInNamespace(cfg.key_template, key)) continue;
+            if (input.into) |target| if (!curation.keyInNamespace(cfg.key_template, target)) return error.InvalidResolverCurationRequest;
+            if (op == .entity_redirects) {
+                const state = try resolver.curation.parseState(a, cfg.curation_json);
+                const aliases = try cfg.effectiveAliasesAlloc(a);
+                const index = try resolver.curation.RedirectIndex.init(a, aliases);
+                var related: std.ArrayListUnmanaged(resolver.KeyAlias) = .empty;
+                for (aliases) |alias| if (std.mem.eql(u8, alias.key, key) or std.mem.eql(u8, index.canonical(alias.key), key)) try related.append(a, alias);
+                try states.append(try json(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = related.items, .canonical_key = index.canonical(key), .curation = state }));
+                continue;
+            }
+            const action: resolver.curation.Action = switch (op) {
+                .entity_merge => .merge,
+                .entity_unmerge => .unmerge,
+                .entity_suppress => .suppress,
+                .entity_unsuppress => .unsuppress,
+                else => unreachable,
+            };
+            try edits.append(a, .{ .name = cfg.name, .request = .{ .action = action, .key = key, .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .expected_revision = input.expected_revision, .wait = input.wait } });
+        }
+        if (edits.items.len == 0) continue;
+        try pending.append(a, .{ .table = source, .plan = try curation.planMetadataBatch(a, source.indexes_json, edits.items), .configs = all });
+        try authorization.append(a, .{ .table_name = source.name, .deletes = &.{key} });
+    }
+    if (op == .entity_redirects) return response(alloc, 200, .{ .entity_table = entity_table.name, .key = key, .complete = true, .atomicity = "source_table", .results = std.json.Value{ .array = states } });
+    if (pending.items.len == 0) return error.ResolverNotFound;
+    try server.authorizeIntegrityMutations(request, authorization.items);
+    var results = std.json.Array.init(a);
+    var partial = false;
+    var applied = true;
+    const wait_deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (input.wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
+    const failures = try a.alloc(?[]const u8, pending.items.len);
+    for (pending.items, failures) |item, *failure| {
+        failure.* = null;
+        var replacement = item.table;
+        replacement.indexes_json = item.plan.indexes_json;
+        if (item.plan.changed) {
+            try request.ensureActive();
+            _ = server.source.replaceTableDefinitionStamped(item.table, replacement) catch |err| blk: {
+                failure.* = @errorName(err);
+                partial = true;
+                break :blk null;
+            };
+        }
+    }
+    for (pending.items, failures) |item, failure| {
+        const observation = try sample(server, a, snapshot, &item.table);
+        for (item.plan.results) |result| {
+            const cfg = try findConfig(item.configs, result.name);
+            const remaining = (wait_deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
+            const progress = if (failure == null and remaining > 0)
+                try observeUntil(server, a, item.table.name, cfg, result.revision, .{ .timeout_ms = @intCast(remaining) }, request)
+            else
+                try observation.progress(a, cfg, result.revision);
+            applied = applied and progress.applied and failure == null;
+            try results.append(try json(a, .{ .source_table = item.table.name, .resolver = result.name, .changed = result.changed and failure == null, .revision = if (failure == null) result.revision else cfg.curation_revision, .replay_sequence = result.revision, .replay_sequence_kind = "resolver_revision", .accepted = failure == null, .@"error" = failure orelse "", .applied = progress.applied and failure == null, .progress = progress }));
+        }
+    }
+    return response(alloc, if (partial) 207 else if (applied) 200 else 202, .{ .entity_table = entity_table.name, .key = key, .atomicity = "source_table", .complete = !partial, .applied = applied, .results = std.json.Value{ .array = results } });
+}
+
+/// Waiting observes detached workers and yields between samples; it never
+/// executes extraction, model inference or promotion on the request worker.
+fn observeUntil(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: Config, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext) !Progress {
+    return observeReplayUntil(server, a, table_name, cfg, revision, wait, request, null);
+}
+const ReplayFloor = struct { group: u64, sequence: u64 };
+fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: Config, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext, floor: ?ReplayFloor) !Progress {
+    const clock = @import("antfly_platform").time;
+    const deadline = clock.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
+    while (true) {
+        try request.ensureActive();
+        var iteration = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer iteration.deinit();
+        const scratch = iteration.allocator();
+        var snapshot = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
+        const table = tableByName(&snapshot, table_name) catch |err| {
+            server.source.freeAdminSnapshot(&snapshot);
+            return err;
+        };
+        const observation = sample(server, scratch, &snapshot, table) catch |err| {
+            server.source.freeAdminSnapshot(&snapshot);
+            return err;
+        };
+        server.source.freeAdminSnapshot(&snapshot);
+        var progress = try observation.progress(scratch, cfg, revision);
+        if (floor) |target| {
+            var observed = false;
+            for (progress.shards) |row| if (row.group_id == target.group) {
+                observed = row.resolution.applied_sequence >= target.sequence and (!cfg.promote or row.promotion.applied_sequence >= target.sequence);
+                break;
+            };
+            progress.applied = progress.applied and observed;
+        }
+        const borrow = request.fanout_io orelse request.deadline_io;
+        if (progress.applied or clock.monotonicNs() >= deadline or borrow == null) {
+            const rows = try a.dupe(GroupProgress, progress.shards);
+            for (rows) |*row| {
+                row.resolution.blocked_reason = try a.dupe(u8, row.resolution.blocked_reason);
+                row.promotion.blocked_reason = try a.dupe(u8, row.promotion.blocked_reason);
+            }
+            return .{ .applied = progress.applied, .shards = rows };
+        }
+        var receiver = try borrow.?.receive();
+        try receiver.io().sleep(.fromMilliseconds(25), .awake);
+    }
+}
+
+const GroupReviewToken = struct { group: u64, value: ?[]const u8 = null };
+fn reviewsOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, table: anytype, cfg: Config, op: Operation, id: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
+    var groups: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    for (snapshot.ranges) |range| if (range.table_id == table.table_id) try groups.put(a, range.group_id, {});
+    const ordered = try a.dupe(u64, groups.keys());
+    std.mem.sort(u64, ordered, {}, std.sort.asc(u64));
+    if (groups.count() == 0) return error.StorageUnavailable;
+    if (op == .review) {
+        if (query.len > 0) return error.InvalidResolverCurationRequest;
+        const token = try curation.decodeToken(GroupReviewToken, a, id);
+        if (!groups.contains(token.group)) return error.ResolverCurationConflict;
+        const Input = struct { decision: resolver.Decision, key: ?[]const u8 = null, table: ?[]const u8 = null, wait: ?resolver.curation.Wait = null };
+        const input = try std.json.parseFromSliceLeaky(Input, a, body, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, curation.ReviewRequest{ .operation = .review, .resolver = cfg.name, .expected_revision = cfg.curation_revision, .id = token.value, .decision = input.decision, .key = input.key, .table = input.table }, .{});
+        if (input.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
+        const reply = try server.executeResolverOperation(a, table.name, token.group, bytes, request);
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, a, reply, .{});
+        const sequence = value.object.get("replay_sequence").?.integer;
+        const progress = try observeReplayUntil(server, a, table.name, cfg, cfg.curation_revision, input.wait, request, .{ .group = token.group, .sequence = @intCast(sequence) });
+        try value.object.put(a, "applied", .{ .bool = progress.applied });
+        try value.object.put(a, "progress", try json(a, progress));
+        return response(alloc, if (progress.applied) 200 else 202, value);
+    }
+    var cursor: ?GroupReviewToken = null;
+    var limit: u16 = 64;
+    var parts = std.mem.splitScalar(u8, query, '&');
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        const split = std.mem.indexOfScalar(u8, part, '=') orelse return error.InvalidResolverCurationRequest;
+        const name = part[0..split];
+        const slot = try seen.getOrPut(a, name);
+        if (slot.found_existing) return error.InvalidResolverCurationRequest;
+        const value = part[split + 1 ..];
+        if (std.mem.eql(u8, name, "cursor")) cursor = try curation.decodeToken(GroupReviewToken, a, value) else if (std.mem.eql(u8, name, "limit")) limit = try std.fmt.parseInt(u16, value, 10) else return error.InvalidResolverCurationRequest;
+    }
+    if (limit == 0 or limit > 256) return error.InvalidResolverCurationRequest;
+    const group = if (cursor) |c| c.group else ordered[0];
+    const index = std.mem.indexOfScalar(u64, ordered, group) orelse return error.ResolverCurationConflict;
+    const bytes = try std.json.Stringify.valueAlloc(a, curation.ReviewRequest{ .operation = .reviews, .resolver = cfg.name, .cursor = if (cursor) |c| c.value else null, .limit = limit }, .{});
+    const reply = try server.executeResolverOperation(a, table.name, group, bytes, request);
+    var page = try std.json.parseFromSliceLeaky(std.json.Value, a, reply, .{});
+    if (page != .object) return error.InvalidResolverCurationRequest;
+    const items = page.object.getPtr("reviews") orelse return error.InvalidResolverCurationRequest;
+    for (items.array.items) |*item| {
+        const raw = item.object.get("id").?.string;
+        try item.object.put(a, "id", .{ .string = try curation.encodeToken(a, GroupReviewToken{ .group = group, .value = raw }) });
+    }
+    const next = page.object.get("next_cursor") orelse .null;
+    const next_token: ?GroupReviewToken = if (next == .string) .{ .group = group, .value = next.string } else if (index + 1 < groups.count()) .{ .group = ordered[index + 1] } else null;
+    try page.object.put(a, "next_cursor", if (next_token) |token| .{ .string = try curation.encodeToken(a, token) } else .null);
+    return response(alloc, 200, page);
+}
+
+fn mutationRequest(a: std.mem.Allocator, op: Operation, key: []const u8, body: []const u8, query: []const u8) !resolver.curation.Request {
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (body.len == 0) "{}" else body, .{});
+    if (root != .object or root.object.contains("action")) return error.InvalidResolverCurationRequest;
+    const action: []const u8 = switch (op) {
+        .merge => "merge",
+        .unmerge => "unmerge",
+        .suppress => if (root.object.contains("add") or root.object.contains("remove")) "suppressions" else "suppress",
+        .unsuppress => "unsuppress",
+        else => return error.InvalidResolverCurationRequest,
+    };
+    if (key.len > 0) {
+        if (root.object.contains("key") or root.object.contains("from")) return error.InvalidResolverCurationRequest;
+        try root.object.put(a, "key", .{ .string = key });
+    }
+    if (query.len > 0) {
+        if (op != .unmerge or (!std.mem.eql(u8, query, "pin_distinct=true") and !std.mem.eql(u8, query, "pin_distinct=false"))) return error.InvalidResolverCurationRequest;
+        if (root.object.contains("pin_distinct")) return error.InvalidResolverCurationRequest;
+        try root.object.put(a, "pin_distinct", .{ .bool = std.mem.eql(u8, query, "pin_distinct=true") });
+    }
+    try root.object.put(a, "action", .{ .string = action });
+    return std.json.parseFromSliceLeaky(resolver.curation.Request, a, try std.json.Stringify.valueAlloc(a, root, .{}), .{});
+}
+
+fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, all: []const Config, cfg: Config, body: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
+    const Input = struct { text: ?[]const u8 = null, extraction: ?std.json.Value = null };
+    const input = try std.json.parseFromSliceLeaky(Input, a, body, .{});
+    if ((input.text == null) == (input.extraction == null) or cfg.source_artifact_kind != .asset) return error.InvalidArgument;
+    const Server = @typeInfo(@TypeOf(server)).pointer.child;
+    const Bridge = struct {
+        server: *Server,
+        request: operation.RequestContext,
+        source_table: []const u8,
+        fn options(ptr: *anyopaque) local.asset_producer_runtime.Runtime.Options {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .antfly_provider = self.server.antfly_provider, .inference_api_url = self.server.configuredInferenceAPIURL(), .secret_store = self.server.cfg.secret_store, .source_table = self.source_table };
+        }
+        fn bind(ptr: *anyopaque, allocator: std.mem.Allocator, names: []const []const u8) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const domain = local.system_catalog_domain;
+            var scratch = std.heap.ArenaAllocator.init(allocator);
+            defer scratch.deinit();
+            const arena = scratch.allocator();
+            const targets = try arena.alloc(domain.Target, names.len);
+            for (names, targets) |name, *target| target.* = try domain.Target.literal(name);
+            const bytes = try self.server.source.systemCatalog(arena, self.request, .{ .resolve_many = .{ .targets = targets } });
+            const result = try std.json.parseFromSliceLeaky(domain.ResolvedMany, arena, bytes, .{});
+            if (result.tables.len != names.len) return error.InvalidCatalogRecord;
+            const out = try allocator.alloc([]u8, names.len);
+            var kept: usize = 0;
+            errdefer {
+                for (out[0..kept]) |name| allocator.free(name);
+                allocator.free(out);
+            }
+            for (result.tables, out) |item, *name| {
+                name.* = try allocator.dupe(u8, (item orelse return error.TableNotFound).name);
+                kept += 1;
+            }
+            return out;
+        }
+    };
+    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name };
+    const io = server.inferenceIo();
+    const invocation: local.storage_db_enrichment_asset_producer.InvocationContext = .{ .io = io, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation };
+    var candidates: @import("distributed_candidate_source.zig").DistributedCandidateSource = .{
+        .reads = server.table_reads orelse return error.UnsupportedOperation,
+        .io = io,
+        .request_context = invocation,
+        .producer_options = .{ .ptr = &bridge, .get = Bridge.options },
+        .catalog_binding = if (server.source.vtable.system_catalog != null) .{ .ptr = &bridge, .bind_fn = Bridge.bind } else null,
+    };
+    const managed = local.inference_managed_embedder;
+    const options: managed.InitOptions = .{
+        .antfly_provider = server.antfly_provider,
+        .io = io,
+        .bounded_http_request = true,
+        .deadline_ns = request.deadline_ns,
+        .cancellation = request.cancellation,
+        .inference_api_url = server.configuredInferenceAPIURL(),
+        .secret_store = server.cfg.secret_store,
+        .source_table = table.name,
+    };
+    const extraction = if (input.text) |text| extracted: {
+        var enrichments: std.ArrayListUnmanaged(types.EnrichmentConfig) = .empty;
+        try local.metadata_local_index_reconcile.collectDesiredEnrichmentsFromJson(a, table.indexes_json, options, &enrichments);
+        for (enrichments.items) |enrichment| {
+            if (enrichment.kind != .asset or !std.mem.eql(u8, enrichment.name, cfg.source_artifact)) continue;
+            var producer_config = try local.storage_db_enrichment_asset_producer.parseProducerConfig(a, enrichment.producer_json);
+            defer producer_config.deinit(a);
+            if (producer_config.type != .extractor) return error.InvalidArgument;
+            const runtime = try local.asset_producer_runtime.Runtime.createOwned(a, io, Bridge.options(&bridge));
+            defer {
+                runtime.deinit();
+                a.destroy(runtime);
+            }
+            break :extracted try runtime.producer().withInvocationContext(invocation).produce(a, .{ .producer_type = .extractor, .config_json = producer_config.config_json, .content_type = enrichment.content_type, .source_text = text, .item_id = "query" });
+        }
+        return error.InvalidArgument;
+    } else try std.json.Stringify.valueAlloc(a, input.extraction.?, .{});
+    var embedding: ?managed.ManagedEmbedder = null;
+    defer if (embedding) |*value| value.deinit();
+    if (cfg.name_embedding.len > 0) {
+        const physical = if (candidates.catalog_binding) |binding| try binding.bindOne(a, cfg.table) else cfg.table;
+        var destinations = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
+        defer server.source.freeAdminSnapshot(&destinations);
+        const destination = try tableByName(&destinations, physical);
+        embedding = try managed.ManagedEmbedder.initFromIndexesJsonWithOptions(a, destination.indexes_json, options);
+    }
+    var active: std.ArrayListUnmanaged(Config) = .empty;
+    for (all) |item| if (!item.retired) try active.append(a, item);
+    const result = try local.storage_db_resolution_runtime.resolveQueryExtractionAlloc(a, active.items, &cfg, extraction, candidates.candidateSource(), if (embedding) |*value| value.denseInterface() else null);
+    try request.ensureActive();
+    var latest = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
+    defer server.source.freeAdminSnapshot(&latest);
+    const current = try tableByName(&latest, table.name);
+    if (!std.mem.eql(u8, current.indexes_json, table.indexes_json)) return error.Busy;
+    return response(alloc, 200, .{ .extraction = try std.json.parseFromSliceLeaky(std.json.Value, a, extraction, .{}), .resolution = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{}) });
+}
+
+fn response(a: std.mem.Allocator, status: u16, value: anytype) !@import("public_table_http.zig").OwnedResponse {
+    return .{ .status = status, .json = true, .body = try std.json.Stringify.valueAlloc(a, value, .{}) };
+}
+fn json(a: std.mem.Allocator, value: anytype) !std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{});
+}
+
+test "resolver curation HTTP routes keep encoded keys inside one resource and classify reads" {
+    const route = matchTablePath("/tables/notes/resolvers/concepts/redirects/concept%2Fkillall").?;
+    try std.testing.expectEqualStrings("notes", route.table_name);
+    try std.testing.expectEqualStrings("concept%2Fkillall", route.key);
+    try std.testing.expectEqual(Operation.unmerge, route.op);
+    try std.testing.expect(matchSuffix("resolvers/concepts/redirects/concept/killall") == null);
+    try std.testing.expectEqual(Operation.entity_merge, matchTablePath("/tables/concepts/entities/concept%2Fnote:merge").?.op);
+    try std.testing.expectEqual(Operation.resolve, matchSuffix("resolvers/concepts:resolve").?.op);
+    try std.testing.expect(readOnly(.resolve));
+    try std.testing.expect(!readOnly(.unmerge));
+}
+
+test "resolver curation HTTP ingress handlers compile against the serving owner" {
+    const Handler = @import("httpx_handler.zig").AntflyApiHandler;
+    _ = &Handler.listResolvers;
+    _ = &Handler.mergeResolverKeys;
+    _ = &Handler.resolveResolverQuery;
+    _ = &Handler.mergeEntity;
+}
+
+test "resolver curation progress requires the revision and complete bounded backfill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var observation: Sample = .{};
+    try observation.groups.put(a, 1, {});
+    var by_group: std.AutoHashMapUnmanaged(u64, GroupProgress) = .empty;
+    try by_group.put(a, 1, .{ .group_id = 1, .available = true, .fresh = true, .curation_revision = 2, .config_generation = 3, .backfill_pending = true, .resolution = .{ .enabled = true, .target_sequence = 5, .applied_sequence = 5 } });
+    try observation.observations.put(a, "concepts", by_group);
+    const cfg: Config = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .promote = false, .config_generation = 3 };
+    try std.testing.expect(!(try observation.progress(a, cfg, 2)).applied);
+    observation.observations.getPtr("concepts").?.getPtr(1).?.backfill_pending = false;
+    try std.testing.expect((try observation.progress(a, cfg, 2)).applied);
+    try std.testing.expect(!(try observation.progress(a, cfg, 3)).applied);
+    observation.observations.getPtr("concepts").?.getPtr(1).?.fresh = false;
+    try std.testing.expect(!(try observation.progress(a, cfg, 2)).applied);
+}

@@ -582,6 +582,11 @@ fn appendNormalizedGraphResolversField(alloc: std.mem.Allocator, out: *std.Array
     for (value.array.items, 0..) |item, i| {
         if (i != 0) try out.append(alloc, ',');
         if (item != .object) return error.InvalidCreateIndexRequest;
+        if (item.object.get("suppress")) |policy| if (policy != .null) {
+            const raw = try stringifyJsonAlloc(alloc, policy);
+            defer alloc.free(raw);
+            @import("antfly_resolver").curation.validateConfig(alloc, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateIndexRequest;
+        };
         if (item.object.get("adjudicate")) |policy| if (policy != .null) {
             const raw = try stringifyJsonAlloc(alloc, policy);
             defer alloc.free(raw);
@@ -1039,6 +1044,22 @@ test "resolver adjudication public policy validates and redacts frozen credentia
     try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true }));
 }
 
+test "resolver curation public policy preserves suppression and rejects misspelled rules" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","suppress":{"keys":["concept/note"],"texts":["content"],"min_text_chars":3}}]}
+    , .{});
+    const normalized = try normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(normalized);
+    const public = try indexes_api.encodeCreatedIndexConfig(a, "g", normalized);
+    defer a.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"suppress\":") != null);
+    try value.object.getPtr("resolvers").?.array.items[0].object.getPtr("suppress").?.object.put(arena.allocator(), "min_chars", .{ .integer = 3 });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
 test "typed enrichment producer and graph scorer normalize to legacy storage fields" {
     const alloc = std.testing.allocator;
     const enrichment = try parseArtifactEnrichmentRequest(alloc, "units",
@@ -1213,7 +1234,7 @@ fn appendDefaultFullTextIndexEntry(
 }
 
 fn validateCreateTableIndexName(index_name: []const u8) !void {
-    if (index_name.len == 0) return error.InvalidCreateTableRequest;
+    if (index_name.len == 0 or std.mem.eql(u8, index_name, "_resolver_curation")) return error.InvalidCreateTableRequest;
     if (isReservedFullTextIndexName(index_name)) return error.InvalidCreateTableRequest;
 }
 
@@ -1222,7 +1243,7 @@ fn isReservedFullTextIndexName(index_name: []const u8) bool {
 }
 
 fn isReservedPublicCreateIndexName(index_name: []const u8) bool {
-    return isReservedFullTextIndexName(index_name) or
+    return std.mem.eql(u8, index_name, "_resolver_curation") or isReservedFullTextIndexName(index_name) or
         std.mem.eql(u8, index_name, "default");
 }
 

@@ -176,6 +176,7 @@ pub fn addOpenApiSourceSteps(
     const metadata_mappings = &[_][2][]const u8{
         .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
         .{ "indexes.yaml", "antfly_indexes_openapi" },
+        .{ "resolvers.yaml", "antfly_resolvers_openapi" },
         .{ "sort.yaml", "antfly_sort_openapi" },
         .{ "embeddings.yaml", "antfly_embeddings_openapi" },
         .{ "schema.yaml", "antfly_schema_openapi" },
@@ -188,6 +189,7 @@ pub fn addOpenApiSourceSteps(
     const public_mappings = &[_][2][]const u8{
         .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
         .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+        .{ "specs/openapi/antfly/resolvers.yaml", "antfly_resolvers_openapi" },
         .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
         .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
         .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
@@ -205,6 +207,7 @@ pub fn addOpenApiSourceSteps(
         addGeneratedModule(b, openapi_build, openapi_codegen, public_spec, "antfly_client_openapi", client_generated_root ++ "/antfly_client_openapi", "types,client", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/resolvers.yaml", "antfly_resolvers_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
@@ -226,6 +229,9 @@ pub fn addOpenApiSourceSteps(
             .{ "chunking.yaml", "antfly_chunking_openapi" },
             .{ "query.yaml", "antfly_query_openapi" },
             .{ "generated/graph_identifier.yaml", "antfly_graph_identifier_openapi" },
+        }),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/resolvers.yaml"), "antfly_resolvers_openapi", antfly_generated_root ++ "/antfly_resolvers_openapi", "types", &.{
+            .{ "indexes.yaml", "antfly_indexes_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi", "types", &.{
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
@@ -417,6 +423,8 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     const schema_openapi_mod = committedModule(b, options, "antfly_schema_openapi", false);
     const graph_identifier_openapi_mod = committedModule(b, options, "antfly_graph_identifier_openapi", false);
     const indexes_openapi_mod = committedModule(b, options, "antfly_indexes_openapi", false);
+    const resolvers_openapi_mod = committedModule(b, options, "antfly_resolvers_openapi", false);
+    resolvers_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     const sort_openapi_mod = committedModule(b, options, "antfly_sort_openapi", false);
     const websearch_openapi_mod = committedModule(b, options, "antfly_websearch_openapi", false);
     const eval_openapi_mod = committedModule(b, options, "antfly_eval_openapi", false);
@@ -449,6 +457,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     public_server_openapi_mod.addImport("antfly_public_openapi", public_openapi_mod);
     public_server_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_server_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    public_server_openapi_mod.addImport("antfly_resolvers_openapi", resolvers_openapi_mod);
     public_server_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     const generating_api_openapi_mod = committedModule(b, options, "antfly_generating_api_openapi", false);
     const extraction_openapi_mod = committedModule(b, options, "antfly_extraction_openapi", false);
@@ -467,6 +476,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    public_openapi_mod.addImport("antfly_resolvers_openapi", resolvers_openapi_mod);
     public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     public_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
@@ -476,6 +486,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    client_openapi_mod.addImport("antfly_resolvers_openapi", resolvers_openapi_mod);
     client_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
@@ -487,8 +498,10 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     metadata_server_openapi_mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
     metadata_server_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     metadata_server_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    metadata_server_openapi_mod.addImport("antfly_resolvers_openapi", resolvers_openapi_mod);
     metadata_server_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_resolvers_openapi", resolvers_openapi_mod);
     metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     metadata_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);

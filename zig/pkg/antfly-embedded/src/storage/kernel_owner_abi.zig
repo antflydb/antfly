@@ -2129,6 +2129,13 @@ pub extern fn antfly_storage_owner_graph_metric_maintenance_json(
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_owner_resolver_operation_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_preflight_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,

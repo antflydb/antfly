@@ -81,6 +81,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
+    if (std.mem.eql(u8, index_name, "_resolver_curation")) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -122,7 +123,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     try out.append(alloc, ':');
     try out.appendSlice(alloc, stored_config);
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
 fn storedIndexConfigForMutationAlloc(
@@ -194,6 +195,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    if (std.mem.eql(u8, index_name, "_resolver_curation")) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 
@@ -221,7 +223,7 @@ pub fn removeIndexFromTableIndexesJson(
     }
 
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
 pub fn addEnrichmentToTableIndexesJson(

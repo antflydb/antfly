@@ -29014,6 +29014,31 @@ pub const DB = struct {
         return try self.upsertResolverWithResultOptions(cfg, .{});
     }
 
+    pub fn curateResolverJsonAlloc(self: *DB, alloc: Allocator, name: []const u8, request_json: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("curateResolverJsonAlloc", .{ self, alloc, name, request_json });
+        return @import("resolver_curation.zig").mutate(self, alloc, name, request_json);
+    }
+
+    pub fn resolverCurationJsonAlloc(self: *DB, alloc: Allocator, name: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolverCurationJsonAlloc", .{ self, alloc, name });
+        return @import("resolver_curation.zig").list(self, alloc, name);
+    }
+
+    pub fn resolverReviewsJsonAlloc(self: *DB, alloc: Allocator, request_json: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolverReviewsJsonAlloc", .{ self, alloc, request_json });
+        return @import("resolver_curation.zig").reviewOperation(self, alloc, request_json);
+    }
+
+    pub fn listResolverIdentities(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("listResolverIdentities", .{ self, alloc });
+        return self.core.index_manager.listResolverIdentities(alloc);
+    }
+
+    pub fn consumeResolverMetadataDrop(self: *DB, alloc: Allocator, identity: @import("resolver_curation.zig").MetadataIdentity) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("consumeResolverMetadataDrop", .{ self, alloc, identity });
+        return @import("resolver_curation.zig").consumeMetadataDrop(self, alloc, identity);
+    }
+
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         _ = try self.upsertResolverWithResult(cfg);
     }
@@ -29408,6 +29433,12 @@ pub const DB = struct {
         table: []const u8,
         key: []const u8,
     ) !u64 {
+        return self.recordReviewDecisionChecked(doc_key, source_artifact, resolution_artifact, local_id, decision, table, key, null, null);
+    }
+
+    pub fn recordReviewDecisionChecked(self: *DB, doc_key: []const u8, source_artifact: []const u8, resolution_artifact: []const u8, local_id: []const u8, decision: resolver_lib.Decision, table: []const u8, key: []const u8, expected_hash: ?[]const u8, expected_revision: ?u64) !u64 {
+        var policy_lease = try self.local_execution.row_policy_gate.enterRaw();
+        defer policy_lease.release();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -29423,13 +29454,52 @@ pub const DB = struct {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
             if (resolvers.len > 0) self.alloc.free(resolvers);
         }
+        var selected_config: ?index_manager_mod.ResolverConfig = null;
         for (resolvers) |cfg| {
             if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
                 std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
             {
+                selected_config = cfg;
                 break;
             }
         } else return error.ResolverNotFound;
+
+        if (expected_revision) |revision| if (selected_config.?.curation_revision != revision) return error.ResolverCurationConflict;
+        if (expected_hash) |expected| {
+            const artifact = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "resolution", resolution_artifact);
+            defer self.alloc.free(artifact);
+            const bytes = self.core.store.get(self.alloc, artifact) catch |err| switch (err) {
+                error.NotFound => return error.ResolverCurationConflict,
+                else => return err,
+            };
+            defer self.alloc.free(bytes);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            const actual = std.fmt.bytesToHex(digest, .lower);
+            if (!std.mem.eql(u8, expected, &actual)) return error.ResolverCurationConflict;
+            var current = try resolver_lib.parseResolution(self.alloc, bytes);
+            defer current.deinit();
+            const cfg = selected_config.?;
+            if (current.config_generation != cfg.effectiveGeneration()) return error.ResolverCurationConflict;
+            for (current.entities) |entity| {
+                if (entity.decision != .review or !std.mem.eql(u8, entity.local_id, local_id)) continue;
+                if (decision != .suppressed) {
+                    if (!std.mem.eql(u8, table, cfg.table)) return error.InvalidResolverCurationRequest;
+                    var arena = std.heap.ArenaAllocator.init(self.alloc);
+                    defer arena.deinit();
+                    const scratch = arena.allocator();
+                    var policy = try resolver_lib.curation.Index.init(scratch, cfg.suppress_json, cfg.curation_json);
+                    const redirects = try resolver_lib.curation.RedirectIndex.init(scratch, try cfg.effectiveAliasesAlloc(scratch));
+                    try policy.bindRedirects(scratch, redirects);
+                    if (policy.keySuppressed(key) or policy.keySuppressed(redirects.canonical(key))) return error.SuppressedResolverRedirectTarget;
+                    var renderer = try resolver_lib.Resolver.initFromParts(scratch, cfg.table, cfg.key_template, .{}, cfg.type_must_match, "");
+                    defer renderer.deinit();
+                    const original = try renderer.renderKeyAlloc(scratch, .{ .text = entity.surface_form, .label = entity.label, .local_id = entity.local_id });
+                    if (try policy.pinnedDistinct(scratch, original, key)) return error.ResolverDistinctPair;
+                }
+                break;
+            } else return error.ResolverCurationConflict;
+        }
 
         const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
         defer self.alloc.free(override_key);
@@ -29451,16 +29521,17 @@ pub const DB = struct {
         }, sequence);
         defer self.alloc.free(replay_payload);
 
-        const writes = [_]docstore_mod.KVPair{.{
-            .key = override_key,
-            .value = override_bytes,
-        }};
+        const catalog = @import("catalog/resolver_catalog.zig");
+        const previous_reader = self.core.index_manager.minimum_reader_version.load(.acquire);
+        const upgrade_reader = decision == .suppressed and previous_reader < catalog.curation_reader_version;
+        const writes = [_]docstore_mod.KVPair{ .{ .key = override_key, .value = override_bytes }, .{ .key = catalog.minimum_reader_key, .value = try catalog.readerVersionBytes(@max(previous_reader, catalog.curation_reader_version)) } };
         var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
         defer backlog_admission.cancel();
-        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..if (upgrade_reader) 2 else 1], &.{}, .{
             .sequence = sequence,
             .payload = replay_payload,
         });
+        if (upgrade_reader) self.core.index_manager.minimum_reader_version.store(catalog.curation_reader_version, .release);
         self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
         self.executor.commitBacklogAdmission(sequence, &backlog_admission);
         self.core.unlockApply();
@@ -30706,6 +30777,9 @@ pub const DB = struct {
             errdefer alloc.free(resolution_artifact);
             resolvers[initialized] = .{
                 .name = name,
+                .config_generation = cfg.config_generation,
+                .effective_generation = cfg.effectiveGeneration(),
+                .curation_revision = cfg.curation_revision,
                 .table = table,
                 .source_artifact = source_artifact,
                 .resolution_artifact = resolution_artifact,
@@ -30714,6 +30788,7 @@ pub const DB = struct {
         }
 
         return .{
+            .reresolve_pending = try resolution_runtime_mod.hasDurableReresolveBacklog(self.core.store),
             .resolver_count = @intCast(catalog.len),
             .resolution_runtime_present = self.resolution_runtime != null,
             .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,

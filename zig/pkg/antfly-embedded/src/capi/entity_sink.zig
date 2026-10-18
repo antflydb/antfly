@@ -26,7 +26,7 @@ const callbacks = @import("../storage/db/runtime_callbacks.zig");
 pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return;
     db.setResolutionCandidateSource(candidateSource(handle));
-    db.setEntitySink(.{ .ptr = handle, .vtable = &.{ .upsert = upsert, .upsert_batch = upsertBatch } });
+    db.setEntitySink(.{ .ptr = handle, .vtable = &.{ .upsert = upsert, .upsert_batch = upsertBatch, .supports_curation = supportsCuration } });
 }
 
 /// Read-only candidate seam also used by ephemeral query resolution.
@@ -497,35 +497,11 @@ const Participant = struct {
 };
 
 fn merge(a: std.mem.Allocator, current: ?[]const u8, incoming: []const u8, key: []const u8) ![]const u8 {
-    const document = try std.json.parseFromSliceLeaky(std.json.Value, a, incoming, .{});
-    if (document != .object) return error.InvalidEntityPromotionDocument;
-    var ops: std.ArrayList(types.TransformOp) = .empty;
-    for ([_][]const u8{ "entity_type", "canonical_name" }) |field| {
-        if (document.object.get(field)) |value| {
-            if (value != .string) return error.InvalidEntityPromotionDocument;
-            try ops.append(a, .{ .op = .set_on_insert, .path = field, .value_json = try std.json.Stringify.valueAlloc(a, value, .{}) });
-        }
-    }
-    if (document.object.get("aliases")) |aliases| {
-        if (aliases != .array) return error.InvalidEntityPromotionDocument;
-        for (aliases.array.items) |alias| {
-            if (alias != .string) return error.InvalidEntityPromotionDocument;
-            try ops.append(a, .{ .op = .add_to_set, .path = "aliases", .value_json = try std.json.Stringify.valueAlloc(a, alias, .{}) });
-        }
-    }
-    if (document.object.get("merged_into")) |redirect| {
-        if (redirect != .string) return error.InvalidEntityPromotionDocument;
-        try ops.append(a, .{ .op = .set, .path = "merged_into", .value_json = try std.json.Stringify.valueAlloc(a, redirect, .{}) });
-        if (document.object.get("merged_into_table")) |table| {
-            switch (table) {
-                .string => try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try std.json.Stringify.valueAlloc(a, table, .{}) }),
-                .null => try ops.append(a, .{ .op = .unset, .path = "merged_into_table" }),
-                else => return error.InvalidEntityPromotionDocument,
-            }
-        } else try ops.append(a, .{ .op = .unset, .path = "merged_into_table" });
-    }
-    if (ops.items.len == 0) return error.InvalidEntityPromotionDocument;
-    return (try @import("../storage/db/transform.zig").resolveDocumentTransform(a, current, .{ .key = key, .operations = ops.items, .upsert = true })) orelse return error.InvalidEntityPromotionDocument;
+    return @import("../storage/db/entity_alias_curation.zig").merge(a, current, incoming, key);
+}
+
+fn supportsCuration(_: *anyopaque) anyerror!bool {
+    return true;
 }
 
 fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const callbacks.EntityUpsert) anyerror!void {
@@ -566,6 +542,7 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
             const old = try participant.db.lookup(a, entry.key, .{ .include_primary_digest = true });
             row.value_ptr.* = .{ .key = entry.key, .json = if (old) |value| value.json else null, .version = if (old) |value| value.version orelse 0 else 0, .digest = if (old) |value| value.expected_content_digest else null };
         }
+        if (entry.skip_if_missing and row.value_ptr.json == null) continue;
         row.value_ptr.json = if (entry.delete) null else try merge(a, row.value_ptr.json, entry.doc_json, entry.key);
     }
     const requests = try a.alloc(contract.TableCommitRequest, participants.count());
@@ -2148,4 +2125,143 @@ test "capi resolver failed replacement permits portable backup and cancellation"
     try runUntilIdle(handle);
     try std.testing.expect(handle.db.core.index_manager.get("old") != null);
     try std.testing.expect(handle.db.core.index_manager.get("new") == null);
+}
+
+test "capi resolver curation repoints restores suppresses and reopens promotion state" {
+    const api = @import("db.zig");
+    const curation = @import("../storage/db/resolver_curation.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("resolver-curation-lifecycle");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    var handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, true, null, null);
+    var opened = true;
+    defer if (opened) h.closeHandle(handle);
+    try tables.create(handle, "entities", "{}", false);
+    const seeded_entities = try tables.get(handle, "entities");
+    try seeded_entities.batch(.{ .writes = &.{ .{ .key = "concept/beta", .value = "{\"canonical_name\":\"Beta\",\"entity_type\":\"concept\",\"aliases\":[\"Beta\"]}" }, .{ .key = "concept/gamma", .value = "{\"canonical_name\":\"Gamma\",\"entity_type\":\"concept\",\"aliases\":[\"Gamma\"]}" } } });
+    try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try handle.db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try handle.db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}" });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"kg\":{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Alpha\"}]}}" }} });
+    try runUntilIdle(handle);
+    const Actions = struct {
+        fn apply(root: *h.Handle, request: []const u8) !void {
+            const result = try curation.mutate(&root.db, std.testing.allocator, "concepts", request);
+            defer std.testing.allocator.free(result);
+            try runUntilIdle(root);
+        }
+        fn document(root: *h.Handle, key: []const u8) ![]u8 {
+            const destination = try tables.get(root, "entities");
+            var row = (try destination.lookup(std.testing.allocator, key, .{})) orelse return error.TestUnexpectedResult;
+            defer row.deinit(std.testing.allocator);
+            return std.testing.allocator.dupe(u8, row.json);
+        }
+    };
+    try Actions.apply(handle, "{\"action\":\"merge\",\"from\":\"concept/alpha\",\"to\":\"concept/beta\"}");
+    try Actions.apply(handle, "{\"action\":\"merge\",\"from\":\"concept/alpha\",\"to\":\"concept/gamma\",\"replace\":true}");
+    const beta = try Actions.document(handle, "concept/beta");
+    defer a.free(beta);
+    try std.testing.expect(std.mem.indexOf(u8, beta, "merged_into") == null);
+    try std.testing.expect(std.mem.indexOf(u8, beta, "Alpha") == null);
+    try Actions.apply(handle, "{\"action\":\"unmerge\",\"from\":\"concept/alpha\",\"pin_distinct\":true}");
+    const restored = try Actions.document(handle, "concept/alpha");
+    defer a.free(restored);
+    try std.testing.expect(std.mem.indexOf(u8, restored, "merged_into") == null);
+    try Actions.apply(handle, "{\"action\":\"suppress\",\"key\":\"concept/alpha\"}");
+    const suppressed = try Actions.document(handle, "concept/alpha");
+    defer a.free(suppressed);
+    try std.testing.expect(std.mem.indexOf(u8, suppressed, "resolver_suppressed_by") != null);
+    try Actions.apply(handle, "{\"action\":\"unsuppress\",\"key\":\"concept/alpha\"}");
+    const before = try curation.list(&handle.db, a, "concepts");
+    defer a.free(before);
+    h.closeHandle(handle);
+    opened = false;
+    handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, false, null, null);
+    opened = true;
+    try runUntilIdle(handle);
+    const after = try curation.list(&handle.db, a, "concepts");
+    defer a.free(after);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, after, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 5), parsed.value.object.get("curation_revision").?.integer);
+    const final = try Actions.document(handle, "concept/alpha");
+    defer a.free(final);
+    try std.testing.expect(std.mem.indexOf(u8, final, "merged_into") == null);
+}
+
+test "capi resolver curation public operations expose durable state reviews and entity fanout" {
+    const api = @import("db.zig");
+    var tmp = try api.TestDirectory.init("resolver-curation-public");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    defer api.antfly_db_close(id);
+    try root.db.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_entity_merge_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{\"into\":\"other/b\"}"), &out));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{\"into\":\"concept/b\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"revision\":1") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_unmerge_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"from\":\"concept/a\",\"pin_distinct\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_suppress_resolver_keys_json(id, .fromSlice("concepts"), .fromSlice("{\"add\":{\"keys\":[\"concept/noise\"]}}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_render_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Noise\",\"label\":\"concept\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"suppressed\":true") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_unsuppress_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/noise\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(id, .fromSlice("concepts"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"curation_revision\":4") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_reviews_json(id, .fromSlice("{\"operation\":\"reviews\",\"resolver\":\"concepts\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"reviews\":[]") != null);
+}
+
+test "capi resolver curation suppression replays mention and relation edge contributions" {
+    const api = @import("db.zig");
+    var tmp = try api.TestDirectory.init("resolver-curation-edges");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    // This asset has no model producer; explicitly enable generated asset replay.
+    root.lite_generated_enrichment_replay = true;
+    const id = try api.publishHandle(root);
+    defer api.antfly_db_close(id);
+    const config =
+        \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"},{"name":"uses"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}"}]}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const batch =
+        \\{"inserts":{"source":{"kg":{"entities":[{"id":"a","label":"concept","text":"Alpha"},{"id":"b","label":"concept","text":"Beta"}],"relations":[{"type":"uses","source":"a","target":"b"}]}}}}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(batch), &out));
+    api.antfly_buffer_free(&out);
+    try runUntilIdle(root);
+    const Edges = struct {
+        fn count(db: ?*anyopaque, key: []const u8, edge_type: []const u8, expected: usize) !void {
+            var buffer: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&buffer);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_edges_json(db, .fromSlice("knowledge"), .fromSlice(key), .fromSlice(edge_type), 0, &buffer));
+            const result = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buffer.ptr.?[0..buffer.len], .{});
+            defer result.deinit();
+            try std.testing.expectEqual(expected, result.value.array.items.len);
+        }
+    };
+    try Edges.count(id, "source", "mentions", 2);
+    try Edges.count(id, "concept/alpha", "uses", 1);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_suppress_resolver_keys_json(id, .fromSlice("concepts"), .fromSlice("{\"add\":{\"keys\":[\"concept/alpha\"]}}"), &out));
+    api.antfly_buffer_free(&out);
+    try runUntilIdle(root);
+    try Edges.count(id, "source", "mentions", 1);
+    try Edges.count(id, "concept/alpha", "uses", 0);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_unsuppress_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/alpha\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try runUntilIdle(root);
+    try Edges.count(id, "source", "mentions", 2);
+    try Edges.count(id, "concept/alpha", "uses", 1);
 }

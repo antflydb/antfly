@@ -12081,6 +12081,10 @@ pub const IndexManager = struct {
             try self.requireResolverNotReplacing(next.name);
             if (self.getResolver(next.name)) |previous| {
                 next.merges = previous.merges;
+                if (next.curation_revision == 0) {
+                    next.curation_json = previous.curation_json;
+                    next.curation_revision = previous.curation_revision;
+                }
                 next.merge_generation = previous.merge_generation;
                 next.merge_state_version = previous.merge_state_version;
                 // A declaration cannot erase identity aliases as a side effect
@@ -12734,6 +12738,10 @@ pub const IndexManager = struct {
         var effective = cfg;
         if (effective.merge_generation == 0) {
             effective.merges = existing.merges;
+            if (effective.curation_revision == 0) {
+                effective.curation_json = existing.curation_json;
+                effective.curation_revision = existing.curation_revision;
+            }
             effective.merge_generation = existing.merge_generation;
             effective.merge_state_version = existing.merge_state_version;
         }
@@ -12784,6 +12792,8 @@ pub const IndexManager = struct {
             existing.max_work_bytes != next.max_work_bytes or
             !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
             !std.mem.eql(u8, existing.adjudicate_json, next.adjudicate_json) or
+            !std.mem.eql(u8, existing.suppress_json, next.suppress_json) or
+            !std.mem.eql(u8, existing.curation_json, next.curation_json) or
             !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
             !std.mem.eql(u8, existing.candidate_ann_index, next.candidate_ann_index) or
             existing.candidate_limit != next.candidate_limit or
@@ -12838,10 +12848,12 @@ pub const IndexManager = struct {
         cfg.replacement_index = "";
         cfg.replacement_resolver = "";
         // Namespace management must not reactivate a retired execution contract.
-        if (migrate_namespace and cfg.retired) {
+        if (cfg.retired) {
             for (self.retired_resolvers.items) |*entry| {
                 if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
-                cfg.namespace_generation = try std.math.add(u64, entry.namespace_generation, 1);
+                if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+                if (!migrate_namespace and (!std.mem.eql(u8, cfg.table, entry.table) or !std.mem.eql(u8, cfg.key_template, entry.key_template))) return error.ResolverMergeNamespaceChange;
+                cfg.namespace_generation = if (migrate_namespace) @max(input_cfg.namespace_generation, try std.math.add(u64, entry.namespace_generation, 1)) else entry.namespace_generation;
                 cfg.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
                 try cfg.validate();
                 var previous = entry.*;
@@ -12878,21 +12890,28 @@ pub const IndexManager = struct {
             if (entry.inline_managed == false) cfg.inline_managed = false;
             if (cfg.inline_managed == null) cfg.inline_managed = entry.inline_managed;
             if (cfg.inline_managed == true and cfg.aliases.len == 0 and !migrate_namespace) cfg.aliases = entry.aliases;
-            if (cfg.merge_generation == 0 and !migrate_namespace) {
+            if (cfg.merge_generation == 0 and cfg.curation_revision <= entry.curation_revision and !migrate_namespace) {
                 cfg.merges = entry.merges;
+                if (cfg.curation_revision == 0) {
+                    cfg.curation_json = entry.curation_json;
+                    cfg.curation_revision = entry.curation_revision;
+                }
                 cfg.merge_generation = entry.merge_generation;
                 cfg.merge_state_version = entry.merge_state_version;
             }
+            if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+            if (cfg.curation_revision == entry.curation_revision and !std.mem.eql(u8, cfg.curation_json, entry.curation_json))
+                return error.ResolverCurationConflict;
             cfg.resolution_generation = entry.resolution_generation;
             cfg.namespace_generation = entry.namespace_generation;
-            if (migrate_namespace) cfg.namespace_generation = try std.math.add(u64, entry.namespace_generation, 1);
+            if (migrate_namespace) cfg.namespace_generation = @max(input_cfg.namespace_generation, try std.math.add(u64, entry.namespace_generation, 1));
             try cfg.validate();
             if (!migrate_namespace and entry.namespace_generation > 0 and
                 (!std.mem.eql(u8, entry.table, cfg.table) or
                     !std.mem.eql(u8, entry.key_template, cfg.key_template) or
                     !resolver_catalog.ResolverConfig.aliasesEqual(entry.aliases, cfg.aliases)))
                 return error.ResolverMergeNamespaceChange;
-            if (!migrate_namespace and entry.merges.len > 0 and
+            if (!migrate_namespace and (entry.merges.len > 0 or entry.curation_revision > 0) and
                 (!std.mem.eql(u8, entry.table, cfg.table) or !std.mem.eql(u8, entry.key_template, cfg.key_template)))
                 return error.ResolverMergeNamespaceChange;
             if (entry.eql(cfg)) return .updated_no_backfill;

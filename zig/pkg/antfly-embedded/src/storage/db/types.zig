@@ -3461,12 +3461,16 @@ pub const ReplayStageStats = struct {
 
 pub const ResolverReplayDiagnostic = struct {
     name: []const u8 = "",
+    config_generation: u64 = 0,
+    effective_generation: u64 = 0,
+    curation_revision: u64 = 0,
     table: []const u8 = "",
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",
 };
 
 pub const ResolverReplayDiagnostics = struct {
+    reresolve_pending: bool = false,
     resolver_count: u64 = 0,
     resolution_runtime_present: bool = false,
     resolution_worker_started: bool = false,

@@ -1767,7 +1767,9 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
         std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
-        std.mem.eql(u8, key, resolver_catalog.merge_catalog_key);
+        std.mem.eql(u8, key, resolver_catalog.merge_catalog_key) or
+        std.mem.eql(u8, key, @import("db/promotion_runtime.zig").source_identity_key) or
+        std.mem.startsWith(u8, key, @import("db/resolver_curation.zig").drop_marker_prefix);
 }
 
 /// True only for durable keys that a validated portable import may create.

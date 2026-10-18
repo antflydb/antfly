@@ -239,5 +239,5 @@ pub fn indexesJsonSource(indexes_json: []const u8) []const u8 {
 }
 
 pub fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments") or std.mem.eql(u8, name, "_resolver_curation");
 }

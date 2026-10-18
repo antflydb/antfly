@@ -905,6 +905,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
                 .vector_migration_group_local = vectorMigrationGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
+                .resolver_operation_group_local = resolverOperationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -6079,6 +6080,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
         var response = try lease.owner().graphMetricMaintenanceJson(table_name, body);
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
+    }
+
+    fn resolverOperationGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().resolverOperationJson(table_name, body);
         defer response.deinit();
         return try alloc.dupe(u8, response.bytes());
     }

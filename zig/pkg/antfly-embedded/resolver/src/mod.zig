@@ -38,6 +38,7 @@ const matcher = @import("antfly_matcher");
 /// but threading `DocRef` now keeps cross-table entity graphs from being a
 /// later redesign.
 pub const adjudication = @import("adjudication.zig");
+pub const curation = @import("curation.zig");
 
 pub const DocRef = struct {
     table: []const u8,
@@ -132,6 +133,7 @@ pub const Decision = enum {
     review,
     /// No confident match; a new canonical entity key was minted.
     new,
+    suppressed,
 };
 
 pub const ResolvedEntity = struct {
@@ -150,6 +152,10 @@ pub const ResolvedEntity = struct {
     /// variants do not clobber an existing entity's canonical name.
     surface_form: []const u8 = "",
     adjudication: ?adjudication.Evidence = null,
+    redirected_from: ?[]const u8 = null,
+    rendered_key: []const u8 = "",
+    suppression_reason: ?curation.Reason = null,
+    identity_restored: bool = false,
     /// Transient proposal from the pure scorer; never serialized as evidence.
     review_candidate: ?usize = null,
 };
@@ -214,6 +220,19 @@ pub const Resolution = struct {
                 defer allocator.free(bytes);
                 try out.appendSlice(allocator, bytes);
             }
+            if (e.redirected_from) |key| {
+                try out.appendSlice(allocator, ",\"redirected_from\":");
+                try writeJsonString(allocator, &out, key);
+            }
+            if (e.rendered_key.len > 0) {
+                try out.appendSlice(allocator, ",\"rendered_key\":");
+                try writeJsonString(allocator, &out, e.rendered_key);
+            }
+            if (e.suppression_reason) |reason| {
+                try out.appendSlice(allocator, ",\"suppressed\":true,\"suppression_reason\":");
+                try writeJsonString(allocator, &out, @tagName(reason));
+            }
+            if (e.identity_restored) try out.appendSlice(allocator, ",\"identity_restored\":true");
             try out.append(allocator, '}');
         }
         try out.append(allocator, ']');
@@ -233,7 +252,7 @@ pub const Resolution = struct {
 /// A parsed, reusable resolver config. Owns the entity table name, key template,
 /// and optional scorer.
 /// Explicit redirects between fully rendered keys in the resolver's table.
-pub const KeyAlias = struct { key: []const u8, target: []const u8 };
+pub const KeyAlias = curation.Redirect;
 
 pub fn canonicalAliasKey(aliases: []const KeyAlias, key: []const u8) ![]const u8 {
     var current = key;
@@ -251,11 +270,10 @@ pub fn canonicalAliasKey(aliases: []const KeyAlias, key: []const u8) ![]const u8
 }
 
 pub fn validateAliases(aliases: []const KeyAlias) !void {
-    for (aliases, 0..) |alias, i| {
-        if (alias.key.len == 0 or alias.target.len == 0) return error.InvalidResolverAlias;
-        for (aliases[0..i]) |prior| if (std.mem.eql(u8, prior.key, alias.key)) return error.InvalidResolverAlias;
-        _ = try canonicalAliasKey(aliases, alias.key);
-    }
+    if (aliases.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    _ = try curation.RedirectIndex.init(arena.allocator(), aliases);
 }
 
 pub const Resolver = struct {
@@ -263,6 +281,9 @@ pub const Resolver = struct {
     table: []const u8,
     key_template: []const u8,
     aliases: []const KeyAlias = &.{},
+    curation_index: curation.Index = .{},
+    curation_enabled: bool = false,
+    alias_index: ?curation.RedirectIndex = null,
     /// Mention labels this resolver consumes; empty is a catch-all. Lets
     /// several resolvers partition one extraction artifact by label (e.g.
     /// `event` mentions to an events table, everything else to entities).
@@ -343,11 +364,17 @@ pub const Resolver = struct {
             &.{};
         try validateAliases(aliases);
 
+        const redirects = try curation.RedirectIndex.init(a, aliases);
+        var curation_index = try curation.Index.init(a, if (obj.get("suppress")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else "", if (obj.get("curation")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else "");
+        try curation_index.bindRedirects(a, redirects);
         return .{
             .arena = arena,
             .table = table,
             .key_template = key_template,
             .aliases = aliases,
+            .alias_index = redirects,
+            .curation_enabled = obj.contains("suppress") or obj.contains("curation"),
+            .curation_index = curation_index,
             .labels = labels,
             .exclude_labels = exclude_labels,
             .type_must_match = type_must_match,
@@ -500,10 +527,13 @@ pub const Resolver = struct {
                 },
                 else => return err,
             };
-            if (std.mem.eql(u8, value.doc_ref.table, self.table)) {
-                const canonical = try canonicalAliasKey(self.aliases, value.doc_ref.key);
+            if (value.decision != .suppressed and std.mem.eql(u8, value.doc_ref.table, self.table)) {
+                const before = value.doc_ref.key;
+                const canonical = try self.canonicalKey(value.doc_ref.key);
                 value.doc_ref.key = try a.dupe(u8, canonical);
+                if (!std.mem.eql(u8, before, canonical)) value.redirected_from = before;
             }
+            if (value.decision != .suppressed and self.curation_enabled) value.rendered_key = try renderKey(a, self.key_template, entity);
             try resolved.append(a, value);
         }
 
@@ -519,16 +549,32 @@ pub const Resolver = struct {
     ) !ResolvedEntity {
         const local_id = try a.dupe(u8, entity.local_id);
 
+        if (try self.curation_index.textReason(a, entity.text)) |reason|
+            return self.suppressedEntity(a, entity, "", reason);
+
         // An exact minted-key redirect is an explicit administrator alias,
         // independent of probabilistic scoring. Never infer this from a fuzzy
         // candidate, or link a dangling redirect to an unavailable survivor.
         const minted_key = try renderKey(a, self.key_template, entity);
-        const canonical_key = try canonicalAliasKey(self.aliases, minted_key);
+        if (self.curation_index.keySuppressed(minted_key)) return self.suppressedEntity(a, entity, minted_key, .key);
+        const canonical_key = try self.canonicalKey(minted_key);
+        if (std.mem.eql(u8, minted_key, canonical_key) and self.curation_index.removed_aliases.contains(minted_key)) return .{
+            .local_id = local_id,
+            .doc_ref = .{ .table = try a.dupe(u8, self.table), .key = minted_key },
+            .confidence = 1,
+            .decision = .new,
+            .label = try a.dupe(u8, entity.label),
+            .canonical_name = try a.dupe(u8, entity.text),
+            .surface_form = try a.dupe(u8, entity.text),
+            .identity_restored = true,
+        };
         if (!std.mem.eql(u8, minted_key, canonical_key)) return .{
             .local_id = local_id,
             .doc_ref = .{ .table = try a.dupe(u8, self.table), .key = try a.dupe(u8, canonical_key) },
             .confidence = 1,
             .decision = .match,
+            .redirected_from = try a.dupe(u8, minted_key),
+            .identity_restored = self.curation_index.removed_aliases.contains(canonical_key),
             .label = try a.dupe(u8, entity.label),
             .canonical_name = try a.dupe(u8, entity.text),
             .surface_form = try a.dupe(u8, entity.text),
@@ -537,8 +583,10 @@ pub const Resolver = struct {
             if (!std.mem.eql(u8, candidate.doc_ref.table, self.table) or
                 !std.mem.eql(u8, candidate.doc_ref.key, minted_key)) continue;
             if (self.type_must_match and !std.mem.eql(u8, candidate.label, entity.label)) continue;
+            if (self.curation_index.removed_aliases.contains(minted_key)) continue;
             if (recordTextField(candidate.record, "merged_into") == null) continue;
             const survivor = candidate.resolved_doc_ref orelse continue;
+            if (self.curation_index.keySuppressed(survivor.key) or try self.curation_index.pinnedDistinct(a, minted_key, survivor.key)) continue;
             const record = candidate.resolved_record orelse continue;
             return .{
                 .local_id = local_id,
@@ -560,6 +608,9 @@ pub const Resolver = struct {
                 var best_outcome: matcher.Outcome = .no_match;
                 for (candidates, 0..) |cand, ci| {
                     if (self.type_must_match and !std.mem.eql(u8, cand.label, entity.label)) continue;
+                    const target = cand.resolved_doc_ref orelse cand.doc_ref;
+                    if (self.curation_index.keySuppressed(cand.doc_ref.key) or self.curation_index.keySuppressed(target.key) or
+                        try self.curation_index.pinnedDistinct(a, minted_key, target.key)) continue;
                     const r = if (cand.features) |features| scorer.scoreFeatures(features) else scorer.score(scratch, mention, cand.record);
                     if (r.probability > best_prob or (r.probability == best_prob and best != null and candidateBefore(cand, candidates[best.?]))) {
                         best_prob = r.probability;
@@ -624,6 +675,31 @@ pub const Resolver = struct {
             .label = try a.dupe(u8, entity.label),
             .canonical_name = try a.dupe(u8, entity.text),
             .surface_form = try a.dupe(u8, entity.text),
+        };
+    }
+
+    pub fn installAliases(self: *Resolver, aliases: []const KeyAlias) !void {
+        self.aliases = aliases;
+        self.alias_index = try curation.RedirectIndex.init(self.arena.allocator(), aliases);
+    }
+
+    fn canonicalKey(self: *const Resolver, key: []const u8) ![]const u8 {
+        if (self.alias_index) |index| if (index.source.ptr == self.aliases.ptr and index.source.len == self.aliases.len)
+            return index.canonical(key);
+        return canonicalAliasKey(self.aliases, key);
+    }
+
+    fn suppressedEntity(self: *const Resolver, a: std.mem.Allocator, entity: ExtractedEntity, key: []const u8, reason: curation.Reason) !ResolvedEntity {
+        return .{
+            .local_id = try a.dupe(u8, entity.local_id),
+            .doc_ref = .{ .table = try a.dupe(u8, self.table), .key = try a.dupe(u8, key) },
+            .confidence = 1,
+            .decision = .suppressed,
+            .label = try a.dupe(u8, entity.label),
+            .canonical_name = try a.dupe(u8, entity.text),
+            .surface_form = try a.dupe(u8, entity.text),
+            .rendered_key = try a.dupe(u8, key),
+            .suppression_reason = reason,
         };
     }
 
@@ -919,6 +995,7 @@ fn decisionFromTag(tag: []const u8) ?Decision {
     if (std.mem.eql(u8, tag, "match")) return .match;
     if (std.mem.eql(u8, tag, "review")) return .review;
     if (std.mem.eql(u8, tag, "new")) return .new;
+    if (std.mem.eql(u8, tag, "suppressed")) return .suppressed;
     return null;
 }
 
@@ -974,6 +1051,10 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
             .label = if (o.get("label")) |v| try a.dupe(u8, jsonString(v) orelse "") else "",
             .canonical_name = canonical_name,
             .surface_form = surface_form,
+            .redirected_from = if (o.get("redirected_from")) |v| try a.dupe(u8, jsonString(v) orelse return error.InvalidResolution) else null,
+            .rendered_key = if (o.get("rendered_key")) |v| try a.dupe(u8, jsonString(v) orelse return error.InvalidResolution) else "",
+            .suppression_reason = if (o.get("suppression_reason")) |v| std.meta.stringToEnum(curation.Reason, jsonString(v) orelse return error.InvalidResolution) orelse return error.InvalidResolution else null,
+            .identity_restored = if (o.get("identity_restored")) |v| v == .bool and v.bool else false,
             .adjudication = if (o.get("adjudication")) |value| try std.json.parseFromSliceLeaky(adjudication.Evidence, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{ .allocate = .alloc_always }) else null,
         };
     }
@@ -1880,6 +1961,12 @@ pub const ResolutionStage = struct {
         const alias_mask = try parsed.arena.allocator().alloc(bool, admitted_count);
         var kept: usize = 0;
         for (parsed.entities) |entity| {
+            if (try self.resolver.curation_index.textReason(parsed.arena.allocator(), entity.text) != null) {
+                alias_mask[kept] = true;
+                parsed.entities[kept] = entity;
+                kept += 1;
+                continue;
+            }
             const key = self.resolver.renderKeyAlloc(parsed.arena.allocator(), entity) catch |err| switch (err) {
                 error.EmptyEntityKey => {
                     std.log.warn("resolver skipped mention {s}: key template produced an empty slug", .{entity.local_id});
@@ -1887,8 +1974,8 @@ pub const ResolutionStage = struct {
                 },
                 else => return err,
             };
-            const canonical = try canonicalAliasKey(self.resolver.aliases, key);
-            alias_mask[kept] = !std.mem.eql(u8, key, canonical);
+            const canonical = try self.resolver.canonicalKey(key);
+            alias_mask[kept] = !std.mem.eql(u8, key, canonical) or self.resolver.curation_index.keySuppressed(key) or self.resolver.curation_index.removed_aliases.contains(key);
             parsed.entities[kept] = entity;
             kept += 1;
         }
@@ -2060,8 +2147,19 @@ pub const ResolutionStage = struct {
         if (self.overrides) |ov| {
             const ents = @constCast(resolution.entities);
             for (ents) |*e| {
+                if (e.decision == .suppressed or e.identity_restored) continue;
                 const o = ov.overrideFor(e.local_id) orelse continue;
+                if (self.resolver.curation_index.keySuppressed(o.key)) {
+                    e.decision = .suppressed;
+                    e.suppression_reason = .key;
+                    continue;
+                }
+                if (try self.resolver.curation_index.pinnedDistinct(result_arena, e.rendered_key, o.key)) continue;
                 e.decision = o.decision;
+                if (o.decision == .suppressed) {
+                    e.suppression_reason = .curator;
+                    if (e.rendered_key.len == 0) e.rendered_key = try self.resolver.renderKeyAlloc(result_arena, .{ .text = e.surface_form, .label = e.label, .local_id = e.local_id });
+                }
                 e.doc_ref = .{
                     .table = try result_arena.dupe(u8, o.table),
                     .key = try result_arena.dupe(u8, o.key),
@@ -2071,6 +2169,7 @@ pub const ResolutionStage = struct {
 
         if (self.doc_ref_binding) |binding| {
             for (@constCast(resolution.entities)) |*entity| {
+                if (entity.decision == .suppressed) continue;
                 if (entity.doc_ref.storage_table != null) continue;
                 if (try binding.bind(binding.ptr, entity.doc_ref.table)) |physical| {
                     entity.doc_ref.storage_table = try resolution.arena.allocator().dupe(u8, physical);
@@ -3505,4 +3604,46 @@ test "incremental resolution reuses stages and invalidates changed dependencies"
     try memory.store().delete("ext");
     try testing.expectEqual(RunResult.cleared, try stage.run(a, memory.store(), provider, "ext", "res"));
     try testing.expect((try memory.store().get(a, "res")) == null);
+}
+
+test "resolver curation suppresses and restores mentions before candidate IO" {
+    var policy = try Resolver.parse(testing.allocator,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","suppress":{"texts":["Note"],"keys":["concept/content"],"min_text_chars":3},"curation":{"version":1,"removed_aliases":["concept/restored"]}}
+    );
+    defer policy.deinit();
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("source",
+        \\{"entities":[{"id":"a","label":"concept","text":"Note"},{"id":"b","label":"concept","text":"Content"},{"id":"c","label":"concept","text":"x"},{"id":"d","label":"concept","text":"Restored"}]}
+    );
+    const NoIO = struct {
+        fn candidates(_: *anyopaque, _: std.mem.Allocator, _: ExtractedEntity, _: *std.ArrayListUnmanaged(Candidate)) !void {
+            return error.UnexpectedCandidateIO;
+        }
+    };
+    var context: u8 = 0;
+    const stage = ResolutionStage{ .resolver = &policy, .config_generation = 1 };
+    try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), .{ .ptr = &context, .vtable = &.{ .candidates_for = NoIO.candidates } }, "source", "resolution"));
+    const bytes = (try map.store().get(testing.allocator, "resolution")).?;
+    defer testing.allocator.free(bytes);
+    var result = try parseResolution(testing.allocator, bytes);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 4), result.entities.len);
+    for (result.entities[0..3]) |entity| try testing.expectEqual(Decision.suppressed, entity.decision);
+    try testing.expectEqual(Decision.new, result.entities[3].decision);
+    try testing.expect(result.entities[3].identity_restored);
+}
+
+test "resolver unmerge restores an intermediate redirect survivor" {
+    var policy = try Resolver.parse(testing.allocator,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","aliases":[{"key":"concept/alpha","target":"concept/beta"}],"curation":{"version":1,"removed_aliases":["concept/beta"]}}
+    );
+    defer policy.deinit();
+    const entity = ExtractedEntity{ .local_id = "a", .label = "concept", .text = "Alpha" };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try policy.resolveOne(arena.allocator(), arena.allocator(), entity, &.{});
+    try testing.expectEqualStrings("concept/beta", result.doc_ref.key);
+    try testing.expectEqualStrings("concept/alpha", result.redirected_from.?);
+    try testing.expect(result.identity_restored);
 }
