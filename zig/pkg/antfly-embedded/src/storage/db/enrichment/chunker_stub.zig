@@ -79,6 +79,10 @@ pub fn chunkTextWithConfigJson(
 ) ![]Chunk {
     var cfg = try chunking_types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
+    if (cfg.embedding != null) {
+        if (cfg.provider != .antfly) return error.InvalidChunkerConfig;
+        return error.UnsupportedPlatform;
+    }
 
     var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "configured enrichment chunker");
     defer sanitized.deinit(alloc);
@@ -115,18 +119,23 @@ pub fn chunkTextWithConfigJsonAndProvider(
     return try chunkTextWithConfigJson(alloc, text, config_json);
 }
 
-pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
-    for (chunks) |*chunk| chunk.deinit(alloc);
-    alloc.free(chunks);
-}
-
-/// Model-aware chunking belongs to the inference owner. Keep the control-side
-/// interface available without importing its physical implementation.
-pub fn chunkInputWithConfigJsonAndProvider(alloc: Allocator, _: anytype, config_json: []const u8, _: anytype) ![]Chunk {
+/// The minimal owner has no model/media executor. Preserve production config
+/// validation, then decline without flattening media or fabricating embeddings.
+pub fn chunkInputWithConfigJsonAndProvider(
+    alloc: Allocator,
+    _: anytype,
+    config_json: []const u8,
+    _: anytype,
+) ![]Chunk {
     var cfg = try chunking_types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
     if (cfg.embedding == null or cfg.provider != .antfly) return error.InvalidChunkerConfig;
     return error.UnsupportedPlatform;
+}
+
+pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
+    for (chunks) |*chunk| chunk.deinit(alloc);
+    alloc.free(chunks);
 }
 
 fn remapChunkOffsets(sanitized: *const utf8_text.SanitizedText, chunks: []Chunk) void {
@@ -232,6 +241,26 @@ test "chunker stub rejects antfly configured chunking" {
             \\{"provider":"antfly","model":"fixed"}
         ),
     );
+}
+
+test "enrichment chunker stub rejects model-aware inputs without flattening media" {
+    const alloc = std.testing.allocator;
+    const config = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"fixed\"}}";
+    try std.testing.expectError(error.UnsupportedPlatform, chunkInputWithConfigJsonAndProvider(alloc, .{ .video = "opaque bytes" }, config, null));
+    try std.testing.expectError(error.UnsupportedPlatform, chunkTextWithConfigJson(alloc, "abcdefghij", config));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(alloc, .{ .text = "abcdefghij" }, "{\"provider\":\"antfly\"}", null));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(alloc, .{ .text = "abcdefghij" }, "{\"provider\":\"mock\",\"embedding\":{\"model\":\"fixed\"}}", null));
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const chunks = chunkInputWithConfigJsonAndProvider(a, .{ .text = "abcdefghij" }, config, null) catch |err| {
+                if (err == error.UnsupportedPlatform) return;
+                return err;
+            };
+            defer freeChunks(a, chunks);
+            return error.ExpectedUnsupportedPlatform;
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Fixture.run, .{});
 }
 
 test "chunker stub model-aware input retains validation without byte chunk fallback" {

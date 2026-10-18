@@ -37,6 +37,7 @@ pub const Replay = struct {
     readers: usize = 0,
     finished: bool = false,
     failed: bool = false,
+    weighted: bool = false,
 
     pub fn create(a: A, width: usize, memory_bytes: usize, manager: ?*spill.Manager) !*Replay {
         if (width > 1024) return error.SqlProgramLimitExceeded;
@@ -91,6 +92,7 @@ pub const Replay = struct {
             try self.startSpill();
         };
         if (self.disk) |*run| _ = try run.append(.{ .values = values, .keys = &.{}, .ordinal = weight }, spill.none);
+        self.weighted = self.weighted or weight != 1;
         self.count += 1;
     }
 
@@ -122,7 +124,7 @@ pub const Replay = struct {
             if (self.remaining != 0) return error.InvalidSqlBackendResponse;
             if (self.index == self.owner.count) return null;
             const result: Weighted = if (self.disk) |*run| blk: {
-                const record = (try run.readBorrowed(self.index)).row;
+                const record = (try run.readCurrent(self.index)).row;
                 break :blk .{ .values = record.values, .weight = record.ordinal };
             } else .{ .values = self.owner.rows.items[self.index], .weight = self.owner.weights.items[self.index] };
             if (result.weight == 0 or result.values.len != self.owner.width) return error.InvalidSqlBackendResponse;
@@ -131,7 +133,7 @@ pub const Replay = struct {
         }
 
         /// A borrowed row survives other readers, but not this reader's next
-        /// block load or close. Retaining operators copy at their boundary.
+        /// read or close. Retaining operators copy at their boundary.
         pub fn next(self: *Reader) !?[]const Datum {
             if (self.remaining == 0) {
                 const bag = try self.nextWeighted() orelse return null;
@@ -140,6 +142,40 @@ pub const Replay = struct {
             }
             self.remaining -= 1;
             return self.current;
+        }
+
+        /// Borrow native columns until this reader loads its next block.
+        pub fn nextBatch(self: *Reader, a: A, maximum: usize) !@import("execution_batch.zig").Batch {
+            if (maximum == 0) return error.InvalidSqlLimit;
+            if (self.owner.weighted) {
+                // Plain batch consumers observe logical rows. Clone once per
+                // physical bag before another read can replace its block, then
+                // share that owned row within the bounded expanded prefix.
+                var rows: std.ArrayList([]const Datum) = .empty;
+                while (rows.items.len < maximum) {
+                    if (self.remaining == 0) {
+                        const bag = try self.nextWeighted() orelse break;
+                        self.current = bag.values;
+                        self.remaining = bag.weight;
+                    }
+                    const row = try a.alloc(Datum, self.current.len);
+                    for (self.current, row) |value, *out| out.* = try operators.cloneDatum(a, value);
+                    const count: usize = @intCast(@min(self.remaining, maximum - rows.items.len));
+                    try rows.appendNTimes(a, row, count);
+                    self.remaining -= count;
+                }
+                return .{ .rows = rows.items };
+            }
+            if (self.index == self.owner.count) return .{ .rows = &.{} };
+            if (self.disk) |*run| {
+                const batch = try run.readBatchCurrent(a, self.index, maximum);
+                self.index = @intCast(batch.following);
+                return batch.values;
+            }
+            const count = @min(maximum, self.owner.count - self.index);
+            const rows = self.owner.rows.items[self.index..][0..count];
+            self.index += count;
+            return .{ .rows = rows };
         }
 
         pub fn rewind(self: *Reader) void {
@@ -254,7 +290,7 @@ test "SQL replay readers own JSON allocators and fail closed on quota cancellati
         const row = (try reader.next()).?;
         const json = row[0].value.array;
         try std.testing.expectEqualStrings("owned", json.items[0].string);
-        const arena = if (reader.disk) |*run| &run.read_arena else &replay.arena;
+        const arena = if (reader.disk) |run| &run.compact.?.arena else &replay.arena;
         try std.testing.expectEqual(@intFromPtr(arena), @intFromPtr(json.allocator.ptr));
     }
     {
@@ -322,5 +358,16 @@ test "SQL weighted replay preserves exact bags across spill and independent expa
         try std.testing.expect((try compact.nextWeighted()) == null);
         expanded.rewind();
         try std.testing.expectEqual(@as(i64, 7), (try expanded.next()).?[0].value.integer);
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const batch = try expanded.nextBatch(page.allocator(), 3);
+        try std.testing.expectEqual(@as(usize, 3), batch.len());
+        try std.testing.expectEqual(@as(i64, 7), (try batch.cell(page.allocator(), 0, 0)).value.integer);
+        try std.testing.expectEqual(@as(i64, 7), (try batch.cell(page.allocator(), 1, 0)).value.integer);
+        try std.testing.expect((try batch.cell(page.allocator(), 2, 0)).sql_null);
+        const more = try expanded.nextBatch(page.allocator(), 2);
+        try std.testing.expectEqual(@as(usize, 2), more.len());
+        try std.testing.expect((try more.cell(page.allocator(), 1, 0)).sql_null);
+        try std.testing.expectEqual(@as(i64, 7), (try batch.cell(page.allocator(), 0, 0)).value.integer);
     }
 }
