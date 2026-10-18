@@ -34,6 +34,9 @@ if [ "$zig_version" != "$zig_required" ]; then
   exit 2
 fi
 
+# Release artifacts and Go bindings must expose the same public ABI header.
+python3 scripts/packaging/sync_cabi_header.py --check
+
 bash scripts/test_install_download_markers.sh
 python3 scripts/test_quickstart_docs.py
 python3 -m unittest discover -s scripts/packaging -p 'test_*.py'

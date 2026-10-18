@@ -16,6 +16,9 @@
 #ifndef ANTFLY_H
 #define ANTFLY_H
 
+/* ABI implemented by this header; compare with antfly_abi_version() at runtime. */
+#define ANTFLY_ABI_VERSION 3
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
