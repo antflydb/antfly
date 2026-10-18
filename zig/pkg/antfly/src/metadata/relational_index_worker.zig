@@ -67,6 +67,16 @@ const Owner = struct {
         self.* = undefined;
     }
 
+    fn acceptRecovery(self: *Owner, response: execution.ControlResponse, request: execution.Request, identity: progress.Owner, now_ns: u64) !bool {
+        if (response != .raft_recovery) return false;
+        if (try response.recoveryAck(request)) |ack| {
+            if (!std.meta.eql(ack.signed.receipt.owner, identity)) return error.InvalidIndexOwnerReceipt;
+            self.ack = ack;
+            self.stage = .acknowledge;
+        } else self.retry_at_ns = now_ns +| retry_ns;
+        return true;
+    }
+
     /// Only a validated, durable pre-publication failure may request this CAS.
     /// Transient transport/storage errors and post-decision audits must not
     /// turn into cancellation or weaken the irreversible installation barrier.
@@ -329,6 +339,7 @@ const Job = struct {
                 };
                 defer response.deinit();
                 try response.value.validate(request);
+                if (try owner.acceptRecovery(response.value, request, identity, now_ns)) return;
                 const ack = switch (response.value) {
                     .acknowledged => {
                         self.retireOwner(index);
@@ -387,6 +398,7 @@ const Job = struct {
                     var response = result;
                     defer response.deinit();
                     try response.value.validate(request);
+                    if (try owner.acceptRecovery(response.value, request, identity, now_ns)) return;
                     if (response.value == .acknowledged) {
                         self.retireOwner(index);
                         return;
@@ -426,7 +438,16 @@ const Job = struct {
             },
             .deliver => {
                 const prior = owner.stream.?.phase;
-                const result = try owner.stream.?.step(transport, host);
+                const result = owner.stream.?.step(transport, host) catch |err| switch (@as(anyerror, err)) {
+                    error.IndexOwnerReceiptChanged, error.PrivateIndexRootRecoveryRequired => {
+                        owner.stream.?.deinit();
+                        owner.stream = null;
+                        owner.stage = .build;
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    else => return err,
+                };
                 if (result == .pending) {
                     if (owner.stream.?.phase == prior) owner.retry_at_ns = now_ns +| retry_ns;
                 } else self.retireOwner(index);
@@ -447,6 +468,7 @@ const Job = struct {
                 };
                 defer response.deinit();
                 try response.value.validate(request);
+                if (try owner.acceptRecovery(response.value, request, identity, now_ns)) return;
                 if (response.value == .acknowledged) {
                     self.retireOwner(index);
                     return;
@@ -471,6 +493,7 @@ const Job = struct {
                 };
                 defer response.deinit();
                 try response.value.validate(request);
+                if (try owner.acceptRecovery(response.value, request, identity, now_ns)) return;
                 if (response.value == .acknowledged) {
                     self.retireOwner(index);
                     return;
@@ -495,6 +518,7 @@ const Job = struct {
                 };
                 defer response.deinit();
                 try response.value.validate(request);
+                if (try owner.acceptRecovery(response.value, request, identity, now_ns)) return;
                 if (response.value == .acknowledged) {
                     self.retireOwner(index);
                     return;
@@ -532,6 +556,7 @@ const Job = struct {
                 };
                 defer response.deinit();
                 try response.value.validate(request);
+                if (try owner.acceptRecovery(response.value, request, identity, now_ns)) return;
                 if (response.value == .acknowledged) {
                     self.retireOwner(index);
                     return;

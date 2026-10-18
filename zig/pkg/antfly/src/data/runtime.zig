@@ -11813,6 +11813,29 @@ pub const DataServer = struct {
         lookup.raft_reporter = .{ .node_id = registration.node_id, .store_id = registration.store_id };
         var permission = try execution.raftDecision(alloc, &self.status_source, lookup, context);
         defer permission.deinit();
+        if (permission.value.raft_recovery) |grant| {
+            if (!std.mem.eql(u8, grant.table_name, table_name)) return error.GenerationPublicationChanged;
+            const owners = try self.ensureKernelOwnerSource();
+            var session = try owners.acquireRaftIndexOwnerSession(group_id, table_name, grant.identity(), context);
+            defer session.deinit();
+            var observed = try session.cancelStep(alloc, .{ .cancel = grant.intent }, false);
+            defer observed.deinit();
+            var response: execution.RaftRecoveryControlResponse = .{ .root_generation = session.rootGeneration(), .accepted = grant.accepted, .state = observed.value.progress.cancel };
+            try response.validate(request);
+            const scope = try self.raftIndexLocalScopeAtRoot(group_id, grant.identity(), session.rootGeneration(), context);
+            const runtime = try self.ensureBackendRuntime();
+            const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+            const root = @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir) catch {
+                response.signing_failure = .identity_unavailable;
+                return .{ .raft_recovery = response };
+            };
+            response.signed_ack = grant.sign(permission.value.head.revision, response.state, scope, root) catch |err| failure: {
+                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+                break :failure null;
+            };
+            try response.validate(request);
+            return .{ .raft_recovery = response };
+        }
         if (permission.value.disposition == .acknowledged) return .acknowledged;
         const identity = try permission.value.raftExecutionIdentity(lookup);
         const dispatch = permission.value.dispatch orelse return error.InvalidGenerationPublication;

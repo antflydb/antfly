@@ -190,6 +190,7 @@ pub const Producer = struct {
                 var response = try transport.control(self.alloc, self.table_name, self.request, self.context);
                 defer response.deinit();
                 try response.value.validate(self.request);
+                if (response.value == .raft_recovery) return error.PrivateIndexRootRecoveryRequired;
                 if (response.value == .acknowledged) {
                     self.result = .idle;
                     self.phase = .done;

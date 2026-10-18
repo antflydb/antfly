@@ -174,10 +174,15 @@ Untouched owners reuse raw-manifest admission rather than copying a schema-sized
 command back through the compiled-owner interface. GC can pin an absent public
 index snapshot, so retiring the first private index or last public index does
 not stall; commit still checks absence, namespace generation and durable owner.
-This is not complete public activation: the worker's Raft cohort guard and
-root-adoption recovery
-remain unfinished, and public CREATE remains guarded. No original case is
-closed by these component changes.
+Read-only Raft control-stage recovery now compares the current leased owner's
+retained fenced/reserved cut with the exact accepted receipt and refreshes only
+its root proof. Recovery decisions carry no schema inputs or proposal permission;
+the worker re-enters recovery after a source stream encounters a replacement
+root and then resumes from its durable journal. The focused Debug gate passes
+72 metadata, four receiver and one decoder-floor tests, with zero failures or
+leaks. Later validation, installation and terminal root-adoption paths still
+need qualification. The worker's Raft cohort guard remains, public CREATE stays
+guarded, and no original SQL case is closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's
 first entry or an owner that has not visited the job. Ordinary work stays closed;
 explicit cancellation controls drain and burn the exact generation. Cleanup
