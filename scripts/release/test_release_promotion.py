@@ -616,9 +616,7 @@ class ReleasePromotionTests(unittest.TestCase):
             discovery.discover_npm_tag(
                 "@antfly/cli",
                 "next",
-                lambda *_args, **_kwargs: response(
-                    {"dist-tags": {"next": "1.3.0-rc.2"}}
-                ),
+                lambda *_args, **_kwargs: response({"next": "1.3.0-rc.2"}),
             ),
             "v1.3.0-rc.2",
         )
