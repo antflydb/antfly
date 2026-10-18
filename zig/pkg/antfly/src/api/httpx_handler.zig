@@ -6697,7 +6697,7 @@ pub const AntflyApiHandler = struct {
                 const resource = try system_catalog_routes.resourceNameAlloc(ctx.allocator, destination);
                 defer ctx.allocator.free(resource);
                 const kind: usermgr.ResourceType = switch (target.kind) {
-                    .query_source => .table,
+                    .query_source, .view => .table,
                     .database => .database,
                     .namespace => .namespace,
                     .table => .table,

@@ -27392,7 +27392,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (try system_catalog_routes.parseAlloc(arena.allocator(), path)) |route| {
         if (route.kind == .table and route.name == null and method == .GET) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
-            .query_source => .table,
+            .query_source, .view => .table,
             .database => .database,
             .namespace => .namespace,
             .table => .table,

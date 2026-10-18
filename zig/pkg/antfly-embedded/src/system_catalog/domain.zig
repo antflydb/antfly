@@ -24,7 +24,7 @@ pub const default_database_id: u64 = 1;
 pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
-pub const Kind = enum { database, namespace, tablespace, table, query_source };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, view };
 
 /// Request-owned query preparation data, excluding topology and unrelated
 /// tables. Read schema and index generations are captured together.
@@ -304,6 +304,10 @@ pub const StateIndex = struct {
         try self.names.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         try self.ids.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         for (state.resources) |r| {
+            if (r.kind == .table or r.kind == .view) {
+                const other: Kind = if (r.kind == .table) .view else .table;
+                if (self.names.contains(.{ .kind = other, .parent = r.parent_id, .name = r.name })) return error.InvalidCatalogRecord;
+            }
             const name = try self.names.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
             if (name.found_existing) return error.InvalidCatalogRecord;
             name.value_ptr.* = r;
@@ -654,6 +658,9 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
 /// Physical table deletion is admitted only alongside an atomic topology
 /// mutation. Its identity is resolved by the authority, never the caller.
 pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
+    // View definitions require attribute/dependency admission. Generic resource
+    // mutation must never publish an opaque caller-provided view payload.
+    if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     try validateResourceName(request.kind, request.name);
     try validateName(request.database);
     try validateName(request.namespace);
@@ -672,7 +679,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     const parent_id: u64 = switch (request.kind) {
         .database, .tablespace, .query_source => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
-        .table => (try reader.namespaceFor(request.database, request.namespace)).id,
+        .table, .view => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
@@ -688,6 +695,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     switch (request.action) {
         .create => {
             if (found != null) return error.CatalogAlreadyExists;
+            if (request.kind == .table and try reader.lookup(.view, parent_id, request.name) != null) return error.CatalogAlreadyExists;
             if (request.new_name != null) return error.InvalidCatalogMutation;
             const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
@@ -720,6 +728,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 if ((existing.kind == .database and existing.id == default_database_id) or (existing.kind == .namespace and existing.id == default_namespace_id)) return error.ProtectedCatalogResource;
                 if (request.action == .rename) {
                     const name = request.new_name orelse return error.InvalidCatalogMutation;
+                    if (existing.kind == .table and try reader.lookup(.view, parent_id, name) != null) return error.CatalogAlreadyExists;
                     if (try reader.lookup(existing.kind, parent_id, name)) |other| if (other.id != existing.id) return error.CatalogAlreadyExists;
                     if (existing.kind == .table and parent_id == default_namespace_id) if (try reader.physicalByName(name)) |table| {
                         if (try reader.byId(.table, table.id) == null) return error.CatalogAlreadyExists;
@@ -733,12 +742,17 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                             const namespaces = try reader.children(.namespace, existing.id, 0);
                             for (namespaces) |namespace| {
                                 if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                                if ((try reader.children(.view, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 try removes.append(alloc, namespace);
                             }
                         },
-                        .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
+                        .namespace => {
+                            if ((try reader.children(.table, existing.id, 1)).len != 0 or
+                                (try reader.children(.view, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
+                        },
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source => {},
+                        .view => unreachable,
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -824,6 +838,29 @@ pub fn validateName(name: []const u8) !void {
     // Dots delimit catalog components; ':' is reserved for physical resources.
     if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return error.InvalidCatalogName;
     for (name[1..]) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return error.InvalidCatalogName;
+}
+
+test "SQL view catalog namespace ownership blocks generic view writes and conflicting table names" {
+    const a = std.testing.allocator;
+    // Ownership-only fixtures; opaque view definitions are admitted separately.
+    const rows = [_]Resource{
+        .{ .kind = .view, .id = 3, .parent_id = default_namespace_id, .name = "stored" },
+        .{ .kind = .table, .id = 7, .parent_id = default_namespace_id, .name = "rows", .storage_name = "table:7" },
+    };
+    const state: State = .{ .resources = &rows, .next_id = 8 };
+    try std.testing.expectError(error.CatalogViewAdmissionRequired, plan(a, state, .{ .action = .create, .kind = .view, .name = "new" }, &.{}));
+    try std.testing.expectError(error.CatalogAlreadyExists, plan(a, state, .{ .action = .create, .kind = .table, .name = "stored", .table_id = 8, .storage_name = "table:8" }, &.{}));
+    try std.testing.expectError(error.CatalogAlreadyExists, plan(a, state, .{ .action = .rename, .kind = .table, .name = "rows", .new_name = "stored" }, &.{}));
+    const scoped = [_]Resource{
+        .{ .kind = .database, .id = 5, .name = "warehouse" },
+        .{ .kind = .namespace, .id = 4, .parent_id = 5, .name = "app" },
+        .{ .kind = .view, .id = 3, .parent_id = 4, .name = "stored" },
+    };
+    try std.testing.expectError(error.NamespaceNotEmpty, plan(a, .{ .resources = &scoped, .next_id = 8 }, .{ .action = .drop, .kind = .namespace, .name = "app", .database = "warehouse" }, &.{}));
+    try std.testing.expectError(error.DatabaseNotEmpty, plan(a, .{ .resources = &scoped, .next_id = 8 }, .{ .action = .drop, .kind = .database, .name = "warehouse" }, &.{}));
+    var conflicting = rows;
+    conflicting[1].name = "stored";
+    try std.testing.expectError(error.InvalidCatalogRecord, StateIndex.init(a, .{ .resources = &conflicting }));
 }
 
 test "catalog rename preserves IDs and tablespace binding inheritance" {
@@ -1127,7 +1164,7 @@ pub const Read = struct {
 /// Selected resources plus the related records needed to render their labels.
 /// Values borrow the index; the caller owns only the returned slice.
 pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: Read) ![]Resource {
-    if (request.kind == .table) return error.InvalidCatalogMutation;
+    if (request.kind == .table or request.kind == .view) return error.InvalidCatalogMutation;
     const parent = if (request.kind == .namespace) (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id else 0;
     var out: std.ArrayListUnmanaged(Resource) = .empty;
     errdefer out.deinit(alloc);
@@ -1386,7 +1423,7 @@ pub fn validateTableName(name: []const u8) !void {
 }
 
 pub fn validateResourceName(kind: Kind, name: []const u8) !void {
-    if (kind == .table) return validateTableName(name);
+    if (kind == .table or kind == .view) return validateTableName(name);
     return validateName(name);
 }
 

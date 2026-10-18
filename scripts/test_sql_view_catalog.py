@@ -34,6 +34,49 @@ def attributes(db, relation):
 
 
 class ViewCatalogTest(unittest.TestCase):
+    def test_replacement_retains_owner_and_output_ids_but_resets_omitted_options(self):
+        with postgres() as db:
+            db.execute("CREATE ROLE view_owner")
+            db.execute("CREATE SCHEMA app")
+            db.execute("CREATE TABLE app.rows(id BIGINT)")
+            db.execute("GRANT USAGE,CREATE ON SCHEMA app TO view_owner")
+            db.execute("SET ROLE view_owner")
+            db.execute(
+                "CREATE VIEW app.stored WITH "
+                "(security_invoker=true,security_barrier=true) AS "
+                "SELECT id,id AS other FROM app.rows"
+            )
+            original = attributes(db, "app.stored")
+            owner = db.execute(
+                "SELECT relowner FROM pg_class WHERE oid='app.stored'::regclass"
+            ).fetchone()
+            db.execute("RESET ROLE")
+            for query in (
+                "SELECT id AS renamed,id AS other FROM app.rows",
+                "SELECT id::TEXT AS id,id AS other FROM app.rows",
+                "SELECT id FROM app.rows",
+            ):
+                with self.assertRaises(psycopg.Error) as invalid:
+                    db.execute("CREATE OR REPLACE VIEW app.stored AS " + query)
+                self.assertEqual("42P16", invalid.exception.sqlstate)
+            db.execute(
+                "CREATE OR REPLACE VIEW app.stored AS "
+                "SELECT id,id AS other,'note'::TEXT AS note FROM app.rows"
+            )
+            self.assertEqual(original, attributes(db, "app.stored")[:2])
+            self.assertEqual(
+                owner,
+                db.execute(
+                    "SELECT relowner FROM pg_class WHERE oid='app.stored'::regclass"
+                ).fetchone(),
+            )
+            self.assertEqual(
+                (None,),
+                db.execute(
+                    "SELECT reloptions FROM pg_class WHERE oid='app.stored'::regclass"
+                ).fetchone(),
+            )
+
     def test_creation_checks_schema_usage_not_select_and_does_not_recheck_source_usage(self):
         with postgres() as db:
             db.execute("CREATE ROLE view_creator")

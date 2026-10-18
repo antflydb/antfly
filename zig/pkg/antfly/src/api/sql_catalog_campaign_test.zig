@@ -375,7 +375,7 @@ fn parent(kind: domain.Kind) u64 {
     return switch (kind) {
         .database, .tablespace, .query_source => 0,
         .namespace => domain.default_database_id,
-        .table => domain.default_namespace_id,
+        .table, .view => domain.default_namespace_id,
     };
 }
 

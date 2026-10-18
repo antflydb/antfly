@@ -765,7 +765,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     defer alloc.free(resource);
     // Check logical scope before any catalog lookup, including IF EXISTS.
     const permission_kind: @import("../usermgr/mod.zig").ResourceType = switch (kind) {
-        .query_source => .table,
+        .query_source, .view => .table,
         inline else => |tag| @field(@import("../usermgr/mod.zig").ResourceType, @tagName(tag)),
     };
     const alter_path_lookup = input == .catalog_ddl and input.catalog_ddl.action == .alter_schema and
@@ -884,13 +884,13 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .database => error.SqlDuplicateDatabase,
             .namespace => error.SqlDuplicateNamespace,
             .tablespace => error.SqlDuplicateTablespace,
-            .table, .query_source => err,
+            .table, .query_source, .view => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
             .database => error.DatabaseNotFound,
             .namespace => error.NamespaceNotFound,
             .tablespace => error.TablespaceNotFound,
-            .table, .query_source => err,
+            .table, .query_source, .view => err,
         };
         return err;
     };

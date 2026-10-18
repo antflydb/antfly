@@ -113,6 +113,9 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlAmbiguousIndex => .{ .code = "42725", .message = "The index name matches more than one table. Specify ON table.", .retryable = false },
         error.IndexNotFound, error.EmbeddingIndexNotFound, error.SqlIndexNotFound => .{ .code = "42704", .message = "The index does not exist.", .retryable = false },
         error.SqlWrongObjectType => .{ .code = "42809", .message = "The named relation has an incompatible object type.", .retryable = false },
+        error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped => .{ .code = "42P16", .message = "The replacement view must preserve existing output column names, order, and types.", .hint = "Keep the existing output prefix unchanged; new columns may be appended.", .retryable = false },
+        error.SqlDependentObjectsExist => .{ .code = "2BP01", .message = "A stored view depends on this relation or column.", .hint = "Remove the dependent views explicitly before changing their referenced columns or dropping the relation.", .retryable = false },
+        error.InvalidSqlViewRecord => .{ .code = "XX001", .message = "The stored view catalog or its dependency records are inconsistent.", .retryable = false },
         error.SqlConstraintAlreadyExists => .{ .code = "42710", .message = "The constraint already exists.", .hint = "Inspect the existing table constraint or choose a distinct constraint name.", .retryable = false },
         error.SqlConstraintNotFound => .{ .code = "42704", .message = "The constraint does not exist.", .retryable = false },
         error.ConstraintNotDeferrable => .{ .code = "55000", .message = "The constraint is not deferrable.", .retryable = false },
@@ -250,6 +253,16 @@ pub fn message(err: anyerror, buffer: []u8) []const u8 {
     const value = describe(err);
     const hint = value.hint orelse return value.message;
     return std.fmt.bufPrint(buffer, "{s} {s}", .{ value.message, hint }) catch value.message;
+}
+
+test "SQL view catalog diagnostics distinguish invalid replacement dependencies and corrupt metadata" {
+    for ([_]anyerror{ error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped }) |err| {
+        const diagnostic = describe(err);
+        try std.testing.expectEqualStrings("42P16", diagnostic.code);
+        try std.testing.expectEqual(false, diagnostic.retryable.?);
+    }
+    try std.testing.expectEqualStrings("2BP01", describe(error.SqlDependentObjectsExist).code);
+    try std.testing.expectEqualStrings("XX001", describe(error.InvalidSqlViewRecord).code);
 }
 
 test "SQL diagnostics retain definite constraints conflicts and unknown outcomes" {

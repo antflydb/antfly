@@ -34,7 +34,7 @@ fn keyAlloc(alloc: std.mem.Allocator, group_id: u64, suffix: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:{s}", .{ group_id, suffix });
 }
 
-fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id: u64) ![]u8 {
+pub fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id: u64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:record:{s}:{d}", .{ group_id, @tagName(kind), id });
 }
 
@@ -684,7 +684,7 @@ pub const View = struct {
         return if (id == 0) null else (try self.byId(.tablespace, id)) orelse return error.TablespaceNotFound;
     }
     pub fn read(self: View, request: domain.Read) !domain.State {
-        if (request.kind == .table) return error.InvalidCatalogMutation;
+        if (request.kind == .table or request.kind == .view) return error.InvalidCatalogMutation;
         const parent = if (request.kind == .namespace) ((try self.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id else 0;
         var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
         if (request.name) |name| {

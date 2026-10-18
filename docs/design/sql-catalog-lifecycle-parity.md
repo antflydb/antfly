@@ -9811,6 +9811,64 @@ layout regression passed all 83 build steps and 11 tests in
 inventory remains 559 implemented / 131 rejected / 125 superseded / 771
 unresolved. These gates do not qualify persisted-view activation.
 
+### Native stored-view catalog transaction and recovery boundary
+
+Views now have a namespace-owned catalog resource kind and indexed names, not
+an index-JSON mapping or a fabricated physical table. The generic mutation path
+rejects opaque view payloads; publication uses a typed private transaction
+primitive. Tables and views cannot claim the same namespace name, table/index
+claim publication checks view occupancy, and nonempty view namespaces/databases
+cannot be retired through the generic catalog planner.
+
+The durable record binds source attribute IDs to the prepared semantic column
+references, preserves captured ordering/hiddenness, and owns a monotonic output
+attribute registry. Its binding digest covers both the definition and source
+IDs. Replacement retains ownership and the existing output-name/type prefix;
+appended outputs get new IDs. Omitted security options reset to defaults,
+matching PostgreSQL rather than inheriting the old view options.
+
+Publication checks the existing unreleased SQL cohort floor (54), a verified
+occupancy-capable physical namespace root, target identity/generation and source
+epochs before writing. Source-attribute bootstrap, the view resource/name
+index, catalog counters and authoritative reverse dependency edges commit in
+one metadata transaction. A view-only mutation does not invalidate the physical
+table/index reconciliation root or trigger an unrelated full catalog rebuild.
+
+Reverse edges include relation existence (column zero, including COUNT(*)) and
+each referenced attribute. Source schema changes probe only changed/dropped
+attribute IDs; unrelated additions remain compatible. Source retirement checks
+dependencies before removing the attribute registry. Stored-state corruption is
+not repaired by a successor mutation. Runtime/recovery checks use stable IDs
+and exact domains, not a permanent fence on the creation-time schema hash.
+
+View records and reverse edges use the shared catalog snapshot machinery.
+Verification checks canonical records, keyed identity, namespace uniqueness,
+the activation/namespace root, source attributes and exact forward/reverse edge
+coverage. Missing and orphan edges fail installation. Cold checkpoint
+verification checks the same invariants, with one source-validation arena at a
+time; snapshot cancellation is checked between sources and dependency edges.
+
+This is **not public or distributed SQL-view activation**. The tested primitive
+is an owned native catalog transaction, not yet a serialized view Raft command
+or an ingress receipt. Command admission/replay, public lifecycle operations,
+tagged relation resolution/expansion and fresh owner/RLS delegation remain to
+be connected. Ingress still rejects execution before reaching generic table
+mutation. No original SQL cases receive credit for this component.
+
+Validation: all 58 Debug metadata build steps passed in
+/private/tmp/antfly-sql-view-catalog-qualified-debug.log (seven shared-source
+tests and nine metadata/view tests, zero skips/failures/leaks). The native view
+test publishes, replaces, permits an unrelated source column, rejects a
+referenced-column removal, restores a snapshot and reopens both stores cold.
+It also rejects missing/orphan snapshot edges. All 16 focused SQL tests passed
+in /private/tmp/antfly-sql-view-catalog-sql-debug.log. All eight PostgreSQL 18.6
+oracle tests passed in
+/private/tmp/antfly-sql-view-catalog-replacement-postgres.log. The first API
+regression build hit local NoSpaceLeft; obsolete test executables/objects were
+removed and the retry passed all 83 build steps and 11 tests in
+/private/tmp/antfly-sql-view-catalog-api-retry-debug.log. Original-case dispositions remain
+559 implemented / 131 rejected / 125 superseded / 771 unresolved.
+
 ### Captured Apply prefix replay
 
 Invariant captured inputs under Apply now retain one suspended iterator instead

@@ -42,12 +42,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
     const sql_column_identity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "system catalog SQL column identities", "SQL column identities", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "system catalog SQL column identities", "SQL column identities", "SQL view catalog", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const sql_column_identity_run = addFilteredTestRunArtifact(b, sql_column_identity_tests);
     sql_column_identity_run.addArg("--require-no-skips");
     b.step("antfly-metadata-sql-column-identities-test", "Verify durable SQL source attributes with schema publication, Raft replay, snapshots and cold reopen")
+        .dependOn(&sql_column_identity_run.step);
+    b.step("antfly-metadata-sql-view-catalog-test", "Verify view record identity, replacement and source binding contracts alongside durable source attributes")
         .dependOn(&sql_column_identity_run.step);
     const backup_cohort_tests = b.addTest(.{
         .root_module = antfly_test_mod,

@@ -36,6 +36,7 @@ pub const max_columns = 1024;
 pub const Principal = struct { name: []const u8, instance_id: [16]u8 };
 pub const Owner = union(enum) { auth_disabled, user: Principal, role: Principal };
 pub const Security = enum { owner, invoker };
+pub const SourceKind = enum(u8) { table = 1, view = 2 };
 pub const Output = struct { name: []const u8, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?scalar.NumericModifier = null };
 /// Names are resolved to durable attribute IDs by catalog publication in the
 /// same transaction as source-epoch admission; they are not execution identity.
@@ -48,6 +49,7 @@ pub const ColumnDependency = struct {
     virtual: bool,
 };
 pub const Source = struct {
+    kind: SourceKind = .table,
     reference: ast.Name,
     database: []const u8,
     namespace: []const u8,
