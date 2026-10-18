@@ -1723,6 +1723,38 @@ pub fn requireRetired(txn: anytype, binding: jobs.Binding) !void {
 /// abort leaves every pair present, commit advances both keys atomically. No
 /// whole-claim scan, RAM cursor or generation-global rewrite is required.
 pub const GcPage = struct {
+    /// A bounded prefix with an immutable value/cut commitment. The last
+    /// address also makes later-entry retries a point/prefix decision without
+    /// retaining a per-page history or resurrecting deleted claim pairs.
+    pub const Replay = struct {
+        binding: jobs.Binding,
+        count: u16,
+        through: integrity.Address,
+        digest: integrity.Digest,
+
+        pub fn validate(self: @This()) !void {
+            _ = try self.binding.encode();
+            _ = try integrity.parseKey(&self.through.claimKey());
+            if (self.binding.authority != .raft or self.binding.phase != .reserved or self.count == 0 or self.count > 256 or std.mem.allEqual(u8, &self.digest, 0)) return error.InvalidPrivateIndexClaimInventory;
+        }
+
+        pub fn applied(self: @This(), txn: anytype) !bool {
+            try self.validate();
+            _ = try jobs.requireCancellationCleanup(txn, self.binding);
+            const allocation = try requireRegistered(txn, self.binding);
+            if (!std.mem.eql(u8, &allocation.generation, &self.through.generation)) return error.InvalidPrivateIndexClaimInventory;
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const start = generationPrefix(allocation.generation);
+            const first = (try cursor.seekAtOrAfter(&start)) orelse return true;
+            return !std.mem.startsWith(u8, first.key, &start) or std.mem.order(u8, first.key, &inventoryKey(self.through)) == .gt;
+        }
+
+        pub fn requireApplied(self: @This(), txn: anytype) !void {
+            if (!try self.applied(txn)) return error.VersionConflict;
+        }
+    };
+
     arena: std.heap.ArenaAllocator,
     binding: jobs.Binding,
     entries: []const Entry,
@@ -1733,6 +1765,38 @@ pub const GcPage = struct {
     }
 
     pub fn prepare(alloc: Allocator, io: ?std.Io, txn: anytype, binding: jobs.Binding) !?GcPage {
+        return prepareSelected(alloc, io, txn, binding, null);
+    }
+
+    pub fn command(self: *const GcPage) !Replay {
+        if (self.entries.len == 0 or self.entries.len > 256) return error.InvalidPrivateIndexClaimInventory;
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-cancel-gc/v1");
+        state.update(&try bindingDigest(self.binding));
+        for (self.entries) |entry| {
+            state.update(&entry.address.claimKey());
+            state.update(&try (entry.position orelse return error.InvalidPrivateIndexClaimInventory).encode());
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, entry.value.len, .little);
+            state.update(&length);
+            state.update(entry.value);
+        }
+        var digest: integrity.Digest = undefined;
+        state.final(&digest);
+        const result: Replay = .{ .binding = self.binding, .count = @intCast(self.entries.len), .through = self.entries[self.entries.len - 1].address, .digest = digest };
+        try result.validate();
+        return result;
+    }
+
+    pub fn prepareReplay(alloc: Allocator, io: ?std.Io, txn: anytype, replay: Replay) !?GcPage {
+        if (try replay.applied(txn)) return null;
+        var page = (try prepareSelected(alloc, io, txn, replay.binding, replay.count)) orelse return error.VersionConflict;
+        errdefer page.deinit();
+        if (!std.meta.eql(replay, try page.command())) return error.VersionConflict;
+        return page;
+    }
+
+    fn prepareSelected(alloc: Allocator, io: ?std.Io, txn: anytype, binding: jobs.Binding, fixed_count: ?u16) !?GcPage {
         _ = try jobs.requireCancellationCleanup(txn, binding);
         const allocation = try requireRegistered(txn, binding);
         const provenance = try Provenance.init(txn, binding);
@@ -1744,7 +1808,7 @@ pub const GcPage = struct {
         defer cursor.close();
         const start = generationPrefix(allocation.generation);
         const time = @import("antfly_platform").time;
-        const started = time.monotonicNs();
+        const started = if (fixed_count == null) time.monotonicNs() else 0;
         var bytes: usize = 0;
         var next = try cursor.seekAtOrAfter(&start);
         while (next) |entry| : (next = try cursor.next()) {
@@ -1764,13 +1828,15 @@ pub const GcPage = struct {
             // Stop BEFORE owning another row; checking after append can admit
             // almost two page budgets when the next claim is large.
             if (record_bytes > max_bytes - bytes) break;
-            const sequence = try decodeInventory(&inventoryKey(address), inventory, provenance, hash(raw));
+            const position = try decodeInventoryPosition(&inventoryKey(address), inventory, provenance, hash(raw));
             const value = try owned.dupe(u8, raw);
             const claim = try integrity.Claim.decode(&address.claimKey(), value);
             if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
-            try entries.append(owned, .{ .address = address, .value = value, .expected = value, .sequence = sequence });
+            try entries.append(owned, .{ .address = address, .value = value, .expected = value, .sequence = positionNumber(position), .position = position });
             bytes += record_bytes;
-            if (entries.items.len >= 256 or bytes >= max_bytes or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
+            if (fixed_count) |count| {
+                if (entries.items.len == count) break;
+            } else if (entries.items.len >= 256 or bytes >= max_bytes or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
         }
         if (entries.items.len == 0) {
             arena.deinit();
@@ -1787,7 +1853,9 @@ pub const GcPage = struct {
         for (self.entries) |entry| {
             if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
             if (!optionalEqual(try optional(txn, &entry.address.claimKey()), entry.expected)) return error.VersionConflict;
-            if (try checkInventory(txn, entry.address, entry.expected, provenance) != entry.sequence) return error.VersionConflict;
+            const inventory = (try optional(txn, &inventoryKey(entry.address))) orelse return error.VersionConflict;
+            const position = try decodeInventoryPosition(&inventoryKey(entry.address), inventory, provenance, hash(entry.value));
+            if (entry.position == null or !std.meta.eql(position, entry.position.?)) return error.VersionConflict;
             if (try optional(txn, &entry.address.jobKey()) != null) return error.InvalidPrivateIndexClaimInventory;
             var cursor = try txn.openCursor();
             defer cursor.close();

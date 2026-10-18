@@ -156,6 +156,8 @@ pub const Command = union(enum) {
     cancel_control: Control,
     cancel_intent: Admission,
     cancel_cleanup: jobs.Binding,
+    cancel_artifacts: @import("relational_index_gc.zig").Page.Replay,
+    cancel_claims: @import("relational_index_private_claims.zig").GcPage.Replay,
     cancel_complete: jobs.Binding,
     cancel_release: @import("relational_index_release.zig").CancellationIntent,
     build: @import("relational_index_jobs.zig").Page.PrivateCommand,
@@ -220,6 +222,7 @@ pub const Command = union(enum) {
             .generation_validation => @import("relational_index_validation.zig").max_wire_bytes,
             .inventory_validation => @import("relational_index_private_claims.zig").InventoryValidation.max_wire_bytes,
             .release_gc => @import("relational_index_release.zig").Gc.max_wire_bytes,
+            .cancel_artifacts => @import("relational_index_gc.zig").Page.Replay.max_wire_bytes,
             else => native.max_cancellation_wire_bytes,
         };
     }
@@ -244,6 +247,15 @@ pub const Command = union(enum) {
             .generation_validation => @import("relational_index_validation.zig").max_wire_bytes,
             .inventory_validation => @import("relational_index_private_claims.zig").InventoryValidation.max_wire_bytes,
             .release_gc => @import("relational_index_release.zig").Gc.max_wire_bytes,
+            .cancel_artifacts => blk: {
+                const gc = @import("relational_index_gc.zig").Page.Replay;
+                inline for (.{ "expected", "next" }) |name| if (body.object.get(name)) |raw| {
+                    if (raw != .null) {
+                        if (raw != .array or raw.array.items.len > gc.max_progress_bytes) return error.InvalidRelationalIndexGcProgress;
+                    }
+                };
+                break :blk gc.max_wire_bytes;
+            },
             else => native.max_cancellation_wire_bytes,
         };
         var buffer: [256]u8 = undefined;

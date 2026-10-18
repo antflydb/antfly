@@ -109,11 +109,17 @@ Cold retries preserve both original cuts. Both authorities share AICC v2 and
 AICR v2; native envelopes and native metadata grants still reject Raft records.
 The catalogs keep their burned allocations rather than reverting counters;
 ordinary Raft mutations can resume without activating the canceled UNIQUE index.
-Public authorization/dispatch remains required before activation. The borrowed
-GC selections are local apply inputs, not serialized receiver commands:
-replicated dispatch must carry the same bounded selection to followers without
-rerunning a timed scan. The storage test supplies a decision identity, not a
-signed metadata grant. None of these primitives closes an original SQL case.
+Public authorization/dispatch remains required before activation. Cancellation
+GC now also uses owned Raft commands. Physical pages carry the expected/next
+cursor and exact record count; claim pages carry a prefix boundary/count and a
+commitment over values and original full authority cuts. Followers use these
+fixed bounds, not their own time budget. Prepared selections retain the same
+shared deletion machinery. Later-entry retries recheck that the cursor/prefix
+has passed the selected interval rather than rebuilding work or retaining a
+per-page history. Cursor arrays are bounded before typed duplication; no list
+of physical delete keys or claim payloads is added to the log. The storage test
+supplies a decision identity, not a signed metadata grant. None of these
+primitives closes an original SQL case.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
 passes 291 storage tests and one server test, with no skips or leaks. The Raft
@@ -149,6 +155,11 @@ store. The two-store fixture additionally applies encoded build and cancellation
 effects through the actual data state machine: failure before native commit
 advances neither store, and failure after it leaves the projection behind until
 cold replay converges without reapplying the effect or inventing a native cut.
+Cancellation GC is included in that wire path. It rejects forged counts and
+claim commitments, recovers later-entry retries including completed intervals,
+and survives a two-store cold restart between native cleanup/release commit and
+projection acknowledgement. Both empty physical phases and populated claim
+retirement are covered; the live reserved definition remains intact.
 `zig build antfly-relational-index-pages-test -Doptimize=Debug -j1` also passes
 all 12 standalone lifecycle tests, including standby replay and bounded released
 companion retirement. This gate is distinct from the publication-only suite.

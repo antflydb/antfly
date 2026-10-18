@@ -2462,11 +2462,15 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         while (try gc.Page.prepareGeneration(alloc, null, canceled_db.core, binding.index)) |value| {
             var page = value;
             defer page.deinit();
-            var selected: owner_control.PreparedCancellationGc = .{ .binding = reserved_binding, .work = .{ .artifacts = &page } };
+            const fixed = try page.command(reserved_binding);
             try std.testing.expect(physical_pages < 8);
-            try canceled_db.applyCommittedRaftIndexCancellationGc(&selected, 11, .{ .term = 11, .index = cut });
-            try canceled_db.applyCommittedRaftIndexCancellationGc(&selected, 11, .{ .term = 11, .index = cut });
-            cut += 1;
+            var wrong_count = fixed;
+            wrong_count.records_scanned += 1;
+            try std.testing.expectError(error.InvalidRelationalIndexGcProgress, Wire.apply(&canceled_db, .{ .cancel_artifacts = wrong_count }, .{ .term = 11, .index = cut }));
+            try Wire.apply(&canceled_db, .{ .cancel_artifacts = fixed }, .{ .term = 11, .index = cut });
+            try Wire.apply(&canceled_db, .{ .cancel_artifacts = fixed }, .{ .term = 11, .index = cut });
+            try Wire.apply(&canceled_db, .{ .cancel_artifacts = fixed }, .{ .term = 11, .index = cut + 1 });
+            cut += 2;
             physical_pages += 1;
         }
         try std.testing.expect(physical_pages >= 2);
@@ -2494,8 +2498,14 @@ test "relational index system Raft owner controls commit authentic phase cuts at
             defer read.abort();
             try std.testing.expectEqualSlices(u8, original_inventory, try read.get(&inventory_key));
         }
-        try canceled_db.applyCommittedRaftIndexCancellationGc(&selected, 11, .{ .term = 11, .index = cut });
-        try canceled_db.applyCommittedRaftIndexCancellationGc(&selected, 11, .{ .term = 11, .index = cut });
+        const claim_selection = try claim_page.command();
+        var forged_claim_selection = claim_selection;
+        forged_claim_selection.digest[0] ^= 1;
+        try std.testing.expectError(error.VersionConflict, Wire.apply(&canceled_db, .{ .cancel_claims = forged_claim_selection }, .{ .term = 11, .index = cut }));
+        try Wire.apply(&canceled_db, .{ .cancel_claims = claim_selection }, .{ .term = 11, .index = cut });
+        try Wire.apply(&canceled_db, .{ .cancel_claims = claim_selection }, .{ .term = 11, .index = cut });
+        try Wire.apply(&canceled_db, .{ .cancel_claims = claim_selection }, .{ .term = 11, .index = cut + 1 });
+        cut += 1;
         canceled_db.close();
         canceled_live = false;
         canceled_db = try db_mod.DB.open(alloc, canceled_directory.path(), options);

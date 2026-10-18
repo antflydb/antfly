@@ -43,7 +43,8 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 pub const batch_protocol_version: u16 = 23;
 /// Version 23 carries one tagged private-index effect per entry, including
 /// fixed build/verification pages and terminal controls. It does not advertise
-/// complete public index-publication support or borrowed GC selections.
+/// complete public index-publication support. Cancellation GC carries fixed
+/// cursor/count or claim-prefix commitments, never borrowed selection pointers.
 pub const batch_index_owner_control_protocol_version: u16 = 23;
 /// Reserved decoder family. Do not advertise this as batch_protocol_version
 /// until committed native dispatch and off-progress preparation are complete.

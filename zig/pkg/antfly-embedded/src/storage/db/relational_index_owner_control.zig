@@ -2381,6 +2381,8 @@ pub const PreparedCancellationGc = struct {
     work: union(enum) {
         artifacts: *@import("relational_index_gc.zig").Page,
         claims: *private_claims.GcPage,
+        artifact_selection_applied: *const @import("relational_index_gc.zig").Page.Replay,
+        claim_selection_applied: *const private_claims.GcPage.Replay,
     },
 
     pub fn validate(self: *const @This()) !void {
@@ -2389,6 +2391,14 @@ pub const PreparedCancellationGc = struct {
         switch (self.work) {
             .artifacts => |page| if (page.id.mapKey() != self.binding.index.mapKey()) return error.PrivateIndexOwnerJobChanged,
             .claims => |page| if (!std.meta.eql(page.binding, self.binding)) return error.PrivateIndexOwnerJobChanged,
+            .artifact_selection_applied => |command| {
+                try command.validate();
+                if (!std.meta.eql(command.binding, self.binding)) return error.PrivateIndexOwnerJobChanged;
+            },
+            .claim_selection_applied => |command| {
+                try command.validate();
+                if (!std.meta.eql(command.binding, self.binding)) return error.PrivateIndexOwnerJobChanged;
+            },
         }
     }
 
@@ -2411,6 +2421,8 @@ pub const PreparedCancellationGc = struct {
         switch (self.work) {
             .artifacts => |page| try page.stage(core, txn),
             .claims => |page| try page.stage(txn),
+            .artifact_selection_applied => |command| try command.requireApplied(txn),
+            .claim_selection_applied => |command| try command.requireApplied(txn),
         }
     }
 };

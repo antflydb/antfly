@@ -114,6 +114,29 @@ fn applyIndexEffect(db: anytype, group_id: u64, command: @import("antfly_local_s
             defer prepared.deinit();
             try db.applyCommittedRaftIndexCancellationCompletion(&prepared, group_id, identity);
         },
+        .cancel_artifacts => |value| {
+            var page = try local.storage_db_relational_index_gc.Page.prepareReplay(db.alloc, null, db.core, value);
+            defer if (page) |*selected| selected.deinit();
+            var prepared: prepared_ops.PreparedCancellationGc = .{
+                .binding = value.binding,
+                .work = if (page) |*selected| .{ .artifacts = selected } else .{ .artifact_selection_applied = &value },
+            };
+            try db.applyCommittedRaftIndexCancellationGc(&prepared, group_id, identity);
+        },
+        .cancel_claims => |value| {
+            const claims = local.storage_db_relational_index_owner_job.private_claims;
+            var page = blk: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk try claims.GcPage.prepareReplay(db.alloc, null, &read, value);
+            };
+            defer if (page) |*selected| selected.deinit();
+            var prepared: prepared_ops.PreparedCancellationGc = .{
+                .binding = value.binding,
+                .work = if (page) |*selected| .{ .claims = selected } else .{ .claim_selection_applied = &value },
+            };
+            try db.applyCommittedRaftIndexCancellationGc(&prepared, group_id, identity);
+        },
         .cancel_release => |value| {
             var prepared = try prepared_ops.PreparedCancellationRelease.init(db.alloc, db.core, value, .{});
             defer prepared.deinit();

@@ -218,8 +218,70 @@ pub fn run(command: controls.Command) !void {
     defer a.free(cleanup_payload);
     try machine.stateMachine().applyReady(group, null, &.{.{ .term = 10, .index = 8, .entry_type = .normal, .data = cleanup_payload }}, &.{});
     try std.testing.expectEqual(@as(u64, 8), driver.applied);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 8), (try jobs.requireCancellationCleanup(&read, binding)).raft.index);
+        try jobs.private_claims.SourceStream.requireCanceledRetired(&read, binding);
+    }
+    var gc_index: u64 = 8;
+    while (true) {
+        const payload = blk: {
+            var page = (try local.storage_db_relational_index_gc.Page.prepareGeneration(a, null, db.core, binding.index)) orelse break;
+            defer page.deinit();
+            break :blk try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .cancel_artifacts = try page.command(binding) } });
+        };
+        defer a.free(payload);
+        gc_index += 1;
+        try std.testing.expect(gc_index <= 10);
+        const entry = [_]raft_engine.core.Entry{.{ .term = 10, .index = gc_index, .entry_type = .normal, .data = payload }};
+        if (gc_index == 9) {
+            driver.after = true;
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, machine.stateMachine().applyReady(group, null, &entry, &.{}));
+            try std.testing.expectEqual(@as(u64, 9), (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectEqual(@as(u64, 8), driver.applied);
+            db.close();
+            db_live = false;
+            store.deinit();
+            store_live = false;
+            db = try db_mod.DB.open(a, native_path, options);
+            db_live = true;
+            store = try projection.RaftApplyStore.init(a, .{ .root_dir = path, .native_source_delegate = true });
+            store_live = true;
+            machine = driver.machine(&store);
+        }
+        try machine.stateMachine().applyReady(group, null, &entry, &.{});
+        try std.testing.expectEqual(gc_index, driver.applied);
+    }
+    try std.testing.expectEqual(@as(u64, 10), gc_index);
+    const complete_payload = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .cancel_complete = binding } });
+    defer a.free(complete_payload);
+    try machine.stateMachine().applyReady(group, null, &.{.{ .term = 11, .index = 11, .entry_type = .normal, .data = complete_payload }}, &.{});
+    const canceled = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :blk (try jobs.Canceled.load(&read)).?;
+    };
+    const intent: @FieldType(owners.CancellationReleaseOutcome, "intent") = .{ .canceled = canceled, .metadata_decision = @splat(12) };
+    const release_payload = try batch.encode(a, "docs", .{ .relational_index_owner_control = .{ .cancel_release = intent } });
+    defer a.free(release_payload);
+    const release_entry = [_]raft_engine.core.Entry{.{ .term = 12, .index = 12, .entry_type = .normal, .data = release_payload }};
+    driver.after = true;
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, machine.stateMachine().applyReady(group, null, &release_entry, &.{}));
+    try std.testing.expectEqual(@as(u64, 11), driver.applied);
+    db.close();
+    db_live = false;
+    store.deinit();
+    store_live = false;
+    db = try db_mod.DB.open(a, native_path, options);
+    db_live = true;
+    store = try projection.RaftApplyStore.init(a, .{ .root_dir = path, .native_source_delegate = true });
+    store_live = true;
+    machine = driver.machine(&store);
+    try machine.stateMachine().applyReady(group, null, &release_entry, &.{});
+    try std.testing.expectEqual(@as(u64, 12), driver.applied);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    try std.testing.expectEqual(@as(u64, 8), (try jobs.requireCancellationCleanup(&read, binding)).raft.index);
-    try jobs.private_claims.SourceStream.requireCanceledRetired(&read, binding);
+    try std.testing.expect(try jobs.load(&read) == null);
+    try local.storage_db_relational_integrity_topology.requireUnfenced(&read);
 }
