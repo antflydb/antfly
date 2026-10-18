@@ -49488,3 +49488,35 @@ test "metal native embeddinggemma2 two-frame scratch ownership survives wait and
         try std.testing.expectEqual(@as(u64, 0), memory.scratch_pool_in_use_slots);
     }
 }
+
+pub fn decoderRuntimeClippedLinear(self: anytype, input: MetalTensor, slot: usize, p: @import("../ops/ops.zig").ClippedLinearParams) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (input.dtype != .f32) return null;
+    if (input.elemCount() != @as(usize, p.rows) * p.in_dim) return error.InvalidTensorShape;
+    var out = try MetalTensor.deviceAllocate(runtime, @as(usize, p.rows) * p.out_dim * 4, .private, &.{ @intCast(p.rows), @intCast(p.out_dim) });
+    errdefer out.deinit();
+    return finishDeviceOutput(&out, antfly_metal_clipped_linear(runtime, input.deviceHandle(), input.deviceByteOffset(), slot, &p, out.deviceHandle(), out.deviceByteOffset()));
+}
+extern fn antfly_metal_clipped_linear(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, params: *const @import("../ops/ops.zig").ClippedLinearParams, out: ?*anyopaque, out_offset: usize) c_int;
+
+pub extern fn antfly_metal_audio_storage_scope(runtime: ?*RawMetalDecodeRuntime, begin: c_int) c_int;
+pub extern fn antfly_metal_audio_storage_clear(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn antfly_metal_audio_storage_hits(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn antfly_metal_audio_storage_bytes(runtime: ?*RawMetalDecodeRuntime) usize;
+
+pub extern fn antfly_metal_clipped_linear_choice(runtime: ?*RawMetalDecodeRuntime, params: *const @import("../ops/ops.zig").ClippedLinearParams) c_int;
+pub extern fn antfly_metal_clipped_linear_tune(runtime: ?*RawMetalDecodeRuntime, slot: usize, params: *const @import("../ops/ops.zig").ClippedLinearParams) c_int;
+
+pub extern fn antfly_metal_audio_linear_tunes(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub fn decoderRuntimeNormClamped(self: anytype, input: MetalTensor, weight: MetalTensor, p: @import("../ops/ops.zig").NormClampParams) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (input.dtype != .f32 or weight.dtype != .f32) return null;
+    if (p.dim % 4 != 0) return null;
+    if (input.elemCount() != @as(usize, p.rows) * p.dim or weight.elemCount() != p.dim) return error.InvalidTensorShape;
+    var output = try MetalTensor.deviceAllocate(runtime, input.elemCount() * 4, .private, input.shape());
+    errdefer output.deinit();
+    return finishDeviceOutput(&output, antfly_metal_norm_clamp(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), &p, output.deviceHandle(), output.deviceByteOffset()));
+}
+extern fn antfly_metal_norm_clamp(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, params: *const @import("../ops/ops.zig").NormClampParams, output: ?*anyopaque, output_offset: usize) c_int;
+pub extern fn antfly_metal_audio_norm_clamp_launches(runtime: ?*RawMetalDecodeRuntime) u64;

@@ -1251,3 +1251,61 @@ PyTorch F32 oracle after these changes, including audio cohorts. Audio cosine
 similarity was 0.999999998 with maximum absolute error 0.000008523; image,
 text/image orderings and mixed inputs also passed. This qualifies the tested
 fixtures; CUDA arithmetic and graph candidates still need NVIDIA qualification.
+
+Metal audio execution also supports measured clipped-linear fusion. Each bounded
+shape/flags entry compares the fused F32 matrix route with staged MPS using
+completed GPU times, three warmups and five timed iterations. Fusion requires a
+5% win. Bounds values reuse the same geometry decision; no request tensor is
+retained. Optional tuning scratch is admitted separately and capped at 32 MiB.
+Short clips can therefore keep MPS while longer clips use fusion.
+
+Private audio scratch can survive command frames under a separately admitted
+128 MiB model reservation. Producer completion fences protect reuse, pressure
+reclamation returns the reservation, and cancellation does not publish scratch.
+Batch feature preparation submits one frame for the cohort. Context-parallel
+attention retains the established dimension-reduction order and keeps narrow
+heads on the original kernel.
+
+Diagnostic controls are `ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR=1`,
+`ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR=1` (qualification only),
+`ANTFLY_EMBEDDINGGEMMA2_METAL_SERIAL_ATTENTION=1`, and
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_STORAGE=1`.
+
+Compatible audio FFNs also fuse weighted RMS normalization with their scalar
+input bounds. This removes a normalization/clamp intermediate and dispatch even
+when staged MPS wins projection qualification. The established reduction order
+and vector multiplication order are retained; unsupported bounds/layouts use
+the reference route. `ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS=1` reports actual
+fused-linear, norm/clamp, parallel-attention and retained-storage route counts.
+F32 device-weight RMS normalization also shares this SIMD4 row reduction when
+no input bounds are requested, preserving the reference fallback for other
+layouts and arithmetic policies.
+
+The optional `ANTFLY_EMBEDDINGGEMMA2_BENCH_AUDIO=1` tests named `completed clipped
+projection and context-parallel attention benchmark` and `Metal RMS input-clamp
+fusion` reproduce the resident-input comparisons. On an M4 Max, with the Debug
+host harness, three warmups and five completed samples:
+
+| Operation | Rows | Staged/serial GPU µs | Fused/parallel GPU µs |
+|---|---:|---:|---:|
+| RMS + input clamp | 25 | 23.5 | 12.5 |
+| RMS + input clamp | 250 | 43.8 | 20.5 |
+| Local attention, head width 256 | 25 | 111.5 | 76.9 |
+| Local attention, head width 256 | 50 | 146.8 | 96.7 |
+| Local attention, head width 256 | 250 | 532.9 | 348.6 |
+
+The staged RMS rows above already use the improved SIMD4 reduction. These are
+kernel timings, excluding decode, uploads and backbone inference. The fused
+GEMM candidate lost the tested 1024↔4096 projection comparisons at 25/50/250 rows;
+it remains measurement-gated, with MPS retained. Qualification uses a bounded
+nonzero deterministic probe and the admitted immutable weight snapshot. Its
+cold setup time is excluded from warm measurements and is not an end-to-end
+PyTorch speed claim.
+
+The pretrained ordered-media oracle passes with default selection and with
+forced fused GEMM, including the two-clip audio cohort. Default audio cosine
+similarity is 0.999999997 (maximum absolute error 0.000008732); forced fusion is
+0.999999998 (0.000008566). Default execution reports normalization fusion,
+parallel attention and retained-buffer hits; forced qualification records 398
+fused projections. These checks preserve the tested PyTorch F32 vectors and do
+not establish broader retrieval quality or full-pipeline speed parity.

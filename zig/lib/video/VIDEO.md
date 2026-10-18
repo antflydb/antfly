@@ -646,3 +646,31 @@ prepared depthwise weights and generation-aware keys preserve replay ownership.
 Audio shares vision/backbone graph admission and completion-fenced eviction;
 capture/admission declines retain eager execution, and cancellation remains
 retryable. Kernel and graph qualification require actual route counters.
+
+Metal conformer scalar-clipped projections have an F32 SIMD-group matrix route
+that applies input bounds during tile loads and output bounds/SiLU before the
+final store. A 32-entry geometry/operation cache compares completed GPU time with
+staged MPS, excludes three warmups, and requires a 5% win; denied or unsupported
+qualification preserves staged execution. Cold tuning uses separately admitted
+scratch of at most 32 MiB and never consumes an unsubmitted request activation.
+
+Audio execution can retain private Metal scratch across frames under an optional
+128 MiB model-tier reservation, with 128 bounded buffer descriptors. Each retired
+buffer retains its producer command buffer; reuse and eviction require completion.
+Cancellation publishes no storage, pressure reclamation drains the cache, and
+model teardown returns the reservation. In-frame reuse remains the first choice.
+
+Compatible 128–1024-wide Metal attention heads distribute context positions
+across SIMD groups while preserving the existing dimension-reduction and softmax
+order. Narrow heads keep the original kernel. Audio feature cohorts share one
+preparation frame and preserve externally owned frames.
+
+Compatible audio FFNs also fuse weighted RMS normalization with their scalar
+input bounds. This removes a normalization/clamp intermediate and dispatch even
+when staged MPS wins projection qualification. The established reduction order
+and vector multiplication order are retained; unsupported bounds/layouts use
+the reference route. `ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS=1` reports actual
+fused-linear, norm/clamp, parallel-attention and retained-storage route counts.
+F32 device-weight RMS normalization also shares this SIMD4 row reduction when
+no input bounds are requested, preserving the reference fallback for other
+layouts and arithmetic policies.

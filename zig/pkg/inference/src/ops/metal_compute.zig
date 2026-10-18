@@ -368,6 +368,13 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
     return enabled;
 }
 
+// Production flags are immutable per process. Qualification tests compare
+// explicit routes within one process and restore their environment afterward.
+fn audioExecutionFlag(comptime name: [*:0]const u8) bool {
+    if (comptime @import("builtin").is_test) return @import("antfly_platform").env.getenvBool(std.mem.span(name));
+    return getenvBool(name);
+}
+
 fn a4bHighMemoryFastPathEnabled() bool {
     return a4b_feature_flags.highMemoryFastPathEnabled();
 }
@@ -15307,6 +15314,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(input);
         const weight_buf = toBuf(weight);
         if (input_buf.quantized_storage != null or weight_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        // Device-weight RMSNorm must use the same row reduction as prepared
+        // SIMD4 slots; the scalar-per-output fallback repeats the row sum.
+        if (self.require_f32_linears and dim != 0 and dim % 4 == 0) {
+            if (denseDeviceF32(input)) |device| {
+                const count = device.elemCount();
+                if (count > 0 and count % dim == 0 and count <= std.math.maxInt(u32) and dim <= std.math.maxInt(u32)) {
+                    if (try rmsNormClampedOp(ctx, input, weight, .{ .rows = @intCast(count / dim), .dim = @intCast(dim), .flags = 0, .eps = eps, .lo = 0, .hi = 0 })) |result| return result;
+                }
+            }
+        }
         if (!disableRuntimeElementwise()) {
             if (input_buf.metal_tensor) |*input_metal| {
                 if (traceGatedDeviceRequested()) {
@@ -15716,6 +15733,72 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(result);
     }
 
+    fn audioStorageOp(ctx: *anyopaque, begin: bool) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const p = self.provider_impl;
+        if (!begin) return metal_runtime.antfly_metal_audio_storage_scope(p.raw_decode_runtime, 0) == 0;
+        if (!self.require_f32_linears or self.shared_provider_lease_io == null or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_STORAGE")) return false;
+        if (p.raw_decode_runtime == null) return false;
+        self.data.prefetch.lock();
+        defer self.data.prefetch.unlock();
+        if (p.embeddinggemma2_audio_storage_bytes == 0) {
+            const cache = if (self.data.tier_cache) |*value| value else return false;
+            if (p.embeddinggemma2_cache_admission) |bound| {
+                if (bound != cache) return false;
+            }
+            const cap = 128 * 1024 * 1024;
+            cache.reserve(.backend, cap) catch return false;
+            p.embeddinggemma2_cache_admission = cache;
+            p.embeddinggemma2_audio_storage_bytes = cap;
+        }
+        return metal_runtime.antfly_metal_audio_storage_scope(p.raw_decode_runtime, 1) == 0;
+    }
+    fn rmsNormClampedOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.NormClampParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.require_f32_linears or p.dim % 4 != 0 or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) return null;
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer x.deinit();
+        var w = try self.ownedDeviceMetalTensorFromCt(weight);
+        defer w.deinit();
+        const result = (try metal_runtime.decoderRuntimeNormClamped(self.provider_impl, x, w, p)) orelse return null;
+        return self.ctFromOwnedMetalTensor(result);
+    }
+    fn clippedLinearOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.ClippedLinearParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.require_f32_linears or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) return null;
+        const runtime = self.provider_impl.raw_decode_runtime;
+        var choice = metal_runtime.antfly_metal_clipped_linear_choice(runtime, &p);
+        if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR")) choice = 1;
+        if (choice == 0 or (choice < 0 and self.data.tier_cache == null)) return null;
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer x.deinit();
+        const bias = try self.cachedZeroBiasBuf(p.out_dim);
+        defer freeOp(ctx, bias);
+        const slot = (try self.ensureDynamicLinearSlot(weight, bias, p.in_dim, p.out_dim)) orelse return null;
+        if (choice < 0) {
+            // Qualification owns separate admitted deterministic-probe scratch, never
+            // reads an unsubmitted producer, and never reruns a model request.
+            const floats = try std.math.mul(usize, p.rows, try std.math.add(usize, try std.math.mul(usize, p.in_dim, 2), p.out_dim));
+            const bytes = try std.math.add(usize, try std.math.mul(usize, floats, 4), 3 * 16384);
+            if (bytes > 32 * 1024 * 1024 or p.in_dim > 8192 or p.out_dim > 8192) return null;
+            const cache = if (self.data.tier_cache) |*value| value else return null;
+            self.data.prefetch.lock();
+            cache.reserve(.backend, bytes) catch {
+                self.data.prefetch.unlock();
+                return null;
+            };
+            self.data.prefetch.unlock();
+            defer {
+                self.data.prefetch.lock();
+                cache.noteRelease(.backend, bytes);
+                self.data.prefetch.unlock();
+            }
+            choice = metal_runtime.antfly_metal_clipped_linear_tune(runtime, slot, &p);
+        }
+        if (choice != 1) return null;
+        const out = (try metal_runtime.decoderRuntimeClippedLinear(self.provider_impl, x, slot, p)) orelse return null;
+        return self.ctFromOwnedMetalTensor(out);
+    }
     fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
@@ -33364,6 +33447,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rmsNormResidual = rmsNormResidualOp;
         vt.modelScalarBounds = modelScalarBoundsOp;
         vt.clampSilu = clampSiluOp;
+        vt.clippedLinear = clippedLinearOp;
+        vt.rmsNormClamped = rmsNormClampedOp;
+        vt.audioStorage = audioStorageOp;
         vt.spatialPoolPrepare = spatialPoolPrepareOp;
         vt.audioFrontend = audioFrontendOp;
         vt.audioLogMelEnabled = audioBatchLayoutsEnabledOp;
@@ -43876,4 +43962,101 @@ test "embeddinggemma2 Metal prepared constant snapshots drain before publication
     const provider = store.shared_metal_native_provider.?;
     try std.testing.expectEqual(@as(usize, 16), try provider.reclaimEmbeddingGemma2Weights(.audio));
     try std.testing.expectEqual(@as(usize, 0), provider.embeddinggemma2_constant_bytes);
+}
+
+test "embeddinggemma2 Metal audio storage admission survives wrappers and yields to pressure" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 16 * 1024 * 1024, 128 * 1024 * 1024 }) |limit| {
+        var controller = runtime_root.tier.memory.AdmissionController{};
+        defer controller.deinit();
+        var store = testMetalWeightStoreInit(a);
+        store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = limit });
+        store.tier_cache.?.configureHardBudget(.{ .backend_limit_bytes = limit });
+        try store.tier_cache.?.configureAdmission(a, &controller, .gpu, .{ .backend_limit_bytes = limit, .combined_limit_bytes = limit }, .{});
+        defer store.tier_cache.?.deinitAdmission();
+        defer store.lazy_weights.deinit(a);
+        initPrefetchQueue(&store, a);
+        defer deinitPrefetchQueue(&store);
+        defer deinitSharedNativeProvider(&store);
+        for (0..2) |_| {
+            var compute = try MetalCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.require_f32_linears = true;
+            const cb = compute.computeBackend();
+            const active = try cb.audioStorage(true);
+            try std.testing.expectEqual(limit == 128 * 1024 * 1024, active);
+            if (active) {
+                try std.testing.expectError(error.MetalWorkspaceBusy, compute.provider_impl.reclaimEmbeddingGemma2Weights(.audio));
+                try std.testing.expect(try cb.audioStorage(false));
+                try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), controller.snapshot().backend_weight_bytes);
+            }
+        }
+        const provider = store.shared_metal_native_provider.?;
+        const expected: usize = if (limit == 128 * 1024 * 1024) 128 * 1024 * 1024 else 0;
+        try std.testing.expectEqual(expected, try provider.reclaimEmbeddingGemma2Weights(.audio));
+        try std.testing.expectEqual(@as(usize, 0), provider.embeddinggemma2_audio_storage_bytes);
+    }
+}
+
+test "embeddinggemma2 Metal clipped linear selector reuses geometry across bounds and wrappers without scratch leaks" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const name = "ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR";
+    const old = if (@import("antfly_platform").env.getenv(name)) |v| try a.dupeSentinel(u8, v, 0) else null;
+    defer if (old) |v| {
+        _ = Env.setenv(name, v.ptr, 1);
+        a.free(v);
+    } else {
+        _ = Env.unsetenv(name);
+    };
+    _ = Env.setenv(name, "0", 1);
+    const disabled = "ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR";
+    const old_disabled = if (@import("antfly_platform").env.getenv(disabled)) |v| try a.dupeSentinel(u8, v, 0) else null;
+    defer if (old_disabled) |v| {
+        _ = Env.setenv(disabled, v.ptr, 1);
+        a.free(v);
+    } else {
+        _ = Env.unsetenv(disabled);
+    };
+    _ = Env.setenv(disabled, "0", 1);
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = 32 * 1024 * 1024 });
+    defer store.tier_cache.?.deinitAdmission();
+    defer store.lazy_weights.deinit(a);
+    var weights: [39 * 35]f32 = @splat(0.05);
+    var shape = [_]i64{ 39, 35 };
+    const key = "audio_tower.layers.0.test.linear.weight";
+    try addLegacyGlinerMpsTestWeight(&store, key, &weights, &shape);
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    for (0..2) |_| {
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        const cb = compute.computeBackend();
+        const weight = try cb.getWeight(key);
+        defer cb.free(weight);
+        const values: [33 * 35]f32 = @splat(0.25);
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ 33, 35 }));
+        defer cb.free(input);
+        const warm = try cb.linearNoBias(input, weight, 33, 35, 39);
+        cb.free(warm);
+        const retained = store.tier_cache.?.backend_bytes;
+        var p = ops.ClippedLinearParams{ .rows = 33, .in_dim = 35, .out_dim = 39, .flags = 31, .input_min = -1, .input_max = 1, .output_min = -1, .output_max = 1 };
+        if (try cb.clippedLinear(input, weight, p)) |out| cb.free(out);
+        try std.testing.expectEqual(@as(u64, 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
+        p.input_min = -0.5;
+        p.input_max = 0.5;
+        if (try cb.clippedLinear(input, weight, p)) |out| cb.free(out);
+        try std.testing.expectEqual(@as(u64, 1), metal_runtime_mod.antfly_metal_audio_linear_tunes(compute.provider_impl.raw_decode_runtime));
+        try std.testing.expectEqual(retained, store.tier_cache.?.backend_bytes);
+    }
 }

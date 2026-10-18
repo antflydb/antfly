@@ -105,6 +105,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_linear_cache_bytes: usize = 0,
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
+    embeddinggemma2_audio_storage_bytes: usize = 0,
     embeddinggemma2_cache_admission: ?*tier_cache_mod.SharedCache = null,
     jit_mode: kernel_jit.Mode = .off,
     jit_scope: metal_runtime.MetalJitRouteScope = metal_runtime.MetalJitRouteScope.none(),
@@ -205,6 +206,12 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         const policy = @import("../models/embedding_gemma2_weight_cache.zig");
         var reclaimed: usize = 0;
         if (cache_class == .audio) {
+            if (self.embeddinggemma2_audio_storage_bytes != 0) {
+                if (metal_runtime.antfly_metal_audio_storage_clear(self.raw_decode_runtime) != 0) return error.MetalWorkspaceBusy;
+                cache.noteRelease(.backend, self.embeddinggemma2_audio_storage_bytes);
+                reclaimed += self.embeddinggemma2_audio_storage_bytes;
+                self.embeddinggemma2_audio_storage_bytes = 0;
+            }
             while (self.embeddinggemma2_constant_cache.count() > 0) {
                 var constants = self.embeddinggemma2_constant_cache.iterator();
                 const key = constants.next().?.key_ptr.*;
@@ -324,6 +331,11 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
         }
         metal_runtime.resetGatheredSpans(self);
+        if (self.embeddinggemma2_audio_storage_bytes != 0) {
+            _ = metal_runtime.antfly_metal_audio_storage_clear(self.raw_decode_runtime);
+            if (self.embeddinggemma2_cache_admission) |cache| cache.noteRelease(.backend, self.embeddinggemma2_audio_storage_bytes);
+            self.embeddinggemma2_audio_storage_bytes = 0;
+        }
         self.deberta_relative_embedding_cache.deinit();
         for (&self.deberta_relative_projection_cache) |*entry| entry.deinit();
         for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.releaseRawLinearSlot(self, slot);

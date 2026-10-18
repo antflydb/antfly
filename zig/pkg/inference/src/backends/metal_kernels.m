@@ -1338,6 +1338,9 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> gemma4_audio_clamp_silu_pipeline;
     id<MTLComputePipelineState> spatial_pool_prepare_pipeline;
     id<MTLComputePipelineState> audio_frontend_pipeline;
+    id<MTLComputePipelineState> audio_clipped_linear_pipeline;
+    id<MTLComputePipelineState> audio_attention_parallel_pipeline;
+    id<MTLComputePipelineState> audio_norm_clamp_pipeline;
     id<MTLComputePipelineState> audio_logmel_pipeline;
     id<MTLComputePipelineState> audio_conv_matrix_pipeline;
     id<MTLComputePipelineState> audio_conv_tiled_pipeline;
@@ -1908,6 +1911,21 @@ typedef struct termite_metal_decode_runtime {
     // reuses one instead of growing memory; Metal's default hazard tracking
     // serializes the reuse-write after prior reads. Bounds peak device memory
     // to the live working set instead of the sum of all intermediates.
+    // Model-admitted execution storage. A fence owns each retired generation;
+    // pending generations cannot be borrowed or evicted by another frame.
+    id<MTLBuffer> audio_reuse_buffers[128];
+    id<MTLCommandBuffer> audio_reuse_fences[128];
+    size_t audio_reuse_bytes;
+    size_t audio_reuse_scope;
+    uint8_t audio_linear_keys[32][32];
+    uint64_t audio_linear_stamps[32];
+    bool audio_linear_choices[32];
+    uint64_t audio_linear_clock;
+    uint64_t audio_reuse_hits;
+    uint64_t audio_fused_linear_launches;
+    uint64_t audio_parallel_attention_launches;
+    uint64_t audio_linear_tunes;
+    uint64_t audio_norm_clamp_launches;
     void **frame_reuse_pool;
     size_t frame_reuse_pool_len;
     size_t frame_reuse_pool_cap;
@@ -8421,6 +8439,35 @@ static NSString *termite_metal_shader_source(void) {
            "        output[i] = y.x; output[i + 1u] = y.y; output[i + 2u] = y.z; output[i + 3u] = y.w;\n"
            "    }\n"
            "}\n"
+"struct antfly_norm_clamp_params {uint rows,dim,flags,reserved;float eps,lo,hi,padding;};\n"
+"kernel void antfly_norm_clamp(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant antfly_norm_clamp_params &p [[buffer(3)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+"    threadgroup float shmem[32];\n"
+"    if (row >= p.rows || p.dim == 0u || (p.dim & 3u) != 0u) return;\n"
+"    if (simd_group == 0u) shmem[simd_lane] = 0.0f;\n"
+"    uint row_base = row * p.dim;\n"
+"    uint vectors = p.dim >> 2u;\n"
+"    float mean_square = 0.0f;\n"
+"    for (uint v = tid; v < vectors; v += tpg) {\n"
+"        uint i = row_base + (v << 2u);\n"
+"        float4 x = float4(input[i], input[i + 1u], input[i + 2u], input[i + 3u]);\n"
+"        mean_square += dot(x, x);\n"
+"    }\n"
+"    mean_square = simd_sum(mean_square);\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (simd_lane == 0u) shmem[simd_group] = mean_square;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    mean_square = simd_sum(shmem[simd_lane]);\n"
+"    float inv_rms = rsqrt(mean_square / float(p.dim) + p.eps);\n"
+"    for (uint v = tid; v < vectors; v += tpg) {\n"
+"        uint j = v << 2u;\n"
+"        uint i = row_base + j;\n"
+"        float4 x = float4(input[i], input[i + 1u], input[i + 2u], input[i + 3u]);\n"
+"        float4 w = float4(weight[j], weight[j + 1u], weight[j + 2u], weight[j + 3u]);\n"
+"        float4 y = x * (inv_rms * w);\n"
+"        if(p.flags&1) y=max(y,float4(p.lo));if(p.flags&2) y=min(y,float4(p.hi));\n"
+"        output[i] = y.x; output[i + 1u] = y.y; output[i + 2u] = y.z; output[i + 3u] = y.w;\n"
+"    }\n"
+"}\n"
            "kernel void termite_apply_rms_norm_rows_triple_simd4_reduce(device const float *input [[buffer(0)]], device const float *first_weight [[buffer(1)]], device const float *second_weight [[buffer(2)]], device const float *third_weight [[buffer(3)]], device float *first_output [[buffer(4)]], device float *second_output [[buffer(5)]], device float *third_output [[buffer(6)]], constant termite_metal_apply_row_norm_params &p [[buffer(7)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.hidden_size == 0u || (p.hidden_size & 3u) != 0u) return;\n"
            "    if (simd_group == 0u) shmem[simd_lane] = 0.0f;\n"
@@ -10703,6 +10750,47 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    output[out_base + tid] = acc;\n"
            "}\n"
+"kernel void antfly_audio_attention_parallel(device const float *q [[buffer(0)]],device const float *k [[buffer(1)]],device const float *v [[buffer(2)]],device const float *rel [[buffer(3)]],device const float *q_scales [[buffer(4)]],device const float *valid [[buffer(5)]],device float *output [[buffer(6)]],constant termite_metal_gemma4_audio_attention_params &p [[buffer(7)]],uint2 tgid [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+"threadgroup float scores[64],query[1024];uint head=tgid.x,q_idx=tgid.y,head_base=head*p.head_dim,out_base=q_idx*p.hidden+head_base;\n"
+"bool row_valid=((p.reserved&2u) ? valid[q_idx]>0.f : valid[q_idx]!=0.f);\n"
+"if(!row_valid) {for(uint d=tid;d<p.head_dim;d+=256) output[out_base+d]=0.f;return;}\n"
+"for(uint d=tid;d<p.head_dim;d+=256) query[d]=q[out_base+d]*q_scales[d];\n"
+"threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"uint clip_start=(p.reserved&2u) ? uint(valid[q_idx])-1u : 0u,block_start=clip_start+((q_idx-clip_start)/p.chunk)*p.chunk,q_off=q_idx-block_start;int past=int(p.context_left)-1;\n"
+"for(uint c=sg;c<p.context;c+=8) {\n"
+"int rel_idx=int(c)-int(q_off),k_idx=int(block_start+c)-past;\n"
+"bool ok=rel_idx>=0 && rel_idx<int(p.context_left) && k_idx>=0 && k_idx<int(p.rows);\n"
+"if(ok) ok=((p.reserved&2u) ? valid[k_idx]==valid[q_idx] : valid[k_idx]!=0.f) && k_idx<=int(q_idx) && int(q_idx)-k_idx<=past-int(p.reserved&1u);\n"
+"float total=0.f;\n"
+"for(uint base=0;base<p.head_dim;base+=32) {uint d=base+lane;float prod=0.f;if(ok) prod=query[d]*(k[uint(k_idx)*p.hidden+head_base+d]*p.k_scale)+query[d]*rel[uint(rel_idx)*p.hidden+head_base+d];float part=simd_sum(prod);if(lane==0) total+=part;}\n"
+"if(lane==0) {float arg=total/p.logit_cap;scores[c]=ok ? (arg>=16.f ? 1.f : (arg<=-16.f ? -1.f : tanh(arg)))*p.logit_cap : p.invalid_value;}\n"
+"}\n"
+"threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (tid == 0u) {\n"
+"        float max_score = -INFINITY;\n"
+"        uint valid_count = 0u;\n"
+"        for (uint c = 0u; c < p.context; ++c) { if (scores[c] != p.invalid_value) { max_score = max(max_score, scores[c]); valid_count += 1u; } }\n"
+"        if (valid_count == 0u) {\n"
+"            for (uint c = 0u; c < p.context; ++c) scores[c] = 0.0f;\n"
+"        } else {\n"
+"            float sum_exp = 0.0f;\n"
+"            for (uint c = 0u; c < p.context; ++c) { float e = exp(scores[c] - max_score); scores[c] = e; sum_exp += e; }\n"
+"            for (uint c = 0u; c < p.context; ++c) scores[c] = sum_exp == 0.0f ? 0.0f : scores[c] / sum_exp;\n"
+"        }\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for(uint dim=tid;dim<p.head_dim;dim+=256) {\n"
+"    float acc = 0.0f;\n"
+"    for (uint c = 0u; c < p.context; ++c) {\n"
+"        float prob = scores[c];\n"
+"        if (prob == 0.0f) continue;\n"
+"        int k_idx = (int)(block_start + c) - past;\n"
+"        if (k_idx < 0 || k_idx >= (int)p.rows) continue; if ((p.reserved & 2u) ? valid[k_idx] != valid[q_idx] : valid[k_idx] == 0.0f) continue; if (k_idx > (int)q_idx || (int)q_idx - k_idx > past - int(p.reserved & 1u)) continue;\n"
+"        acc += prob * v[(uint)k_idx * p.hidden + head_base + dim];\n"
+"    }\n"
+"    output[out_base + dim] = acc;\n"
+"    }\n"
+"}\n"
            "kernel void termite_apply_where_select_1x(device const float *cond [[buffer(0)]], device const float *on_true [[buffer(1)]], device const float *on_false [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_add_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    float c = cond[(p.flags & 1u) != 0u ? 0u : gid]; float t = on_true[(p.flags & 2u) != 0u ? 0u : gid]; float f = on_false[(p.flags & 4u) != 0u ? 0u : gid];\n"
@@ -13522,6 +13610,20 @@ static NSString *termite_metal_shader_source(void) {
            "    if (in_t >= 0 && uint(in_t) < p.time_steps) { v = p.time_major != 0u ? input[(b * p.time_steps + uint(in_t)) * p.in_channels + ic] : input[(b * p.in_channels + ic) * p.time_steps + uint(in_t)]; }\n"
            "    output[gid] = v;\n"
            "}\n"
+"struct antfly_clipped_linear_params { uint rows,in_dim,out_dim,flags; float input_min,input_max,output_min,output_max; };\n"
+"kernel void antfly_clipped_linear(device const float *input [[buffer(0)]],device const float *weight [[buffer(1)]],device float *out [[buffer(2)]],constant antfly_clipped_linear_params &p [[buffer(3)]],uint tid [[thread_index_in_threadgroup]],ushort sg [[simdgroup_index_in_threadgroup]],uint3 group [[threadgroup_position_in_grid]]) {\n"
+"threadgroup float a[1024],b[1024],c[1024];uint r0=group.y*32,o0=group.x*32;\n"
+"simdgroup_float8x8 ma,mb,acc0=make_filled_simdgroup_matrix<float,8>(0.f),acc1=make_filled_simdgroup_matrix<float,8>(0.f);\n"
+"for(uint base=0;base<p.in_dim;base+=32) {\n"
+"for(uint i=tid;i<1024;i+=256) {uint r=r0+i/32,k=base+i%32;float x=(r<p.rows && k<p.in_dim) ? input[r*p.in_dim+k] : 0.f;\n"
+"if(r<p.rows && k<p.in_dim) {if(p.flags&1) x=max(x,p.input_min);if(p.flags&2) x=min(x,p.input_max);} a[i]=x;\n"
+"uint bk=base+i/32,o=o0+i%32;b[i]=(o<p.out_dim && bk<p.in_dim) ? weight[o*p.in_dim+bk] : 0.f;}\n"
+"threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"for(uint k=0;k<32;k+=8) {simdgroup_load(mb,b+k*32+(uint(sg)%4)*8,32);simdgroup_load(ma,a+(uint(sg)/4)*16*32+k,32);simdgroup_multiply_accumulate(acc0,ma,mb,acc0);simdgroup_load(ma,a+((uint(sg)/4)*16+8)*32+k,32);simdgroup_multiply_accumulate(acc1,ma,mb,acc1);}\n"
+"threadgroup_barrier(mem_flags::mem_threadgroup);}\n"
+"simdgroup_store(acc0,c+(uint(sg)/4)*16*32+(uint(sg)%4)*8,32);simdgroup_store(acc1,c+((uint(sg)/4)*16+8)*32+(uint(sg)%4)*8,32);threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"for(uint i=tid;i<1024;i+=256) {uint r=r0+i/32,o=o0+i%32;if(r<p.rows && o<p.out_dim) {float x=c[i];if(p.flags&4) x=max(x,p.output_min);if(p.flags&8) x=min(x,p.output_max);if(p.flags&16) x=x/(1.f+exp(-x));out[r*p.out_dim+o]=x;}}\n"
+"}\n"
 "#define ADD(a,b) ((a)+(b))\n"
 "#define SUB(a,b) ((a)-(b))\n"
 "#define MUL(a,b) ((a)*(b))\n"
@@ -28908,6 +29010,9 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_scale_1x");
         runtime->norm_residual_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_norm_residual");
         runtime->gemma4_audio_clamp_silu_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_clamp_silu");
+        runtime->audio_clipped_linear_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_clipped_linear");
+        runtime->audio_attention_parallel_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_audio_attention_parallel");
+        runtime->audio_norm_clamp_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_norm_clamp");
         runtime->audio_logmel_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_audio_logmel");
         runtime->audio_conv_matrix_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_audio_conv_matrix");
         runtime->audio_conv_tiled_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_audio_conv_tiled");
@@ -29494,6 +29599,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
 }
 
 static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_runtime *runtime, int keep_alive);
+int antfly_metal_audio_storage_clear(termite_metal_decode_runtime *r);
 
 void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL) return;
@@ -29564,6 +29670,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
         runtime->expert_subbuffer_cache_lens[slot] = 0;
         runtime->expert_subbuffer_cache_buffers[slot] = nil;
     }
+    runtime->audio_reuse_scope=0;
+    (void)antfly_metal_audio_storage_clear(runtime);
     termite_metal_decode_runtime_drain_reuse_pool(runtime, 0);
     if (runtime->frame_reuse_pool != NULL) {
         free(runtime->frame_reuse_pool);
@@ -29871,6 +29979,9 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->gemma4_audio_clamp_silu_pipeline = nil;
     runtime->spatial_pool_prepare_pipeline = nil;
     runtime->audio_frontend_pipeline = nil;
+    runtime->audio_clipped_linear_pipeline = nil;
+    runtime->audio_attention_parallel_pipeline = nil;
+    runtime->audio_norm_clamp_pipeline = nil;
     runtime->audio_logmel_pipeline = nil;
     runtime->audio_conv_matrix_pipeline = nil;
     runtime->audio_conv_tiled_pipeline = nil;
@@ -54665,6 +54776,11 @@ int termite_metal_decode_runtime_gemma4_audio_local_attention_device(
     const bool threadgroup_path = runtime->gemma4_audio_attention_tg_pipeline != nil &&
         params->head_dim % 32u == 0u && params->head_dim <= 1024u &&
         params->head_dim <= runtime->gemma4_audio_attention_tg_pipeline.maxTotalThreadsPerThreadgroup;
+    if (threadgroup_path && runtime->precise_library_safe && params->head_dim >= 128 && runtime->audio_attention_parallel_pipeline != nil && runtime->audio_attention_parallel_pipeline.threadExecutionWidth == 32 && runtime->audio_attention_parallel_pipeline.maxTotalThreadsPerThreadgroup >= 256 && !termite_metal_env_flag_enabled(getenv("ANTFLY_EMBEDDINGGEMMA2_METAL_SERIAL_ATTENTION"))) {
+        const int rc=termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->audio_attention_parallel_pipeline, bindings, 7, params, sizeof(*params), params->heads, params->rows, 256, __func__);
+        if(rc==0) runtime->audio_parallel_attention_launches++;
+        return rc;
+    }
     if (threadgroup_path) {
         return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_attention_tg_pipeline, bindings, 7, params, sizeof(*params), params->heads, params->rows, params->head_dim, __func__);
     }
@@ -65581,14 +65697,94 @@ static int termite_metal_decode_runtime_retain_frame_resource(termite_metal_deco
 // (not-yet-completed) commands, so when `keep_alive` they are moved into the
 // in-flight frame's retained set (active if present, else submitted) to stay
 // alive until the GPU finishes; otherwise their +1 is released immediately.
-static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_runtime *runtime, int keep_alive) {
-    if (runtime == NULL || runtime->frame_reuse_pool == NULL) return;
+static size_t antfly_audio_buffer_charge(id<MTLBuffer> buffer) {
+    const size_t bytes=(size_t)MAX(buffer.length,buffer.allocatedSize);
+    if(bytes>SIZE_MAX-16383u) return SIZE_MAX;
+    return (bytes+16383u)&~(size_t)16383u;
+}
+static bool antfly_audio_fence_complete(id<MTLCommandBuffer> cb) {
+    return cb == nil || cb.status == MTLCommandBufferStatusCompleted ||
+           cb.status == MTLCommandBufferStatusError;
+}
+int antfly_metal_audio_storage_clear(termite_metal_decode_runtime *r) {
+    if (!r || r->audio_reuse_scope || r->active_frame_cb || r->submitted_frame_cb)
+        return -1;
+    for (size_t i = 0; i < 128; i++) {
+        id<MTLCommandBuffer> fence = r->audio_reuse_fences[i];
+        if (fence && !antfly_audio_fence_complete(fence))
+            [fence waitUntilCompleted];
+        r->audio_reuse_buffers[i] = nil;
+        r->audio_reuse_fences[i] = nil;
+    }
+    r->audio_reuse_bytes = 0;
+    return 0;
+}
+int antfly_metal_audio_storage_scope(termite_metal_decode_runtime *r, int begin) {
+    if (!r)
+        return -1;
+    if (begin)
+        r->audio_reuse_scope++;
+    else {
+        if (!r->audio_reuse_scope)
+            return -1;
+        r->audio_reuse_scope--;
+        if (!r->audio_reuse_scope &&
+            termite_metal_env_flag_enabled(getenv("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS")))
+            fprintf(stderr,
+                    "metal_audio_execution fused_linear=%llu parallel_attention=%llu "
+                    "retained_hits=%llu retained_bytes=%zu linear_tunes=%llu norm_clamp=%llu\n",
+                    (unsigned long long)r->audio_fused_linear_launches,
+                    (unsigned long long)r->audio_parallel_attention_launches,
+                    (unsigned long long)r->audio_reuse_hits, r->audio_reuse_bytes,
+                    (unsigned long long)r->audio_linear_tunes,(unsigned long long)r->audio_norm_clamp_launches);
+    }
+    return 0;
+}
+uint64_t antfly_metal_audio_storage_hits(termite_metal_decode_runtime *r) {
+    return r ? r->audio_reuse_hits : 0;
+}
+size_t antfly_metal_audio_storage_bytes(termite_metal_decode_runtime *r) {
+    return r ? r->audio_reuse_bytes : 0;
+}
+static void antfly_audio_storage_retire(termite_metal_decode_runtime *r, id<MTLBuffer> buffer,
+                                        id<MTLCommandBuffer> fence) {
+    const size_t limit = 128u * 1024u * 1024u, charge = antfly_audio_buffer_charge(buffer);
+    if (charge > limit)
+        return;
+    size_t empty = 128;
+    for (size_t i = 0; i < 128; i++) {
+        if (r->audio_reuse_buffers[i] == nil)
+            empty = i;
+    }
+    // Evict only completed, dead storage. In-flight generations remain protected.
+    for (size_t i = 0; i < 128 && (empty == 128 || r->audio_reuse_bytes > limit - charge); i++)
+        if (r->audio_reuse_buffers[i] && antfly_audio_fence_complete(r->audio_reuse_fences[i])) {
+            r->audio_reuse_bytes -= antfly_audio_buffer_charge(r->audio_reuse_buffers[i]);
+            r->audio_reuse_buffers[i] = nil;
+            r->audio_reuse_fences[i] = nil;
+            empty = i;
+        }
+    if (empty == 128 || r->audio_reuse_bytes > limit - charge)
+        return;
+    r->audio_reuse_buffers[empty] = buffer;
+    r->audio_reuse_fences[empty] = fence;
+    r->audio_reuse_bytes += charge;
+}
+
+static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_runtime *runtime,
+                                                          int keep_alive) {
+    if (runtime == NULL || runtime->frame_reuse_pool == NULL)
+        return;
     for (size_t i = 0; i < runtime->frame_reuse_pool_len; ++i) {
         void *handle = runtime->frame_reuse_pool[i];
-        if (handle == NULL) continue;
+        if (handle == NULL)
+            continue;
         @autoreleasepool {
             id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle; // reclaim the +1
             if (keep_alive && buffer != nil) {
+                if (runtime->audio_reuse_scope)
+                    antfly_audio_storage_retire(
+                        runtime, buffer, runtime->active_frame_cb ?: runtime->submitted_frame_cb);
                 (void)termite_metal_decode_runtime_retain_frame_resource(runtime, buffer);
             }
         }
@@ -65596,11 +65792,15 @@ static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_r
     runtime->frame_reuse_pool_len = 0;
 }
 
-int termite_metal_decode_runtime_retain_active_frame_buffer(termite_metal_decode_runtime *runtime, void *handle) {
-    if (runtime == NULL || handle == NULL) return -1;
-    if (runtime->active_frame_cb == nil) return 0;
+int termite_metal_decode_runtime_retain_active_frame_buffer(termite_metal_decode_runtime *runtime,
+                                                            void *handle) {
+    if (runtime == NULL || handle == NULL)
+        return -1;
+    if (runtime->active_frame_cb == nil)
+        return 0;
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
-    if (buffer == nil) return -2;
+    if (buffer == nil)
+        return -2;
     return termite_metal_decode_runtime_retain_frame_resource(runtime, buffer);
 }
 
@@ -65982,6 +66182,7 @@ int termite_metal_decode_runtime_wait_frame(termite_metal_decode_runtime *runtim
     if (status_code != 0) {
         termite_metal_log_command_buffer_failure(cb, __func__);
     }
+    for (size_t i=0;i<128;i++) if(runtime->audio_reuse_fences[i]==cb) runtime->audio_reuse_fences[i]=nil;
     runtime->submitted_frame_cb = nil;
     runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u;
     termite_metal_decode_runtime_clear_frame_resources(&runtime->submitted_frame_retained_resources);
@@ -66882,6 +67083,11 @@ void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t l
                 return handle;
             }
         }
+    }
+    if(storage_mode==1 && runtime->audio_reuse_scope && runtime->active_frame_cb!=nil) {
+        size_t best=128,best_len=SIZE_MAX;
+        for(size_t i=0;i<128;i++) {id<MTLBuffer> b=runtime->audio_reuse_buffers[i];if(b && (size_t)b.length>=length && (size_t)b.length<best_len && antfly_audio_fence_complete(runtime->audio_reuse_fences[i])) {best=i;best_len=(size_t)b.length;}}
+        if(best!=128) {id<MTLBuffer> b=runtime->audio_reuse_buffers[best];runtime->audio_reuse_bytes-=antfly_audio_buffer_charge(b);runtime->audio_reuse_buffers[best]=nil;runtime->audio_reuse_fences[best]=nil;runtime->audio_reuse_hits++;return (__bridge_retained void *)b;}
     }
     return termite_metal_buffer_alloc_new(runtime, length, storage_mode);
 }
@@ -69628,4 +69834,199 @@ const termite_metal_gemma4_audio_binding bindings[4]={
 {(__bridge id<MTLBuffer>)out,out_offset,frames*128*4,true}};
 uint32_t params[2]={(uint32_t)hop,0};memcpy(&params[1],&floor,4);
 return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime,runtime->audio_logmel_pipeline,bindings,4,params,sizeof(params),frames,1,256,__func__);
+}
+
+typedef struct {
+    uint32_t rows, in_dim, out_dim, flags;
+    float input_min, input_max, output_min, output_max;
+} antfly_clipped_linear_params;
+int antfly_metal_clipped_linear(termite_metal_decode_runtime *r, void *input, size_t input_offset,
+                                size_t slot, const antfly_clipped_linear_params *p, void *out,
+                                size_t out_offset) {
+    if (!r || !r->precise_library_safe || !p || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
+        !r->linear_slot_prepared[slot] || r->linear_in_dims[slot] != p->in_dim ||
+        r->linear_out_dims[slot] != p->out_dim ||
+        (r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
+         r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS))
+        return -1;
+    if (!r->audio_clipped_linear_pipeline ||
+        r->audio_clipped_linear_pipeline.threadExecutionWidth != 32 ||
+        r->audio_clipped_linear_pipeline.maxTotalThreadsPerThreadgroup < 256)
+        return -1;
+    const termite_metal_gemma4_audio_binding bindings[3] = {
+        {(__bridge id<MTLBuffer>)input, input_offset, (size_t)p->rows * p->in_dim * 4, false},
+        {r->linear_weight_buffers[slot], 0, (size_t)p->in_dim * p->out_dim * 4, false},
+        {(__bridge id<MTLBuffer>)out, out_offset, (size_t)p->rows * p->out_dim * 4, true}};
+    const int rc = termite_metal_decode_runtime_gemma4_audio_dispatch(
+        r, r->audio_clipped_linear_pipeline, bindings, 3, p, sizeof(*p), (p->out_dim + 31) / 32,
+        (p->rows + 31) / 32, 256, __func__);
+    if (rc == 0)
+        r->audio_fused_linear_launches++;
+    return rc;
+}
+
+int antfly_metal_clipped_linear_choice(termite_metal_decode_runtime *r,
+                                       const antfly_clipped_linear_params *p) {
+    if (!r || !r->precise_library_safe || !p || !r->audio_clipped_linear_pipeline ||
+        r->audio_clipped_linear_pipeline.threadExecutionWidth != 32 ||
+        r->audio_clipped_linear_pipeline.maxTotalThreadsPerThreadgroup < 256)
+        return 0;
+    for (size_t i = 0; i < 32; i++)
+        if (r->audio_linear_stamps[i] && memcmp(r->audio_linear_keys[i], p, 16) == 0) {
+            r->audio_linear_stamps[i] = ++r->audio_linear_clock;
+            return r->audio_linear_choices[i] ? 1 : 0;
+        }
+    return -1;
+}
+int antfly_metal_clipped_linear_tune(termite_metal_decode_runtime *r, size_t slot,
+                                     const antfly_clipped_linear_params *p) {
+    if (!r || !r->precise_library_safe || !p || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
+        !r->linear_slot_prepared[slot] || r->linear_in_dims[slot] != p->in_dim ||
+        r->linear_out_dims[slot] != p->out_dim ||
+        (r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
+         r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS))
+        return 0;
+    @autoreleasepool {
+        size_t xb = (size_t)p->rows * p->in_dim * 4, yb = (size_t)p->rows * p->out_dim * 4;
+        id<MTLBuffer> x = antfly_observe_metal_buffer(
+            [r->device newBufferWithLength:xb options:MTLResourceStorageModeShared],
+            ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> tmp = antfly_observe_metal_buffer(
+            [r->device newBufferWithLength:xb options:MTLResourceStorageModePrivate],
+            ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> y = antfly_observe_metal_buffer(
+            [r->device newBufferWithLength:yb options:MTLResourceStorageModePrivate],
+            ANTFLY_BUFFER_OWNED);
+        if (!x || !tmp || !y)
+            return 0;
+        // A nonzero deterministic probe avoids qualifying a data-degenerate GEMM.
+        // Its lifetime is independent of every request's unsubmitted activations.
+        float *probe = (float *)x.contents;
+        for (size_t i = 0; i < xb / 4; i++) {
+            uint32_t bits = (uint32_t)i * 747796405u + 2891336453u;
+            bits = (bits ^ (bits >> 16)) * 2246822519u;
+            probe[i] = (float)(bits & 0x00ffffffu) * (6.0f / 16777215.0f) - 3.0f;
+        }
+        MPSMatrix *a = [[MPSMatrix alloc]
+            initWithBuffer:(p->flags & 3 ? tmp : x)
+                descriptor:[MPSMatrixDescriptor matrixDescriptorWithRows:p->rows
+                                                                 columns:p->in_dim
+                                                                rowBytes:(size_t)p->in_dim * 4
+                                                                dataType:MPSDataTypeFloat32]];
+        MPSMatrix *b = [[MPSMatrix alloc]
+            initWithBuffer:r->linear_weight_buffers[slot]
+                descriptor:[MPSMatrixDescriptor matrixDescriptorWithRows:p->out_dim
+                                                                 columns:p->in_dim
+                                                                rowBytes:(size_t)p->in_dim * 4
+                                                                dataType:MPSDataTypeFloat32]];
+        MPSMatrix *c = [[MPSMatrix alloc]
+            initWithBuffer:y
+                descriptor:[MPSMatrixDescriptor matrixDescriptorWithRows:p->rows
+                                                                 columns:p->out_dim
+                                                                rowBytes:(size_t)p->out_dim * 4
+                                                                dataType:MPSDataTypeFloat32]];
+        MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:r->device
+                                                                        transposeLeft:NO
+                                                                       transposeRight:YES
+                                                                           resultRows:p->rows
+                                                                        resultColumns:p->out_dim
+                                                                      interiorColumns:p->in_dim
+                                                                                alpha:1
+                                                                                 beta:0];
+        double times[2] = {0, 0};
+        bool valid = true;
+        for (unsigned route = 0; route < 2; route++)
+            for (unsigned iteration = 0; iteration < 8; iteration++) {
+                id<MTLCommandBuffer> cb = [r->queue commandBuffer];
+                if (route) {
+                    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                    [e setComputePipelineState:r->audio_clipped_linear_pipeline];
+                    [e setBuffer:x offset:0 atIndex:0];
+                    [e setBuffer:r->linear_weight_buffers[slot] offset:0 atIndex:1];
+                    [e setBuffer:y offset:0 atIndex:2];
+                    [e setBytes:p length:32 atIndex:3];
+                    [e dispatchThreadgroups:MTLSizeMake((p->out_dim + 31) / 32, (p->rows + 31) / 32,
+                                                        1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [e endEncoding];
+                } else {
+                    if (p->flags & 3) {
+                        termite_metal_gemma4_audio_clamp_params cp = {
+                            (uint32_t)((size_t)p->rows * p->in_dim), p->flags & 3, p->input_min,
+                            p->input_max};
+                        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                        [e setComputePipelineState:r->gemma4_audio_clamp_pipeline];
+                        [e setBuffer:x offset:0 atIndex:0];
+                        [e setBuffer:tmp offset:0 atIndex:1];
+                        [e setBytes:&cp length:sizeof(cp) atIndex:2];
+                        [e dispatchThreads:MTLSizeMake(cp.total, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [e endEncoding];
+                    }
+                    [mm encodeToCommandBuffer:cb leftMatrix:a rightMatrix:b resultMatrix:c];
+                    if (p->flags & 28) {
+                        termite_metal_gemma4_audio_clamp_params cp = {
+                            (uint32_t)((size_t)p->rows * p->out_dim), (p->flags >> 2) & 3,
+                            p->output_min, p->output_max};
+                        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                        [e setComputePipelineState:p->flags & 16
+                                                       ? r->gemma4_audio_clamp_silu_pipeline
+                                                       : r->gemma4_audio_clamp_pipeline];
+                        [e setBuffer:y offset:0 atIndex:0];
+                        [e setBuffer:y offset:0 atIndex:1];
+                        [e setBytes:&cp length:sizeof(cp) atIndex:2];
+                        [e dispatchThreads:MTLSizeMake(cp.total, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [e endEncoding];
+                    }
+                }
+                [cb commit];
+                [cb waitUntilCompleted];
+                double dt = cb.GPUEndTime - cb.GPUStartTime;
+                if (cb.error || !(dt > 0) || !isfinite(dt))
+                    valid = false;
+                if (iteration >= 3)
+                    times[route] += dt;
+            }
+        r->audio_linear_tunes++;
+        size_t victim = 0;
+        for (size_t i = 1; i < 32; i++)
+            if (r->audio_linear_stamps[i] < r->audio_linear_stamps[victim])
+                victim = i;
+        memcpy(r->audio_linear_keys[victim], p, 16);
+        r->audio_linear_stamps[victim] = ++r->audio_linear_clock;
+        r->audio_linear_choices[victim] = valid && times[1] < times[0] * 0.95;
+        return r->audio_linear_choices[victim] ? 1 : 0;
+    }
+}
+
+uint64_t antfly_metal_audio_linear_tunes(termite_metal_decode_runtime *r) {
+    return r ? r->audio_linear_tunes : 0;
+}
+
+typedef struct {
+    uint32_t rows, dim, flags, reserved;
+    float eps, lo, hi, padding;
+} antfly_norm_clamp_params;
+int antfly_metal_norm_clamp(termite_metal_decode_runtime *r, void *input, size_t input_offset,
+                            void *weight, size_t weight_offset, const antfly_norm_clamp_params *p,
+                            void *output, size_t output_offset) {
+    if (!r || !r->precise_library_safe || !p || !p->dim || p->dim % 4 ||
+        !r->audio_norm_clamp_pipeline || r->audio_norm_clamp_pipeline.threadExecutionWidth != 32)
+        return -1;
+    const termite_metal_gemma4_audio_binding bindings[3] = {
+        {(__bridge id<MTLBuffer>)input, input_offset, (size_t)p->rows * p->dim * 4, false},
+        {(__bridge id<MTLBuffer>)weight, weight_offset, (size_t)p->dim * 4, false},
+        {(__bridge id<MTLBuffer>)output, output_offset, (size_t)p->rows * p->dim * 4, true}};
+    size_t width = ((p->dim / 4 + 31) / 32) * 32;
+    if (width > 256)
+        width = 256;
+    const int rc = termite_metal_decode_runtime_gemma4_audio_dispatch(
+        r, r->audio_norm_clamp_pipeline, bindings, 3, p, sizeof(*p), p->rows, 1, width, __func__);
+    if (rc == 0)
+        r->audio_norm_clamp_launches++;
+    return rc;
+}
+uint64_t antfly_metal_audio_norm_clamp_launches(termite_metal_decode_runtime *r) {
+    return r ? r->audio_norm_clamp_launches : 0;
 }

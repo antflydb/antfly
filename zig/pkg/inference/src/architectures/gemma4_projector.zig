@@ -811,21 +811,39 @@ pub fn encodeEmbeddingGemma2Pcm(cb: *const ComputeBackend, a: std.mem.Allocator,
 pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
 pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio) !ResidentProjectedImages {
     if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
+    const storage = try cb.audioStorage(true);
+    defer if (storage) {
+        _ = cb.audioStorage(false) catch false;
+    };
     var weights = ProjectorWeights.initHuggingFace(cb, a);
     defer weights.deinit();
     var features: [4]AudioFeatures = undefined;
     var pointers: [4]*AudioFeatures = undefined;
     var count: usize = 0;
     defer for (features[0..count]) |*feature| feature.deinit();
-    for (prepared) |item| {
-        features[count] = try audioFeaturesFromPrepared(cb, a, @constCast(item));
-        pointers[count] = &features[count];
-        count += 1;
-    }
+    count = try audioFeatureCohort(cb, a, prepared, &features);
+    for (pointers[0..count], 0..) |*pointer, i| pointer.* = &features[i];
     const lengths = try a.alloc(usize, prepared.len);
     errdefer a.free(lengths);
     const result = try encodeAudioFeatureCohortResident(cb, a, &weights, embeddingGemma2AudioConfig(), pointers[0..count], lengths);
     return .{ .allocator = a, .backend = cb, .embeddings = result.embeddings, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = 1, .max_batch_executed = count };
+}
+
+fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio, features: *[4]AudioFeatures) !usize {
+    if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
+    var frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
+    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var count: usize = 0;
+    errdefer for (features[0..count]) |*feature| feature.deinit();
+    for (prepared) |item| {
+        features[count] = try audioFeaturesFromPrepared(cb, a, @constCast(item));
+        count += 1;
+    }
+    if (frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame = false;
+    }
+    return count;
 }
 
 pub fn encodePreparedEmbeddingGemma2AudioResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: *const PreparedAudio) !ResidentEncodedAudio {
@@ -1172,6 +1190,10 @@ fn audioFramePlan(rows: usize, hidden: usize, intermediate: usize) AudioFramePla
 
 fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
+    const storage = try cb.audioStorage(true);
+    defer if (storage) {
+        _ = cb.audioStorage(false) catch false;
+    };
     const features = features_list[0];
     const cohort = features_list.len > 1;
 
@@ -3417,10 +3439,15 @@ fn audioFeedForward(
     var buf: [128]u8 = undefined;
     const suffix = if (second) "_1" else "";
     const norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
-    const normed = try cb.rmsNorm(input, norm_w, cfg.audio_hidden, cfg.layer_norm_eps);
-    defer cb.free(normed);
     const up_name = try fmt(&buf, "a.blk.{d}.ffn_up{s}", .{ layer, suffix });
-    const activated = if (store.gguf == null)
+    const preparation = try audioFfnPreparation(cb, allocator, store, input, norm_w, up_name, rows, cfg.audio_hidden, cfg.layer_norm_eps);
+    const normed = preparation.normed;
+    defer cb.free(normed);
+    const activated = if (preparation.spec) |spec| fused: {
+        const name = try std.fmt.allocPrint(allocator, "{s}.weight", .{up_name});
+        defer allocator.free(name);
+        break :fused try linearNoBiasScalarClipped(cb, allocator, store, normed, name, spec, rows, cfg.audio_hidden, cfg.intermediate_size, true);
+    } else if (store.gguf == null)
         try linearNoBiasMaybeClippedInternal(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, true)
     else blk: {
         const up = try linearNoBiasMaybeClipped(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size);
@@ -5774,6 +5801,19 @@ fn linearNoBiasScalarClipped(
     out_dim: usize,
     silu_output: bool,
 ) !CT {
+    if (!audioHostOps().clamp and cb.vtable.clippedLinear != null) {
+        const weight = try projectorLinearWeightCt(cb, allocator, store, weight_name, in_dim, out_dim);
+        if (try cb.clippedLinear(input, weight, .{
+            .rows = std.math.cast(u32, rows) orelse return error.InvalidTensorShape,
+            .in_dim = std.math.cast(u32, in_dim) orelse return error.InvalidTensorShape,
+            .out_dim = std.math.cast(u32, out_dim) orelse return error.InvalidTensorShape,
+            .flags = @as(u32, @intFromBool(spec.input_min != null)) | (@as(u32, @intFromBool(spec.input_max != null)) << 1) | (@as(u32, @intFromBool(spec.output_min != null)) << 2) | (@as(u32, @intFromBool(spec.output_max != null)) << 3) | (@as(u32, @intFromBool(silu_output)) << 4),
+            .input_min = spec.input_min orelse 0,
+            .input_max = spec.input_max orelse 0,
+            .output_min = spec.output_min orelse 0,
+            .output_max = spec.output_max orelse 0,
+        })) |result| return result;
+    }
     var linear_input = input;
     var free_linear_input = false;
     if (spec.clipsInput()) {
@@ -8414,4 +8454,391 @@ fn checkAdmittedAudioPeak(cb: ComputeBackend, _: ComputeBackend) !void {
 }
 test "embeddinggemma2 Metal admitted audio cohort measures retained peak within unchanged ceiling" {
     try @import("../ops/media_residency_test.zig").onMetal(populateLargeAudioSubsample, checkAdmittedAudioPeak);
+}
+
+const AudioTestEnv = struct {
+    name: [:0]const u8,
+    previous: ?[:0]u8,
+    extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+    extern "c" fn unsetenv([*:0]const u8) c_int;
+    fn set(name: [:0]const u8, value: [:0]const u8) !@This() {
+        const old = if (platform.env.getenv(name)) |v| try std.testing.allocator.dupeSentinel(u8, v, 0) else null;
+        _ = setenv(name.ptr, value.ptr, 1);
+        return .{ .name = name, .previous = old };
+    }
+    fn deinit(self: @This()) void {
+        if (self.previous) |old| {
+            _ = setenv(self.name.ptr, old.ptr, 1);
+            std.testing.allocator.free(old);
+        } else _ = unsetenv(self.name.ptr);
+    }
+};
+fn checkClippedProjection(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    const force = try AudioTestEnv.set("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR", "1");
+    defer force.deinit();
+    const enabled = try AudioTestEnv.set("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR", "0");
+    defer enabled.deinit();
+    for ([_]usize{ 7, 33 }) |rows| {
+        const k = 35;
+        const n = 39;
+        const x = try a.alloc(f32, rows * k);
+        defer a.free(x);
+        var w: [n * k]f32 = undefined;
+        for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 37)) * 0.03 - 0.5;
+        for (&w, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 31)) * 0.003 - 0.04;
+        const input = try deviceResidentFromFloat32(&cb, x, &.{ @intCast(rows), k });
+        defer cb.free(input);
+        const weight = try cb.fromFloat32Shape(&w, &.{ n, k });
+        defer cb.free(weight);
+        const warm = (try cb.clippedLinear(input, weight, .{ .rows = @intCast(rows), .in_dim = k, .out_dim = n, .flags = 0, .input_min = 0, .input_max = 0, .output_min = 0, .output_max = 0 })).?;
+        cb.free(warm);
+        for ([_]u32{ 0, 1, 2, 4, 8, 15, 31 }) |flags| {
+            const p = ops.ClippedLinearParams{ .rows = @intCast(rows), .in_dim = k, .out_dim = n, .flags = flags, .input_min = -0.12, .input_max = 0.13, .output_min = -0.025, .output_max = 0.03 };
+            const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            const result = (try cb.clippedLinear(input, weight, p)).?;
+            defer cb.free(result);
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            try before.expectUnchanged(cb);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            const values = try a.dupe(f32, x);
+            defer a.free(values);
+            for (values) |*v| {
+                if (flags & 1 != 0) v.* = @max(v.*, -0.12);
+                if (flags & 2 != 0) v.* = @min(v.*, 0.13);
+            }
+            const ri = try reference.fromFloat32Shape(values, &.{ @intCast(rows), k });
+            defer reference.free(ri);
+            const rw = try reference.fromFloat32Shape(&w, &.{ n, k });
+            defer reference.free(rw);
+            const ro = try reference.linearNoBias(ri, rw, rows, k, n);
+            defer reference.free(ro);
+            const expected = try reference.toFloat32(ro, a);
+            defer a.free(expected);
+            for (expected, actual) |v, g| {
+                var y = v;
+                if (flags & 4 != 0) y = @max(y, -0.025);
+                if (flags & 8 != 0) y = @min(y, 0.03);
+                if (flags & 16 != 0) y = y / (1 + @exp(-y));
+                try std.testing.expectApproxEqAbs(y, g, 0.00001);
+            }
+        }
+    }
+}
+test "embeddinggemma2 Metal clipped projections fuse scalar bounds and SiLU across row and channel tails" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkClippedProjection);
+}
+fn checkParallelAudioAttention(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const rows = 53;
+    const heads = 2;
+    for ([_]usize{ 128, 256, 512 }) |dim| {
+        const hidden = heads * dim;
+        const x = try a.alloc(f32, rows * hidden);
+        defer a.free(x);
+        const rel = try a.alloc(f32, 13 * hidden);
+        defer a.free(rel);
+        const scales = try a.alloc(f32, dim);
+        defer a.free(scales);
+        @memset(scales, 0.25);
+        var tags: [rows]f32 = undefined;
+        var valid: [rows]bool = undefined;
+        for (x, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.1;
+        for (rel, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
+        for (&tags, &valid, 0..) |*tag, *flag, i| {
+            flag.* = i % 7 != 0;
+            tag.* = @as(f32, if (flag.*) 1 else -1) * @as(f32, if (i < 17) 1 else 18);
+        }
+        const q = try deviceResidentFromFloat32(&cb, x, &.{ rows, @intCast(hidden) });
+        defer cb.free(q);
+        const r = try deviceResidentFromFloat32(&cb, rel, &.{ 13, @intCast(hidden) });
+        defer cb.free(r);
+        const sc = try deviceResidentFromFloat32(&cb, scales, &.{@intCast(dim)});
+        defer cb.free(sc);
+        const mask = try deviceResidentFromFloat32(&cb, &tags, &.{rows});
+        defer cb.free(mask);
+        for ([_]f32{ -1e9, -3 }) |invalid| {
+            var p = ops.Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = hidden, .heads = heads, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = invalid, .exclude_farthest_key = true, .segmented = true };
+            const out = (try cb.gemma4AudioLocalAttention(q, q, q, r, sc, mask, p)).?;
+            defer cb.free(out);
+            const actual = try cb.toFloat32(out, a);
+            defer a.free(actual);
+            var offset: usize = 0;
+            for ([_]usize{ 17, 36 }) |span| {
+                p.rows = span;
+                p.segmented = false;
+                const values = x[offset * hidden ..][0 .. span * hidden];
+                const expected = try audioLocalAttentionReference(a, p, values, values, values, rel, scales, valid[offset..][0..span]);
+                defer a.free(expected);
+                for (actual[offset * hidden ..][0 .. span * hidden], expected) |g, v| try std.testing.expectApproxEqAbs(v, g, 0.00001);
+                offset += span;
+            }
+        }
+    }
+}
+test "embeddinggemma2 Metal parallel local attention preserves segmented invalid-key semantics and reduction order" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkParallelAudioAttention);
+}
+fn checkAudioFrontendCohort(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    var samples: [2080]f32 = undefined;
+    for (&samples, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.4;
+    var prepared = try prepareAudioPcm(a, .{ .samples = &samples, .sample_rate = 16000 }, 128, true, true);
+    defer prepared.deinit();
+    var features: [4]AudioFeatures = undefined;
+    const before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+    const count = try audioFeatureCohort(&cb, a, &.{ &prepared, &prepared, &prepared }, &features);
+    defer for (features[0..count]) |*f| f.deinit();
+    try std.testing.expectEqual(before + 1, cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits);
+    const expected = try cb.toFloat32(features[0].resident.?, a);
+    defer a.free(expected);
+    for (features[1..count]) |f| {
+        const actual = try cb.toFloat32(f.resident.?, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    }
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    defer cb.decoderRuntimeCancelFrame() catch {};
+    var external: [4]AudioFeatures = undefined;
+    const n = try audioFeatureCohort(&cb, a, &.{ &prepared, &prepared }, &external);
+    defer for (external[0..n]) |*f| f.deinit();
+    try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
+    try std.testing.expectEqual(before + 1, cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits);
+}
+test "embeddinggemma2 Metal audio frontends share one cohort submission and preserve external frame ownership" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkAudioFrontendCohort);
+}
+fn checkRetainedAudioStorage(cb: ComputeBackend, _: ComputeBackend) !void {
+    const runtime = @import("../backends/metal_runtime.zig");
+    const DeviceTensor = @import("../backends/metal_tensor.zig").MetalTensor;
+    const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const raw = compute.provider_impl.raw_decode_runtime;
+    try std.testing.expectEqual(@as(c_int, 0), runtime.antfly_metal_audio_storage_scope(raw, 1));
+    var scoped = true;
+    defer if (scoped) {
+        _ = runtime.antfly_metal_audio_storage_scope(raw, 0);
+    };
+    const hits = runtime.antfly_metal_audio_storage_hits(raw);
+    for (0..2) |iteration| {
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        var tensor = try DeviceTensor.deviceAllocate(raw.?, 1024 * 4, .private, &.{1024});
+        const data: [1024]f32 = @splat(0.25);
+        try tensor.uploadBytes(std.mem.sliceAsBytes(&data));
+        tensor.deinit();
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        try std.testing.expect(runtime.antfly_metal_audio_storage_bytes(raw) <= 128 * 1024 * 1024);
+        if (iteration == 1) try std.testing.expect(runtime.antfly_metal_audio_storage_hits(raw) > hits);
+    }
+    try std.testing.expectEqual(@as(c_int, -1), runtime.antfly_metal_audio_storage_clear(raw));
+    try std.testing.expectEqual(@as(c_int, 0), runtime.antfly_metal_audio_storage_scope(raw, 0));
+    scoped = false;
+    try std.testing.expectEqual(@as(c_int, 0), runtime.antfly_metal_audio_storage_clear(raw));
+    try std.testing.expectEqual(@as(usize, 0), runtime.antfly_metal_audio_storage_bytes(raw));
+    // Cancellation never publishes an unexecuted generation into retained storage.
+    try std.testing.expectEqual(@as(c_int, 0), runtime.antfly_metal_audio_storage_scope(raw, 1));
+    scoped = true;
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    var tensor = try DeviceTensor.deviceAllocate(raw.?, 4096, .private, &.{1024});
+    const data: [1024]f32 = @splat(0.5);
+    try tensor.uploadBytes(std.mem.sliceAsBytes(&data));
+    tensor.deinit();
+    try cb.decoderRuntimeCancelFrame();
+    try std.testing.expectEqual(@as(usize, 0), runtime.antfly_metal_audio_storage_bytes(raw));
+}
+test "embeddinggemma2 Metal retained audio storage reuses completed generations and excludes cancellation" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkRetainedAudioStorage);
+}
+
+fn benchmarkAudioConformerKernels(cb: ComputeBackend, _: ComputeBackend) !void {
+    if (!platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_AUDIO")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    const enabled = try AudioTestEnv.set("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR", "0");
+    defer enabled.deinit();
+    for ([_]usize{ 25, 50, 250 }) |rows| for (0..2) |direction| {
+        const k: usize = if (direction == 0) 1024 else 4096;
+        const n: usize = if (direction == 0) 4096 else 1024;
+        const values = try a.alloc(f32, rows * k);
+        defer a.free(values);
+        const weights = try a.alloc(f32, k * n);
+        defer a.free(weights);
+        for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.031) * 0.5;
+        for (weights, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.013) * 0.01;
+        const input = try deviceResidentFromFloat32(&cb, values, &.{ @intCast(rows), @intCast(k) });
+        defer cb.free(input);
+        const weight = try cb.fromFloat32Shape(weights, &.{ @intCast(n), @intCast(k) });
+        defer cb.free(weight);
+        const force = try AudioTestEnv.set("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR", "1");
+        defer force.deinit();
+        for (0..2) |route| {
+            var gpu: u128 = 0;
+            var wall: u64 = 0;
+            for (0..8) |iteration| {
+                const before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+                const started = platform.time.monotonicNs();
+                try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                const out = if (route == 1) (try cb.clippedLinear(input, weight, .{ .rows = @intCast(rows), .in_dim = @intCast(k), .out_dim = @intCast(n), .flags = 31, .input_min = -0.3, .input_max = 0.3, .output_min = -2, .output_max = 2 })).? else staged: {
+                    const clipped = (try cb.clampScalar(input, -0.3, 0.3)).?;
+                    defer cb.free(clipped);
+                    const projected = try cb.linearNoBias(clipped, weight, rows, k, n);
+                    defer cb.free(projected);
+                    break :staged (try cb.clampSilu(projected, -2, 2)).?;
+                };
+                defer cb.free(out);
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                if (iteration >= 3) {
+                    gpu += cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos - before;
+                    wall += platform.time.monotonicNs() - started;
+                }
+            }
+            std.debug.print("audio_clipped_linear rows={} k={} n={} fused={} gpu_ns={} wall_ns={}\n", .{ rows, k, n, route == 1, gpu / 5, wall / 5 });
+        }
+    };
+    for ([_]usize{ 25, 50, 250 }) |rows| {
+        const hidden = 1024;
+        const dim = 256;
+        const values = try a.alloc(f32, rows * hidden);
+        defer a.free(values);
+        for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.1;
+        var rel: [13 * hidden]f32 = undefined;
+        for (&rel, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
+        const scales: [dim]f32 = @splat(0.25);
+        const valid = try a.alloc(f32, rows);
+        defer a.free(valid);
+        @memset(valid, 1);
+        const q = try deviceResidentFromFloat32(&cb, values, &.{ @intCast(rows), hidden });
+        defer cb.free(q);
+        const r = try deviceResidentFromFloat32(&cb, &rel, &.{ 13, hidden });
+        defer cb.free(r);
+        const sc = try deviceResidentFromFloat32(&cb, &scales, &.{dim});
+        defer cb.free(sc);
+        const m = try deviceResidentFromFloat32(&cb, valid, &.{@intCast(rows)});
+        defer cb.free(m);
+        for (0..2) |route| {
+            const env = try AudioTestEnv.set("ANTFLY_EMBEDDINGGEMMA2_METAL_SERIAL_ATTENTION", if (route == 0) "1" else "0");
+            defer env.deinit();
+            var gpu: u128 = 0;
+            var wall: u64 = 0;
+            for (0..8) |iteration| {
+                const before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+                const started = platform.time.monotonicNs();
+                try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                const out = (try cb.gemma4AudioLocalAttention(q, q, q, r, sc, m, .{ .rows = rows, .hidden = hidden, .heads = 4, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = -1e9, .exclude_farthest_key = true })).?;
+                defer cb.free(out);
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                if (iteration >= 3) {
+                    gpu += cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos - before;
+                    wall += platform.time.monotonicNs() - started;
+                }
+            }
+            std.debug.print("audio_local_attention rows={} dim={} parallel={} gpu_ns={} wall_ns={}\n", .{ rows, dim, route == 1, gpu / 5, wall / 5 });
+        }
+    }
+}
+test "embeddinggemma2 completed clipped projection and context-parallel attention benchmark" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, benchmarkAudioConformerKernels);
+}
+
+fn audioFfnPreparation(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, input: CT, weight: CT, prefix: []const u8, rows: usize, dim: usize, eps: f32) !struct { normed: CT, spec: ?ClampSpec = null } {
+    if (store.gguf == null and cb.vtable.rmsNormClamped != null and !audioHostOps().clamp) {
+        const name = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
+        defer a.free(name);
+        const bounds = try cb.modelScalarBounds(name, null);
+        const spec: ?ClampSpec = if (bounds) |b| .{ .input_min = b[0], .input_max = b[1], .output_min = b[2], .output_max = b[3] } else try loadScalarClampSpec(a, store.source(), prefix);
+        if (spec) |source| {
+            if (bounds == null) {
+                _ = try cb.modelScalarBounds(name, .{ source.input_min, source.input_max, source.output_min, source.output_max });
+            }
+            if (source.clipsInput()) if (try cb.rmsNormClamped(input, weight, .{ .rows = std.math.cast(u32, rows) orelse return error.InvalidTensorShape, .dim = std.math.cast(u32, dim) orelse return error.InvalidTensorShape, .flags = @as(u32, @intFromBool(source.input_min != null)) | (@as(u32, @intFromBool(source.input_max != null)) << 1), .eps = eps, .lo = source.input_min orelse 0, .hi = source.input_max orelse 0 })) |normed| {
+                var fused = source;
+                fused.input_min = null;
+                fused.input_max = null;
+                return .{ .normed = normed, .spec = fused };
+            };
+        }
+    }
+    return .{ .normed = try cb.rmsNorm(input, weight, dim, eps) };
+}
+
+fn checkNormClamp(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    const enabled = try AudioTestEnv.set("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR", "0");
+    defer enabled.deinit();
+    for ([_]usize{ 128, 1024 }) |dim| {
+        const rows = 33;
+        const values = try a.alloc(f32, rows * dim);
+        defer a.free(values);
+        const gamma = try a.alloc(f32, dim);
+        defer a.free(gamma);
+        for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.4;
+        for (gamma, 0..) |*v, i| v.* = 1 + @cos(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
+        const input = try deviceResidentFromFloat32(&cb, values, &.{ rows, @intCast(dim) });
+        defer cb.free(input);
+        const weight = try deviceResidentFromFloat32(&cb, gamma, &.{@intCast(dim)});
+        defer cb.free(weight);
+        const cpu_input = try reference.fromFloat32Shape(values, &.{ rows, @intCast(dim) });
+        defer reference.free(cpu_input);
+        const cpu_weight = try reference.fromFloat32Shape(gamma, &.{@intCast(dim)});
+        defer reference.free(cpu_weight);
+        const cpu_norm = try reference.rmsNorm(cpu_input, cpu_weight, dim, 1e-6);
+        defer reference.free(cpu_norm);
+        const normalized = try reference.toFloat32(cpu_norm, a);
+        defer a.free(normalized);
+        for ([_]u32{ 1, 2, 3 }) |flags| {
+            const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+            const out = (try cb.rmsNormClamped(input, weight, .{ .rows = rows, .dim = @intCast(dim), .flags = flags, .eps = 1e-6, .lo = -0.8, .hi = 0.9 })).?;
+            defer cb.free(out);
+            try before.expectUnchanged(cb);
+            const got = try cb.toFloat32(out, a);
+            defer a.free(got);
+            for (got, normalized) |g, v| {
+                var expected = v;
+                if (flags & 1 != 0) expected = @max(expected, -0.8);
+                if (flags & 2 != 0) expected = @min(expected, 0.9);
+                try std.testing.expectApproxEqAbs(expected, g, 0.000002);
+            }
+        }
+    }
+    if (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_AUDIO")) for ([_]usize{ 25, 250 }) |rows| {
+        const dim = 1024;
+        const values = try a.alloc(f32, rows * dim);
+        defer a.free(values);
+        for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.4;
+        const gamma: [dim]f32 = @splat(1);
+        const input = try deviceResidentFromFloat32(&cb, values, &.{ @intCast(rows), dim });
+        defer cb.free(input);
+        const weight = try deviceResidentFromFloat32(&cb, &gamma, &.{dim});
+        defer cb.free(weight);
+        for (0..2) |route| {
+            var gpu: u128 = 0;
+            var wall: u64 = 0;
+            for (0..8) |iteration| {
+                const before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos;
+                const started = platform.time.monotonicNs();
+                try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                const out = if (route == 1) (try cb.rmsNormClamped(input, weight, .{ .rows = @intCast(rows), .dim = dim, .flags = 3, .eps = 1e-6, .lo = -0.8, .hi = 0.9 })).? else staged: {
+                    const norm = try cb.rmsNorm(input, weight, dim, 1e-6);
+                    defer cb.free(norm);
+                    break :staged (try cb.clampScalar(norm, -0.8, 0.9)).?;
+                };
+                defer cb.free(out);
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                if (iteration >= 3) {
+                    gpu += cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos - before;
+                    wall += platform.time.monotonicNs() - started;
+                }
+            }
+            std.debug.print("audio_norm_clamp rows={} fused={} gpu_ns={} wall_ns={}\n", .{ rows, route == 1, gpu / 5, wall / 5 });
+        }
+    };
+}
+test "embeddinggemma2 Metal RMS input-clamp fusion preserves weighted normalization and bound semantics" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkNormClamp);
 }

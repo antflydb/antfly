@@ -2054,6 +2054,9 @@ pub const ComputeBackend = struct {
         /// position bias; see `Gemma4AudioLocalAttentionParams`.
         /// Starts has one exact F32 clip start index per row; no cross-clip taps.
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+        rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
+        clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT = null,
         audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
@@ -4760,6 +4763,28 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, weight, channels, positions, eps);
     }
 
+    pub fn rmsNormClamped(self: *const ComputeBackend, input: CT, weight: CT, p: NormClampParams) !?CT {
+        if (p.rows == 0 or p.dim == 0 or @as(u64, p.rows) * p.dim > std.math.maxInt(u32) or p.flags & ~@as(u32, 3) != 0 or !std.math.isFinite(p.eps) or p.eps <= 0) return error.InvalidTensorShape;
+        const op = self.vtable.rmsNormClamped orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, weight, p);
+        errdefer if (result) |t| self.free(t);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn clippedLinear(self: *const ComputeBackend, input: CT, weight: CT, p: ClippedLinearParams) !?CT {
+        try p.validate();
+        const op = self.vtable.clippedLinear orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, weight, p);
+        errdefer if (result) |t| self.free(t);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn audioStorage(self: *const ComputeBackend, begin: bool) !bool {
+        const op = self.vtable.audioStorage orelse return false;
+        return op(self.ptr, begin);
+    }
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
         const op = self.vtable.audioExecution orelse return null;
         try self.checkExecutionControl();
@@ -6307,3 +6332,39 @@ test "embeddinggemma2 audio frontend bounds every kernel index and ABI" {
     try std.testing.expectEqual(@as(usize, 8), window.input);
     try std.testing.expectEqual(@as(usize, 12), window.output);
 }
+
+/// Scalar bounds are applied during input loads and the GEMM epilogue.
+pub const ClippedLinearParams = extern struct {
+    rows: u32,
+    in_dim: u32,
+    out_dim: u32,
+    flags: u32,
+    input_min: f32,
+    input_max: f32,
+    output_min: f32,
+    output_max: f32,
+    pub fn validate(p: @This()) !void {
+        const max = std.math.maxInt(u32);
+        if (p.rows == 0 or p.in_dim == 0 or p.out_dim == 0 or p.flags & ~@as(u32, 31) != 0 or p.rows > max - 31 or p.in_dim > max - 31 or p.out_dim > max - 31 or @as(u64, p.rows) * p.in_dim > max or @as(u64, p.rows) * p.out_dim > max or @as(u64, p.in_dim) * p.out_dim > max) return error.InvalidTensorShape;
+    }
+};
+
+test "embeddinggemma2 clipped projection bounds every Metal index before backend access" {
+    var p = ClippedLinearParams{ .rows = 33, .in_dim = 35, .out_dim = 39, .flags = 31, .input_min = -1, .input_max = 1, .output_min = -1, .output_max = 1 };
+    try p.validate();
+    p.rows = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+    p.rows = 33;
+    p.in_dim = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+    p.in_dim = 35;
+    p.flags = 32;
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+    p.rows = 1;
+    p.out_dim = 1;
+    p.in_dim = std.math.maxInt(u32);
+    p.flags = 0;
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+}
+
+pub const NormClampParams = extern struct { rows: u32, dim: u32, flags: u32, reserved: u32 = 0, eps: f32, lo: f32, hi: f32, padding: f32 = 0 };
