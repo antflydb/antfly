@@ -281,10 +281,12 @@ The canonical ABI, archive, package, wheel, backend, and consumer matrix lives
 in `scripts/release/platforms.json`; channel behavior lives in
 `scripts/release/channels.json`. Release jobs, CLI packaging, Homebrew, and
 promotion and retention read those policies instead of maintaining independent
-conditionals or platform tables. PyPI publication of native CLI and embedded
-packages is temporarily paused: `publish_pypi` is false for stable and next.
-Wheels are still built and verified as release artifacts. Restore those policy
-flags to resume PyPI publication. To finish a partially published release under
+conditionals or platform tables. PyPI publication of the native CLI installer
+is temporarily paused: `publish_pypi` is false for stable and next. The separate
+`embedded-release-publish.yml` workflow publishes `antfly-embedded` independently,
+after its registry setup is complete. CLI wheels are still built and verified as
+release artifacts. Restore those policy flags to resume CLI PyPI publication.
+To finish a partially published CLI release under
 the updated policy, use the exact-ledger recovery dispatch from `main`; rerunning
 an old workflow retains its original policy. Python
 dependencies used by the release control plane are exact and hash-locked in
