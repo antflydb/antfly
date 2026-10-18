@@ -150,6 +150,95 @@ pub const CheckedBuilder = struct {
     }
 };
 
+/// Region-owned computed results. Fixed-width arrays avoid a Datum vector;
+/// small/variable-width results preserve the existing borrowed-cell contract.
+/// The region owns partial and completed allocations, including unused dense
+/// capacity after sparse finalization. No borrowed allocator escapes finish.
+pub const ResultBuilder = union(enum) {
+    cells: struct { kind: arrays.ElementType, dimensions: []const arrays.Dimension, elements: []arrays.Element, index: usize = 0 },
+    fixed: CheckedBuilder,
+
+    pub fn usesFixed(kind: arrays.ElementType, count: usize) bool {
+        return count >= 32 and supported(kind) and kind != .text;
+    }
+    pub fn allocationBytes(kind: arrays.ElementType, count: usize, rank: usize) !usize {
+        if (rank > 6 or count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        if ((rank == 0) != (count == 0)) return error.InvalidSqlArrayShape;
+        const metadata = @sizeOf(arrays.Value) + rank * @sizeOf(arrays.Dimension);
+        if (usesFixed(kind, count)) return std.math.add(usize, metadata + @sizeOf(layout.View), try layout.sectionSize(kind, rank, count)) catch error.SqlProgramLimitExceeded;
+        return std.math.add(usize, metadata, std.math.mul(usize, count, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded) catch error.SqlProgramLimitExceeded;
+    }
+    pub fn init(a: A, kind: arrays.ElementType, dimensions: []const arrays.Dimension, count: usize, limits: arrays.Limits) !ResultBuilder {
+        const empty = try arrays.validateShape(dimensions, count, limits);
+        const axes = if (empty) &.{} else dimensions;
+        if (try allocationBytes(kind, count, axes.len) > limits.bytes) return error.SqlProgramLimitExceeded;
+        if (usesFixed(kind, count)) return .{ .fixed = try CheckedBuilder.init(a, kind, axes, count, count, 0, limits) };
+        const owned_axes = try a.dupe(arrays.Dimension, axes);
+        const elements = try a.alloc(arrays.Element, count);
+        return .{ .cells = .{ .kind = kind, .dimensions = owned_axes, .elements = elements } };
+    }
+    pub fn append(self: *ResultBuilder, element: arrays.Element, work: *arrays.Budget) !void {
+        switch (self.*) {
+            .cells => |*cells| {
+                if (cells.index == cells.elements.len) return error.InvalidSqlArrayShape;
+                cells.elements[cells.index] = element;
+                cells.index += 1;
+            },
+            .fixed => |*fixed| {
+                try arrays.validateElement(fixed.state.kind, element, work);
+                try fixed.state.append(element);
+            },
+        }
+    }
+    pub fn finish(self: *ResultBuilder, a: A, limits: arrays.Limits, work: *arrays.Budget) !arrays.Value {
+        try work.consume(0);
+        return switch (self.*) {
+            .cells => |cells| blk: {
+                if (cells.index != cells.elements.len) return error.InvalidSqlArrayShape;
+                break :blk try arrays.Value.initWithBudget(cells.kind, cells.dimensions, cells.elements, limits, work);
+            },
+            .fixed => |*fixed| blk: {
+                const state = &fixed.state;
+                if (state.index != state.count) return error.InvalidSqlArrayShape;
+                if (!state.compact and layout.usesCompact(state.kind, state.count, state.non_null)) {
+                    // Pack into the dense prefix first, then shift right for
+                    // checkpoints. Forward packing cannot overwrite unread
+                    // slots; the final overlapping move proceeds backwards.
+                    const width = layout.width(state.kind);
+                    var present: usize = 0;
+                    for (0..state.count) |i| {
+                        if (i % 1024 == 0) try work.consume(@min(1024, state.count - i));
+                        const is_null = state.bytes[state.bitmap + i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0;
+                        if (is_null) continue;
+                        if (present != i) @memcpy(state.bytes[state.values + present * width ..][0..width], state.bytes[state.values + i * width ..][0..width]);
+                        present += 1;
+                    }
+                    const directory = layout.checkpointSize(state.count);
+                    const packed_bytes = present * width;
+                    std.mem.copyBackwards(u8, state.bytes[state.values + directory ..][0..packed_bytes], state.bytes[state.values..][0..packed_bytes]);
+                    var prefix: u32 = 0;
+                    var begin: usize = 0;
+                    while (begin < state.count) : (begin += 64) {
+                        try work.consume(1);
+                        std.mem.writeInt(u32, state.bytes[state.slots + begin / 64 * 4 ..][0..4], prefix, .little);
+                        const end = @min(state.count, begin + 64);
+                        var nulls: usize = 0;
+                        for (state.bytes[state.bitmap + begin / 8 ..][0 .. (end - begin + 7) / 8]) |byte| nulls += @popCount(byte);
+                        prefix += @intCast(end - begin - nulls);
+                    }
+                    const size = state.values + directory + packed_bytes;
+                    _ = a.resize(state.bytes, size);
+                    state.bytes = state.bytes[0..size];
+                    state.values += directory;
+                    state.compact = true;
+                    state.bytes[2] = 1;
+                }
+                break :blk try fixed.finish(a, limits);
+            },
+        };
+    }
+};
+
 test "SQL compact ingress preserves codecs shape nulls and isolated ownership" {
     const a = std.testing.allocator;
     const text = @import("array_text.zig");
@@ -305,4 +394,140 @@ test "SQL checked array builders publish exact proofs and preserve unchecked val
     var invalid = try Builder.init(a, .text, &.{.{ .length = 1 }}, 1, 1, 1, .{});
     try invalid.append(.json(.{ .string = "\x00" }));
     try std.testing.expectError(error.SqlInvalidTextEncoding, invalid.finish(a, .{}));
+}
+
+test "SQL computed array builder matches canonical storage and binary wire across widths shapes and null densities" {
+    const a = std.testing.allocator;
+    const binary = @import("array_binary.zig");
+    for ([_]arrays.ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64 }) |kind| {
+        for ([_]usize{ 0, 1, 31, 32, 33, 63, 64, 65, 129, 1024 }) |count| {
+            for (0..4) |density| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const region = arena.allocator();
+                const dimensions: [1]arrays.Dimension = .{.{ .length = @intCast(count), .lower = -7 }};
+                const axes = dimensions[0..@intFromBool(count != 0)];
+                const cells = try region.alloc(arrays.Element, count);
+                var output = try ResultBuilder.init(region, kind, axes, count, .{});
+                var work: arrays.Budget = .{};
+                for (cells, 0..) |*cell, i| {
+                    const missing = switch (density) {
+                        0 => false,
+                        1 => i % 16 == 0,
+                        2 => i % 16 != 0,
+                        else => true,
+                    };
+                    cell.* = if (missing) .{} else arrays.Element.json(switch (kind) {
+                        .boolean => .{ .bool = i % 2 == 0 },
+                        .float32, .float64 => .{ .float = switch (i % 8) {
+                            0 => -0.0,
+                            1 => std.math.inf(f64),
+                            2 => -std.math.inf(f64),
+                            3 => std.math.nan(f64),
+                            else => @floatFromInt(i),
+                        } },
+                        else => .{ .integer = @intCast(i) },
+                    });
+                    try output.append(cell.*, &work);
+                }
+                const value = try output.finish(region, .{}, &work);
+                try std.testing.expectEqual(ResultBuilder.usesFixed(kind, count), value.stored != null);
+                if (value.stored) |view| {
+                    try std.testing.expect(view.validation != null);
+                    _ = try layout.View.open(kind, view.bytes, .{});
+                    const source = try arrays.Value.init(kind, axes, cells, .{});
+                    const canonical = try @import("array_storage.zig").encodeAlloc(region, source, .{});
+                    try std.testing.expectEqualSlices(u8, canonical, view.bytes);
+                }
+                const source = try arrays.Value.init(kind, axes, cells, .{});
+                var expected: std.Io.Writer.Allocating = .init(a);
+                defer expected.deinit();
+                var actual: std.Io.Writer.Allocating = .init(a);
+                defer actual.deinit();
+                try binary.encode(source, &expected.writer, .{});
+                try binary.encode(value, &actual.writer, .{});
+                try std.testing.expectEqualSlices(u8, expected.written(), actual.written());
+            }
+        }
+    }
+}
+
+test "SQL computed array builder unwinds faults without resize and retains shared cancellation quotas" {
+    const Fixture = struct {
+        fn run(a: A) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var nr: @import("../storage/lite/test_allocator.zig").NoResizeAllocator = .{ .backing = arena.allocator() };
+            const region = nr.allocator();
+            var output = try ResultBuilder.init(region, .int64, &.{ .{ .length = 3, .lower = -3 }, .{ .length = 43, .lower = 7 } }, 129, .{});
+            var work: arrays.Budget = .{};
+            for (0..129) |i| try output.append(if (i % 64 == 0) .json(.{ .integer = @intCast(i) }) else .{}, &work);
+            const value = try output.finish(region, .{}, &work);
+            const view = value.stored.?;
+            try std.testing.expectEqual(@as(usize, 3), view.validation.?.non_null);
+            try std.testing.expectEqual(@as(i32, -3), value.dimensions[0].lower);
+            try std.testing.expectEqual(@as(i32, 7), value.dimensions[1].lower);
+            _ = try layout.View.open(.int64, view.bytes, .{});
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const region = arena.allocator();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, ResultBuilder.init(region, .int64, &.{.{ .length = 64 }}, 64, .{ .elements = 63 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, ResultBuilder.init(region, .int64, &.{.{ .length = 64 }}, 64, .{ .bytes = 128 }));
+    try std.testing.expectError(error.InvalidSqlArrayShape, ResultBuilder.init(region, .int64, &.{.{ .length = 63 }}, 64, .{}));
+    var output = try ResultBuilder.init(region, .int64, &.{.{ .length = 64 }}, 64, .{});
+    var work: arrays.Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, output.append(.{}, &work));
+    work = .{};
+    try std.testing.expectError(error.SqlTypeMismatch, output.append(.json(.{ .string = "bad" }), &work));
+    for (0..64) |_| try output.append(.{}, &work);
+    const Cancel = struct {
+        fn poll(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = region, .checkpoint = Cancel.poll };
+    work = .{ .shared = &parent };
+    try std.testing.expectError(error.Canceled, output.finish(region, .{}, &work));
+    // Cancel during sparse finalization too, after append validation succeeded.
+    parent = .{ .alloc = region, .checkpoint = Cancel.poll, .since_poll = 0 };
+    work = .{ .shared = &parent };
+    var larger = try ResultBuilder.init(region, .int64, &.{.{ .length = 1024 }}, 1024, .{});
+    var local: arrays.Budget = .{};
+    for (0..1024) |_| try larger.append(.{}, &local);
+    try std.testing.expectError(error.Canceled, larger.finish(region, .{}, &work));
+}
+
+test "SQL computed array builder direct preparation and binary output measurement" {
+    const a = std.testing.allocator;
+    const cells = try a.alloc(arrays.Element, 65536);
+    defer a.free(cells);
+    for (cells, 0..) |*cell, i| cell.* = if (i % 16 == 0) .{} else .json(.{ .integer = @intCast(i) });
+    const source = try arrays.Value.init(.int64, &.{.{ .length = 65536, .lower = -7 }}, cells, .{});
+    for (0..2) |mode| {
+        var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a };
+        {
+            var arena = std.heap.ArenaAllocator.init(counter.allocator());
+            defer arena.deinit();
+            const region = arena.allocator();
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            const value = if (mode == 0) (try @import("operators.zig").cloneDatum(region, .typedArray(&source))).array.?.* else compact: {
+                var output = try ResultBuilder.init(region, .int64, source.dimensions, source.cardinality(), .{});
+                var work: arrays.Budget = .{};
+                for (cells) |cell| try output.append(cell, &work);
+                break :compact try output.finish(region, .{}, &work);
+            };
+            const prepare_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+            const peak = counter.peak;
+            const encode_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            var discard: std.Io.Writer.Discarding = .init(&.{});
+            for (0..20) |_| try @import("array_binary.zig").encode(value, &discard.writer, .{});
+            const encode_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - encode_start;
+            std.debug.print("SQL_COMPUTED_ARRAY direct={} elements=65536 prepare_ns={} retained={} peak={} encode20_ns={} wire_bytes={}\n", .{ mode == 1, prepare_ns, try value.retainedBytes(), peak, encode_ns, discard.count });
+        }
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
 }

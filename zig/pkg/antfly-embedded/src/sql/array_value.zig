@@ -127,21 +127,7 @@ pub const Value = struct {
 
     /// Ingress codecs share parsing and typed validation under one work budget.
     pub fn initWithBudget(kind: ElementType, dimensions: []const Dimension, elements: []const Element, limits: Limits, work: *Budget) !Value {
-        if (dimensions.len > 6 or elements.len > limits.elements) return error.SqlProgramLimitExceeded;
-        var empty = dimensions.len == 0;
-        for (dimensions) |dimension| {
-            if (dimension.length == 0) empty = true;
-            // PostgreSQL requires the exclusive upper end to fit int32,
-            // not merely the last valid subscript. Dimension lengths and
-            // intermediate row-major products are also signed-int32 bounded.
-            if (dimension.length > std.math.maxInt(i32) or @as(i64, dimension.lower) + dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        }
-        var count: usize = @intFromBool(dimensions.len != 0);
-        for (dimensions) |dimension| {
-            count = std.math.mul(usize, count, dimension.length) catch return error.SqlProgramLimitExceeded;
-            if (count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        }
-        if (count != elements.len) return error.InvalidSqlArrayShape;
+        const empty = try validateShape(dimensions, elements.len, limits);
         var bytes: usize = @sizeOf(Value) + dimensions.len * @sizeOf(Dimension);
         if (bytes > limits.bytes) return error.SqlProgramLimitExceeded;
         for (elements) |element| {
@@ -240,16 +226,12 @@ pub const Value = struct {
         for (0..self.cardinality()) |i| if (try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq) {
             count += 1;
         };
-        try resultAdmission(count, @intFromBool(count != 0), limits);
-        const dimensions = try alloc.alloc(Dimension, @intFromBool(count != 0));
-        if (count != 0) dimensions[0] = .{ .length = @intCast(count) };
-        const elements = try alloc.alloc(Element, count);
-        var output: usize = 0;
+        const dimensions: [1]Dimension = .{.{ .length = @intCast(count) }};
+        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, .int32, dimensions[0..@intFromBool(count != 0)], count, limits);
         for (0..self.cardinality()) |i| if (try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq) {
-            elements[output] = Element.json(.{ .integer = @as(i64, self.dimensions[0].lower) + @as(i64, @intCast(i)) });
-            output += 1;
+            try output.append(Element.json(.{ .integer = @as(i64, self.dimensions[0].lower) + @as(i64, @intCast(i)) }), work);
         };
-        return Value.initWithBudget(.int32, dimensions, elements, limits, work);
+        return output.finish(alloc, limits, work);
     }
 
     /// Result vectors/dimensions belong to alloc; cell payloads borrow the
@@ -265,19 +247,19 @@ pub const Value = struct {
             if (try compareElement(self.element_type, element, needle, work) == .eq) count -= 1;
         };
         const rank_: usize = if (count == 0) 0 else self.dimensions.len;
-        try resultAdmission(count, rank_, limits);
-        const dimensions = try alloc.dupe(Dimension, self.dimensions[0..rank_]);
+        var axes: [6]Dimension = undefined;
+        if (rank_ > axes.len) return error.SqlProgramLimitExceeded;
+        const dimensions = axes[0..rank_];
+        @memcpy(dimensions, self.dimensions[0..rank_]);
         if (replacement == null and count != 0) dimensions[0].length = @intCast(count);
-        const elements = try alloc.alloc(Element, count);
-        var output: usize = 0;
+        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, self.element_type, dimensions, count, limits);
         for (0..self.cardinality()) |array_cell_0| {
             const element = self.flatCell(array_cell_0);
             const matches = try compareElement(self.element_type, element, needle, work) == .eq;
             if (matches and replacement == null) continue;
-            elements[output] = if (matches) replacement.? else element;
-            output += 1;
+            try output.append(if (matches) replacement.? else element, work);
         }
-        return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
+        return output.finish(alloc, limits, work);
     }
 
     /// Append/prepend preserve an existing one-dimensional lower bound.
@@ -287,20 +269,20 @@ pub const Value = struct {
         if (self.dimensions.len > 1) return error.SqlArrayAppendDimensions;
         try validateElement(self.element_type, element, work);
         const count = self.cardinality() + 1;
-        try resultAdmission(count, 1, limits);
         const lower_bound: i32 = if (self.dimensions.len == 0) 1 else self.dimensions[0].lower;
         if (@as(i64, lower_bound) + @as(i64, @intCast(count)) > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        const dimensions = try alloc.dupe(Dimension, &.{.{ .length = @intCast(count), .lower = lower_bound }});
-        const elements = try alloc.alloc(Element, count);
-        for (elements[@intFromBool(prepend)..][0..self.cardinality()], 0..) |*out, i| out.* = self.flatCell(i);
-        elements[if (prepend) 0 else count - 1] = element;
-        return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
+        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, self.element_type, &.{.{ .length = @intCast(count), .lower = lower_bound }}, count, limits);
+        if (prepend) try output.append(element, work);
+        for (0..self.cardinality()) |i| try output.append(self.flatCell(i), work);
+        if (!prepend) try output.append(element, work);
+        return output.finish(alloc, limits, work);
     }
 
     /// Concatenate whole first-axis slices. Equal-rank arrays may differ only
     /// in their first axis; adjacent ranks require the lower-rank shape to
     /// exactly match the higher-rank tail, including lower bounds. Identity
-    /// results borrow all storage; nonidentity results allocate one flat vector.
+    /// results borrow all storage; nonidentity results allocate typed storage or
+    /// a small/variable-width cell vector.
     pub fn concatenate(self: Value, alloc: Allocator, other: Value, limits: Limits, work: *Budget) !Value {
         if (self.element_type != other.element_type) return error.SqlTypeMismatch;
         if (self.cardinality() == 0) return other;
@@ -315,15 +297,17 @@ pub const Value = struct {
             if (a.length != b.length or a.lower != b.lower) return error.SqlArrayConcatenationDimensions;
         }
         const count = self.cardinality() + other.cardinality();
-        try resultAdmission(count, higher.dimensions.len, limits);
         const first_length = higher.dimensions[0].length + @as(u32, if (left_rank == right_rank) other.dimensions[0].length else 1);
         if (@as(i64, higher.dimensions[0].lower) + first_length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        const dimensions = try alloc.dupe(Dimension, higher.dimensions);
+        var axes: [6]Dimension = undefined;
+        if (higher.dimensions.len > axes.len) return error.SqlProgramLimitExceeded;
+        const dimensions = axes[0..higher.dimensions.len];
+        @memcpy(dimensions, higher.dimensions);
         dimensions[0].length = first_length;
-        const elements = try alloc.alloc(Element, count);
-        for (elements[0..self.cardinality()], 0..) |*out, i| out.* = self.flatCell(i);
-        for (elements[self.cardinality()..], 0..) |*out, i| out.* = other.flatCell(i);
-        return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
+        var output = try @import("array_compact.zig").ResultBuilder.init(alloc, self.element_type, dimensions, count, limits);
+        for (0..self.cardinality()) |i| try output.append(self.flatCell(i), work);
+        for (0..other.cardinality()) |i| try output.append(other.flatCell(i), work);
+        return output.finish(alloc, limits, work);
     }
 
     pub fn compare(self: Value, other: Value, budget: *Budget) !std.math.Order {
@@ -362,11 +346,27 @@ pub const Value = struct {
     }
 };
 
-fn resultAdmission(elements: usize, rank_: usize, limits: Limits) !void {
-    if (elements > limits.elements or @sizeOf(Value) + rank_ * @sizeOf(Dimension) + elements * @sizeOf(Element) > limits.bytes) return error.SqlProgramLimitExceeded;
+/// Shared allocation-free shape gate for prepared and directly typed results.
+pub fn validateShape(dimensions: []const Dimension, count_: usize, limits: Limits) !bool {
+    if (dimensions.len > 6 or count_ > limits.elements) return error.SqlProgramLimitExceeded;
+    var empty = dimensions.len == 0;
+    for (dimensions) |dimension| {
+        if (dimension.length == 0) empty = true;
+        // PostgreSQL requires the exclusive upper end to fit int32,
+        // not merely the last valid subscript. Dimension lengths and
+        // intermediate row-major products are also signed-int32 bounded.
+        if (dimension.length > std.math.maxInt(i32) or @as(i64, dimension.lower) + dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+    }
+    var count: usize = @intFromBool(dimensions.len != 0);
+    for (dimensions) |dimension| {
+        count = std.math.mul(usize, count, dimension.length) catch return error.SqlProgramLimitExceeded;
+        if (count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+    }
+    if (count != count_) return error.InvalidSqlArrayShape;
+    return empty;
 }
 
-fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
+pub fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
     try budget.consume(1);
     if (element.patterns != null or element.array != null) return error.SqlTypeMismatch;
     if (element.numeric != null and (kind != .numeric or element.sql_null or element.value != .null)) return error.SqlTypeMismatch;
