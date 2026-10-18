@@ -5752,3 +5752,12 @@ the 213 shared focused lake checks, and the runtime I/O ABI gate passed.
 The combined SQL/lake/API/ABI/CLI build exited successfully with zero test
 failures or leaks. Source/error catalogs, license and Apache-boundary checks,
 Python lint/format and whitespace checks also passed.
+
+Merged origin/main `08cfbb73c1` without conflicts (`dfa59c1b79`). The
+post-merge inference registry tests, runtime I/O ABI gate and CLI rebuild passed,
+as did all four upstream GLiNER migration/preparation Python checks. The rebuilt
+CLI passed the real Parquet decimal and Iceberg snapshot/schema/delete/restart
+regressions (2 E2Es, 25.48 seconds), with an unchanged executable hash. Source
+and error catalogs, formatting, licenses and the Apache boundary (2,286 sources)
+also passed after the merge. Repository cache cleanup completed; uv pruning
+skipped a shared cache lock rather than interrupting its owner.
