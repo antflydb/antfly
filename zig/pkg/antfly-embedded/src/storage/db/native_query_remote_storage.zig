@@ -33,7 +33,8 @@ pub const Reader = struct {
     root: []const u8,
     files: []const File,
     checkpoint_reference: ?[]const u8 = null,
-    fetch: Fetch,
+    fetch: ?Fetch,
+    linked: ?Linked = null,
     control: Control,
     io: std.Io,
     io_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
@@ -41,16 +42,18 @@ pub const Reader = struct {
     mutex: std.Io.Mutex = .init,
     cache: [32]?Cached = @splat(null),
     clock: u64 = 0,
+    linked_cache: [32]?LinkedCached = @splat(null),
+    const linked_page_bytes = 64 * 1024;
+    const LinkedCached = struct { index: usize, offset: u64, bytes: []u8, used: u64 };
+    const LinkedFile = struct { metadata: @import("native_backup_seal.zig").File, index: usize, physical_path: []const u8 };
+    const Linked = struct { files: std.StringHashMapUnmanaged(LinkedFile), lease: std.Io.File };
     const Cached = struct { id: []const u8, bytes: []u8, used: u64 };
 
     /// Manifest ownership is copied; caller buffers may be released after open.
     pub fn create(a: A, io: std.Io, root: []const u8, files: []const File, fetch: Fetch, control: Control) !*Reader {
-        const self = try a.create(Reader);
-        errdefer a.destroy(self);
-        self.* = .{ .a = a, .arena = .init(a), .root = undefined, .files = undefined, .fetch = fetch, .control = control, .io = io };
-        errdefer self.arena.deinit();
+        const self = try createBase(a, io, root, fetch, control);
+        errdefer self.release();
         const scratch = self.arena.allocator();
-        self.root = try scratch.dupe(u8, std.mem.trimEnd(u8, root, "/"));
         const owned = try scratch.alloc(File, files.len);
         for (owned, files) |*out, manifest_file| {
             if (manifest_file.path.len == 0 or std.fs.path.isAbsolute(manifest_file.path) or std.mem.indexOf(u8, manifest_file.path, "..") != null or std.mem.indexOfAny(u8, manifest_file.path, "\\\x00") != null) return error.CatalogGenerationChanged;
@@ -64,6 +67,40 @@ pub const Reader = struct {
             if (size != manifest_file.size) return error.CatalogGenerationChanged;
         }
         self.files = owned;
+        return self;
+    }
+    fn createBase(a: A, io: std.Io, root: []const u8, fetch: ?Fetch, control: Control) !*Reader {
+        const self = try a.create(Reader);
+        errdefer a.destroy(self);
+        self.* = .{ .a = a, .arena = .init(a), .root = undefined, .files = &.{}, .fetch = fetch, .control = control, .io = io };
+        errdefer self.arena.deinit();
+        self.root = try self.arena.allocator().dupe(u8, std.mem.trimEnd(u8, root, "/"));
+        return self;
+    }
+
+    /// Takes ownership of the shared expiry lease on success. Only metadata is
+    /// copied; paged sources retain this owner and read immutable files in place.
+    pub fn createLinkedWithExecutor(a: A, executor: @import("antfly_runtime_abi").io_abi.Borrow, root: []const u8, physical: []const u8, files: []const @import("native_backup_seal.zig").File, lease_file: std.Io.File, control: Control) !*Reader {
+        var receiver = try executor.receive();
+        const self = try createBase(a, receiver.io(), root, null, control);
+        errdefer self.release();
+        self.io_receiver = receiver;
+        self.io = self.io_receiver.?.io();
+        const a_owned = self.arena.allocator();
+        const owned = try a_owned.alloc(File, files.len);
+        var metadata: std.StringHashMapUnmanaged(LinkedFile) = .empty;
+        for (owned, files, 0..) |*out, input, index| {
+            try control.token().check();
+            if (input.path.len == 0 or std.fs.path.isAbsolute(input.path) or std.mem.indexOf(u8, input.path, "..") != null or std.mem.indexOfAny(u8, input.path, "\\\x00") != null) return error.CatalogGenerationChanged;
+            const path = try a_owned.dupe(u8, input.path);
+            out.* = .{ .path = path, .size = input.size, .chunks = &.{} };
+            if (metadata.contains(path)) return error.CatalogGenerationChanged;
+            var file_metadata = input;
+            file_metadata.path = path;
+            try metadata.put(a_owned, path, .{ .metadata = file_metadata, .index = index, .physical_path = try std.fs.path.join(a_owned, &.{ physical, path }) });
+        }
+        self.files = owned;
+        self.linked = .{ .files = metadata, .lease = lease_file };
         return self;
     }
     pub fn createWithExecutor(a: A, executor: @import("antfly_runtime_abi").io_abi.Borrow, root: []const u8, files: []const File, fetch: Fetch, control: Control) !*Reader {
@@ -87,6 +124,8 @@ pub const Reader = struct {
     pub fn release(self: *Reader) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         for (self.cache) |entry| if (entry) |value| self.a.free(value.bytes);
+        for (self.linked_cache) |entry| if (entry) |value| self.a.free(value.bytes);
+        if (self.linked) |value| value.lease.close(self.io);
         self.arena.deinit();
         self.a.destroy(self);
     }
@@ -105,6 +144,7 @@ pub const Reader = struct {
     }
     fn file(self: *Reader, path: []const u8) !*const File {
         const relative_path = try self.relative(path);
+        if (self.linked) |linked| return if (linked.files.get(relative_path)) |entry| &self.files[entry.index] else error.FileNotFound;
         for (self.files) |*entry| if (std.mem.eql(u8, relative_path, entry.path)) return entry;
         return error.FileNotFound;
     }
@@ -125,7 +165,8 @@ pub const Reader = struct {
             }
         };
         self.mutex.unlock(self.io);
-        const bytes = try self.fetch.read(self.fetch.ptr, self.a, ref, self.control.token());
+        const fetch = self.fetch.?;
+        const bytes = try fetch.read(fetch.ptr, self.a, ref, self.control.token());
         var adopted = false;
         defer if (!adopted) self.a.free(bytes);
         if (bytes.len != ref.byte_len) return error.CatalogGenerationChanged;
@@ -148,8 +189,67 @@ pub const Reader = struct {
         self.cache[victim] = .{ .id = ref.artifact_id, .bytes = bytes, .used = self.clock };
         adopted = true;
     }
+    /// A small bounded page cache avoids open/stat/pread per posting or tree
+    /// key. Misses perform only one page of I/O outside the cache mutex; neither
+    /// descriptors nor cached bytes grow with the table or the number of reads.
+    fn linkedPageSlice(self: *Reader, physical: LinkedFile, offset: u64, within: usize, out: []u8) !void {
+        try self.control.token().check();
+        self.mutex.lockUncancelable(self.io);
+        self.clock +%= 1;
+        for (&self.linked_cache) |*entry| if (entry.*) |*cached| {
+            if (cached.index == physical.index and cached.offset == offset) {
+                cached.used = self.clock;
+                @memcpy(out, cached.bytes[within..][0..out.len]);
+                self.mutex.unlock(self.io);
+                return;
+            }
+        };
+        self.mutex.unlock(self.io);
+        const bytes = try self.a.alloc(u8, @intCast(@min(linked_page_bytes, physical.metadata.size - offset)));
+        var adopted = false;
+        defer if (!adopted) self.a.free(bytes);
+        const file_handle = std.Io.Dir.cwd().openFile(self.io, physical.physical_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.CatalogGenerationChanged,
+            else => return err,
+        };
+        defer file_handle.close(self.io);
+        const stat = try file_handle.stat(self.io);
+        const expected = physical.metadata;
+        if (stat.kind != .file or stat.inode != expected.inode or stat.size != expected.size or stat.mtime.toNanoseconds() != expected.mtime_ns) return error.CatalogGenerationChanged;
+        if (try file_handle.readPositionalAll(self.io, bytes, offset) != bytes.len) return error.CatalogGenerationChanged;
+        try self.control.token().check();
+        @memcpy(out, bytes[within..][0..out.len]);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.linked_cache) |entry| if (entry) |cached| if (cached.index == physical.index and cached.offset == offset) return;
+        var victim: usize = 0;
+        for (self.linked_cache, 0..) |entry, index| {
+            if (entry == null) {
+                victim = index;
+                break;
+            }
+            if (entry.?.used < self.linked_cache[victim].?.used) victim = index;
+        }
+        if (self.linked_cache[victim]) |cached| self.a.free(cached.bytes);
+        self.clock +%= 1;
+        self.linked_cache[victim] = .{ .index = physical.index, .offset = offset, .bytes = bytes, .used = self.clock };
+        adopted = true;
+    }
     fn readInto(self: *Reader, entry: *const File, offset: u64, out: []u8) !void {
         if (offset > entry.size or out.len > entry.size - offset) return error.EndOfStream;
+        if (self.linked) |linked| {
+            const physical = linked.files.get(entry.path).?;
+            var copied: usize = 0;
+            while (copied < out.len) {
+                const wanted = offset + copied;
+                const page_offset = wanted / linked_page_bytes * linked_page_bytes;
+                const within: usize = @intCast(wanted - page_offset);
+                const length = @min(out.len - copied, linked_page_bytes - within);
+                try self.linkedPageSlice(physical, page_offset, within, out[copied..][0..length]);
+                copied += length;
+            }
+            return;
+        }
         var position: u64 = 0;
         var copied: usize = 0;
         for (entry.chunks) |ref| {
@@ -165,6 +265,10 @@ pub const Reader = struct {
             if (copied == out.len) return;
         }
         if (copied != out.len) return error.EndOfStream;
+    }
+    fn readRangeInto(raw: *anyopaque, path: []const u8, offset: u64, bytes: []u8) !void {
+        const self = cast(raw);
+        return self.readInto(try self.file(path), offset, bytes);
     }
     fn readRange(raw: *anyopaque, a: A, path: []const u8, offset: u64, length: usize) ![]u8 {
         const self = cast(raw);
@@ -233,7 +337,7 @@ pub const Reader = struct {
         return .{ .ranges = .{ .ptr = page, .length = entry.size, .read_into = PageSource.read, .close = PageSource.close } };
     }
     pub fn view(self: *Reader) storage.Storage {
-        return .{ .ptr = self, .vtable = &.{ .native_checkpoint_reference_alloc = checkpointReference, .acquire_lease = acquire, .create_dir_path = readOnly, .read_file_alloc = readFile, .read_file_range_alloc = readRange, .file_size = fileSize, .write_file_absolute = writeOnly, .rename_absolute = writeOnly, .delete_file_absolute = readOnly, .delete_tree = readOnly, .now_ns = now, .list_file_names_alloc = list, .open_immutable_source = openSource, .open_leased_immutable_source = openSource } };
+        return .{ .ptr = self, .vtable = &.{ .native_checkpoint_reference_alloc = checkpointReference, .acquire_lease = acquire, .create_dir_path = readOnly, .read_file_alloc = readFile, .read_file_range_alloc = readRange, .read_file_range_into = readRangeInto, .file_size = fileSize, .write_file_absolute = writeOnly, .rename_absolute = writeOnly, .delete_file_absolute = readOnly, .delete_tree = readOnly, .now_ns = now, .list_file_names_alloc = list, .open_immutable_source = openSource, .open_leased_immutable_source = openSource } };
     }
 };
 

@@ -92,6 +92,19 @@ pub const Collector = struct {
                 if (!try lock.tryLock(self.io, .exclusive)) return .{ .complete = false, .visited = visited };
                 {
                     defer lock.unlock(self.io);
+                    // Reader admission also holds the publication lock while
+                    // acquiring this shared lease. Never retire an expiry tree
+                    // whose files are still addressed by a lazy reader.
+                    const lease_path = try std.fs.path.join(self.a, &.{ self.root, name, ".lease" });
+                    defer self.a.free(lease_path);
+                    const reader_lease = try std.Io.Dir.cwd().createFile(self.io, lease_path, .{ .truncate = false });
+                    defer reader_lease.close(self.io);
+                    if (!try reader_lease.tryLock(self.io, .exclusive)) {
+                        self.pending = null;
+                        self.a.free(name);
+                        visited += 1;
+                        continue;
+                    }
                     try std.Io.Dir.rename(self.live_dir, name, self.trash_dir, name, self.io);
                     try fs.syncDirPortable(self.io, self.trash);
                     try fs.syncDirPortable(self.io, self.root);
@@ -205,7 +218,7 @@ test "external lake native linked GC bounds scans and deletion outside publicati
             const available = lock.tryLock(original, .exclusive) catch return error.Unexpected;
             if (!available) return error.Unexpected;
             lock.unlock(original);
-            unlinks += 1;
+            if (!std.mem.eql(u8, name, ".lease")) unlinks += 1;
             return original.vtable.dirDeleteFile(raw, dir, name);
         }
     };
