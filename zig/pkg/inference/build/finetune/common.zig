@@ -140,6 +140,9 @@ pub const CommandSpec = struct {
 pub const TestSpec = struct {
     /// This import-only root is completely covered by the full inference unit gate.
     covered_by_inference: bool = false,
+    /// Small accelerator/model families can compile their actual root rather
+    /// than the shared executable, without inheriting unrelated trainer tests.
+    isolated: bool = false,
     step_name: []const u8,
     root_source_file: []const u8,
     description: []const u8,
@@ -302,7 +305,7 @@ pub fn sharedTests(ctx: Context, specs: []const TestSpec) *std.Build.Step.Compil
     });
     root.addImport("antfly_platform", ctx.antfly_platform_mod);
     for (specs) |spec| {
-        if (spec.covered_by_inference) continue;
+        if (spec.covered_by_inference or spec.isolated) continue;
         std.debug.assert(spec.filters.len == 0);
         std.debug.assert(spec.native_link != .no_accel);
         for (spec.imports) |dependency| {

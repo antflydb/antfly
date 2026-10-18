@@ -23,6 +23,38 @@ const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 pub const specs = [_]common.CommandSpec{
     .{
+        .name = "train-embeddinggemma2",
+        .root_source_file = "src/finetune/train/train_embedding_gemma2.zig",
+        .description = "Train resident CUDA EmbeddingGemma 2 LoRA with durable full-state resume",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
+        .name = "export-embeddinggemma2-lora",
+        .root_source_file = "src/finetune/tools/export_embedding_gemma2_lora.zig",
+        .description = "Export verified EmbeddingGemma 2 checkpoint as PEFT and merged BF16 model",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
+        .name = "eval-embeddinggemma2-retrieval",
+        .root_source_file = "src/finetune/tools/eval_embedding_gemma2_retrieval.zig",
+        .description = "Evaluate prepared text/code retrieval against a deduplicated held-out corpus",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
+        .name = "prepare-embeddinggemma2-lora-inputs",
+        .root_source_file = "src/finetune/tools/prepare_embedding_gemma2_lora_inputs.zig",
+        .description = "Prepare authenticated indexed EmbeddingGemma 2 retrieval shards",
+        .imports = &.{ .build_options, .inference_internal, .inference_hf_tokenizer },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
         .name = "train-laya",
         .root_source_file = "src/finetune/train/train_laya.zig",
         .description = "Finetune native Laya typed decisions with resumable optimizer state and serving export",

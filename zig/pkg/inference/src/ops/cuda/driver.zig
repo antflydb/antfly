@@ -32,6 +32,7 @@ pub const CUstreamCaptureStatus = c_uint;
 pub const CUgraphExecUpdateResult = c_uint;
 pub const CUgraphInstantiateResult = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
+pub const CUDA_ERROR_OUT_OF_MEMORY: CUresult = 2;
 pub const CU_EVENT_DEFAULT: c_uint = 0;
 pub const CU_EVENT_DISABLE_TIMING: c_uint = 2;
 

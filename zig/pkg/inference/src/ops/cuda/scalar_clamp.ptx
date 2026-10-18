@@ -1,0 +1,73 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Handwritten portable PTX: clamp f32 activations without host staging.
+.version 6.0
+.target sm_50
+.address_size 64
+.visible .entry scalar_clamp(
+    .param .u64 input, .param .u64 output, .param .u32 count,
+    .param .f32 lower, .param .f32 upper, .param .u32 bounds
+) {
+    .reg .pred p;
+    .reg .b32 i, block, block_size, thread, n, flags, enabled;
+    .reg .b64 src, dst, offset;
+    .reg .f32 value, lo, hi;
+    ld.param.u64 src, [input];
+    ld.param.u64 dst, [output];
+    ld.param.u32 n, [count];
+    ld.param.f32 lo, [lower];
+    ld.param.f32 hi, [upper];
+    ld.param.u32 flags, [bounds];
+    mov.u32 block, %ctaid.x;
+    mov.u32 block_size, %ntid.x;
+    mov.u32 thread, %tid.x;
+    mad.lo.u32 i, block, block_size, thread;
+    setp.ge.u32 p, i, n;
+    @p bra done;
+    mul.wide.u32 offset, i, 4;
+    add.u64 src, src, offset;
+    add.u64 dst, dst, offset;
+    ld.global.f32 value, [src];
+    and.b32 enabled, flags, 1;
+    setp.ne.u32 p, enabled, 0;
+    @p max.f32 value, value, lo;
+    and.b32 enabled, flags, 2;
+    setp.ne.u32 p, enabled, 0;
+    @p min.f32 value, value, hi;
+    st.global.f32 [dst], value;
+done:
+    ret;
+}
+
+// Exact widening of stored projector weights; no activation precision change.
+.visible .entry widen_16bit(.param .u64 input, .param .u64 output, .param .u32 count, .param .u32 bf16) {
+    .reg .pred p;
+    .reg .b32 i, block, block_size, thread, n;
+    .reg .b64 src, dst, src_offset, dst_offset;
+    .reg .b16 half;
+    .reg .f32 value;
+    ld.param.u64 src, [input];
+    ld.param.u64 dst, [output];
+    ld.param.u32 n, [count];
+    mov.u32 block, %ctaid.x;
+    mov.u32 block_size, %ntid.x;
+    mov.u32 thread, %tid.x;
+    mad.lo.u32 i, block, block_size, thread;
+    setp.ge.u32 p, i, n;
+    @p bra done;
+    mul.wide.u32 src_offset, i, 2;
+    mul.wide.u32 dst_offset, i, 4;
+    add.u64 src, src, src_offset;
+    add.u64 dst, dst, dst_offset;
+    ld.global.b16 half, [src];
+    .reg .b32 bf, bits;
+    ld.param.u32 bf, [bf16];
+    setp.eq.u32 p, bf, 0;
+    @p cvt.f32.f16 value, half;
+    @!p cvt.u32.u16 bits, half;
+    @!p shl.b32 bits, bits, 16;
+    @!p mov.b32 value, bits;
+    st.global.f32 [dst], value;
+done:
+    ret;
+}

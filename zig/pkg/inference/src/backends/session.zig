@@ -86,6 +86,7 @@ pub const RunAdmission = struct {
         intermediate_size: usize = 0,
         attention_heads: usize = 0,
         quadratic_attention: bool = false,
+        embedding_gemma2_cuda: bool = false,
         qwen_dense_workspace: bool = false,
         query_width: usize = 0,
         kv_width: usize = 0,
@@ -183,7 +184,10 @@ pub const RunAdmission = struct {
             @max(self.static_workspace_bytes, request.workspace_bytes),
             @max(dynamic_workspace, try self.profiledWorkspace(request)),
         );
-        const resident_input_bytes = try addBytes(request.host_preprocess_bytes, input_bytes);
+        const resident_input_bytes = try addBytes(
+            try addBytes(request.host_preprocess_bytes, input_bytes),
+            try self.profiledHostScratch(request),
+        );
         // A preceding host-only permit may remain live across execution. Its
         // retained bytes are an explicit credit, not permission to hide
         // outputs or backend workspace from this run reservation.
@@ -220,7 +224,28 @@ pub const RunAdmission = struct {
         if (profile.hidden_size == 0 or request.batch == 0 or request.sequence == 0)
             return 0;
 
-        const tokens = try mulBytes(request.batch, request.sequence);
+        const workspace_sequence = if (profile.embedding_gemma2_cuda)
+            embeddingGemma2AdmissionSequence(request.sequence)
+        else
+            request.sequence;
+        const tokens = try mulBytes(request.batch, workspace_sequence);
+        if (profile.embedding_gemma2_cuda) {
+            // The resident encoder reuses four BF16 [B*S, 2048] arena
+            // buffers across all 24 layers. Account the two persistent
+            // [B*S, 512] activations, request staging, bounded attention and
+            // cuBLASLt workspaces, plus the largest qualified media tower
+            // scratch. No [B,H,S,S] score tensor is materialized.
+            const arena = try mulBytes(try mulBytes(tokens, 4 * 2048), @sizeOf(u16));
+            const states = try mulBytes(try mulBytes(tokens, 2 * 512), @sizeOf(u16));
+            const staging = try addBytes(request.input_bytes, try mulBytes(tokens, 2 * @sizeOf(i64)));
+            const attention = try mulBytes(workspace_sequence, 4 * 256 * (@sizeOf(f32) + @sizeOf(u16)));
+            // Media runs before the text encoder but its BF16 tower keeps a
+            // ~60 MiB reusable layer arena live alongside the bounded
+            // vision-attention arena and F32 bridge tensors. Reserve their
+            // measured peak plus headroom independently of the Lt workspace.
+            const fixed = 80 * 1024 * 1024 + (if (request.preprocessing_complete) @as(usize, 0) else 384 * 1024 * 1024);
+            return try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed));
+        }
         // Attention and FFN phases are sequential, so reserve the larger peak
         // rather than summing mutually exclusive intermediates.
         const attention_floats = try mulBytes(profile.hidden_size, 6);
@@ -259,6 +284,20 @@ pub const RunAdmission = struct {
         return peak;
     }
 
+    fn profiledHostScratch(self: RunAdmission, request: RunRequest) !usize {
+        if (!self.model_profile.embedding_gemma2_cuda) return 0;
+        const padded_sequence = embeddingGemma2AdmissionSequence(request.sequence);
+        if (padded_sequence == request.sequence) return 0;
+        // The input-embedding route retains the caller's original F32 tensor
+        // while materializing a complete zero-padded `[B,roundedS,512]` copy.
+        // Token-id requests over-reserve this amount, which is preferable to
+        // admitting an embedding request that cannot allocate its staging.
+        return try mulBytes(
+            try mulBytes(try mulBytes(request.batch, padded_sequence), 512),
+            @sizeOf(f32),
+        );
+    }
+
     /// Retained slots cannot fund fresh upload, head staging, pooling, and
     /// shape-dependent temporary allocations on a smaller subsequent frame.
     pub fn qwenTransientWorkspaceBytes(self: RunAdmission, tokens: usize) !usize {
@@ -267,6 +306,15 @@ pub const RunAdmission = struct {
         return addBytes(16 * 1024 * 1024, try mulBytes(try mulBytes(tokens, floats), @sizeOf(f32)));
     }
 };
+
+/// The qualified SM89 resident encoder rounds medium and long sequences to a
+/// complete 64-query tile. Admission does not depend on a live device probe,
+/// so conservatively reserve that larger shape for every EG2 CUDA session.
+/// Accepted model inputs never exceed the official 8192-token topology.
+fn embeddingGemma2AdmissionSequence(sequence: usize) usize {
+    if (sequence < 128 or sequence % 64 == 0 or sequence >= 8192) return sequence;
+    return ((sequence + 63) / 64) * 64;
+}
 
 pub const RunRequest = struct {
     batch: usize = 1,
@@ -277,6 +325,9 @@ pub const RunRequest = struct {
     output_kv_bytes: usize = 0,
     workspace_bytes: usize = 0,
     host_preprocess_bytes: usize = 0,
+    /// Media towers have completed; their transient peak is no longer live.
+    /// Retained model caches carry independent leases.
+    preprocessing_complete: bool = false,
     /// Host input bytes still covered by a separate live permit. This credit
     /// is limited to input + preprocessing residency and lets callers compose
     /// CPU preprocessing with backend execution without a release/reacquire
@@ -1716,6 +1767,43 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
     try std.testing.expect(profiled_amounts.host_scratch_bytes > 256 * 1024 * 1024);
 }
 
+test "EmbeddingGemma2 CUDA admission follows the bounded resident arena" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{},
+        .static_workspace_bytes = 1024 * 1024 * 1024,
+        .model_profile = .{
+            .hidden_size = 512,
+            .intermediate_size = 2048,
+            .attention_heads = 4,
+            .embedding_gemma2_cuda = true,
+        },
+    };
+    const b8 = try admission.profiledWorkspace(.{ .batch = 8, .sequence = 8192, .input_bytes = 8 * 8192 * 24 });
+    const b32 = try admission.profiledWorkspace(.{ .batch = 32, .sequence = 8192, .input_bytes = 32 * 8192 * 24 });
+    try std.testing.expect(b8 < 2 * 1024 * 1024 * 1024);
+    try std.testing.expect(b32 < 6 * 1024 * 1024 * 1024);
+    try std.testing.expect(b32 > b8);
+    const tail = try admission.profiledWorkspace(.{ .batch = 32, .sequence = 270, .input_bytes = 32 * 270 * 24 });
+    const complete_tile = try admission.profiledWorkspace(.{ .batch = 32, .sequence = 320, .input_bytes = 32 * 270 * 24 });
+    try std.testing.expectEqual(complete_tile, tail);
+    const tail_amounts = try admission.estimateRequest(.{ .batch = 32, .sequence = 8191, .input_bytes = 32 * 8191 * 512 * @sizeOf(f32) }, &.{});
+    try std.testing.expect(tail_amounts.host_scratch_bytes >= 32 * 8192 * 512 * @sizeOf(f32));
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        admission.profiledHostScratch(.{ .batch = std.math.maxInt(usize), .sequence = 8191 }),
+    );
+    try std.testing.expectEqual(@as(usize, 127), embeddingGemma2AdmissionSequence(127));
+    try std.testing.expectEqual(@as(usize, 8192), embeddingGemma2AdmissionSequence(8191));
+    try std.testing.expectEqual(std.math.maxInt(usize), embeddingGemma2AdmissionSequence(std.math.maxInt(usize)));
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        admission.profiledWorkspace(.{ .batch = std.math.maxInt(usize), .sequence = 8192 }),
+    );
+}
+
 test "forced run admission denials are counted and recover" {
     var controller = memory.AdmissionController{};
     controller.configureForcedRunDenialsForTesting(2);
@@ -1946,4 +2034,18 @@ test "embeddinggemma2 stage supplements preserve base admission and reject overc
     retry.deinit();
     base.deinit();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "embeddinggemma2 CUDA phased admission retires media peak without borrowing" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false, .model_profile = .{ .hidden_size = 512, .intermediate_size = 2048, .attention_heads = 4, .embedding_gemma2_cuda = true } };
+    const before = try admission.estimateRequest(.{ .sequence = 1024, .host_preprocess_bytes = 128 * 1024 * 1024 }, &.{});
+    const after = try admission.estimateRequest(.{ .sequence = 64, .host_preprocess_bytes = 1024, .preprocessing_complete = true }, &.{});
+    try std.testing.expect(before.backend_scratch_bytes > after.backend_scratch_bytes + 384 * 1024 * 1024);
+    var lease = try controller.tryAcquire(.gpu, .{}, before, false);
+    defer lease.release();
+    try lease.retain(after);
+    try std.testing.expectEqual(after, controller.snapshot());
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, lease.retain(before));
+    try std.testing.expectEqual(after, controller.snapshot());
 }

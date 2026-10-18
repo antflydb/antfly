@@ -526,3 +526,206 @@ failure retains bounded preparation; cache reclamation cannot invalidate active
 CPU borrowers or Metal commands. These mechanisms establish reuse and bounded
 lifetimes; speed comparisons require the pinned per-case performance gate in
 [the model guide](../../../docs/guides/embeddinggemma2.md#per-case-performance-gate).
+
+### CUDA decoder cache accounting
+
+Each cached NVDEC decoder owns its admission lease independently of the request
+that created it. Sequence negotiation reserves both the context's physical device
+budget and shared backend scratch admission before driver allocation. Compatible
+clips reuse the same reservation; resize, failed creation, error cleanup, eviction
+and context teardown release it after decoder destruction. Changing admission
+controllers first evicts the old decoder under the session execution lock. Video
+requests denied admission evict their idle decoder and retry admission once.
+
+NVDEC does not report an exact allocation size. The policy reserves 64 MiB of
+opaque driver headroom plus twice the aligned NV12 payload for decode surfaces,
+one mapped output and one working surface. Width is aligned to 256 bytes and
+height to 32 rows, with at most 4096 by 4096 pixels and 32 decode surfaces. This
+is a conservative policy envelope, not measured driver memory. NVIDIA hardware
+qualification must check that envelope against completed-driver memory deltas.
+See NVIDIA's [NVDEC programming guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/nvdec-video-decoder-api-prog-guide/index.html)
+for decode/output surface allocation behavior.
+
+### CUDA staged frame cohorts
+
+The EmbeddingGemma 2 NVDEC consumer converts each selected coded picture to owned
+RGB storage and records a CUDA event before resize/projection. Surface unmapping
+waits for that event, so subsequent vision work does not hold the decoder surface
+and CPU/NVDEC decoding can overlap queued vision execution. Consumer failures
+still drain all queued reads before unmapping.
+
+Repeated model samples of one coded picture share staging and vision projection;
+the projected token rows and timestamps are repeated in their original logical
+order. The default singleton route transfers its hidden tensor directly into the
+tower. The image-batch qualification profile permits bounded cohorts of four
+compatible pictures, flushes geometry changes and the final partial cohort, and
+preserves the 32-frame/model-token limits. Cleanup drains failed work and owns all
+partial staging slots. Batched cuDNN plans preserve independent attention per
+picture. Profile identity and NVIDIA qualification are documented in
+[CUDA_TUNING.md](../../pkg/inference/CUDA_TUNING.md#embeddinggemma-2-encoder-optimization-profiles).
+
+The CUDA EmbeddingGemma2 resize path caches coefficient plans by source/target
+geometry and pixel preparation policy. Model-owned plans and pinned copy staging
+remove success-path per-picture stream drains; source slots wait for H2D events,
+while NVDEC surface release retains its separate RGB-conversion fence. Retention
+is bounded and shared-admitted, with a synchronous uncached fallback on pressure.
+The `NATIVE_VISION` qualification profile runs batched native online-softmax
+attention without score/probability arenas or cuDNN. Video admission drops the
+completed media peak before the BF16 backbone, using the actual expanded length.
+These changes do not establish NVIDIA speedups without completed-device timings.
+
+The native CUDA vision tower now keeps attention inputs/output in BF16. Rotary
+packing preserves the existing F32 arithmetic and conversion boundary, while the
+native head-64 kernel stores BF16 output directly for projection. This removes
+per-layer whole-tensor F32 bridges without changing the tiled attention reduction.
+The opt-in native-vision identity is versioned for the typed BF16 implementation.
+
+
+CUDA media cohorts pack composed BF16 rows directly for the text backbone.
+Resident F32 video producers remain accepted and convert directly into the final
+BF16 encoder arena, including zero padding. Optional graph replay supports up to
+four items and 4096 padded rows, with shape-specific addresses, bounded retained
+admission and synchronized eviction. Grouped immutable PLE projections use a
+16-MiB output budget rather than retaining all 24 layers for long contexts.
+
+CUDA packed projection consumers read QKV and gate/up GEMM rows directly, keeping
+head RMS, text rotary and GELU BF16 rounding boundaries. Vision head fusion is
+limited to attention routes that already consume BF16 rotary output. The fused
+backbone profile also combines vision residual/norm passes. Optional BF16-output
+GEMM tuning uses bounded completed-device trials and a context-owned bounded
+cache; cache misses decline during graph capture. These profiles remain opt-in,
+carry versioned model identities and require NVIDIA vector/ranking and timing
+qualification. See [CUDA tuning](../../pkg/inference/CUDA_TUNING.md) for controls,
+memory bounds and observed execution gates.
+
+CUDA vision replay shares the encoder's four bounded arena slots. Grid axes and
+batch identify retained position tables; workspace/weight changes invalidate
+captured execution. BF16 towers capture after warming, while transient F32
+attention keeps eager ownership. Short encoder graphs avoid the former 64-row
+minimum and use completed warm latency to choose eager/replay submission.
+
+Spatial projector preparation has direct CUDA/Metal kernels for ordered patch
+merging and channel standardization, without host index tables or intermediate
+gathers. RMS keeps the backend's established reduction. CUDA `SPATIAL_POOL`
+remains a separately identified opt-in profile pending NVIDIA qualification.
+
+CUDA deferred frame/image cohorts resize into final patch row spans and share a
+single patch-projection GEMM. Bounds and per-item fallback preserve ordered,
+bounded preparation without growing concatenations. Vision `a` scratch is
+hidden-width, allowing four 480×480 frames to fit the unchanged graph arena cap.
+
+Audio preparation shares fixed immutable frontend tables. CUDA device constants
+have an 8 MiB / 128-entry admitted cache; warm query scales require no per-layer
+readback. Snapshot borrowers retain memory/admission through eviction. Neither
+cache stores clip data, and unusual frontend configurations retain private plans.
+
+
+Accelerator audio preparation uploads PCM once and windows on device, with
+fused magnitude and log/mask operations. Equal-length audio clips batch through
+subsampling without temporal padding; masks and output order remain clip-local.
+CUDA/Metal normalization and final flatten index batched NCHW storage directly,
+removing five full transposes. The fixed 512 FFT uses shared immutable twiddles,
+Zig SIMD across CPU frames and cooperative accelerator blocks. BLAS builds choose from
+completed FFT/BLAS log-mel timings in a bounded eight-geometry policy; a forced
+DFT reference remains available. CUDA implicit-GEMM convolution and FFT are
+separately identified opt-in candidates pending NVIDIA qualification.
+CUDA clamp metadata uses immutable scalar lookups before packed projection.
+CUDA graph retention shares the existing memory ceiling across reuse-aware
+vision/backbone descriptors and fences only evicted storage by completion event.
+
+The fixed audio frontend can fuse windowing, FFT, sparse mel projection and
+log/masking in one accelerator block, with one caller-owned or preparation-owned
+Metal command frame. F32 SIMD-group matrix convolution reuses NCHW tiles on
+compatible Metal devices, with tiled F32 and direct fallbacks. Batch admission
+counts current live/retained buffers and the CUDA masking buffer; legacy backends
+retain the transpose allowance under the same 128 MiB limit.
+
+CUDA conformer plans are opt-in. Actual eager requests warm and learn bounded
+buffer lifetimes before capture. Stable input/mask/segment/scale storage, immutable
+prepared depthwise weights and generation-aware keys preserve replay ownership.
+Audio shares vision/backbone graph admission and completion-fenced eviction;
+capture/admission declines retain eager execution, and cancellation remains
+retryable. Kernel and graph qualification require actual route counters.
+
+Metal conformer scalar-clipped projections have an F32 SIMD-group matrix route
+that applies input bounds during tile loads and output bounds/SiLU before the
+final store. A 32-entry geometry/operation cache compares completed GPU time with
+staged MPS, excludes three warmups, and requires a 5% win; denied or unsupported
+qualification preserves staged execution. Cold tuning uses separately admitted
+scratch of at most 32 MiB and never consumes an unsubmitted request activation.
+
+Audio execution can retain private Metal scratch across frames in an optional
+cache with 128 buffer descriptors and a 128 MiB ceiling. Page-rounded buffer
+allocations are admitted individually. Each retired
+buffer retains its producer command buffer; reuse and eviction require completion.
+Cancellation publishes no storage, pressure reclamation drains the cache, and
+model teardown returns the reservation. In-frame reuse remains the first choice.
+
+Compatible 128–1024-wide Metal attention heads distribute context positions
+across SIMD groups while preserving the existing dimension-reduction and softmax
+order. Narrow heads keep the original kernel. Audio feature cohorts share one
+preparation frame and preserve externally owned frames.
+
+Compatible audio FFNs also fuse weighted RMS normalization with their scalar
+input bounds. This removes a normalization/clamp intermediate and dispatch even
+when staged MPS wins projection qualification. The established reduction order
+and vector multiplication order are retained; unsupported bounds/layouts use
+the reference route. `ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS=1` reports actual
+fused-linear, norm/clamp, parallel-attention and retained-storage route counts.
+F32 device-weight RMS normalization also shares this SIMD4 row reduction when
+no input bounds are requested, preserving the reference fallback for other
+layouts and arithmetic policies.
+
+Metal audio retention charges page-rounded buffer allocations when they enter
+retained storage, rather than reserving the entire ceiling per model. Borrowing
+and eviction return their charges; releases reconcile at safe residency-lock
+boundaries. Retention declines on admission or lock contention, preserving eager
+execution. Completion fences, cancellation cleanup, and model pressure reclamation
+remain mandatory.
+
+Nearby Metal audio lengths can share subsampling convolutions with at most
+12.5% geometry padding. Device-only NCHW padding zeros artificial rows after the
+first normalization, preserving the shorter clip's second-convolution boundary.
+Compaction uses the padded batch stride and returns each clip's original rows
+and mask. Existing exact-length CUDA batching is preserved.
+
+Metal audio schedules bind current inputs to prepared immutable model slots
+and coefficient buffers. They retain no request tensors, allocators, or weight
+pins. Sixteen admitted geometry/range entries cover singleton execution and all
+twelve possible cohort frame groups; recurrent shapes receive priority over
+one-off requests. Model pressure releases schedules before their model entries.
+Capture uses request-local scratch; retained instruction/constant arrays are
+sized to the actual capture. Small coefficients share a packed buffer (at most
+4 MiB per plan). Non-escaping linear and nonlinear outputs share a lifetime-planned
+private arena (at most 64 MiB per plan), with model-owned tensor descriptors reused
+on replay. View ancestors extend lifetimes; returned storage remains independently
+owned. Oversized geometries retain ordinary output allocation.
+Host metadata and physical device allocations are admitted before retention,
+including driver padding. Denied optional preparation preserves eager results
+and retries with bounded backoff, so a transient denial cannot permanently lose
+prepared bindings or the arena.
+
+Replay checks current request control at every instruction and uses shared
+compute encoders within each existing command frame. Cohorts keep their bounded
+pipelined frame groups and cancellation fences. Prepared fused linear routes
+are independent of the evictable tuning cache; unprepared routes can complete
+with staged device operations if fusion declines. Five interleaved warm pairs
+compare median encoding times, rejecting isolated outliers. A slower plan cools
+down for eight visits before retrying; a winning plan resamples after 64 visits.
+Commands are still encoded per execution; this is not a GPU command graph.
+Transposed depthwise coefficients use the model preparation cache across weight
+sources. `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN=1` selects eager scheduling.
+
+The Metal backbone uses model-owned indexed coefficient bindings and projection
+slots across text and media requests. Norm coefficients share one admitted
+buffer; layer scalars remain validated host values. Model pressure drops these
+bindings before releasing language projection slots. A two-entry LRU retains
+full-mask attention ranges, positions and aligned device metadata, keyed by
+batch, sequence length and window. Warm reuse allocates no request descriptors
+or upload buffers; padded or sparse masks retain dynamic preparation. Geometry
+storage shares model admission and pressure cleanup. Optional preparation can
+retry after admission pressure clears. CPU audio waves prepare and wait outside
+the execution gate; each ready wave acquires it for device execution and releases
+it before waiting for the next wave. Invalid CPU inputs require no execution
+lease. Preparation leases, cancellation checks and ordered output ownership
+remain in force.

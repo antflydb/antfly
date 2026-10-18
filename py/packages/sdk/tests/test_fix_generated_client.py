@@ -32,11 +32,22 @@ def write_generated_files(root: Path, signature_count: int) -> None:
     path = root / EMBED_REQUEST
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        "        input_: list[str] | str\n"
-        + "        if isinstance(self.input_, list):\n" * 3
-        + "        model_identity = self.model_identity\n"
-        + "                input_type_1 = cast(list[str], data)\n"
-        + "            return cast(\n"
+        "    def to_dict(self) -> dict[str, Any]:\n"
+        "        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput\n\n"
+        "        input_: dict[str, Any] | list[dict[str, Any]] | list[str] | str\n"
+        "        if isinstance(self.input_, list):\n            input_ = self.input_\n"
+        "        elif isinstance(self.input_, list):\n            input_ = self.input_\n"
+        "        elif isinstance(self.input_, InferenceEmbeddingContentInput):\n            input_ = {}\n"
+        "        elif isinstance(self.input_, list):\n            input_ = self.input_\n"
+        "        encoding_format: str | Unset = UNSET\n\n"
+        "    @classmethod\n"
+        "    def from_dict(cls, src_dict):\n"
+        "        def _parse_input_(data):\n"
+        "            if not isinstance(data, list):\n                raise TypeError()\n"
+        "            if not isinstance(data, list):\n                raise TypeError()\n"
+        "            if not isinstance(data, list):\n                raise TypeError()\n"
+        "            return data\n\n"
+        "        input_ = _parse_input_(src_dict['input'])\n"
     )
 
 
@@ -55,6 +66,9 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
         assert "from ....sql_transport import sql_request, sql_request_async" in source
         assert "response = sql_request(client.get_httpx_client(),**kwargs)" in source
         assert "response = await sql_request_async(client.get_async_httpx_client(),**kwargs)" in source
+    embed_source = (tmp_path / EMBED_REQUEST).read_text()
+    assert embed_source.count("if isinstance(self.input_, list):") == 1
+    assert "ordered content inputs cannot be mixed" in embed_source
 
 
 def test_generator_shape_drift_fails_before_writing(tmp_path: Path) -> None:

@@ -25,6 +25,7 @@ const model_config = @import("embedding_gemma2_config.zig");
 pub const checkpoint_revision = model_config.checkpoint_revision;
 pub const recipe_version = model_config.recipe_version;
 pub const max_tokens = model_config.max_tokens;
+pub const output_dim: usize = 768;
 pub const Config = model_config.Config;
 pub const isModel = model_config.isModel;
 pub const parseConfig = model_config.parseConfig;
@@ -109,7 +110,7 @@ fn requireWeight(allocator: std.mem.Allocator, store: anytype, name: []const u8,
 }
 
 pub fn validDimension(dim: usize) bool {
-    return dim == 768 or dim == 512 or dim == 256 or dim == 128;
+    return dim > 0 and dim <= output_dim;
 }
 
 pub fn taskPrefix(task: []const u8) ![]const u8 {
@@ -118,7 +119,9 @@ pub fn taskPrefix(task: []const u8) ![]const u8 {
         .{ .task = "RETRIEVAL_DOCUMENT", .prefix = "title: none | text: " },
         .{ .task = "QUESTION_ANSWERING", .prefix = "task: question answering | query: " },
         .{ .task = "FACT_VERIFICATION", .prefix = "task: fact checking | query: " },
+        .{ .task = "FACT_CHECKING", .prefix = "task: fact checking | query: " },
         .{ .task = "CODE_RETRIEVAL_QUERY", .prefix = "task: code retrieval | query: " },
+        .{ .task = "CODE_RETRIEVAL", .prefix = "task: code retrieval | query: " },
         .{ .task = "CLASSIFICATION", .prefix = "task: classification | query: " },
         .{ .task = "CLUSTERING", .prefix = "task: clustering | query: " },
         .{ .task = "SEMANTIC_SIMILARITY", .prefix = "task: sentence similarity | query: " },
@@ -269,24 +272,32 @@ test "embeddinggemma2 CPU last use preserves source ownership after operation fa
     try std.testing.expectEqual(@as(?CT, null), source);
 }
 
-fn weight(cb: *const ComputeBackend, layer: usize, suffix: []const u8) !CT {
+fn weight(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8) !CT {
+    if (comptime ops.EmbeddingModelWeight.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingModelWeight) |get| {
+        if (get(cb.ptr, layer, kind)) |ct| return ct;
+    };
     var buf: [192]u8 = undefined;
     return cb.getWeight(try std.fmt.bufPrint(&buf, "language_model.layers.{d}.{s}", .{ layer, suffix }));
 }
 
-fn norm(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: CT, dim: usize, eps: f32) !CT {
+fn globalWeight(cb: *const ComputeBackend, comptime kind: ops.EmbeddingModelWeight) !CT {
+    if (cb.vtable.embeddingModelWeight) |get| if (get(cb.ptr, 0, kind)) |ct| return ct;
+    return cb.getWeight(kind.suffix());
+}
+
+fn norm(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: CT, dim: usize, eps: f32) !CT {
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     return cb.rmsNorm(input, w, dim, eps);
 }
 
-fn normLastUse(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: *?CT, dim: usize, eps: f32) !CT {
+fn normLastUse(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: *?CT, dim: usize, eps: f32) !CT {
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     return rmsNormLastUse(cb, input, w, dim, eps);
 }
 
-fn normResidual(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: *?CT, residual: CT, dim: usize, eps: f32, output_scale: f32) !CT {
+fn normResidual(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: *?CT, residual: CT, dim: usize, eps: f32, output_scale: f32) !CT {
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     if (try cb.rmsNormResidual(input.*.?, w, residual, dim, eps, 1, output_scale)) |result| return finishLastUse(cb, input, result);
@@ -298,7 +309,10 @@ fn normResidual(cb: *const ComputeBackend, layer: usize, suffix: []const u8, inp
     return scaled(cb, sum, output_scale);
 }
 
-fn linear(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+fn linear(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+    if (comptime ops.EmbeddingModelProjection.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingModelLinear) |run| {
+        if (try run(cb.ptr, layer, kind, input, rows, in_dim, out_dim)) |ct| return ct;
+    };
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     return cb.linearNoBias(input, w, rows, in_dim, out_dim);
@@ -314,7 +328,9 @@ const Visibility = struct {
     window_metadata: ?CT = null,
     windowed: ?[]u32 = null,
     allocator: std.mem.Allocator,
+    borrowed: bool = false,
     fn deinit(self: Visibility) void {
+        if (self.borrowed) return;
         self.allocator.free(self.ranges);
         self.allocator.free(self.positions);
         self.allocator.free(self.key_positions);
@@ -463,7 +479,8 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     // Full-context CPU execution otherwise retains several redundant Q/K/V
     // copies until attention returns, exceeding the admitted workspace.
     var names: [3][128]u8 = undefined;
-    var packed_rows = try cb.linearPackedNamed(input, &.{
+    var packed_rows = if (cb.vtable.embeddingModelLinear) |run| try run(cb.ptr, layer, .packed_qkv, input, rows, cfg.hidden_size, (heads + 2 * kv) * d) else null;
+    if (packed_rows == null) packed_rows = try cb.linearPackedNamed(input, &.{
         try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.self_attn.q_proj.weight", .{layer}),
         try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.self_attn.k_proj.weight", .{layer}),
         try std.fmt.bufPrint(&names[2], "language_model.layers.{d}.self_attn.v_proj.weight", .{layer}),
@@ -678,7 +695,8 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     var down: ?CT = blk: {
         const product = product: {
             var names: [2][128]u8 = undefined;
-            if (try cb.linearPackedNamed(fnorm, &.{
+            const prepared = if (cb.vtable.embeddingModelLinear) |run| try run(cb.ptr, layer, .packed_ffn, fnorm, rows, h, 2 * cfg.intermediate_size) else null;
+            if (prepared orelse try cb.linearPackedNamed(fnorm, &.{
                 try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.mlp.gate_proj.weight", .{layer}),
                 try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.mlp.up_proj.weight", .{layer}),
             }, &.{ cfg.intermediate_size, cfg.intermediate_size }, rows, h)) |packed_rows| {
@@ -715,7 +733,7 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
         defer cb.free(projected);
         const ps = try scaled(cb, projected, 1 / @sqrt(@as(f32, @floatFromInt(h))));
         defer cb.free(ps);
-        const pnw = try cb.getWeight("language_model.ple.per_layer_projection_norm.weight");
+        const pnw = try globalWeight(cb, .ple_norm);
         defer cb.free(pnw);
         break :blk try cb.rmsNorm(ps, pnw, cfg.per_layer_input_dim, cfg.rms_norm_eps);
     };
@@ -730,12 +748,16 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(pp);
     var po: ?CT = try linear(cb, layer, "ple_block.per_layer_projection.weight", pp, rows, cfg.per_layer_input_dim, h);
     defer if (po) |value| cb.free(value);
-    const scalar = try weight(cb, layer, "layer_scalar");
-    defer cb.free(scalar);
-    const value = try cb.toFloat32(scalar, allocator);
-    defer allocator.free(value);
-    if (value.len != 1 or !std.math.isFinite(value[0])) return error.InvalidEmbeddingGemma2Weight;
-    const result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, value[0]);
+    const scale: f32 = cached: {
+        if (cb.vtable.embeddingModelScalar) |get| if (get(cb.ptr, layer)) |value| break :cached value;
+        const scalar = try weight(cb, layer, "layer_scalar");
+        defer cb.free(scalar);
+        const value = try cb.toFloat32(scalar, allocator);
+        defer allocator.free(value);
+        if (value.len != 1 or !std.math.isFinite(value[0])) return error.InvalidEmbeddingGemma2Weight;
+        break :cached value[0];
+    };
+    const result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, scale);
     errdefer cb.free(result);
     ple_region.deinit();
     if (comptime @import("build_options").enable_metal) {
@@ -779,7 +801,7 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
     defer cb.free(ps);
     const shaped = (try cb.reshape2d(ps, rows * cfg.num_hidden_layers, cfg.per_layer_input_dim)) orelse return error.EmbeddingGemma2OperationUnavailable;
     defer cb.free(shaped);
-    const pnw = try cb.getWeight("language_model.ple.per_layer_projection_norm.weight");
+    const pnw = try globalWeight(cb, .ple_norm);
     defer cb.free(pnw);
     const normalized = try cb.rmsNorm(shaped, pnw, cfg.per_layer_input_dim, cfg.rms_norm_eps);
     defer cb.free(normalized);
@@ -861,23 +883,27 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (mask.len != rows) return error.InvalidEmbeddingInputLength;
-    var vis = try visibility(allocator, mask, batch, seq);
+    if (cb.vtable.embeddingModelPrepare) |prepare| try prepare(cb.ptr, cfg.num_hidden_layers);
+    const cached = if (cb.vtable.embeddingModelVisibility) |get| try get(cb.ptr, mask, batch, seq, cfg.sliding_window) else null;
+    var vis = if (cached) |view| Visibility{ .ranges = view.ranges, .positions = view.positions, .key_positions = view.positions, .gather = view.gather, .windowed = view.windowed, .global_metadata = view.global_metadata, .window_metadata = view.window_metadata, .allocator = allocator, .borrowed = true } else try visibility(allocator, mask, batch, seq);
     defer vis.deinit();
-    vis.windowed = try windowedRanges(allocator, vis, cfg.sliding_window);
-    if (cb.vtable.embeddingHeadPrepare != null) {
-        const ids = try allocator.alloc(i32, vis.gather.len);
-        defer allocator.free(ids);
-        for (vis.gather, ids) |id, *dest| dest.* = @intCast(id);
-        vis.device_gather = (try cb.fromInt32Shape(ids, &.{@intCast(ids.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
+    if (!vis.borrowed) {
+        vis.windowed = try windowedRanges(allocator, vis, cfg.sliding_window);
+        if (cb.vtable.embeddingHeadPrepare != null) {
+            const ids = try allocator.alloc(i32, vis.gather.len);
+            defer allocator.free(ids);
+            for (vis.gather, ids) |id, *dest| dest.* = @intCast(id);
+            vis.device_gather = (try cb.fromInt32Shape(ids, &.{@intCast(ids.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
+        }
+        if (cb.kind() == .metal) {
+            vis.global_metadata = try visibilityMetadata(cb, allocator, vis, vis.ranges);
+            vis.window_metadata = visibilityMetadata(cb, allocator, vis, vis.windowed.?) catch |err| {
+                if (vis.global_metadata) |tensor| cb.free(tensor);
+                return err;
+            };
+        }
     }
     defer if (vis.device_gather) |tensor| cb.free(tensor);
-    if (cb.kind() == .metal) {
-        vis.global_metadata = try visibilityMetadata(cb, allocator, vis, vis.ranges);
-        vis.window_metadata = visibilityMetadata(cb, allocator, vis, vis.windowed.?) catch |err| {
-            if (vis.global_metadata) |tensor| cb.free(tensor);
-            return err;
-        };
-    }
     defer if (vis.global_metadata) |tensor| cb.free(tensor);
     defer if (vis.window_metadata) |tensor| cb.free(tensor);
     // Native BF16 weights are widened on acquisition. Keep this shared
@@ -998,7 +1024,7 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
             if (!shared_frame) return error.EmbeddingGemma2OperationUnavailable;
         }
     }
-    const nw = try cb.getWeight("language_model.norm.weight");
+    const nw = try globalWeight(cb, .final_norm);
     defer cb.free(nw);
     const normalized = try cb.rmsNorm(hidden, nw, cfg.hidden_size, cfg.rms_norm_eps);
     defer cb.free(normalized);
@@ -1206,8 +1232,12 @@ test "embeddinggemma2 official task prefixes and matryoshka dimensions" {
     try std.testing.expectEqualStrings("title: none | text: ", try taskPrefix("RETRIEVAL_DOCUMENT"));
     try std.testing.expectEqualStrings("task: clustering | query: ", try taskPrefix("CLUSTERING"));
     try std.testing.expectError(error.UnsupportedEmbeddingTask, taskPrefix("unknown"));
+    try std.testing.expect(validDimension(1));
     try std.testing.expect(validDimension(128));
-    try std.testing.expect(!validDimension(384));
+    try std.testing.expect(validDimension(384));
+    try std.testing.expect(validDimension(768));
+    try std.testing.expect(!validDimension(0));
+    try std.testing.expect(!validDimension(769));
 }
 
 test "embeddinggemma2 real official checkpoint matches F32 oracle" {
@@ -1468,7 +1498,9 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
 test "embeddinggemma2 rejects incompatible checkpoint semantics" {
     const a = std.testing.allocator;
     const fixture = @embedFile("embedding_gemma2_config.json");
-    _ = try parseConfig(a, fixture);
+    const cfg = try parseConfig(a, fixture);
+    try std.testing.expect(cfg.resident != null);
+    try std.testing.expect(cfg.resident.?.isOfficialTextTopology());
     const parsed = try std.json.parseFromSlice(std.json.Value, a, fixture, .{});
     defer parsed.deinit();
     const tc = parsed.value.object.getPtr("text_config").?;

@@ -55,6 +55,8 @@ pub const DType = enum(u8) {
     }
 };
 
+pub const device_buffer_ref_bytes = @sizeOf(DeviceBufferRef);
+
 const DeviceBufferRef = struct {
     handle: *anyopaque,
     runtime: *anyopaque,

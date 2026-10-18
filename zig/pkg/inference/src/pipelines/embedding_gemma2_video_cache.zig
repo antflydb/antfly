@@ -268,7 +268,7 @@ test "embeddinggemma2 Metal video cache survives compute wrappers without interm
             self.disarms += 1;
         }
         fn classify(_: *anyopaque) @import("../execution_control.zig").Interruption {
-            return .process_required;
+            return .uninterruptible;
         }
     };
     var probe = Probe{};

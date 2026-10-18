@@ -55,6 +55,10 @@ const materialize_reranker_lora = @import("../tools/materialize_reranker_lora.zi
 const prepare_colqwen2_inputs = @import("../tools/prepare_colqwen2_inputs.zig");
 const prepare_entity_cleanup_cache = @import("../tools/prepare_entity_cleanup_cache.zig");
 const prepare_gemma4_lora_inputs = @import("../tools/prepare_gemma4_lora_inputs.zig");
+const prepare_embedding_gemma2_lora_inputs = @import("../tools/prepare_embedding_gemma2_lora_inputs.zig");
+const train_embedding_gemma2 = @import("../train/train_embedding_gemma2.zig");
+const export_embedding_gemma2_lora = @import("../tools/export_embedding_gemma2_lora.zig");
+const eval_embedding_gemma2_retrieval = @import("../tools/eval_embedding_gemma2_retrieval.zig");
 const prepare_gemma4_multimodal_dataset = dataCommand(@import("../tools/prepare_gemma4_multimodal_dataset.zig"));
 const prepare_gemma4_text_dataset = dataCommand(@import("../tools/prepare_gemma4_text_dataset.zig"));
 const prepare_gliner2_entity_cleanup_cache = @import("../tools/prepare_gliner2_entity_cleanup_cache.zig");
@@ -103,6 +107,10 @@ const Command = struct {
 };
 
 const commands = [_]Command{
+    .{ .domain = "train", .action = "run", .subject = "embeddinggemma2", .adapter_argv0 = "train-embeddinggemma2", .main_fn = train_embedding_gemma2.main },
+    .{ .domain = "adapter", .action = "export", .subject = "embeddinggemma2-lora", .adapter_argv0 = "export-embeddinggemma2-lora", .main_fn = export_embedding_gemma2_lora.main },
+    .{ .domain = "eval", .action = "run", .subject = "embeddinggemma2-retrieval", .adapter_argv0 = "eval-embeddinggemma2-retrieval", .main_fn = eval_embedding_gemma2_retrieval.main },
+    .{ .domain = "dataset", .action = "prepare", .subject = "embeddinggemma2-lora", .adapter_argv0 = "prepare-embeddinggemma2-lora-inputs", .main_fn = prepare_embedding_gemma2_lora_inputs.main },
     .{ .domain = "train", .action = "run", .subject = "laya", .adapter_argv0 = "train-laya", .main_fn = train_laya.main },
     .{ .domain = "train", .action = "run", .subject = "gliner25", .adapter_argv0 = "train-gliner25", .main_fn = train_gliner25.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-pilot", .adapter_argv0 = "generate-gemma4-pilot-dataset", .main_fn = generate_gemma4_pilot_dataset.main },
@@ -359,6 +367,7 @@ fn runCommand(init: std.process.Init, argv0: []const u8, main_fn: CommandMain, a
 
     var command_init = init;
     command_init.minimal.args = .{ .vector = adapted.vector };
+    if (main_fn == train_embedding_gemma2.main) return train_embedding_gemma2.mainWithOriginal(command_init, init.minimal.args);
     if (main_fn == train_gliner25.main) return train_gliner25.mainWithOriginal(command_init, init.minimal.args);
     if (main_fn == materialize_gliner25_adapter.main) return materialize_gliner25_adapter.mainWithOriginal(command_init, init.minimal.args);
     return main_fn(command_init);

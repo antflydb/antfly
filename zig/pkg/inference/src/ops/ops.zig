@@ -36,6 +36,15 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+
+/// Result of an optional backend lookup for immutable scalar model metadata.
+/// `unsupported` lets callers retain their existing weight-loading path;
+/// `missing` is a supported, cached negative lookup.
+pub const ImmutableScalarF32Lookup = union(enum) {
+    unsupported,
+    missing,
+    value: f32,
+};
 pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
 pub const resident_training = @import("resident_training_ops.zig");
 pub const rope_table = @import("rope_table.zig");
@@ -255,6 +264,50 @@ pub const DotGeneral2DManyRequest = struct {
 
 pub const DotGeneral2DManyResult = struct {
     outputs: []CT,
+};
+
+/// Checked device frontend ABI shared by accelerator implementations.
+pub const AudioFrontendParams = extern struct {
+    // 0: window PCM; 1: complex magnitude; 2: log floor and row mask.
+    // 3: channel norm/ReLU (rows=positions, width=channels, floor=eps).
+    // 4: NCHW flatten (rows=time, width=freq, hop=channels).
+    mode: u32,
+    rows: u32,
+    width: u32,
+    hop: u32 = 0,
+    floor: f32 = 0,
+    batch: u32 = 1,
+    pub fn counts(p: @This()) !struct { input: usize, auxiliary: usize, output: usize } {
+        if (p.batch == 0 or (p.batch != 1 and p.mode < 3) or p.mode > 4 or p.rows == 0 or p.width == 0 or ((p.mode == 0 or p.mode == 4) and p.hop == 0) or ((p.mode == 2 or p.mode == 3) and (!std.math.isFinite(p.floor) or p.floor <= 0))) return error.InvalidTensorShape;
+        const n = try std.math.mul(usize, try std.math.mul(usize, try std.math.mul(usize, p.rows, p.width), if (p.mode == 4) p.hop else 1), p.batch);
+        if (n > std.math.maxInt(u32) or (p.mode == 1 and n > std.math.maxInt(u32) / 2)) return error.InvalidTensorShape;
+        const input = switch (p.mode) {
+            0 => try std.math.add(usize, try std.math.mul(usize, p.rows - 1, p.hop), p.width),
+            1 => try std.math.mul(usize, n, 2),
+            else => n,
+        };
+        if (input > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        return .{ .input = input, .auxiliary = if (p.mode == 0 or p.mode == 3) p.width else if (p.mode == 2) p.rows else 0, .output = n };
+    }
+};
+
+/// Spatial merge in row-major dy/dx addition order, followed by optional
+/// per-channel (pooled-bias)*scale. RMS stays on the backend's qualified route.
+pub const SpatialPoolParams = struct {
+    batch: u32,
+    grid_x: u32,
+    grid_y: u32,
+    merge: u32,
+    dim: u32,
+    pub fn validate(p: @This()) !void {
+        if (p.batch == 0 or p.grid_x == 0 or p.grid_y == 0 or p.merge == 0 or p.dim == 0 or p.grid_x % p.merge != 0 or p.grid_y % p.merge != 0) return error.InvalidTensorShape;
+        var count: u64 = p.batch;
+        for ([_]u32{ p.grid_x, p.grid_y, p.dim }) |factor| count = std.math.mul(u64, count, factor) catch return error.InvalidTensorShape;
+        if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+    }
+    pub fn rows(p: @This()) usize {
+        return @as(usize, p.batch) * (p.grid_x / p.merge) * (p.grid_y / p.merge);
+    }
 };
 
 /// Backend-neutral inputs for a device-resident AdamW update.  Bias
@@ -768,6 +821,8 @@ pub const Gemma4AudioLocalAttentionParams = struct {
     invalid_value: f32,
     /// HF Gemma4 audio masking uses distance < context_left - 1.
     exclude_farthest_key: bool = false,
+    /// Segmented entries carry +/- (clip_start + 1); negative is invalid.
+    segmented: bool = false,
 };
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
@@ -1674,6 +1729,11 @@ pub const ComputeBackend = struct {
         return self.vtable.backendKind(self.ptr);
     }
 
+    pub fn immutableResidentScalarF32(self: *const ComputeBackend, name: []const u8) !ImmutableScalarF32Lookup {
+        const op = self.vtable.immutableResidentScalarF32 orelse return .unsupported;
+        return op(self.ptr, name);
+    }
+
     /// Install a backend-provided device-write hook on `storage` if this
     /// backend supports one. When the backend can't accelerate device writes
     /// for the storage's dtype or geometry, the call is a no-op and the
@@ -1808,6 +1868,10 @@ pub const ComputeBackend = struct {
         /// fast paths; backends without a device KV implementation leave it
         /// null.
         provisionKvDeviceWriteHook: ?*const fn (ctx: *anyopaque, storage: *runtime.kv.storage_runtime.KvStorageRuntime) anyerror!void = null,
+
+        /// Read immutable scalar inference metadata from resident model
+        /// storage. Implementations may cache both values and missing names.
+        immutableResidentScalarF32: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!ImmutableScalarF32Lookup = null,
 
         /// Optional request boundary for shared backend implementations.
         beginRequest: ?*const fn (ctx: *anyopaque) anyerror!void = null,
@@ -1988,6 +2052,31 @@ pub const ComputeBackend = struct {
 
         /// Gemma 4 audio conformer chunked local attention with relative
         /// position bias; see `Gemma4AudioLocalAttentionParams`.
+        /// Starts has one exact F32 clip start index per row; no cross-clip taps.
+        depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+        rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
+        clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        embeddingModelVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingModelVisibility = null,
+        embeddingModelPrepare: ?*const fn (ctx: *anyopaque, layers: usize) anyerror!void = null,
+        embeddingModelWeight: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight) ?CT = null,
+        embeddingModelScalar: ?*const fn (ctx: *anyopaque, layer: usize) ?f32 = null,
+        embeddingModelLinear: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelProjection, input: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
+        audioNodeInto: ?*const fn (ctx: *anyopaque, node: *const anyopaque, values: []const ?CT, output: CT) anyerror!bool = null,
+        audioPreparedLinear: ?*const fn (ctx: *anyopaque, input: CT, slot: usize, rows: usize, in_dim: usize, out_dim: usize, clip: ?ClippedLinearParams, output: ?CT) anyerror!?CT = null,
+        audioArenaView: ?*const fn (ctx: *anyopaque, arena: CT, offset: usize, rows: usize, dim: usize) anyerror!CT = null,
+        audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
+        audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
+        audioPad: ?*const fn (ctx: *anyopaque, input: CT, p: AudioPadParams) anyerror!?CT = null,
+        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT = null,
+        audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
+        audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
+        audioBatchLayoutsEnabled: ?*const fn (ctx: *anyopaque) bool = null,
+        audioFft512Enabled: ?*const fn (ctx: *anyopaque) bool = null,
+        audioFft512: ?*const fn (ctx: *anyopaque, input: CT, twiddles: CT, frames: usize) anyerror!?CT = null,
+        channelLayerNormReluBatch: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) anyerror!?CT = null,
+        flattenChannelsTimeFreqBatch: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, time: usize, freq: usize, channels: usize) anyerror!?CT = null,
+        audioFrontend: ?*const fn (ctx: *anyopaque, input: CT, auxiliary: ?CT, params: AudioFrontendParams) anyerror!?CT = null,
+        supportsLinearPackedNamed: ?*const fn (ctx: *anyopaque) bool = null,
         gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers
@@ -2416,6 +2505,20 @@ pub const ComputeBackend = struct {
         scaledDotProductAttentionGemma4Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         scaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        tryScaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        /// Direct spatial merge and optional channel standardization.
+        spatialPoolPrepare: ?*const fn (ctx: *anyopaque, input: CT, bias: ?CT, scale: ?CT, params: SpatialPoolParams) anyerror!?CT = null,
+
+        /// Complete official EmbeddingGemma2 HF vision encoder. The input and
+        /// output are token-major F32 `[sequence, 768]`. A backend may decline
+        /// before queueing work; errors after submission must propagate.
+        runEmbeddingGemma2VisionTower: ?*const fn (ctx: *anyopaque, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize, control: ?InferenceExecutionControl) anyerror!?CT = null,
+        /// Exact Pillow RGB8 resize and official 16x16 patch packing. Returns
+        /// F32 `[patch_count, 768]` scaled pixels; decline before queueing work.
+        preprocessEmbeddingGemma2ImagePatches: ?*const fn (ctx: *anyopaque, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!?CT = null,
+        /// Same preparation, written into caller-owned F32 patch rows. A
+        /// decline occurs before any write to the destination.
+        preprocessEmbeddingGemma2ImagePatchesInto: ?*const fn (ctx: *anyopaque, destination: CT, row_offset: usize, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!bool = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
         /// to scaledDotProductAttention with an all-ones mask, but lets
@@ -4355,6 +4458,38 @@ pub const ComputeBackend = struct {
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
+    pub fn tryScaledDotProductAttentionEmbeddingGemma2Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
+        if (self.vtable.tryScaledDotProductAttentionEmbeddingGemma2Vision) |f| {
+            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+        }
+        return null;
+    }
+
+    pub fn spatialPoolPrepare(self: *const ComputeBackend, input: CT, bias: ?CT, scale: ?CT, params: SpatialPoolParams) !?CT {
+        try params.validate();
+        if ((bias == null) != (scale == null)) return error.InvalidTensorShape;
+        const op = self.vtable.spatialPoolPrepare orelse return null;
+        return op(self.ptr, input, bias, scale, params);
+    }
+
+    pub fn runEmbeddingGemma2VisionTower(self: *const ComputeBackend, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize) !?CT {
+        const op = self.vtable.runEmbeddingGemma2VisionTower orelse return null;
+        return op(self.ptr, input, sequence, grid_x, grid_y, batch, self.execution_control);
+    }
+
+    pub fn preprocessEmbeddingGemma2ImagePatchesInto(self: *const ComputeBackend, destination: CT, row_offset: usize, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !bool {
+        const op = self.vtable.preprocessEmbeddingGemma2ImagePatchesInto orelse return false;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, destination, row_offset, rgb, width, height, stride, target_width, target_height);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    pub fn preprocessEmbeddingGemma2ImagePatches(self: *const ComputeBackend, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !?CT {
+        const op = self.vtable.preprocessEmbeddingGemma2ImagePatches orelse return null;
+        return op(self.ptr, rgb, width, height, stride, target_width, target_height);
+    }
+
     /// Token-major `Q [queries, heads*head_dim]` attending to `K`/`V`
     /// `[keys, heads*head_dim]` through per-query key ranges (see
     /// `SegmentAttention`). Returns token-major `[queries, heads*head_dim]`.
@@ -4636,6 +4771,115 @@ pub const ComputeBackend = struct {
     pub fn channelLayerNormRelu(self: *const ComputeBackend, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) !?CT {
         const op = self.vtable.channelLayerNormRelu orelse return null;
         return op(self.ptr, input, weight, channels, positions, eps);
+    }
+
+    pub fn rmsNormClamped(self: *const ComputeBackend, input: CT, weight: CT, p: NormClampParams) !?CT {
+        if (p.rows == 0 or p.dim == 0 or @as(u64, p.rows) * p.dim > std.math.maxInt(u32) or p.flags & ~@as(u32, 3) != 0 or !std.math.isFinite(p.eps) or p.eps <= 0) return error.InvalidTensorShape;
+        const op = self.vtable.rmsNormClamped orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, weight, p);
+        errdefer if (result) |t| self.free(t);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn clippedLinear(self: *const ComputeBackend, input: CT, weight: CT, p: ClippedLinearParams) !?CT {
+        try p.validate();
+        const op = self.vtable.clippedLinear orelse return null;
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, weight, p);
+        errdefer if (result) |t| self.free(t);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn audioStorage(self: *const ComputeBackend, begin: bool) !bool {
+        const op = self.vtable.audioStorage orelse return false;
+        return op(self.ptr, begin);
+    }
+    pub fn audioPad(self: *const ComputeBackend, input: CT, p: AudioPadParams) !?CT {
+        const op = self.vtable.audioPad orelse return null;
+        try self.checkExecutionControl();
+        if (p.batch == 0 or p.batch > 4 or p.channels == 0 or p.rows == 0 or p.width == 0 or p.output_rows < p.rows) return error.InvalidTensorShape;
+        for (p.valid_rows[0..p.batch]) |n| if (n > p.rows) return error.InvalidTensorShape;
+        var total: u64 = p.batch;
+        for ([_]u32{ p.channels, p.output_rows, p.width }) |factor| total = std.math.mul(u64, total, factor) catch return error.InvalidTensorShape;
+        if (total > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const out = try op(self.ptr, input, p);
+        errdefer if (out) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return out;
+    }
+    pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
+        const op = self.vtable.audioExecution orelse return null;
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, key, inputs, context, run);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn supportsAudioBatchLayouts(self: *const ComputeBackend) bool {
+        return self.vtable.channelLayerNormReluBatch != null and self.vtable.flattenChannelsTimeFreqBatch != null and if (self.vtable.audioBatchLayoutsEnabled) |op| op(self.ptr) else false;
+    }
+    pub fn supportsAudioLogMel(self: *const ComputeBackend) bool {
+        return self.vtable.audioLogMel != null and if (self.vtable.audioLogMelEnabled) |op| op(self.ptr) else true;
+    }
+    pub fn audioLogMel(self: *const ComputeBackend, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) !?CT {
+        if (frames == 0 or frames > std.math.maxInt(u32) / 512 or hop == 0 or hop > std.math.maxInt(u32) or !std.math.isFinite(floor) or floor <= 0) return error.InvalidTensorShape;
+        const op = self.vtable.audioLogMel orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, pcm, plan, mask, frames, hop, floor);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn supportsAudioFft512(self: *const ComputeBackend) bool {
+        if (self.vtable.audioFft512 == null) return false;
+        return if (self.vtable.audioFft512Enabled) |op| op(self.ptr) else true;
+    }
+    pub fn audioFft512(self: *const ComputeBackend, input: CT, twiddles: CT, frames: usize) !?CT {
+        if (frames == 0 or frames > std.math.maxInt(u32) / 320) return error.InvalidTensorShape;
+        try self.checkExecutionControl();
+        const op = self.vtable.audioFft512 orelse return null;
+        const result = try op(self.ptr, input, twiddles, frames);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn channelLayerNormReluBatch(self: *const ComputeBackend, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) !?CT {
+        const op = self.vtable.channelLayerNormReluBatch orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, weight, batch, channels, positions, eps);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn flattenChannelsTimeFreqBatch(self: *const ComputeBackend, input: CT, batch: usize, time: usize, freq: usize, channels: usize) !?CT {
+        const op = self.vtable.flattenChannelsTimeFreqBatch orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, input, batch, time, freq, channels);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn audioFrontend(self: *const ComputeBackend, input: CT, auxiliary: ?CT, params: AudioFrontendParams) !?CT {
+        _ = try params.counts();
+        try self.checkExecutionControl();
+        const op = self.vtable.audioFrontend orelse return null;
+        const result = try op(self.ptr, input, auxiliary, params);
+        errdefer if (result) |tensor| self.free(tensor);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn supportsLinearPackedNamed(self: *const ComputeBackend) bool {
+        if (self.vtable.linearPackedNamed == null) return false;
+        return if (self.vtable.supportsLinearPackedNamed) |op| op(self.ptr) else true;
     }
 
     pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
@@ -6109,3 +6353,152 @@ test "packed boundary QKV releases all outputs and cancels its owned scope on re
         try std.testing.expectEqual(@as(usize, if (case == .post_cancel or case == .success) 3 else 0), fake.frees);
     }
 }
+
+test "embeddinggemma2 audio frontend bounds every kernel index and ABI" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(AudioFrontendParams));
+    try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 0, .rows = 2, .width = 4, .hop = std.math.maxInt(u32) }).counts());
+    try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 4, .rows = 2, .width = 4 }).counts());
+    try std.testing.expectError(error.InvalidTensorShape, (AudioFrontendParams{ .mode = 3, .rows = 2, .width = 4, .floor = std.math.nan(f32) }).counts());
+    const window = try (AudioFrontendParams{ .mode = 0, .rows = 3, .width = 4, .hop = 2 }).counts();
+    try std.testing.expectEqual(@as(usize, 8), window.input);
+    try std.testing.expectEqual(@as(usize, 12), window.output);
+}
+
+/// Scalar bounds are applied during input loads and the GEMM epilogue.
+pub const ClippedLinearParams = extern struct {
+    rows: u32,
+    in_dim: u32,
+    out_dim: u32,
+    flags: u32,
+    input_min: f32,
+    input_max: f32,
+    output_min: f32,
+    output_max: f32,
+    pub fn validate(p: @This()) !void {
+        const max = std.math.maxInt(u32);
+        if (p.rows == 0 or p.in_dim == 0 or p.out_dim == 0 or p.flags & ~@as(u32, 31) != 0 or p.rows > max - 31 or p.in_dim > max - 31 or p.out_dim > max - 31 or @as(u64, p.rows) * p.in_dim > max or @as(u64, p.rows) * p.out_dim > max or @as(u64, p.in_dim) * p.out_dim > max) return error.InvalidTensorShape;
+    }
+};
+
+test "embeddinggemma2 clipped projection bounds every Metal index before backend access" {
+    var p = ClippedLinearParams{ .rows = 33, .in_dim = 35, .out_dim = 39, .flags = 31, .input_min = -1, .input_max = 1, .output_min = -1, .output_max = 1 };
+    try p.validate();
+    p.rows = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+    p.rows = 33;
+    p.in_dim = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+    p.in_dim = 35;
+    p.flags = 32;
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+    p.rows = 1;
+    p.out_dim = 1;
+    p.in_dim = std.math.maxInt(u32);
+    p.flags = 0;
+    try std.testing.expectError(error.InvalidTensorShape, p.validate());
+}
+
+pub const NormClampParams = extern struct { rows: u32, dim: u32, flags: u32, reserved: u32 = 0, eps: f32, lo: f32, hi: f32, padding: f32 = 0 };
+
+/// NCHW geometry padding; valid rows are geometry, independent of model masks.
+pub const AudioPadParams = extern struct {
+    batch: u32,
+    channels: u32,
+    rows: u32,
+    width: u32,
+    output_rows: u32,
+    valid_rows: [4]u32,
+};
+
+/// Immutable EmbeddingGemma2 bindings, indexed independently of request shapes.
+pub const EmbeddingModelWeight = enum {
+    input_norm,
+    post_attention_norm,
+    pre_ffn_norm,
+    post_ffn_norm,
+    post_ple_norm,
+    q_norm,
+    k_norm,
+    final_norm,
+    ple_norm,
+    pub fn suffix(self: @This()) []const u8 {
+        return switch (self) {
+            .input_norm => "input_layernorm.weight",
+            .post_attention_norm => "post_attention_layernorm.weight",
+            .pre_ffn_norm => "pre_feedforward_layernorm.weight",
+            .post_ffn_norm => "post_feedforward_layernorm.weight",
+            .post_ple_norm => "ple_block.post_per_layer_input_norm.weight",
+            .q_norm => "self_attn.q_norm.weight",
+            .k_norm => "self_attn.k_norm.weight",
+            .final_norm => "language_model.norm.weight",
+            .ple_norm => "language_model.ple.per_layer_projection_norm.weight",
+        };
+    }
+    pub fn fromSuffix(comptime name: []const u8) ?@This() {
+        inline for (comptime std.meta.tags(@This()).*) |tag| {
+            if (std.mem.eql(u8, name, tag.suffix())) return tag;
+        }
+        return null;
+    }
+    pub fn index(self: @This(), layer: usize) usize {
+        const id: usize = @backingInt(self);
+        return if (id < 7) layer * 7 + id else 24 * 7 + id - 7;
+    }
+};
+pub const EmbeddingModelProjection = enum {
+    q,
+    k,
+    v,
+    attention_out,
+    gate,
+    up,
+    down,
+    ple_gate,
+    ple_out,
+    packed_qkv,
+    packed_ffn,
+    pub fn suffix(self: @This()) []const u8 {
+        return switch (self) {
+            .q => "self_attn.q_proj.weight",
+            .k => "self_attn.k_proj.weight",
+            .v => "self_attn.v_proj.weight",
+            .attention_out => "self_attn.o_proj.weight",
+            .gate => "mlp.gate_proj.weight",
+            .up => "mlp.up_proj.weight",
+            .down => "mlp.down_proj.weight",
+            .ple_gate => "ple_block.per_layer_input_gate.weight",
+            .ple_out => "ple_block.per_layer_projection.weight",
+            .packed_qkv, .packed_ffn => "",
+        };
+    }
+    pub fn fromSuffix(comptime name: []const u8) ?@This() {
+        inline for (comptime std.meta.tags(@This()).*) |tag| {
+            if (std.mem.eql(u8, name, tag.suffix())) return tag;
+        }
+        return null;
+    }
+};
+
+test "embeddinggemma2 indexed model bindings cover distinct layers and global coefficients" {
+    try std.testing.expectEqual(EmbeddingModelWeight.q_norm, EmbeddingModelWeight.fromSuffix("self_attn.q_norm.weight").?);
+    try std.testing.expectEqual(EmbeddingModelProjection.ple_out, EmbeddingModelProjection.fromSuffix("ple_block.per_layer_projection.weight").?);
+    var seen: [170]bool = @splat(false);
+    for (std.meta.tags(EmbeddingModelWeight)) |kind| {
+        const count: usize = if (@backingInt(kind) < 7) 24 else 1;
+        for (0..count) |layer| {
+            const index = kind.index(layer);
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+        }
+    }
+    for (seen) |value| try std.testing.expect(value);
+}
+
+pub const EmbeddingModelVisibility = struct {
+    ranges: []u32,
+    windowed: []u32,
+    positions: []i32,
+    gather: []i64,
+    global_metadata: CT,
+    window_metadata: CT,
+};

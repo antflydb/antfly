@@ -129,7 +129,7 @@ const Job = struct {
                     const probability = self.scores[c] / sum;
                     if (probability == 0) continue;
                     const key = block + c - past;
-                    if (key > row or row - key > past or self.valid[key] == 0) continue;
+                    if (key > row or row - key > past - @intFromBool(p.exclude_farthest_key) or self.valid[key] == 0) continue;
                     axpy(dst, self.v[key * p.hidden + head * p.head_dim ..][0..p.head_dim], probability);
                 }
             }

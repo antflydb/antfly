@@ -81,7 +81,7 @@ pub fn groupShape(group: grouped.Group) !micro.Shape {
         },
         .audio => |bytes| {
             result.bytes = try std.math.add(usize, result.bytes, bytes.len);
-            result.tokens = @min(@as(usize, 8192), result.tokens + 1024);
+            result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, try projector.embeddingGemma2EncodedAudioSequenceBound(bytes)));
         },
         .pcm => |pcm| {
             result.bytes = try std.math.add(usize, result.bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
@@ -121,9 +121,20 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         if ((shape(group) catch return null) == null) general = true;
         if (group.content.len != 1 or (groups[0].content.len == 1 and @backingInt(std.meta.activeTag(group.content[0])) != @backingInt(std.meta.activeTag(groups[0].content[0])))) general = true;
     }
-    if (general and session.backend() == .cuda) return null;
+    if (session.backend() == .cuda) {
+        const media_batch = if (factory.getEmbeddingGemma2CudaPolicy(session)) |policy| policy.media_batch else false;
+        // Audio uses the shared prepared-group scheduler so CUDA keeps its
+        // reference resampling and BF16 backbone instead of the F32 route.
+        if (groups[0].content[0] == .audio and media_batch) general = true;
+        if (general and !media_batch) return null;
+        if (general) for (groups) |group| for (group.content) |part| switch (part) {
+            .text, .image, .audio => {},
+            else => return null,
+        };
+    }
     const audio_mode = !general and groups[0].content.len == 1 and groups[0].content[0] == .audio;
     if (!general and ((audio_mode and (!cfg.audio or !options.resident_audio)) or (!audio_mode and !cfg.vision))) return null;
+    if (session.backend() == .cuda and !general and (audio_mode or grouped.imageCohortLimit(session) == 1)) return null;
     var capacity: usize = @min(@as(usize, 4), max_batch);
     if (capacity == 0) return error.InvalidImageBatch;
     try control.check();
@@ -166,7 +177,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         }
     };
     const shared = std.heap.smp_allocator;
-    const items = try broker.submitBatchControlled(Ticket, grouped.Result, io, shared, .{ .model = model, .generation = generation, .task = .embed, .schema = options.task_type, .option_key = @as(u64, @intCast(options.dimensions)) * 64 + @as(u64, @backingInt(options.video_decoder.policy)) * 8 + @as(u64, @intFromBool(options.resident_audio)) * 4 + @as(u64, @intFromBool(options.resident_images)) * 2 + @intFromBool(options.prepare_ahead), .transform = if (general) "gemma4-prepared-groups" else if (audio_mode) "gemma4-audio" else if (raster_mode.?) "gemma4-rgba" else "gemma4-encoded", .resource_class = if (session.backend() == .metal or session.backend() == .cuda) .gpu else .cpu }, .{ .mode = .native, .preferred_items = capacity, .max_items = capacity, .max_bytes = if (!general and raster_mode.?) 512 * 1024 * 1024 else max_bytes, .max_pixels = max_pixels, .max_tokens = if (general) 4 * 8192 else if (audio_mode) 4096 else 2048, .max_wait_us = max_wait_us }, shapes, identities, try deadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, broker, execute);
+    const items = try broker.submitBatchControlled(Ticket, grouped.Result, io, shared, .{ .model = model, .generation = generation, .task = .embed, .schema = options.task_type, .option_key = imageOptionsKey(options), .transform = if (general) "gemma4-prepared-groups" else if (audio_mode) "gemma4-audio" else if (raster_mode.?) "gemma4-rgba" else "gemma4-encoded", .resource_class = if (session.backend() == .metal or session.backend() == .cuda) .gpu else .cpu }, .{ .mode = .native, .preferred_items = capacity, .max_items = capacity, .max_bytes = if (!general and raster_mode.?) 512 * 1024 * 1024 else max_bytes, .max_pixels = max_pixels, .max_tokens = if (general) 4 * 8192 else if (audio_mode) 4096 else 2048, .max_wait_us = max_wait_us }, shapes, identities, try deadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, broker, execute);
     defer {
         for (items) |item| switch (item.result) {
             .value => |value| shared.free(value.vector),
@@ -358,6 +369,15 @@ test "gemma4 audio broker bounds unknown lengths and rejects mixed modalities" {
     try std.testing.expectEqual(@as(usize, 1024), value.tokens);
     try std.testing.expectEqual(@as(usize, 7), value.bytes);
     try std.testing.expect(try shape(.{ .content = &.{ .{ .text = "query" }, .{ .audio = "encoded" } } }) == null);
+}
+
+fn imageOptionsKey(options: grouped.Options) u64 {
+    return (@as(u64, @intCast(options.max_tokens)) << 16) | (@as(u64, @intCast(options.dimensions)) * 64 + @as(u64, @backingInt(options.video_decoder.policy)) * 8 + @as(u64, @intFromBool(options.resident_audio)) * 4 + @as(u64, @intFromBool(options.resident_images)) * 2 + @intFromBool(options.prepare_ahead));
+}
+
+test "gemma4 image broker isolates expanded token limits" {
+    try std.testing.expect(imageOptionsKey(.{ .max_tokens = 256 }) != imageOptionsKey(.{ .max_tokens = 512 }));
+    try std.testing.expect(imageOptionsKey(.{ .dimensions = 128 }) != imageOptionsKey(.{ .dimensions = 768 }));
 }
 
 test "embeddinggemma2 prepared broker accounts mixed and video groups before decoding" {

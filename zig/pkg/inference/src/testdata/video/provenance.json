@@ -1,0 +1,17 @@
+{
+  "source_commit": "f9c8c701ff747db8e6eca6ede2c158c7c4a1b161",
+  "license": "Apache-2.0",
+  "fixtures": [
+    {
+      "file": "closed.mp4",
+      "source": "zig/pkg/inference/src/testdata/video/closed.mp4",
+      "sha256": "3b5a5e12bf9831002e1f45d3d0b2ed8676632a884b526c098f15bcd18cb06efc"
+    },
+    {
+      "file": "bframes.mp4",
+      "source": "zig/pkg/inference/src/testdata/video/bframes.mp4",
+      "sha256": "58de44f592e3df42aca292965394a3213b1bc7047e1269d5262652fb32a2dc18"
+    }
+  ],
+  "original_generator": "zig/lib/video testdata schedule-closed.mp4 and decode-bframes.mp4; zig/lib/media/scripts/generate_ts_fixtures.py records MP4 source provenance"
+}

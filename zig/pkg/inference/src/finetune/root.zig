@@ -14,6 +14,18 @@
 // limitations under the License.
 
 pub const lora = @import("lora.zig");
+pub const embedding_gemma2_job = @import("embedding_gemma2_job.zig");
+pub const embedding_gemma2_runner = @import("embedding_gemma2_runner.zig");
+pub const embedding_gemma2_data = @import("embedding_gemma2_data.zig");
+pub const embedding_gemma2_batch = @import("embedding_gemma2_batch.zig");
+pub const embedding_gemma2_loss = @import("embedding_gemma2_loss.zig");
+pub const embedding_gemma2_training = @import("embedding_gemma2_training.zig");
+pub const embedding_gemma2_graph = @import("embedding_gemma2_graph.zig");
+pub const embedding_gemma2_real_autodiff = @import("embedding_gemma2_real_autodiff.zig");
+pub const embedding_gemma2_cuda = @import("embedding_gemma2_cuda.zig");
+pub const embedding_gemma2_export = @import("embedding_gemma2_export.zig");
+pub const embedding_gemma2_checkpoint = @import("embedding_gemma2_checkpoint.zig");
+pub const embedding_gemma2_adapter_state = @import("embedding_gemma2_adapter_state.zig");
 pub const laya_job = @import("laya/job.zig");
 pub const laya_evaluate = @import("laya/evaluate.zig");
 pub const command_registry = @import("command_registry.zig");
@@ -89,6 +101,15 @@ pub const runners = @import("runners.zig");
 
 test {
     _ = lora;
+    // The isolated model-training root imports inference_internal as a separate
+    // module, whose tests Zig does not discover. Keep these model-backed tests
+    // reachable from the main inference test root as well.
+    _ = embedding_gemma2_real_autodiff;
+    _ = @import("embedding_gemma2_cuda_encoder.zig");
+    _ = @import("embedding_gemma2_cuda_session.zig");
+    _ = @import("embedding_gemma2_cuda_projection.zig");
+    _ = @import("embedding_gemma2_cuda_attention.zig");
+    _ = @import("embedding_gemma2_cuda_objective.zig");
     _ = command_registry;
     _ = peft;
     _ = graph_bridge;

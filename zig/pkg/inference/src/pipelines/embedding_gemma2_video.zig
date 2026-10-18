@@ -2926,6 +2926,10 @@ test "embeddinggemma2 video retained WebM preparation matches independent window
             const retained = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, null, .{}, .{ .pool = &window_pool, .sampling = sampling, .decoder = .{ .policy = .portable }, .webm = .{ .reader = &reader, .index = &indexed, .continuation = &owner } });
             defer retained.deinit();
             try std.testing.expectEqual(expected, try preparedReaderHash(a, retained));
+            if (owner.session) |session| {
+                try std.testing.expect(std.meta.eql(media.source.Control{}, session.options.control));
+                try std.testing.expect(std.meta.eql(media.source.Control{}, session.owner.control));
+            }
         }
         try std.testing.expect(owner.reused_windows > 0);
     }

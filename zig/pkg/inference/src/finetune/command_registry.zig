@@ -16,6 +16,10 @@
 const std = @import("std");
 
 pub const direct_command_adapters = [_][]const u8{
+    "prepare-embeddinggemma2-lora-inputs",
+    "train-embeddinggemma2",
+    "export-embeddinggemma2-lora",
+    "eval-embeddinggemma2-retrieval",
     "prepare-gemma4-lora-inputs",
     "bootstrap-gemma4-lora",
     "train-eval-gemma4-lora-bundle",

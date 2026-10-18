@@ -14,6 +14,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.image_url_content_part import ImageURLContentPart
+    from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput
     from ..models.inference_embedding_group import InferenceEmbeddingGroup
     from ..models.media_content_part import MediaContentPart
     from ..models.text_content_part import TextContentPart
@@ -30,25 +31,28 @@ class InferenceEmbedRequest:
 
         Attributes:
             model (str): Model name to use for embedding generation
-            input_ (list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[InferenceEmbeddingGroup] |
-                list[str] | str): Input content to embed.
+            input_ (InferenceEmbeddingContentInput | list[ImageURLContentPart | MediaContentPart | TextContentPart] |
+                list[InferenceEmbeddingContentInput] | list[InferenceEmbeddingGroup] | list[str] | str): Input content to embed.
                 Supports:
                 - a single string
                 - an array of strings
                 - an array of OpenAI-style content parts for multimodal embedding
-                - an array of ordered groups for EmbeddingGemma 2, one vector per group
+                - an object with an ordered content array, producing one embedding
+                - an array of ordered content objects, producing one embedding per object
+                Legacy arrays of content parts continue to produce one embedding per part.
             model_identity (str | Unset): Optional exact asset identity pin. A mismatch returns 409 before inference.
             encoding_format (InferenceEmbedRequestEncodingFormat | Unset): Encoding format for the embeddings (only "float"
                 supported) Default: InferenceEmbedRequestEncodingFormat.FLOAT.
-            dimensions (int | Unset): Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512,
-                256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the
-                truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not
-                supported for sparse models.
+            dimensions (int | Unset): Optional truncation size for dense embeddings. Must be a positive integer no larger
+                than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka
+                semantics, matching the OpenAI dimensions parameter). EmbeddingGemma 2 is trained for 768, 512, 256, and 128
+                dimensions. Not supported for sparse models.
             task_type (InferenceEmbedRequestTaskType | Unset): Optional embedding task type using Google embedding task-type
-                names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For
-                Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-                For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction,
-                RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+                names. EmbeddingGemma 2 applies its official prompt for each of the eight task types to text-bearing inputs and
+                rejects custom instructions. For Jina v5 text embeddings, query-side tasks use the query prefix and
+                RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-
+                in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit
+                instruction.
             instruction (str | Unset): Task description for instruction-aware embedding models (Qwen3-Embedding), rendered
                 inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY,
                 which has a model-owned default; required for other non-document task types; rejected for document tasks and
@@ -67,7 +71,12 @@ class InferenceEmbedRequest:
 
     model: str
     input_: (
-        list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[InferenceEmbeddingGroup] | list[str] | str
+        InferenceEmbeddingContentInput
+        | list[ImageURLContentPart | MediaContentPart | TextContentPart]
+        | list[InferenceEmbeddingContentInput]
+        | list[InferenceEmbeddingGroup]
+        | list[str]
+        | str
     )
     model_identity: str | Unset = UNSET
     encoding_format: InferenceEmbedRequestEncodingFormat | Unset = InferenceEmbedRequestEncodingFormat.FLOAT
@@ -79,13 +88,34 @@ class InferenceEmbedRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput
+        from ..models.inference_embedding_group import InferenceEmbeddingGroup
+        from ..models.media_content_part import MediaContentPart
+        from ..models.text_content_part import TextContentPart
+
         model = self.model
 
-        input_: list[dict[str, Any]] | list[str] | str
-        if isinstance(self.input_, list):
-            input_ = [item if isinstance(item, str) else item.to_dict() for item in self.input_]
-        else:
+        input_: dict[str, Any] | list[dict[str, Any]] | list[str] | str
+        if isinstance(self.input_, str):
             input_ = self.input_
+        elif isinstance(self.input_, InferenceEmbeddingContentInput):
+            input_ = self.input_.to_dict()
+        elif isinstance(self.input_, list):
+            if all(isinstance(item, str) for item in self.input_):
+                input_ = list(self.input_)
+            elif all(
+                isinstance(item, (InferenceEmbeddingContentInput, InferenceEmbeddingGroup)) for item in self.input_
+            ):
+                input_ = [item.to_dict() for item in self.input_]
+            elif all(
+                isinstance(item, (TextContentPart, ImageURLContentPart, MediaContentPart)) for item in self.input_
+            ):
+                input_ = [item.to_dict() for item in self.input_]
+            else:
+                raise TypeError("input list must contain only strings, content parts, or ordered content inputs")
+        else:
+            raise TypeError("input must be a string, list, or ordered content input")
 
         model_identity = self.model_identity
 
@@ -137,6 +167,7 @@ class InferenceEmbedRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput
         from ..models.inference_embedding_group import InferenceEmbeddingGroup
         from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
@@ -147,82 +178,48 @@ class InferenceEmbedRequest:
         def _parse_input_(
             data: object,
         ) -> (
-            list[ImageURLContentPart | MediaContentPart | TextContentPart]
-            | list[InferenceEmbeddingGroup]
+            InferenceEmbeddingContentInput
+            | list[ImageURLContentPart | MediaContentPart | TextContentPart]
+            | list[InferenceEmbeddingContentInput | InferenceEmbeddingGroup]
             | list[str]
             | str
         ):
-            try:
-                if not isinstance(data, list):
-                    raise TypeError()
-                if any(not isinstance(item, str) for item in data):
-                    raise TypeError()
-                input_type_1 = cast(list[str], data)
+            if isinstance(data, str):
+                return data
+            if isinstance(data, dict):
+                if "content" not in data:
+                    raise TypeError("ordered embedding input must contain content")
+                return InferenceEmbeddingContentInput.from_dict(data)
+            if not isinstance(data, list):
+                raise TypeError("input must be a string, list, or ordered content input")
+            if all(isinstance(item, str) for item in data):
+                return cast(list[str], data)
+            if not all(isinstance(item, dict) for item in data):
+                raise TypeError("input list must contain only strings or objects")
+            object_items = cast(list[dict[str, Any]], data)
+            ordered = ["content" in item for item in object_items]
+            if any(ordered):
+                if not all(ordered):
+                    raise TypeError("ordered content inputs cannot be mixed with legacy content parts")
+                return [
+                    InferenceEmbeddingGroup.from_dict(item)
+                    if "title" in item
+                    else InferenceEmbeddingContentInput.from_dict(item)
+                    for item in object_items
+                ]
 
-                return input_type_1
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, list):
-                    raise TypeError()
-                input_type_2 = []
-                _input_type_2 = data
-                for input_type_2_item_data in _input_type_2:
-
-                    def _parse_input_type_2_item(
-                        data: object,
-                    ) -> ImageURLContentPart | MediaContentPart | TextContentPart:
-                        try:
-                            if not isinstance(data, dict):
-                                raise TypeError()
-                            componentsschemas_content_part_type_0 = TextContentPart.from_dict(data)
-
-                            return componentsschemas_content_part_type_0
-                        except (TypeError, ValueError, AttributeError, KeyError):
-                            pass
-                        try:
-                            if not isinstance(data, dict):
-                                raise TypeError()
-                            componentsschemas_content_part_type_1 = ImageURLContentPart.from_dict(data)
-
-                            return componentsschemas_content_part_type_1
-                        except (TypeError, ValueError, AttributeError, KeyError):
-                            pass
-                        if not isinstance(data, dict):
-                            raise TypeError()
-                        componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
-
-                        return componentsschemas_content_part_type_2
-
-                    input_type_2_item = _parse_input_type_2_item(input_type_2_item_data)
-
-                    input_type_2.append(input_type_2_item)
-
-                return input_type_2
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, list):
-                    raise TypeError()
-                input_type_3 = []
-                _input_type_3 = data
-                for input_type_3_item_data in _input_type_3:
-                    input_type_3_item = InferenceEmbeddingGroup.from_dict(input_type_3_item_data)
-
-                    input_type_3.append(input_type_3_item)
-
-                return input_type_3
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            if not isinstance(data, str):
-                raise TypeError("embedding input must be text, content parts or groups")
-            return cast(
-                list[ImageURLContentPart | MediaContentPart | TextContentPart]
-                | list[InferenceEmbeddingGroup]
-                | list[str]
-                | str,
-                data,
-            )
+            content_parts: list[ImageURLContentPart | MediaContentPart | TextContentPart] = []
+            for item in object_items:
+                kind = item.get("type")
+                if kind == "text":
+                    content_parts.append(TextContentPart.from_dict(item))
+                elif kind == "image_url":
+                    content_parts.append(ImageURLContentPart.from_dict(item))
+                elif kind == "media":
+                    content_parts.append(MediaContentPart.from_dict(item))
+                else:
+                    raise TypeError(f"unsupported content part type: {kind!r}")
+            return content_parts
 
         input_ = _parse_input_(d.pop("input"))
 

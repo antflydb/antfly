@@ -66,6 +66,9 @@ pub const DeviceBuffer = struct {
     /// Original allocation size, independent of a logical view's length.
     /// Non-owning descriptors constructed from pointers have no charge.
     allocation_bytes: usize = 0,
+    /// Suballocations of a graph arena cannot be freed through an op's direct
+    /// error cleanup. The arena owner alone releases their physical storage.
+    borrowed: bool = false,
 
     pub fn alloc(ctx: *context_mod.CudaContext, len: usize) driver_mod.Error!DeviceBuffer {
         if (len == 0) return .{};
@@ -75,6 +78,9 @@ pub const DeviceBuffer = struct {
         var ptr: driver_mod.CUdeviceptr = 0;
         const result = ctx.driver.fns.cuMemAlloc(&ptr, len);
         if (result != driver_mod.CUDA_SUCCESS) {
+            // Physical exhaustion (including other resident GPU runtimes)
+            // follows the same bounded retry path as our allocation quota.
+            if (result == driver_mod.CUDA_ERROR_OUT_OF_MEMORY) return error.CudaMemoryLimitExceeded;
             std.log.err("CUDA cuMemAlloc failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
@@ -82,6 +88,10 @@ pub const DeviceBuffer = struct {
     }
 
     pub fn free(self: *DeviceBuffer, ctx: *context_mod.CudaContext) void {
+        if (self.borrowed) {
+            self.* = .{};
+            return;
+        }
         if (self.ptr != 0) {
             ctx.makeCurrent() catch {};
             const result = ctx.driver.fns.cuMemFree(self.ptr);
@@ -131,3 +141,44 @@ pub const DeviceBuffer = struct {
         }
     }
 };
+
+test "CUDA physical OOM releases its reservation and permits a later allocation" {
+    const Mock = struct {
+        var oom: bool = true;
+
+        fn setCurrent(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+
+        fn alloc(ptr: *driver_mod.CUdeviceptr, _: usize) callconv(.c) driver_mod.CUresult {
+            if (oom) return driver_mod.CUDA_ERROR_OUT_OF_MEMORY;
+            ptr.* = 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+
+        fn free(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    var ctx: context_mod.CudaContext = undefined;
+    ctx.ctx = @ptrFromInt(1);
+    ctx.device_allocations = .{ .limit = 32 };
+    ctx.driver.fns.cuCtxSetCurrent = Mock.setCurrent;
+    ctx.driver.fns.cuMemAlloc = Mock.alloc;
+    ctx.driver.fns.cuMemFree = Mock.free;
+    Mock.oom = true;
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, DeviceBuffer.alloc(&ctx, 16));
+    try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
+    Mock.oom = false;
+    var buffer = try DeviceBuffer.alloc(&ctx, 16);
+    try std.testing.expectEqual(@as(usize, 16), ctx.device_allocations.snapshot().live);
+    buffer.free(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
+}
+
+test "embeddinggemma2 CUDA graph suballocation error cleanup never frees its arena" {
+    var borrowed = DeviceBuffer{ .ptr = 1234, .len = 256, .borrowed = true };
+    borrowed.free(undefined);
+    try std.testing.expectEqual(@as(usize, 0), borrowed.len);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), borrowed.ptr);
+}

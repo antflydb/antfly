@@ -26,6 +26,7 @@ const managed_receipt = @import("managed_receipt.zig");
 const gliner_catalog = @import("gliner_catalog.zig");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+const embedding_gemma2_catalog = @import("embedding_gemma2_catalog.zig");
 const artifact_dependencies = @import("artifact_dependencies.zig");
 const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
@@ -1856,6 +1857,35 @@ pub fn downloadPinnedQwen3EmbeddingBundle(
             manifest,
         );
     }
+}
+
+/// Download the immutable official EmbeddingGemma 2 BF16 bundle. All
+/// tokenizer, processor, prompt, pooling, and normalization sidecars are part
+/// of the verified transaction because each affects observable embeddings.
+pub fn downloadPinnedEmbeddingGemma2Bundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    bundle: *const embedding_gemma2_catalog.Bundle,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    try embedding_gemma2_catalog.validate();
+    try downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        source_owner,
+        source_name,
+        source_variant,
+        bundle.artifacts(),
+        null,
+        dest_dir,
+        config,
+        progress,
+    );
 }
 
 /// Download an immutable pinned Qwen3 text-reranker bundle. The Q8 serving

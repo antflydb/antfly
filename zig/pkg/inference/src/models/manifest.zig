@@ -24,6 +24,7 @@ const bert = @import("bert.zig");
 const deberta = @import("deberta.zig");
 const modern_bert = @import("../architectures/modern_bert_config.zig");
 const gpt = @import("gpt.zig");
+const embedding_gemma2 = @import("embedding_gemma2.zig");
 const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
 const boundary_bundle = @import("gliner_boundary_bundle.zig");
@@ -203,6 +204,7 @@ pub const EmbeddingStyle = enum {
     jina_v5,
     /// Qwen3-Embedding trailing-EOS last-token pooling.
     qwen3_embedding,
+    /// Bidirectional multimodal EmbeddingGemma 2 encoder with mean pooling.
     embedding_gemma2,
 };
 
@@ -354,6 +356,10 @@ pub const ModelManifest = struct {
     // Pipeline config
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
+    /// Final token projection width advertised by SentenceTransformers.
+    embedding_dimension: u32 = 0,
+    /// Whether prompt/task-prefix tokens participate in mean pooling.
+    include_prompt: bool = true,
     embedding_profile: EmbeddingProfile = .{},
     embedding_style: EmbeddingStyle = .none,
     model_manifest_declarations: ModelManifestDeclarations = .{},
@@ -423,7 +429,8 @@ pub const ModelManifest = struct {
     add_eos_token: bool = false,
 
     pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
-        if (self.embedding_style == .embedding_gemma2) return 8192;
+        if (self.embedding_style == .embedding_gemma2)
+            return @min(@as(usize, self.max_position_embeddings), embedding_gemma2.official_max_input_tokens);
         if (self.gliner_boundary_config) |config| return config.max_len;
         const position_id_mode: bert.PositionIdMode = if (self.bert_model_type == .roberta)
             .roberta_padding
@@ -551,6 +558,7 @@ pub const ModelManifest = struct {
     /// embedder (Qwen3-Embedding, Jina v5) eligible for the resident Qwen3
     /// embedding path and query/document prefix handling.
     pub fn isLastTokenDecoderEmbedder(self: *const ModelManifest) bool {
+        if (self.embedding_style == .embedding_gemma2) return false;
         if (self.embedding_style != .none) return self.model_type == .embedder;
         // Legacy heuristic kept for manifests written before embedding_style
         // existed: Jina v5's last pooling + document prefix pairing.
@@ -2741,6 +2749,23 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (manifest.model_type == .embedder) manifest.model_type = .classifier;
             } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
                 manifest.model_type = .embedder;
+            } else if (std.mem.eql(u8, s, "embedding_gemma2")) {
+                manifest.model_type = .embedder;
+                manifest.model_type_origin = .config;
+                manifest.embedding_style = .embedding_gemma2;
+                manifest.pooling = .mean;
+                manifest.normalize = true;
+                var inferred_inputs = std.ArrayListUnmanaged([]const u8).empty;
+                errdefer {
+                    for (inferred_inputs.items) |input| allocator.free(input);
+                    inferred_inputs.deinit(allocator);
+                }
+                try inferred_inputs.append(allocator, try allocator.dupe(u8, "text"));
+                if (obj.get("vision_config")) |vision| if (vision == .object)
+                    try inferred_inputs.append(allocator, try allocator.dupe(u8, "image"));
+                if (obj.get("audio_config")) |audio| if (audio == .object)
+                    try inferred_inputs.append(allocator, try allocator.dupe(u8, "audio"));
+                replaceOwnedStringArray(allocator, &manifest.inputs, try inferred_inputs.toOwnedSlice(allocator));
             } else if (std.mem.eql(u8, s, "nomic_bert")) {
                 // Nomic Embed v1/v1.5 checkpoints require asymmetric literal
                 // task prefixes. Keep these in the manifest so HTTP and
@@ -2770,6 +2795,9 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
         if (tc == .object) {
             if (tc.object.get("max_position_embeddings")) |v| {
                 if (jsonU32(v)) |val| manifest.max_position_embeddings = val;
+            }
+            if (tc.object.get("embedding_dim")) |v| {
+                if (jsonU32(v)) |val| manifest.embedding_dimension = val;
             }
         }
     }
@@ -2806,6 +2834,17 @@ fn parseSentenceTransformersPoolingConfig(manifest: *ModelManifest, allocator: s
     var selected: ?PoolingStrategy = null;
     if (obj.get("pooling_mode")) |mode| {
         if (mode == .string and std.mem.eql(u8, mode.string, "mean")) selected = .mean;
+    }
+
+    // SentenceTransformers 6 emits this compact shape for EmbeddingGemma 2.
+    if (obj.get("pooling_mode")) |mode| {
+        if (mode == .string) selected = std.meta.stringToEnum(PoolingStrategy, mode.string);
+    }
+    if (obj.get("embedding_dimension")) |dimension| {
+        if (jsonU32(dimension)) |value| manifest.embedding_dimension = value;
+    }
+    if (obj.get("include_prompt")) |include_prompt| {
+        if (include_prompt == .bool) manifest.include_prompt = include_prompt.bool;
     }
 
     if (jsonBool(obj.get("pooling_mode_cls_token"))) selected = .cls;
@@ -4142,9 +4181,9 @@ fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
         .embedding_gemma2 => {
             markEmbeddingTaskProfileRequired(manifest);
             if (!manifest.embedding_profile.query.declared)
-                try setEmbeddingProfilePrefix(manifest, .query, "task: search result | query: ");
+                try setEmbeddingProfilePrefix(manifest, .query, try embedding_gemma2.taskPrefix("RETRIEVAL_QUERY"));
             if (!manifest.embedding_profile.document.declared)
-                try setEmbeddingProfilePrefix(manifest, .document, "title: none | text: ");
+                try setEmbeddingProfilePrefix(manifest, .document, try embedding_gemma2.taskPrefix("RETRIEVAL_DOCUMENT"));
         },
         .none => {},
     }
@@ -4833,6 +4872,28 @@ test "manifest from config.json" {
     try std.testing.expectEqual(bert.ModelType.bert, manifest.bert_model_type);
     try std.testing.expectEqualStrings("bert", manifest.config_model_arch);
     try std.testing.expectEqual(ModelTypeOrigin.config, manifest.model_type_origin);
+}
+
+test "EmbeddingGemma2 manifest advertises unified inputs and serving dimensions" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const config_json = @embedFile("../architectures/embedding_gemma2_config.json");
+    try parseConfigJson(&manifest, allocator, config_json);
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.embedding_gemma2, manifest.embedding_style);
+    try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
+    try std.testing.expect(manifest.normalize);
+    try std.testing.expectEqual(@as(u32, 768), manifest.embedding_dimension);
+    try std.testing.expectEqual(@as(usize, 8192), manifest.maxTextSequenceLength());
+    try std.testing.expectEqual(@as(usize, 4), manifest.inputs.len);
+    try std.testing.expectEqualStrings("text", manifest.inputs[0]);
+    try std.testing.expectEqualStrings("image", manifest.inputs[1]);
+    try std.testing.expectEqualStrings("audio", manifest.inputs[2]);
+    try std.testing.expectEqualStrings("video", manifest.inputs[3]);
+    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
 }
 
 test "RoBERTa manifest reserves padding position indices" {

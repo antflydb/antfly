@@ -28,6 +28,7 @@ pub const gguf = @import("../gguf/root.zig");
 pub const bert = @import("bert.zig");
 pub const t5 = @import("t5.zig");
 pub const gpt = @import("gpt.zig");
+pub const embedding_gemma2 = @import("embedding_gemma2.zig");
 pub const whisper = @import("whisper.zig");
 pub const florence = @import("florence.zig");
 pub const clip = @import("clip.zig");
@@ -48,6 +49,7 @@ test {
     _ = bert;
     _ = t5;
     _ = gpt;
+    _ = embedding_gemma2;
     _ = whisper;
     _ = florence;
     _ = clip;

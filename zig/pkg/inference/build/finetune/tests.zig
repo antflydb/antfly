@@ -25,6 +25,30 @@ pub const inference_overlap_filters: []const []const u8 = &.{
 
 pub const specs = [_]common.TestSpec{
     .{
+        .step_name = "test-embedding-gemma2-graph",
+        .isolated = true,
+        .root_source_file = "src/test_embedding_gemma2_graph.zig",
+        .description = "Run exact EmbeddingGemma 2 differentiable graph and adapter-layout unit tests",
+        .imports = &.{ .antfly_platform, .ml },
+        .native_link = .default,
+    },
+    .{
+        .step_name = "test-embedding-gemma2-job",
+        .isolated = true,
+        .root_source_file = "src/test_embedding_gemma2_job.zig",
+        .description = "Run EmbeddingGemma 2 data, job, contrastive oracle and export tests",
+        .imports = &.{.antfly_platform},
+        .native_link = .default,
+    },
+    .{
+        .step_name = "test-embedding-gemma2-model-training",
+        .isolated = true,
+        .root_source_file = "src/test_embedding_gemma2_training.zig",
+        .description = "Run EmbeddingGemma2 differentiable model and LoRA tests",
+        .imports = &.{ .antfly_platform, .build_options, .ml, .inference_internal },
+        .native_link = .default,
+    },
+    .{
         .step_name = "test-layoutlmv3-finetune",
         .root_source_file = "src/finetune/test/test_layoutlmv3_finetune.zig",
         .description = "Run isolated LayoutLMv3 finetune tests",
@@ -222,9 +246,14 @@ pub fn addTests(ctx: common.Context, name: []const u8) *@import("std").Build.Ste
     run.setCwd(ctx.root orelse ctx.b.path("."));
     addRuntimeSelection(ctx, run, &.{});
     aggregate.dependOn(&run.step);
-    ctx.b.step(if (ctx.publish_targets) "test-finetune-unit" else "inference-finetune-unit-test", "Run the shared finetuning unit executable").dependOn(&run.step);
+    const unit_step = ctx.b.step(if (ctx.publish_targets) "test-finetune-unit" else "inference-finetune-unit-test", "Run shared and isolated finetuning unit executables");
+    unit_step.dependOn(&run.step);
     for (specs) |spec| {
-        if (spec.covered_by_inference) {
+        if (spec.isolated) {
+            const isolated = common.addTest(ctx, spec);
+            aggregate.dependOn(isolated);
+            unit_step.dependOn(isolated);
+        } else if (spec.covered_by_inference) {
             // Compatibility targets only: inference-test owns these tests in
             // both root and standalone gates. Do not execute them twice.
             if (ctx.publish_targets) _ = common.addTest(ctx, spec);

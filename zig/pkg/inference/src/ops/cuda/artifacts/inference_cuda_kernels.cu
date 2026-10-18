@@ -16,6 +16,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include "../kernels/embedding_gemma2.cuh"
 
 using namespace nvcuda;
 
@@ -25044,3 +25045,6 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
         __syncthreads();
     }
 }
+
+// Append inference-only kernels so existing kernel numbering stays stable.
+#include "../kernels/embedding_gemma2_optimized.cuh"

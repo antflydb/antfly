@@ -20,6 +20,43 @@ const file = @import("../util/c_file.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const receipt = @import("../registry/managed_receipt.zig");
 pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
+/// CUDA also uses BF16-specific token scaling and media preparation. Version
+/// this complete execution recipe independently of the qualified F32 route.
+pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v2-audio-frontend";
+
+pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
+    if (backend != .cuda) return artifact_identity;
+    return forCudaPolicy(artifact_identity, @import("../ops/cuda/embedding_gemma2_policy.zig").configured());
+}
+
+pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/embedding_gemma2_policy.zig").Policy) [64]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(cuda_recipe);
+    if (policy.arithmeticBits() != 0) {
+        hash.update("\x00optimized-v1");
+        const bits = policy.arithmeticBits();
+        hash.update(&.{@as(u8, @truncate(bits))});
+        if (bits > 255) hash.update(&.{@as(u8, @intCast(bits >> 8))});
+    }
+    if (policy.extended_flash) hash.update("\x00extended-dispatch-v3");
+    if (policy.packed_projections) hash.update("\x00packed-consumers-v3");
+    if (policy.fused_backbone) hash.update("\x00vision-residual-v2");
+    if (policy.audio_conv_gemm) hash.update("\x00audio-conv-tiled-f32-v1");
+    if (policy.audio_conv_bf16) hash.update("\x00audio-conv-bf16-wmma-v1");
+    if (policy.audio_graph) hash.update("\x00audio-conformer-graph-v1");
+    if (policy.audio_frontend_fused) hash.update("\x00audio-frontend-fused-v1");
+    if (policy.audio_fft) hash.update("\x00audio-fft512-v1");
+    if (policy.spatial_pool) hash.update("\x00spatial-pool-v1");
+    if (policy.tuned_gemm) hash.update("\x00tuned-bf16-output-v1");
+    if (policy.image_batch or policy.media_batch) hash.update("\x00batched-patches-v2");
+    if (policy.media_batch) hash.update("\x00audio-subsample-batch-v2");
+    if (policy.graph_replay) hash.update("\x00media-graphs-v3");
+    if (policy.native_vision) hash.update("\x00native-vision-bf16-v2");
+    hash.update(&.{0});
+    hash.update(&artifact_identity);
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
 pub const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
 pub const Snapshot = struct { digest: [64]u8, signature: [32]u8 };
 
@@ -76,6 +113,7 @@ pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
         .{ .id = 0, .token = "<pad>" },          .{ .id = 1, .token = "<eos>" },         .{ .id = 2, .token = "<bos>" },
         .{ .id = 255999, .token = "<|image>" },  .{ .id = 256000, .token = "<|audio>" }, .{ .id = 258880, .token = "<|image|>" },
         .{ .id = 258881, .token = "<|audio|>" }, .{ .id = 258882, .token = "<image|>" }, .{ .id = 258883, .token = "<audio|>" },
+        .{ .id = 258884, .token = "<|video|>" },
     };
     for (required) |want| {
         var found = false;
@@ -184,4 +222,37 @@ test "embeddinggemma2 processor changes fail closed" {
     const index = std.mem.indexOf(u8, changed, "\"fft_length\": 512").?;
     changed[index + "\"fft_length\": ".len] = '6';
     try std.testing.expectError(error.InvalidEmbeddingGemma2Processor, validateProcessor(a, changed));
+}
+
+test "embeddinggemma2 video processor sampling and token budgets fail closed" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("embedding_gemma2_processor.json"), .{});
+    defer parsed.deinit();
+    const processor = parsed.value.object.getPtr("video_processor").?;
+    for ([_][]const u8{ "fps", "max_frames", "max_soft_tokens" }) |key| {
+        const value = processor.object.getPtr(key).?;
+        const original = value.*;
+        value.* = .{ .integer = 0 };
+        const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(changed);
+        try std.testing.expectError(error.InvalidEmbeddingGemma2Processor, validateProcessor(a, changed));
+        value.* = original;
+    }
+}
+
+test "embeddinggemma2 precision identities preserve F32 pins and isolate CUDA recipes" {
+    const artifacts = fromDigests(@splat(@splat(7)));
+    try std.testing.expectEqual(artifacts, forBackend(artifacts, .native));
+    try std.testing.expectEqual(artifacts, forBackend(artifacts, .metal));
+    const cuda = forBackend(artifacts, .cuda);
+    try std.testing.expect(!std.mem.eql(u8, &artifacts, &cuda));
+    try std.testing.expectEqual(cuda, forBackend(artifacts, .cuda));
+    try std.testing.expect(!std.mem.eql(u8, &cuda, &forBackend(fromDigests(@splat(@splat(8))), .cuda)));
+}
+
+test "embeddinggemma2 CUDA optimized identities isolate every arithmetic profile" {
+    const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
+    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true }, .{ .tuned_gemm = true }, .{ .spatial_pool = true }, .{ .audio_conv_gemm = true }, .{ .audio_conv_bf16 = true }, .{ .audio_fft = true }, .{ .audio_frontend_fused = true }, .{ .audio_graph = true }, .{ .tuned_gemm = true, .packed_projections = true }, .{ .tuned_gemm = true, .fused_backbone = true, .graph_replay = true } };
+    const artifacts = fromDigests(@splat(@splat(7)));
+    for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(!std.mem.eql(u8, &forCudaPolicy(artifacts, left), &forCudaPolicy(artifacts, right)));
 }

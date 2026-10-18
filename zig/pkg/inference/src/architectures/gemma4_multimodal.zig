@@ -31,6 +31,42 @@ const SpecialTokenIds = struct {
     eoa: i32,
 };
 
+/// Gemma4 video uses timestamped, independently bounded vision spans. Internally
+/// use the existing image placeholder for soft slots: it is replaced by projected
+/// rows and masked from PLE, so no dynamic tokenizer vocabulary entry is needed.
+/// This preserves the same per-frame vision mask as upstream video token slots.
+pub fn expandVideoPromptText(allocator: std.mem.Allocator, prompt: []const u8, timestamps_us: []const i64) ![]u8 {
+    const marker = "<|video|>";
+    const offset = std.mem.indexOf(u8, prompt, marker) orelse return error.VideoPlaceholderCountMismatch;
+    if (std.mem.indexOfPos(u8, prompt, offset + marker.len, marker) != null or timestamps_us.len == 0 or timestamps_us.len > 60) return error.VideoPlaceholderCountMismatch;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, prompt[0..offset]);
+    var last: i64 = -1;
+    for (timestamps_us, 0..) |us, i| {
+        if (us < 0 or us <= last or us >= 60_000_000) return error.InvalidVideoTimestamp;
+        last = us;
+        if (i != 0) try out.append(allocator, ' ');
+        var buffer: [32]u8 = undefined;
+        const seconds: u64 = @intCast(@divFloor(us, 1_000_000));
+        try out.appendSlice(allocator, try std.fmt.bufPrint(&buffer, "{d:0>2}:{d:0>2} <|image|>", .{ @divFloor(seconds, 60), @mod(seconds, 60) }));
+    }
+    try out.appendSlice(allocator, prompt[offset + marker.len ..]);
+    return out.toOwnedSlice(allocator);
+}
+
+test "gemma4 video prompt preserves timestamps and frame boundaries" {
+    const a = std.testing.allocator;
+    const result = try expandVideoPromptText(a, "User: <|video|> summarize", &.{ 0, 1_500_000, 59_000_000 });
+    defer a.free(result);
+    try std.testing.expectEqualStrings("User: 00:00 <|image|> 00:01 <|image|> 00:59 <|image|> summarize", result);
+    const expanded = try expandPromptText(a, result, &.{ 2, 1, 2 }, &.{});
+    defer a.free(expanded);
+    try std.testing.expectEqualStrings("User: 00:00 <|image><|image|><|image|><image|> 00:01 <|image><|image|><image|> 00:59 <|image><|image|><|image|><image|> summarize", expanded);
+    try std.testing.expectError(error.VideoPlaceholderCountMismatch, expandVideoPromptText(a, "<|video|><|video|>", &.{0}));
+    try std.testing.expectError(error.InvalidVideoTimestamp, expandVideoPromptText(a, "<|video|>", &.{ 1_000_000, 0 }));
+}
+
 pub fn expandPromptText(
     allocator: std.mem.Allocator,
     prompt: []const u8,
