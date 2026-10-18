@@ -3422,11 +3422,10 @@ const Evaluator = struct {
                             const other = right.array orelse return error.SqlTypeMismatch;
                             if (self.program.constant_memberships.get(call.args[0])) |prepared| break :contains if (call.function == .@"$overlaps") try prepared.overlaps(other.*, &work) else try prepared.contains(other.*, &work);
                             if (call.function == .@"$overlaps") if (self.program.constant_memberships.get(call.args[1])) |prepared| break :contains try prepared.overlaps(array.*, &work);
-                            const swapped = call.function == .@"$overlaps" and other.cardinality() < array.cardinality();
-                            var membership = try arrays.Membership.initWithBudget(self.alloc, if (swapped) other.* else array.*, .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
-                            defer membership.deinit();
-                            try self.charge(membership.budget.live + @sizeOf(arrays.Membership));
-                            break :contains if (call.function == .@"$overlaps") try membership.overlaps(if (swapped) array.* else other.*, &work) else try membership.contains(other.*, &work);
+                            // Temporary index bytes are bounded by remaining output
+                            // headroom and released before returning the boolean;
+                            // they are not retained result bytes to charge again.
+                            break :contains try arrays.dynamicMembership(self.alloc, array.*, other.*, call.function == .@"$overlaps", .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
                         } else try @import("json_containment.zig").contains(left.value, right.value, &work, 0);
                         break :blk Datum.json(.{ .bool = accepted });
                     },
@@ -6787,5 +6786,37 @@ test "SQL prepared fusion metadata preserves fallback depth work and allocation 
             try std.testing.expect((try actual).array.? == value.array.?);
         } else |err| try std.testing.expectError(err, actual);
         try std.testing.expectEqual(slow.usedSteps(), fast.usedSteps());
+    }
+}
+
+test "SQL native dynamic containment scratch measurement" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const region = source_arena.allocator();
+    const count = 8192;
+    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region, .int64, &.{.{ .length = count }}, count, count, .{});
+    var work: arrays.Budget = .{};
+    for (0..count) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &work);
+    const source = try builder.finish(region, .{}, &work);
+    var cells: [32]Datum = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(count - 32 + i) });
+    var compiled = try @import("compiler.zig").compileScalar(a, "a @> b", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{ .{ .name = "a", .type = .array, .element_type = .int64 }, .{ .name = "b", .type = .array, .element_type = .int64 } }, &.{}, .{});
+    defer program.deinit();
+    for ([_]usize{ 0, 1, 4, 32 }) |probes| {
+        const right = try arrays.Value.init(.int64, if (probes == 0) &.{} else &.{.{ .length = @intCast(probes) }}, cells[0..probes], .{});
+        var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 64 * 1024 * 1024 };
+        var arena = std.heap.ArenaAllocator.init(counter.allocator());
+        defer arena.deinit();
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..20) |_| {
+            const result = try program.evaluate(arena.allocator(), &.{ Datum.typedArray(&source), Datum.typedArray(&right) }, &.{}, .{ .steps = 1_048_576 });
+            try std.testing.expect(result.value.bool);
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+        }
+        const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+        std.debug.print("SQL_DYNAMIC_CONTAINMENT repetitions=20 source_cells={} probes={} peak={} retained={} elapsed_ns={}\n", .{ count, probes, counter.peak, counter.live, elapsed });
     }
 }

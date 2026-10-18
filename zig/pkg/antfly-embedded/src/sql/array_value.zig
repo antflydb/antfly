@@ -1032,6 +1032,42 @@ test "SQL typed array prepared membership bounds repeated probe work without all
     std.debug.print("SQL array membership: source_elements=4096 probe_elements=256 iterations=10 prepare_ns={} scan_ns={} indexed_ns={} retained_bytes={} probe_allocated_bytes=0\n", .{ prepared_ns, scan_ns, indexed_ns, retained });
 }
 
+/// One evaluation owns this scratch; immutable statement indexes use Membership
+/// directly. Tiny probe sets scan borrowed storage without constructing a hash
+/// table. Larger sets reclaim every growth buffer, even inside a result arena.
+pub fn dynamicMembership(backing: Allocator, left: Value, right: Value, overlap: bool, limits: Limits, work: *Budget) !bool {
+    try work.poll();
+    if (left.element_type != right.element_type) return error.SqlTypeMismatch;
+    // Shortcuts must retain ingress validation, quota and cancellation checks.
+    const a = try left.validateWithBudget(limits, work);
+    const b = try right.validateWithBudget(limits, work);
+    if (b.cardinality() == 0) return !overlap;
+    if (a.cardinality() == 0) return false;
+    const scan_swapped = overlap and a.cardinality() < b.cardinality();
+    const source = if (scan_swapped) b else a;
+    const probes = if (scan_swapped) a else b;
+    if (probes.cardinality() <= 4) {
+        for (0..probes.cardinality()) |i| {
+            const probe = probes.flatCell(i);
+            try work.consume(1);
+            // Containment equality is strict: NULL is never a matching cell.
+            const found = !probe.sql_null and ((try source.quantified(probe, .eq, .any, work)) orelse false);
+            if (overlap and found) return true;
+            if (!overlap and !found) return false;
+        }
+        return !overlap;
+    }
+    const swapped = overlap and b.cardinality() < a.cardinality();
+    // Metadata is allocated too; include it in the temporary memory allowance.
+    if (limits.bytes < @sizeOf(MemoryBudget)) return error.SqlProgramLimitExceeded;
+    var scratch_limits = limits;
+    scratch_limits.bytes -= @sizeOf(MemoryBudget);
+    var index = try Membership.initValidated(MemoryBudget.reclaimingAllocator(backing), if (swapped) b else a, scratch_limits);
+    defer index.deinit();
+    try index.populate(work);
+    return if (overlap) index.overlaps(if (swapped) a else b, work) else index.contains(b, work);
+}
+
 /// Reusable equality membership, O(n) build and expected O(m) probes. The
 /// immutable array owner must outlive this index. NULLs never satisfy @>/&&;
 /// firstPosition separately uses IS NOT DISTINCT FROM semantics.
@@ -1050,16 +1086,26 @@ pub const Membership = struct {
 
     pub fn initWithBudget(backing: Allocator, value: Value, limits: Limits, work: *Budget) !Membership {
         const validated = try value.validateWithBudget(limits, work);
+        var index = try initValidated(backing, validated, limits);
+        errdefer index.deinit();
+        try index.populate(work);
+        return index;
+    }
+
+    fn initValidated(backing: Allocator, value: Value, limits: Limits) !Membership {
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
         budget.* = .{ .backing = backing, .limit = limits.bytes };
-        var index: Membership = .{ .budget = budget, .value = validated };
+        return .{ .budget = budget, .value = value };
+    }
+
+    fn populate(index: *Membership, work: *Budget) !void {
+        const value = index.value;
+        const budget = index.budget;
         // Mutable build buffers use the quota allocator directly: hash-table
         // and entry-list growth must reclaim replaced capacity, not accumulate
         // obsolete buffers in the immutable value's arena.
         const a = budget.allocator();
-        errdefer index.heads.deinit(a);
-        errdefer index.entries.deinit(a);
         for (0..value.cardinality(), 0..) |array_cell_0, ordinal| {
             const element = value.flatCell(array_cell_0);
             if (element.sql_null) {
@@ -1073,7 +1119,6 @@ pub const Membership = struct {
             index.entries.append(a, entry) catch |err| return allocationError(budget, err);
             index.heads.put(a, hash, slot) catch |err| return allocationError(budget, err);
         }
-        return index;
     }
 
     pub fn deinit(self: *Membership) void {
@@ -1550,4 +1595,111 @@ test "SQL native search unwinds allocation faults cancellation and oversized scr
     try std.testing.expectEqual(count, output.cardinality());
     try std.testing.expectEqual(@as(i64, -7), output.flatCell(0).value.integer);
     try std.testing.expectEqual(@as(i64, count - 8), output.flatCell(count - 1).value.integer);
+}
+
+test "SQL native dynamic membership matches indexes across representations and probe sizes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const region = arena.allocator();
+    const number: @import("numeric_value.zig").Value = .{ .digits = &.{7}, .weight = 0 };
+    const cases = [_]struct { kind: ElementType, cells: []const Element }{
+        .{ .kind = .numeric, .cells = &.{ .{ .sql_null = false, .numeric = &number }, .{}, .{ .sql_null = false, .numeric = &number } } },
+        .{ .kind = .uuid, .cells = &.{ .json(.{ .string = "00112233-4455-6677-8899-aabbccddeeff" }), .{}, .json(.{ .string = "ffeeddcc-bbaa-9988-7766-554433221100" }) } },
+        .{ .kind = .boolean, .cells = &.{ .json(.{ .bool = true }), .{}, .json(.{ .bool = false }) } },
+        .{ .kind = .int16, .cells = &.{ .json(.{ .integer = -7 }), .{}, .json(.{ .integer = 9 }) } },
+        .{ .kind = .int32, .cells = &.{ .json(.{ .integer = -7 }), .{}, .json(.{ .integer = 9 }) } },
+        .{ .kind = .int64, .cells = &.{ .json(.{ .integer = -7 }), .{}, .json(.{ .integer = 9 }) } },
+        .{ .kind = .float32, .cells = &.{ .json(.{ .float = -0.0 }), .{}, .json(.{ .float = std.math.nan(f64) }) } },
+        .{ .kind = .float64, .cells = &.{ .json(.{ .float = -0.0 }), .{}, .json(.{ .float = std.math.nan(f64) }) } },
+        .{ .kind = .text, .cells = &.{ .json(.{ .string = "é" }), .{}, .json(.{ .string = "" }) } },
+        .{ .kind = .jsonb, .cells = &.{ .json(.null), .{}, .json(.{ .string = "x" }) } },
+    };
+    for (cases) |case| {
+        var cells: [96]Element = undefined;
+        for (&cells, 0..) |*cell, i| cell.* = case.cells[i % 3];
+        const prepared = try Value.init(case.kind, &.{ .{ .length = 3, .lower = -7 }, .{ .length = 32 } }, &cells, .{});
+        var work: Budget = .{};
+        var builder = try @import("array_compact.zig").ResultBuilder.initPlanned(region, case.kind, prepared.dimensions, 96, 64, if (case.kind == .text) 32 * (case.cells[0].value.string.len + case.cells[2].value.string.len) else null, .{});
+        for (cells) |cell| try builder.append(cell, &work);
+        const native = try builder.finish(region, .{}, &work);
+        for ([_]Value{ prepared, native }) |source| {
+            var index = try Membership.init(a, source, .{});
+            defer index.deinit();
+            for (0..7) |count| {
+                const probes = try Value.init(case.kind, if (count == 0) &.{} else &.{.{ .length = @intCast(count), .lower = 4 }}, cells[0..count], .{});
+                for ([_]bool{ false, true }) |overlap| {
+                    const expected = if (overlap) try index.overlaps(probes, &work) else try index.contains(probes, &work);
+                    const alloc = if (count <= 4) std.testing.failing_allocator else a;
+                    try std.testing.expectEqual(expected, try dynamicMembership(alloc, source, probes, overlap, .{}, &work));
+                    if (overlap) try std.testing.expectEqual(expected, try dynamicMembership(alloc, probes, source, true, .{}, &work));
+                }
+            }
+            // Probe sets without NULLs test duplicate and NaN/zero matches.
+            const probes = try Value.init(case.kind, &.{.{ .length = 3 }}, &.{ case.cells[2], case.cells[0], case.cells[0] }, .{});
+            try std.testing.expect(try dynamicMembership(std.testing.failing_allocator, source, probes, false, .{}, &work));
+            const missing: ?Element = switch (case.kind) {
+                .int16, .int32, .int64 => .json(.{ .integer = 10000 }),
+                .float32, .float64 => .json(.{ .float = 1.25 }),
+                .text => .json(.{ .string = "missing" }),
+                .uuid => .json(.{ .string = "11111111-1111-1111-1111-111111111111" }),
+                .jsonb => .json(.{ .bool = false }),
+                else => null,
+            };
+            if (missing) |cell| {
+                const absent = try Value.init(case.kind, &.{.{ .length = 1 }}, &.{cell}, .{});
+                for ([_]bool{ false, true }) |overlap| try std.testing.expect(!try dynamicMembership(std.testing.failing_allocator, source, absent, overlap, .{}, &work));
+            }
+            if (case.kind == .float32 or case.kind == .float64) {
+                const equal = try Value.init(case.kind, &.{.{ .length = 2 }}, &.{ .json(.{ .float = 0.0 }), .json(.{ .float = -std.math.nan(f64) }) }, .{});
+                try std.testing.expect(try dynamicMembership(std.testing.failing_allocator, source, equal, false, .{}, &work));
+            }
+        }
+    }
+}
+
+test "SQL native dynamic membership reclaims indexed scratch and preserves admission failures" {
+    const a = std.testing.allocator;
+    var cells: [129]Element = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
+    const source = try Value.init(.int64, &.{.{ .length = cells.len }}, &cells, .{});
+    const probes = try Value.init(.int64, &.{.{ .length = 8 }}, cells[121..], .{});
+    const Fixture = struct {
+        fn run(backing: Allocator, left: Value, right: Value) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            var work: Budget = .{};
+            try std.testing.expect(try dynamicMembership(arena.allocator(), left, right, false, .{}, &work));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ source, probes });
+    var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(counter.allocator());
+    defer arena.deinit();
+    var work: Budget = .{};
+    for (0..20) |_| {
+        try std.testing.expect(try dynamicMembership(arena.allocator(), source, probes, false, .{}, &work));
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+    var empty = try Value.init(.int64, &.{}, &.{}, .{});
+    var invalid = source;
+    invalid.element_type = .text;
+    try std.testing.expectError(error.SqlTypeMismatch, dynamicMembership(a, invalid, empty, false, .{}, &work));
+    invalid = source;
+    invalid.dimensions = &.{.{ .length = 128 }};
+    try std.testing.expectError(error.InvalidSqlArrayShape, dynamicMembership(a, invalid, empty, false, .{}, &work));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, dynamicMembership(a, source, empty, false, .{ .elements = 128 }, &work));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, dynamicMembership(a, source, probes, false, .{ .bytes = 4096 }, &work));
+    var exhausted: Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, dynamicMembership(a, source, empty, false, .{}, &exhausted));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check };
+    var canceled: Budget = .{ .shared = &context };
+    try std.testing.expectError(error.Canceled, dynamicMembership(a, empty, empty, false, .{}, &canceled));
+    empty.element_type = .text;
+    try std.testing.expectError(error.SqlTypeMismatch, dynamicMembership(a, source, empty, true, .{}, &work));
 }
