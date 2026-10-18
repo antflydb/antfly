@@ -431,7 +431,10 @@ Pull selects a split bundle's encoder and head from its descriptor at the
 resolved immutable Hub commit. This supports the historical mixed-suffix
 layout as well as canonical paired filenames, rejects missing or unsafe
 references, and never substitutes an unrelated GGUF for a missing component.
-An explicitly requested quantization must match the declared encoder.
+An explicitly requested quantization selects the declared encoder when it
+matches, or another complete canonical GLiNER pair for that quantization. A
+partial pair never falls back to an unrelated GGUF. Managed manifests resolve
+the published variant when the Hub default pair was not downloaded.
 
 The 1B layout migration was published at `98ce73668cea4b940299396920671ec0a8abc57f`.
 The current revision adds the [immutable capacity receipts](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B/blob/ef47cca0f42f554e146cd9ab3ce870741c98daa5/qualification/2026-10-17-capacity/manifest.json)
