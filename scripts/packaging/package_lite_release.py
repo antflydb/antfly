@@ -46,6 +46,7 @@ from package_cli_release import (  # noqa: E402
     project_requires_python,
     safe_extract,
     update_json_version,
+    update_pyproject_version,
 )
 
 
@@ -102,22 +103,17 @@ def extract_lite_archive(
         )
 
 
-def populate_npm_package(
-    platform: Platform, extracted: Path, version: str, npm_root: Path
-) -> Path:
+def populate_npm_package(platform: Platform, extracted: Path, version: str) -> Path:
     assert platform.npm_package_dir is not None
-    source = (
+    package_dir = (
         ROOT / "ts" / "packages" / platform.npm_package_dir.replace("cli-", "embedded-")
     )
-    package_dir = npm_root / source.name
-    clean_path(package_dir)
-    package_dir.mkdir(parents=True)
-    for name in ("package.json", "README.md"):
-        shutil.copy2(source / name, package_dir / name)
     manifest = package_dir / "package.json"
     if json.loads(manifest.read_text())["license"] != "Apache-2.0":
         raise ValueError(f"not an Apache platform package: {manifest}")
     update_json_version(manifest, version)
+    for name in ("bin", "lib", "include", "share", "LICENSES"):
+        clean_path(package_dir / name)
     shutil.copytree(
         extracted / "lib",
         package_dir / "lib",
@@ -220,17 +216,11 @@ def main() -> int:
     args = parser.parse_args()
     version = normalize_release_version(args.version)
     python_version = python_version_from_release(version)
-    # Release manifests live outside the pnpm workspace. Rewriting workspace:*
-    # dependencies in place invalidates its frozen lockfile, including when a
-    # package test invokes pnpm recursively.
-    npm_root = args.out_dir / "npm-packages"
-    wrapper = npm_root / "embedded"
-    clean_path(wrapper)
-    wrapper.mkdir(parents=True)
-    for name in ("package.json", "README.md", "LICENSE"):
-        shutil.copy2(ROOT / "ts/packages/embedded" / name, wrapper / name)
+    update_pyproject_version(
+        ROOT / "py" / "packages" / "embedded" / "pyproject.toml", python_version
+    )
     update_json_version(
-        wrapper / "package.json",
+        ROOT / "ts" / "packages" / "embedded" / "package.json",
         version,
         optional_deps=True,
     )
@@ -238,7 +228,7 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as raw:
             extracted = Path(raw)
             extract_lite_archive(args.archive_dir, version, platform, extracted)
-            populate_npm_package(platform, extracted, version, npm_root)
+            populate_npm_package(platform, extracted, version)
             if platform.wheel_platform:
                 print(
                     write_wheel(

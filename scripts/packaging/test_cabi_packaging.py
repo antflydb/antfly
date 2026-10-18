@@ -912,7 +912,7 @@ class CAbiPackagingTests(unittest.TestCase):
 #include <stdlib.h>
 uint32_t antfly_abi_version(void) {
     const char *abi = getenv("TEST_ABI");
-    return abi ? (uint32_t)atoi(abi) : ANTFLY_ABI_VERSION;
+    return abi ? (uint32_t)atoi(abi) : TEST_EXPECTED_ABI;
 }
 uint32_t antfly_open_options_size(void) {
     return sizeof(antfly_open_options) + (getenv("TEST_SIZE") ? 1 : 0);
@@ -927,38 +927,65 @@ const char *antfly_error_code_name(antfly_error_code code) {
 }
 const char *antfly_last_error_detail(void) { return "test create failure"; }
 """)
-            subprocess.run(
-                [
-                    cc,
-                    "-Wall",
-                    "-Werror",
-                    "smoke.c",
-                    "stub.c",
-                    "-I",
-                    str(header.parent),
-                    "-o",
-                    "smoke",
-                ],
-                cwd=root,
-                check=True,
-                capture_output=True,
+            legacy = root / "legacy"
+            legacy.mkdir()
+            legacy_header = re.sub(
+                r"(?m)^#define ANTFLY_ABI_VERSION .*\n", "", header.read_text()
             )
-            for variables, status, message in (
-                ({}, 0, ""),
-                ({"TEST_ABI": str(int(abi[1]) + 1)}, 1, "differs from header ABI"),
-                ({"TEST_SIZE": "1"}, 2, "open options size differs"),
-                ({"TEST_CREATE": "1"}, 3, "INTERNAL: test create failure"),
+            for declaration in (
+                "uint32_t antfly_open_options_size(void);",
+                "const char *antfly_last_error_detail(void);",
+                "const char *antfly_error_code_name(antfly_error_code code);",
             ):
-                with self.subTest(variables=variables):
-                    result = subprocess.run(
-                        [str(root / "smoke")],
-                        cwd=root,
-                        env={**os.environ, **variables},
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(status, result.returncode, result.stderr)
-                    self.assertIn(message, result.stderr)
+                legacy_header = legacy_header.replace(declaration, "")
+            (legacy / "antfly.h").write_text(legacy_header)
+            for include, expected_abi in ((header.parent, abi[1]), (legacy, "3")):
+                subprocess.run(
+                    [
+                        cc,
+                        "-Wall",
+                        "-Werror",
+                        f"-DTEST_EXPECTED_ABI={expected_abi}",
+                        "smoke.c",
+                        "stub.c",
+                        "-I",
+                        str(include),
+                        "-o",
+                        "smoke",
+                    ],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                )
+                cases = [
+                    ({}, 0, ""),
+                    ({"TEST_ABI": str(int(abi[1]) + 1)}, 1, "ABI"),
+                    (
+                        {"TEST_SIZE": "1"},
+                        0 if include == legacy else 2,
+                        "" if include == legacy else "open options size differs",
+                    ),
+                    (
+                        {"TEST_CREATE": "1"},
+                        3,
+                        "failed with error 255"
+                        if include == legacy
+                        else "INTERNAL: test create failure",
+                    ),
+                    ({"TEST_ABI": "1"}, 0 if include == legacy else 1, ""),
+                    ({"TEST_ABI": "2"}, 0 if include == legacy else 1, ""),
+                ]
+                for variables, status, message in cases:
+                    with self.subTest(include=include, variables=variables):
+                        result = subprocess.run(
+                            [str(root / "smoke")],
+                            cwd=root,
+                            env={**os.environ, **variables},
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(status, result.returncode, result.stderr)
+                        self.assertIn(message, result.stderr)
             self.assertIn("antfly_1.2.3_Darwin_arm64.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_arm64_gnu.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_x86_64_gnu.tar.gz", rendered)

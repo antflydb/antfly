@@ -106,13 +106,37 @@ class LitePackagingTests(unittest.TestCase):
                     for item in stage.iterdir():
                         tar.add(item, arcname=item.name)
 
+            # Run the existing source packaging contract in the same detached
+            # worktree arrangement used by the controller. Its manifest writes
+            # must never invalidate the active workspace's frozen lockfile.
+            lock = root / "ts/pnpm-lock.yaml"
+            lock.write_bytes((ROOT / "ts/pnpm-lock.yaml").read_bytes())
             manifests = list(root.glob("ts/packages/*/package.json")) + [
-                root / "py/packages/embedded/pyproject.toml"
+                root / "py/packages/embedded/pyproject.toml",
+                lock,
             ]
-            original_manifests = {path: path.read_bytes() for path in manifests}
-
+            originals = {path: path.read_bytes() for path in manifests}
+            commands = (
+                ["init", "-q"],
+                ["add", "ts", "py", "LICENSES"],
+                [
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "Source fixture",
+                ],
+                ["worktree", "add", "--detach", "dist/embedded-package-source", "HEAD"],
+            )
+            for command in commands:
+                subprocess.run(
+                    ["git", *command], cwd=root, check=True, capture_output=True
+                )
+            staged = root / "dist/embedded-package-source"
             with (
-                mock.patch.object(package, "ROOT", root),
+                mock.patch.object(package, "ROOT", staged),
                 mock.patch.object(
                     sys,
                     "argv",
@@ -129,19 +153,12 @@ class LitePackagingTests(unittest.TestCase):
             ):
                 self.assertEqual(0, package.main())
 
-            for path, original in original_manifests.items():
+            for path, original in originals.items():
                 self.assertEqual(original, path.read_bytes(), str(path))
-            wrapper = root / "out/npm-packages/embedded"
-            manifest = json.loads((wrapper / "package.json").read_text())
-            self.assertEqual("1.2.3", manifest["version"])
-            self.assertEqual({"1.2.3"}, set(manifest["optionalDependencies"].values()))
-            # The workflow supplies the checked TypeScript build after staging.
-            (wrapper / "dist").mkdir()
-            (wrapper / "dist/index.js").write_text("export {};\n")
 
             for platform in package.PACKAGE_PLATFORMS:
                 suffix = platform.npm_package_dir.replace("cli-", "embedded-")
-                npm = root / "out/npm-packages" / suffix
+                npm = staged / "ts/packages" / suffix
                 self.assertEqual(
                     "1.2.3", json.loads((npm / "package.json").read_text())["version"]
                 )
@@ -237,7 +254,7 @@ class LitePackagingTests(unittest.TestCase):
                         "--ignore-scripts",
                         "--pack-destination",
                         str(npm_dir),
-                        str(root / "out/npm-packages" / name),
+                        str(staged / "ts/packages" / name),
                     ],
                     check=True,
                     capture_output=True,

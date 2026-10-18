@@ -46,9 +46,10 @@ requires every declared runtime archive for each supported platform.
 from the embedded archives, bundling only the native library. Prebuilt language
 packages cover Linux x86-64/ARM64 (glibc 2.28+) and macOS ARM64; the native
 archive matrix is separate. Go/Rust/C use `lib/pkgconfig/libantfly.pc`.
-Embedded package assembly stages release manifests and native npm packages under
-`dist/embedded-packages/npm-packages`, preserving the workspace manifests and
-frozen pnpm lockfile. Binding checks use the staged native library and the
+Embedded package assembly runs the source commit's packaging script in a detached
+worktree at `dist/embedded-package-source`, preserving the active workspace's
+manifests and frozen pnpm lockfile. This also preserves older source commits'
+packaging-script contract. Binding checks use the staged native library and the
 workflow copies their TypeScript build into the staged wrapper before packing.
 The Homebrew C smoke test checks the installed library against
 `ANTFLY_ABI_VERSION` and the open-options layout in its installed header.
