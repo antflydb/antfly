@@ -955,7 +955,7 @@ const Engine = struct {
     shortest_fast: bool = false,
     stream_fold: ?*StreamFold = null,
     expression_memo: ?CallMemo = null,
-    probe_predicate_failed: ?*bool = null,
+    route_pruner: ?*RoutePruner = null,
     route_probe: ?struct { rejected: *usize, fold: *StreamFold } = null,
     numeric_consolidation: bool = false,
     numeric_attempted: bool = false,
@@ -1053,6 +1053,7 @@ const Engine = struct {
         distinct_index: value_work.Index = .{},
         count: u64 = 0,
         sum: v.Value = .{ .integer = 0 },
+        sum_sign: enum { zero, positive, negative } = .zero,
         mean: f64 = 0,
         mean_weight: f64 = 0,
         // Only promoted AVG counts need this state; ordinary aggregate groups
@@ -1098,10 +1099,17 @@ const Engine = struct {
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
-                // Regrouping SUM is licensed only after every observed input
-                // has certified the nonnegative integer domain. The speculative
-                // executor publishes nothing until this certificate completes.
-                if (engine.numeric_consolidation and (value != .integer or value.integer < 0)) return error.CypherNumericRegroupingDeclined;
+                // Each aggregate group certifies one integer sign independently.
+                // Zero is neutral. Mixed signs and floating point retain the
+                // ordinary contribution order, including intermediate overflow.
+                if (engine.numeric_consolidation) {
+                    if (value != .integer) return error.CypherNumericRegroupingDeclined;
+                    const sign: @TypeOf(self.sum_sign) = if (value.integer == 0) .zero else if (value.integer > 0) .positive else .negative;
+                    if (sign != .zero) {
+                        if (self.sum_sign != .zero and self.sum_sign != sign) return error.CypherNumericRegroupingDeclined;
+                        self.sum_sign = sign;
+                    }
+                }
                 if (value != .integer and value != .number) return error.CypherTypeMismatch;
                 if ((value == .integer and value.integer == 0) or (value == .number and value.number == 0)) {
                     self.sum = try engine.binary(.add, self.sum, value);
@@ -1278,6 +1286,7 @@ const Engine = struct {
         stage_counts: []usize,
         matched: *usize,
         distinct: []DistinctRows,
+        applies: []ApplyMemo = &.{},
         distinct_goal: ?usize = null,
         had_match: bool = false,
         weight: Count = Count.one,
@@ -1355,11 +1364,17 @@ const Engine = struct {
                         }
                         // Non-streamable child shapes keep their scoped windows
                         // and reducers; apply never truncates a selective tail.
-                        const scope = PatternScope.enter(engine);
-                        const children = blk: {
+                        const apply = &fold.applies[index];
+                        var key_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                        defer key_arena.deinit();
+                        const key = try apply.key(engine, row, inner, fold.retained, key_arena.allocator());
+                        const cached = try apply.memo.find(engine, key, null);
+                        const children = cached orelse blk: {
+                            const scope = PatternScope.enter(engine);
                             defer scope.leave(engine);
                             break :blk try engine.runWeightedRows(inner, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
                         };
+                        if (cached == null) try apply.memo.put(engine, key, null, children);
                         const prior = fold.weight;
                         defer fold.weight = prior;
                         for (children.rows, children.weights) |child, weight| {
@@ -2006,7 +2021,10 @@ const Engine = struct {
         @memset(stage_counts, 0);
         const distinct_stages = try retained.alloc(DistinctRows, middle.len);
         @memset(distinct_stages, .{});
-        var fold: StreamFold = .{ .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        const applies = try retained.alloc(ApplyMemo, middle.len);
+        for (applies, middle) |*apply, clause| apply.* = .{ .memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = clause.operation != .subquery or !pureReturningCall(clause.operation.subquery) } };
+        defer for (applies) |*apply| apply.memo.deinit();
+        var fold: StreamFold = .{ .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         if (projection.distinct and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) {
             fold.distinct_goal = try std.math.add(usize, if (projection.skip) |skip| try self.count(skip) else 0, try self.count(projection.limit.?));
         }
@@ -2085,17 +2103,6 @@ const Engine = struct {
                 defer self.route_probe = previous_probe;
                 self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |err| switch (err) {
                     error.CypherStreamComplete => if (continuation != null) return err else break :produce,
-                    error.CypherProbeEndpoints => {
-                        self.route_probe = null;
-                        if (try self.proveEmptyEndpoints(row, planned)) continue :produce;
-                        // No output was observed before the probe. A declined
-                        // proof restarts the ordinary producer, preserving its
-                        // route order and first observable expression error.
-                        self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |restart_error| switch (restart_error) {
-                            error.CypherStreamComplete => if (continuation != null) return restart_error else break :produce,
-                            else => return restart_error,
-                        };
-                    },
                     else => return err,
                 };
                 batch.flush(self, &ignored) catch |err| switch (err) {
@@ -2130,30 +2137,6 @@ const Engine = struct {
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
         try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = if (self.pending_window) |weighted| weighted.count() else rows.len });
         return rows;
-    }
-    /// After a bounded amount of unsuccessful route exploration, try an
-    /// endpoint-DP emptiness certificate. It is useful only on a proved path
-    /// quotient: cyclic/trail-sensitive shapes decline without enumeration.
-    /// Successful rows still come from the original demand-driven DFS.
-    fn proveEmptyEndpoints(self: *Engine, row: Row, operation: ast.Match) anyerror!bool {
-        const scope = PatternScope.enter(self);
-        defer scope.leave(self);
-        const previous = self.component_proof;
-        self.component_proof = true;
-        defer self.component_proof = previous;
-        const previous_failure = self.probe_predicate_failed;
-        var failed = false;
-        self.probe_predicate_failed = &failed;
-        defer self.probe_predicate_failed = previous_failure;
-        const one: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = 1 } } };
-        const count_value: ast.Expr = .{ .span = .{}, .value = .{ .call = .{ .name = "count", .args = &.{&one}, .distinct = true } } };
-        const projection: ast.Projection = .{ .items = &.{.{ .expression = &count_value }} };
-        const result = self.streamMatchProjection(&.{row}, operation, projection, &.{}, .{}, .{}) catch |err| switch (err) {
-            error.CypherComponentDeclined, error.CypherNumericOverflow, error.CypherTypeMismatch, error.UnboundCypherVariable, error.MissingCypherParameter, error.CypherInvalidArgument, error.CypherDivisionByZero => return false,
-            else => return err,
-        };
-        const rows = result orelse return false;
-        return !failed and rows.len == 1 and rows[0][0].value == .integer and rows[0][0].value.integer == 0;
     }
     // EXISTS consumes one result row. Keep aggregation, DISTINCT, ordering and
     // pagination barriers intact; ordinary terminal projections can carry the
@@ -2569,9 +2552,17 @@ const Engine = struct {
     }
     // Only a commutative terminal reduction licenses regrouping nonadjacent
     // bindings. Windows, order-sensitive reductions and procedures stay barriers.
+    fn consolidatableCall(inner: []const ast.Clause) bool {
+        // Identical complete parent bindings invoke the same repeatable child
+        // from a unit bag. Child reducers and windows keep that unit scope;
+        // only their returned bag is multiplied by the consolidated parent.
+        // Unit bodies and effects never license this transformation.
+        return pureReturningCall(inner);
+    }
     fn consolidationDemand(self: *Engine, clauses: []const ast.Clause) !?Multiplicity {
         for (clauses) |clause| switch (clause.operation) {
             .match, .unwind => {},
+            .subquery => |inner| if (!consolidatableCall(inner)) return null,
             .project => |p| {
                 if (p.value.order.len != 0 or p.value.skip != null or p.value.limit != null) return null;
                 var calls: std.ArrayList(*const ast.Expr) = .empty;
@@ -2643,6 +2634,24 @@ const Engine = struct {
         copy[copy.len - 1].operation.project.value.limit = expression;
         return copy;
     }
+    const ApplyMemo = struct {
+        memo: CallMemo,
+        captures: ?Names = null,
+        fn key(self: *@This(), engine: *Engine, row: Row, inner: []const ast.Clause, retained: A, temporary: A) !Row {
+            if (self.memo.disabled) return &.{};
+            if (self.captures == null) {
+                const previous = engine.a;
+                engine.a = retained;
+                defer engine.a = previous;
+                var names: Names = .empty;
+                try engine.retainQueryReferences(&names, row, inner);
+                self.captures = names;
+            }
+            var captured: std.ArrayList(v.Entry) = .empty;
+            for (row) |entry| if (self.captures.?.contains(entry.name)) try captured.append(temporary, entry);
+            return captured.items;
+        }
+    };
     // One apply stage owns one bounded, snapshot-local memo. Keys include
     // only captured bindings and the child's row goal. Binding equality keeps
     // numeric representation (including nested 1 versus 1.0) observable.
@@ -2710,6 +2719,7 @@ const Engine = struct {
     fn hasConsolidatableSum(self: *Engine, clauses: []const ast.Clause) !bool {
         for (clauses) |clause| switch (clause.operation) {
             .match, .unwind => {},
+            .subquery => |inner| if (!consolidatableCall(inner)) return false,
             .project => |p| {
                 if (p.value.order.len != 0 or p.value.skip != null or p.value.limit != null) return false;
                 var calls: std.ArrayList(*const ast.Expr) = .empty;
@@ -2728,7 +2738,7 @@ const Engine = struct {
     }
     fn runWeightedRows(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool, retain_final: bool) anyerror!WeightedRows {
         if (!self.numeric_attempted and self.read_only and self.stream_fold == null and self.weighted_sink == null and weightedExpression(clauses) and try self.hasConsolidatableSum(clauses)) {
-            // A successful integer-only, one-sign reduction is independent of
+            // A successful integer-only, one-sign-per-group reduction is independent of
             // contribution order, including its overflow outcome. Use a private
             // arena and publish only after all groups certify. Mixed signs,
             // floating point and semantic errors retry the ordinary executor;
@@ -2789,7 +2799,7 @@ const Engine = struct {
         while (clause_index < clauses.len) : (clause_index += 1) {
             const clause = clauses[clause_index];
             try self.checkpoint();
-            if (clause.operation == .match and bags.rows.len > 1) if (try self.consolidationDemand(clauses[clause_index..])) |demand| {
+            if ((clause.operation == .match or clause.operation == .subquery) and bags.rows.len > 1) if (try self.consolidationDemand(clauses[clause_index..])) |demand| {
                 bags = try self.consolidateBags(bags, demand);
             };
             const before = bags.count();
@@ -2925,10 +2935,8 @@ const Engine = struct {
                     const demand = try self.matchDemand(clauses[clause_index + 1 ..]);
                     const goal = if (unit) null else self.callRowGoal(clauses[clause_index + 1 ..]);
                     var produced: usize = 0;
-                    var memo: CallMemo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = !weightedExpression(inner) or unit };
-                    defer memo.deinit();
-                    var captures: Names = .empty;
-                    if (!memo.disabled and bags.rows.len != 0) try self.retainQueryReferences(&captures, bags.rows[0], inner);
+                    var apply: ApplyMemo = .{ .memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = !weightedExpression(inner) or unit } };
+                    defer apply.memo.deinit();
                     for (bags.rows, bags.weights) |row, weight| {
                         if (goal) |bound| if (produced >= bound) break;
                         const child_goal: ?usize = if (goal) |bound| blk: {
@@ -2939,11 +2947,8 @@ const Engine = struct {
                         const body = if (child_goal) |bound| try self.boundedCallBody(inner, bound) else inner;
                         var key_arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
                         defer key_arena.deinit();
-                        var key: std.ArrayList(v.Entry) = .empty;
-                        if (!memo.disabled) for (row) |entry| if (captures.contains(entry.name)) {
-                            try key.append(key_arena.allocator(), entry);
-                        };
-                        const cached = try memo.find(self, key.items, child_goal);
+                        const key = try apply.key(self, row, inner, self.a, key_arena.allocator());
+                        const cached = try apply.memo.find(self, key, child_goal);
                         const scope = PatternScope.enter(self);
                         const children = cached orelse blk: {
                             defer scope.leave(self);
@@ -2952,7 +2957,7 @@ const Engine = struct {
                         };
                         // A cache hit does not enter the child's pattern scope.
                         if (cached != null) scope.leave(self);
-                        if (cached == null) try memo.put(self, key.items, child_goal, children);
+                        if (cached == null) try apply.memo.put(self, key, child_goal, children);
                         if (unit) {
                             try rows.append(self.a, row);
                             try weights.append(self.a, weight);
@@ -4561,24 +4566,166 @@ const Engine = struct {
         if ((self.shortest_count != null or self.count_endpoints) and path.selector == .all and try self.countAllPath(input, path, mode, node, output)) return;
         if (self.component_proof) return error.CypherComponentDeclined;
         if (!self.shortest_fast or path.selector == .all or path.edges.len != 1 or input.used.len != 0 or input.constraints.len != 0) {
-            return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
+            return self.routePath(input, path, mode, node, output);
         }
         // Rebound relationship/path variables constrain the complete route,
         // rather than only its endpoint distance.
         if (path.alias) |alias| if (lookup(input.row, alias) != null)
-            return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
+            return self.routePath(input, path, mode, node, output);
         if (path.edges[0].alias) |alias| if (lookup(input.row, alias) != null)
-            return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
+            return self.routePath(input, path, mode, node, output);
         // Forward references, path-dependent predicates and multi-pattern MATCH
         // keep the exhaustive selector. Endpoint-local patterns admit a native
         // breadth-first operator, with one frontier distance per identity.
         for (path.edges[0].properties) |property| if (self.constant(property.value, input.row) == null)
-            return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
+            return self.routePath(input, path, mode, node, output);
         for (path.nodes[1].properties) |property| if (self.constant(property.value, input.row) == null)
-            return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
+            return self.routePath(input, path, mode, node, output);
         if (path.edges[0].min_hops > 1) return self.lowerPath(input, path, mode, node, output);
         try self.breadthPath(input, path, mode, node, output);
     }
+    fn routePath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, start: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!void {
+        const probe = self.route_probe;
+        if (probe) |value| value.rejected.* = 0;
+        self.pathStep(input, path, mode, 0, &.{start}, &.{}, output) catch |err| {
+            if (err != error.CypherProbeEndpoints) return err;
+            self.route_probe = null;
+            defer self.route_probe = probe;
+            if (path.execution_prefix or self.interior != null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+            // Constant residuals and proved finite bounds admit this quotient.
+            // Path histories and output order stay in the original DFS. The
+            // quotient deliberately ignores uniqueness, so it is a superset
+            // even for cyclic trails and can only prune impossible suffixes.
+            var maximum: usize = 0;
+            var needs_bound = false;
+            for (path.edges) |edge| {
+                if (edge.max_hops) |upper| maximum = std.math.add(usize, maximum, upper) catch return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output) else needs_bound = true;
+                for (edge.properties) |entry| if (self.constant(entry.value, input.row) == null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+            }
+            if (maximum > self.limits.path_depth) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+            for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, input.row) == null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+            var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const domains = try a.alloc(ast.Edge, path.edges.len);
+            for (domains, path.edges) |*domain, edge| domain.* = .{ .span = edge.span, .types = edge.types, .direction = edge.direction };
+            var pruner: RoutePruner = .{ .a = a, .path = path, .predicate = self.stream_predicate, .row = input.row, .graph = .{ .input = .{ .row = input.row }, .path = path, .domains = domains, .qualified = true } };
+            try pruner.graph.positions.put(a, start.identity, 0);
+            try pruner.graph.nodes.append(a, .{ .node = start, .depth = 0 });
+            if (needs_bound and !try pruner.bound(self)) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+            const previous_pruner = self.route_pruner;
+            const previous_graph = self.lower_graph;
+            self.route_pruner = &pruner;
+            self.lower_graph = &pruner.graph;
+            defer self.route_pruner = previous_pruner;
+            defer self.lower_graph = previous_graph;
+            return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+        };
+    }
+    const RoutePruner = struct {
+        const Key = struct { node: usize, edge: usize, hop: u32 };
+        const Frame = struct { key: Key, children: []const Key, next: usize = 0 };
+        a: A,
+        path: ast.Path,
+        row: Row,
+        predicate: ?*const ast.Expr,
+        graph: LowerGraph,
+        possible: std.AutoHashMapUnmanaged(Key, bool) = .empty,
+        fn bound(self: *@This(), engine: *Engine) anyerror!bool {
+            const scope = EvalScope.enter(engine, self.a);
+            defer scope.leave(engine);
+            const previous_graph = engine.lower_graph;
+            engine.lower_graph = null;
+            defer engine.lower_graph = previous_graph;
+            // Unbounded segments need a finite proof before quotienting. Load
+            // the union closure conservatively, then bound each unbounded
+            // domain by its DAG depth. Cyclic domains keep ordinary trails.
+            var head: usize = 0;
+            while (head < self.graph.nodes.items.len) : (head += 1) for (self.graph.domains, 0..) |_, domain| {
+                _ = try engine.loadLowerDomain(&self.graph, head, domain);
+            };
+            var roots: std.AutoHashMapUnmanaged(usize, u64) = .empty;
+            for (0..self.graph.nodes.items.len) |index| try roots.put(self.a, index, 1);
+            const edges = try self.a.dupe(ast.Edge, self.path.edges);
+            var maximum: usize = 0;
+            for (edges, 0..) |*edge, domain| {
+                if (edge.max_hops == null) {
+                    const proof = (try engine.lowerDomainDepth(&self.graph, domain, edge.*, &roots)) orelse return false;
+                    edge.max_hops = @intCast(proof.maximum);
+                }
+                maximum = std.math.add(usize, maximum, edge.max_hops.?) catch return false;
+            }
+            if (maximum > engine.limits.path_depth) return false;
+            self.path.edges = edges;
+            return true;
+        }
+        fn admits(self: *@This(), engine: *Engine, identity: v.Identity, edge: usize, hop: u32) anyerror!bool {
+            const node = self.graph.positions.get(identity) orelse return true;
+            const key: Key = .{ .node = node, .edge = edge, .hop = hop };
+            if (self.possible.get(key)) |result| return result;
+            const scope = EvalScope.enter(engine, self.a);
+            defer scope.leave(engine);
+            const previous_graph = engine.lower_graph;
+            engine.lower_graph = null;
+            defer engine.lower_graph = previous_graph;
+            // An explicit postorder stack bounds native stack use by neither
+            // graph diameter nor the number of pattern segments.
+            var frames: std.ArrayList(Frame) = .empty;
+            defer frames.deinit(self.a);
+            try frames.append(self.a, try self.frame(engine, key));
+            while (frames.items.len != 0) {
+                const last = frames.items.len - 1;
+                const current = frames.items[last].key;
+                if (self.possible.contains(current)) {
+                    _ = frames.pop();
+                    continue;
+                }
+                if (frames.items[last].next == frames.items[last].children.len) {
+                    try self.possible.put(self.a, current, false);
+                    _ = frames.pop();
+                    continue;
+                }
+                const child = frames.items[last].children[frames.items[last].next];
+                if (self.possible.get(child)) |result| {
+                    if (result) try self.possible.put(self.a, current, true) else frames.items[last].next += 1;
+                } else try frames.append(self.a, try self.frame(engine, child));
+            }
+            return self.possible.get(key).?;
+        }
+        fn accepts(_: *@This(), engine: *Engine, predicate: *const ast.Expr, row: Row) anyerror!bool {
+            return (try (try engine.eval(predicate, row, null)).truth()) == true;
+        }
+        fn frame(self: *@This(), engine: *Engine, key: Key) anyerror!Frame {
+            try engine.state();
+            const edge = self.path.edges[key.edge];
+            const pattern = self.path.nodes[key.edge + 1];
+            const node = self.graph.nodes.items[key.node].node;
+            var children: std.ArrayList(Key) = .empty;
+            if (key.hop >= edge.min_hops and try engine.nodeMatches(node, pattern) and boundNodeMatches(node, pattern, self.row) and try engine.constantProperties(.{ .node = node }, pattern.properties, self.row)) {
+                if (key.edge + 1 == self.path.edges.len) {
+                    const row = (try engine.bind(self.row, pattern.alias, .{ .node = node })) orelse return .{ .key = key, .children = &.{} };
+                    // A speculative expression error makes this suffix unknown,
+                    // never empty. Its error is observed only if DFS reaches it.
+                    const accepted = if (self.predicate) |predicate| self.accepts(engine, predicate, row) catch |err| switch (err) {
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.DeadlineExceeded, error.CypherStateBudgetExceeded, error.CypherMemoryBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherRecursionBudgetExceeded, error.CypherPathBudgetExceeded => return err,
+                        else => true,
+                    } else true;
+                    if (accepted) {
+                        try self.possible.put(self.a, key, true);
+                        return .{ .key = key, .children = &.{} };
+                    }
+                } else try children.append(self.a, .{ .node = key.node, .edge = key.edge + 1, .hop = 0 });
+            }
+            if (key.hop < edge.max_hops.?) {
+                const range = try engine.loadLowerDomain(&self.graph, key.node, key.edge);
+                for (self.graph.nodes.items[key.node].arcs.items[range.first..range.last]) |arc| {
+                    try engine.state();
+                    if (try engine.constantProperties(.{ .relationship = arc.relationship }, edge.properties, self.row)) try children.append(self.a, .{ .node = arc.target, .edge = key.edge, .hop = key.hop + 1 });
+                }
+            }
+            return .{ .key = key, .children = children.items };
+        }
+    };
     // A statement-owned adjacency capture shares physical reads between route
     // prefixes. DAGs and repeatable walks admit distance states indexed by the
     // unsatisfied lower bound; cyclic trails retain exact route histories.
@@ -4631,6 +4778,14 @@ const Engine = struct {
         return self.expandEdges(mapping_index, mapping, identity, edge.direction, cursor, demand);
     }
     fn expandEdges(self: *Engine, mapping_index: usize, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Relationship) {
+        if (cursor != null and self.route_pruner != null and self.lower_graph == &self.route_pruner.?.graph) {
+            // Lazy reachability can capture a cyclic ancestor while its DFS
+            // frame is paging a native reader. Finish that reader with its
+            // native token rather than interpreting it as a captured cursor.
+            const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, identity, direction, cursor, demand);
+            try self.accountEdges(page);
+            return page;
+        }
         if (self.lower_graph) |graph| if (graph.positions.get(identity)) |position| {
             const range: LowerRange = if (graph.domains.len != 0) blk: {
                 for (graph.domains, 0..) |domain, index| {
@@ -5195,6 +5350,7 @@ const Engine = struct {
     fn expandPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, edge_index: usize, nodes: []const *const v.Node, relationships: []const *const v.Relationship, hops: u32, edge_values: []const v.Value, output: *std.ArrayList(MatchState)) anyerror!void {
         const edge = path.edges[edge_index];
         const current = nodes[nodes.len - 1];
+        if (self.route_pruner) |pruner| if (pruner.path.nodes.ptr == path.nodes.ptr and !try pruner.admits(self, current.identity, edge_index, hops)) return;
         if (hops >= edge.min_hops and try self.nodeMatches(current, path.nodes[edge_index + 1])) {
             if (try self.bind(input.row, path.nodes[edge_index + 1].alias, .{ .node = current })) |node_row| {
                 const edge_value = try self.routeEdgeValue(path, edge, edge_values, relationships);
@@ -5394,15 +5550,7 @@ const Engine = struct {
             key = captured.items;
             if (try self.expression_memo.?.find(self, key, @intFromPtr(expression))) |cached| return cached.rows[0][0].value;
         }
-        const result = self.evalInner(expression, row, group) catch |err| {
-            if (self.probe_predicate_failed) |failed| if (expression == self.stream_predicate) {
-                // An emptiness proof cannot expose an error from a route
-                // the demand-driven producer might never have observed.
-                failed.* = true;
-                return .{ .boolean = false };
-            };
-            return err;
-        };
+        const result = try self.evalInner(expression, row, group);
         if (memoizable) try self.expression_memo.?.put(self, key, @intFromPtr(expression), .{ .rows = &.{&.{.{ .name = "value", .value = result }}}, .weights = &.{Count.one} });
         _ = try self.values.info(result);
         return result;

@@ -2597,3 +2597,31 @@ test "certified numeric consolidation releases unpublished rows on allocation fa
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "adaptive suffix reachability releases every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH REPEATABLE ELEMENTS (a:Document {id:'a'})-[:CITES*14..14]->(b:Document) WHERE b.rank+0<0 RETURN b.rank LIMIT 1", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "integer sign certification is per aggregate group and keeps mixed-sign overflow" {
+    try check("UNWIND [{k:1,x:1},{k:2,x:-1},{k:1,x:2},{k:2,x:-2}] AS r MATCH (a:Document {id:'a'}) WITH r,a MATCH (a)-[:CITES]->(b) RETURN r.k,sum(r.x)", "[[1,6],[2,-6]]");
+    // The positive prefix overflows before the later negative contribution;
+    // the unpublished certification attempt must retain that ordinary error.
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [9223372036854775807,1,-1] AS x MATCH (a:Document {id:'c'}) WITH x,a MATCH (a) RETURN sum(x)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}

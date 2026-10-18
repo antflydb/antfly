@@ -1527,13 +1527,17 @@ variable conflicts and recursion limits follow ordinary subquery semantics.
 Pure CALL queries enter this pipeline from a weighted unit input, so an initial
 CALL does not need an earlier MATCH or finite window to retain child bags.
 Pure MATCH chains separated by WITH or UNWIND enter weighted execution directly.
-Before another MATCH, equivalent complete bindings can be consolidated when a
-downstream COUNT/MIN/MAX reduction makes their interleaving unobservable. Counts
-are combined without changing bag multiplicity; representation-sensitive binding
+Before another MATCH or pure returning CALL, equivalent complete bindings can
+be consolidated when a downstream COUNT/MIN/MAX reduction makes their
+interleaving unobservable. Counts are combined without changing bag multiplicity; representation-sensitive binding
 keys keep integer/float distinctions, including inside containers. Pagination,
-ordering, correlated calls and order-sensitive reductions block this regrouping.
+ordering, unit calls, effects and order-sensitive outer reductions block this
+regrouping. Returning apply always executes each child from a unit bag before
+multiplying its returned weights; internal child windows/reducers keep their
+own invocation scope.
 SUM can also consolidate under a runtime certificate: a private, unpublished
-attempt verifies that every non-null contribution is a nonnegative integer.
+attempt verifies one integer sign per aggregate group, with zero neutral.
+Nonpositive groups and nonnegative groups can coexist across aggregate states.
 Successful attempts publish owned rows and exact weights. Mixed signs, floating
 point or checked arithmetic failures retry ordinary execution with cumulative
 work accounting; intermediate overflow and floating-point order stay observable.
@@ -1547,17 +1551,27 @@ returned scope into each parent before resuming the outer consumer. Empty child
 bags resume the producer rather than truncating its prefix. Child reducers,
 DISTINCT, ordering and windows retain their own stage barriers. Filters and
 OPTIONAL null extension remain in their own MATCH scopes; no prefix is truncated
-before its continuation qualifies. After 64 unsuccessful routes, an endpoint-local filtered window can
-try a proved endpoint-DP emptiness certificate. A declined proof or a possible
-result resumes ordinary route order; speculative predicate errors cannot become
-observable. First successful rows retain the original lazy traversal.
+before its continuation qualifies. After 64 unsuccessful routes, an endpoint-local
+filtered window builds a lazy suffix reachability memo over node, pattern
+segment and hop states.
+It resumes the original DFS while pruning impossible suffixes, including when
+one late branch qualifies after an exponentially large rejected branch. The
+reachability graph ignores trail/simple uniqueness as a conservative superset;
+DFS still enforces exact histories and output order. An explicit postorder
+stack avoids recursion proportional to graph depth. Unbounded segments require
+a finite domain-DAG depth proof before quotienting; cyclic unbounded trails keep
+the ordinary producer. Speculative predicate errors mark a suffix unknown rather than exposing errors early. Constant residuals,
+read authority and statement budgets remain mandatory; unproved shapes retain
+the ordinary producer. First successful rows keep lazy traversal.
 Returning CALL bodies inherit proven row goals through unfiltered projections,
-capped by their own existing limits;
-child SKIP and aggregate/sort barriers remain inside the child scope. An outer
+capped by their own existing limits; child SKIP and aggregate/sort barriers remain
+inside the child scope. An outer
 filter, DISTINCT, sort, aggregation or expanding stage prevents this propagation.
-Pure returning CALL stages memoize child bags by captured bindings and the
-child row goal, within a bounded statement-local cache. Keys preserve binding
-representations and implicit prebound MATCH aliases. Cache admission can decline
+Pure returning CALL stages and their finite-window continuations share bounded
+child-bag memoization by captured bindings and child row goal. Streaming bodies
+retain lazy production; scoped child reducers/windows reuse complete memoized
+bags across parent continuations. Keys preserve binding representations and
+implicit prebound MATCH aliases. Cache admission can decline
 without failing the query; writes, procedures, volatile functions and unit CALL
 remain barriers. Cached children own their payloads and preserve parent weights.
 Pattern dependency analysis follows query WITH scopes and lexical shadowing;

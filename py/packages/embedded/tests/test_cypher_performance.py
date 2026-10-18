@@ -1993,8 +1993,7 @@ def test_sibling_branch_counts_do_not_enumerate_assignments(graph_db):
     assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
 
 
-def test_weighted_chains_goals_and_promoted_producers(graph_db):
-    db = graph_db
+def populate_layered_graph(db):
     db.sql("CREATE INDEX docs_id ON docs(id)")
     layers = 68
     patterns = ["(s:D {id:'start',score:0})"] + [
@@ -2003,6 +2002,11 @@ def test_weighted_chains_goals_and_promoted_producers(graph_db):
     patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
     patterns += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
     db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+
+
+def test_weighted_chains_goals_and_promoted_producers(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
     base = "MATCH (s:D {id:'start'})-[:R*66..66]->(b:D) "
     for tail, expected in (
         ("RETURN avg(b.score),sum(0),count(b.missing)", [66.0, "0", "0"]),
@@ -2602,3 +2606,59 @@ def test_certified_reductions_and_pattern_cache_scope(graph_db):
     )
     result = db.cypher_json("g", {"query": query})
     assert [[cell["value"] for cell in row] for row in result["rows"]] == [["1"], ["1"]]
+
+
+def test_late_qualified_windows_and_repeated_apply_keep_physical_work_bounded(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    chain = "MATCH (s:D {id:'start'})-[:R*4..4]->(b:D) "
+    call_chain = chain + "WITH b CALL { WITH b MATCH (b)-[:R*4..4]->(c:D) RETURN c } WITH c AS b " * 13
+    expected_sum = 56 * 2**56
+    for query in (
+        chain + "WITH b MATCH (b)-[:R*4..4]->(c:D) WITH c AS b " * 13 + "RETURN sum(-b.score)",
+        call_chain + "RETURN sum(-b.score)",
+        call_chain + "RETURN count(*),sum(b.score),sum(-b.score)",
+    ):
+        result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+        expected = [2**56, expected_sum, -expected_sum] if "count(*)" in query else [-expected_sum]
+        assert [cell["value"] for cell in result["rows"][0]] == [str(value) for value in expected]
+
+    for child, expected_count in (("RETURN c,count(*) AS n", 2**17), ("RETURN c ORDER BY c.score LIMIT 1", 16)):
+        body = f"WITH b CALL {{ WITH b MATCH (b)-[:R*4..4]->(c:D) {child} }} WITH c AS b "
+        result = db.cypher_json(
+            "g",
+            {
+                "query": chain + body * 13 + "RETURN count(*)",
+                "limits": {"explored_edges": 1000, "intermediate_states": 20000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected_count)}]]
+
+    apply = (
+        "UNWIND range(1,100) AS i MATCH (s:D {id:'start'}) "
+        "CALL { WITH s MATCH (s)-[:R*32..32]->(b:D) RETURN count(*) AS n } RETURN i,n LIMIT 100"
+    )
+    result = db.cypher_json("g", {"query": apply, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [[str(i), str(2**32)] for i in range(1, 101)]
+    assert result["stats"]["explored_edges"] == 126
+
+    # Determine native traversal order before attaching the exponential rejected
+    # branch and a single late qualifying chain. Every endpoint is observable
+    # only through the same endpoint-local predicate/projection.
+    db.cypher_json(
+        "g",
+        {"query": "CREATE (s:D {id:'branch-root'}),(a:D {id:'left'}),(b:D {id:'right'}),(s)-[:R]->(a),(s)-[:R]->(b)"},
+    )
+    rows = db.cypher_json("g", {"query": "MATCH (s:D {id:'branch-root'})-[:R]->(b:D) RETURN b.id"})["rows"]
+    bad, good = [row[0]["value"] for row in rows]
+    create = f"MATCH (bad:D {{id:'{bad}'}}),(base:D {{id:'start'}}),(good:D {{id:'{good}'}}) CREATE (bad)-[:R]->(base),"
+    create += ",".join(f"(g{i}:D {{score:{999 if i == 32 else -10}}})" for i in range(33))
+    create += ",(good)-[:R]->(g0)," + ",".join(f"(g{i})-[:R]->(g{i + 1})" for i in range(32))
+    db.cypher_json("g", {"query": create})
+    for path in ("[:R*34..34]", "[:R*17..17]->()-[:R*17..17]", "[:R*34..]"):
+        query = f"MATCH (s:D {{id:'branch-root'}})-{path}->(b:D) WHERE b.score+0=999 RETURN b.score LIMIT 1"
+        result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+        assert result["rows"] == [[{"type": "integer", "value": "999"}]]
+    query = "MATCH (s:D {id:'branch-root'})-[:R*34..34]->(b:D) WHERE CASE WHEN b.score=999 THEN 1/0=0 ELSE false END RETURN b.score LIMIT 1"
+    with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+        db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
