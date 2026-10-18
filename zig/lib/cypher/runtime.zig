@@ -4783,6 +4783,8 @@ const Engine = struct {
                 break :blk .{ .list = try values.toOwnedSlice(self.a) };
             },
             .pattern_comprehension => |c| blk: {
+                const pattern_scope = PatternScope.enter(self);
+                defer pattern_scope.leave(self);
                 var input = row;
                 if (c.path.alias) |alias| {
                     var local: std.ArrayList(v.Entry) = .empty;
@@ -4870,6 +4872,8 @@ const Engine = struct {
                 break :blk if (c.otherwise) |other| try self.eval(other, row, group) else .null;
             },
             .exists => |clauses| blk: {
+                const pattern_scope = PatternScope.enter(self);
+                defer pattern_scope.leave(self);
                 const columns = self.columns;
                 defer self.columns = columns;
                 const candidates = try self.existsRows(clauses, row);
@@ -5220,6 +5224,31 @@ const Engine = struct {
         };
     }
     const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, sequence: usize = 0, weight: usize = 1 };
+    const PatternScope = struct {
+        columns: @FieldType(Engine, "columns"),
+        stages: @FieldType(Engine, "stages"),
+        retain_windows: bool,
+        match_weight_demand: ?Multiplicity,
+        pending_window: ?WeightedRows,
+        fn enter(engine: *Engine) PatternScope {
+            const scope: PatternScope = .{ .columns = engine.columns, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .pending_window = engine.pending_window };
+            // A correlated query owns its result/profiling buffers and must
+            // produce ordinary expression values. Its caller may itself be
+            // retaining a weighted window in a temporary evaluation arena.
+            engine.stages = .empty;
+            engine.retain_windows = false;
+            engine.match_weight_demand = null;
+            engine.pending_window = null;
+            return scope;
+        }
+        fn leave(scope: PatternScope, engine: *Engine) void {
+            engine.columns = scope.columns;
+            engine.stages = scope.stages;
+            engine.retain_windows = scope.retain_windows;
+            engine.match_weight_demand = scope.match_weight_demand;
+            engine.pending_window = scope.pending_window;
+        }
+    };
     const EvalScope = struct {
         a: A,
         values: value_work.Work,
@@ -5227,19 +5256,8 @@ const Engine = struct {
         regex: @import("regex.zig").Runtime,
         reads: @FieldType(Engine, "read_nodes"),
         cache_reads: bool,
-        stages: @FieldType(Engine, "stages"),
-        retain_windows: bool,
-        match_weight_demand: ?Multiplicity,
-        pending_window: ?WeightedRows,
         fn enter(engine: *Engine, a: A) EvalScope {
-            const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .pending_window = engine.pending_window };
-            // Correlated expression subplans use this scope's allocator.
-            // Never let their temporary stage buffers replace the owner's
-            // retained buffer; it must survive when this arena is reset.
-            engine.stages = .empty;
-            engine.retain_windows = false;
-            engine.match_weight_demand = null;
-            engine.pending_window = null;
+            const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads };
             engine.a = a;
             engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork };
             engine.strings = .{ .a = a, .ptr = engine, .charge = chargeWork };
@@ -5256,10 +5274,6 @@ const Engine = struct {
             engine.regex = scope.regex;
             engine.read_nodes = scope.reads;
             engine.cache_reads = scope.cache_reads;
-            engine.stages = scope.stages;
-            engine.retain_windows = scope.retain_windows;
-            engine.match_weight_demand = scope.match_weight_demand;
-            engine.pending_window = scope.pending_window;
         }
     };
     const Pick = struct { arena: std.heap.ArenaAllocator, value: Projected };
@@ -5370,7 +5384,7 @@ const Engine = struct {
                     }
                 }
             }
-            self.total = if (scope.match_weight_demand != null) @intCast(@min(total, std.math.maxInt(usize))) else std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
+            self.total = if (engine.match_weight_demand != null) @intCast(@min(total, std.math.maxInt(usize))) else std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
         }
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;

@@ -2068,6 +2068,7 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "WITH b ORDER BY b.rank LIMIT 3 RETURN count(EXISTS { MATCH (b)-[:CITES]->(d:Document) RETURN count(*) })",
         "WITH b ORDER BY b.rank LIMIT 3 WITH b,[(b)-[:CITES]->(d:Document) | d.rank] AS xs UNWIND xs AS x RETURN count(*),sum(x)",
         "WITH b ORDER BY b.rank LIMIT 3 RETURN [(b)-[:CITES]->(d:Document) | d.rank]",
+        "WITH b ORDER BY b.rank LIMIT 3 UNWIND [(b)-[:CITES]->(d:Document) | d.rank] AS x RETURN count(*),sum(x)",
         "WITH b ORDER BY b.rank LIMIT 3 RETURN EXISTS { MATCH (b)-[:CITES]->(d:Document) }",
     }) |tail| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
