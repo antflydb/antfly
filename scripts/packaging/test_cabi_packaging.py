@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -889,6 +890,73 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn("version_scheme 1", rendered)
             self.assertIn('license all_of: ["Elastic-2.0", "Apache-2.0"]', rendered)
             self.assertIn('system "./smoke"', rendered)
+            # Execute the exact C program emitted into the formula. A hardcoded
+            # ABI 1/2 allowlist used to reject the current library silently.
+            header = REPO_ROOT / "zig/pkg/antfly-embedded/include/antfly.h"
+            abi = re.search(r"#define ANTFLY_ABI_VERSION (\d+)", header.read_text())
+            implementation = (
+                REPO_ROOT / "zig/pkg/antfly-embedded/src/capi/handles.zig"
+            ).read_text()
+            self.assertIsNotNone(abi)
+            self.assertIn(f"pub const abi_version: u32 = {abi[1]};", implementation)
+            cc = shutil.which("cc")
+            self.assertIsNotNone(cc, "Homebrew smoke regression requires a C compiler")
+            smoke = rendered.split('(testpath/"smoke.c").write <<~C\n', 1)[1].split(
+                "\n    C", 1
+            )[0]
+            (root / "smoke.c").write_text(smoke)
+            (root / "stub.c").write_text("""
+#include <antfly.h>
+#include <stdlib.h>
+uint32_t antfly_abi_version(void) {
+    const char *abi = getenv("TEST_ABI");
+    return abi ? (uint32_t)atoi(abi) : ANTFLY_ABI_VERSION;
+}
+uint32_t antfly_open_options_size(void) {
+    return sizeof(antfly_open_options) + (getenv("TEST_SIZE") ? 1 : 0);
+}
+antfly_error_code antfly_lite_create(const char *path, antfly_db **out_db) {
+    (void)path; (void)out_db;
+    return getenv("TEST_CREATE") ? ANTFLY_INTERNAL : ANTFLY_OK;
+}
+void antfly_db_close(antfly_db *db) { (void)db; }
+const char *antfly_error_code_name(antfly_error_code code) {
+    (void)code; return "INTERNAL";
+}
+const char *antfly_last_error_detail(void) { return "test create failure"; }
+""")
+            subprocess.run(
+                [
+                    cc,
+                    "-Wall",
+                    "-Werror",
+                    "smoke.c",
+                    "stub.c",
+                    "-I",
+                    str(header.parent),
+                    "-o",
+                    "smoke",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            for variables, status, message in (
+                ({}, 0, ""),
+                ({"TEST_ABI": str(int(abi[1]) + 1)}, 1, "differs from header ABI"),
+                ({"TEST_SIZE": "1"}, 2, "open options size differs"),
+                ({"TEST_CREATE": "1"}, 3, "INTERNAL: test create failure"),
+            ):
+                with self.subTest(variables=variables):
+                    result = subprocess.run(
+                        [str(root / "smoke")],
+                        cwd=root,
+                        env={**os.environ, **variables},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(status, result.returncode, result.stderr)
+                    self.assertIn(message, result.stderr)
             self.assertIn("antfly_1.2.3_Darwin_arm64.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_arm64_gnu.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_x86_64_gnu.tar.gz", rendered)

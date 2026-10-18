@@ -64,6 +64,9 @@ jobs:
 
       - name: Build and check TypeScript binding
         working-directory: ts
+        env:
+          ANTFLY_LIBRARY: ${{ github.workspace }}/dist/embedded-packages/npm-packages/embedded-linux-x64/lib/libantfly.so
+          ANTFLY_LITE_REQUIRE_LIBRARY: "1"
         run: |
           pnpm --filter @antfly/embedded typecheck
           pnpm --filter @antfly/embedded test
@@ -73,8 +76,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/embedded-packages/npm
+          cp -R ts/packages/embedded/dist dist/embedded-packages/npm-packages/embedded/dist
           for name in embedded-darwin-arm64 embedded-linux-arm64 embedded-linux-x64 embedded; do
-            npm pack --pack-destination dist/embedded-packages/npm "./ts/packages/$name"
+            npm pack --ignore-scripts --pack-destination dist/embedded-packages/npm "./dist/embedded-packages/npm-packages/$name"
           done
           python scripts/packaging/verify_lite_release.py \
             --version "${{ inputs.version }}" \

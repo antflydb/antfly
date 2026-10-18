@@ -106,6 +106,11 @@ class LitePackagingTests(unittest.TestCase):
                     for item in stage.iterdir():
                         tar.add(item, arcname=item.name)
 
+            manifests = list(root.glob("ts/packages/*/package.json")) + [
+                root / "py/packages/embedded/pyproject.toml"
+            ]
+            original_manifests = {path: path.read_bytes() for path in manifests}
+
             with (
                 mock.patch.object(package, "ROOT", root),
                 mock.patch.object(
@@ -124,9 +129,19 @@ class LitePackagingTests(unittest.TestCase):
             ):
                 self.assertEqual(0, package.main())
 
+            for path, original in original_manifests.items():
+                self.assertEqual(original, path.read_bytes(), str(path))
+            wrapper = root / "out/npm-packages/embedded"
+            manifest = json.loads((wrapper / "package.json").read_text())
+            self.assertEqual("1.2.3", manifest["version"])
+            self.assertEqual({"1.2.3"}, set(manifest["optionalDependencies"].values()))
+            # The workflow supplies the checked TypeScript build after staging.
+            (wrapper / "dist").mkdir()
+            (wrapper / "dist/index.js").write_text("export {};\n")
+
             for platform in package.PACKAGE_PLATFORMS:
                 suffix = platform.npm_package_dir.replace("cli-", "embedded-")
-                npm = root / "ts/packages" / suffix
+                npm = root / "out/npm-packages" / suffix
                 self.assertEqual(
                     "1.2.3", json.loads((npm / "package.json").read_text())["version"]
                 )
@@ -222,7 +237,7 @@ class LitePackagingTests(unittest.TestCase):
                         "--ignore-scripts",
                         "--pack-destination",
                         str(npm_dir),
-                        str(root / "ts/packages" / name),
+                        str(root / "out/npm-packages" / name),
                     ],
                     check=True,
                     capture_output=True,

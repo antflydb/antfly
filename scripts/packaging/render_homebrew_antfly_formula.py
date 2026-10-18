@@ -131,11 +131,23 @@ class Antfly < Formula
     system "#{{bin}}/antfly", "--help"
     (testpath/"smoke.c").write <<~C
       #include <antfly.h>
+      #include <stdio.h>
       int main(void) {{
         uint32_t abi = antfly_abi_version();
-        if (abi != 1 && abi != 2) return 1;
-        void *db = NULL;
-        if (antfly_lite_create("smoke.aflite", (void *)&db) != ANTFLY_OK) return 2;
+        if (abi != ANTFLY_ABI_VERSION) {{
+          fprintf(stderr, "libantfly ABI %u differs from header ABI %u\\n", abi, ANTFLY_ABI_VERSION);
+          return 1;
+        }}
+        if (antfly_open_options_size() != sizeof(antfly_open_options)) {{
+          fprintf(stderr, "libantfly open options size differs from header\\n");
+          return 2;
+        }}
+        antfly_db *db = NULL;
+        antfly_error_code code = antfly_lite_create("smoke.aflite", &db);
+        if (code != ANTFLY_OK) {{
+          fprintf(stderr, "antfly_lite_create: %s: %s\\n", antfly_error_code_name(code), antfly_last_error_detail());
+          return 3;
+        }}
         antfly_db_close(db);
         return 0;
       }}
