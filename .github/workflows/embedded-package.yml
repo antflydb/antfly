@@ -53,17 +53,23 @@ jobs:
       - name: Verify embedded packaging contract
         run: python -m unittest scripts.packaging.test_lite_packaging scripts.packaging.test_release_licenses
 
+      - name: Stage release package source
+        run: git worktree add --detach dist/embedded-package-source HEAD
+
       - name: Populate platform packages and wheels
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          python scripts/packaging/package_lite_release.py \
+          python dist/embedded-package-source/scripts/packaging/package_lite_release.py \
             --version "$RELEASE_VERSION" \
             --archive-dir dist/release-archives \
             --out-dir dist/embedded-packages
 
       - name: Build and check TypeScript binding
         working-directory: ts
+        env:
+          ANTFLY_LIBRARY: ${{ github.workspace }}/dist/embedded-package-source/ts/packages/embedded-linux-x64/lib/libantfly.so
+          ANTFLY_LITE_REQUIRE_LIBRARY: "1"
         run: |
           pnpm --filter @antfly/embedded typecheck
           pnpm --filter @antfly/embedded test
@@ -73,8 +79,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/embedded-packages/npm
+          cp -R ts/packages/embedded/dist dist/embedded-package-source/ts/packages/embedded/dist
           for name in embedded-darwin-arm64 embedded-linux-arm64 embedded-linux-x64 embedded; do
-            npm pack --pack-destination dist/embedded-packages/npm "./ts/packages/$name"
+            npm pack --ignore-scripts --pack-destination dist/embedded-packages/npm "./dist/embedded-package-source/ts/packages/$name"
           done
           python scripts/packaging/verify_lite_release.py \
             --version "${{ inputs.version }}" \
