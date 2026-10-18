@@ -866,7 +866,7 @@ pub fn validateJsonSchemaValue(
         root_property.deinit(alloc);
         alloc.destroy(root_property);
     }
-    if (propertyContainsRelationalOnlySchemaType(root_property.*)) return error.InvalidSchemaUpdateRequest;
+    if (propertyContainsRelationalOnlySchemaType(root_property)) return error.InvalidSchemaUpdateRequest;
 
     var validation_context = RuntimeValidationContext{
         .alloc = alloc,
@@ -2955,11 +2955,11 @@ fn validateParsedStorageModeSchema(schema: TableSchema) !void {
     if (schema.storage_mode == .relational) return;
     for (schema.document_schemas) |document_schema| {
         const root_property = makeRootDocumentProperty(document_schema);
-        if (propertyContainsRelationalOnlySchemaType(root_property)) return error.InvalidSchemaUpdateRequest;
+        if (propertyContainsRelationalOnlySchemaType(&root_property)) return error.InvalidSchemaUpdateRequest;
     }
 }
 
-fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
+fn propertyContainsRelationalOnlySchemaType(property: *const DocumentProperty) bool {
     if (property.sql_type != null) return true;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "geopoint") or
@@ -2967,40 +2967,40 @@ fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
             std.mem.eql(u8, field_type, "json")) return true;
     }
 
-    for (property.prefix_items) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
-    for (property.properties) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
-    for (property.pattern_properties) |child| if (propertyContainsRelationalOnlySchemaType(child.property.*)) return true;
-    for (property.dependent_schemas) |child| if (propertyContainsRelationalOnlySchemaType(child.schema.*)) return true;
-    for (property.any_of) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
-    for (property.one_of) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
-    for (property.all_of) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.prefix_items) |*child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.properties) |*child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.pattern_properties) |child| if (propertyContainsRelationalOnlySchemaType(child.property)) return true;
+    for (property.dependent_schemas) |child| if (propertyContainsRelationalOnlySchemaType(child.schema)) return true;
+    for (property.any_of) |*child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.one_of) |*child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    for (property.all_of) |*child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
 
-    if (property.additional_properties_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.unevaluated_properties_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.property_names) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.not_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.if_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.then_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.else_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.contains_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.item) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
-    if (property.unevaluated_items_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    if (property.additional_properties_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.unevaluated_properties_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.property_names) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.not_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.if_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.then_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.else_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.contains_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.item) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
+    if (property.unevaluated_items_schema) |child| if (propertyContainsRelationalOnlySchemaType(child)) return true;
     return false;
 }
 
-fn propertyContainsSqlType(property: DocumentProperty) bool {
+fn propertyContainsSqlType(property: *const DocumentProperty) bool {
     if (property.sql_type != null) return true;
     const info = @typeInfo(DocumentProperty).@"struct";
     inline for (info.field_names, info.field_types) |name, Field| {
         const child = @field(property, name);
         if (Field == []DocumentProperty) {
-            for (child) |entry| if (propertyContainsSqlType(entry)) return true;
+            for (child) |*entry| if (propertyContainsSqlType(entry)) return true;
         } else if (Field == ?*DocumentProperty) {
-            if (child) |entry| if (propertyContainsSqlType(entry.*)) return true;
+            if (child) |entry| if (propertyContainsSqlType(entry)) return true;
         } else if (Field == []PatternProperty) {
-            for (child) |entry| if (propertyContainsSqlType(entry.property.*)) return true;
+            for (child) |entry| if (propertyContainsSqlType(entry.property)) return true;
         } else if (Field == []DependentSchema) {
-            for (child) |entry| if (propertyContainsSqlType(entry.schema.*)) return true;
+            for (child) |entry| if (propertyContainsSqlType(entry.schema)) return true;
         }
     }
     return false;
@@ -3107,7 +3107,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         var descendants = property;
         descendants.sql_type = null;
         descendants.numeric_modifier = null;
-        if (propertyContainsSqlType(descendants)) return error.InvalidSchemaUpdateRequest;
+        if (propertyContainsSqlType(&descendants)) return error.InvalidSchemaUpdateRequest;
         if (!isRelationalStorageProperty(property) or !relationalPhysicalConstraintsAreExact(property)) {
             return error.InvalidSchemaUpdateRequest;
         }
@@ -3722,6 +3722,19 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         alloc.destroy(property);
     }
 
+    // Scalar parsing owns large Debug temporaries. Finish that work before
+    // descending so nested schemas retain only the child traversal frame.
+    try @call(.never_inline, parseScalarPropertyKeywords, .{ alloc, context.numeric_domain, object, property });
+    property.properties = if (object.get("properties")) |properties_value|
+        if (properties_value == .object) try parseDocumentProperties(alloc, context, properties_value.object) else &[_]DocumentProperty{}
+    else
+        &[_]DocumentProperty{};
+    try @call(.never_inline, parseChildPropertyKeywords, .{ alloc, context, object, property });
+    try validatePropertyKeywords(property);
+    return property;
+}
+
+fn parseScalarPropertyKeywords(alloc: std.mem.Allocator, numeric_domain: bool, object: std.json.ObjectMap, property: *DocumentProperty) anyerror!void {
     const type_spec = if (object.get("type")) |property_type|
         try parseTypeSpec(alloc, property_type, false)
     else
@@ -3769,8 +3782,8 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         try stringifyJsonValue(alloc, const_schema_value)
     else
         null;
-    property.numeric_constraints = if (context.numeric_domain) try @import("numeric_constraints.zig").Plan.create(alloc, object) else null;
-    property.minimum = if (context.numeric_domain) null else if (object.get("minimum")) |minimum_value|
+    property.numeric_constraints = if (numeric_domain) try @import("numeric_constraints.zig").Plan.create(alloc, object) else null;
+    property.minimum = if (numeric_domain) null else if (object.get("minimum")) |minimum_value|
         if (minimum_value == .null) null else parseJsonNumber(minimum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
@@ -3778,7 +3791,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (minimum_value == .null) null else exactI64JsonNumber(minimum_value)
     else
         null;
-    property.maximum = if (context.numeric_domain) null else if (object.get("maximum")) |maximum_value|
+    property.maximum = if (numeric_domain) null else if (object.get("maximum")) |maximum_value|
         if (maximum_value == .null) null else parseJsonNumber(maximum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
@@ -3786,7 +3799,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (maximum_value == .null) null else exactI64JsonNumber(maximum_value)
     else
         null;
-    property.exclusive_minimum = if (context.numeric_domain) null else if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
+    property.exclusive_minimum = if (numeric_domain) null else if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
         if (exclusive_minimum_value == .null) null else parseJsonNumber(exclusive_minimum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
@@ -3794,7 +3807,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (exclusive_minimum_value == .null) null else exactI64JsonNumber(exclusive_minimum_value)
     else
         null;
-    property.exclusive_maximum = if (context.numeric_domain) null else if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
+    property.exclusive_maximum = if (numeric_domain) null else if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
         if (exclusive_maximum_value == .null) null else parseJsonNumber(exclusive_maximum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
@@ -3802,7 +3815,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (exclusive_maximum_value == .null) null else exactI64JsonNumber(exclusive_maximum_value)
     else
         null;
-    property.multiple_of = if (context.numeric_domain) null else if (object.get("multipleOf")) |multiple_of_value|
+    property.multiple_of = if (numeric_domain) null else if (object.get("multipleOf")) |multiple_of_value|
         if (multiple_of_value == .null) null else blk: {
             const parsed = parseJsonNumber(multiple_of_value) catch return error.InvalidSchemaUpdateRequest;
             if (parsed <= 0) return error.InvalidSchemaUpdateRequest;
@@ -3901,6 +3914,9 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (include_value == .array) try parseRequiredFields(alloc, include_value.array) else &[_][]const u8{}
     else
         &[_][]const u8{};
+}
+
+fn parseChildPropertyKeywords(alloc: std.mem.Allocator, context: SchemaContext, object: std.json.ObjectMap, property: *DocumentProperty) anyerror!void {
     property.prefix_items = if (object.get("prefixItems")) |prefix_items_value|
         if (prefix_items_value == .array) try parsePropertyVariants(alloc, context, prefix_items_value.array) else &[_]DocumentProperty{}
     else
@@ -3946,10 +3962,6 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     else
         &[_]PatternProperty{};
 
-    property.properties = if (object.get("properties")) |properties_value|
-        if (properties_value == .object) try parseDocumentProperties(alloc, context, properties_value.object) else &[_]DocumentProperty{}
-    else
-        &[_]DocumentProperty{};
     property.property_names = if (object.get("propertyNames")) |property_names_value|
         if (property_names_value == .object) try parseAnonymousProperty(alloc, context, property_names_value.object) else null
     else
@@ -4037,7 +4049,9 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (unevaluated_items_value == .object) try parseAnonymousProperty(alloc, context, unevaluated_items_value.object) else null
     else
         null;
+}
 
+fn validatePropertyKeywords(property: *DocumentProperty) !void {
     const array_like = schemaShapeIsArrayLike(
         property.field_type,
         property.min_items,
@@ -4073,7 +4087,6 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     if (property.dynamic_infer_types and (!(property.additional_properties_allowed orelse false) or property.additional_properties_schema != null)) {
         return error.InvalidSchemaUpdateRequest;
     }
-    return property;
 }
 
 test "relational contract schema parsing uses bounded stack and unwinds partial ownership" {
@@ -4082,9 +4095,9 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(alloc);
     try input.appendSlice(alloc, "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":");
-    for (0..8) |_| try input.appendSlice(alloc, "{\"type\":\"object\",\"properties\":{\"child\":");
+    for (0..32) |_| try input.appendSlice(alloc, "{\"type\":\"object\",\"properties\":{\"child\":");
     try input.appendSlice(alloc, "{\"type\":\"string\",\"enum\":[\"a\",\"b\"],\"minLength\":1,\"pattern\":\".\"}");
-    for (0..8) |_| try input.appendSlice(alloc, "}}");
+    for (0..32) |_| try input.appendSlice(alloc, "}}");
     try input.appendSlice(alloc, "}}}");
     const Probe = struct {
         input: []const u8,
@@ -4103,8 +4116,9 @@ test "relational contract schema parsing uses bounded stack and unwinds partial 
         }
     };
     var probe = Probe{ .input = input.items };
-    // Include LLVM Debug's surrounding JSON/cleanup frames in this portable
-    // budget. The former property parser alone used about 276 KiB per level.
+    // Keep 32 nested objects within one serving-thread-sized stack, including
+    // allocator tracing and JSON parsing. Scalar scratch must not accumulate
+    // along the recursive child path.
     const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Probe.run, .{&probe});
     thread.join();
     if (probe.failure) |err| return err;

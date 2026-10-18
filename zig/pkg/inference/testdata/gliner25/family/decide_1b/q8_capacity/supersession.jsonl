@@ -1,0 +1,13 @@
+{"earlier": "The Codex Antfly importer writes 1,024 history items per import batch.", "later": "The Codex Antfly importer writes 1,024 history items per batch now that Antfly lifted its 2 MiB transaction limit.", "replaces": true}
+{"earlier": "Use Qwen3 Embedding as the embedder for Codex semantic search in Antfly.", "later": "Use EmbeddingGemma 2 instead of Qwen3 Embedding as the Codex semantic search embedder.", "replaces": true}
+{"earlier": "Creating hello.txt failed because the elevated-permission request was declined.", "later": "The requested elevated permission to create hello.txt was declined, so hello.txt was not created.", "replaces": true}
+{"earlier": "The Codex Antfly importer writes 256 history items per import batch.", "later": "The Codex Antfly importer writes 1,024 history items per import batch.", "replaces": true}
+{"earlier": "Approval review defaults to off.", "later": "Approval review now defaults to shadow mode.", "replaces": true}
+{"earlier": "It is unresolved whether the importer should skip threads older than a year.", "later": "The Codex Antfly importer keeps threads of every age.", "replaces": true}
+{"earlier": "The user prefers benchmarks on release builds.", "later": "The user prefers that benchmarks always run on release builds.", "replaces": true}
+{"earlier": "The Codex Antfly importer writes 1,024 history items per import batch.", "later": "The Codex Antfly importer keeps threads of every age.", "replaces": false}
+{"earlier": "Pin Antfly by git revision rather than tracking a branch.", "later": "Use EmbeddingGemma 2 as the Codex semantic search embedder.", "replaces": false}
+{"earlier": "The user prefers benchmarks on release builds.", "later": "The Codex importer writes 1,024 items per batch.", "replaces": false}
+{"earlier": "Stage 1 memory extraction requires threads idle for an hour.", "later": "Claim extraction runs two minutes after a turn ends.", "replaces": false}
+{"earlier": "Laya is the default decide model for approvals.", "later": "GLiNER is the default concept extraction model.", "replaces": false}
+{"earlier": "Antfly rejects NUL characters in TEXT columns.", "later": "Antfly reports SQLSTATE 22P05 for NUL characters.", "replaces": false}

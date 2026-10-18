@@ -9361,7 +9361,20 @@ pub const ApiHttpServer = struct {
 
         const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
         defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
-        const can_observe_physical_coverage = if (self.table_reads) |source|
+        // External lake sorts are validated against their pinned native column
+        // source. A local shard's full-text index is neither the owner nor
+        // evidence of those columns, and may intentionally be unconstructed.
+        const external_source = if (std.mem.eql(u8, schema_json, table.schema_json))
+            parsed_schema.external_base_source != null
+        else external: {
+            // A pinned read schema describes columns, not current physical
+            // ownership. Reuse the parsed view when possible, and inspect the
+            // current table definition only when those views differ.
+            var binding = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+            defer if (binding) |*value| value.deinit(self.alloc);
+            break :external binding != null;
+        };
+        const can_observe_physical_coverage = !external_source and if (self.table_reads) |source|
             source.supportsObservedDynamicFieldCapabilitySets()
         else
             false;
@@ -32468,6 +32481,49 @@ test "api http public sort gate accepts synthetic hierarchy child positions" {
         .hierarchy_children = .{ .parent_id = "doc:a" },
         .order_by = &wrong_order,
     }, runtime_schema, &.{}));
+}
+
+test "api http public sort capability gate uses external lake coverage without local index preflight" {
+    const a = std.testing.allocator;
+    const ColdReads = struct {
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnexpectedLocalRead;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnexpectedLocalRead;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnexpectedLocalRead;
+        }
+        fn observe(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: table_reads.DynamicFieldObservationQuery) anyerror!?[]table_reads.ObservedDynamicFieldCapabilitySet {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+        fn preflight(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) anyerror!?db_mod.RuntimePreflightSummary {
+            return error.IndexNotFound;
+        }
+    };
+    const local_schema =
+        \\{"storage_mode":"relational","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    const external_schema = try std.fmt.allocPrint(a, "{s},\"base_source\":{{\"kind\":\"external\",\"table_id\":\"test\",\"format\":\"parquet\",\"uri\":\"file:///lake\"}}}}", .{local_schema[0 .. local_schema.len - 1]});
+    defer a.free(external_schema);
+    var resolver = ApiHttpServer.CatalogQueryResolver{ .arena = a };
+    defer resolver.definitions.deinit(a);
+    try resolver.definitions.put(a, "docs", .{ .schema_json = external_schema, .read_schema_json = "", .indexes_json = "{}" });
+    // Only sort admission is under test; its catalog definition is already
+    // captured, and no unrelated server owner is constructed or consulted.
+    var server: ApiHttpServer = undefined;
+    server.alloc = a;
+    server.table_reads = .{ .ptr = undefined, .vtable = &.{ .lookup = ColdReads.lookup, .scan = ColdReads.scan, .query = ColdReads.query, .preflight_query = ColdReads.preflight, .observed_dynamic_field_capability_sets = ColdReads.observe } };
+    for ([_]u32{ 10, 0 }) |limit| {
+        try server.validateQuerySortWithResolver("docs", .{ .limit = limit, .order_by = &.{.{ .field = "amount" }} }, &resolver);
+    }
+    // A historical read view can omit the physical external-source binding.
+    resolver.definitions.getPtr("docs").?.read_schema_json = local_schema;
+    try server.validateQuerySortWithResolver("docs", .{ .order_by = &.{.{ .field = "amount" }} }, &resolver);
+    resolver.definitions.getPtr("docs").?.schema_json = local_schema;
+    resolver.definitions.getPtr("docs").?.read_schema_json = external_schema;
+    try std.testing.expectError(error.IndexNotFound, server.validateQuerySortWithResolver("docs", .{ .order_by = &.{.{ .field = "amount" }} }, &resolver));
 }
 
 test "api http public sort capability gate validates mapped sortable fields" {
