@@ -67,15 +67,17 @@ pub fn Registry(comptime Search: type) type {
                 defer if (!keep) arena.deinit();
                 const a = arena.allocator();
                 var members: std.ArrayList(@import("incremental.zig").Member) = .empty;
+                var by_path: std.StringHashMapUnmanaged([32]u8) = .empty;
                 var current = plan.index.first();
                 while (current) |file| : (current = Search.IncrementalIndex.next(file)) {
                     if (members.items.len >= plan.options.max_result_files) break;
                     const path = a.dupe(u8, file.path) catch return;
                     members.append(a, .{ .path = path, .tag = file.tag }) catch return;
+                    by_path.put(a, path, file.tag) catch return;
                 }
                 if (plan.delivery_arena) |*old| old.deinit();
                 plan.delivery_arena = arena;
-                plan.delivery = .{ .token = token, .revision = plan.index.revision.?, .members = members.items };
+                plan.delivery = .{ .token = token, .revision = plan.index.revision.?, .members = members.items, .by_path = by_path };
                 keep = true;
             }
             pub fn deinit(plan: *Plan) void {

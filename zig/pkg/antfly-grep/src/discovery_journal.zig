@@ -136,6 +136,7 @@ pub const Journal = struct {
         for (entries) |entry| {
             if (entry.blob.watcher != sources or entry.blob.token == null or !sources.intact(entry.blob.token.?)) self.sources_covered = false;
         }
+        if (self.sources_covered) sources.clearEvents();
         self.source_epoch = sources.epoch;
         self.dependency_epoch = self.watch.epoch;
         self.sealed = true;

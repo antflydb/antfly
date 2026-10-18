@@ -29,6 +29,18 @@ pub const Entry = struct {
     revision: [64]u8,
     explicit_file: bool = false,
     prepared: ?source.Prepared = null,
+    preparation: ?*PreparedOwner = null,
+    fn retain(self: Entry) void {
+        self.blob.refs += 1;
+        if (self.preparation) |owner| owner.refs += 1;
+    }
+    fn release(self: Entry) void {
+        self.blob.release();
+        if (self.preparation) |owner| owner.release();
+    }
+    fn charge(self: Entry) usize {
+        return self.blob.budget.live + @sizeOf(Blob) + (if (self.preparation) |owner| owner.bytes() else @as(usize, 0));
+    }
 };
 pub const Generation = struct {
     refs: usize = 1,
@@ -48,6 +60,17 @@ pub const Generation = struct {
     preparations_reused: usize = 0,
     parent_revision: ?[64]u8 = null,
     changes: std.ArrayList([]const u8) = .empty,
+    blob_bytes: usize = 0,
+    merkle: [][32]u8 = &.{},
+    merkle_base: usize = 0,
+    watch_heads: []usize = &.{},
+    watch_next: []usize = &.{},
+    watch_slots: []usize = &.{},
+    touched: []u64 = &.{},
+    touch_epoch: u64 = 0,
+    refresh_entries_visited: usize = 0,
+    preparation_mutex: std.Io.Mutex = .init,
+    preparation_count: usize = 0,
     pub fn capture(a: A, io: std.Io, o: *const Options, previous: ?*const Generation) !*Generation {
         return captureWatched(a, io, o, previous, null);
     }
@@ -80,7 +103,11 @@ pub const Generation = struct {
             old.preparations_reused += old.preparations_built;
             old.preparations_built = 0;
             old.discovery_reused = true;
+            old.refresh_entries_visited = 0;
             return old;
+        }
+        if (clean and j.sources_covered and previous.?.refs == 1 and !w.failed) {
+            if (captureDirty(a, io, o, previous.?, w, j) catch null) |updated| return updated;
         }
         if (!clean) j.reset();
         const next = captureOnce(a, io, o, previous, w, j, clean) catch {
@@ -112,20 +139,34 @@ pub const Generation = struct {
                 return std.mem.order(u8, x.path, y.path) == .lt;
             }
         }.less);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("antfly-workspace-v1");
-        for (self.entries.items, 0..) |*entry, i| {
+        self.merkle_base = std.math.ceilPowerOfTwo(usize, @max(1, self.entries.items.len)) catch return error.OutOfMemory;
+        self.merkle = try self.arena.allocator().alloc([32]u8, 2 * self.merkle_base);
+        @memset(self.merkle, @as([32]u8, @splat(0)));
+        for (self.entries.items, 0..) |entry, i| {
             if (i > 0 and std.mem.eql(u8, self.entries.items[i - 1].path, entry.path)) return error.DuplicateWorkspacePath;
-            var len: [8]u8 = undefined;
-            std.mem.writeInt(u64, &len, entry.path.len, .little);
-            hash.update(&len);
-            hash.update(entry.path);
-            hash.update(&entry.revision);
-            hash.update(&.{@intFromBool(entry.explicit_file)});
+            self.merkle[self.merkle_base + i] = leafHash(entry);
         }
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        self.revision = std.fmt.bytesToHex(digest, .lower);
+        var branch = self.merkle_base;
+        while (branch > 1) {
+            branch -= 1;
+            self.merkle[branch] = branchHash(self.merkle[branch * 2], self.merkle[branch * 2 + 1]);
+        }
+        self.revision = rootRevision(self.entries.items.len, self.merkle[1]);
+        if (watcher != null and journal != null) {
+            const allocator = self.arena.allocator();
+            self.watch_heads = try allocator.alloc(usize, watcher.?.limit);
+            @memset(self.watch_heads, std.math.maxInt(usize));
+            self.watch_next = try allocator.alloc(usize, self.entries.items.len);
+            self.watch_slots = try allocator.alloc(usize, self.entries.items.len);
+            self.touched = try allocator.alloc(u64, self.entries.items.len);
+            @memset(self.touched, 0);
+            for (self.entries.items, 0..) |entry, i| {
+                self.watch_next[i] = std.math.maxInt(usize);
+                self.watch_slots[i] = std.math.maxInt(usize);
+                if (entry.blob.token) |token| self.linkWatch(i, token.slot);
+            }
+        }
+        self.refresh_entries_visited = self.entries.items.len;
         if (previous) |old| {
             self.parent_revision = old.revision;
             if (std.mem.eql(u8, &self.revision, &old.revision)) {
@@ -146,17 +187,209 @@ pub const Generation = struct {
         self.captured_at = std.Io.Clock.real.now(io).toSeconds();
         return self;
     }
+    fn leafHash(entry: Entry) [32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("antfly-workspace-leaf-v2");
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, entry.path.len, .little);
+        h.update(&length);
+        h.update(entry.path);
+        h.update(&entry.revision);
+        h.update(&.{@intFromBool(entry.explicit_file)});
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return digest;
+    }
+    fn branchHash(left: [32]u8, right: [32]u8) [32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("antfly-workspace-branch-v2");
+        h.update(&left);
+        h.update(&right);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return digest;
+    }
+    fn rootRevision(count: usize, root: [32]u8) [64]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("antfly-workspace-root-v2");
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, count, .little);
+        h.update(&length);
+        h.update(&root);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+    fn linkWatch(self: *Generation, i: usize, slot: usize) void {
+        self.watch_next[i] = self.watch_heads[slot];
+        self.watch_heads[slot] = i;
+        self.watch_slots[i] = slot;
+    }
+    fn unlinkWatch(self: *Generation, i: usize) void {
+        const slot = self.watch_slots[i];
+        if (slot == std.math.maxInt(usize)) return;
+        var link = &self.watch_heads[slot];
+        while (link.* != std.math.maxInt(usize)) {
+            if (link.* == i) {
+                link.* = self.watch_next[i];
+                break;
+            }
+            link = &self.watch_next[link.*];
+        }
+    }
+    /// Query workers have joined and the namespace certificate is unchanged.
+    /// Stage dirty contents and Merkle paths before touching the published tree.
+    /// Exclusive ownership permits transactional replacement without retaining
+    /// a chain of prior generations or copying the unchanged inventory.
+    fn captureDirty(a: A, io: std.Io, o: *const Options, old: *Generation, w: *Watch, journal: *@import("discovery_journal.zig").Journal) !?*Generation {
+        if (old.watch_heads.len == 0 or old.watch_next.len != old.entries.items.len or old.touch_epoch == std.math.maxInt(u64)) return null;
+        const epoch = w.epoch;
+        const original_limit = old.budget.limit;
+        var published = false;
+        defer if (!published) {
+            old.budget.limit = original_limit;
+        };
+        old.touch_epoch += 1;
+        var stage: Generation = .{ .backing = a, .budget = .{ .backing = a, .limit = o.workspace_memory_limit - @sizeOf(Generation) }, .arena = undefined };
+        stage.arena = .init(stage.budget.allocator());
+        defer {
+            for (stage.entries.items) |entry| entry.release();
+            stage.arena.deinit();
+        }
+        var indices: std.ArrayList(usize) = .empty;
+        var updates: std.AutoHashMapUnmanaged(usize, [32]u8) = .empty;
+        const scratch = stage.arena.allocator();
+        // Freeze the event suffix; any new event during capture abandons the
+        // optimization before publication and uses conservative capture.
+        const event_count = w.event_count;
+        for (w.events[0..event_count]) |slot| {
+            var i = old.watch_heads[slot];
+            while (i != std.math.maxInt(usize)) : (i = old.watch_next[i]) {
+                if (old.touched[i] == old.touch_epoch) continue;
+                old.touched[i] = old.touch_epoch;
+                try indices.append(scratch, i);
+            }
+        }
+        if (indices.items.len == 0) return null;
+        var collector: Collector = .{ .generation = &stage, .io = io, .options = o, .previous = old, .watcher = w };
+        var retained = old.blob_bytes;
+        var source_bytes = old.source_bytes;
+        var changed: usize = 0;
+        for (indices.items) |i| {
+            const entry = old.entries.items[i];
+            const before = stage.entries.items.len;
+            try collector.addFile(entry.path, entry.path, entry.explicit_file);
+            // Oversize exclusion changes membership, requiring ordinary capture.
+            if (stage.entries.items.len != before + 1) return null;
+            const next = stage.entries.items[before];
+            source_bytes = source_bytes - entry.bytes.len + next.bytes.len;
+            retained = retained - entry.charge() + next.charge();
+            if (!std.mem.eql(u8, &entry.revision, &next.revision)) changed += 1;
+            var node = old.merkle_base + i;
+            try updates.put(scratch, node, leafHash(next));
+            while (node > 1) {
+                node /= 2;
+                const left = updates.get(node * 2) orelse old.merkle[node * 2];
+                const right = updates.get(node * 2 + 1) orelse old.merkle[node * 2 + 1];
+                try updates.put(scratch, node, branchHash(left, right));
+            }
+        }
+        if (retained + old.budget.live + @sizeOf(Generation) > o.workspace_memory_limit) return null;
+        const revision = rootRevision(old.entries.items.len, updates.get(1) orelse old.merkle[1]);
+        if (!std.mem.eql(u8, &revision, &old.revision)) {
+            // Restore the old blob allowance only for bounded metadata growth.
+            const prior_limit = old.budget.limit;
+            old.budget.limit = @min(original_limit, o.workspace_memory_limit - @sizeOf(Generation) - retained);
+            old.changes.ensureTotalCapacity(old.arena.allocator(), changed) catch |err| {
+                old.budget.limit = prior_limit;
+                return err;
+            };
+        }
+        w.poll();
+        if (!journal.clean() or w.failed or w.epoch != epoch) return null;
+        for (stage.entries.items) |entry| if (entry.blob.token == null or !w.intact(entry.blob.token.?)) return null;
+        // No fallible work remains after this point.
+        const content_changed = !std.mem.eql(u8, &revision, &old.revision);
+        if (content_changed) {
+            old.parent_revision = old.revision;
+            old.changes.clearRetainingCapacity();
+        }
+        old.preparations_built = 0;
+        old.preparations_reused = old.preparation_count;
+        for (indices.items, stage.entries.items) |i, next| {
+            const prior = old.entries.items[i];
+            if (content_changed and !std.mem.eql(u8, &prior.revision, &next.revision)) old.changes.appendAssumeCapacity(prior.path);
+            old.unlinkWatch(i);
+            old.entries.items[i] = next;
+            old.entries.items[i].path = prior.path;
+            next.retain();
+            old.preparation_count = old.preparation_count - @intFromBool(prior.prepared != null) + @intFromBool(next.prepared != null);
+            prior.release();
+            if (next.blob.token) |token| old.linkWatch(i, token.slot);
+        }
+        var it = updates.iterator();
+        while (it.next()) |item| old.merkle[item.key_ptr.*] = item.value_ptr.*;
+        old.preparations_reused = old.preparation_count;
+        old.blob_bytes = retained;
+        old.budget.limit = o.workspace_memory_limit - @sizeOf(Generation) - retained;
+        old.revision = revision;
+        old.source_bytes = source_bytes;
+        old.captured_at = std.Io.Clock.real.now(io).toSeconds();
+        old.sources_opened = stage.sources_opened;
+        old.source_bytes_read = stage.source_bytes_read;
+        old.source_bytes_reused = old.source_bytes -| stage.source_bytes_read;
+        old.discovery_reused = true;
+        old.refresh_entries_visited = indices.items.len;
+        old.refs += 1;
+        published = true;
+        w.clearEvents();
+        journal.source_epoch = w.epoch;
+        return old;
+    }
+    /// Immutable content has an optional, independently owned derived memo.
+    /// Reserve its peak before parsing, then publish only a complete preparation.
+    /// Workers prepare different entries concurrently; metadata admission alone
+    /// takes the generation mutex. Failure is an ordinary uncached-query fallback.
+    pub fn prepareEntry(generation: *const Generation, io: std.Io, entry: *const Entry) bool {
+        const self = @constCast(generation);
+        if (entry.prepared != null or !std.unicode.utf8ValidateSlice(entry.bytes) or std.mem.indexOfScalar(u8, entry.bytes, 0) != null or @import("antfly_encoding").hasBom(entry.bytes)) return false;
+        self.preparation_mutex.lockUncancelable(io);
+        const available = self.budget.limit -| self.budget.live;
+        const desired = @max(2 * 1024 * 1024, @min(32 * 1024 * 1024, std.math.mul(usize, entry.bytes.len, 16) catch std.math.maxInt(usize)));
+        const reservation = @min(available, desired);
+        if (reservation <= @sizeOf(PreparedOwner)) {
+            self.preparation_mutex.unlock(io);
+            return false;
+        }
+        self.budget.limit -= reservation;
+        self.preparation_mutex.unlock(io);
+        const owner = PreparedOwner.create(self.backing, reservation, entry.path, entry.bytes) catch {
+            self.preparation_mutex.lockUncancelable(io);
+            self.budget.limit += reservation;
+            self.preparation_mutex.unlock(io);
+            return false;
+        };
+        self.preparation_mutex.lockUncancelable(io);
+        defer self.preparation_mutex.unlock(io);
+        const size = owner.bytes();
+        const mutable = @constCast(entry);
+        mutable.preparation = owner;
+        mutable.prepared = owner.value;
+        self.budget.limit += reservation - size;
+        self.blob_bytes += size;
+        self.preparation_count += 1;
+        self.preparations_built += 1;
+        return true;
+    }
     /// Shared blobs count in full against every generation that retains them.
     pub fn retainedBytes(self: *const Generation) usize {
-        var bytes = self.budget.live + @sizeOf(Generation);
-        for (self.entries.items) |entry| bytes += entry.blob.budget.live + @sizeOf(Blob);
-        return bytes;
+        return self.budget.live + @sizeOf(Generation) + self.blob_bytes;
     }
     pub fn deinit(self: *Generation) void {
         self.refs -= 1;
         if (self.refs != 0) return;
         const a = self.backing;
-        for (self.entries.items) |entry| entry.blob.release();
+        for (self.entries.items) |entry| entry.release();
         self.arena.deinit();
         a.destroy(self);
     }
@@ -183,7 +416,6 @@ const Blob = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     bytes: []const u8 = "",
-    prepared: ?source.Prepared = null,
     stamp: ?std.Io.File.Stat = null,
     watcher: ?*Watch = null,
     token: ?Token = null,
@@ -192,6 +424,36 @@ const Blob = struct {
         if (self.refs != 0) return;
         const a = self.backing;
         if (self.watcher) |watcher| if (self.token) |token| watcher.release(token);
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
+const PreparedOwner = struct {
+    backing: A,
+    refs: usize = 1,
+    budget: Budget,
+    arena: std.heap.ArenaAllocator,
+    value: source.Prepared,
+    fn create(a: A, maximum: usize, path: []const u8, bytes_value: []const u8) !*PreparedOwner {
+        const self = try a.create(PreparedOwner);
+        errdefer a.destroy(self);
+        self.* = .{ .backing = a, .budget = .{ .backing = a, .limit = maximum - @sizeOf(PreparedOwner) }, .arena = undefined, .value = undefined };
+        self.arena = .init(self.budget.allocator());
+        errdefer self.arena.deinit();
+        var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const value: source.Prepared = .{ .lines = try source.lines(temporary, bytes_value, '\n', false), .index = try @import("source.zig").parse(temporary, path, bytes_value) };
+        self.value = try clonePrepared(self.arena.allocator(), temporary, bytes_value, value);
+        return self;
+    }
+    fn bytes(self: *const PreparedOwner) usize {
+        return @sizeOf(PreparedOwner) + self.budget.live;
+    }
+    fn release(self: *PreparedOwner) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        const a = self.backing;
         self.arena.deinit();
         a.destroy(self);
     }
@@ -317,13 +579,6 @@ const Collector = struct {
                 reused = true;
             }
         }
-        if (!reused and std.unicode.utf8ValidateSlice(blob.bytes) and std.mem.indexOfScalar(u8, blob.bytes, 0) == null and !@import("antfly_encoding").hasBom(blob.bytes)) {
-            var scratch = std.heap.ArenaAllocator.init(blob.budget.allocator());
-            defer scratch.deinit();
-            const temp = scratch.allocator();
-            const prepared: source.Prepared = .{ .lines = try source.lines(temp, blob.bytes, '\n', false), .index = try @import("source.zig").parse(temp, display, blob.bytes) };
-            blob.prepared = try clonePrepared(blob.arena.allocator(), temp, blob.bytes, prepared);
-        }
         if (blob.watcher) |w| if (blob.token) |old| w.release(old);
         blob.watcher = self.watcher;
         blob.token = token;
@@ -337,15 +592,24 @@ const Collector = struct {
     fn append(self: *Collector, blob: *Blob, display: []const u8, explicit_file: bool, revision: [64]u8, reused: bool, available: usize) !void {
         const generation = self.generation;
         const a = generation.arena.allocator();
-        const charge = blob.budget.live + @sizeOf(Blob);
+        const previous = if (self.previous) |old| old.find(display) else null;
+        const preparation = if (previous != null and std.mem.eql(u8, &previous.?.revision, &revision)) previous.?.preparation else null;
+        const charge = blob.budget.live + @sizeOf(Blob) + (if (preparation) |owner| owner.bytes() else @as(usize, 0));
         if (charge > available) return error.OutOfMemory;
         generation.budget.limit -= charge;
-        errdefer generation.budget.limit += charge;
-        try generation.entries.append(a, .{ .blob = blob, .path = try a.dupe(u8, display), .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .prepared = blob.prepared });
-        generation.source_bytes += blob.bytes.len;
-        if (blob.prepared != null) {
-            if (reused) generation.preparations_reused += 1 else generation.preparations_built += 1;
+        generation.blob_bytes += charge;
+        errdefer {
+            generation.budget.limit += charge;
+            generation.blob_bytes -= charge;
         }
+        try generation.entries.append(a, .{ .blob = blob, .path = try a.dupe(u8, display), .bytes = blob.bytes, .revision = revision, .explicit_file = explicit_file, .prepared = if (preparation) |owner| owner.value else null, .preparation = preparation });
+        generation.source_bytes += blob.bytes.len;
+        if (preparation) |owner| {
+            owner.refs += 1;
+            generation.preparations_reused += 1;
+            generation.preparation_count += 1;
+        }
+        _ = reused;
     }
 };
 
@@ -362,6 +626,8 @@ test "workspace generations own reused indexes and failed captures release their
     try o.paths.append(a, path_name);
     var old: ?*Generation = try Generation.capture(a, io, &o, null);
     defer if (old) |value| value.deinit();
+    try std.testing.expectEqual(@as(usize, 0), old.?.preparations_built);
+    try std.testing.expect(old.?.prepareEntry(io, &old.?.entries.items[0]));
     const next = try Generation.capture(a, io, &o, old);
     defer next.deinit();
     try std.testing.expectEqualSlices(u8, &old.?.revision, &next.revision);
@@ -396,4 +662,38 @@ test "preparations preserve source name offsets and own parser synthesized names
     scratch_live = false;
     try std.testing.expect(index.index.declarations[0].name.ptr == bytes[4..9].ptr);
     try std.testing.expectEqualStrings("Receiver.method", index.index.calls[0].name);
+}
+
+test "dirty capture preserves a retained generation and lazy preparations stay bounded" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data = "def old():\n    STOP()\n" });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var o: Options = .{ .no_ignore = true };
+    defer o.deinit(a);
+    try o.paths.append(a, path);
+    var watch = Watch.init();
+    defer watch.deinit();
+    var journal = @import("discovery_journal.zig").Journal.init(a, io);
+    defer journal.deinit();
+    const old = try Generation.captureJournal(a, io, &o, null, &watch, &journal);
+    defer old.deinit();
+    old.refs += 1;
+    defer old.deinit();
+    const revision = old.revision;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.py", .data = "def changed():\n    STOP()\n" });
+    const next = try Generation.captureJournal(a, io, &o, old, &watch, &journal);
+    defer next.deinit();
+    try std.testing.expect(old != next);
+    try std.testing.expectEqualSlices(u8, &revision, &old.revision);
+    try std.testing.expectEqualStrings("def old():\n    STOP()\n", old.entries.items[0].bytes);
+    try std.testing.expectEqualStrings("def changed():\n    STOP()\n", next.entries.items[0].bytes);
+    try std.testing.expectEqual(@as(usize, 0), next.preparations_built);
+    try std.testing.expect(next.prepareEntry(io, &next.entries.items[0]));
+    try std.testing.expect(next.retainedBytes() <= o.workspace_memory_limit);
+    try std.testing.expect(old.entries.items[0].prepared == null);
+    try std.testing.expectEqualStrings("changed", next.entries.items[0].prepared.?.index.declarations[0].name);
 }

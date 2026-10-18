@@ -121,6 +121,7 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=51)
+    parser.add_argument("--result-files", type=int, default=15)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.rounds < 9:
@@ -154,7 +155,7 @@ def main():
                 "--json-compact",
                 "--no-refine",
                 "--threads=2",
-                "--max-result-files=15",
+                f"--max-result-files={args.result_files}",
                 "--max-requests=unlimited",
             ]
             services[name] = Client(
@@ -282,6 +283,7 @@ def main():
             "host": platform.platform(),
             "cpu_count": os.cpu_count(),
             "fixture_only": True,
+            "max_result_files": args.result_files,
             "native_rss_kib": resident,
             "trim": trims,
             "median": {

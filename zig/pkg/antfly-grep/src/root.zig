@@ -92,6 +92,7 @@ const Candidate = struct {
     }
 };
 const SavedCandidate = struct {
+    payload: ?*CachedPayload = null,
     path: []const u8,
     score: f64,
     ordinal: usize,
@@ -103,7 +104,77 @@ const SavedCandidate = struct {
     filename: bool,
     color: bool,
 };
-const SavedQuery = struct { summary: Summary, considered: usize, items: []SavedCandidate };
+// A payload owns its immutable strings/evidence independently of cache-entry
+// metadata. Active leases and all sharing entries retain its physical charge.
+const CachedPayload = struct {
+    a: Allocator,
+    physical: *std.atomic.Value(usize),
+    tracking: @import("physical_allocator.zig").Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    budget: @import("antfly_regex").Budget,
+    arena: std.heap.ArenaAllocator,
+    value: SavedCandidate,
+    fn create(owner: anytype, value: SavedCandidate) !*CachedPayload {
+        const C = @TypeOf(owner.*);
+        const reserve = @sizeOf(CachedPayload);
+        if (!Limits.reserve(&owner.physical, reserve, C.physical_limit)) return error.OutOfMemory;
+        errdefer _ = owner.physical.fetchSub(reserve, .monotonic);
+        const payload = try owner.a.create(CachedPayload);
+        errdefer owner.a.destroy(payload);
+        payload.* = .{ .a = owner.a, .physical = &owner.physical, .tracking = .{ .backing = owner.a, .physical = &owner.physical, .limit = C.physical_limit }, .budget = undefined, .arena = undefined, .value = undefined };
+        payload.budget = .{ .backing = payload.tracking.allocator(), .limit = C.value_limit };
+        payload.arena = .init(payload.budget.allocator());
+        errdefer payload.arena.deinit();
+        payload.value = value;
+        inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "payload")) payload.value.payload = null else @field(payload.value, name) = try retainedClone(@FieldType(SavedCandidate, name), payload.arena.allocator(), @field(value, name), 0);
+        }
+        return payload;
+    }
+    fn bytes(self: *const CachedPayload) usize {
+        return @sizeOf(CachedPayload) + self.budget.live;
+    }
+    fn release(self: *CachedPayload) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const a = self.a;
+        const physical = self.physical;
+        self.arena.deinit();
+        a.destroy(self);
+        _ = physical.fetchSub(@sizeOf(CachedPayload), .monotonic);
+    }
+};
+const SavedQuery = struct {
+    summary: Summary,
+    considered: usize,
+    items: []SavedCandidate,
+    pub fn cacheClone(value: SavedQuery, owner: anytype, a: Allocator) !SavedQuery {
+        var result = value;
+        result.items = try a.alloc(SavedCandidate, value.items.len);
+        var done: usize = 0;
+        var logical: usize = result.items.len * @sizeOf(SavedCandidate);
+        errdefer for (result.items[0..done]) |item| item.payload.?.release();
+        for (value.items, result.items) |item, *dest| {
+            const payload = if (item.payload) |existing| blk: {
+                _ = existing.refs.fetchAdd(1, .monotonic);
+                break :blk existing;
+            } else try CachedPayload.create(owner, item);
+            dest.* = payload.value;
+            dest.payload = payload;
+            done += 1;
+            logical += payload.bytes();
+            if (logical > @TypeOf(owner.*).value_limit - 4096) return error.OutOfMemory;
+        }
+        return result;
+    }
+    pub fn cacheBytes(value: SavedQuery) usize {
+        var total: usize = 0;
+        for (value.items) |item| total += item.payload.?.bytes();
+        return total;
+    }
+    pub fn cacheRelease(value: SavedQuery) void {
+        for (value.items) |item| item.payload.?.release();
+    }
+};
 const EvaluationRun = struct { end: usize, probability: f64, line_score: f64, selected: bool };
 const DenseEvaluation = struct { selected: []bool, probabilities: []f64, line_scores: []f64 };
 const SavedEvaluation = struct {
@@ -210,6 +281,7 @@ pub const Search = struct {
     executor: ?*@import("worker_pool.zig").Pool = null,
     workspace_generation: ?*const @import("workspace_store.zig").Generation = null,
     workspace_entry: ?*const @import("workspace_store.zig").Entry = null,
+    fresh_workspace_preparation: bool = false,
     coalescer: decision.Coalescer = .{},
     spill: ?*Spill = null,
     owns_spill: bool = false,
@@ -320,6 +392,8 @@ pub const Search = struct {
         search.summary.file_evaluation_cache_hits = 0;
         search.summary.incremental_cache_hits = 0;
         search.summary.incremental_files_evaluated = 0;
+        search.summary.source_parses = 0;
+        search.summary.source_cache_hits = 0;
         if (!search.limits.cancel.load(.acquire)) try search.protocolJson(.{ .type = "workspace_unchanged", .result_token = expected, .revision = generation.revision, .observed_at = generation.captured_at }, false);
         return try search.finish(started);
     }
@@ -411,13 +485,15 @@ pub const Search = struct {
             !self.options.files and !self.options.files_with_matches and !self.options.files_without_match and
             !self.options.inventory and !self.options.multiline);
         const query_key = self.queryReuseKey();
-        if (self.incremental == null or self.incremental.?.revision != null) if (query_key) |key| if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
+        if (self.incremental == null or (self.incremental.?.revision != null and std.mem.eql(u8, &self.incremental.?.revision.?, &self.workspace_generation.?.revision))) if (query_key) |key| if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
             defer pinned.release();
             self.summary = pinned.value.summary;
             self.summary.query_cache_hits = 1;
             self.summary.file_evaluation_cache_hits = 0;
             self.summary.incremental_cache_hits = 0;
             self.summary.incremental_files_evaluated = 0;
+            self.summary.source_parses = 0;
+            self.summary.source_cache_hits = 0;
             self.decider.evidence_times.merge(pinned.times);
             const token = std.fmt.bytesToHex(pinned.token, .lower);
             self.last_result_token = token;
@@ -1401,6 +1477,11 @@ pub const Search = struct {
                 if (self.options.skip_oversize) return;
                 return error.StreamTooLong;
             }
+            self.fresh_workspace_preparation = false;
+            if (self.options.ask != null and !self.options.crlf and !self.options.null_data and entry.prepared == null) {
+                self.fresh_workspace_preparation = self.workspace_generation.?.prepareEntry(self.io, entry);
+                if (self.fresh_workspace_preparation) self.summary.source_parses += 1;
+            }
             self.replacement_file_context = @import("builtin").os.tag == .linux and (self.options.mmap or (self.options.mmap_auto and self.options.ask == null));
             return self.processBytes(display, entry.bytes);
         }
@@ -2084,7 +2165,7 @@ pub const Search = struct {
                 }
                 break :blk2 try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
             } else try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
-            self.summary.source_cache_hits += @intFromBool(hit);
+            self.summary.source_cache_hits += @intFromBool(hit and !self.fresh_workspace_preparation);
             self.summary.source_parses += @intFromBool(!hit);
             break :blk prepared.?.lines;
         } else try lineRangesWith(a, bytes, if (self.options.null_data) 0 else '\n', self.options.crlf);
@@ -2606,14 +2687,11 @@ pub const Search = struct {
         const a = arena.allocator();
         const order = try a.alloc([]const u8, items.len);
         for (items, order) |item, *path| path.* = item.path;
+        var selected: std.StringHashMapUnmanaged(void) = .empty;
+        for (items) |item| try selected.put(a, item.path, {});
         var removed: std.ArrayList([]const u8) = .empty;
         for (base.members) |old| {
-            var retained = false;
-            for (items) |item| if (std.mem.eql(u8, old.path, item.path)) {
-                retained = true;
-                break;
-            };
-            if (!retained) try removed.append(a, old.path);
+            if (!selected.contains(old.path)) try removed.append(a, old.path);
         }
         try self.protocolJson(.{ .type = "workspace_delta", .base_token = base.token, .revision = self.workspace_generation.?.revision, .observed_at = self.workspace_generation.?.captured_at, .order = order, .removed = removed.items }, false);
         self.delta_used = true;
@@ -2621,8 +2699,8 @@ pub const Search = struct {
     }
     fn deltaChanged(self: *Search, path: []const u8) bool {
         const current = self.incremental.?.files.get(path) orelse return true;
-        for (self.delta_base.?.members) |old| if (std.mem.eql(u8, old.path, path)) return !std.mem.eql(u8, &old.tag, &current.tag);
-        return true;
+        const old = self.delta_base.?.by_path.get(path) orelse return true;
+        return !std.mem.eql(u8, &old, &current.tag);
     }
     fn runIncremental(self: *Search, index: *Incremental, started: std.Io.Timestamp) !?u8 {
         const generation = self.workspace_generation orelse return null;
@@ -2671,7 +2749,11 @@ pub const Search = struct {
             }
         }
         const errors = self.summary.errors;
+        const actual_parses = self.summary.source_parses;
+        const actual_source_hits = self.summary.source_cache_hits;
         self.summary = index.aggregate;
+        self.summary.source_parses = actual_parses;
+        self.summary.source_cache_hits = actual_source_hits;
         self.summary.errors += errors;
         self.summary.incremental_cache_hits = 1;
         self.summary.incremental_files_evaluated = changed;
@@ -2696,6 +2778,9 @@ pub const Search = struct {
                 if (std.mem.eql(u8, &token, &base.token)) previous = lease else lease.release();
             }
         }
+        var previous_items: std.StringHashMapUnmanaged(SavedCandidate) = .empty;
+        defer previous_items.deinit(self.a);
+        if (previous) |lease| for (lease.value.items) |candidate| try previous_items.put(self.a, candidate.path, candidate);
         var items: std.ArrayList(SavedCandidate) = .empty;
         defer items.deinit(self.a);
         var current = index.first();
@@ -2703,16 +2788,10 @@ pub const Search = struct {
         while (current) |record| : (current = Incremental.next(record)) {
             if (count >= self.options.max_result_files or self.limits.cancel.load(.acquire)) break;
             const entry = generation.find(record.path) orelse continue;
-            if (!std.mem.eql(u8, &entry.revision, &record.revision) or entry.prepared == null) continue;
+            if (!std.mem.eql(u8, &entry.revision, &record.revision) or entry.prepared == null) return error.InconsistentIncrementalIndex;
             var borrowed: ?SavedCandidate = null;
-            if (previous) |lease| if (self.prior_delivery) |base| {
-                for (base.members) |old| if (std.mem.eql(u8, old.path, record.path) and std.mem.eql(u8, &old.tag, &record.tag)) {
-                    for (lease.value.items) |candidate| if (std.mem.eql(u8, candidate.path, record.path)) {
-                        borrowed = candidate;
-                        break;
-                    };
-                    break;
-                };
+            if (self.prior_delivery) |base| if (base.by_path.get(record.path)) |tag| {
+                if (std.mem.eql(u8, &tag, &record.tag)) borrowed = previous_items.get(record.path);
             };
             if (borrowed) |candidate| {
                 try items.append(self.a, candidate);
@@ -2748,7 +2827,9 @@ pub const Search = struct {
                 candidate.summary = record.summary;
                 try ranking.offer(candidate);
                 var saved: SavedCandidate = undefined;
-                inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| @field(saved, name) = @field(candidate, name);
+                inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| {
+                    if (comptime std.mem.eql(u8, name, "payload")) @field(saved, name) = null else @field(saved, name) = @field(candidate, name);
+                }
                 try items.append(self.a, saved);
             }
             count += 1;
@@ -2888,7 +2969,9 @@ pub const Search = struct {
         const ranking = self.ranking.?;
         const items = arena.allocator().alloc(SavedCandidate, ranking.items.items.len) catch return;
         for (items, ranking.items.items) |*saved, candidate| {
-            inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| @field(saved, name) = @field(candidate, name);
+            inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| {
+                if (comptime std.mem.eql(u8, name, "payload")) @field(saved, name) = null else @field(saved, name) = @field(candidate, name);
+            }
         }
         self.reuse.?.queries.put(key, self.decider.evidence_times, .{ .summary = self.summary, .considered = ranking.considered, .items = items });
     }
@@ -3855,3 +3938,36 @@ test "cancelled cached empty results are incomplete and do not acknowledge token
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "result_token") == null);
 }
 const ReuseForTest = WorkspaceReuse;
+
+test "query revisions share immutable payloads and retain physical charges through leases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var cache: @TypeOf(@as(WorkspaceReuse, undefined).queries) = .{ .a = a, .io = io };
+    defer cache.deinit();
+    var times: @import("reuse_cache.zig").Times = .{};
+    times.add(std.Io.Clock.real.now(io).toSeconds());
+    const text = try a.alloc(u8, 128 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    var rows = [_]RenderRow{.{ .raw = text, .length = text.len, .line = 1, .offset = 0, .matched = true, .probability = 1, .independent = true, .gap = false }};
+    var candidates = [_]SavedCandidate{.{ .path = "same.py", .score = 1, .ordinal = 0, .provenance = .{}, .rows = &rows, .view = null, .before = .{}, .summary = .{}, .filename = true, .color = false }};
+    cache.put(@splat(1), times, .{ .summary = .{}, .considered = 1, .items = &candidates });
+    const first = cache.lease(@splat(1), 100) orelse return error.TestUnexpectedResult;
+    const before = cache.physical.load(.monotonic);
+    cache.put(@splat(2), times, first.value);
+    const second = cache.lease(@splat(2), 100) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first.value.items[0].payload == second.value.items[0].payload);
+    try std.testing.expect(cache.physical.load(.monotonic) - before < text.len / 4);
+    cache.deinit();
+    try std.testing.expect(cache.physical.load(.monotonic) >= text.len);
+    first.release();
+    try std.testing.expectEqualStrings(text, second.value.items[0].rows[0].raw);
+    second.release();
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.load(.monotonic));
+    // Distinct changed payloads must evict old entries rather than permanently
+    // exhausting admission headroom, while shared/active owners remain bounded.
+    for (0..64) |i| cache.put(@splat(@as(u8, @intCast(i))), times, .{ .summary = .{}, .considered = 1, .items = &candidates });
+    const latest = cache.lease(@splat(63), 100) orelse return error.TestUnexpectedResult;
+    latest.release();
+    try std.testing.expect(cache.physical.load(.monotonic) <= @TypeOf(cache).physical_limit);
+}

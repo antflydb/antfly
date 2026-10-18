@@ -5929,6 +5929,91 @@ class CliTests(unittest.TestCase):
             self.assertNotIn(b"leaked", stderr)
             self.assertNotIn(b"panic", stderr)
 
+    def test_workspace_registered_index_cannot_adopt_unapplied_cached_revision(self):
+        a = self.write("src/a.txt", "STOP HIGH original\n")
+        b = self.write("src/b.txt", "STOP LOW original\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=2",
+            "--max-requests=unlimited",
+            "--threads=1",
+            "--json-compact",
+        ]
+
+        def matches(rows):
+            return [r["data"]["lines"]["text"] for r in rows if r["type"] == "match"]
+
+        with self.workspace("src") as (ready, request):
+            handle = request("register", args=args)[0]["query_handle"]
+            request("search", revision=ready["revision"], query_handle=handle)
+            a.write_text("STOP HIGH updated\n")
+            ready = request("refresh")[0]
+            ordinary = request("search", revision=ready["revision"], args=args)
+            registered = request(
+                "search", revision=ready["revision"], query_handle=handle
+            )
+            self.assertEqual(matches(registered), matches(ordinary))
+            b.write_text("STOP LOW updated\n")
+            ready = request("refresh")[0]
+            registered = request(
+                "search", revision=ready["revision"], query_handle=handle
+            )
+            self.assertEqual(
+                matches(registered), ["STOP HIGH updated\n", "STOP LOW updated\n"]
+            )
+            summary = next(r for r in registered if r["type"] == "summary")
+            self.assertTrue(summary["stats"]["complete"])
+            self.assertEqual(summary["stats"]["matches"], len(matches(registered)))
+
+    def test_workspace_dirty_refresh_visits_only_changed_entries_and_matches_rescan(
+        self,
+    ):
+        paths = [self.write(f"src/f{i:03}.txt", "original\n") for i in range(96)]
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            stable = request("refresh")[0]
+            if not stable["discovery_reused"]:
+                self.skipTest("kernel witness coverage unavailable")
+            self.assertEqual(stable["refresh_entries_visited"], 0)
+            for iteration in range(4):
+                paths[17].write_text(f"updated {iteration}\n")
+                ready = request("refresh")[0]
+                self.assertEqual(ready["sources_opened"], 1)
+                self.assertEqual(ready["refresh_entries_visited"], 1)
+                self.assertTrue(ready["discovery_reused"])
+                revision = ready["revision"]
+                forced = request("refresh", force_rescan=True)[0]
+                self.assertEqual(forced["revision"], revision)
+                self.assertEqual(forced["refresh_entries_visited"], len(paths))
+            self.write("src/new.txt", "membership change\n")
+            changed = request("refresh")[0]
+            self.assertFalse(changed["discovery_reused"])
+            self.assertEqual(changed["files"], len(paths) + 1)
+
+    def test_workspace_prepares_sources_only_for_decision_queries(self):
+        self.write("src/a.py", "def retry():\n" + "    STOP()\n" * 32)
+        with self.workspace("src") as (ready, request):
+            self.assertEqual(ready["preparations_built"], 0)
+            lexical = request("search", revision=ready["revision"], args=["STOP"])
+            self.assertEqual(lexical[-1]["exit_code"], 0)
+            self.assertEqual(request("refresh")[0]["preparations_reused"], 0)
+            args = [*self.decision_args(), "--no-refine", "--no-rank", "--threads=1"]
+            cold = request("search", revision=ready["revision"], args=args)
+            self.assertEqual(
+                next(r for r in cold if r["type"] == "summary")["stats"][
+                    "source_parses"
+                ],
+                1,
+            )
+            warm = request("search", revision=ready["revision"], args=args)
+            self.assertEqual(
+                next(r for r in warm if r["type"] == "summary")["stats"][
+                    "source_parses"
+                ],
+                0,
+            )
+            self.assertEqual(request("refresh")[0]["preparations_reused"], 1)
+
     def test_workspace_registered_queries_bind_options_and_compact_delivery(self):
         self.write("src/a.txt", "STOP HIGH\n")
         args = [*self.decision_args(), "--no-refine", "--max-result-files=1"]
@@ -6261,14 +6346,16 @@ class CliTests(unittest.TestCase):
         with self.workspace("src") as (ready, request):
             args = [*self.decision_args(), "--no-refine", "--no-rank", "--threads=2"]
             refreshed = request("refresh")[0]
-            self.assertEqual(refreshed["preparations_reused"], 1)
+            self.assertEqual(refreshed["preparations_reused"], 0)
             shutil.rmtree(self.root / "src")
-            for _ in range(2):
+            for iteration in range(2):
                 rows = request("search", revision=ready["revision"], args=args)
                 self.assertEqual(rows[-1]["exit_code"], 0)
                 summary = next(row for row in rows if row["type"] == "summary")
-                self.assertEqual(summary["stats"]["source_parses"], 0)
-                self.assertEqual(summary["stats"]["source_cache_hits"], 1)
+                self.assertEqual(summary["stats"]["source_parses"], int(iteration == 0))
+                self.assertEqual(
+                    summary["stats"]["source_cache_hits"], int(iteration != 0)
+                )
             for flags in (
                 ["STOP", "src"],
                 ["--pre=cat", "STOP"],
@@ -6870,7 +6957,7 @@ class CliTests(unittest.TestCase):
             refreshed = request("refresh")[0]
             self.assertEqual(refreshed["revision"], ready["revision"])
             self.assertEqual(refreshed["preparations_built"], 0)
-            self.assertEqual(refreshed["preparations_reused"], 1)
+            self.assertEqual(refreshed["preparations_reused"], 0)
         self.raw_cli("workspace", "serve", "--workspace-max-files=0", "src", code=2)
         self.raw_cli("workspace", "serve", "--workspace-memory-limit=1K", "src", code=2)
 

@@ -29,9 +29,25 @@ pub const Watch = struct {
     limit: usize = if (builtin.os.tag == .macos) 256 else 4096,
     generation: u64 = 0,
     epoch: u64 = 0,
+    events: [4096]u16 = undefined,
+    event_count: usize = 0,
+    event_seen: [4096]bool = @splat(false),
     handles: std.AutoHashMapUnmanaged(c_int, usize) = .empty,
+    identities: std.AutoHashMapUnmanaged(Identity, usize) = .empty,
     slots: [4096]Slot = @splat(.{}),
+    const Identity = struct { device: u64, inode: u64 };
     const Slot = struct { handle: c_int = -1, users: usize = 0, dirty: bool = true, generation: u64 = 0, sequence: u64 = 0, device: u64 = 0, inode: u64 = 0 };
+    pub fn clearEvents(self: *Watch) void {
+        self.event_count = 0;
+        @memset(&self.event_seen, false);
+    }
+    fn note(self: *Watch, i: usize) void {
+        if (!self.event_seen[i]) {
+            self.event_seen[i] = true;
+            self.events[self.event_count] = @intCast(i);
+            self.event_count += 1;
+        }
+    }
     pub fn init() Watch {
         var self: Watch = .{};
         self.open();
@@ -61,6 +77,9 @@ pub const Watch = struct {
         self.fd = -1;
         self.handles.deinit(std.heap.page_allocator);
         self.handles = .empty;
+        self.identities.deinit(std.heap.page_allocator);
+        self.identities = .empty;
+        self.clearEvents();
     }
     pub fn reset(self: *Watch) void {
         self.deinit();
@@ -75,7 +94,7 @@ pub const Watch = struct {
         self.poll();
         if (self.failed or self.fd < 0) self.reset();
     }
-    fn identity(fd: c_int) ?struct { device: u64, inode: u64 } {
+    fn identity(fd: c_int) ?Identity {
         if (comptime !supported) return null;
         if (comptime builtin.os.tag == .linux) {
             const linux = std.os.linux;
@@ -99,6 +118,11 @@ pub const Watch = struct {
         if (self.fd < 0 or self.failed) return null;
         const id = identity(file.handle) orelse return null;
         var handle: c_int = -1;
+        if (comptime builtin.os.tag == .macos) if (self.identities.get(id)) |i| {
+            const slot = &self.slots[i];
+            slot.users += 1;
+            return .{ .slot = i, .generation = slot.generation, .sequence = slot.sequence };
+        };
         if (comptime builtin.os.tag == .linux) {
             var path: [64]u8 = undefined;
             const name = std.mem.printSentinel(&path, "/proc/self/fd/{d}", .{file.handle}, 0) catch return null;
@@ -132,6 +156,10 @@ pub const Watch = struct {
             _ = std.c.inotify_rm_watch(self.fd, handle);
             return null;
         };
+        if (comptime builtin.os.tag == .macos) self.identities.put(std.heap.page_allocator, id, free) catch {
+            _ = std.c.close(handle);
+            return null;
+        };
         self.generation +%= 1;
         self.slots[free] = .{ .handle = handle, .users = 1, .generation = self.generation, .device = id.device, .inode = id.inode };
         return .{ .slot = free, .generation = self.generation, .sequence = 0 };
@@ -149,6 +177,7 @@ pub const Watch = struct {
         slot.users -= 1;
         if (slot.users != 0) return;
         if (comptime builtin.os.tag == .macos) {
+            _ = self.identities.remove(.{ .device = slot.device, .inode = slot.inode });
             _ = std.c.close(slot.handle);
         } else if (self.fd >= 0 and slot.handle >= 0) {
             _ = self.handles.remove(slot.handle);
@@ -198,6 +227,7 @@ pub const Watch = struct {
                         return;
                     }
                     self.epoch +%= 1;
+                    self.note(event.udata - 1);
                     dirty(&self.slots[event.udata - 1]);
                 }
             } else {
@@ -238,6 +268,7 @@ pub const Watch = struct {
                             _ = self.handles.remove(event.wd);
                             self.slots[i].handle = -1;
                         }
+                        self.note(i);
                         dirty(&self.slots[i]);
                     }
                     const size = @sizeOf(Header) + @as(usize, event.len);

@@ -121,7 +121,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         } else if (std.mem.eql(u8, request.op, "trim")) {
             // Protocol requests are serial and every search joins its workers.
             // Drop optional state without changing the published source lease.
-            const released = registrations.retainedBytes() + session.plans.physical.load(.monotonic) + reuse.files.bytes + reuse.queries.bytes + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
+            const released = registrations.retainedBytes() + session.plans.physical.load(.monotonic) + reuse.files.physical.load(.monotonic) + reuse.queries.physical.load(.monotonic) + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
             if (watch) |watcher| watcher.reset();
             if (journal) |value| value.reset();
             session.deinit();
@@ -168,7 +168,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     return 0;
 }
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
-    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .sources_opened = generation.sources_opened, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
 }
 fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8, if_result_token: ?[]const u8) !u8 {
     var option_arena = std.heap.ArenaAllocator.init(a);
@@ -221,8 +221,11 @@ fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Genera
     const guard = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
     defer guard.deinit();
     const code = try searcher.run();
+    if (plan.options.trace) std.debug.print("antfly-grep: registered index attached={} healthy={} files={d}/{d} bytes={d} revision_present={} query_hit={d} incremental_hit={d}\n", .{ searcher.incremental != null, plan.index.healthy, plan.index.files.count(), generation.entries.items.len, plan.index.budget.live, plan.index.revision != null, searcher.summary.query_cache_hits, searcher.summary.incremental_cache_hits });
     if (searcher.incremental != null and code <= 1 and searcher.summary.complete and plan.index.healthy and plan.index.files.count() == generation.entries.items.len) {
-        plan.index.revision = generation.revision;
+        // Only a cold population or an incremental run may publish a revision.
+        // Complete-query replay does not update file outcomes.
+        if (searcher.summary.query_cache_hits == 0) plan.index.revision = generation.revision;
         plan.incremental_disabled_revision = null;
         if (searcher.last_result_token) |value| plan.remember(value);
     } else if (searcher.incremental != null) {

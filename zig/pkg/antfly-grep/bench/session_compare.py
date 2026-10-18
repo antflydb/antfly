@@ -235,6 +235,8 @@ def main():
                             "file_evaluation_cache_hits",
                             "incremental_cache_hits",
                             "incremental_files_evaluated",
+                            "source_parses",
+                            "source_cache_hits",
                         )
                     }
 

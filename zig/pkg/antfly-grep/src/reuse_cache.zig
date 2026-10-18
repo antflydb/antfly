@@ -71,22 +71,33 @@ pub const Times = struct {
 pub fn Cache(comptime Value: type, comptime capacity: usize, comptime limit: usize) type {
     return struct {
         const Self = @This();
+        const custom = switch (@typeInfo(Value)) {
+            .@"struct" => @hasDecl(Value, "cacheClone"),
+            else => false,
+        };
+        pub const value_limit = limit / 4;
+        pub const physical_limit = limit;
         const ways = @min(4, capacity);
         const reservation = limit / 4 + @sizeOf(Entry);
         const Entry = struct {
             owner: *Self,
             refs: std.atomic.Value(usize) = .init(1),
             budget: @import("antfly_regex").Budget,
+            tracking: @import("physical_allocator.zig").Allocator = undefined,
             arena: std.heap.ArenaAllocator,
             key: [32]u8,
             token: [32]u8,
             stamp: u64 = 0,
             times: Times,
             value: Value,
+            fn residentBytes(entry: *const Entry) usize {
+                return entry.budget.live + @sizeOf(Entry) + (if (comptime custom) entry.value.cacheBytes() else @as(usize, 0));
+            }
             fn release(entry: *Entry) void {
                 if (entry.refs.fetchSub(1, .acq_rel) != 1) return;
                 const owner = entry.owner;
-                const size = entry.budget.live + @sizeOf(Entry);
+                const size = if (comptime custom) @sizeOf(Entry) else entry.budget.live + @sizeOf(Entry);
+                if (comptime custom) entry.value.cacheRelease();
                 entry.arena.deinit();
                 owner.a.destroy(entry);
                 _ = owner.physical.fetchSub(size, .monotonic);
@@ -115,7 +126,7 @@ pub fn Cache(comptime Value: type, comptime capacity: usize, comptime limit: usi
         }
         fn remove(self: *Self, slot: *?*Entry) void {
             if (slot.*) |entry| {
-                self.bytes -= entry.budget.live + @sizeOf(Entry);
+                self.bytes -= entry.residentBytes();
                 slot.* = null;
                 entry.release();
             }
@@ -154,16 +165,21 @@ pub fn Cache(comptime Value: type, comptime capacity: usize, comptime limit: usi
             // If leases occupy headroom, decline admission without eviction.
             if (limit -| self.physical.load(.monotonic) < reservation) return;
             const entry = self.a.create(Entry) catch return;
-            _ = self.physical.fetchAdd(reservation, .monotonic);
+            const reserved = if (comptime custom) @sizeOf(Entry) else reservation;
+            _ = self.physical.fetchAdd(reserved, .monotonic);
             entry.* = .{ .owner = self, .key = key, .token = undefined, .times = times, .budget = .{ .backing = self.a, .limit = limit / 4 }, .arena = undefined, .value = undefined };
+            if (comptime custom) {
+                entry.tracking = .{ .backing = self.a, .physical = &self.physical, .limit = limit };
+                entry.budget.backing = entry.tracking.allocator();
+            }
             entry.arena = .init(entry.budget.allocator());
-            entry.value = retainedClone(Value, entry.arena.allocator(), value, 0) catch {
+            entry.value = (if (comptime custom) value.cacheClone(self, entry.arena.allocator()) else retainedClone(Value, entry.arena.allocator(), value, 0)) catch {
                 entry.arena.deinit();
                 self.a.destroy(entry);
-                _ = self.physical.fetchSub(reservation, .monotonic);
+                _ = self.physical.fetchSub(reserved, .monotonic);
                 return;
             };
-            _ = self.physical.fetchSub(limit / 4 - entry.budget.live, .monotonic);
+            if (comptime !custom) _ = self.physical.fetchSub(limit / 4 - entry.budget.live, .monotonic);
             self.io.random(&entry.token);
             self.stamp +%= 1;
             entry.stamp = self.stamp;
@@ -179,7 +195,7 @@ pub fn Cache(comptime Value: type, comptime capacity: usize, comptime limit: usi
                 if (item.?.stamp < self.slots[victim].?.stamp) victim = i;
             }
             self.remove(&self.slots[victim]);
-            const size = entry.budget.live + @sizeOf(Entry);
+            const size = entry.residentBytes();
             while (self.bytes + size > limit - reservation) {
                 self.remove(&self.slots[self.clock % capacity]);
                 self.clock +%= 1;

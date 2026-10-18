@@ -2297,3 +2297,97 @@ Evidence: [paired protocol trials](bench/results/handles-protocol-macos.json),
 [differential results](bench/results/handles-differential.json),
 [validation and source identities](bench/results/handles-validation.json), and
 [verified release archives](bench/results/handles-archives.json).
+
+
+### Incremental refresh and shared evidence follow-up
+
+Registered indexes may advance their revision only after their own file outcomes
+have been populated or updated. A complete-result cache hit from another request
+cannot certify an older file index. This has a cross-request A → B → C regression;
+rendering a mismatched indexed file now fails explicitly instead of silently
+omitting it from a complete response.
+
+Capture no longer parses every source file. Decision workers lazily prepare
+compatible files, with independently owned immutable memos and bounded peak
+reservations against the workspace quota (2–32 MiB per active preparation,
+limited by remaining quota, with unused capacity returned after parsing). Different files can prepare concurrently;
+failed optional memo admission uses ordinary query preparation. Lexical captures
+and searches require no declaration/call parsing. Prepared memos survive compatible
+refreshes and remain owned independently of the generation that first built them.
+
+Opt-in certified refresh routes dirty watch slots to source entries (including
+hard-link aliases) and stages only those files. With an exclusively owned generation,
+publication replaces staged blobs and updates a binary Merkle tree in O(D log N)
+work, without rebuilding/sorting the full inventory. No fallible operation follows
+publication. Retained readers, uncertain witnesses, new events during capture,
+membership/configuration changes or insufficient admission use ordinary capture.
+Opaque workspace revisions now use the canonical version-2 Merkle root; forced
+rescans and incremental refresh produce identical revisions for identical captures.
+The protocol version remains 1. `refresh_entries_visited` distinguishes inventory
+work from source opens; cached retained-byte totals keep unchanged ready responses
+independent of corpus size. Membership-changing capture still performs discovery.
+
+Complete-result entries now share immutable file payloads. Metadata and all shared
+payload allocations, construction, growth and evicted active leases participate in
+the existing 4 MiB query-cache physical cap. Payload quota retires after backing
+memory is freed. A new revision copies its bounded metadata and new/promoted file
+payloads, while unchanged winners retain existing payloads. A unit regression checks
+pointer identity, negligible metadata growth and charge retention through eviction.
+Delta membership, winner lookup and change checks use path maps, eliminating the
+previous quadratic top-k comparisons. Delivery-map memory remains in the existing
+2 MiB registered-plan budget.
+
+These paths reduce work for repeated and incremental queries. They do not promise
+zero memory, free cold inference, or fresh evidence after TTL expiry. Clients can
+avoid unchanged requests using their editor revision and retained complete result;
+misses and expired evidence still require evaluation or explicit partial cached-only
+results. The service continues blocking on stdin while idle.
+
+#### Follow-up measurements and verification
+
+The frozen follow-up binary passes **218 CLI cases on macOS and Linux ARM64**,
+71/72 native package tests (one platform skip), all 72 Linux package tests, six
+Linux hardening tests, 1,000 generated differential cases without differences or
+timeouts, and Windows cross-compilation. Linux runtime checks use a two-CPU Docker
+VM; Windows runtime and independent native-Linux hardware throughput remain unverified.
+
+Paired controls against the preceding PR binary use 64 Python functions per file,
+seven alternating new-process captures after warmup, and eleven paired dirty
+refreshes. The filesystem is warm; this does not measure cold disk caches.
+
+| Corpus | Capture before → after | Dirty refresh before → after | Accounted capture bytes before → after |
+|---|---:|---:|---:|
+| 64 files | 17.58 → 8.45 ms | 0.410 → 0.176 ms | 1,227,882 → 327,736 |
+| 256 files | 51.99 → 16.77 ms | 0.427 → 0.192 ms | 5,064,004 → 1,470,218 |
+
+Every optimized dirty refresh visits and opens one source entry. Each fixture's
+final incremental revision equals its forced-rescan revision. Capture allocations
+are 71–73% lower here; these are allocator-accounted bytes, not an RSS guarantee.
+macOS now shares watch subscriptions by device/inode, preserving per-capture
+sequence checks, so replacement reads need no extra subscription at full capacity.
+Ordinary unwatched captures allocate no watch-routing arrays.
+
+A separate 19-pair comparison edits a **selected** file and reconstructs both
+binaries' complete result views after every delta. Refresh plus search falls from
+0.814 to 0.570 ms at 15 winners, and 0.940 to 0.666 ms at 128 winners (about 1.4×).
+Search alone is slightly slower: 0.426 → 0.448 ms and 0.477 → 0.523 ms. Lazy
+preparation moves parsing from refresh into search, so end-to-end latency is the
+appropriate comparison. No isolated search-speed improvement is claimed.
+
+The same-binary ordinary/registered fixture edits an **unselected** file. At 15
+winners, full delivery is 3.210 ms / 140,381 bytes versus 0.350 ms / 1,925 bytes for
+a delta; at 128 winners, it is 14.786 ms / 1,177,508 bytes versus 0.557 ms / 3,457
+bytes. These are delivery-mode comparisons, not improvements against the previous
+binary. Both modes make one fixture evaluation per edit. Valid warm hits make zero
+provider requests. Sample RSS after edits is 13,104/10,368 KiB for ordinary/registered
+services in the 15-winner fixture; retained state and allocator behavior still cost
+memory. No live-model cost, relevance, universal ripgrep-speed or literal zero-cost
+claim follows from these shared-host synthetic measurements.
+
+Evidence: [paired startup/refresh](bench/results/review-refresh-macos.json),
+[paired selected-file edits](bench/results/review-incremental-paired-macos.json),
+[15-winner delivery](bench/results/review-protocol-macos.json),
+[128-winner delivery](bench/results/review-protocol-large-macos.json),
+[differential](bench/results/review-refresh-differential.json),
+[validation/source identities](bench/results/refresh-validation.json), and
+[release archives](bench/results/refresh-archives.json).

@@ -20,7 +20,7 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const Times = @import("reuse_cache.zig").Times;
 pub const Member = struct { path: []const u8, tag: [32]u8 };
-pub const Delivery = struct { token: [64]u8, revision: [64]u8, members: []Member };
+pub const Delivery = struct { token: [64]u8, revision: [64]u8, members: []Member, by_path: std.StringHashMapUnmanaged([32]u8) = .empty };
 pub fn Index(comptime Summary: type, comptime Evaluation: type) type {
     return struct {
         const Self = @This();
