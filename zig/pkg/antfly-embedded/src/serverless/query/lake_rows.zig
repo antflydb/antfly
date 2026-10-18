@@ -407,7 +407,7 @@ pub fn scanRowsAlloc(
         for (0..batch.rowCount()) |row_idx| {
             rows_examined = std.math.add(u64, rows_examined, 1) catch return error.LakeRowsScanBudgetExceeded;
             if (rows_examined > request.limits.max_rows_examined) return error.LakeRowsScanBudgetExceeded;
-            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
+            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.rowRef(row_idx))) continue;
             if (request.predicate) |predicate| {
                 if (!try predicateMatches(predicate, predicate_column.?, row_idx)) continue;
             }
@@ -723,7 +723,8 @@ fn hydrateRowsInternalAlloc(
             batch.findColumn(value.column) orelse return error.RowSourceColumnNotFound
         else
             null;
-        for (batch.row_refs, 0..) |row_ref, row_idx| {
+        for (0..batch.rowCount()) |row_idx| {
+            const row_ref = batch.rowRef(row_idx);
             rows_examined = std.math.add(u64, rows_examined, 1) catch return error.LakeRowsHydrationBudgetExceeded;
             if (rows_examined > limits.max_rows_examined) return error.LakeRowsHydrationBudgetExceeded;
             if (rowIsDeletedLookup(deleted_lookup, deleted_row_filter, row_ref)) continue;
@@ -808,6 +809,11 @@ fn predicateMatches(predicate: Predicate, column: rowsource.ColumnVector, row_id
     if (column.nulls.isNull(row_idx)) return false;
     return switch (predicate.op) {
         .eq_bytes => switch (column.values) {
+            .decimal128 => blk: {
+                var scratch: [rowsource.Decimal128.max_text_bytes]u8 = undefined;
+                break :blk std.mem.eql(u8, try column.bytesAtScratch(row_idx, &scratch), predicate.bytes_value);
+            },
+
             .bytes => |items| std.mem.eql(u8, items[row_idx], predicate.bytes_value),
             .dictionary_bytes => |items| std.mem.eql(u8, items.at(row_idx), predicate.bytes_value),
             .json => |items| std.mem.eql(u8, items[row_idx], predicate.bytes_value),
@@ -1039,16 +1045,17 @@ fn resultFromSourceAlloc(
     while (try source.next(alloc)) |batch| {
         try budget.admitBatch(batch.rowCount());
         const group_column = batch.findColumn(request.group_column) orelse return error.RowSourceColumnNotFound;
-        if (group_column.kind() != .bytes and group_column.kind() != .dictionary_bytes) return error.UnsupportedLakeRowsGroupColumnKind;
+        if (group_column.kind().logical() != .bytes) return error.UnsupportedLakeRowsGroupColumnKind;
         const value_column = if (request.op == .count) null else batch.findColumn(request.value_column) orelse return error.RowSourceColumnNotFound;
         if (value_column) |column| {
             if (column.kind() != .i64 and column.kind() != .dictionary_i64) return error.UnsupportedLakeRowsValueColumnKind;
         }
 
         for (0..batch.rowCount()) |row_idx| {
-            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
+            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.rowRef(row_idx))) continue;
             if (group_column.nulls.isNull(row_idx)) continue;
-            const key = try group_column.bytesAt(row_idx);
+            var key_scratch: [rowsource.Decimal128.max_text_bytes]u8 = undefined;
+            const key = try group_column.bytesAtScratch(row_idx, &key_scratch);
             if (key.len == 0) continue;
             const next_value = (try rowAggregateValue(request.op, value_column, row_idx)) orelse continue;
             if (map.getPtr(key)) |value| {
@@ -1115,7 +1122,7 @@ fn expressionResultFromSourceAlloc(
             }
         }
         for (0..batch.rowCount()) |row_idx| {
-            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
+            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.rowRef(row_idx))) continue;
             for (accumulators, value_columns) |*accumulator, value_column| {
                 const next_value = (try rowAggregateValue(accumulator.spec.op, value_column, row_idx)) orelse continue;
                 if (!accumulator.initialized) {
@@ -1181,7 +1188,7 @@ fn projectRowAlloc(
     row_idx: usize,
     projected_columns: []const []const u8,
 ) !ProjectedRow {
-    const row_ref = try source_binding.cloneRowRefAlloc(alloc, batch.row_refs[row_idx]);
+    const row_ref = try source_binding.cloneRowRefAlloc(alloc, batch.rowRef(row_idx));
     errdefer source_binding.freeOwnedRowRef(alloc, row_ref);
     const cells = try alloc.alloc(ProjectedCell, projected_columns.len);
     errdefer alloc.free(cells);
@@ -1216,12 +1223,15 @@ fn projectedRowAllocatedBytes(
         @sizeOf(ProjectedRow),
         std.math.mul(usize, projected_columns.len, @sizeOf(ProjectedCell)) catch return std.math.maxInt(usize),
     ) catch return std.math.maxInt(usize);
-    total = std.math.add(usize, total, rowRefPayloadBytes(batch.row_refs[row_idx])) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, rowRefPayloadBytes(batch.rowRef(row_idx))) catch return std.math.maxInt(usize);
     for (projected_columns) |name| {
         const column = batch.findColumn(name) orelse return error.RowSourceColumnNotFound;
         total = std.math.add(usize, total, name.len) catch return std.math.maxInt(usize);
         if (column.nulls.isNull(row_idx)) continue;
         const payload_bytes = switch (column.values) {
+            .decimal128 => |values| @as(usize, @intCast(values.precision)) + 3,
+            .encoded => return error.UnsupportedSqlExecution,
+
             .bytes, .json => |items| items[row_idx].len,
             .dictionary_bytes => |items| items.at(row_idx).len,
             .vector_f32 => |items| std.math.mul(usize, items[row_idx].len, @sizeOf(f32)) catch return std.math.maxInt(usize),
@@ -1250,6 +1260,8 @@ fn cloneCellValueAlloc(
     row_idx: usize,
 ) !CellValue {
     return switch (values) {
+        .decimal128 => |items| .{ .bytes = try items.text(alloc, row_idx) },
+        .encoded => return error.UnsupportedSqlExecution,
         .bytes => |items| .{ .bytes = try alloc.dupe(u8, items[row_idx]) },
         .dictionary_bytes => |items| .{ .bytes = try alloc.dupe(u8, items.at(row_idx)) },
         .json => |items| .{ .json = try alloc.dupe(u8, items[row_idx]) },
@@ -2845,4 +2857,14 @@ test "lake rows hydrates projected cells from serverless row fragments" {
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expect(rowRefsEqual(wanted[0], result.rows[0].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
+}
+
+test "external lake decimal raw predicates retain fixed scale and null semantics" {
+    const column: rowsource.ColumnVector = .{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 12300, -1 }, .precision = 38, .scale = 4 } }, .nulls = .{ .bytes = &.{ 0, 1 } } };
+    const predicate: Predicate = .{ .column = "n", .op = .eq_bytes, .bytes_value = "1.2300" };
+    try std.testing.expect(try predicateMatches(predicate, column, 0));
+    try std.testing.expect(!try predicateMatches(predicate, column, 1));
+    var scratch: [rowsource.Decimal128.max_text_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("-0.0001", try column.bytesAtScratch(1, &scratch));
+    try std.testing.expectEqual(rowsource.ColumnKind.bytes, column.kind().logical());
 }

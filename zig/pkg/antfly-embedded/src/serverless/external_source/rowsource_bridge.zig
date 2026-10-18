@@ -36,6 +36,7 @@ pub fn bindingFromValidatedInventory(inventory: external_source.Inventory) rowso
             .iceberg => .iceberg,
             .lance => .lance,
         },
+        .identity_version = inventory.row_identity_version,
         .source_id = inventory.source_id,
         .source_uri = inventory.source_uri,
         .snapshot_id = inventory.snapshot_id,
@@ -78,7 +79,8 @@ pub fn validateBatchAgainstInventoryAlloc(
     try files_by_id.ensureTotalCapacity(alloc, file_capacity);
     for (inventory.files) |*file| files_by_id.putAssumeCapacity(file.file_id, file);
 
-    for (batch.row_refs) |row_ref| {
+    for (0..batch.rowCount()) |row_index| {
+        const row_ref = batch.rowRef(row_index);
         const external = switch (row_ref) {
             .external => |external| external,
             else => return error.InvalidExternalRowSource,
