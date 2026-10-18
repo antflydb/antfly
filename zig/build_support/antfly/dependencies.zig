@@ -321,7 +321,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
-    sql_tests.step.max_rss = 3072 * 1024 * 1024;
+    // ReleaseFast macOS compilation reached 3.89 GB. Keep explicit headroom
+    // for that owner without inflating the unmeasured Linux scheduling claim.
+    sql_tests.step.max_rss = (if (target.result.os.tag == .macos) @as(usize, 5) else 3) * 1024 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
@@ -356,6 +358,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     @import("../embedded/source_owner.zig").attach(pgwire_test_mod);
     pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
+    pgwire_test_mod.addImport("antfly_platform", platform_mod);
     // This intentionally remains a storage-independent test root. Every
     // pgwire-owned test has the pgwire prefix; without a compile filter Zig
     // also discovers transitive storage tests through the SQL binder and
@@ -1303,6 +1306,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     antfly_imports.configureRuntimeContracts(usermgr_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    sql_test_mod.addImport("antfly-json", json_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
@@ -1317,6 +1321,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     antfly_imports.storage_boundary.configureSources(refinement_bench_mod, false, false);
     refinement_bench_mod.addImport("sql_parser", sql_parser_mod);
+    refinement_bench_mod.addImport("antfly-json", json_mod);
     refinement_bench_mod.addImport("antfly_platform", platform_mod);
     refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     refinement_bench_mod.addImport("antfly_regex", regex_mod);
@@ -1326,6 +1331,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     refinement_bench_mod.link_libc = link_libc;
     const refinement_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native refinements benchmark"} });
     b.step("sql-native-refinement-bench", "Compare native expression, aggregate and window spill refinements").dependOn(&b.addRunArtifact(refinement_bench).step);
+    const projection_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native projection refinements benchmark"} });
+    b.step("sql-native-projection-bench", "Compare selected document, columnar replay and validated array costs").dependOn(&b.addRunArtifact(projection_bench).step);
     const pipeline_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native pipeline refinements benchmark"} });
     b.step("sql-native-pipeline-bench", "Compare shared typed DAGs and block result delivery").dependOn(&b.addRunArtifact(pipeline_bench).step);
 
