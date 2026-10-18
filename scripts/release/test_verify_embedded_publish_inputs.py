@@ -19,8 +19,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from release_channels import build_release_spec
+from release_channels import build_release_spec, load_policy
 from verify_embedded_publish_inputs import (
     CONTROLLER_PATH,
     verify_identity,
@@ -131,8 +132,20 @@ class EmbeddedPublishTests(unittest.TestCase):
                     "version": "0.3.0",
                     "python_version": "0.3.0",
                     "npm_tag": "latest",
+                    "publish_pypi": str(
+                        load_policy()["channels"]["stable"]["publish_pypi"]
+                    ).lower(),
                 },
             )
+            for publish in (False, True):
+                policy = load_policy()
+                policy["channels"]["stable"]["publish_pypi"] = publish
+                with mock.patch(
+                    "verify_embedded_publish_inputs.load_policy", return_value=policy
+                ):
+                    self.assertEqual(
+                        verify(document)["publish_pypi"], str(publish).lower()
+                    )
             combined = copy.deepcopy(document)
             combined["build_contract_schema"] = 3
             self.assertEqual(verify(combined)["build_contract_schema"], "3")

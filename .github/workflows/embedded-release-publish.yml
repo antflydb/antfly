@@ -31,6 +31,7 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       python_version: ${{ steps.identity.outputs.python_version }}
       npm_tag: ${{ steps.identity.outputs.npm_tag }}
+      publish_pypi: ${{ steps.identity.outputs.publish_pypi }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -113,6 +114,7 @@ jobs:
   publish-pypi:
     name: Publish antfly-embedded wheels to PyPI
     needs: prepare
+    if: ${{ needs.prepare.outputs.publish_pypi == 'true' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
