@@ -297,34 +297,36 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
             try std.testing.expectEqual(@as(usize, 0), manager.files);
             try std.testing.expectEqual(self.opened, self.closed);
         }
-        fn run(a: Allocator) !void {
+        const cases = [_]struct { sql: []const u8, sum: []const u8, count: []const u8 }{
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v) d", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs WHERE v>=2) d", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) d", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT CAST(3 AS BIGINT) AS v) d", .sum = "203", .count = "101" },
+            .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k) x", .sum = "600", .count = "100" },
+            .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM (SELECT 3 AS k) x CROSS JOIN docs d", .sum = "600", .count = "100" },
+            .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k UNION ALL SELECT 4 AS k) x", .sum = "1400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k UNION ALL SELECT 4 AS k) x CROSS JOIN docs d", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v DESC LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT 2 AS k UNION ALL SELECT 2 AS k UNION ALL SELECT NULL AS k) x ON d.v=x.k", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d LEFT JOIN (SELECT 3 AS k) x ON d.v=x.k", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k) x RIGHT JOIN docs d ON d.v=x.k", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN dim x ON d.v=x.v", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM dim x JOIN docs d ON d.v=x.v", .sum = "200", .count = "100" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d FULL JOIN dim x ON d.v=x.v", .sum = "200", .count = "102" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d WHERE d.v IN(SELECT v FROM dim)", .sum = "200", .count = "100" },
+            .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM cached", .sum = "200", .count = "100" },
+            .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM (SELECT v FROM cached UNION ALL SELECT v FROM cached) d", .sum = "400", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN docs x ON d.v=x.v", .sum = "20000", .count = "10000" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d FULL JOIN docs x ON d.v=x.v AND d.v=3", .sum = "200", .count = "200" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d CROSS JOIN docs x", .sum = "20000", .count = "10000" },
+            .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT v FROM docs UNION ALL SELECT v FROM docs) x ON d.v=x.v", .sum = "40000", .count = "20000" },
+        };
+        fn run(a: Allocator, only: ?usize) !void {
             var self: @This() = .{};
             const backend: catalog.Backend = .{ .ptr = &self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint } };
-            for ([_]struct { sql: []const u8, sum: []const u8, count: []const u8 }{
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v) d", .sum = "200", .count = "100" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs WHERE v>=2) d", .sum = "200", .count = "100" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) d", .sum = "400", .count = "200" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT CAST(3 AS BIGINT) AS v) d", .sum = "203", .count = "101" },
-                .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k) x", .sum = "600", .count = "100" },
-                .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM (SELECT 3 AS k) x CROSS JOIN docs d", .sum = "600", .count = "100" },
-                .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k UNION ALL SELECT 4 AS k) x", .sum = "1400", .count = "200" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k UNION ALL SELECT 4 AS k) x CROSS JOIN docs d", .sum = "400", .count = "200" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v DESC LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT 2 AS k UNION ALL SELECT 2 AS k UNION ALL SELECT NULL AS k) x ON d.v=x.k", .sum = "400", .count = "200" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d LEFT JOIN (SELECT 3 AS k) x ON d.v=x.k", .sum = "200", .count = "100" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k) x RIGHT JOIN docs d ON d.v=x.k", .sum = "200", .count = "100" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN dim x ON d.v=x.v", .sum = "200", .count = "100" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM dim x JOIN docs d ON d.v=x.v", .sum = "200", .count = "100" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d FULL JOIN dim x ON d.v=x.v", .sum = "200", .count = "102" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d WHERE d.v IN(SELECT v FROM dim)", .sum = "200", .count = "100" },
-                .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM cached", .sum = "200", .count = "100" },
-                .{ .sql = "WITH cached AS MATERIALIZED(SELECT v FROM docs) SELECT sum(v),count(*) FROM (SELECT v FROM cached UNION ALL SELECT v FROM cached) d", .sum = "400", .count = "200" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN docs x ON d.v=x.v", .sum = "20000", .count = "10000" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d FULL JOIN docs x ON d.v=x.v AND d.v=3", .sum = "200", .count = "200" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d CROSS JOIN docs x", .sum = "20000", .count = "10000" },
-                .{ .sql = "SELECT sum(d.v),count(*) FROM docs d JOIN (SELECT v FROM docs UNION ALL SELECT v FROM docs) x ON d.v=x.v", .sum = "40000", .count = "20000" },
-            }) |case| {
+            for (cases, 0..) |case, index| {
+                if (only) |selected| if (selected != index) continue;
                 var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
                 defer compiled.deinit();
                 var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
@@ -332,7 +334,7 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 try std.testing.expectEqualStrings(case.sum, result.output.rows[0][0].string);
                 try std.testing.expectEqualStrings(case.count, result.output.rows[0][1].string);
             }
-            {
+            if (only == null or only.? == cases.len) {
                 self.weighted_dimension = true;
                 defer self.weighted_dimension = false;
                 var compiled = try @import("compiler.zig").compile(a, "SELECT sum(d.v),sum(x.v),count(*),count(DISTINCT x.v) FROM docs d FULL JOIN dim x ON d.v=x.v", .{});
@@ -344,7 +346,7 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 try std.testing.expectEqualStrings("10200", result.output.rows[0][2].string);
                 try std.testing.expectEqualStrings("2", result.output.rows[0][3].string);
             }
-            {
+            if (only == null or only.? == cases.len + 1) {
                 var compiled = try @import("compiler.zig").compile(a, "SELECT count(*) FROM (SELECT 1/(v-2) AS bad FROM docs LIMIT 1 OFFSET 100) d", .{});
                 defer compiled.deinit();
                 var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 100 });
@@ -352,7 +354,7 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
             }
             self.saturated = true;
-            {
+            if (only == null or only.? == cases.len + 2) {
                 var compiled = try @import("compiler.zig").compile(a, "SELECT d.v FROM docs d CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) x ORDER BY d.v DESC LIMIT 3 OFFSET 5", .{});
                 defer compiled.deinit();
                 var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
@@ -363,10 +365,13 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
             try std.testing.expectEqual(self.opened, self.closed);
         }
     };
-    try Fixture.run(std.testing.allocator);
+    try Fixture.run(std.testing.allocator, null);
     try Fixture.spillRun(std.testing.allocator, false);
     try Fixture.spillRun(std.testing.allocator, true);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    // Each query owns a separate statement and cursor cohort. Enumerate every
+    // allocation failure per query, avoiding quadratic replay of earlier cases.
+    for (0..Fixture.cases.len + 3) |index|
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{@as(?usize, index)});
 }
 
 test "SQL row membership executes captured typed relations with NULL-aware truth and query boundaries" {
