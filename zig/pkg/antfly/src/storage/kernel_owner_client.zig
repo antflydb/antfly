@@ -724,6 +724,29 @@ pub const Owner = struct {
         return parsed;
     }
 
+    pub fn raftIndexOwnerLifecycle(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.LifecycleRequest, prepare: bool, audit_root: ?@import("antfly_local_sources").storage_db_relational_index_owner_control.AuditRoot, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.LifecyclePreparation) {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        try request.validate();
+        if ((prepare and request == .install) != (audit_root != null)) return error.InvalidArgument;
+        const root_json = if (audit_root) |root| try std.json.Stringify.valueAlloc(alloc, root, .{}) else null;
+        defer if (root_json) |bytes| alloc.free(bytes);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > contract.LifecyclePreparation.max_request_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_lifecycle_json(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(encoded), .prepare = @intFromBool(prepare), .audit_root_json = .fromSlice(root_json orelse ""), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerLifecycleRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner lifecycle preparation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.LifecyclePreparation.max_response_bytes) return error.InvalidRelationalIndexProgress;
+        var parsed = try std.json.parseFromSlice(contract.LifecyclePreparation, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(request);
+        if (!prepare and (parsed.value.gc != null or (parsed.value.progress == .install and (parsed.value.progress.install.command != null or parsed.value.progress.install.physical != null)))) return error.InvalidRelationalIndexProgress;
+        return parsed;
+    }
+
     pub fn raftIndexOwnerBuild(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildRequest, prepare: bool, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildPreparation) {
         return self.raftIndexOwnerStep(alloc, table_name, request, @intFromBool(prepare), null, options);
     }

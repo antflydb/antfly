@@ -475,7 +475,7 @@ const Job = struct {
                     self.retireOwner(index);
                     return;
                 }
-                if (response.value != .releasing) return error.InvalidPrivateIndexNativeReceipt;
+                if (response.value != .releasing and response.value != .raft_lifecycle) return error.InvalidPrivateIndexNativeReceipt;
                 const ack = (try response.value.releaseAck(request)) orelse {
                     owner.retry_at_ns = now_ns +| retry_ns;
                     return;
@@ -499,12 +499,19 @@ const Job = struct {
                     self.retireOwner(index);
                     return;
                 }
-                if (response.value != .installing) return error.InvalidPrivateIndexNativeReceipt;
-                const outcome = response.value.installing.outcome;
-                if (outcome == .audit) {
-                    if (outcome.audit.audit.inventory.phase == .failed) return error.PrivateIndexTargetInventoryMismatch;
-                    if (outcome.audit.audit.generation) |fields| if (fields.phase == .failed) return error.PrivateIndexGenerationValidationFailed;
-                    return;
+                if (response.value == .raft_lifecycle) {
+                    if (response.value.raft_lifecycle.progress.install.physical) |physical| {
+                        if (physical.audit.inventory.phase == .failed) return error.PrivateIndexTargetInventoryMismatch;
+                        if (physical.audit.generation) |fields| if (fields.phase == .failed) return error.PrivateIndexGenerationValidationFailed;
+                    }
+                } else {
+                    if (response.value != .installing) return error.InvalidPrivateIndexNativeReceipt;
+                    const outcome = response.value.installing.outcome;
+                    if (outcome == .audit) {
+                        if (outcome.audit.audit.inventory.phase == .failed) return error.PrivateIndexTargetInventoryMismatch;
+                        if (outcome.audit.audit.generation) |fields| if (fields.phase == .failed) return error.PrivateIndexGenerationValidationFailed;
+                        return;
+                    }
                 }
                 const ack = (try response.value.installationAck(request)) orelse {
                     owner.retry_at_ns = now_ns +| retry_ns;

@@ -8559,7 +8559,7 @@ pub const DB = struct {
         try self.requireRaftIndexOwnerIdentity(owner_group, expected);
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        return RaftIndexOwnerControl.observe(&txn, expected);
+        return RaftIndexOwnerControl.observe(self.alloc, &txn, expected);
     }
 
     /// Read-only bounded proposal preparation. The caller keeps its working

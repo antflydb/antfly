@@ -163,6 +163,11 @@ fn currentStateMode(txn: anytype, binding: jobs.Binding, comptime canceling: boo
 /// Absence grants nothing. Existing jobs must verify their durable phase cuts
 /// and catalog preimage in this same snapshot, not just deserialize a binding.
 pub fn inspect(txn: anytype, expected: Identity) !?jobs.Binding {
+    const binding = (try inspectBinding(txn, expected)) orelse return null;
+    return try currentState(txn, binding);
+}
+
+fn inspectBinding(txn: anytype, expected: Identity) !?jobs.Binding {
     try expected.validate();
     const actual = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
     if (!actual.eql(expected.namespace)) return error.IdentityNamespaceMismatch;
@@ -172,7 +177,7 @@ pub fn inspect(txn: anytype, expected: Identity) !?jobs.Binding {
         !std.mem.eql(u8, &binding.plan_digest, &expected.plan_digest) or
         !std.mem.eql(u8, &binding.owner_digest, &expected.owner_digest) or binding.ordinal != expected.ordinal or
         !binding.fence.namespace.eql(expected.namespace) or binding.fence.owner_group_id != expected.owner_group_id) return error.PrivateIndexOwnerJobChanged;
-    return try currentState(txn, binding);
+    return binding;
 }
 
 /// Read-only recovery never mints a cut from the current term/index.
@@ -202,8 +207,20 @@ fn logicalReceipt(binding: jobs.Binding, effect: Effect, cut: Cut) publication.R
     };
 }
 
-pub fn observe(txn: anytype, expected: Identity) !Observation {
-    const binding = try inspect(txn, expected);
+pub fn observe(alloc: std.mem.Allocator, txn: anytype, expected: Identity) !Observation {
+    const binding = try inspectBinding(txn, expected);
+    if (binding) |value| {
+        if (value.phase == .installed) {
+            // Observation is not execution permission. Verify the actual
+            // successor, retained seal and ordered cuts in this snapshot;
+            // ordinary control/build paths keep currentState's strict guard.
+            const validation = @import("relational_index_validation.zig");
+            const installed = (try validation.Installed.load(alloc, txn, value)) orelse return error.PrivateIndexTargetValidationRequired;
+            try installed.requireCurrent(alloc, txn);
+            try jobs.requireActive(txn, value.fence);
+            try requireCuts(txn, value);
+        } else _ = try currentState(txn, value);
+    }
     const applied = try marker(txn);
     var result: Observation = .{ .format_version = 1, .binding = binding, .applied = if (applied) |entry| .{ .raft = .{ .term = entry.term, .index = entry.index } } else null };
     if (binding) |value| {

@@ -4309,6 +4309,103 @@ pub fn storageOwnerRaftIndexClaimsJson(owner: ?*anyopaque, request: *const kerne
     return .ok;
 }
 
+pub fn storageOwnerRaftIndexLifecycleJson(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftIndexOwnerLifecycleRequest, out_response: *kernel_owner_abi.OwnedBytes, out_failure: *kernel_owner_abi.FailureIdentity) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const local = @import("antfly_local_sources");
+    const contract = local.storage_db_relational_index_raft_contract;
+    const native = local.storage_db_relational_index_owner_control;
+    const validation = local.storage_db_relational_index_validation;
+    const release = contract.Release;
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftIndexOwnerLifecycleRequest.operation);
+            return out.status;
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.prepare > 1 or request.request_json.ptr == null or request.request_json.len == 0 or request.request_json.len > contract.LifecyclePreparation.max_request_bytes or
+        request.audit_root_json.len > native.AuditRoot.max_wire_bytes or (request.audit_root_json.len != 0 and request.audit_root_json.ptr == null) or
+        request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
+    const context: local.api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    const resources = local.storage_resource_manager;
+    var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
+    defer if (budget) |*value| value.deinit();
+    const alloc = if (budget) |*value| value.allocator() else handle.alloc;
+    const Work = struct {
+        fn run(a: std.mem.Allocator, h: *Handle, table: []const u8, req: *const kernel_owner_abi.RaftIndexOwnerLifecycleRequest, ctx: local.api_operation.RequestContext, output: *kernel_owner_abi.OwnedBytes) !void {
+            var parsed = std.json.parseFromSlice(contract.LifecycleRequest, a, req.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidArgument;
+            defer parsed.deinit();
+            try parsed.value.validate();
+            const b = parsed.value.binding();
+            _ = try h.db.raftIndexOwnerObservation(h.storage_owner_group_id, .{ .id = b.id, .plan_digest = b.plan_digest, .owner_digest = b.owner_digest, .ordinal = b.ordinal, .namespace = b.fence.namespace, .owner_group_id = b.fence.owner_group_id });
+            if ((parsed.value == .install and req.prepare == 1) != (req.audit_root_json.len != 0)) return error.InvalidArgument;
+            var result: contract.LifecyclePreparation = undefined;
+            var gc_page: ?release.Gc.Page = null;
+            defer if (gc_page) |*value| value.deinit();
+            switch (parsed.value) {
+                .install => |input| {
+                    var progress: contract.InstallationProgress = .{};
+                    {
+                        var read = try h.db.core.store.beginReadTxn();
+                        defer read.abort();
+                        progress.installed = try validation.Installed.load(a, &read, b);
+                        if (progress.installed) |installed| {
+                            if (!std.meta.eql(installed.command.intent(), input.intent)) return error.InvalidPrivateIndexNativeReceipt;
+                            try installed.requireCurrent(a, &read);
+                        }
+                    }
+                    if (req.prepare == 1) {
+                        var root = std.json.parseFromSlice(native.AuditRoot, a, req.audit_root_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidArgument;
+                        defer root.deinit();
+                        try root.value.validate();
+                        const audit = try h.db.stepRaftIndexOwnerInstallationAudit(h.storage_owner_group_id, table, input.intent, input.budget, root.value.root_dir, root.value.root_incarnation, ctx);
+                        progress.physical = .{ .binding = b, .expected = input.intent.validation.command.expected, .audit = audit };
+                        if (audit.inventory.phase == .ready and audit.generation != null and audit.generation.?.phase == .ready) {
+                            var prepared = try native.PreparedInstall.initIntent(a, h.db.core, input.intent, ctx);
+                            defer prepared.deinit();
+                            progress.command = prepared.command;
+                        }
+                    }
+                    result = .{ .progress = .{ .install = progress } };
+                },
+                .release => |intent| {
+                    var read = try h.db.core.store.beginReadTxn();
+                    defer read.abort();
+                    const record = try release.Record.load(a, &read, intent);
+                    var progress: contract.ReleaseProgress = .{ .record = record };
+                    if (record != null) {
+                        try release.Record.verifyRecovery(a, &read);
+                        const pending = try release.Record.pending(a, &read);
+                        progress.retired = pending == null;
+                        if (pending) |value| {
+                            if (!std.meta.eql(value, record.?)) return error.InvalidPrivateIndexNativeReceipt;
+                            if (req.prepare == 1) gc_page = try release.Gc.Page.prepare(a, null, &read);
+                        }
+                    } else try intent.requireInstalled(a, &read);
+                    result = .{ .progress = .{ .release = progress }, .gc = if (gc_page) |value| value.command else null };
+                },
+            }
+            try result.validateFor(parsed.value);
+            try ctx.ensureActive();
+            var response = try BoundedOwnerJsonResponse(contract.LifecyclePreparation.max_response_bytes).initSized(result);
+            defer response.deinit();
+            const used = try response.encode(result);
+            try ctx.ensureActive();
+            output.* = response.detach(used);
+        }
+    };
+    Work.run(alloc, handle, table_name, request, context, out_response) catch |err| {
+        if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
+        return Failure.result(err, out_failure);
+    };
+    return .ok;
+}
+
 const RaftSchemaPreparation = struct {
     owner_id: *anyopaque,
     owner: *Handle,

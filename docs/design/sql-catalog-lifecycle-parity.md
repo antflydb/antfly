@@ -145,8 +145,19 @@ installation command as well as metadata's grant. Installation signing checks
 the actual completed Raft prefix; release requires the accepted installation's
 same root, generation, reporter and replica identity. A changed root must use
 the distinct recovery/adoption protocol rather than a release signature.
+The leased compiled-owner interface now prepares installation from locally
+derived schema/activation hashes, advances bounded physical audits, and recovers
+the original installed cut. Release recovers the retained terminal record and
+prepares at most one bounded companion-GC page; no apply position or permission
+bit crosses this interface. The authenticated receiver proposes at most one
+installation, release or retirement effect per turn through the same member,
+term and root-generation barriers. After commit it reads only retained records,
+preserving progress when signing fails. The worker recognizes the explicit Raft
+lifecycle response, and release cannot produce an ACK before retirement ends.
+Installed observations verify the actual successor schema, seal and Raft cuts;
+ordinary build/control entry points still reject installed jobs.
 This is not complete public activation: the worker's Raft cohort guard,
-installation/release/cancellation receiver paths and root-adoption recovery
+cancellation receiver paths and root-adoption recovery
 remain unfinished, and public CREATE remains guarded. No original case is
 closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's

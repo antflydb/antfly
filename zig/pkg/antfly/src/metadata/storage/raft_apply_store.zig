@@ -4586,6 +4586,25 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         var wrong_root = releasing;
         wrong_root.raft_signing.?.root_generation += 1;
         try std.testing.expectError(error.InvalidCatalogRecord, wrong_root.raftReleaseIntent(release_request));
+        const lifecycle_install: execution.ControlResponse = .{ .raft_lifecycle = .{ .root_generation = proof.root_generation, .input = .{ .install = .{ .intent = install_intent } }, .progress = .{ .install = .{ .physical = audit, .command = install_command, .installed = installed } }, .signed_ack = installed_ack } };
+        const install_control: execution.Request = .{ .table_id = head.table_id, .group_id = owner.owner.group_id, .id = head.plan_id, .operation = .install };
+        try std.testing.expectEqualDeep(installed_ack, (try lifecycle_install.installationAck(install_control)).?);
+        try std.testing.expect(try lifecycle_install.releaseAck(install_control) == null);
+        const release_intent = try releasing.raftReleaseIntent(release_request);
+        try releasing.requireRaftReleaseProposal(dispatch.value.table_name, release_request, .{ .release = release_intent });
+        const release_progress: local.storage_db_relational_index_raft_contract.ReleaseProgress = .{ .record = .{ .intent = release_intent, .position = .{ .raft = .{ .term = 2, .index = 13 } } }, .retired = true };
+        var pending_release = release_progress;
+        pending_release.retired = false;
+        try std.testing.expectError(error.GenerationRetirementPending, releasing.signRaftRelease(release_request, pending_release, scope, root));
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, releasing.signRaftRelease(release_request, release_progress, scope, root));
+        scope.completed_index = 13;
+        const released_ack = try releasing.signRaftRelease(release_request, release_progress, scope, root);
+        const release_control: execution.Request = .{ .table_id = head.table_id, .group_id = owner.owner.group_id, .id = head.plan_id, .operation = .release };
+        const lifecycle_release: execution.ControlResponse = .{ .raft_lifecycle = .{ .root_generation = proof.root_generation, .input = .{ .release = release_intent }, .progress = .{ .release = release_progress }, .signed_ack = released_ack } };
+        try std.testing.expectEqualDeep(released_ack, (try lifecycle_release.releaseAck(release_control)).?);
+        var premature_release = lifecycle_release;
+        premature_release.raft_lifecycle.progress.release.retired = false;
+        try std.testing.expectError(error.GenerationRetirementPending, premature_release.releaseAck(release_control));
         const snapshot = try store.buildMetadataSnapshotTxn(store.alloc, &txn, group, null);
         defer store.alloc.free(snapshot);
     }

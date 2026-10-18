@@ -1768,6 +1768,67 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     var sealed_retry = try Build.call(id, audit_input, validation_request);
     defer sealed_retry.deinit();
     try std.testing.expectEqualDeep(sealed.value.audit, sealed_retry.value.audit);
+    const Lifecycle = struct {
+        fn call(owner: ?*anyopaque, work: contract.LifecycleRequest, prepare: bool, root_bytes: []const u8) !std.json.Parsed(contract.LifecyclePreparation) {
+            const lifecycle_encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, work, .{});
+            defer std.testing.allocator.free(lifecycle_encoded);
+            var lifecycle_output: kernel_owner_abi.OwnedBytes = .{};
+            defer freeRawBuffer(lifecycle_output.ptr, lifecycle_output.len);
+            var lifecycle_failure: kernel_owner_abi.FailureIdentity = .{};
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerRaftIndexLifecycleJson(owner, &.{ .table_name = .fromSlice("items"), .request_json = .fromSlice(lifecycle_encoded), .prepare = @intFromBool(prepare), .audit_root_json = .fromSlice(root_bytes) }, &lifecycle_output, &lifecycle_failure));
+            var lifecycle_parsed = try std.json.parseFromSlice(contract.LifecyclePreparation, std.testing.allocator, lifecycle_output.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+            errdefer lifecycle_parsed.deinit();
+            try lifecycle_parsed.value.validateFor(work);
+            return lifecycle_parsed;
+        }
+    };
+    const install_request: contract.LifecycleRequest = .{ .install = .{ .intent = .{ .validation = sealed_retry.value.audit.seal.?, .metadata_decision = @splat(12) }, .budget = .{ .records = 1, .time_ns = std.time.ns_per_s } } };
+    var installation_step = try Lifecycle.call(id, install_request, true, root_json);
+    defer installation_step.deinit();
+    const install_command = installation_step.value.progress.install.command orelse return error.TestUnexpectedResult;
+    try std.testing.expect(installation_step.value.progress.install.installed == null);
+    var installation = try native.PreparedInstall.init(a, handle.db.core, install_command, .{});
+    defer installation.deinit();
+    const install_index = next_index + 2;
+    try handle.db.applyCommittedRaftIndexInstallation(&installation, 11, .{ .term = 9, .index = install_index });
+    var installed_step = try Lifecycle.call(id, install_request, false, "");
+    defer installed_step.deinit();
+    try std.testing.expectEqual(install_index, installed_step.value.progress.install.installed.?.position.raft.index);
+    try std.testing.expect(installed_step.value.progress.install.physical == null);
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var installed_retry = try Lifecycle.call(id, install_request, true, root_json);
+    defer installed_retry.deinit();
+    try std.testing.expectEqualDeep(installed_step.value.progress.install.installed, installed_retry.value.progress.install.installed);
+    try std.testing.expectEqualDeep(install_command, installed_retry.value.progress.install.command.?);
+    const release_request: contract.LifecycleRequest = .{ .release = .{ .installed = installed_retry.value.progress.install.installed.?, .metadata_decision = @splat(13) } };
+    var release_step = try Lifecycle.call(id, release_request, true, "");
+    defer release_step.deinit();
+    try std.testing.expect(release_step.value.progress.release.record == null);
+    var releasing = try native.PreparedRelease.init(a, handle.db.core, release_request.release, .{});
+    defer releasing.deinit();
+    const release_index = install_index + 1;
+    try handle.db.applyCommittedRaftIndexRelease(&releasing, 11, .{ .term = 10, .index = release_index });
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = identity.namespace });
+    var gc_index = release_index + 1;
+    var gc_turns: usize = 0;
+    while (gc_turns < 16) : (gc_turns += 1) {
+        var gc_step = try Lifecycle.call(id, release_request, true, "");
+        defer gc_step.deinit();
+        try std.testing.expectEqual(release_index, gc_step.value.progress.release.record.?.position.raft.index);
+        if (gc_step.value.progress.release.retired) break;
+        var prepared_gc: native.PreparedReleaseGc = .{ .alloc = a, .command = gc_step.value.gc orelse return error.TestUnexpectedResult };
+        defer prepared_gc.deinit();
+        try handle.db.applyCommittedRaftIndexReleaseGc(&prepared_gc, 11, .{ .term = 11, .index = gc_index });
+        gc_index += 1;
+    }
+    try std.testing.expect(gc_turns > 0 and gc_turns < 16);
+    var released_step = try Lifecycle.call(id, release_request, false, "");
+    defer released_step.deinit();
+    try std.testing.expect(released_step.value.progress.release.retired);
+    try std.testing.expect(released_step.value.gc == null);
+    try std.testing.expectEqual(release_index, released_step.value.progress.release.record.?.position.raft.index);
 }
 
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {

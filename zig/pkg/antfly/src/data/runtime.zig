@@ -421,6 +421,7 @@ const DataRaftBatchRoute = struct {
         context: antfly.public_api.operation.RequestContext,
         accepted_source: ?@import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.SourceStream.Accepted = null,
         audited_validation: ?@import("antfly_local_sources").storage_db_relational_index_validation.SealCommand = null,
+        audited_installation: ?@import("antfly_local_sources").storage_db_relational_index_validation.InstallCommand = null,
     } = null,
 };
 
@@ -11805,7 +11806,7 @@ pub const DataServer = struct {
     fn raftIndexOwnerControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
-        if (request.operation != .fence and request.operation != .reserve and request.operation != .build and request.operation != .source and request.operation != .validate) return error.UnsupportedNativeIndexOwner;
+        if (request.operation != .fence and request.operation != .reserve and request.operation != .build and request.operation != .source and request.operation != .validate and request.operation != .install and request.operation != .release) return error.UnsupportedNativeIndexOwner;
         const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
         try self.waitDataReadSafeWithCancellation(group_id, "index-owner-control", 30_000, context.cancellation);
         var lookup = request.lookup(.permission);
@@ -11831,6 +11832,7 @@ pub const DataServer = struct {
         // effect, not merely when attempting post-commit decoration.
         try (try permission.value.raftSigningView(lookup)).requireLocal(scope);
         if (request.operation == .validate) return self.raftIndexValidationControl(alloc, group_id, table_name, request, lookup, &permission.value, &session, rooted, route);
+        if (request.operation == .install or request.operation == .release) return self.raftIndexLifecycleControl(alloc, group_id, table_name, request, lookup, &permission.value, &session, rooted, route);
         if (request.operation == .source) {
             var wire = try session.claimSource(alloc);
             errdefer wire.deinit();
@@ -11961,6 +11963,56 @@ pub const DataServer = struct {
         };
         try response.validate(request);
         return .{ .raft_validation = response };
+    }
+
+    fn raftIndexLifecycleControl(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: antfly.public_api.relational_index_owner_execution.Request, lookup: @import("../metadata/relational_index_publication.zig").OwnerRequest, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, original_route: DataRaftBatchRoute) !antfly.public_api.relational_index_owner_execution.Result {
+        const execution = antfly.public_api.relational_index_owner_execution;
+        const local = @import("antfly_local_sources");
+        const contract = local.storage_db_relational_index_raft_contract;
+        const context = original_route.index_owner_permission.?.context;
+        const input: contract.LifecycleRequest = if (request.operation == .install) .{ .install = .{ .intent = try permission.raftInstallationIntent(lookup, rooted.observation.binding orelse return error.PrivateIndexRootRecoveryRequired), .budget = request.build_budget orelse .{} } } else .{ .release = try permission.raftReleaseIntent(lookup) };
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const root = try local.storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
+        const root_scope: local.storage_db_relational_index_owner_control.AuditRoot = .{ .root_dir = self.write_source.replica_root_dir, .root_incarnation = root.root_incarnation };
+        var prepared = try session.lifecycle(alloc, input, true, if (input == .install) root_scope else null);
+        defer prepared.deinit();
+        var progress = prepared.value.progress;
+        const command: ?contract.Command = switch (progress) {
+            .install => |value| if (value.installed == null and value.command != null) .{ .install = value.command.? } else null,
+            .release => |value| if (value.record == null) .{ .release = input.release } else if (prepared.value.gc) |gc| .{ .release_gc = gc } else null,
+        };
+        if (command) |value| {
+            var route = original_route;
+            if (value == .install) route.index_owner_permission.?.audited_installation = value.install;
+            try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = value }, route);
+            // Only recover bounded retained records after commit. Keep the
+            // pre-proposal physical audit; never start an uncancellable scan.
+            var recovered = try session.lifecycle(alloc, input, false, null);
+            defer recovered.deinit();
+            if (progress == .install) progress.install.installed = recovered.value.progress.install.installed else progress = recovered.value.progress;
+        }
+        var response: execution.RaftLifecycleControlResponse = .{ .root_generation = rooted.root_generation, .input = input, .progress = progress };
+        const ready = switch (progress) {
+            .install => |value| value.installed != null and value.command != null,
+            .release => |value| value.retired,
+        };
+        if (ready) response.signed_ack = signed: {
+            const scope = self.raftIndexLocalScope(group_id, rooted, context) catch |err| {
+                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+                break :signed null;
+            };
+            const ack = switch (progress) {
+                .install => |value| permission.signRaftInstallation(lookup, value.installed.?, value.physical.?, value.physical.?.audit.physical_root_incarnation, scope, root),
+                .release => |value| permission.signRaftRelease(lookup, value, scope, root),
+            };
+            break :signed ack catch |err| {
+                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+                break :signed null;
+            };
+        };
+        try response.validate(request);
+        return .{ .raft_lifecycle = response };
     }
 
     fn signRaftIndexValidation(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, lookup: @import("../metadata/relational_index_publication.zig").OwnerRequest, audited: @import("antfly_local_sources").storage_db_relational_index_raft_contract.AuditProgress, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").Ack {
@@ -13299,6 +13351,8 @@ pub const DataServer = struct {
                 .claims => |claims| try permission.decision.requireRaftClaimsProposal(table_name, permission.request, claims),
                 .consume => |consume| try permission.decision.requireRaftConsumptionProposal(table_name, permission.request, consume, permission.accepted_source orelse return error.InvalidPrivateIndexClaimReceipt),
                 .inventory_validation, .generation_validation, .validation_seal => try permission.decision.requireRaftValidationProposal(table_name, permission.request, command, permission.audited_validation),
+                .install => |install| try permission.decision.requireRaftInstallationProposal(table_name, permission.request, install, permission.audited_installation),
+                .release, .release_gc => try permission.decision.requireRaftReleaseProposal(table_name, permission.request, command),
                 else => return error.InvalidGenerationPublication,
             }
         } else if (route.index_owner_permission != null) return error.InvalidGenerationPublication;

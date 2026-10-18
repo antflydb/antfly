@@ -1444,6 +1444,32 @@ pub const OwnerDecision = struct {
         return grant.intent();
     }
 
+    pub fn requireRaftReleaseProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: raft_control.Command) !void {
+        const intent = try self.raftReleaseIntent(request);
+        try command.validate();
+        const supplied = switch (command) {
+            .release => |value| value,
+            .release_gc => |value| value.record.intent,
+            else => return error.InvalidGenerationPublication,
+        };
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        if (!std.meta.eql(intent, supplied) or !std.mem.eql(u8, dispatch.table_name, table_name)) return error.GenerationPublicationChanged;
+    }
+
+    pub fn signRaftRelease(self: OwnerDecision, request: OwnerRequest, progress_: raft_control.ReleaseProgress, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        const intent = try self.raftReleaseIntent(request);
+        try progress_.validateFor(intent);
+        if (!progress_.retired) return error.GenerationRetirementPending;
+        const record = progress_.record orelse return error.GenerationRetirementPending;
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        if (record.position.raft.term > actual.leader_term or record.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const receipt = try intent.receiptAt(record.position);
+        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) } };
+        try ack.validate();
+        return ack;
+    }
+
     /// Immutable identity only, not live execution permission. Checkpoints use
     /// this for retained acceptance after cancellation or publication as well.
     pub fn requireRetainedNativeBinding(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding) !void {

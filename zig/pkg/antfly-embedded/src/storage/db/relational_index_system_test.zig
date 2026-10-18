@@ -1893,7 +1893,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         var pinned = try db.core.store.beginReadTxn();
         defer pinned.abort();
         try Wire.apply(&db, .{ .control = admission.command }, .{ .term = 1, .index = 10 });
-        const old = try raft.observe(&pinned, identity);
+        const old = try raft.observe(alloc, &pinned, identity);
         try std.testing.expect(old.binding == null and old.fenced == null and old.reserved == null);
         try std.testing.expectEqual(@as(u64, 1), old.applied.?.raft.index);
         const current = try db.raftIndexOwnerObservation(11, identity);

@@ -90,9 +90,9 @@ pub const Observation = struct {
             !std.mem.eql(u8, &binding.owner_digest, &expected.owner_digest) or binding.ordinal != expected.ordinal or
             !binding.fence.namespace.eql(expected.namespace) or binding.fence.owner_group_id != expected.owner_group_id)
             return error.PrivateIndexOwnerJobChanged;
-        if (binding.phase != .fencing and binding.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
+        if (binding.phase != .fencing and binding.phase != .reserved and binding.phase != .installed) return error.InvalidPrivateIndexOwnerJob;
         const applied = self.applied orelse return error.InvalidControlReceiptPosition;
-        if (binding.phase == .reserved) {
+        if (binding.phase == .reserved or binding.phase == .installed) {
             if (self.fenced == null or self.reserved == null) return error.InvalidControlReceiptPosition;
         } else if (self.reserved != null) return error.InvalidControlReceiptPosition;
         const owner: publication.Owner = .{ .plan_id = binding.id, .plan_digest = binding.plan_digest, .ordinal = binding.ordinal, .group_id = binding.fence.owner_group_id, .namespace = binding.fence.namespace, .authority = .raft, .fence_digest = binding.owner_digest };
@@ -149,6 +149,98 @@ pub const Control = struct {
 };
 
 pub const BuildRequest = @import("relational_index_owner_control.zig").BuildRequest;
+const installation = @import("relational_index_validation.zig");
+const release = @import("relational_index_release.zig");
+pub const Release = release;
+
+/// Read-only preparation/observation through the leased physical owner. No
+/// execution cut or metadata permission bit is accepted at this boundary.
+pub const LifecycleRequest = union(enum) {
+    install: struct { intent: installation.InstallIntent, budget: @import("relational_index_jobs.zig").Budget = .{} },
+    release: release.Intent,
+
+    pub fn binding(self: @This()) jobs.Binding {
+        return switch (self) {
+            .install => |value| value.intent.validation.command.binding,
+            .release => |value| value.installed.command.validation.command.binding,
+        };
+    }
+    pub fn validate(self: @This()) !void {
+        if (self.binding().authority != .raft) return error.InvalidControlReceiptPosition;
+        switch (self) {
+            .install => |value| {
+                try value.intent.validate();
+                try value.budget.validate();
+            },
+            .release => |value| try value.validate(),
+        }
+    }
+};
+
+pub const InstallationProgress = struct {
+    physical: ?@import("relational_index_owner_control.zig").AuditOutcome = null,
+    command: ?installation.InstallCommand = null,
+    installed: ?installation.Installed = null,
+
+    pub fn validateFor(self: @This(), intent: installation.InstallIntent) !void {
+        try intent.validate();
+        if (intent.validation.position != .raft) return error.InvalidControlReceiptPosition;
+        if (self.physical) |physical| {
+            const b = intent.validation.command.binding;
+            var request = try BuildRequest.initRaft(.{ .id = b.id, .plan_digest = b.plan_digest, .owner_digest = b.owner_digest, .ordinal = b.ordinal, .namespace = b.fence.namespace, .owner_group_id = b.fence.owner_group_id }, b, .{});
+            request.target_expectation = intent.validation.command.expected;
+            try physical.validateForRaft(request);
+        }
+        if (self.command) |command| {
+            try command.validate();
+            const physical = self.physical orelse return error.PrivateIndexTargetValidationRequired;
+            if (!std.meta.eql(command.intent(), intent) or !std.meta.eql(try physical.logicalCommand(), intent.validation.command)) return error.PrivateIndexAuditScopeChanged;
+        }
+        if (self.installed) |installed| {
+            _ = try installed.command.receiptAt(installed.position);
+            if (installed.position != .raft or !std.meta.eql(installed.command.intent(), intent)) return error.InvalidControlReceiptPosition;
+            if (self.command) |command| if (!std.meta.eql(command, installed.command)) return error.PrivateIndexAuditScopeChanged;
+        }
+    }
+};
+pub const ReleaseProgress = struct {
+    record: ?release.Record = null,
+    retired: bool = false,
+
+    pub fn validateFor(self: @This(), intent: release.Intent) !void {
+        try intent.validate();
+        if (intent.installed.position != .raft) return error.InvalidControlReceiptPosition;
+        if (self.record) |record| {
+            try record.validate();
+            if (record.position != .raft or !std.meta.eql(record.intent, intent)) return error.InvalidControlReceiptPosition;
+        } else if (self.retired) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+pub const LifecycleProgress = union(enum) {
+    install: InstallationProgress,
+    release: ReleaseProgress,
+    pub fn validateFor(self: @This(), request: LifecycleRequest) !void {
+        try request.validate();
+        if ((self == .install) != (request == .install)) return error.InvalidArgument;
+        switch (self) {
+            .install => |value| try value.validateFor(request.install.intent),
+            .release => |value| try value.validateFor(request.release),
+        }
+    }
+};
+pub const LifecyclePreparation = struct {
+    pub const max_request_bytes = 32 * 1024;
+    pub const max_response_bytes = release.Gc.max_wire_bytes + 64 * 1024;
+    progress: LifecycleProgress,
+    gc: ?release.Gc.Command = null,
+    pub fn validateFor(self: @This(), request: LifecycleRequest) !void {
+        try self.progress.validateFor(request);
+        if (self.gc) |gc| {
+            try gc.validate();
+            if (self.progress != .release or self.progress.release.retired or !std.meta.eql(gc.record, self.progress.release.record orelse return error.InvalidPrivateIndexNativeReceipt)) return error.InvalidPrivateIndexNativeReceipt;
+        }
+    }
+};
 pub const BuildProgress = struct {
     binding: jobs.Binding,
     state: @import("relational_index_jobs.zig").State = .building,
