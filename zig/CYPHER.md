@@ -1569,8 +1569,11 @@ Proved pure MATCH and returning CALL continuations can also run as presence
 probes in a private query scope. They stop at the first qualifying continuation,
 and a bounded memo keys possible/absent results by captured bindings and the
 current admission generation. Probes never update the parent's rows, weights,
-DISTINCT sets or completed-child cache. Unsupported child barriers stay unknown,
-and semantic errors remain observable only when ordinary DFS reaches them.
+DISTINCT sets or completed-child cache. Pure child windows, DISTINCT and reducers
+can run to completion as private weighted stages before their returned bindings
+probe the parent tail. Their scope and pagination remain inside the child;
+unsupported or unavailable dependencies stay unknown. Semantic errors remain
+observable only when ordinary DFS reaches them.
 Consumer progress resets the stall counter; a later stall can still activate pruning.
 Activation happens inside the suspended DFS, without restarting or duplicating
 previously emitted rows. OPTIONAL retains its separate MATCH success flag:
@@ -1586,6 +1589,10 @@ a finite bound before quotienting. Speculative predicate errors mark a suffix un
 rather than exposing errors early. Constant residuals, read authority and
 statement budgets remain mandatory; unproved shapes retain
 the ordinary producer. First successful rows keep lazy traversal.
+Intermediate ordered projections negotiate a weighted stage plan. DISTINCT
+collapses bindings before sorting and handing the ordered bag to downstream
+stages, without materializing the route multiplicity or removing observable
+sort keys, windows or errors.
 Unordered DISTINCT windows and intermediate WITH DISTINCT stages use the same
 demand-triggered proof when their row goal remains unfilled. Each projection
 evaluates before checking its already retained keys; probes only read these sets.

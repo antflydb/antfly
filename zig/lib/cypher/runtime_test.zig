@@ -2647,20 +2647,24 @@ test "completed streaming child memo releases retained rows on every allocation 
 
 test "continuation presence memo and intermediate DISTINCT release allocation failures" {
     const Campaign = struct {
-        fn run(backing: std.mem.Allocator, child: bool) !void {
+        fn run(backing: std.mem.Allocator, kind: u2) !void {
             var fixed: FixedAllocation = .{ .backing = backing };
             const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
             var diagnostic: c.Diagnostic = .{};
             const prefix = "MATCH REPEATABLE ELEMENTS (a:Document {id:'a'})-[:CITES*14..14]->(b:Document) ";
-            const text = if (child) prefix ++ "CALL { WITH b MATCH (b)-[:CITES]->(c) WHERE c.rank+0<0 RETURN c } RETURN c.rank LIMIT 1" else prefix ++ "WITH DISTINCT b.rank AS rank RETURN rank LIMIT 3";
+            const text = switch (kind) {
+                0 => prefix ++ "WITH DISTINCT b.rank AS rank RETURN rank LIMIT 3",
+                1 => prefix ++ "CALL { WITH b MATCH (b)-[:CITES]->(c) WHERE c.rank+0<0 RETURN c } RETURN c.rank LIMIT 1",
+                2 => prefix ++ "CALL { WITH b MATCH (b)-[:CITES]->(c) RETURN count(*) AS n } WITH n WHERE n<0 RETURN n LIMIT 1",
+                3 => prefix ++ "WITH DISTINCT b.rank AS rank ORDER BY rank RETURN rank LIMIT 3",
+            };
             var compiled = try c.compile(a, text, .{}, &diagnostic);
             defer compiled.deinit();
             var fixture: Fixture = .{};
             var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, if (child) 0 else 2), result.rows.len);
+            try std.testing.expectEqual(@as(usize, if (kind == 1 or kind == 2) 0 else 2), result.rows.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{true});
+    inline for (0..4) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(u2, kind)});
 }

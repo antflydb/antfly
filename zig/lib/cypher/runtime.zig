@@ -1594,6 +1594,23 @@ const Engine = struct {
                 matching = operation.match;
             } else {
                 const inner = operation.subquery;
+                if (!streamableCall(inner)) {
+                    // Windows and reducers belong to the child, not to each
+                    // upstream route. Evaluate its complete weighted result
+                    // in this private scope before probing the parent tail.
+                    const children = try engine.runWeightedRows(inner, .{ .rows = &.{row}, .weights = &.{Count.one} }, true, true);
+                    var possible = false;
+                    for (children.rows) |child| {
+                        var merged = row;
+                        for (child) |entry| merged = (try engine.bind(merged, entry.name, entry.value)) orelse return error.CypherVariableConflict;
+                        if (try fold.probe(engine, merged, index + 1)) {
+                            possible = true;
+                            break;
+                        }
+                    }
+                    try memo.put(engine, row, epoch, if (possible) .{ .rows = &.{&.{}}, .weights = &.{Count.one} } else .{ .rows = &.{}, .weights = &.{} });
+                    return possible;
+                }
                 var start: usize = 0;
                 while (start + 1 < inner.len and inner[start].operation == .project) : (start += 1) {
                     const rows = try engine.projectUnordered(&.{input}, inner[start].operation.project.value, false);
@@ -2597,6 +2614,16 @@ const Engine = struct {
         };
         return false;
     }
+    // Ordered WITH stages own a complete ordered bag. Negotiate the upstream
+    // producer's multiplicity instead of falling back to ordinary route rows
+    // when the row-local streaming planner declines that stage barrier.
+    fn hasOrderedIntermediate(clauses: []const ast.Clause) bool {
+        for (clauses) |clause| if (clause.operation == .project) {
+            const step = clause.operation.project;
+            if (!step.final and step.value.order.len != 0) return true;
+        };
+        return false;
+    }
     fn weightedTail(self: *Engine, clauses: []const ast.Clause) bool {
         _ = self;
         if (clauses.len == 0) return false;
@@ -3245,7 +3272,7 @@ const Engine = struct {
         self.recursion += 1;
         defer self.recursion -= 1;
         if (self.recursion > self.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
-        if (!explain and self.weightedTail(clauses) and ((clauses[0].operation != .match and hasCorrelatedBoundary(clauses)) or separatedMatches(clauses) or hasStreamableCall(clauses))) {
+        if (!explain and self.weightedTail(clauses) and ((clauses[0].operation != .match and hasCorrelatedBoundary(clauses)) or separatedMatches(clauses) or hasStreamableCall(clauses) or hasOrderedIntermediate(clauses))) {
             const weights = try self.a.alloc(Count, input.len);
             @memset(weights, Count.one);
             return self.runWeighted(clauses, .{ .rows = input, .weights = weights }, preserve_rows);
@@ -4605,14 +4632,20 @@ const Engine = struct {
         var result = source;
         for (operation.paths) |path| {
             for (path.nodes) |node| if (node.alias) |alias| {
-                if (lookup(result, alias) == null) result = try self.replace(result, alias, .{ .boolean = true });
+                if (lookup(result, alias)) |known| {
+                    if (!known.boolean) return null;
+                } else result = try self.replace(result, alias, .{ .boolean = true });
             };
             for (path.edges) |edge| if (edge.alias) |alias| {
-                if (lookup(result, alias) == null) result = try self.replace(result, alias, .{ .boolean = true });
+                if (lookup(result, alias)) |known| {
+                    if (!known.boolean) return null;
+                } else result = try self.replace(result, alias, .{ .boolean = true });
             };
-            if (path.alias) |alias| if (lookup(result, alias) == null) {
-                result = try self.replace(result, alias, .{ .boolean = true });
-            };
+            if (path.alias) |alias| {
+                if (lookup(result, alias)) |known| {
+                    if (!known.boolean) return null;
+                } else result = try self.replace(result, alias, .{ .boolean = true });
+            }
         }
         for (operation.paths) |path| {
             for (path.nodes) |node| for (node.properties) |property| if (!rules.rowLocal(property.value, PipelineScope{ .bindings = result })) return null;
@@ -4622,11 +4655,11 @@ const Engine = struct {
         return result;
     }
     fn admissionCallShape(self: *Engine, source: Row, inner: []const ast.Clause) anyerror!?Row {
-        if (!streamableCall(inner)) return null;
+        if (!pureReturningCall(inner)) return null;
         var shape = source;
         const rules = @import("expressions.zig");
         for (inner) |clause| switch (clause.operation) {
-            .project => |step| shape = (try self.admissionProjectionShape(shape, step.value)) orelse return null,
+            .project => |step| shape = (try self.admissionChildProjectionShape(shape, step.value, true)) orelse return null,
             .match => |matching| shape = (try self.admissionMatchShape(shape, matching)) orelse return null,
             .subquery => |child| shape = (try self.admissionCallShape(shape, child)) orelse return null,
             .unwind => |u| {
@@ -4640,18 +4673,22 @@ const Engine = struct {
         return merged;
     }
     fn admissionProjectionShape(self: *Engine, source: Row, projection: ast.Projection) !?Row {
+        return self.admissionChildProjectionShape(source, projection, false);
+    }
+    fn admissionChildProjectionShape(self: *Engine, source: Row, projection: ast.Projection, barriers: bool) !?Row {
         const rules = @import("expressions.zig");
-        if (projection.order.len != 0) return null;
+        if (!barriers and projection.order.len != 0) return null;
+        if (projection.skip) |skip| if (!rules.rowLocal(skip, PipelineScope{ .bindings = source })) return null;
+        if (projection.limit) |limit| if (!rules.rowLocal(limit, PipelineScope{ .bindings = source })) return null;
         var result: Row = if (projection.wildcard) source else &.{};
         for (projection.items) |item| {
-            if (aggregates(item.expression) or !rules.rowLocal(item.expression, PipelineScope{ .bindings = source })) return null;
+            if ((!barriers and aggregates(item.expression)) or !rules.rowLocal(item.expression, PipelineScope{ .bindings = source })) return null;
             result = try self.replace(result, item.alias orelse try self.expressionName(item.expression), .{ .boolean = true });
         }
-        if (projection.predicate) |predicate| {
-            var visible = source;
-            for (result) |entry| visible = try self.replace(visible, entry.name, entry.value);
-            if (!rules.rowLocal(predicate, PipelineScope{ .bindings = visible })) return null;
-        }
+        var visible = source;
+        for (result) |entry| visible = try self.replace(visible, entry.name, entry.value);
+        if (projection.predicate) |predicate| if (!rules.rowLocal(predicate, PipelineScope{ .bindings = visible })) return null;
+        for (projection.order) |order| if (!rules.rowLocal(order.expression, PipelineScope{ .bindings = visible })) return null;
         return result;
     }
     fn pipelineLocal(self: *Engine, path: ast.Path, row: Row, middle: []const ast.Clause, projection: ast.Projection, include_start: bool) !bool {
@@ -7400,4 +7437,31 @@ test "suffix depth canonicalization preserves unknown horizons and failed alloca
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "child barrier admission requires available bound pattern identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var engine: Engine = .{ .a = a, .scratch_allocator = std.testing.allocator, .regex = undefined, .backend = undefined, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    const shape: Row = &.{ .{ .name = "b", .value = .{ .boolean = true } }, .{ .name = "i", .value = .{ .boolean = false } } };
+    for ([_][]const u8{
+        "WITH * MATCH (i) RETURN count(*) AS n",
+        "WITH * MATCH (b)-[i:R]->(c) RETURN count(*) AS n",
+        "WITH * MATCH i=(b)-[:R]->(c) RETURN count(*) AS n",
+        "WITH * MATCH (b) RETURN count(*) AS n ORDER BY i",
+        "WITH * MATCH (b) RETURN count(*) AS n LIMIT i",
+    }) |source| {
+        var diagnostic: compiler.Diagnostic = .{};
+        var compiled = try compiler.compile(std.testing.allocator, source, .{}, &diagnostic);
+        defer compiled.deinit();
+        engine.source = source;
+        try std.testing.expect(try engine.admissionCallShape(shape, compiled.query.clauses) == null);
+    }
+    const source = "WITH * MATCH (b) RETURN count(*) AS n ORDER BY n LIMIT 1";
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(std.testing.allocator, source, .{}, &diagnostic);
+    defer compiled.deinit();
+    engine.source = source;
+    try std.testing.expect(try engine.admissionCallShape(shape, compiled.query.clauses) != null);
 }

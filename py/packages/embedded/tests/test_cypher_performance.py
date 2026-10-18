@@ -2899,3 +2899,47 @@ def test_unbounded_simple_cycles_use_finite_identity_bounds(graph_db):
     query = "MATCH REPEATABLE ELEMENTS (s:D {id:'cycle-root'})-[:R*1..]->(b:D) WHERE b.score+0<0 RETURN b LIMIT 1"
     with pytest.raises(af.GraphError, match="CypherPathBudgetExceeded"):
         db.cypher_json("g", {"query": query, "limits": {"path_depth": 80}})
+
+
+def test_barrier_calls_and_ordered_distinct_bound_upstream_routes(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    base = "MATCH (s:D {id:'start'})-[:R*32..32]->(b:D) "
+    limits = {"explored_edges": 1000, "intermediate_states": 20000}
+    for tail, expected in (
+        ("CALL { WITH b MATCH (b)-[:R]->(c:D) WHERE c.score+0<0 RETURN c LIMIT 1 } RETURN c.score LIMIT 1", []),
+        ("CALL { WITH b MATCH (b)-[:R]->(c:D) WHERE c.score+0<0 RETURN DISTINCT c } RETURN c.score LIMIT 1", []),
+        ("CALL { WITH b MATCH (b)-[:R]->(c:D) RETURN count(*) AS n } WITH n WHERE n<0 RETURN n LIMIT 1", []),
+        (
+            "CALL { WITH b MATCH (b)-[:R]->(c:D) RETURN c ORDER BY c.score LIMIT 1 } WITH c WHERE c.score+0<0 RETURN c.score LIMIT 1",
+            [],
+        ),
+        ("CALL { WITH b UNWIND [0,1] AS x RETURN x LIMIT 1 } WITH x WHERE x=1 RETURN x LIMIT 1", []),
+        (
+            "CALL { WITH b UNWIND [0,1] AS x RETURN x ORDER BY x DESC SKIP 1 LIMIT 1 } WITH x WHERE x=1 RETURN x LIMIT 1",
+            [],
+        ),
+        (
+            "CALL { WITH b MATCH (b)-[:R]->(c:D) WHERE false RETURN count(*) AS n } WITH n WHERE n=0 RETURN n LIMIT 1",
+            [["0"]],
+        ),
+        ("CALL { WITH b UNWIND [0,1] AS x RETURN x ORDER BY x DESC LIMIT 1 } RETURN x LIMIT 1", [["1"]]),
+        ("CALL { WITH b UNWIND [0,0] AS x RETURN DISTINCT x } WITH DISTINCT x RETURN x LIMIT 2", [["0"]]),
+        ("WITH DISTINCT b.score AS score ORDER BY score RETURN score LIMIT 2", [["32"]]),
+        ("WITH DISTINCT b.score AS score ORDER BY score RETURN score SKIP 1 LIMIT 2", []),
+        (
+            "WITH DISTINCT b.score AS score ORDER BY score DESC UNWIND [0,1] AS x RETURN score,x LIMIT 3",
+            [["32", "0"], ["32", "1"]],
+        ),
+    ):
+        result = db.cypher_json("g", {"query": base + tail, "limits": limits})
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected, tail
+
+    # Child barriers cannot suppress a scalar error reached by ordinary DFS.
+    for tail in (
+        "CALL { WITH b MATCH (b)-[:R]->(c:D) RETURN count(*)/0 AS n } RETURN n LIMIT 1",
+        "CALL { WITH b UNWIND [0,1] AS x RETURN x ORDER BY 1/0 LIMIT 1 } RETURN x LIMIT 1",
+        "WITH DISTINCT b.score AS score ORDER BY 1/0 RETURN score LIMIT 2",
+    ):
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            db.cypher_json("g", {"query": base + tail})
