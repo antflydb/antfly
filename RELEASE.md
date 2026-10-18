@@ -132,8 +132,8 @@ credentials.
    exact scope membership, and every digest.
 5. Policy-selected package registries, the Homebrew formula, and the single
    multi-architecture container image consume those verified scopes. Stable
-   and RC releases publish npm packages; CLI PyPI publication is paused. Nightly builds verify the same
-   package snapshot but publish it only to R2 and the container registries. The
+   and RC releases publish npm packages; CLI PyPI publication is paused. Nightly
+   builds verify the same package snapshot but publish it only to R2 and the container registries. The
    container publisher is callable
    only by this controller, checks out the recorded controller commit, and
    consumes the GNU runtime archives built from the source commit in step 2.
