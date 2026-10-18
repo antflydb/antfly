@@ -2656,6 +2656,7 @@ def test_late_qualified_windows_and_repeated_apply_keep_physical_work_bounded(gr
     create = f"MATCH (bad:D {{id:'{bad}'}}),(base:D {{id:'start'}}),(good:D {{id:'{good}'}}) CREATE (bad)-[:R]->(base),"
     create += ",".join(f"(g{i}:D {{score:{999 if i == 32 else -10}}})" for i in range(33))
     create += ",(good)-[:R]->(g0)," + ",".join(f"(g{i})-[:R]->(g{i + 1})" for i in range(32))
+    create += "," + ",".join(f"(g{i})-[:R]->(g{i + 1})" for i in range(32))
     db.cypher_json("g", {"query": create})
     for path in ("[:R*34..34]", "[:R*17..17]->()-[:R*17..17]", "[:R*34..]"):
         query = f"MATCH (s:D {{id:'branch-root'}})-{path}->(b:D) WHERE b.score+0=999 RETURN b.score LIMIT 1"
@@ -2664,6 +2665,26 @@ def test_late_qualified_windows_and_repeated_apply_keep_physical_work_bounded(gr
     query = "MATCH (s:D {id:'branch-root'})-[:R*34..34]->(b:D) WHERE CASE WHEN b.score=999 THEN 1/0=0 ELSE false END RETURN b.score LIMIT 1"
     with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
         db.cypher_json("g", {"query": query, "limits": {"explored_edges": 1000, "intermediate_states": 20000}})
+
+    # The late branch also has exponentially many routes to the new key.
+    # Reconsider positive admissions after that key is retained.
+    base = "MATCH (s:D {id:'branch-root'})-[:R*34..34]->(b:D) "
+    result = db.cypher_json(
+        "g",
+        {
+            "query": base + "RETURN DISTINCT b.score LIMIT 3",
+            "limits": {"explored_edges": 1000, "intermediate_states": 20000},
+        },
+    )
+    assert [row[0]["value"] for row in result["rows"]] == ["32", "999"]
+    with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+        db.cypher_json(
+            "g",
+            {
+                "query": base + "RETURN DISTINCT CASE WHEN b.score=999 THEN 1/0 ELSE b.score END LIMIT 3",
+                "limits": {"explored_edges": 1000, "intermediate_states": 20000},
+            },
+        )
 
 
 def test_row_local_continuations_and_certification_share_captured_work(graph_db):
@@ -2726,3 +2747,78 @@ def test_dense_dag_suffixes_collapse_nonbinding_hop_bounds(graph_db):
             "g", {"query": base + tail, "limits": {"explored_edges": 10000, "intermediate_states": 50000}}
         )
         assert result["rows"] == []
+
+
+def test_stalled_windows_distinct_and_optional_prune_without_replaying_rows(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    prefix = "MATCH (s:D {id:'start'}) "
+    route = "MATCH (s)-[:R*32..32]->(b:D) "
+    for query, expected in (
+        (
+            prefix + "MATCH (s)-[:R*0..32]->(b:D) WHERE b.score=0 RETURN b.score LIMIT 2",
+            [[{"type": "integer", "value": "0"}]],
+        ),
+        (prefix + route + "RETURN DISTINCT b.score LIMIT 2", [[{"type": "integer", "value": "32"}]]),
+        (prefix + route + "RETURN DISTINCT b.score SKIP 1 LIMIT 2", []),
+        (
+            prefix + "OPTIONAL MATCH (s)-[:R*32..32]->(b:D) WHERE b.score+0<0 RETURN b.score LIMIT 1",
+            [[{"type": "null", "value": None}]],
+        ),
+        (
+            prefix + "OPTIONAL MATCH (s)-[:R*32..32]->(b:D) WITH b WHERE b IS NULL RETURN b LIMIT 1",
+            [],
+        ),
+        (
+            prefix + "CALL { WITH s " + route + "RETURN b } RETURN DISTINCT b.score LIMIT 2",
+            [[{"type": "integer", "value": "32"}]],
+        ),
+        (
+            prefix + "MATCH (s)-[:R*0..32]->(b:D) WHERE b.score=0 RETURN b.score SKIP 1 LIMIT 1",
+            [],
+        ),
+    ):
+        result = db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 20000, "explored_edges": 1000}})
+        assert result["rows"] == expected, query
+    # Seen-key admission changes as DISTINCT groups grow; positive suffix
+    # entries must be reconsidered while negative entries remain reusable.
+    query = prefix + "MATCH (s)-[:R*0..32]->(b:D) RETURN DISTINCT b.score LIMIT 40"
+    result = db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 40000, "explored_edges": 1000}})
+    assert [row[0]["value"] for row in result["rows"]] == [str(i) for i in range(33)]
+
+
+def test_completed_streamed_children_memoize_owned_intrinsic_rows(graph_db):
+    db = graph_db
+    populate_layered_graph(db)
+    prefix = "UNWIND range(1,100) AS i MATCH (s:D {id:'start'}) "
+    child = "CALL { WITH s MATCH (s)-[:R]->(b:D) RETURN b.score AS score } "
+    result = db.cypher_json(
+        "g", {"query": prefix + child + "RETURN i,score LIMIT 200", "limits": {"explored_edges": 2}}
+    )
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+        [str(i), "1"] for i in range(1, 101) for _ in range(2)
+    ]
+    assert result["stats"]["explored_edges"] == 2
+    weighted = "UNWIND [1,1,2] AS i MATCH (s:D {id:'start'}) " + child + "RETURN i,score LIMIT 6"
+    result = db.cypher_json("g", {"query": weighted, "limits": {"explored_edges": 2}})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [["1", "1"]] * 4 + [["2", "1"]] * 2
+    # Parent filters and weights are outside the child's memoized bag.
+    query = prefix + child + "WITH i,score WHERE i=100 RETURN i,score LIMIT 2"
+    result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 2}})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [["100", "1"], ["100", "1"]]
+    query = prefix + "CALL { WITH s " + child + "RETURN score } RETURN i,score LIMIT 200"
+    result = db.cypher_json("g", {"query": query, "limits": {"explored_edges": 2}})
+    assert len(result["rows"]) == 200
+
+    # A large intrinsic row exceeds the tee quota but fits the statement. Cache
+    # admission declines, while both parents still receive complete child bags.
+    query = (
+        "UNWIND [1,2] AS i MATCH (s:D {id:'start'}) "
+        "CALL { WITH s MATCH (s)-[:R]->(b:D) RETURN range(1,10000) AS payload } "
+        "RETURN i,size(payload) LIMIT 4"
+    )
+    result = db.cypher_json("g", {"query": query, "limits": {"memory_bytes": 4 << 20, "explored_edges": 4}})
+    assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+        [str(i), "10000"] for i in (1, 2) for _ in range(2)
+    ]
+    assert result["stats"]["explored_edges"] == 4

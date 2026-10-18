@@ -2626,3 +2626,21 @@ test "integer sign certification is per aggregate group and keeps mixed-sign ove
     var fixture: Fixture = .{};
     try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
 }
+
+test "completed streaming child memo releases retained rows on every allocation failure" {
+    try check("UNWIND [1,1,2] AS i MATCH (a:Document {id:'a'}) CALL { WITH a MATCH (a)-[:CITES]->(b) RETURN b.rank AS rank } RETURN i,rank LIMIT 10", "[[1,2],[1,2],[1,2],[1,2],[2,2],[2,2]]");
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "UNWIND [1,2] AS i MATCH (a:Document {id:'a'}) CALL { WITH a MATCH (a)-[:CITES]->(b) RETURN b.rank AS rank } RETURN i,rank LIMIT 10", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = std.math.maxInt(usize) });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 4), result.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

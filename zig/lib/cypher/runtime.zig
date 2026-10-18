@@ -1289,10 +1289,12 @@ const Engine = struct {
         applies: []ApplyMemo = &.{},
         distinct_goal: ?usize = null,
         had_match: bool = false,
+        optional: bool = false,
+        probe_tail: bool = true,
         weight: Count = Count.one,
         active_calls: ?[]const bool = null,
         record_rows: bool = true,
-        continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null } = null,
+        continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             fold.had_match = true;
@@ -1356,6 +1358,8 @@ const Engine = struct {
                         const cached = try apply.memo.find(engine, key, null);
                         if (cached == null and streamableCall(inner)) {
                             var child_returned = false;
+                            var capture: StreamCapture = .{ .budget = .{ .backing = engine.scratch_allocator, .limit = @min(4 << 20, engine.limits.memory_bytes / 32) }, .disabled = apply.memo.disabled };
+                            defer capture.deinit();
                             var input = row;
                             var start: usize = 0;
                             while (start + 1 < inner.len and inner[start].operation == .project) : (start += 1) {
@@ -1368,8 +1372,12 @@ const Engine = struct {
                             }
                             if (start + 1 < inner.len and inner[start].operation == .match) {
                                 const last = inner[inner.len - 1].operation.project.value;
-                                if (try engine.streamMatchProjectionInto(&.{input}, &.{fold.weight}, inner[start].operation.match, last, inner[start + 1 .. inner.len - 1], inner[start].span, inner[inner.len - 1].span, .{ .parent = fold, .index = index + 1, .apply = row, .returned = &child_returned })) |_| {
-                                    if (!child_returned) try apply.memo.put(engine, key, null, .{ .rows = &.{}, .weights = &.{} });
+                                if (try engine.streamMatchProjectionInto(&.{input}, &.{Count.one}, inner[start].operation.match, last, inner[start + 1 .. inner.len - 1], inner[start].span, inner[inner.len - 1].span, .{ .parent = fold, .index = index + 1, .apply = row, .returned = &child_returned, .capture = &capture })) |_| {
+                                    if (!child_returned) {
+                                        try apply.memo.put(engine, key, null, .{ .rows = &.{}, .weights = &.{} });
+                                    } else if (!capture.disabled) {
+                                        try apply.memo.put(engine, key, null, .{ .rows = capture.rows.items, .weights = capture.weights.items });
+                                    }
                                     return;
                                 }
                             }
@@ -1407,13 +1415,14 @@ const Engine = struct {
             }
             if (fold.continuation) |next| {
                 const weight = next.parent.weight;
-                next.parent.weight = fold.weight;
+                next.parent.weight = if (next.apply != null) try weight.multiply(engine.a, fold.weight) else fold.weight;
                 defer next.parent.weight = weight;
-                if (next.parent.record_rows) next.parent.stage_counts[next.index] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
+                if (next.parent.record_rows) next.parent.stage_counts[next.index] +|= @as(usize, @intCast(next.parent.weight.cap(std.math.maxInt(usize))));
                 var output = row;
                 if (next.apply) |parent| {
                     const projected = try engine.projectUnordered(&.{row}, fold.projection, false);
                     if (projected.len == 0) return;
+                    if (next.capture) |capture| try capture.add(engine, projected[0], fold.weight);
                     output = parent;
                     for (projected[0]) |entry| output = (try engine.bind(output, entry.name, entry.value)) orelse return error.CypherVariableConflict;
                 }
@@ -1455,12 +1464,30 @@ const Engine = struct {
         }
         fn unorderedGoal(fold: *@This(), engine: *Engine) ?usize {
             if (fold.continuation) |next| return next.parent.unorderedGoal(engine);
-            if (fold.top.* == null or fold.projection.order.len != 0) return null;
+            if ((fold.top.* == null and fold.distinct_goal == null) or fold.projection.order.len != 0) return null;
             return engine.windowGoal(fold.projection);
         }
-        fn observed(fold: *@This()) bool {
-            if (fold.continuation) |next| return next.parent.observed();
-            return if (fold.top.*) |top| top.total != 0 else true;
+        fn progress(fold: *@This()) usize {
+            if (fold.continuation) |next| return next.parent.progress();
+            return if (fold.top.*) |top| top.total else fold.groups.items.len;
+        }
+        fn generation(fold: *@This()) usize {
+            const matched: usize = @intFromBool(fold.optional and fold.had_match);
+            if (fold.continuation) |next| return matched + next.parent.generation();
+            return matched + if (fold.distinct_goal != null) fold.groups.items.len else @as(usize, 0);
+        }
+        fn seen(fold: *@This(), engine: *Engine, row: Row) !bool {
+            if (fold.distinct_goal == null) return false;
+            var key: std.ArrayList(v.Value) = .empty;
+            for (fold.projection.items) |item| try key.append(engine.a, try engine.eval(item.expression, row, null));
+            const hash = (try engine.values.info(.{ .list = key.items })).hash;
+            var candidate = fold.group_index.head(hash);
+            while (candidate) |position| {
+                const link = fold.group_index.links.items[position];
+                if (try engine.values.eql(.{ .list = fold.groups.items[link.index].key }, .{ .list = key.items })) return true;
+                candidate = link.next;
+            }
+            return false;
         }
         fn probeShape(fold: *@This(), engine: *Engine, initial: Row, index: usize) anyerror!?Row {
             var shape = initial;
@@ -1512,6 +1539,9 @@ const Engine = struct {
                     // Conservative cache admission: even a speculative child
                     // row prevents caching an empty bag after parent filtering.
                     if (next.returned) |returned| returned.* = true;
+                    // A speculative row may be pruned by the parent. The tee
+                    // then cannot certify a complete intrinsic child bag.
+                    if (next.capture) |capture| capture.disabled = true;
                     for (rows[0]) |entry| output = (try engine.bind(output, entry.name, entry.value)) orelse return error.CypherVariableConflict;
                 }
                 return next.parent.probe(engine, output, next.index);
@@ -1519,7 +1549,7 @@ const Engine = struct {
             var projection = fold.projection;
             projection.skip = null;
             projection.limit = null;
-            return (try engine.projectUnordered(&.{row}, projection, false)).len != 0;
+            return (try engine.projectUnordered(&.{row}, projection, false)).len != 0 and !try fold.seen(engine, row);
         }
         fn demand(fold: *@This()) usize {
             if (fold.top.*) |top| if (fold.projection.order.len == 0) return @min(128, top.capacity - top.total);
@@ -2063,7 +2093,8 @@ const Engine = struct {
             break :blk true;
         };
         const count_endpoints = endpoint_local and (grouped or weighted_top);
-        const adaptive_candidate = path.edges.len != 0 and !(path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) and !count_endpoints and !grouped and self.read_only and small_window and operation.paths.len == 1 and path.selector == .all and !operation.optional and weightedExpression(operation);
+        const distinct_window = projection.distinct and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null;
+        const adaptive_candidate = path.edges.len != 0 and !(path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) and !count_endpoints and (!grouped or distinct_window) and self.read_only and small_window and operation.paths.len == 1 and path.selector == .all and weightedExpression(operation);
         if (self.component_proof and !count_endpoints and !count_shortest) return null;
         var shape: std.ArrayList(v.Entry) = .empty;
         if (input.len != 0) try shape.appendSlice(self.a, input[0]);
@@ -2101,7 +2132,7 @@ const Engine = struct {
         const applies = try retained.alloc(ApplyMemo, middle.len);
         for (applies, middle) |*apply, clause| apply.* = .{ .memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = clause.operation != .subquery or !pureReturningCall(clause.operation.subquery) } };
         defer for (applies) |*apply| apply.memo.deinit();
-        var fold: StreamFold = .{ .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
             if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) {
@@ -2110,8 +2141,12 @@ const Engine = struct {
             };
             const shape_mask = try self.endpointShape(path, row);
             if (try fold.probeShape(self, shape_mask, 0) == null) {
-                adaptive_probe = false;
-                break;
+                if (operation.optional) {
+                    fold.probe_tail = false;
+                } else {
+                    adaptive_probe = false;
+                    break;
+                }
             }
         };
         if (projection.distinct and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) {
@@ -2723,6 +2758,31 @@ const Engine = struct {
         copy[copy.len - 1].operation.project.value.limit = expression;
         return copy;
     }
+    const StreamCapture = struct {
+        budget: Budget,
+        arena: ?std.heap.ArenaAllocator = null,
+        rows: std.ArrayList(Row) = .empty,
+        weights: std.ArrayList(Count) = .empty,
+        disabled: bool = false,
+        fn deinit(self: *@This()) void {
+            if (self.arena) |*arena| arena.deinit();
+        }
+        fn add(self: *@This(), engine: *Engine, row: Row, weight: Count) !void {
+            if (self.disabled) return;
+            self.capture(engine, row, weight) catch |err| {
+                if (err != error.OutOfMemory or !self.budget.exhausted) return err;
+                self.disabled = true;
+            };
+        }
+        fn capture(self: *@This(), engine: *Engine, row: Row, weight: Count) !void {
+            try engine.state();
+            if (self.arena == null) self.arena = .init(self.budget.allocator());
+            const a = self.arena.?.allocator();
+            const owned = (try (v.Value{ .map = row }).clone(a)).map;
+            try self.rows.append(a, owned);
+            try self.weights.append(a, try weight.clone(a));
+        }
+    };
     const ApplyMemo = struct {
         memo: CallMemo,
         captures: ?Names = null,
@@ -4703,56 +4763,72 @@ const Engine = struct {
         try self.breadthPath(input, path, mode, node, output);
     }
     fn routePath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, start: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!void {
-        const probe = self.route_probe;
-        if (probe) |value| value.rejected.* = 0;
-        self.pathStep(input, path, mode, 0, &.{start}, &.{}, output) catch |err| {
-            if (err != error.CypherProbeEndpoints) return err;
-            self.route_probe = null;
-            defer self.route_probe = probe;
-            if (path.execution_prefix or self.interior != null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
-            // Constant residuals and proved finite bounds admit this quotient.
-            // Path histories and output order stay in the original DFS. The
-            // quotient deliberately ignores uniqueness, so it is a superset
-            // even for cyclic trails and can only prune impossible suffixes.
-            var maximum: usize = 0;
-            var needs_bound = false;
-            for (path.edges) |edge| {
-                if (edge.max_hops) |upper| maximum = std.math.add(usize, maximum, upper) catch return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output) else needs_bound = true;
-                for (edge.properties) |entry| if (self.constant(entry.value, input.row) == null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
-            }
-            if (maximum > self.limits.path_depth) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
-            for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, input.row) == null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
-            var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
-            defer arena.deinit();
-            const a = arena.allocator();
-            const domains = try a.alloc(ast.Edge, path.edges.len);
-            for (domains, path.edges) |*domain, edge| domain.* = .{ .span = edge.span, .types = edge.types, .direction = edge.direction };
-            var pruner: RoutePruner = .{ .fold = probe.?.fold, .a = a, .path = path, .predicate = self.stream_predicate, .row = input.row, .graph = .{ .input = .{ .row = input.row }, .path = path, .domains = domains, .qualified = true } };
-            try pruner.graph.positions.put(a, start.identity, 0);
-            try pruner.graph.nodes.append(a, .{ .node = start, .depth = 0 });
-            if (needs_bound and !try pruner.bound(self)) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
-            const previous_pruner = self.route_pruner;
-            const previous_graph = self.lower_graph;
-            self.route_pruner = &pruner;
-            self.lower_graph = &pruner.graph;
-            defer self.route_pruner = previous_pruner;
-            defer self.lower_graph = previous_graph;
-            return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
-        };
+        const probe = self.route_probe orelse return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+        if (path.execution_prefix or self.interior != null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+        var maximum: usize = 0;
+        var needs_bound = false;
+        for (path.edges) |edge| {
+            if (edge.max_hops) |upper| maximum = std.math.add(usize, maximum, upper) catch return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output) else needs_bound = true;
+            for (edge.properties) |entry| if (self.constant(entry.value, input.row) == null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+        }
+        if (maximum > self.limits.path_depth) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+        for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, input.row) == null) return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+        var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer arena.deinit();
+        var pruner: RoutePruner = .{ .fold = probe.fold, .a = arena.allocator(), .path = path, .predicate = self.stream_predicate, .row = input.row, .graph = .{ .input = .{ .row = input.row }, .path = path, .qualified = true }, .start = start, .needs_bound = needs_bound };
+        const previous_pruner = self.route_pruner;
+        const previous_graph = self.lower_graph;
+        self.route_pruner = &pruner;
+        defer self.route_pruner = previous_pruner;
+        defer self.lower_graph = previous_graph;
+        probe.rejected.* = 0;
+        // Activate at a suspended DFS frame, without restarting prefixes that
+        // have already produced rows or affected DISTINCT/OPTIONAL state.
+        return self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
     }
     const RoutePruner = struct {
         const Key = struct { node: usize, edge: usize, hop: u32 };
         const Frame = struct { key: Key, children: []const Key, next: usize = 0 };
+        const Admission = struct { possible: bool, generation: usize };
         a: A,
         path: ast.Path,
         row: Row,
         predicate: ?*const ast.Expr,
         graph: LowerGraph,
         fold: *StreamFold,
-        possible: std.AutoHashMapUnmanaged(Key, bool) = .empty,
+        possible: std.AutoHashMapUnmanaged(Key, Admission) = .empty,
+        start: ?*const v.Node = null,
+        needs_bound: bool = false,
+        active: bool = false,
+        attempted: bool = false,
         suffix_depth: ?[]const ?usize = null,
         depth_attempted: bool = false,
         frames_built: usize = 0,
+        fn activate(self: *@This(), engine: *Engine) anyerror!void {
+            if (self.attempted) return;
+            self.attempted = true;
+            const scope = EvalScope.enter(engine, self.a);
+            defer scope.leave(engine);
+            const domains = try self.a.alloc(ast.Edge, self.path.edges.len);
+            for (domains, self.path.edges) |*domain, edge| domain.* = .{ .span = edge.span, .types = edge.types, .direction = edge.direction };
+            self.graph.domains = domains;
+            const start = self.start.?;
+            try self.graph.positions.put(self.a, start.identity, 0);
+            try self.graph.nodes.append(self.a, .{ .node = start, .depth = 0 });
+            if (self.needs_bound and !try self.bound(engine)) return;
+            self.active = true;
+            engine.lower_graph = &self.graph;
+        }
+        fn get(self: *@This(), key: Key) ?bool {
+            const value = self.possible.get(self.memoKey(key)) orelse return null;
+            // Seen DISTINCT keys grow monotonically. Negative admissions stay
+            // valid; positive ones must be reconsidered after a new group.
+            if (value.possible and value.generation != self.fold.generation()) return null;
+            return value.possible;
+        }
+        fn put(self: *@This(), key: Key, possible: bool) !void {
+            try self.possible.put(self.a, self.memoKey(key), .{ .possible = possible, .generation = self.fold.generation() });
+        }
         fn memoKey(self: *@This(), key: Key) Key {
             const depths = self.suffix_depth orelse return key;
             if (key.node >= depths.len) return key;
@@ -4841,11 +4917,17 @@ const Engine = struct {
             return true;
         }
         fn admits(self: *@This(), engine: *Engine, identity: v.Identity, edge: usize, hop: u32) anyerror!bool {
-            const node = self.graph.positions.get(identity) orelse return true;
-            const key: Key = .{ .node = node, .edge = edge, .hop = hop };
-            if (self.possible.get(self.memoKey(key))) |result| return result;
             const scope = EvalScope.enter(engine, self.a);
             defer scope.leave(engine);
+            const node = self.graph.positions.get(identity) orelse blk: {
+                const captured = (try engine.getNode(identity)) orelse return true;
+                const position = self.graph.nodes.items.len;
+                try self.graph.positions.put(self.a, captured.identity, position);
+                try self.graph.nodes.append(self.a, .{ .node = captured, .depth = 0 });
+                break :blk position;
+            };
+            const key: Key = .{ .node = node, .edge = edge, .hop = hop };
+            if (self.get(key)) |result| return result;
             const previous_graph = engine.lower_graph;
             engine.lower_graph = null;
             defer engine.lower_graph = previous_graph;
@@ -4857,31 +4939,33 @@ const Engine = struct {
             while (frames.items.len != 0) {
                 const last = frames.items.len - 1;
                 const current = frames.items[last].key;
-                if (self.possible.contains(self.memoKey(current))) {
+                if (self.get(current) != null) {
                     _ = frames.pop();
                     continue;
                 }
                 if (frames.items[last].next == frames.items[last].children.len) {
-                    try self.possible.put(self.a, self.memoKey(current), false);
+                    try self.put(current, false);
                     _ = frames.pop();
                     continue;
                 }
                 const child = frames.items[last].children[frames.items[last].next];
-                if (self.possible.get(self.memoKey(child))) |result| {
-                    if (result) try self.possible.put(self.a, self.memoKey(current), true) else frames.items[last].next += 1;
+                if (self.get(child)) |result| {
+                    if (result) try self.put(current, true) else frames.items[last].next += 1;
                 } else try frames.append(self.a, try self.frame(engine, child));
             }
-            return self.possible.get(self.memoKey(key)).?;
+            return self.get(key).?;
         }
         fn accepts(self: *@This(), engine: *Engine, row: Row) anyerror!bool {
             if (self.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) return false;
-            return self.fold.probe(engine, row, 0);
+            // OPTIONAL's match-success flag precedes downstream qualification.
+            // Only intrinsic MATCH absence licenses NULL extension.
+            return (self.fold.optional and (!self.fold.had_match or !self.fold.probe_tail)) or try self.fold.probe(engine, row, 0);
         }
         fn frame(self: *@This(), engine: *Engine, key: Key) anyerror!Frame {
             try engine.state();
             self.frames_built += 1;
             if (!self.depth_attempted and self.frames_built >= 128) try self.prepareDepth(engine);
-            if (self.possible.contains(self.memoKey(key))) return .{ .key = key, .children = &.{} };
+            if (self.get(key) != null) return .{ .key = key, .children = &.{} };
             const edge = self.path.edges[key.edge];
             const pattern = self.path.nodes[key.edge + 1];
             const node = self.graph.nodes.items[key.node].node;
@@ -4896,7 +4980,7 @@ const Engine = struct {
                         else => true,
                     };
                     if (accepted) {
-                        try self.possible.put(self.a, self.memoKey(key), true);
+                        try self.put(key, true);
                         return .{ .key = key, .children = &.{} };
                     }
                 } else try children.append(self.a, .{ .node = key.node, .edge = key.edge + 1, .hop = 0 });
@@ -5511,9 +5595,16 @@ const Engine = struct {
                 return;
             }
             if (self.stream_fold) |fold| {
-                if (self.route_probe) |probe| if (probe.fold == fold and !fold.observed()) {
-                    probe.rejected.* += 1;
-                    if (probe.rejected.* == 64) return error.CypherProbeEndpoints;
+                const progress = fold.progress();
+                const probe = self.route_probe;
+                defer if (probe) |value| {
+                    if (value.fold == fold and fold.progress() != progress) value.rejected.* = 0;
+                };
+                if (probe) |value| if (value.fold == fold) {
+                    value.rejected.* +|= 1;
+                    if (value.rejected.* >= 64) if (self.route_pruner) |pruner| {
+                        if (pruner.fold == fold) try pruner.activate(self);
+                    };
                 };
                 if (!try self.constraintsMatch(input.constraints, row, false)) return;
                 if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) return;
@@ -5535,7 +5626,7 @@ const Engine = struct {
     fn expandPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, edge_index: usize, nodes: []const *const v.Node, relationships: []const *const v.Relationship, hops: u32, edge_values: []const v.Value, output: *std.ArrayList(MatchState)) anyerror!void {
         const edge = path.edges[edge_index];
         const current = nodes[nodes.len - 1];
-        if (self.route_pruner) |pruner| if (pruner.path.nodes.ptr == path.nodes.ptr and !try pruner.admits(self, current.identity, edge_index, hops)) return;
+        if (self.route_pruner) |pruner| if (pruner.active and pruner.path.nodes.ptr == path.nodes.ptr and !try pruner.admits(self, current.identity, edge_index, hops)) return;
         if (hops >= edge.min_hops and try self.nodeMatches(current, path.nodes[edge_index + 1])) {
             if (try self.bind(input.row, path.nodes[edge_index + 1].alias, .{ .node = current })) |node_row| {
                 const edge_value = try self.routeEdgeValue(path, edge, edge_values, relationships);

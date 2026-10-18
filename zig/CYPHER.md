@@ -1560,10 +1560,14 @@ filtered window builds a lazy suffix reachability memo over node, pattern
 segment and hop states. Admissibility follows pure row-local WITH projections,
 filters and UNWIND stages, including renamed columns and returning CALL scope
 merges. Child producers inherit finite demand from the enclosing continuation;
-they do not need an artificial LIMIT attached to their own RETURN. Only actual
-consumer progress disables a restart; OPTIONAL retains its separate MATCH
-success flag. Speculative projection/filter errors leave a suffix unknown.
-It resumes the original DFS while pruning impossible suffixes, including when
+they do not need an artificial LIMIT attached to their own RETURN. Consumer
+progress resets the stall counter; a later stall can still activate pruning.
+Activation happens inside the suspended DFS, without restarting or duplicating
+previously emitted rows. OPTIONAL retains its separate MATCH success flag:
+before the first intrinsic match, only the MATCH predicate can prove absence;
+after a match, a proved local continuation can reject remaining suffixes.
+Speculative projection/filter errors leave a suffix unknown.
+The original DFS continues while pruning impossible suffixes, including when
 one late branch qualifies after an exponentially large rejected branch. The
 reachability graph ignores trail/simple uniqueness as a conservative superset;
 DFS still enforces exact histories and output order. An explicit postorder
@@ -1573,6 +1577,11 @@ the ordinary producer. Speculative predicate errors mark a suffix unknown
 rather than exposing errors early. Constant residuals, read authority and
 statement budgets remain mandatory; unproved shapes retain
 the ordinary producer. First successful rows keep lazy traversal.
+Unordered DISTINCT windows use the same demand-triggered proof when their row
+goal remains unfilled. Already retained keys are inadmissible; negative suffix
+entries remain reusable as keys grow, while positive entries carry a generation
+and are reconsidered after DISTINCT or OPTIONAL match-state changes. The proof
+does not replace DFS ordering or evaluate a projection error before DFS reaches it.
 Repeated product-state work can trigger a bounded DAG depth proof. When a
 single variable segment's lower bound is satisfied and its remaining upper
 bound covers the proved suffix depth, hop states share one reachability entry
@@ -1589,9 +1598,13 @@ bags across parent continuations. Keys preserve binding representations and
 implicit prebound MATCH aliases. Cache admission can decline
 without failing the query; writes, procedures, volatile functions and unit CALL
 remain barriers. Cached children own their payloads and preserve parent weights.
-A completed empty streaming child can be memoized without retaining its routes.
-Speculative child rows conservatively prevent empty-child admission when a
-parent filter rejects them, so unrelated parent bindings cannot poison the memo.
+A bounded tee owns a streaming child's intrinsic projected rows and relative
+weights before merging parent bindings. Only a completed child can publish
+its bag; an early outer LIMIT, speculative parent pruning, or tee quota decline
+prevents admission. Parent weights and filters remain outside the cached bag.
+A completed empty child needs no retained routes. Speculative child rows
+conservatively prevent empty-child admission when a parent filter rejects them,
+so unrelated parent bindings cannot poison the memo.
 Pattern dependency analysis follows query WITH scopes and lexical shadowing;
 only captured outer bindings stay live. Unobserved path aliases therefore do
 not force route production merely because a later expression contains a pattern.
