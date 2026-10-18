@@ -1271,6 +1271,8 @@ const GuardedCatalog = struct {
         }
         fn cursor(self: *@This(), release: *const fn (*anyopaque) void) catalog.Cursor {
             return .{
+                .column_statistics = self.inner.column_statistics,
+                .estimated_filtered_rows = self.inner.estimated_filtered_rows,
                 .estimated_rows = self.inner.estimated_rows,
                 .estimated_bytes = self.inner.estimated_bytes,
                 .ptr = self,
@@ -1552,7 +1554,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             return cursor(ptr);
         }
         fn cursor(ptr: *anyopaque) catalog.Cursor {
-            return .{ .estimated_rows = 99, .estimated_bytes = 1024, .ptr = ptr, .next = next, .next_columns = nextColumns, .count_rows = countRows, .set_dynamic_filter = setFilter, .split_scan = split, .split_ordered = split, .close = close };
+            return .{ .estimated_filtered_rows = 7, .estimated_rows = 99, .estimated_bytes = 1024, .ptr = ptr, .next = next, .next_columns = nextColumns, .count_rows = countRows, .set_dynamic_filter = setFilter, .split_scan = split, .split_ordered = split, .close = close };
         }
         fn next(ptr: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1640,6 +1642,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     const page = try cursor.next(cursor.ptr, alloc, 1);
     page.deinit();
     try std.testing.expectEqual(@as(usize, 1), native_cursor.pages);
+    try std.testing.expectEqual(@as(?u64, 7), cursor.estimated_filtered_rows);
     try std.testing.expectEqual(@as(?u64, 99), cursor.estimated_rows);
     try std.testing.expectEqual(@as(?u64, 1024), cursor.estimated_bytes);
     _ = try cursor.next_columns.?(cursor.ptr, alloc, 1);

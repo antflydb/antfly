@@ -263,6 +263,7 @@ const ConstantPool = struct {
 };
 
 pub const Program = struct {
+    decimal_plan: ?@import("decimal_program.zig").Plan = null,
     arena: *std.heap.ArenaAllocator,
     instructions: []const Instruction,
     root: u32,
@@ -706,6 +707,7 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     errdefer program.releaseConstants();
     try program.prepareConstantArrays(binder.alloc, limits);
     try program.prepareConcatNodes(binder.alloc);
+    if (required_columns.len != 0) program.decimal_plan = try @import("decimal_program.zig").compile(binder.alloc, instructions, root);
     if (limits.invocation) |invocation| try invocation.register(&program);
     program.arena = arena;
     return program;

@@ -74,6 +74,8 @@ pub const MaterializedBatch = struct {
         for (self.batch.columns) |column| {
             if (column.nulls.bytes.len != 0) alloc.free(column.nulls.bytes);
             switch (column.values) {
+                .decimal128 => |values| alloc.free(values.values),
+                .encoded => {},
                 inline .dictionary_i64, .dictionary_f64 => |values| values.deinit(alloc),
                 .bytes => |values| alloc.free(values),
                 .dictionary_bytes => |values| {
@@ -246,6 +248,8 @@ fn freeColumnValues(alloc: Allocator, column: rowsource.ColumnVector) void {
 
 fn freeColumnValuesOnly(alloc: Allocator, column_values: rowsource.ColumnValues) void {
     switch (column_values) {
+        .decimal128 => |values| alloc.free(values.values),
+        .encoded => {},
         inline .dictionary_i64, .dictionary_f64 => |values| values.deinit(alloc),
         .bytes => |slice| alloc.free(slice),
         .dictionary_bytes => |values| {
@@ -307,7 +311,7 @@ test "serverless fragment source produces one typed row batch" {
     const batch = (try row_source.next(alloc)).?;
     try std.testing.expectEqual(rowsource.SourceKind.serverless_fragment, row_source.kind);
     try std.testing.expectEqual(@as(usize, 2), batch.rowCount());
-    try std.testing.expectEqual(@as(u64, 8), batch.row_refs[1].serverless.row_ordinal);
+    try std.testing.expectEqual(@as(u64, 8), batch.rowRef(1).serverless.row_ordinal);
     try std.testing.expectEqual(@as(i64, 20), batch.columns[0].values.i64[1]);
     try std.testing.expect(batch.columns[1].nulls.isNull(1));
     try std.testing.expectEqual(@as(f32, 0.5), batch.columns[2].values.vector_f32[1][0]);
