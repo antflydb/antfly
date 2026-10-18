@@ -145,6 +145,46 @@ pub fn updateFingerprints(a: A, store: tree.Store, roots: Roots, files: []const 
     try validate(result);
     return result;
 }
+pub const Edit = struct { slot: u32, file: []const u8, fingerprint: [32]u8 };
+/// Path-copy only reached slots. Shared public navigation proves the complete
+/// current source cut; tombstones keep slot coordinates stable across refreshes.
+pub fn applyEdits(a: A, store: tree.Store, roots: Roots, edits: []const Edit, shared: Public) !Roots {
+    var result = roots;
+    var slots: Batch = .{ .arena = .init(a) };
+    defer slots.arena.deinit();
+    var names: Batch = .{ .arena = .init(a) };
+    defer names.arena.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var previous: ?u32 = null;
+    for (edits) |edit| {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        if (edit.file.len == 0 or edit.slot > result.count or (previous != null and edit.slot <= previous.?)) return error.InvalidNativeLakeRowIndex;
+        previous = edit.slot;
+        const old: ?Record = if (edit.slot < roots.count) try file(sa, store, roots, edit.slot) else null;
+        if (edit.slot == result.count) result.count = std.math.add(u32, result.count, 1) catch return error.LakeSidecarBuildLimitExceeded;
+        const same_name = if (old) |record| std.mem.eql(u8, record.file, edit.file) else false;
+        if (old == null or !same_name or !std.mem.eql(u8, &old.?.fingerprint, &edit.fingerprint))
+            try slots.add(&slotKey(edit.slot), try std.json.Stringify.valueAlloc(sa, Record{ .file = edit.file, .fingerprint = edit.fingerprint }, .{}));
+        if (!same_name) {
+            if (old) |record| try names.add(&nameKey(record.file), null);
+            try names.add(&nameKey(edit.file), try std.json.Stringify.valueAlloc(sa, .{ .file = edit.file, .slot = edit.slot }, .{}));
+        }
+        if (slots.changes.items.len >= 64 or names.changes.items.len >= 64) {
+            try slots.flush(store, &result.slots);
+            try names.flush(store, &result.names);
+        }
+    }
+    try slots.flush(store, &result.slots);
+    try names.flush(store, &result.names);
+    result.public = shared.root;
+    result.public_names = true;
+    result.public_count = shared.count;
+    result.public_identity_version = shared.identity_version;
+    try validate(result);
+    return result;
+}
 pub const Previous = struct { roots: Roots, files: []const []const u8, fingerprints: []const [32]u8, same_snapshot: bool };
 pub fn publish(a: A, store: tree.Store, source: []const u8, snapshot: []const u8, files: []const []const u8, fingerprints: []const [32]u8, previous: ?Previous) !Roots {
     return publishWithOptions(a, store, source, snapshot, files, fingerprints, previous, .{});

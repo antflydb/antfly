@@ -25,6 +25,7 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 pub const File = struct {
     id: []const u8,
     digest: [32]u8,
+    aggregate_digest: ?[32]u8 = null,
     docs: []const artifacts.ChunkRef = &.{},
     count: u64 = 0,
     key_width: u16 = 96,

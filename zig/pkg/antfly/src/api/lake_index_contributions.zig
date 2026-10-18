@@ -32,14 +32,19 @@ pub const Index = struct {
     cache: PageCache = undefined,
     retained: std.AutoHashMapUnmanaged([32]u8, bool) = .empty,
     counted: bool = false,
+    delta_reductions: usize = 0,
+    reduction_seeds: std.AutoHashMapUnmanaged(catalog.Digest, catalog.FileContribution) = .empty,
+    seeds_loaded: bool = false,
+    seed_arena: std.heap.ArenaAllocator = undefined,
     covered_files: std.AutoHashMapUnmanaged(catalog.Digest, void) = .empty,
     has_file_coverage: bool = false,
     migrating: bool = false,
     prior_roots: []const catalog.Digest = &.{},
+    predecessor: ?struct { source: []const u8, schema: []const u8, snapshot: []const u8, count: u32 } = null,
     roots: std.AutoHashMapUnmanaged(catalog.Digest, void) = .empty,
     pub fn init(self: *Index, a: A, store: stores.ArtifactStore, root: ?tree.Ref, cancellation: Cancellation) !void {
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-        self.* = .{ .a = a, .root = root, .store = store };
+        self.* = .{ .a = a, .root = root, .store = store, .seed_arena = .init(a) };
         self.bridge = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &self.store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes };
         self.cache = .{ .underlying = self.bridge.store(), .slots = try std.heap.page_allocator.alloc(?tree.Ref, 4096) };
         @memset(self.cache.slots, null);
@@ -48,6 +53,8 @@ pub const Index = struct {
         self.retained.deinit(self.a);
         self.roots.deinit(self.a);
         self.covered_files.deinit(self.a);
+        self.reduction_seeds.deinit(self.a);
+        self.seed_arena.deinit();
         self.cache.deinit();
     }
     pub fn lookup(self: *Index, a: A, key: [32]u8) !?catalog.FileContribution {
@@ -59,6 +66,31 @@ pub const Index = struct {
         try validate(value);
         if (!std.mem.eql(u8, &key, &identity(value))) return error.InvalidLakeIndexCatalog;
         return value;
+    }
+    pub fn acceptsDelta(self: *const Index, delta: @import("lake_source_navigation.zig").Delta) bool {
+        const prior = self.predecessor orelse return false;
+        return self.counted and !self.migrating and delta.prior_snapshot != null and
+            delta.prior_count == prior.count and std.mem.eql(u8, delta.prior_snapshot.?, prior.snapshot) and
+            std.mem.eql(u8, delta.source, prior.source) and std.mem.eql(u8, delta.schema, prior.schema);
+    }
+    /// Borrowed recipe-root metadata remains valid until this Index is deinitialized.
+    pub fn reductionRoot(self: *Index, _: A, recipe: catalog.Digest, name: []const u8, count: usize) !?catalog.FileContribution {
+        if (!self.seeds_loaded) {
+            for (self.prior_roots) |key| {
+                const value = (try self.lookup(self.seed_arena.allocator(), key)) orelse return error.InvalidLakeIndexCatalog;
+                var descriptor = value;
+                descriptor.file = @splat(0);
+                const entry = try self.reduction_seeds.getOrPut(self.a, identity(descriptor));
+                if (entry.found_existing) return error.InvalidLakeIndexCatalog;
+                entry.value_ptr.* = value;
+            }
+            self.seeds_loaded = true;
+        }
+        // The file component is zero only in this build-local recipe/name key.
+        const key = identity(.{ .file = @splat(0), .recipe = recipe, .name = name, .artifact = undefined });
+        const value = self.reduction_seeds.get(key) orelse return null;
+        const range = value.radix orelse return null;
+        return if (range.files == count) value else null;
     }
     /// Retain the authenticated ownership graph without opening aggregate
     /// roots, range directories or blocks. A gray entry detects cycles; the
@@ -293,6 +325,13 @@ pub fn identity(value: catalog.FileContribution) [32]u8 {
 pub fn validate(value: catalog.FileContribution) !void {
     if (value.name.len == 0 or value.name.len > 128 or std.mem.allEqual(u8, &value.file, 0) or std.mem.allEqual(u8, &value.recipe, 0) or value.artifact.kind != .algebraic_segment) return error.InvalidLakeIndexCatalog;
     try stores.validateSha256ArtifactIdentity(value.artifact.artifact_id, value.artifact.checksum);
+    if (value.radix) |range| {
+        if (range.files == 0 or std.mem.order(u8, &range.first, &range.last) == .gt) return error.InvalidLakeIndexCatalog;
+        if (range.files == 1) {
+            if (!std.mem.eql(u8, &range.first, &range.last) or !std.mem.eql(u8, &range.first, &value.file) or (if (value.owned) |owned| owned.len != 0 else false)) return error.InvalidLakeIndexCatalog;
+        } else if (std.mem.eql(u8, &range.first, &range.last) or value.owned == null or value.owned.?.len < 2) return error.InvalidLakeIndexCatalog;
+    }
+
     if (value.owned) |keys| {
         if (keys.len > 66) return error.InvalidLakeIndexCatalog;
         for (keys, 0..) |key, i| {

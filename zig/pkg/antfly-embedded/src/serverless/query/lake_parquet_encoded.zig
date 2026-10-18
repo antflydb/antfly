@@ -44,6 +44,13 @@ const Reader = struct {
 };
 fn unpack(bytes: []const u8, width: u8, index: usize) u64 {
     if (width == 0) return 0;
+    switch (width) {
+        8 => return bytes[index],
+        16 => return std.mem.readInt(u16, bytes[index * 2 ..][0..2], .little),
+        32 => return std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little),
+        64 => return std.mem.readInt(u64, bytes[index * 8 ..][0..8], .little),
+        else => {},
+    }
     const start = index * width;
     const shift: u3 = @intCast(start % 8);
     const length = (@as(usize, width) + shift + 7) / 8;
@@ -65,8 +72,30 @@ pub const Delta = struct {
         const result = @as(u64, @bitCast(value)) +% @as(u64, @bitCast(minimum)) +% residual;
         return if (self.bits == 32) @as(i32, @bitCast(@as(u32, @truncate(result)))) else @bitCast(result);
     }
+    fn decode(self: Delta, checkpoint: Checkpoint) [32]i64 {
+        const V = @Vector(32, u64);
+        var residuals: [32]u64 = @splat(0);
+        if (checkpoint.width == 0) {
+            for (&residuals, 0..) |*value, i| value.* = @as(u64, @bitCast(checkpoint.minimum)) *% (i + 1);
+        } else {
+            for (0..checkpoint.count) |i| residuals[i] = unpack(checkpoint.bytes, checkpoint.width, checkpoint.offset + i) +% @as(u64, @bitCast(checkpoint.minimum));
+            var prefix: V = residuals;
+            inline for (.{ 1, 2, 4, 8, 16 }) |distance| {
+                const shifts = comptime blk: {
+                    var lanes: [32]i32 = undefined;
+                    for (&lanes, 0..) |*lane, i| lane.* = if (i >= distance) @intCast(i - distance) else -1;
+                    break :blk lanes;
+                };
+                prefix +%= @shuffle(u64, prefix, @as(V, @splat(0)), shifts);
+            }
+            residuals = prefix;
+        }
+        const values: V = @as(V, residuals) +% @as(V, @splat(@as(u64, @bitCast(checkpoint.base))));
+        return if (self.bits == 32) @as(@Vector(32, i64), @intCast(@as(@Vector(32, i32), @bitCast(@as(@Vector(32, u32), @truncate(values)))))) else @bitCast(values);
+    }
     pub fn init(a: A, bytes: []const u8, count: usize, bits: u8) !Delta {
         if (bits != 32 and bits != 64) return error.InvalidParquetPage;
+        if (count == 0 and bytes.len == 0) return .{ .first = 0, .count = 0, .bits = bits, .checkpoints = &.{}, .consumed = 0 };
         var reader: Reader = .{ .bytes = bytes };
         const block = try reader.unsigned();
         const minis = try reader.unsigned();
@@ -84,6 +113,8 @@ pub const Delta = struct {
             const minimum = try reader.signed();
             const widths = try reader.take(@intCast(minis));
             for (widths) |width| {
+                // Unused widths have arbitrary byte values and no bodies.
+                if (remaining == 0) break;
                 if (width > bits) return error.InvalidParquetPage;
                 const size: usize = @intCast(block / minis);
                 const data = try reader.take(size * width / 8);
@@ -93,7 +124,7 @@ pub const Delta = struct {
                     const n = @min(32, actual - begin);
                     checkpoints[slot] = .{ .base = predecessor, .minimum = minimum, .bytes = data, .offset = begin, .width = width, .count = n };
                     slot += 1;
-                    for (begin..begin + n) |i| predecessor = result.advance(predecessor, minimum, unpack(data, width, i));
+                    predecessor = if (width == 0) result.advance(predecessor, 0, @as(u64, @bitCast(minimum)) *% n) else result.decode(checkpoints[slot - 1])[n - 1];
                 }
                 remaining -= actual;
             }
@@ -106,16 +137,43 @@ pub const Delta = struct {
         if (index >= self.count) return error.InvalidParquetPage;
         if (index == 0) return self.first;
         const slot = (index - 1) / 32;
+        const checkpoint = self.checkpoints[slot];
+        if (checkpoint.width == 0) return self.advance(checkpoint.base, 0, @as(u64, @bitCast(checkpoint.minimum)) *% ((index - 1) % 32 + 1));
         if (self.cached != slot) {
-            const checkpoint = self.checkpoints[slot];
-            var value = checkpoint.base;
-            for (0..checkpoint.count) |i| {
-                value = self.advance(value, checkpoint.minimum, unpack(checkpoint.bytes, checkpoint.width, checkpoint.offset + i));
-                self.values[i] = value;
-            }
+            self.values = self.decode(checkpoint);
             self.cached = slot;
         }
         return self.values[(index - 1) % 32];
+    }
+    pub fn read(self: *Delta, begin: usize, output: []i64) !void {
+        if (begin > self.count or output.len > self.count - begin) return error.InvalidParquetPage;
+        var offset: usize = 0;
+        while (offset < output.len) {
+            const row = begin + offset;
+            if (row == 0) {
+                output[0] = self.first;
+                offset += 1;
+                continue;
+            }
+            const slot = (row - 1) / 32;
+            const lane = (row - 1) % 32;
+            const n = @min(output.len - offset, self.checkpoints[slot].count - lane);
+            if (self.cached != slot) {
+                self.values = self.decode(self.checkpoints[slot]);
+                self.cached = slot;
+            }
+            @memcpy(output[offset..][0..n], self.values[lane..][0..n]);
+            offset += n;
+        }
+    }
+    pub fn mask(self: *Delta, begin: usize, keep: []bool, literal: i64, comptime op: anytype) !void {
+        if (keep.len > 32) return error.InvalidParquetPage;
+        var values: [32]i64 = @splat(0);
+        try self.read(begin, values[0..keep.len]);
+        const left: @Vector(32, i64) = values;
+        const right: @Vector(32, i64) = @splat(literal);
+        const matches: [32]bool = if (op == .eq) left == right else if (op == .neq) left != right else if (op == .lt) left < right else if (op == .lte) left <= right else if (op == .gt) left > right else left >= right;
+        for (keep, matches[0..keep.len]) |*active, matched| active.* = active.* and matched;
     }
 };
 /// Delta lengths borrow suffix bytes. Prefix compression reconstructs only
@@ -128,6 +186,9 @@ pub const Strings = struct {
     data: []const u8,
     a: A,
     materialized: std.AutoHashMapUnmanaged(usize, []const u8) = .empty,
+    scratch: []u8 = &.{},
+    scratch_row: ?usize = null,
+    scratch_len: usize = 0,
     pub fn init(a: A, bytes: []const u8, count: usize, prefix: bool) !Strings {
         var prefixes: ?Delta = if (prefix) try Delta.init(a, bytes, count, 32) else null;
         const skip = if (prefixes) |p| p.consumed else 0;
@@ -150,14 +211,27 @@ pub const Strings = struct {
     }
     pub fn at(self: *Strings, index: usize) ![]const u8 {
         if (index >= self.lengths.count) return error.InvalidParquetPage;
+        if (self.prefixes == null) return self.data[self.offsets[index]..self.offsets[index + 1]];
+        if (self.materialized.get(index)) |value| return value;
+        const output = try self.a.dupe(u8, try self.borrow(index));
+        errdefer self.a.free(output);
+        try self.materialized.put(self.a, index, output);
+        return output;
+    }
+    /// Valid until the next borrow; predicates and complete materializers do
+    /// not retain a reconstructed string for every rejected/input row.
+    pub fn borrow(self: *Strings, index: usize) ![]const u8 {
+        if (index >= self.lengths.count) return error.InvalidParquetPage;
         const prefixes = if (self.prefixes) |*p| p else return self.data[self.offsets[index]..self.offsets[index + 1]];
         if (self.materialized.get(index)) |value| return value;
+        if (self.scratch_row == index) return self.scratch[0..self.scratch_len];
         const size = @as(usize, @intCast(try prefixes.at(index))) + self.offsets[index + 1] - self.offsets[index];
-        const output = try self.a.alloc(u8, size);
-        errdefer self.a.free(output);
+        if (size > self.scratch.len) self.scratch = try self.a.realloc(self.scratch, @max(size, self.scratch.len * 2));
+        const output = self.scratch[0..size];
         var row = index;
         var remaining = size;
         while (remaining != 0) {
+            if (self.scratch_row == row and remaining <= self.scratch_len) break;
             if (self.materialized.get(row)) |value| {
                 @memcpy(output[0..remaining], value[0..remaining]);
                 break;
@@ -173,7 +247,8 @@ pub const Strings = struct {
             if (row == 0) return error.InvalidParquetPage;
             row -= 1;
         }
-        try self.materialized.put(self.a, index, output);
+        self.scratch_row = index;
+        self.scratch_len = size;
         return output;
     }
 };
@@ -279,4 +354,56 @@ fn compactAllocationScenario(a: A) !void {
 test "parquet compact codec unwinds allocation failures and rejects invalid prefix evidence" {
     try compactAllocationScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, compactAllocationScenario, .{});
+}
+
+test "parquet compact zero streams and unused miniblock widths preserve framing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var values = try Delta.init(a, &.{ 128, 1, 4, 2, 0, 2, 0, 255, 7, 1 }, 2, 64);
+    try std.testing.expectEqual(@as(i64, 1), try values.at(1));
+    try std.testing.expectEqual(@as(usize, 10), values.consumed);
+    const empty = try Delta.init(a, &.{ 128, 2, 4, 0, 0 }, 0, 64);
+    try std.testing.expectEqual(@as(usize, 5), empty.consumed);
+    const strings = try Strings.init(a, &.{ 128, 1, 4, 0, 0, 128, 1, 4, 0, 0 }, 0, true);
+    try std.testing.expectEqual(@as(usize, 0), strings.data.len);
+    try std.testing.expectError(error.InvalidParquetPage, Strings.init(a, &.{ 128, 1, 4, 0, 0, 0 }, 0, false));
+}
+
+test "parquet compact vector reads and masks agree at signed wrapping and block boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var expected: [300]i64 = undefined;
+    expected[0] = std.math.maxInt(i64);
+    for (1..expected.len) |i| expected[i] = expected[i - 1] +% @as(i64, @intCast(i % 7)) -% 3;
+    var delta = try Delta.init(a, try testDelta(a, &expected), expected.len, 64);
+    var actual: [300]i64 = undefined;
+    try delta.read(0, &actual);
+    try std.testing.expectEqualSlices(i64, &expected, &actual);
+    for (0..270) |begin| {
+        var keep: [31]bool = @splat(true);
+        keep[2] = false;
+        try delta.mask(begin, &keep, expected[begin + 15], .gte);
+        for (keep, 0..) |matched, i| try std.testing.expectEqual(i != 2 and expected[begin + i] >= expected[begin + 15], matched);
+    }
+    const prefixes = try testDelta(a, &.{ 0, 3, 4, 0 });
+    const lengths = try testDelta(a, &.{ 6, 1, 2, 3 });
+    var strings = try Strings.init(a, try std.mem.concat(a, u8, &.{ prefixes, lengths, "abcdefX12new" }), 4, true);
+    for ([_][]const u8{ "abcdef", "abcX", "abcX12", "new" }, 0..) |text, i| try std.testing.expectEqualStrings(text, try strings.borrow(i));
+    try std.testing.expectEqual(@as(usize, 0), strings.materialized.count());
+    try std.testing.expectEqualStrings("abcX12", try strings.borrow(2));
+}
+
+test "parquet compact vector INT32 constant deltas wrap in their physical width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var delta = try Delta.init(arena.allocator(), &.{ 128, 1, 4, 36, 254, 255, 255, 255, 15, 2, 0, 0, 0, 0 }, 36, 32);
+    var values: [36]i64 = undefined;
+    try delta.read(0, &values);
+    for (values, 0..) |value, i| {
+        const expected: i32 = @bitCast(@as(u32, std.math.maxInt(i32)) +% @as(u32, @intCast(i)));
+        try std.testing.expectEqual(@as(i64, expected), value);
+        try std.testing.expectEqual(value, try delta.at(i));
+    }
 }

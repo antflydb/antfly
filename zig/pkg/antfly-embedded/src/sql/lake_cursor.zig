@@ -2939,3 +2939,28 @@ test "lake SQL compact encodings scan independent nullable Parquet and project s
         try std.testing.expectEqual(@as(usize, if (mode == .amount) 11 else if (mode == .decimal) 12 else 300), count);
     };
 }
+
+test "lake SQL compact encodings accept all-null delta headers in full and selective scans" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        @embedFile("../serverless/query/testdata/pyarrow_null_encoded_v1.parquet"),
+        @embedFile("../serverless/query/testdata/pyarrow_null_encoded_v2.parquet"),
+    }) |data| for ([_]bool{ false, true }) |selective| {
+        var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+        try lake.populateData(a, 1, data);
+        defer lake.deinit(a);
+        lake.table.columns = &.{
+            .{ .name = "row", .path = "row", .type = .integer },
+            .{ .name = "v", .path = "v", .type = .integer },
+            .{ .name = "lengths", .path = "lengths", .type = .string },
+            .{ .name = "prefixes", .path = "prefixes", .type = .string },
+        };
+        const conditions = [_]catalog.Condition{.{ .column = "row", .op = .eq, .value = .{ .integer = 3 } }};
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{ "v", "lengths", "prefixes" }, .conditions = if (selective) &conditions else &.{}, .limit = 7 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        const result = try cursor.next(cursor.ptr, a, 7);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (selective) 1 else 4), result.rows.len);
+        for (result.rows) |row| for ([_][]const u8{ "v", "lengths", "prefixes" }) |field| try std.testing.expect(row.value.object.get(field).? == .null);
+    };
+}

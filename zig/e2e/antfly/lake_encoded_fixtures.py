@@ -73,6 +73,32 @@ def write_compact_parquet(path: Path, page_version: int) -> None:
     )
 
 
+def write_null_compact_parquet(path: Path, page_version: int) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table(
+            {
+                "row": pa.array(range(4), type=pa.int64()),
+                "v": pa.array([None] * 4, type=pa.int64()),
+                "lengths": pa.array([None] * 4, type=pa.string()),
+                "prefixes": pa.array([None] * 4, type=pa.string()),
+            }
+        ),
+        path,
+        compression="snappy",
+        use_dictionary=False,
+        column_encoding={
+            "row": "PLAIN",
+            "v": "DELTA_BINARY_PACKED",
+            "lengths": "DELTA_LENGTH_BYTE_ARRAY",
+            "prefixes": "DELTA_BYTE_ARRAY",
+        },
+        data_page_version=f"{page_version}.0",
+    )
+
+
 if __name__ == "__main__":
     import sys
 
@@ -81,4 +107,8 @@ if __name__ == "__main__":
     for version in (1, 2):
         write_compact_parquet(
             directory / f"pyarrow_encoded_v{version}.parquet", version
+        )
+
+        write_null_compact_parquet(
+            directory / f"pyarrow_null_encoded_v{version}.parquet", version
         )

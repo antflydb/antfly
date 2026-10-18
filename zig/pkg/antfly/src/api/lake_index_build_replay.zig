@@ -124,12 +124,6 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
     var old: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer old.deinit(a);
     for (contributions) |contribution| try old.put(a, aggregate.contributionKey(contribution.file, contribution.recipe, contribution.name), {});
-    const needs_contribution_keys = for (declarations) |declaration| {
-        if (declaration.artifact.kind == .algebraic_segment) break true;
-    } else false;
-    const file_keys = try a.alloc([32]u8, if (needs_contribution_keys) provider.source.inventory.files.len else 0);
-    defer a.free(file_keys);
-    for (provider.source.inventory.files[0..file_keys.len], file_keys) |file, *key| key.* = aggregate.fileIdentity(provider.source, file);
     for (declarations) |declaration| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -139,7 +133,14 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             const recipe = try @import("lake_index_aggregate_artifact.zig").loadRecipe(ca, store, declaration.artifact, cancellation);
             if (!aggregate.incrementalRecipe(recipe) or provider.source.inventory.deleted_row_groups.len != 0 or (if (provider.source.scanner.iceberg_delete_plan) |plan| plan.files.len != 0 else false)) return null;
             const fingerprint = recipe.fingerprint();
-            for (file_keys, 0..) |key, ordinal| {
+            if (provider.native_delta) |delta| if (index) |lookup| if (lookup.acceptsDelta(delta) and try lookup.reductionRoot(ca, fingerprint, declaration.name, delta.prior_count) != null) {
+                var plan = try state.Plan.fromDelta(a, ca, delta);
+                defer plan.deinit();
+                try needed.addPlan(&plan);
+                continue;
+            };
+            for (provider.source.inventory.files, 0..) |file, ordinal| {
+                const key = aggregate.fileIdentity(provider.source, file);
                 const lookup_key = aggregate.contributionKey(key, fingerprint, declaration.name);
                 if (!needed.contains(ordinal) and !old.contains(lookup_key)) {
                     const missing = if (index) |lookup| missing: {

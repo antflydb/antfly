@@ -26,6 +26,7 @@ const Context = local.serverless_query_lake_read_context.Context;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const Provider = struct {
+    ordered_delta_plans: usize = 0,
     source: *serving.ServingSource,
     /// Borrowed authenticated prior inventory, shared by all native builders.
     previous_inventory: ?local.serverless_external_source_types.Inventory = null,

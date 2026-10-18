@@ -238,17 +238,9 @@ pub fn parsePageHeader(bytes: []const u8) !ParsedHeader {
     return .{ .header = header, .header_len = reader.cursor };
 }
 
-// Full materializers share the compact codec with selected cursors. Only
-// callers requesting a complete physical column expand it into plain wire.
+// Compact encodings fill final physical vectors directly. The small codec
+// arena owns navigation/scratch only, never a complete plain-wire expansion.
 const ExtendedPhysical = union(enum) { integer: usize, number: usize, bytes, fixed: usize };
-const NormalizedPage = struct {
-    header: Header,
-    bytes: []const u8,
-    owned: ?[]u8 = null,
-    fn deinit(self: @This(), a: Allocator) void {
-        if (self.owned) |bytes| a.free(bytes);
-    }
-};
 fn validatePhysicalHeader(header: Header, physical: ExtendedPhysical) !void {
     var view = header;
     const supported = switch (header.encoding) {
@@ -260,74 +252,97 @@ fn validatePhysicalHeader(header: Header, physical: ExtendedPhysical) !void {
     if (supported) view.encoding = .plain;
     try view.validatePlainRequired();
 }
-fn normalizeExtended(a: Allocator, header: Header, payload: []const u8, physical: ExtendedPhysical, optional: bool) !NormalizedPage {
+fn CompactValues(comptime T: type) type {
+    return struct { values: []T, nulls: []u8 };
+}
+fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: []const u8, physical: ExtendedPhysical, optional: bool) !?CompactValues(T) {
     const encoding = header.encoding;
-    if (encoding != .delta_binary_packed and encoding != .delta_length_byte_array and encoding != .delta_byte_array and encoding != .byte_stream_split) return .{ .header = header, .bytes = payload };
-    try header.validateResourceLimits();
+    if (encoding != .delta_binary_packed and encoding != .delta_length_byte_array and encoding != .delta_byte_array and encoding != .byte_stream_split) return null;
+    try validatePhysicalHeader(header, physical);
     if (header.data_payload_offset > payload.len or header.repetition_level_bytes != 0) return error.InvalidParquetPage;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const work = arena.allocator();
-    var count: usize = header.value_count;
+    const rows: usize = header.value_count;
+    var definitions: ?DefinitionIndex = null;
     if (optional) {
-        if (header.definition_level_bytes > header.data_payload_offset) return error.InvalidParquetPage;
-        const index = try DefinitionIndex.init(work, payload[0..header.definition_level_bytes], count);
-        count = index.present;
+        if (header.definition_level_bytes == 0 or header.definition_level_bytes > header.data_payload_offset) return error.InvalidParquetPage;
+        definitions = try DefinitionIndex.init(work, payload[0..header.definition_level_bytes], rows);
     }
+    const count = if (definitions) |index| index.present else rows;
     const data = payload[header.data_payload_offset..];
     const codec = @import("lake_parquet_encoded.zig");
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(a);
-    try output.appendSlice(a, payload[0..header.data_payload_offset]);
-    if (count == 0) {
-        if (data.len != 0) return error.InvalidParquetPage;
-    } else if (encoding == .delta_binary_packed) {
+    var delta: ?codec.Delta = null;
+    var strings: ?codec.Strings = null;
+    const width: usize = switch (physical) {
+        .integer, .number, .fixed => |n| n,
+        .bytes => 0,
+    };
+    if (encoding == .delta_binary_packed) {
         if (physical != .integer) return error.UnsupportedParquetPage;
-        const width = physical.integer;
-        var delta = try codec.Delta.init(work, data, count, @intCast(width * 8));
-        if (delta.consumed != data.len or count > (max_uncompressed_page_bytes -| output.items.len) / width) return error.InvalidParquetPage;
-        const start = output.items.len;
-        try output.resize(a, start + count * width);
-        for (0..count) |i| {
-            const value = try delta.at(i);
-            if (width == 4) std.mem.writeInt(i32, output.items[start + i * width ..][0..4], @intCast(value), .little) else std.mem.writeInt(i64, output.items[start + i * width ..][0..8], value, .little);
-        }
+        delta = try codec.Delta.init(work, data, count, @intCast(width * 8));
+        if (delta.?.consumed != data.len or count > (max_uncompressed_page_bytes -| header.data_payload_offset) / width) return error.InvalidParquetPage;
     } else if (encoding == .byte_stream_split) {
-        const width = switch (physical) {
-            .integer, .number, .fixed => |n| n,
-            else => return error.UnsupportedParquetPage,
-        };
-        if (width == 0 or width > 16 or count > (max_uncompressed_page_bytes -| output.items.len) / width or data.len != count * width) return error.InvalidParquetPage;
-        const start = output.items.len;
-        try output.resize(a, start + data.len);
-        for (0..count) |row| for (0..width) |byte| {
-            output.items[start + row * width + byte] = data[byte * count + row];
-        };
+        if (width == 0 or width > 16 or count > (max_uncompressed_page_bytes -| header.data_payload_offset) / width or data.len != count * width) return error.InvalidParquetPage;
     } else {
         if (physical != .bytes) return error.UnsupportedParquetPage;
-        var strings = try codec.Strings.init(work, data, count, encoding == .delta_byte_array);
-        // Reject expansion before reconstructing a potentially wide prefix.
-        for (0..count) |i| {
-            const prefix: usize = if (strings.prefixes) |*p| @intCast(try p.at(i)) else 0;
-            const length = prefix + strings.offsets[i + 1] - strings.offsets[i];
-            if (length + 4 > max_uncompressed_page_bytes -| output.items.len) return error.ParquetPageTooLarge;
-            var size: [4]u8 = undefined;
-            std.mem.writeInt(u32, &size, @intCast(length), .little);
-            try output.appendSlice(a, &size);
-            try output.appendSlice(a, try strings.at(i));
-        }
+        strings = try codec.Strings.init(work, data, count, encoding == .delta_byte_array);
     }
-    var normalized = header;
-    normalized.encoding = .plain;
-    const owned = try output.toOwnedSlice(a);
-    return .{ .header = normalized, .bytes = owned, .owned = owned };
+    const values = try a.alloc(T, rows);
+    errdefer a.free(values);
+    var initialized: usize = 0;
+    errdefer if (T == []u8) {
+        for (values[0..initialized]) |value| a.free(value);
+    };
+    const nulls = if (optional) try a.alloc(u8, rows) else @as([]u8, &.{});
+    errdefer a.free(nulls);
+    if (T == i64) if (!optional and delta != null) {
+        try delta.?.read(0, values);
+        return .{ .values = values, .nulls = nulls };
+    };
+    var expanded: usize = header.data_payload_offset;
+    for (values, 0..) |*value, row| {
+        const position: ?usize = if (definitions) |index| if (index.position(row)) |ordinal| ordinal else null else row;
+        if (optional) nulls[row] = @intFromBool(position == null);
+        if (position == null) {
+            value.* = if (T == []u8) &.{} else 0;
+        } else if (T == []u8) {
+            var buffer: [16]u8 = undefined;
+            const bytes = if (strings) |*stream| string: {
+                const index = position.?;
+                const prefix: usize = if (stream.prefixes) |*prefixes| @intCast(try prefixes.at(index)) else 0;
+                const length = prefix + stream.offsets[index + 1] - stream.offsets[index];
+                // Reject expansion before growing the reconstruction scratch.
+                if (length + 4 > max_uncompressed_page_bytes -| expanded) return error.ParquetPageTooLarge;
+                break :string try stream.borrow(index);
+            } else split: {
+                for (0..width) |byte| buffer[byte] = data[byte * count + position.?];
+                break :split buffer[0..width];
+            };
+            const overhead: usize = if (strings != null) 4 else 0;
+            if (bytes.len + overhead > max_uncompressed_page_bytes -| expanded) return error.ParquetPageTooLarge;
+            expanded += bytes.len + overhead;
+            value.* = try a.dupe(u8, bytes);
+        } else if (T == i64) {
+            if (delta) |*stream| value.* = try stream.at(position.?) else {
+                var buffer: [8]u8 = undefined;
+                for (0..width) |byte| buffer[byte] = data[byte * count + position.?];
+                value.* = if (width == 4) std.mem.readInt(i32, buffer[0..4], .little) else std.mem.readInt(i64, &buffer, .little);
+            }
+        } else if (T == f64) {
+            var buffer: [8]u8 = undefined;
+            for (0..width) |byte| buffer[byte] = data[byte * count + position.?];
+            value.* = if (width == 4) @as(f32, @bitCast(std.mem.readInt(u32, buffer[0..4], .little))) else @as(f64, @bitCast(std.mem.readInt(u64, &buffer, .little)));
+        } else unreachable;
+        initialized += 1;
+    }
+    return .{ .values = values, .nulls = nulls };
 }
 
 pub fn decodePlainI64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]i64 {
-    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .integer = 8 }, false);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(i64, alloc, original_header, original_payload, .{ .integer = 8 }, false)) |decoded| return decoded.values;
+    const header = original_header;
+    const page_payload = original_payload;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -365,10 +380,9 @@ pub fn scanUncompressedPlainInt96TimestampNsColumnChunkAlloc(alloc: Allocator, c
 }
 
 pub fn decodePlainF64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]f64 {
-    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .number = 8 }, false);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(f64, alloc, original_header, original_payload, .{ .number = 8 }, false)) |decoded| return decoded.values;
+    const header = original_header;
+    const page_payload = original_payload;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -388,10 +402,9 @@ pub fn scanUncompressedPlainF64ColumnChunkAlloc(alloc: Allocator, column_chunk_b
 }
 
 pub fn decodePlainI32AsI64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]i64 {
-    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .integer = 4 }, false);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(i64, alloc, original_header, original_payload, .{ .integer = 4 }, false)) |decoded| return decoded.values;
+    const header = original_header;
+    const page_payload = original_payload;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -410,10 +423,9 @@ pub fn scanUncompressedPlainI32AsI64ColumnChunkAlloc(alloc: Allocator, column_ch
 }
 
 pub fn decodePlainF32AsF64Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]f64 {
-    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .number = 4 }, false);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(f64, alloc, original_header, original_payload, .{ .number = 4 }, false)) |decoded| return decoded.values;
+    const header = original_header;
+    const page_payload = original_payload;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     const payload = page_payload[header.data_payload_offset..];
@@ -1544,10 +1556,9 @@ pub fn decodeOptionalPlainI64V2HybridLevelsAlloc(
     original_payload: []const u8,
 ) !NullableI64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .integer = 8 }, true);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(i64, alloc, flat.header, flat.payload, .{ .integer = 8 }, true)) |decoded| return .{ .values = decoded.values, .nulls = decoded.nulls };
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1642,10 +1653,9 @@ pub fn decodeOptionalPlainF64V2HybridLevelsAlloc(
     original_payload: []const u8,
 ) !NullableF64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .number = 8 }, true);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(f64, alloc, flat.header, flat.payload, .{ .number = 8 }, true)) |decoded| return .{ .values = decoded.values, .nulls = decoded.nulls };
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1693,10 +1703,9 @@ pub fn decodeOptionalPlainI32V2HybridLevelsAsI64Alloc(
     original_payload: []const u8,
 ) !NullableI64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .integer = 4 }, true);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(i64, alloc, flat.header, flat.payload, .{ .integer = 4 }, true)) |decoded| return .{ .values = decoded.values, .nulls = decoded.nulls };
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1875,10 +1884,9 @@ pub fn decodeOptionalPlainF32V2HybridLevelsAsF64Alloc(
     original_payload: []const u8,
 ) !NullableF64Values {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .number = 4 }, true);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc(f64, alloc, flat.header, flat.payload, .{ .number = 4 }, true)) |decoded| return .{ .values = decoded.values, .nulls = decoded.nulls };
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -2231,10 +2239,9 @@ pub fn scanOptionalDictionaryF32AsF64ColumnChunkAllocCached(
 }
 
 pub fn decodePlainByteArraysAlloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![][]u8 {
-    const normalized = try normalizeExtended(alloc, original_header, original_payload, .bytes, false);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc([]u8, alloc, original_header, original_payload, .bytes, false)) |decoded| return decoded.values;
+    const header = original_header;
+    const page_payload = original_payload;
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
     var cursor = header.data_payload_offset;
@@ -2264,10 +2271,9 @@ pub fn decodeOptionalPlainByteArraysV2HybridLevelsAlloc(
     original_payload: []const u8,
 ) !NullableByteArrayValues {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .bytes, true);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc([]u8, alloc, flat.header, flat.payload, .bytes, true)) |decoded| return .{ .values = decoded.values, .nulls = decoded.nulls };
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -2422,10 +2428,9 @@ pub fn decodePlainFixedLenByteArraysAlloc(
     original_payload: []const u8,
     type_length: usize,
 ) ![][]u8 {
-    const normalized = try normalizeExtended(alloc, original_header, original_payload, .{ .fixed = type_length }, false);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc([]u8, alloc, original_header, original_payload, .{ .fixed = type_length }, false)) |decoded| return decoded.values;
+    const header = original_header;
+    const page_payload = original_payload;
     try header.validatePlainRequired();
     if (type_length == 0) return error.InvalidParquetPage;
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
@@ -2454,10 +2459,9 @@ pub fn decodeOptionalPlainFixedLenByteArraysV2HybridLevelsAlloc(
     type_length: usize,
 ) !NullableByteArrayValues {
     const flat = try flatOptionalPage(original_header, original_payload);
-    const normalized = try normalizeExtended(alloc, flat.header, flat.payload, .{ .fixed = type_length }, true);
-    defer normalized.deinit(alloc);
-    const header = normalized.header;
-    const page_payload = normalized.bytes;
+    if (try decodeExtendedAlloc([]u8, alloc, flat.header, flat.payload, .{ .fixed = type_length }, true)) |decoded| return .{ .values = decoded.values, .nulls = decoded.nulls };
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (type_length == 0) return error.InvalidParquetPage;
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
@@ -4774,4 +4778,19 @@ test "parquet compact full materializers share delta and split codecs with optio
     try std.testing.expectEqualStrings("ab", strings[0]);
     try std.testing.expectEqualStrings("", strings[1]);
     try std.testing.expectEqualStrings("xyz", strings[2]);
+}
+
+test "parquet compact full decode admits final typed vector without a plain staging buffer" {
+    const a = std.testing.allocator;
+    const expected = try a.alloc(i64, 8192);
+    defer a.free(expected);
+    for (expected, 0..) |*value, i| value.* = @intCast(i);
+    const encoded = try @import("lake_parquet_encoded.zig").testDelta(a, expected);
+    defer a.free(encoded);
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 96 * 1024 };
+    const header: Header = .{ .page_type = .data_page, .encoding = .delta_binary_packed, .compressed_page_size = @intCast(encoded.len), .uncompressed_page_size = @intCast(encoded.len), .value_count = @intCast(expected.len) };
+    const values = try decodePlainI64Alloc(budget.allocator(), header, encoded);
+    defer budget.allocator().free(values);
+    try std.testing.expectEqualSlices(i64, expected, values);
+    try std.testing.expect(budget.peak < expected.len * @sizeOf(i64) * 2);
 }

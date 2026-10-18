@@ -337,6 +337,9 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     contribution_index.migrating = previous_root != null and previous_ownership == 0;
     contribution_index.prior_roots = if (previous_root != null and previous_ownership == 1) current.value.published.?.contribution_roots else &.{};
     defer contribution_index.deinit();
+    if (prior_navigation) |prior| {
+        if (previous_root != null and previous_ownership == 1) contribution_index.predecessor = .{ .source = prior.source, .schema = prior.schema, .snapshot = prior.snapshot, .count = prior.count };
+    }
     // The authenticated inventory supplies the file delta once per refresh.
     // Counted ownership proves all prior files belong to the unchanged recipes;
     // replay need not point-probe every file/recipe in the contribution tree.
@@ -348,12 +351,14 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
             source.inventory.deleted_row_groups.len == 0 and
             (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true))
         {
-            if (try priorInventory(na, scoped, previous.inventory, cancellation)) |old_inventory| {
-                if (old_inventory.deleted_row_groups.len == 0) {
-                    provider.previous_inventory = old_inventory;
-                    if (previous_root != null and previous_ownership == 1 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
-                        for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
-                        contribution_index.has_file_coverage = true;
+            if (!contribution_index.acceptsDelta(navigation.delta)) {
+                if (try priorInventory(na, scoped, previous.inventory, cancellation)) |old_inventory| {
+                    if (old_inventory.deleted_row_groups.len == 0) {
+                        provider.previous_inventory = old_inventory;
+                        if (previous_root != null and previous_ownership == 1 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
+                            for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
+                            contribution_index.has_file_coverage = true;
+                        }
                     }
                 }
             }

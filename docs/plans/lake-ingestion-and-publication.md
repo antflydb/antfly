@@ -2037,10 +2037,10 @@ Compatible text roots and completed ordered roots borrow the publication's authe
 complete file catalogs. Source, schema and predecessor snapshot must match. Text
 coverage must match the predecessor file population. Partial or older checkpoints
 retain their own reconciliation path. Dense/sparse paged roots likewise add only
-changed ordinals. Algebraic coverage can still require a full file pass. The sparse
-union governs replay reuse only; an uncaptured file retains ordinary source reads.
-The source inventory and ordered-index construction's slot reconciliation remain
-shared/full-population work; total publication is not claimed to be delta-only.
+changed ordinals. Compatible algebraic and ordered cuts use the protocol-55
+planning described below. The sparse union governs replay reuse only; an
+uncaptured file retains ordinary source reads. Discovery and the source inventory
+remain shared work; total publication is not claimed to be delta-only.
 
 Spilled hash joins collect candidates across probe rows within one pinned physical
 block. A per-probe match bitmap replaces the single current-row flag. Residual
@@ -2058,8 +2058,8 @@ bytes; prefix strings reconstruct only demanded values and reuse previously
 reconstructed immutable prefixes. Byte-stream-split gathers selected physical
 lanes without transposing the whole page. Nullable V1/V2 framing, signed wrapping,
 logical decimal/timestamp conversion and declared SQL widths remain separate.
-General full-column materializers use the same codec through bounded plain-wire
-expansion. Footer eligibility recognizes the new data encodings independently of
+General full-column materializers fill their final typed vectors directly,
+with compact navigation and bounded string reconstruction scratch. Footer eligibility recognizes the new data encodings independently of
 RLE definition levels. Existing request/cache admission and cancellation apply;
 no new SQL syntax, public identities or native sidecar wire version is introduced.
 
@@ -2076,3 +2076,64 @@ Debug Antfly server build passed. The new two-case public E2E was attempted loca
 but stopped before server launch by storage admission (about 2.1 GiB available;
 16.25 GiB required). These HTTP attachment/restart cases still need execution in
 `e2e-full` or another environment with sufficient disk headroom.
+
+
+### Delta publication and direct physical decoding (protocol 55)
+
+Completed algebraic reductions persist authenticated Patricia-tree ranges and
+file counts alongside their existing child/alias ownership. Compatible refreshes
+match the prior source/schema/snapshot/count proof, collect only changed and
+removed file keys, and apply sorted mutations bottom-up. Each affected reduction
+node is merged once; untouched branches retain their artifacts and incoming
+ownership counts. Recipe-local roots are bound to the same predecessor census.
+Legacy reductions reconcile once to establish range evidence. Replay planning
+uses the same evidence instead of allocating all file digests or probing each
+file/recipe. The prior source census carries aggregate identities for removed
+files, including pinned object versions. Protocol 55 fences the additional durable
+contribution metadata; aggregate payload and query wire formats do not change.
+
+Completed ordered indexes plan small updates against authenticated paged slot/name
+dictionaries and shared public navigation. Only changed/removed names are resolved;
+sorted slot edits path-copy dictionary pages, preserve unchanged slots, and reuse
+slots retired in the current cut. Replacements remove only their reverse ranges.
+A source file checkpoints all of its new covering rows and fingerprints together.
+Incomplete checkpoint cuts and incompatible/new indexes use full reconciliation;
+dense refreshes retain the bounded base/run merge strategy. No-change source cuts
+update the public directory without walking all ordered rows. The shared source
+inventory still exists; this removes additional per-index archive-sized maps,
+fingerprint arrays and keep masks from the compatible small-update path.
+
+Compact Parquet full scans now fill final integer/floating/byte vectors without
+creating an intermediate plain-wire page. Delta navigation uses vector prefix
+sums, aligned-width unpacking, and arithmetic constant-delta checkpoints. Numeric
+predicates compare up to 32 contiguous physical lanes at once. Prefix-string
+predicates and full scans borrow reusable reconstruction scratch; only demanded
+stable projection values enter the immutable value cache. NULL-only pages accept
+validated zero-value delta headers, and unused terminal miniblock widths are
+ignored once all declared values are consumed. Nullable framing and logical
+interpretation retain their existing validation and request admission boundaries.
+
+Independent V1/V2 NULL-only fixtures cover all three delta encodings in full and
+selective scans. Additional regressions cover arbitrary unused width bytes, signed
+INT32/INT64 wrapping, vector masks across checkpoint boundaries, and full decoding
+inside admission that cannot hold both a final vector and a plain staging buffer.
+Native publication tests deny unchanged Parquet reads while exercising aggregate
+append/removal/mixed/no-change edits and ordered file churn with covering payloads.
+Public attachment/restart tests include NULL-only files; their local disk admission
+requirement and live cloud qualification remain unchanged. Archive-scale latency
+and RSS measurements are still required before claiming workload speedups.
+
+
+Fault-injection qualification also found and fixed a schema-footer cleanup error:
+schema elements now remain owned until the columns array has transferred out,
+including failure of its final allocation. Schema-prefetch fault injection uses
+the existing deterministic allocator helper; ordinary serial and parallel checks
+continue using the normal allocator. The final reader/cursor suite passes 271 tests
+with no leaks. Public E2E execution still requires sufficient local disk headroom.
+
+Publication qualification passed 175 shared and 302 native external-lake tests
+without failures or leaks; the final retained-root ordered churn regression also
+passed independently. All four public V1/V2 mixed/NULL-only attachment and restart
+cases were attempted, but storage admission stopped them before launch (about
+2.0 GiB free versus 16.25 GiB required). They remain pending in `e2e-full`; no
+production admission safeguard was disabled.

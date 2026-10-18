@@ -93,10 +93,6 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
     self.present = present;
     if (extended(header.encoding)) {
         self.width = if (std.mem.eql(u8, chunk.physical_type, "int32") or std.mem.eql(u8, chunk.physical_type, "float")) 4 else if (kind == .integer or kind == .number) 8 else std.math.cast(usize, chunk.type_length) orelse return error.InvalidParquetPage;
-        if (present == 0) {
-            if (data.len != 0) return error.InvalidParquetPage;
-            return self;
-        }
         switch (header.encoding) {
             .delta_binary_packed => {
                 if (kind != .integer) return error.UnsupportedParquetPage;
@@ -218,7 +214,10 @@ fn predicateValue(self: *Self, comptime T: type, position: usize, domain: types.
         return std.math.mul(i64, try self.integer(position), factor) catch error.InvalidParquetPage;
     }
     if (T == f64) return @import("../../common/float_domain.zig").normalize(try self.number(position), domain);
-    if (T == []const u8) return self.bytes(position);
+    if (T == []const u8) {
+        if (self.strings) |*strings| return strings.borrow(position);
+        return self.bytes(position);
+    }
     if (T == bool) return self.data[position / 8] & (@as(u8, 1) << @as(u3, @intCast(position % 8))) != 0;
     unreachable;
 }
@@ -255,6 +254,15 @@ fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, 
         if (T == i64 or T == f64) {
             const timestamp = std.mem.startsWith(u8, self.chunk.logical_type, "timestamp_") and !std.mem.eql(u8, self.chunk.logical_type, "timestamp_nanos");
             const position = self.lanePosition(begin + lane);
+            if (T == i64) if (!timestamp and position != absent) if (self.delta) |*delta| {
+                var count: usize = 0;
+                while (count < @min(32, keep.len - lane) and keep[lane + count] and self.lanePosition(begin + lane + count) == position + count) : (count += 1) {}
+                if (count >= 4) {
+                    try delta.mask(position, keep[lane..][0..count], literal, op);
+                    lane += count;
+                    continue;
+                }
+            };
             const dense = !timestamp and self.dictionary == null and lane + 4 <= keep.len and position != absent and for (keep[lane..][0..4], 0..) |active, offset| {
                 if (!active or self.lanePosition(begin + lane + offset) != position + offset) break false;
                 if (T == f64) if (!std.math.isFinite(try self.number(position + offset)) or !std.math.isFinite(literal)) break false;
@@ -571,4 +579,25 @@ test "lake SQL nullable repeated pages retain native masks within a tiny decode 
         for (mask, 0..) |active, lane| try std.testing.expectEqual(lane != 1000 and (!mixed or lane >= 768), active);
         try std.testing.expectEqual(@as(usize, 0), selected.converted);
     }
+}
+
+test "lake SQL compact prefix predicates keep only stable projected strings" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const prefixes = try encoded_page.testDelta(work, &.{ 0, 3, 4, 0 });
+    const lengths = try encoded_page.testDelta(work, &.{ 6, 1, 2, 3 });
+    const payload = try std.mem.concat(work, u8, &.{ prefixes, lengths, "abcdefX12new" });
+    const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = @intCast(payload.len), .uncompressed_page_size = @intCast(payload.len), .value_count = 4, .encoding = .delta_byte_array };
+    const chunk: Chunk = .{ .column_id = @constCast("s"), .file_offset = 0, .compressed_len = @intCast(payload.len), .physical_type = @constCast("byte_array"), .logical_type = @constCast("string") };
+    const selected = (try create(a, chunk, header, payload, null, 65536)).?;
+    defer selected.destroy();
+    var keep: [4]bool = @splat(true);
+    try std.testing.expect(try encodedMask(selected, 0, &keep, .{ .string = "abcX12" }, .eq));
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false }, &keep);
+    try std.testing.expectEqual(@as(usize, 0), selected.strings.?.materialized.count());
+    const vector = try selected.project(work, 0, &keep);
+    try std.testing.expectEqualStrings("abcX12", vector.values.bytes[2]);
+    try std.testing.expectEqual(@as(usize, 1), selected.strings.?.materialized.count());
 }

@@ -29,14 +29,13 @@ from pathlib import Path
 
 import pytest
 import requests
-from lake_encoded_fixtures import write_compact_parquet
-
 from conftest import (
     AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     StandaloneAntflyServer,
     resolve_binary_path,
 )
+from lake_encoded_fixtures import write_compact_parquet, write_null_compact_parquet
 
 pytestmark = pytest.mark.fresh_antfly_process
 
@@ -6298,10 +6297,15 @@ def test_typed_floating_pruning_skips_pages_and_preserves_nan(
 
 
 @pytest.mark.parametrize("page_version", [1, 2])
-def test_compact_parquet_encodings_attach_query_and_restart(tmp_path, page_version):
+@pytest.mark.parametrize("null_only", [False, True])
+def test_compact_parquet_encodings_attach_query_and_restart(
+    tmp_path, page_version, null_only
+):
     pytest.importorskip("pyarrow")
     path = tmp_path / "encoded.parquet"
-    write_compact_parquet(path, page_version)
+    (write_null_compact_parquet if null_only else write_compact_parquet)(
+        path, page_version
+    )
     payload = path.read_bytes()
     objects = tmp_path / "lake" / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
@@ -6355,11 +6359,15 @@ def test_compact_parquet_encodings_attach_query_and_restart(tmp_path, page_versi
             if cold:
                 server.restart()
             for statement, rows in (
-                ("SELECT COUNT(*) FROM compact_encodings", [["300"]]),
                 (
-                    'SELECT small,bsint,n,"real",label,short,exact '
-                    "FROM compact_encodings WHERE amount >= 288 ORDER BY amount",
-                    expected,
+                    "SELECT COUNT(*) FROM compact_encodings",
+                    [["4" if null_only else "300"]],
+                ),
+                (
+                    'SELECT v,lengths,prefixes FROM compact_encodings WHERE "row" = 3'
+                    if null_only
+                    else 'SELECT small,bsint,n,"real",label,short,exact FROM compact_encodings WHERE amount >= 288 ORDER BY amount',
+                    [[None, None, None]] if null_only else expected,
                 ),
             ):
                 response = _request_with_idle_ddl_retry(

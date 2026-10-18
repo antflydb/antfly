@@ -128,6 +128,9 @@ pub fn publish(a: A, result_alloc: A, store: *stores.ArtifactStore, sort: *local
     return publishIncremental(a, result_alloc, store, sort, name, fingerprint, inventory, cover, cancellation, .{});
 }
 pub const Delta = struct {
+    /// Sorted changed slots replace the archive-sized keep mask on proven cuts.
+    sparse_slots: bool = false,
+    dictionary_edits: ?[]const file_dictionary.Edit = null,
     public_navigation: ?file_dictionary.Public = null,
     run_only: bool = false,
     // Dictionary ownership is independent of a data run's merge ancestry.
@@ -145,13 +148,14 @@ pub const Delta = struct {
 const Retirements = struct {
     keep: []const bool,
     slots: ?[]const u32,
+    count: ?usize = null,
     position: usize = 0,
     previous: ?u32 = null,
     fn next(self: *@This()) !?u32 {
         if (self.slots) |slots| {
             if (self.position == slots.len) return null;
             const slot = slots[self.position];
-            if (slot >= self.keep.len or self.keep[slot] or (self.previous != null and slot <= self.previous.?)) return error.InvalidNativeLakeRowIndex;
+            if (slot >= (self.count orelse self.keep.len) or (self.count == null and self.keep[slot]) or (self.previous != null and slot <= self.previous.?)) return error.InvalidNativeLakeRowIndex;
             self.position += 1;
             self.previous = slot;
             return slot;
@@ -203,6 +207,19 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     var read_bytes: u64 = 256 * 1024 * 1024;
     var write_bytes: u64 = 512 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .streaming = true, .io = sort.manager.io };
+    if (delta.sparse_slots and delta.dictionary_edits != null and delta.retired_slots != null and delta.retired_slots.?.len == 0 and sort.total == 0) {
+        const previous = delta.previous orelse return error.InvalidNativeLakeRowIndex;
+        const shared = delta.public_navigation orelse return error.InvalidNativeLakeRowIndex;
+        if (!std.mem.eql(u8, &previous.domain, &scope.domain) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or !std.mem.eql(u8, shared.source, inventory.source_id) or !std.mem.eql(u8, shared.snapshot, inventory.snapshot_id)) return error.InvalidNativeLakeRowIndex;
+        const dictionary = try file_dictionary.applyEdits(a, pages.store(), previous.file_dictionary orelse return error.InvalidNativeLakeRowIndex, delta.dictionary_edits.?, shared);
+        var fresh = previous;
+        fresh.source = inventory.source_id;
+        fresh.snapshot = inventory.snapshot_id;
+        fresh.files = &.{};
+        fresh.file_fingerprints = &.{};
+        fresh.cover = cover;
+        return persistRoot(a, result_alloc, store, fresh, name, cancellation, previous, true, sort.manager, dictionary);
+    }
     var reverse_storage = pages.store();
     reverse_storage.reduce = @import("lake_index_predicate_ranges.zig").reduce;
     var predicates = predicate_blocks.Builder.init(a, sort.manager);
@@ -277,6 +294,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         sorted: *Sorted,
         cursor: ?RunSource = null,
         keep: []const bool,
+        retired: ?[]const u32 = null,
+        file_count: usize = 0,
         old: ?tree.Cursor.Record = null,
         fresh: ?tree.Cursor.Record = null,
         old_done: bool = false,
@@ -291,8 +310,17 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 const row = record.?;
                 if ((row.value.len != 16 and row.value.len != 70) or row.key.len < 16 or !std.mem.eql(u8, row.value[0..16], row.key[row.key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
                 const ordinal = std.mem.readInt(u32, row.value[0..4], .big);
-                if (ordinal >= self.keep.len) return error.InvalidNativeLakeRowIndex;
-                if (self.keep[ordinal]) self.old = row;
+                if (self.retired) |retired| {
+                    if (ordinal >= self.file_count) return error.InvalidNativeLakeRowIndex;
+                    if (std.sort.binarySearch(u32, retired, ordinal, struct {
+                        fn order(key_: u32, value: u32) std.math.Order {
+                            return std.math.order(key_, value);
+                        }
+                    }.order) == null) self.old = row;
+                } else {
+                    if (ordinal >= self.keep.len) return error.InvalidNativeLakeRowIndex;
+                    if (self.keep[ordinal]) self.old = row;
+                }
             }
             if (self.fresh == null and !self.fresh_done) {
                 self.fresh = try self.sorted.next();
@@ -311,9 +339,9 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             return fresh;
         }
     };
-    var merge: Merge = .{ .sorted = &sorted, .keep = delta.keep };
+    var merge: Merge = .{ .sorted = &sorted, .keep = delta.keep, .retired = if (delta.sparse_slots) delta.retired_slots orelse return error.InvalidNativeLakeRowIndex else null, .file_count = if (delta.previous) |previous| previous.fileCount() else 0 };
     if (delta.previous) |previous| {
-        if (!std.mem.eql(u8, &previous.domain, &scope.domain) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or delta.keep.len != previous.fileCount()) return error.InvalidNativeLakeRowIndex;
+        if (!std.mem.eql(u8, &previous.domain, &scope.domain) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or (!delta.sparse_slots and delta.keep.len != previous.fileCount())) return error.InvalidNativeLakeRowIndex;
         merge.cursor = try RunSource.init(a, pages.store(), previous, sort.manager);
     }
     defer if (merge.cursor) |*cursor| cursor.deinit();
@@ -325,7 +353,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     const has_delta = if (delta.previous) |previous| blk: {
         if (previous.building or delta.run_only or previous.tie_version != 1 or previous.reverse == null or (previous.page != null and previous.predicates == null)) break :blk false;
         var removed: u64 = 0;
-        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots };
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots, .count = if (delta.sparse_slots) previous.fileCount() else null };
         while (try retirements.next()) |slot| {
             var lower: [4]u8 = undefined;
             var upper: [4]u8 = undefined;
@@ -343,7 +371,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         // Walk only the reverse ranges belonging to replaced/removed files.
         // Every cursor stays on the retained prior root while copy-on-write
         // mutations publish a new candidate, never a partially visible index.
-        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots };
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots, .count = if (delta.sparse_slots) previous.fileCount() else null };
         while (try retirements.next()) |slot| {
             var prefix: [4]u8 = undefined;
             std.mem.writeInt(u32, &prefix, @intCast(slot), .big);
@@ -445,11 +473,16 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         if (!delta.run_only and delta.reverse_built and (page != null) != (reverse != null)) return error.InvalidNativeLakeRowIndex;
     }
     const predicate_root = if (delta.run_only) null else try predicates.publish(pages.store(), if (has_delta) delta.previous.?.predicates else null);
-    const files: [][]const u8 = if (delta.files.len == 0) try a.alloc([]const u8, inventory.files.len) else @constCast(&.{});
+    const files: [][]const u8 = if (delta.files.len == 0 and delta.dictionary_edits == null) try a.alloc([]const u8, inventory.files.len) else @constCast(&.{});
     defer a.free(files);
-    for (files, if (delta.files.len == 0) inventory.files else &.{}) |*file, entry| file.* = entry.file_id;
+    for (files, if (delta.files.len == 0 and delta.dictionary_edits == null) inventory.files else &.{}) |*file, entry| file.* = entry.file_id;
     var dictionary: ?file_dictionary.Roots = null;
-    if (delta.dictionary_slots) |slots| {
+    if (delta.dictionary_edits) |edits| {
+        const previous = delta.previous orelse return error.InvalidNativeLakeRowIndex;
+        const shared = delta.public_navigation orelse return error.InvalidNativeLakeRowIndex;
+        if (!std.mem.eql(u8, shared.source, inventory.source_id) or !std.mem.eql(u8, shared.snapshot, inventory.snapshot_id)) return error.ExternalLakeSnapshotMismatch;
+        dictionary = try file_dictionary.applyEdits(a, pages.store(), previous.file_dictionary orelse return error.InvalidNativeLakeRowIndex, edits, shared);
+    } else if (delta.dictionary_slots) |slots| {
         const previous = delta.dictionary_previous orelse delta.previous orelse return error.InvalidNativeLakeRowIndex;
         dictionary = try file_dictionary.updateFingerprints(a, pages.store(), previous.file_dictionary orelse return error.InvalidNativeLakeRowIndex, delta.files, delta.fingerprints, slots);
     }

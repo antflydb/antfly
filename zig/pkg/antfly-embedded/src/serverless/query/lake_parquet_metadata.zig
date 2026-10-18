@@ -689,9 +689,9 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     try reader.admitAllocation(SchemaColumn, list.len);
     try reader.admitAllocation([]const u8, list.len);
     const elements = try alloc.alloc(SchemaElement, list.len);
-    errdefer alloc.free(elements);
+    defer alloc.free(elements);
     var initialized: usize = 0;
-    errdefer {
+    defer {
         for (elements[0..initialized]) |*element| element.deinit(alloc);
     }
     for (elements) |*element| {
@@ -711,8 +711,6 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     try collectSchemaColumnsAlloc(alloc, reader, elements, &cursor, elements[0].child_count, false, &path, &columns, 0);
     if (cursor != elements.len) return error.InvalidParquetMetadata;
 
-    for (elements) |*element| element.deinit(alloc);
-    alloc.free(elements);
     return try columns.toOwnedSlice(alloc);
 }
 

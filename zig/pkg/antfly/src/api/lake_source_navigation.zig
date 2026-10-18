@@ -604,7 +604,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                     self.changed[i] = !std.mem.eql(u8, &old.digest, &self.current[i].digest);
                     if (!self.changed[i]) return;
                 }
-                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest });
+                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest, .aggregate_digest = @import("lake_index_native_aggregates.zig").inventoryFileIdentity(self.provider.source.inventory, old.file) });
                 try self.files.add(id, null);
                 try self.private.add(&old.digest, null);
                 if (self.files.changes.items.len >= 64) {

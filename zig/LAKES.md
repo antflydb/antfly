@@ -1176,5 +1176,13 @@ The native reader supports plain and dictionary pages plus DELTA_BINARY_PACKED,
 DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT. Both nullable V1
 and V2 pages use the same selected-row semantics. Delta navigation keeps compact
 predecessor checkpoints; split streams gather selected lanes; prefix strings are
-reconstructed when demanded. Complete materializers share the same physical codec.
+reconstructed when demanded. Complete materializers fill final typed vectors directly. NULL-only delta pages
+and unused terminal miniblock widths are supported.
 The encoding is detected from Parquet metadata and requires no attachment option.
+
+
+Small compatible index refreshes use authenticated source deltas for algebraic
+reduction trees and ordered file-slot dictionaries (reader protocol 55). Unchanged
+branches and file slots survive without rebuilding complete per-index catalogs.
+Older/incomplete seeds reconcile conservatively; dense ordered refreshes retain
+bounded compaction. This changes refresh efficiency without adding SQL options.
