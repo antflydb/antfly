@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 pub const default_max_requests: usize = 1000;
 pub const Options = struct {
     typesafe_api_key: ?[]const u8 = null,
+    workspace_watch: bool = false,
     workspace_memory_limit: usize = 256 * 1024 * 1024,
     workspace_max_files: usize = 100000,
     table_config: ?[]const u8 = null,
@@ -393,6 +394,7 @@ pub const Options = struct {
                     .{ "--type-list", "type_list" },
                     .{ "--no-cache", "no_cache" },
                     .{ "--cached-only", "cached_only" },
+                    .{ "--workspace-watch", "workspace_watch" },
                     .{ "--triage", "triage" },
                     .{ "--broad", "broad" },
                     .{ "--refine", "refine" },

@@ -68,6 +68,7 @@ const help =
     \\      --decision-batch-wait-ms N  Cross-file gather window (default 1ms; 0 disables)
     \\      --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)
     \\      --workspace-memory-limit SIZE  Retained snapshot cap (default 256M)
+    \\      --workspace-watch        Use kernel witnesses for explicit refresh
     \\      --workspace-max-files N  Snapshot entry cap (default 100000)
     \\      --max-pending-output N  Ranked output memory cap (default 64MiB)
     \\      --dictionary-format FORMAT  auto/raw/brotli/brotli-google

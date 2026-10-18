@@ -19,6 +19,8 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const Options = @import("options.zig").Options;
 const source = @import("source_cache.zig");
+const Watch = @import("source_watch.zig").Watch;
+const Token = @import("source_watch.zig").Token;
 const Budget = @import("antfly_regex").Budget;
 pub const Entry = struct {
     blob: *Blob,
@@ -36,15 +38,35 @@ pub const Generation = struct {
     revision: [64]u8 = undefined,
     captured_at: i64 = 0,
     source_bytes: usize = 0,
+    watch_fallback: bool = false,
+    source_bytes_read: usize = 0,
+    source_bytes_reused: usize = 0,
     preparations_built: usize = 0,
     preparations_reused: usize = 0,
     pub fn capture(a: A, io: std.Io, o: *const Options, previous: ?*const Generation) !*Generation {
+        return captureWatched(a, io, o, previous, null);
+    }
+    pub fn captureWatched(a: A, io: std.Io, o: *const Options, previous: ?*const Generation, watcher: ?*Watch) !*Generation {
+        if (watcher) |w| w.beginRefresh();
+        return captureOnce(a, io, o, previous, watcher) catch |err| {
+            if (watcher) |w| if (w.fd >= 0) {
+                // Witness resources must never turn a capture that fits without
+                // watchers into an error. Retry once with every witness lost.
+                w.deinit();
+                const next = try captureOnce(a, io, o, previous, watcher);
+                next.watch_fallback = true;
+                return next;
+            };
+            return err;
+        };
+    }
+    fn captureOnce(a: A, io: std.Io, o: *const Options, previous: ?*const Generation, watcher: ?*Watch) !*Generation {
         if (o.workspace_memory_limit < @sizeOf(Generation)) return error.OutOfMemory;
         const self = try a.create(Generation);
         self.* = .{ .backing = a, .budget = .{ .backing = a, .limit = o.workspace_memory_limit - @sizeOf(Generation) }, .arena = undefined };
         self.arena = .init(self.budget.allocator());
         errdefer self.deinit();
-        var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous };
+        var collector = Collector{ .generation = self, .io = io, .options = o, .previous = previous, .watcher = watcher };
         if (o.paths.items.len == 0) try collector.path(".") else for (o.paths.items) |path| try collector.path(path);
         std.mem.sort(Entry, self.entries.items, {}, struct {
             fn less(_: void, x: Entry, y: Entry) bool {
@@ -104,10 +126,14 @@ const Blob = struct {
     arena: std.heap.ArenaAllocator,
     bytes: []const u8 = "",
     prepared: ?source.Prepared = null,
+    stamp: ?std.Io.File.Stat = null,
+    watcher: ?*Watch = null,
+    token: ?Token = null,
     fn release(self: *Blob) void {
         self.refs -= 1;
         if (self.refs != 0) return;
         const a = self.backing;
+        if (self.watcher) |watcher| if (self.token) |token| watcher.release(token);
         self.arena.deinit();
         a.destroy(self);
     }
@@ -144,6 +170,7 @@ const Collector = struct {
     io: std.Io,
     options: *const Options,
     previous: ?*const Generation,
+    watcher: ?*Watch = null,
     fn path(self: *Collector, name: []const u8) !void {
         if (std.mem.eql(u8, name, "-")) return error.WorkspaceStdinUnsupported;
         var scratch = std.heap.ArenaAllocator.init(self.generation.budget.allocator());
@@ -171,7 +198,6 @@ const Collector = struct {
     fn addFile(self: *Collector, path_name: []const u8, display: []const u8, explicit_file: bool) !void {
         const generation = self.generation;
         if (generation.entries.items.len >= self.options.workspace_max_files) return error.WorkspaceFileLimit;
-        const a = generation.arena.allocator();
         var file_handle = try std.Io.Dir.cwd().openFile(self.io, path_name, .{});
         defer file_handle.close(self.io);
         const before = try file_handle.stat(self.io);
@@ -179,6 +205,18 @@ const Collector = struct {
         if (before.size > self.options.max_file_bytes and self.options.skip_oversize) return;
         const available = generation.budget.limit -| generation.budget.live;
         if (available < @sizeOf(Blob)) return error.OutOfMemory;
+        if (self.watcher) |watcher| if (if (self.previous) |old| old.find(display) else null) |old| {
+            if (old.blob.token != null and old.blob.watcher == watcher and old.blob.stamp != null and sameStamp(old.blob.stamp.?, before) and watcher.clean(old.blob.token.?, file_handle)) {
+                if (old.blob.budget.live + @sizeOf(Blob) > available) return error.OutOfMemory;
+                old.blob.refs += 1;
+                errdefer old.blob.release();
+                try self.append(old.blob, display, explicit_file, old.revision, true, available);
+                generation.source_bytes_reused += old.bytes.len;
+                return;
+            }
+        };
+        var token = if (self.watcher) |w| w.arm(file_handle) else null;
+        defer if (token) |value| self.watcher.?.release(value);
         var blob = try generation.backing.create(Blob);
         // Use the ordinary search allocator for parser/capture arenas so
         // bounded parser outcomes remain identical across both entry points.
@@ -191,6 +229,8 @@ const Collector = struct {
         const after = try file_handle.stat(self.io);
         if (before.inode != after.inode or before.size != after.size or after.size != blob.bytes.len or
             before.mtime.nanoseconds != after.mtime.nanoseconds or before.ctime.nanoseconds != after.ctime.nanoseconds) return error.WorkspaceChangedDuringCapture;
+        generation.source_bytes_read += blob.bytes.len;
+        if (token) |value| self.watcher.?.certify(value);
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(blob.bytes, &digest, .{});
         const revision = std.fmt.bytesToHex(digest, .lower);
@@ -212,6 +252,19 @@ const Collector = struct {
             const prepared: source.Prepared = .{ .lines = try source.lines(temp, blob.bytes, '\n', false), .index = try @import("source.zig").parse(temp, display, blob.bytes) };
             blob.prepared = try clonePrepared(blob.arena.allocator(), temp, blob.bytes, prepared);
         }
+        if (blob.watcher) |w| if (blob.token) |old| w.release(old);
+        blob.watcher = self.watcher;
+        blob.token = token;
+        blob.stamp = before;
+        token = null;
+        try self.append(blob, display, explicit_file, revision, reused, available);
+    }
+    fn sameStamp(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
+        return a.inode == b.inode and a.kind == b.kind and a.size == b.size and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
+    }
+    fn append(self: *Collector, blob: *Blob, display: []const u8, explicit_file: bool, revision: [64]u8, reused: bool, available: usize) !void {
+        const generation = self.generation;
+        const a = generation.arena.allocator();
         const charge = blob.budget.live + @sizeOf(Blob);
         if (charge > available) return error.OutOfMemory;
         generation.budget.limit -= charge;

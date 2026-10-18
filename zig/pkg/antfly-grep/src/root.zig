@@ -147,25 +147,40 @@ const WorkspaceReuse = struct {
     // Hash effective field values, never ArrayList capacities or pointer bytes.
     // This deliberately includes every option, including auth and policy, so a
     // new option cannot accidentally reuse outcomes from an incompatible query.
+    fn presentationField(comptime name: []const u8) bool {
+        inline for (.{ "before", "after", "max_result_files", "max_regions_per_file", "max_columns", "max_columns_preview", "source_excerpt_bytes", "line_numbers", "line_numbers_explicit", "column", "byte_offset", "heading", "filename", "color", "colors", "json_compact", "stats", "suppress_progress", "line_buffered", "block_buffered", "field_match_separator", "field_context_separator", "context_separator", "path_separator", "null_paths", "trim", "hyperlink_format" }) |field| if (std.mem.eql(u8, name, field)) return true;
+        return false;
+    }
     pub fn identity(a: Allocator, o: *const Options) ![32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        return (try identities(a, o)).full;
+    }
+    pub fn evaluationIdentity(a: Allocator, o: *const Options) ![32]u8 {
+        return (try identities(a, o)).evaluation;
+    }
+    pub fn identities(a: Allocator, o: *const Options) !struct { full: [32]u8, evaluation: [32]u8 } {
+        @setEvalBranchQuota(100000);
+        var full = std.crypto.hash.sha2.Sha256.init(.{});
+        var evaluation = std.crypto.hash.sha2.Sha256.init(.{});
         inline for (@typeInfo(Options).@"struct".field_names) |name| {
             const value = @field(o.*, name);
             const T = @TypeOf(value);
-            const json = if (@typeInfo(T) == .@"struct" and @hasField(T, "items"))
-                try std.json.Stringify.valueAlloc(a, value.items, .{})
-            else
-                try std.json.Stringify.valueAlloc(a, value, .{});
+            const json = if (@typeInfo(T) == .@"struct" and @hasField(T, "items")) try std.json.Stringify.valueAlloc(a, value.items, .{}) else try std.json.Stringify.valueAlloc(a, value, .{});
             defer a.free(json);
-            hash.update(name);
             var size: [8]u8 = undefined;
             std.mem.writeInt(u64, &size, json.len, .little);
-            hash.update(&size);
-            hash.update(json);
+            full.update(name);
+            full.update(&size);
+            full.update(json);
+            if (comptime !presentationField(name)) {
+                evaluation.update(name);
+                evaluation.update(&size);
+                evaluation.update(json);
+            }
         }
-        var key: [32]u8 = undefined;
-        hash.final(&key);
-        return key;
+        var result: struct { full: [32]u8, evaluation: [32]u8 } = undefined;
+        full.final(&result.full);
+        evaluation.final(&result.evaluation);
+        return .{ .full = result.full, .evaluation = result.evaluation };
     }
 };
 const Ranking = @import("ranked.zig").Heap(Candidate);
@@ -177,6 +192,9 @@ pub const Search = struct {
     pub const Reuse = WorkspaceReuse;
     reuse: ?*Reuse = null,
     reuse_identity: ?[32]u8 = null,
+    evaluation_identity: ?[32]u8 = null,
+    if_result_token: ?[]const u8 = null,
+    query_reuse_eligible: bool = false,
     region_plans: ?*@import("region_plan.zig").Cache = null,
     executor: ?*@import("worker_pool.zig").Pool = null,
     workspace_generation: ?*const @import("workspace_store.zig").Generation = null,
@@ -201,7 +219,7 @@ pub const Search = struct {
     independent_override: ?bool = null,
     reserved_output: usize = 0,
     index_worker: ?*Search = null,
-    local_cwd: ?[]const u8 = null,
+    local_cwd: ?[:0]const u8 = null,
     owns_cwd: bool = false,
     provenance: @import("document.zig").Provenance = .{},
     dictionary: ?*ExternalDictionary = null,
@@ -270,6 +288,7 @@ pub const Search = struct {
         result.region_plans = root.region_plans;
         result.reuse = root.reuse;
         result.reuse_identity = root.reuse_identity;
+        result.evaluation_identity = root.evaluation_identity;
         result.decider.shareCache(&root.decider);
         result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
@@ -351,28 +370,39 @@ pub const Search = struct {
             try self.decider.ensureLocal();
         }
         const implicit_directory = self.options.ask != null and self.options.paths.items.len == 0 and self.options.table_config == null and (try std.Io.File.stdin().isTty(self.io));
-        if (self.options.ask != null and self.options.ranked and self.options.sort == null and
+        self.query_reuse_eligible = (self.options.ask != null and self.options.ranked and self.options.sort == null and
             self.options.max_result_files != std.math.maxInt(usize) and !self.hasStdinPath() and
             (self.options.paths.items.len > 0 or self.options.table_config != null or implicit_directory) and
             !self.options.quiet and !self.options.count and !self.options.count_matches and
             !self.options.files and !self.options.files_with_matches and !self.options.files_without_match and
-            !self.options.inventory and !self.options.multiline)
-        {
+            !self.options.inventory and !self.options.multiline);
+        const query_key = self.queryReuseKey();
+        if (query_key) |key| if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
+            defer pinned.release();
+            self.summary = pinned.value.summary;
+            self.summary.query_cache_hits = 1;
+            self.summary.file_evaluation_cache_hits = 0;
+            self.decider.evidence_times.merge(pinned.times);
+            const token = std.fmt.bytesToHex(pinned.token, .lower);
+            var unchanged = false;
+            if (!self.limits.cancel.load(.acquire)) {
+                if (self.if_result_token != null and std.mem.eql(u8, self.if_result_token.?, &token)) {
+                    unchanged = true;
+                    try self.protocolJson(.{ .type = "workspace_unchanged", .result_token = token, .revision = self.workspace_generation.?.revision, .observed_at = self.workspace_generation.?.captured_at }, false);
+                } else try self.renderCandidates(pinned.value.items, pinned.value.considered, true);
+            }
+            const code = try self.finish(started);
+            if (code <= 1 and !unchanged) {
+                try self.protocolJson(.{ .type = "result_token", .result_token = token }, true);
+                try self.flushOutput();
+            }
+            return code;
+        };
+        if (self.query_reuse_eligible) {
             const ranking = try self.a.create(Ranking);
             ranking.* = .{ .a = self.a, .io = self.io, .limits = &self.limits, .capacity = self.options.max_result_files, .max_bytes = self.options.max_pending_output };
             self.ranking = ranking;
             self.owns_ranking = true;
-        }
-        const query_key = self.queryReuseKey();
-        if (query_key) |key| {
-            var arena = std.heap.ArenaAllocator.init(self.a);
-            defer arena.deinit();
-            if (self.reuse.?.queries.get(arena.allocator(), key, self.options.cache_ttl_seconds) catch null) |hit| {
-                try self.restoreQuery(hit.value);
-                self.decider.evidence_times.merge(hit.times);
-                try self.emitRanked();
-                return self.finish(started);
-            }
         }
         const single_regular_file = if (self.workspace_generation) |generation| generation.entries.items.len == 1 else self.options.paths.items.len == 1 and !self.hasStdinPath() and
             (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
@@ -471,10 +501,36 @@ pub const Search = struct {
             self.decider.peak_request_bytes = @max(self.decider.peak_request_bytes, client.peak_request_bytes);
         }
         const code = try self.finish(started);
-        if (query_key) |key| if (code <= 1 and self.summary.complete and !self.limits.cancel.load(.monotonic)) self.saveQuery(key);
+        if (query_key) |key| if (code <= 1 and self.summary.complete and !self.limits.cancel.load(.monotonic)) {
+            self.saveQuery(key);
+            if (self.reuse.?.queries.lease(key, self.options.cache_ttl_seconds)) |pinned| {
+                defer pinned.release();
+                try self.protocolJson(.{ .type = "result_token", .result_token = std.fmt.bytesToHex(pinned.token, .lower) }, true);
+                try self.flushOutput();
+            }
+        };
         return code;
     }
+    // Protocol metadata is observation-global. It must not acquire a file's
+    // source envelope or make an otherwise successful bounded search fail.
+    fn protocolJson(self: *Search, value: anytype, optional: bool) !void {
+        const bytes = std.json.Stringify.valueAlloc(self.a, value, .{}) catch |err| {
+            if (optional) return;
+            return err;
+        };
+        defer self.a.free(bytes);
+        if (bytes.len + 1 > self.options.max_output_bytes - self.output_bytes) {
+            if (optional) return;
+            return error.OutputBudgetExceeded;
+        }
+        try self.write(bytes);
+        try self.write("\n");
+    }
     fn finish(self: *Search, started: std.Io.Timestamp) !u8 {
+        if (self.limits.cancel.load(.acquire) and self.summary.complete and !self.options.quiet) {
+            self.summary.complete = false;
+            try self.reportError("<search>", error.Canceled);
+        }
         const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0;
         const human = try std.fmt.allocPrint(self.a, "{d:.6}s", .{seconds});
@@ -2182,11 +2238,14 @@ pub const Search = struct {
     fn emitRanked(self: *Search) !void {
         const ranking = self.ranking.?;
         ranking.sort();
+        try self.renderCandidates(ranking.items.items, ranking.considered, false);
+    }
+    fn renderCandidates(self: *Search, items: anytype, considered: usize, comptime cached: bool) !void {
         if (self.options.jev_mode and !self.options.json) {
             const header = try std.fmt.allocPrint(self.a, "Search: {s}\n{d} files searched; {d} selected source lines; {s}\n", .{ self.options.ask.?, self.summary.files, self.summary.matches, if (self.summary.complete) "complete" else "incomplete" });
             defer self.a.free(header);
             try self.write(header);
-            for (ranking.items.items) |c| {
+            for (items) |c| {
                 const row = try std.fmt.allocPrint(self.a, "  {s}  {d:.3}\n", .{ c.path, c.score });
                 defer self.a.free(row);
                 try self.write(row);
@@ -2200,18 +2259,23 @@ pub const Search = struct {
         var forward = ForwardSink{ .search = self, .writer = .{ .vtable = &.{ .drain = ForwardSink.drain }, .buffer = &.{} } };
         forward.started = true;
         renderer.sink = &forward.writer;
-        for (ranking.items.items) |c| {
+        for (items) |c| {
+            if (self.limits.cancel.load(.acquire)) return;
             try self.rankedBoundary(c.filename);
             const render_started = std.Io.Clock.awake.now(self.io);
             render_options.max_output_bytes = self.options.max_output_bytes - self.output_bytes;
             renderer.summary = c.summary;
             renderer.best_probability = c.score;
             renderer.provenance = c.provenance;
+            if (cached) {
+                renderer.provenance.snapshot = &self.workspace_generation.?.revision;
+                renderer.provenance.observed_at = self.workspace_generation.?.captured_at;
+            }
             renderer.render_filename = c.filename;
             renderer.color_enabled = c.color;
             renderer.header_printed = false;
             renderer.file_started = null;
-            renderer.file_elapsed_ns = c.elapsed_ns;
+            renderer.file_elapsed_ns = if (cached) 0 else c.elapsed_ns;
             renderer.file_output_start = 0;
             renderer.output_bytes = 0;
             renderer.json_started = false;
@@ -2229,10 +2293,10 @@ pub const Search = struct {
                 renderer.emit(c.path, row.raw[0..row.length], row.line, row.offset, row.matched, row.probability) catch |err| return forward.failure orelse err;
             }
             // Add actual rendering work, excluding the wait for other candidates.
-            renderer.file_elapsed_ns = c.elapsed_ns + @as(i96, @intCast(@max(0, render_started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)));
+            renderer.file_elapsed_ns = (if (cached) @as(i96, 0) else c.elapsed_ns) + @as(i96, @intCast(@max(0, render_started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds)));
             renderer.jsonEnd(c.path, c.before) catch |err| return forward.failure orelse err;
         }
-        const omitted = ranking.considered - ranking.items.items.len;
+        const omitted = considered - items.len;
         if (omitted > 0) {
             if (self.options.json) try self.json(.{ .type = "omitted_files", .count = omitted }) else {
                 const row = try std.fmt.allocPrint(self.a, "[omitted {d} qualifying files; increase -n/--max-result-files]\n", .{omitted});
@@ -2454,14 +2518,14 @@ pub const Search = struct {
         try self.write(output.written());
     }
     fn evaluationReuseKey(self: *Search, path: []const u8) ?[32]u8 {
-        if (self.reuse == null or self.reuse_identity == null or self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return null;
+        if (self.reuse == null or self.evaluation_identity == null or self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return null;
         // A complete outcome cannot stand in for the prefix an interrupted
         // finite-budget evaluation would have produced after another file grew.
         if (self.options.max_regions != std.math.maxInt(usize)) return null;
         const entry = self.workspace_entry orelse return null;
         if (entry.prepared == null or self.options.crlf or self.options.null_data) return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(&self.reuse_identity.?);
+        hash.update(&self.evaluation_identity.?);
         hash.update(&entry.revision);
         hash.update(path);
         var key: [32]u8 = undefined;
@@ -2471,7 +2535,8 @@ pub const Search = struct {
     fn evaluateFile(self: *Search, a: Allocator, path: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !bool {
         const evidence = self.evidence.?;
         const key = self.evaluationReuseKey(path);
-        if (key) |k| if (self.reuse.?.files.get(a, k, self.options.cache_ttl_seconds) catch null) |hit| {
+        if (key) |k| if (self.reuse.?.files.lease(k, self.options.cache_ttl_seconds)) |hit| {
+            defer hit.release();
             const v = hit.value;
             if (v.line_count == selected.len) {
                 if (self.shared_limits) |limits| if (!Limits.reserve(&limits.regions, v.evaluated, self.options.max_regions)) return error.RegionBudgetExceeded;
@@ -2489,7 +2554,8 @@ pub const Search = struct {
                     }
                 }
                 evidence.regions = .empty;
-                try evidence.regions.appendSlice(a, v.regions);
+                evidence.regions.items = try retainedClone(@TypeOf(v.regions), a, v.regions, 0);
+                evidence.regions.capacity = evidence.regions.items.len;
                 evidence.file_score = v.file_score;
                 self.best_probability = v.best;
                 self.summary.regions_considered += v.considered;
@@ -2534,7 +2600,7 @@ pub const Search = struct {
         return !preview_rejected;
     }
     fn queryReuseKey(self: *Search) ?[32]u8 {
-        if (self.reuse == null or self.reuse_identity == null or self.ranking == null or self.options.no_cache or self.options.cache_dir == null or self.options.cache_ttl_seconds == 0) return null;
+        if (self.reuse == null or self.reuse_identity == null or !self.query_reuse_eligible or self.options.no_cache or self.options.cache_dir == null or self.options.cache_ttl_seconds == 0) return null;
         const generation = self.workspace_generation orelse return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&self.reuse_identity.?);
@@ -2552,29 +2618,6 @@ pub const Search = struct {
             inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| @field(saved, name) = @field(candidate, name);
         }
         self.reuse.?.queries.put(key, self.decider.evidence_times, .{ .summary = self.summary, .considered = ranking.considered, .items = items });
-    }
-    fn restoreQuery(self: *Search, value: SavedQuery) !void {
-        self.summary = value.summary;
-        self.summary.query_cache_hits = 1;
-        self.summary.file_evaluation_cache_hits = 0;
-        const ranking = self.ranking.?;
-        for (value.items) |saved| {
-            if (self.limits.cancel.load(.monotonic)) return error.Canceled;
-            const candidate = try self.a.create(Candidate);
-            candidate.* = .{ .a = self.a, .budget = .{ .backing = self.a, .limit = self.options.max_pending_output }, .arena = undefined };
-            candidate.arena = .init(candidate.budget.allocator());
-            var transferred = false;
-            defer if (!transferred) candidate.deinit();
-            inline for (@typeInfo(SavedCandidate).@"struct".field_names) |name| @field(candidate, name) = try retainedClone(@FieldType(SavedCandidate, name), candidate.arena.allocator(), @field(saved, name), 0);
-            // Snapshot content can be identical after refresh; observation
-            // metadata must always describe the current published generation.
-            candidate.provenance.snapshot = &self.workspace_generation.?.revision;
-            candidate.provenance.observed_at = self.workspace_generation.?.captured_at;
-            candidate.elapsed_ns = 0;
-            transferred = true;
-            try ranking.offer(candidate);
-        }
-        ranking.considered = value.considered;
     }
     fn evaluate(self: *Search, a: Allocator, path_name: []const u8, bytes: []const u8, lines: []const Line, selected: []bool, probabilities: []f64) !void {
         var regions: std.ArrayList(Region) = .empty;
@@ -3421,6 +3464,7 @@ test {
     _ = @import("workspace_store.zig");
     _ = @import("worker_pool.zig");
     _ = @import("region_plan.zig");
+    _ = @import("source_watch.zig");
     _ = @import("spill.zig");
     _ = @import("ranked.zig");
     _ = @import("batch_store.zig");
@@ -3499,3 +3543,42 @@ test "retained evaluation runs preserve NaN bits and fall back for variable scor
     for (&scores, 0..) |*score, i| score.* = @floatFromInt(i);
     try std.testing.expectEqual(@as(usize, 0), (try evaluationRuns(a, &selected, &probabilities, &scores)).len);
 }
+
+test "JSON search owns the complete sentinel-terminated cwd allocation" {
+    const o: Options = .{ .json = true };
+    var search = try Search.init(std.testing.allocator, std.testing.io, &o);
+    search.deinit();
+}
+
+test "cancelled cached empty results are incomplete and do not acknowledge tokens" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var o: Options = .{ .ask = "q", .cache_dir = "unused", .cached_only = true, .max_result_files = 1, .json = true, .suppress_progress = true };
+    defer o.deinit(a);
+    try o.paths.append(a, ".");
+    var generation: @import("workspace_store.zig").Generation = .{ .backing = a, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .arena = .init(a), .revision = @splat('a') };
+    defer generation.arena.deinit();
+    var reuse = ReuseForTest.init(a, io);
+    defer reuse.deinit();
+    var search = try Search.init(a, io, &o);
+    defer search.deinit();
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    search.sink = &output.writer;
+    search.workspace_generation = &generation;
+    search.reuse = &reuse;
+    search.reuse_identity = @splat(1);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(&search.reuse_identity.?);
+    hash.update(&generation.revision);
+    var key: [32]u8 = undefined;
+    hash.final(&key);
+    var times: @import("reuse_cache.zig").Times = .{};
+    times.add(std.Io.Clock.real.now(io).toSeconds());
+    reuse.queries.put(key, times, .{ .summary = .{}, .considered = 0, .items = &.{} });
+    search.limits.cancel.store(true, .monotonic);
+    try std.testing.expectEqual(@as(u8, 2), try search.run());
+    try std.testing.expect(!search.summary.complete);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "result_token") == null);
+}
+const ReuseForTest = WorkspaceReuse;

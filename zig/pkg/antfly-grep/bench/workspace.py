@@ -340,7 +340,7 @@ def main():
                 },
                 "profile_queries": profiled_queries,
                 "trimmed": trimmed,
-                "limitations": "Warm filesystem on this host, explicit immutable snapshot, native constant-score fixture. Pinned query latency excludes capture/refresh; ordinary latency includes process startup. Both timers include consumer JSON decoding. Both paths read and return the same selected evidence. Retained memory excludes per-query scratch and the old generation during transactional refresh. No live-model quality, billing or independent Linux hardware claims.",
+                "limitations": "Warm filesystem on this host, explicit immutable snapshot, native constant-score fixture. Pinned query latency excludes capture/refresh; ordinary latency includes process startup. Client elapsed includes consumer JSON decoding; engine elapsed includes output backpressure but excludes client decoding work and final summary serialization. Both paths read and return the same selected evidence. Retained memory excludes per-query scratch and the old generation during transactional refresh. No live-model quality, billing or independent Linux hardware claims.",
             }
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n")

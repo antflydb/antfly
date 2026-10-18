@@ -1998,17 +1998,25 @@ highly variable outcomes use the smaller dense representation. Optional run cons
 budgets deliberately use ordinary per-file evaluation so partial-prefix behavior
 is preserved when another file grows after refresh.
 
-Cache identity hashes all effective options, including provider credentials,
-model/revision, policies, thresholds, rendering and budget options; document
-content and paths scope file entries, and the snapshot scopes complete queries.
+Complete-query identity hashes all effective options, including provider credentials,
+model/revision, policies, thresholds, rendering and budgets. File-evaluation identity
+excludes only an explicit presentation-field allowlist (context shown, top-k/output
+caps, styling, IDs and separators); context used by the model, evaluation/refinement
+controls, policies, credentials and budgets remain part of that identity. Content
+and paths scope file entries, and the snapshot scopes complete queries.
 Both caches expire at the earliest contributing judgment timestamp, including
 negative evidence and omitted files, and reject excessive future clock skew.
 Reading does not extend expiry. Interrupted/failed/incomplete evaluations never
 become complete hits. `--no-cache`, zero TTL, cache-only provider restrictions,
 changed identities, eviction and allocation failures keep their ordinary
-fallback behavior. Individual entries use at most one quarter of their cache's
-budget, including construction headroom. Cache lookup/render scratch and
-allocator metadata are additional to retained-entry accounting.
+fallback behavior. Both caches are four-way associative with per-set LRU replacement.
+Admission constructs an independent candidate before committing any eviction;
+failed/oversized admissions preserve existing entries, including same-key entries.
+Immutable leases pin values during rendering, avoiding deep copies, heap rebuilding
+and repeated sorting. Active evicted leases and construction share the physical
+cap. Each entry's construction budget is at most one quarter of the cache cap;
+permanent construction headroom reserves that quarter plus one entry header.
+Lookup/render scratch and allocator metadata remain additional memory.
 
 Region-key preparation now runs only after a batch reserves its region budget,
 and observes cancellation between regions. A new query with `--max-regions=0`
@@ -2025,12 +2033,46 @@ resident until close. Combined retained cache caps are now 16 + 8 + 4 + 4 MiB
 (plans, file outcomes, complete queries, batch payloads), versus the previous
 32 + 4 MiB. Lexical-only sessions no longer initialize provider resources.
 
-Refresh continues to rediscover, reread and hash sources conservatively; this
-change does not add a filesystem watcher or claim live filesystem freshness.
-A watcher remains a separate optimization requiring fail-closed overflow and
-watch-loss handling before it can safely bypass reads. Cache hits eliminate
-repeated evaluation/provider billing while valid; parsing requests, lookup,
-rendering, output, retained snapshots and refresh still consume resources.
+Refresh defaults to conservative discovery, reads and hashing. Opt in with
+`antfly-grep workspace serve --workspace-watch PATH` to let native kqueue (macOS)
+or inotify (Linux) witnesses skip unchanged content reads. Witness state is
+allocated only when explicitly enabled. Every refresh still
+rediscovers files and evaluates ignore/config rules; each reused path is opened
+and its device/inode, size, timestamps and live witness checked. Subscriptions
+are bounded (at most 256 macOS files/4096 Linux files, further capped by the
+file-descriptor limit); missing subscriptions, admission failures, overflow,
+watch loss, unsupported targets and errors fall back to ordinary reads. Linux
+event dispatch uses a bounded handle map. Capture retries without watches if
+watch resources cause a capture failure. `workspace_ready` reports
+`source_bytes_read`, `source_bytes_reused` and `watch_fallback`.
+
+Use watching only where kernel events cover the writers/filesystem in use.
+Linux mmap writes and remote filesystem changes may not produce inotify events.
+Send `{"version":1,"id":5,"op":"refresh","force_rescan":true}` for a conservative
+read/hash capture that also rebuilds witnesses. Trim drops witnesses and the
+next refresh reads sources normally. Watches accelerate explicit refresh; they
+do not update the published snapshot or make captures globally atomic.
+
+Complete, admitted ranked results publish an optional 64-character `result_token`
+after the summary. Repeat the same search request with `if_result_token` to
+receive `workspace_unchanged`, a fresh summary and normal begin/end framing,
+avoiding repeated file/match output. Tokens are random cache-entry identities,
+not content or credential hashes. Acknowledgements require a valid revision,
+matching effective query/provider/policy identity, live unexpired evidence and
+an uncanceled query. Misses/eviction/trim/expired evidence take the normal search
+path; changed bytes produce a different snapshot. Conditional acknowledgements
+refer to the requested pinned snapshot, not the live filesystem. Clients must
+consume through `workspace_end`, require successful exit and complete summary,
+and retain their original result data. Optional token metadata is omitted when
+it would exceed the output budget; required responses use normal budget errors.
+
+Search cleanup preserves sentinel allocation length; canceled empty cache hits
+now finish incomplete with exit 2. Regressions cover these findings, transactional
+admission/collisions, lease lifetime, fresh compact IDs, conditional responses,
+presentation reuse and watched discovery/edits/replacements/forced rescans.
+Cache hits avoid repeated evaluation/provider billing while valid. Request
+parsing, lookup, validation, output, retained snapshots and refresh still consume
+resources; this is not zero-cost execution.
 
 
 The final native macOS campaign compares `c213e061` with this implementation,
@@ -2079,3 +2121,46 @@ isolated Docker VM; Windows runtime, independent Linux hardware performance and
 live-model relevance/billing remain unqualified. See
 [validation/source hashes](bench/results/reuse-validation.json) and
 [release archive contents/hashes](bench/results/reuse-archives.json).
+
+
+### Conditional replay qualification
+
+The current native macOS fixture campaign compares PR head `557b5f6b` with
+immutable leased replay. Alternating 51 paired queries preserve matched evidence,
+logical scan statistics, zero provider requests and zero source parses. Full
+replay is effectively unchanged: paired median speedup **1.02×**, process CPU
+about **0.78 ms/query** for each binary (coarse cumulative CPU sampling). Separate
+elapsed medians were 2.33/2.32 ms. This does not establish a substantial new
+full-output throughput win.
+
+A 128-file selected-result campaign measures the protocol savings separately:
+
+| Warm operation | Client elapsed median | Producer elapsed median | Response bytes median |
+|---|---:|---:|---:|
+| Full cached result | 2.25 ms | 1.75 ms | 419,059 |
+| Matching conditional token | 0.143 ms | 0.00283 ms | 1,212 |
+| New presentation, reused file judgments | 2.54 ms | 1.99 ms | 419,061 |
+
+Conditional requests transfer **99.7% fewer bytes** and reduce observed client
+elapsed time about **15.7×** on this fixture. Producer elapsed includes pipe
+backpressure and excludes option parsing/identity setup and summary serialization;
+client elapsed includes framing and Python JSON decoding. Neither timer is CPU
+time. Presentation variations miss complete-query reuse and hit all 128 file
+outcomes with zero provider calls. Repeated queries on unchanged inputs avoid
+provider evaluation only while evidence remains valid.
+
+On the same 128-file corpus, unchanged watched refresh reads **zero source bytes**
+(reusing 47,122 bytes), taking median **4.47 ms** versus **8.16 ms** for alternating
+forced conservative rescans. This is a small warm corpus, not a large-repository,
+cold-cache, native Linux hardware or remote-filesystem result. Measurements run
+on a shared macOS host and are not performance guarantees. The exact production
+binary sample reports **13.3 MB** physical footprint for the separate synthetic
+1024-file profile; no cross-workload RSS improvement is claimed.
+
+Evidence: [paired full replay](bench/results/replay-synthetic-paired-macos.json),
+[conditional/presentation/refresh](bench/results/replay-protocol-macos.json),
+[production-binary profile campaign](bench/results/replay-profile-macos.json),
+[sample](bench/results/replay-profile.sample.txt),
+[generated comparisons](bench/results/replay-differential.json),
+[validation/source hashes](bench/results/replay-validation.json), and
+[release archives](bench/results/replay-archives.json).

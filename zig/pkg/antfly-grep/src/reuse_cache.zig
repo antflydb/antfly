@@ -15,7 +15,7 @@
 
 //! Bounded process-local typed memoization. All values own their slices; no
 //! source generation, credential, query arena or worker is retained. A lookup
-//! copies under the lock, so eviction never leaves a borrowed cache pointer.
+//! leases pin immutable values; eviction never invalidates an active reader.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub fn retainedClone(comptime T: type, a: Allocator, value: T, depth: usize) error{ OutOfMemory, ResultNestingTooDeep }!T {
@@ -71,68 +71,120 @@ pub const Times = struct {
 pub fn Cache(comptime Value: type, comptime capacity: usize, comptime limit: usize) type {
     return struct {
         const Self = @This();
+        const ways = @min(4, capacity);
+        const reservation = limit / 4 + @sizeOf(Entry);
         const Entry = struct {
+            owner: *Self,
+            refs: std.atomic.Value(usize) = .init(1),
             budget: @import("antfly_regex").Budget,
             arena: std.heap.ArenaAllocator,
             key: [32]u8,
+            token: [32]u8,
+            stamp: u64 = 0,
             times: Times,
             value: Value,
+            fn release(entry: *Entry) void {
+                if (entry.refs.fetchSub(1, .acq_rel) != 1) return;
+                const owner = entry.owner;
+                _ = owner.physical.fetchSub(entry.budget.live + @sizeOf(Entry), .monotonic);
+                entry.arena.deinit();
+                owner.a.destroy(entry);
+            }
         };
         pub const Hit = struct { times: Times, value: Value };
+        pub const Lease = struct {
+            entry: *Entry,
+            times: Times,
+            value: Value,
+            token: [32]u8,
+            pub fn release(self: Lease) void {
+                self.entry.release();
+            }
+        };
         a: Allocator,
         io: std.Io,
         mutex: std.Io.Mutex = .init,
         slots: [capacity]?*Entry = @splat(null),
         bytes: usize = 0,
+        physical: std.atomic.Value(usize) = .init(0),
         clock: usize = 0,
+        stamp: u64 = 0,
         pub fn deinit(self: *Self) void {
             for (&self.slots) |*slot| self.remove(slot);
         }
         fn remove(self: *Self, slot: *?*Entry) void {
             if (slot.*) |entry| {
                 self.bytes -= entry.budget.live + @sizeOf(Entry);
-                entry.arena.deinit();
-                self.a.destroy(entry);
                 slot.* = null;
+                entry.release();
             }
         }
         fn index(key: [32]u8) usize {
-            return std.mem.readInt(u32, key[0..4], .little) % capacity;
+            return (std.mem.readInt(u32, key[0..4], .little) % (capacity / ways)) * ways;
         }
-        pub fn get(self: *Self, a: Allocator, key: [32]u8, ttl: u64) !?Hit {
+        pub fn lease(self: *Self, key: [32]u8, ttl: u64) ?Lease {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            const slot = &self.slots[index(key)];
-            const entry = slot.* orelse return null;
-            if (!std.mem.eql(u8, &key, &entry.key)) return null;
-            if (!entry.times.valid(std.Io.Clock.real.now(self.io).toSeconds(), ttl)) {
-                self.remove(slot);
-                return null;
+            const start = index(key);
+            for (self.slots[start..][0..ways], start..) |item, i| {
+                const entry = item orelse continue;
+                if (!std.mem.eql(u8, &key, &entry.key)) continue;
+                if (!entry.times.valid(std.Io.Clock.real.now(self.io).toSeconds(), ttl)) {
+                    self.remove(&self.slots[i]);
+                    return null;
+                }
+                self.stamp +%= 1;
+                entry.stamp = self.stamp;
+                _ = entry.refs.fetchAdd(1, .monotonic);
+                return .{ .entry = entry, .times = entry.times, .value = entry.value, .token = entry.token };
             }
-            return .{ .times = entry.times, .value = try retainedClone(Value, a, entry.value, 0) };
+            return null;
+        }
+        pub fn get(self: *Self, a: Allocator, key: [32]u8, ttl: u64) !?Hit {
+            const pinned = self.lease(key, ttl) orelse return null;
+            defer pinned.release();
+            return .{ .times = pinned.times, .value = try retainedClone(Value, a, pinned.value, 0) };
         }
         pub fn put(self: *Self, key: [32]u8, times: Times, value: Value) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            const slot = &self.slots[index(key)];
-            self.remove(slot);
-            // Include construction in the limit; oversized entries are simply
-            // not retained. Reserve at most a quarter for a single value.
-            const entry_limit = limit / 4;
-            while (limit - self.bytes < entry_limit + @sizeOf(Entry)) {
-                self.remove(&self.slots[self.clock % capacity]);
-                self.clock +%= 1;
-            }
+            // Keep one entry's headroom permanently available. Construction,
+            // resident entries and evicted active leases all share this cap.
+            // If leases occupy headroom, decline admission without eviction.
+            if (limit -| self.physical.load(.monotonic) < reservation) return;
             const entry = self.a.create(Entry) catch return;
-            entry.* = .{ .key = key, .times = times, .budget = .{ .backing = self.a, .limit = entry_limit }, .arena = undefined, .value = undefined };
+            _ = self.physical.fetchAdd(reservation, .monotonic);
+            entry.* = .{ .owner = self, .key = key, .token = undefined, .times = times, .budget = .{ .backing = self.a, .limit = limit / 4 }, .arena = undefined, .value = undefined };
             entry.arena = .init(entry.budget.allocator());
             entry.value = retainedClone(Value, entry.arena.allocator(), value, 0) catch {
                 entry.arena.deinit();
                 self.a.destroy(entry);
+                _ = self.physical.fetchSub(reservation, .monotonic);
                 return;
             };
-            self.bytes += entry.budget.live + @sizeOf(Entry);
-            slot.* = entry;
+            _ = self.physical.fetchSub(limit / 4 - entry.budget.live, .monotonic);
+            self.io.random(&entry.token);
+            self.stamp +%= 1;
+            entry.stamp = self.stamp;
+            // Commit only a fully constructed value. Failed admission leaves
+            // every existing key, including a same-key replacement, intact.
+            const start = index(key);
+            var victim = start;
+            for (self.slots[start..][0..ways], start..) |item, i| {
+                if (item == null or std.mem.eql(u8, &item.?.key, &key)) {
+                    victim = i;
+                    break;
+                }
+                if (item.?.stamp < self.slots[victim].?.stamp) victim = i;
+            }
+            self.remove(&self.slots[victim]);
+            const size = entry.budget.live + @sizeOf(Entry);
+            while (self.bytes + size > limit - reservation) {
+                self.remove(&self.slots[self.clock % capacity]);
+                self.clock +%= 1;
+            }
+            self.bytes += size;
+            self.slots[victim] = entry;
         }
     };
 }
@@ -164,4 +216,58 @@ test "typed cache owns slices, evicts oversized values and expires without slidi
     var oversized: [8192]u8 = @splat('x');
     cache.put(@splat(0), times, &oversized);
     try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+}
+
+test "failed admission preserves hot collisions and leases survive eviction" {
+    const C = Cache([]const u8, 4, 16384);
+    var cache: C = .{ .a = std.testing.allocator, .io = std.testing.io };
+    defer cache.deinit();
+    var times: Times = .{};
+    times.add(std.Io.Clock.real.now(std.testing.io).toSeconds());
+    cache.put(@splat(0), times, "hot");
+    const pinned = cache.lease(@splat(0), 100).?;
+    defer pinned.release();
+    const oversized: [8192]u8 = @splat('x');
+    cache.put(@splat(0), times, &oversized);
+    try std.testing.expect(cache.lease(@splat(1), 100) == null);
+    const hot = cache.lease(@splat(0), 100).?;
+    hot.release();
+    for (1..12) |n| cache.put(@splat(@intCast(n)), times, "new");
+    try std.testing.expectEqualStrings("hot", pinned.value);
+    try std.testing.expect(cache.physical.load(.monotonic) <= 16384);
+    cache.deinit();
+    try std.testing.expectEqualStrings("hot", pinned.value);
+}
+
+test "associative cache preserves active colliding questions and failed foreign admission" {
+    const C = Cache([]const u8, 32, 65536);
+    var cache: C = .{ .a = std.testing.allocator, .io = std.testing.io };
+    defer cache.deinit();
+    var times: Times = .{};
+    times.add(std.Io.Clock.real.now(std.testing.io).toSeconds());
+    for (0..4) |n| {
+        var key: [32]u8 = @splat(0);
+        key[0] = @intCast(n * 8);
+        cache.put(key, times, "active");
+    }
+    const first = cache.lease(@splat(0), 100).?;
+    first.release();
+    var rejected: [32]u8 = @splat(0);
+    rejected[0] = 32;
+    const oversized: [32768]u8 = @splat('x');
+    cache.put(rejected, times, &oversized);
+    for (0..4) |n| {
+        var key: [32]u8 = @splat(0);
+        key[0] = @intCast(n * 8);
+        const pinned = cache.lease(key, 100).?;
+        pinned.release();
+    }
+    const recent = cache.lease(@splat(0), 100).?;
+    recent.release();
+    cache.put(rejected, times, "new");
+    const kept = cache.lease(@splat(0), 100).?;
+    kept.release();
+    var evicted: [32]u8 = @splat(0);
+    evicted[0] = 8;
+    try std.testing.expect(cache.lease(evicted, 100) == null);
 }

@@ -6368,6 +6368,139 @@ class CliTests(unittest.TestCase):
                 run(["--no-cache"])[1]["stats"]["file_evaluation_cache_hits"], 0
             )
 
+    def test_workspace_conditional_results_are_scoped_and_replayed_ids_are_fresh(self):
+        path = self.write("src/a.txt", "STOP HIGH\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--max-result-files=1",
+            "--json-compact",
+        ]
+        with self.workspace("src") as (ready, request):
+
+            def run(**extra):
+                rows = request("search", revision=ready["revision"], args=args, **extra)
+                self.assertEqual(rows[-1]["exit_code"], 0, rows)
+                return rows
+
+            first = run()
+            token = next(
+                row["result_token"] for row in first if row["type"] == "result_token"
+            )
+            second = run()
+            self.assertNotEqual(
+                next(row["file_id"] for row in first if row["type"] == "begin"),
+                next(row["file_id"] for row in second if row["type"] == "begin"),
+            )
+            unchanged = run(if_result_token=token)
+            self.assertTrue(
+                any(row["type"] == "workspace_unchanged" for row in unchanged)
+            )
+            self.assertFalse(
+                any(
+                    row["type"] in ("begin", "match", "file", "result_token")
+                    for row in unchanged
+                )
+            )
+            summary = next(row for row in unchanged if row["type"] == "summary")
+            self.assertEqual(summary["requests"], 0)
+            self.assertEqual(summary["stats"]["query_cache_hits"], 1)
+            self.assertTrue(
+                any(row["type"] == "match" for row in run(if_result_token="0" * 64))
+            )
+            self.assertEqual(
+                request(
+                    "search",
+                    revision=ready["revision"],
+                    args=args,
+                    if_result_token="bad",
+                )[0]["message"],
+                "InvalidResultToken",
+            )
+            path.write_text("STOP HIGH new\n")
+            ready = request("refresh")[0]
+            changed = run(if_result_token=token)
+            self.assertFalse(
+                any(row["type"] == "workspace_unchanged" for row in changed)
+            )
+            self.assertTrue(any(row["type"] == "match" for row in changed))
+            request("trim")
+            self.assertFalse(
+                any(
+                    row["type"] == "workspace_unchanged"
+                    for row in run(if_result_token=token)
+                )
+            )
+
+    def test_workspace_presentation_changes_reuse_file_evidence(self):
+        self.write("src/a.txt", "prefix\nSTOP HIGH\nsuffix\n")
+        self.write("src/b.txt", "noise\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--unit=line",
+            "--max-result-files=1",
+            "--threads=2",
+        ]
+        with self.workspace("src") as (ready, request):
+
+            def run(extra=()):
+                rows = request(
+                    "search", revision=ready["revision"], args=[*args, *extra]
+                )
+                self.assertEqual(rows[-1]["exit_code"], 0, rows)
+                return rows, next(row for row in rows if row["type"] == "summary")
+
+            run()
+            for extra in (
+                ["--before-context=1"],
+                ["--max-result-files=2"],
+                ["--json-compact"],
+            ):
+                rows, summary = run(extra)
+                self.assertEqual(summary["requests"], 0)
+                self.assertEqual(summary["stats"]["query_cache_hits"], 0)
+                self.assertEqual(summary["stats"]["file_evaluation_cache_hits"], 2)
+            rows, summary = run(["--only=STOP"])
+            self.assertEqual(summary["stats"]["file_evaluation_cache_hits"], 0)
+
+    def test_workspace_watched_refresh_changes_discovery_replacements_and_forced_rescan(
+        self,
+    ):
+        a = self.write("src/a.txt", "old source\n")
+        self.write("src/b.txt", "unchanged\n")
+        with self.workspace("--workspace-watch", "src") as (ready, request):
+            refreshed = request("refresh")[0]
+            if refreshed["source_bytes_reused"] == 0:
+                self.skipTest(
+                    "native watcher unavailable; conservative fallback remains active"
+                )
+            self.assertEqual(refreshed["source_bytes_read"], 0)
+            self.assertEqual(refreshed["source_bytes_reused"], ready["bytes"])
+            a.write_text("new source contents\n")
+            changed = request("refresh")[0]
+            self.assertEqual(changed["source_bytes_read"], len(a.read_bytes()))
+            self.assertGreater(changed["source_bytes_reused"], 0)
+            forced = request("refresh", force_rescan=True)[0]
+            self.assertEqual(forced["source_bytes_read"], forced["bytes"])
+            self.assertEqual(forced["source_bytes_reused"], 0)
+            self.assertEqual(request("refresh")[0]["source_bytes_read"], 0)
+            replacement = self.write("src/.replacement", "replacement source\n")
+            os.replace(replacement, a)
+            self.assertEqual(
+                request("refresh")[0]["source_bytes_read"], len(a.read_bytes())
+            )
+            self.write("src/.ignore", "b.txt\n")
+            self.write("src/c.txt", "new eligible file\n")
+            discovery = request("refresh")[0]
+            self.assertEqual(discovery["files"], 2)
+            self.assertEqual(
+                discovery["source_bytes_read"], len(b"new eligible file\n")
+            )
+            request("trim")
+            after_trim = request("refresh")[0]
+            self.assertEqual(after_trim["source_bytes_read"], after_trim["bytes"])
+
     def test_workspace_explicit_binary_file_uses_native_input_semantics(self):
         self.write("binary.txt", b"STOP\0tail\n")
         args = [

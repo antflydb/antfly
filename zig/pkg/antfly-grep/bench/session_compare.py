@@ -36,11 +36,13 @@ from workspace import signature
 
 
 class Service:
-    def __init__(self, binary, cwd, source, query, env):
+    def __init__(self, binary, cwd, source, query, env, start_args=()):
         self.query = query
         self.pending = bytearray()
+        self.cursor = 0
+        self.wire_bytes = 0
         self.process = subprocess.Popen(
-            [str(binary), "workspace", "serve", source],
+            [str(binary), "workspace", "serve", *start_args, source],
             cwd=cwd,
             env=env,
             stdin=subprocess.PIPE,
@@ -56,7 +58,16 @@ class Service:
 
     def read(self):
         deadline = time.monotonic() + 120
-        while b"\n" not in self.pending:
+        while True:
+            end = self.pending.find(b"\n", self.cursor)
+            if end >= 0:
+                line = bytes(self.pending[self.cursor : end])
+                self.wire_bytes += end + 1 - self.cursor
+                self.cursor = end + 1
+                return json.loads(line)
+            if self.cursor:
+                del self.pending[: self.cursor]
+                self.cursor = 0
             remaining = deadline - time.monotonic()
             if (
                 remaining <= 0
@@ -67,19 +78,19 @@ class Service:
             if not data:
                 raise RuntimeError("workspace closed unexpectedly")
             self.pending.extend(data)
-        line, _, rest = self.pending.partition(b"\n")
-        self.pending = bytearray(rest)
-        return json.loads(line)
 
-    def search(self):
+    def search(self, token=None, query=None, require_warm=True):
         request = {
             "version": 1,
             "id": 1,
             "op": "search",
             "revision": self.ready["revision"],
-            "args": self.query,
+            "args": self.query if query is None else query,
         }
+        if token is not None:
+            request["if_result_token"] = token
         started = time.monotonic()
+        before_bytes = self.wire_bytes
         self.process.stdin.write(json.dumps(request).encode() + b"\n")
         self.process.stdin.flush()
         rows = []
@@ -94,13 +105,20 @@ class Service:
             rows.append(row)
         elapsed = time.monotonic() - started
         summary = next(row for row in rows if row["type"] == "summary")
-        if (
+        if require_warm and (
             summary["requests"]
             or summary["stats"]["source_parses"]
             or not summary["stats"]["complete"]
         ):
             raise RuntimeError(summary)
-        return {"seconds": elapsed, "summary": summary}, signature(rows)
+        self.rows = rows
+        native = summary["data"]["elapsed_total"]
+        return {
+            "seconds": elapsed,
+            "producer_seconds": native["secs"] + native["nanos"] / 1e9,
+            "response_bytes": self.wire_bytes - before_bytes,
+            "summary": summary,
+        }, signature(rows)
 
     def close(self):
         self.process.stdin.close()
@@ -277,6 +295,8 @@ def main():
                         **{
                             name: {
                                 "seconds": pair[name]["seconds"],
+                                "producer_seconds": pair[name]["producer_seconds"],
+                                "response_bytes": pair[name]["response_bytes"],
                                 "requests": pair[name]["summary"]["requests"],
                                 "source_parses": pair[name]["summary"]["stats"][
                                     "source_parses"

@@ -28,7 +28,17 @@ fn emit(a: A, io: std.Io, value: anytype) !void {
 }
 pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 {
     if (base.pre != null or base.search_zip or base.table_config != null or base.pattern_files.items.len != 0 or base.inventory or base.follow) return error.UnsupportedWorkspaceCaptureOptions;
-    var generation = try Generation.capture(a, io, base, null);
+    const Watch = @import("source_watch.zig").Watch;
+    const watch: ?*Watch = if (base.workspace_watch) blk: {
+        const watcher = try a.create(Watch);
+        watcher.* = Watch.init();
+        break :blk watcher;
+    } else null;
+    defer if (watch) |watcher| {
+        watcher.deinit();
+        a.destroy(watcher);
+    };
+    var generation = try Generation.captureWatched(a, io, base, null, watch);
     defer generation.deinit();
     var session = @import("session.zig").Session.init(a, io);
     defer session.deinit();
@@ -46,7 +56,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{} };
+        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false };
         const parsed = std.json.parseFromSlice(Request, scratch, line, .{}) catch {
             try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
             continue;
@@ -56,6 +66,19 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnsupportedWorkspaceVersion" });
             continue;
         }
+        if (request.if_result_token) |token| {
+            const valid_token = token.len == 64 and for (token) |ch| {
+                if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) break false;
+            } else true;
+            if (!valid_token or !std.mem.eql(u8, request.op, "search")) {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidResultToken" });
+                continue;
+            }
+        }
+        if (request.force_rescan and !std.mem.eql(u8, request.op, "refresh")) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidForceRescanOperation" });
+            continue;
+        }
         if (std.mem.eql(u8, request.op, "invalidate")) {
             valid = false;
             try emit(a, io, .{ .type = "workspace_invalidated", .id = request.id, .revision = generation.revision });
@@ -63,6 +86,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             // Protocol requests are serial and every search joins its workers.
             // Drop optional state without changing the published source lease.
             const released = session.plans.physical.load(.monotonic) + reuse.files.bytes + reuse.queries.bytes + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
+            if (watch) |watcher| watcher.reset();
             session.deinit();
             session = @import("session.zig").Session.init(a, io);
             reuse.deinit();
@@ -71,7 +95,8 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
             try emit(a, io, .{ .type = "workspace_trimmed", .id = request.id, .revision = generation.revision, .retained_source_bytes = generation.retainedBytes(), .retained_cache_bytes = @as(usize, 0), .released_cache_bytes = released });
         } else if (std.mem.eql(u8, request.op, "refresh")) {
             valid = false;
-            const next = Generation.capture(a, io, base, generation) catch |err| {
+            if (request.force_rescan) if (watch) |watcher| watcher.reset();
+            const next = Generation.captureWatched(a, io, base, generation, watch) catch |err| {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 continue;
             };
@@ -85,7 +110,7 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
                 continue;
             }
             try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
-            const code = search(Search, a, io, base, generation, &session, &reuse, request.args) catch |err| blk: {
+            const code = search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token) catch |err| blk: {
                 try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
                 break :blk @as(u8, 2);
             };
@@ -98,9 +123,9 @@ pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 
     return 0;
 }
 fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
-    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused });
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .files = generation.entries.items.len, .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .source_bytes_reused = generation.source_bytes_reused });
 }
-fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8) !u8 {
+fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8, if_result_token: ?[]const u8) !u8 {
     var o: Options = .{};
     defer o.deinit(a);
     // Provider identity and credentials remain process-owned. Requests may
@@ -119,7 +144,7 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
         o.jobs = base.jobs;
     }
     if (o.paths.items.len != 0 or o.table_config != null or o.pre != null or o.hostname_bin != null or o.search_zip or o.pattern_files.items.len != 0 or o.inventory or o.files or o.cache_clear or o.generate != null or o.help or o.version or o.pcre2_version or o.type_list or o.sort != null or
-        o.globs.items.len != 0 or o.iglobs.items.len != 0 or o.types.items.len != 0 or o.types_not.items.len != 0 or o.ignore_files.items.len != 0 or o.type_clear.items.len != 0 or o.type_add.items.len != 0 or o.exclude.items.len != 0 or o.triage) return error.UnsupportedWorkspaceQueryOptions;
+        o.globs.items.len != 0 or o.iglobs.items.len != 0 or o.types.items.len != 0 or o.types_not.items.len != 0 or o.ignore_files.items.len != 0 or o.type_clear.items.len != 0 or o.type_add.items.len != 0 or o.exclude.items.len != 0 or o.triage or o.workspace_watch) return error.UnsupportedWorkspaceQueryOptions;
     const defaults: Options = .{};
     inline for (.{ "hidden", "no_ignore", "no_ignore_vcs", "no_ignore_global", "no_ignore_parent", "no_ignore_dot", "no_ignore_exclude", "no_ignore_files", "follow", "one_file_system", "max_depth", "max_files", "include_dependencies", "include_sensitive" }) |name| {
         if (@field(o, name) != @field(defaults, name)) return error.UnsupportedWorkspaceQueryOptions;
@@ -137,7 +162,12 @@ fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generat
     if (o.ask != null) try session.configure(&o);
     searcher.workspace_generation = generation;
     searcher.reuse = reuse;
-    if (o.ask != null and !o.no_cache and o.cache_dir != null and o.cache_ttl_seconds != 0) searcher.reuse_identity = try Search.Reuse.identity(a, &o);
+    searcher.if_result_token = if_result_token;
+    if (o.ask != null and !o.no_cache and o.cache_dir != null and o.cache_ttl_seconds != 0) {
+        const identity = try Search.Reuse.identities(a, &o);
+        searcher.reuse_identity = identity.full;
+        searcher.evaluation_identity = identity.evaluation;
+    }
     searcher.executor = &session.files;
     searcher.region_plans = &session.plans;
     searcher.decider.executor = &session.providers;
