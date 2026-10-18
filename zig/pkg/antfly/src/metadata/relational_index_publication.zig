@@ -1104,6 +1104,22 @@ pub const OwnerDecision = struct {
         return ack;
     }
 
+    /// Header commitment includes its payload hash and original producer cut.
+    /// The receiver obtains the wire from its held owner lease; consumers must
+    /// still decode/verify the body, and metadata must recheck live enrollment.
+    pub fn signRaftSource(self: OwnerDecision, request: OwnerRequest, wire: native_control.SourceWire, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !RootProof {
+        const identity = try self.raftExecutionIdentity(request);
+        try wire.requireRaftIdentity(identity);
+        _ = try self.raftBuild(request, wire.binding, .{});
+        const view = try self.raftSigningView(request);
+        try view.requireLocal(actual);
+        const header = wire.header orelse return error.InvalidPrivateIndexClaimReceipt;
+        if (header.bytes[184] == @backingInt(local.storage_db_relational_index_owner_job.private_claims.SourceStream.State.failed)) return error.InvalidPrivateIndexClaimReceipt;
+        const position = try header.orderedPosition();
+        if (position != .raft or position.raft.term > actual.leader_term or position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        return (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try wire.headerCommitment());
+    }
+
     fn executionIdentity(self: OwnerDecision, request: OwnerRequest, authority: progress.Authority) !raft_control.Identity {
         if (self.disposition != .execute) return error.InvalidGenerationPublication;
         try self.requireRequest(request);
@@ -2829,6 +2845,37 @@ test "relational index publication Raft decisions bind immutable admission and e
     try build_response.validate(build_control);
     build_response.raft_build.progress.position = .{ .native = .{ .namespace = reserved.fence.namespace, .sequence = 4 } };
     try std.testing.expectError(error.InvalidControlReceiptPosition, build_response.validate(build_control));
+    // Synthetic owner data qualifies scope/signature/body checks only. The
+    // storage/ABI tests independently qualify retained producer provenance.
+    const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+    var source_page = try Source.PreparedSource.init(a, reserved, .{ .table_name = dispatch.value.table_name, .generation = @splat(6), .schema_version = reserved.physical_candidate.schema_version, .tuple_fingerprint = @splat(7), .nulls_not_distinct = false }, @splat(8), .ready, &.{});
+    defer source_page.deinit();
+    std.mem.writeInt(u64, source_page.header[104..112], 1, .little);
+    @memcpy(source_page.header[112..145], &try (local.storage_db_receipt_position.Position{ .raft = .{ .term = 7, .index = 4 } }).encode());
+    std.crypto.hash.Blake3.hash(source_page.header[0..288], source_page.header[288..320], .{});
+    const source_b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(source_page.payload.len));
+    defer a.free(source_b64);
+    _ = std.base64.standard.Encoder.encode(source_b64, source_page.payload);
+    const wire: native_control.SourceWire = .{ .binding = reserved, .header = .{ .bytes = source_page.header }, .payload_b64 = source_b64 };
+    var source_permission = building;
+    source_permission.raft_signing = signing.raft_signing;
+    build_lookup.raft_reporter = sign_request.raft_reporter;
+    var source_scope = actual;
+    source_scope.completed_index = 4;
+    const source_proof = try source_permission.signRaftSource(build_lookup, wire, source_scope, root);
+    const source_request: execution.Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .source };
+    const source_response: execution.ControlResponse = .{ .raft_source = .{ .root_generation = source_scope.root_generation, .observation = wire, .signed_source = source_proof } };
+    try source_response.validate(source_request);
+    var source_body = try source_response.raft_source.decodeSignedRaft(a, source_request);
+    defer source_body.deinit();
+    try std.testing.expectEqual(@as(usize, 0), source_body.batch.?.rows().len);
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, source_response.raft_source.decodeSigned(a, source_request));
+    source_scope.completed_index = 3;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, source_permission.signRaftSource(build_lookup, wire, source_scope, root));
+    const original_byte = source_b64[0];
+    source_b64[0] = if (original_byte == 'A') 'B' else 'A';
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, source_response.raft_source.decodeSignedRaft(a, source_request));
+    source_b64[0] = original_byte;
     decision.disposition = .acknowledged;
     try std.testing.expectError(error.InvalidGenerationPublication, decision.raftControl(reserve_request, reserved));
     try dispatch.value.requireBinding(decision.head, decision.owner.owner, reserved, .raft, decision.metadata_incarnation);

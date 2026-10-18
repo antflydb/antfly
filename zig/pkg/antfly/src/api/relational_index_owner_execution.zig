@@ -82,6 +82,7 @@ pub const Result = union(enum) {
     acknowledged,
     raft: RaftControlResponse,
     raft_build: RaftBuildControlResponse,
+    raft_source: RaftSourceResult,
     recovered: struct {
         /// Copied from the lease that recovered the committed physical cut;
         /// never substitute a later current-root observation when signing.
@@ -117,6 +118,7 @@ pub const Result = union(enum) {
             .controlled => |value| value.outcome.deinit(),
             .building => |value| value.outcome.deinit(),
             .source => |*value| value.deinit(),
+            .raft_source => |*value| value.wire.deinit(),
             .installing => |*value| value.outcome.deinit(),
             .releasing => |*value| value.outcome.deinit(),
             .canceling => |*value| value.result.deinit(),
@@ -127,7 +129,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .raft, .raft_build, .building, .source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -144,6 +146,7 @@ pub const Result = union(enum) {
             .controlled => |value| value.root_generation,
             .building => |value| value.root_generation,
             .source => |value| value.root_generation,
+            .raft_source => |value| value.root_generation,
             .installing => |value| value.root_generation,
             .releasing => |value| value.root_generation,
             .canceling => |value| switch (value.result) {
@@ -159,7 +162,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .raft, .raft_build, .applied, .building, .source, .installing, .releasing, .canceling => null,
+            .acknowledged, .raft, .raft_build, .applied, .building, .source, .raft_source, .installing, .releasing, .canceling => null,
         };
     }
 
@@ -288,6 +291,7 @@ pub const Result = union(enum) {
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .building => |value| .{ .building = .{ .root_generation = value.root_generation, .expected_revision = value.expected_revision, .outcome = value.outcome.value, .signed_audit = value.signed_audit, .signed_receipt = value.signed_receipt, .signing_failure = value.signing_failure } },
             .source => |*value| .{ .source = value.response() },
+            .raft_source => |*value| .{ .raft_source = value.response() },
             .installing => |*value| .{ .installing = value.response() },
             .releasing => |*value| .{ .releasing = value.response() },
             .canceling => |*value| .{ .canceling = try value.result.response(value.request) },
@@ -476,6 +480,7 @@ pub const ControlResponse = union(enum) {
     recovered: RootedOutcome,
     building: struct { root_generation: u64, expected_revision: u64 = 0, outcome: native.BuildResponse, signed_audit: ?publication.SignedAudit = null, signed_receipt: ?publication.SignedReceipt = null, signing_failure: ?SigningFailure = null },
     source: SourceResponse,
+    raft_source: SourceResponse,
     installing: InstallationControlResponse,
     releasing: ReleaseControlResponse,
     canceling: CancellationControlResponse,
@@ -524,6 +529,7 @@ pub const ControlResponse = union(enum) {
             .raft => |value| return value.validate(request),
             .raft_build => |value| return value.validate(request),
             .source => |value| return value.validate(request),
+            .raft_source => |value| return value.validateRaft(request),
             .installing => |value| return value.validate(request),
             .releasing => |value| return value.validate(request),
             .canceling => |value| return value.validate(request),
@@ -616,12 +622,20 @@ pub const SourceResponse = struct {
     }
 
     pub fn validate(self: SourceResponse, request: Request) !void {
+        return self.validateAuthority(request, .native);
+    }
+
+    pub fn validateRaft(self: SourceResponse, request: Request) !void {
+        return self.validateAuthority(request, .raft);
+    }
+
+    fn validateAuthority(self: SourceResponse, request: Request, authority: local.storage_db_relational_index_publication_progress.Authority) !void {
         try request.validate(request.group_id);
         if (request.operation != .source or self.root_generation == 0 or self.observation.binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexClaimReceipt;
-        try self.observation.requireIdentity(self.identity(request));
+        if (authority == .native) try self.observation.requireIdentity(self.identity(request)) else try self.observation.requireRaftIdentity(self.identity(request));
         if (self.signed_source) |proof| {
-            if (self.signing_failure != null or proof.root_generation != self.root_generation or proof.authority != .native) return error.InvalidPrivateIndexClaimReceipt;
-            (publication.NativeSigningView{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native }).validate(proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+            if (self.signing_failure != null or proof.root_generation != self.root_generation or (proof.authority == .native) != (authority == .native)) return error.InvalidPrivateIndexClaimReceipt;
+            if (authority == .native) (publication.NativeSigningView{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native }).validate(proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
             proof.verify(try self.observation.headerCommitment()) catch return error.InvalidPrivateIndexClaimReceipt;
         }
     }
@@ -633,6 +647,23 @@ pub const SourceResponse = struct {
         // canonical body against that exact header; no second signature/hash
         // pass over reconstructed logical rows is necessary.
         return self.observation.decode(alloc, self.identity(request));
+    }
+
+    pub fn decodeSignedRaft(self: SourceResponse, alloc: std.mem.Allocator, request: Request) !native.SourceRead {
+        try self.validateRaft(request);
+        _ = self.signed_source orelse return error.InvalidPrivateIndexClaimReceipt;
+        return self.observation.decodeRaft(alloc, self.identity(request));
+    }
+};
+
+pub const RaftSourceResult = struct {
+    root_generation: u64,
+    wire: std.json.Parsed(native.SourceWire),
+    signed_source: ?publication.RootProof = null,
+    signing_failure: ?SigningFailure = null,
+
+    pub fn response(self: *const @This()) SourceResponse {
+        return .{ .root_generation = self.root_generation, .observation = self.wire.value, .signed_source = self.signed_source, .signing_failure = self.signing_failure };
     }
 };
 
@@ -655,6 +686,7 @@ pub const SourceResult = struct {
     }
 
     pub fn signNative(self: *SourceResult, root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+        if (self.outcome.binding.authority != .native or self.wire.value.binding.authority != .native) return error.InvalidPrivateIndexClaimReceipt;
         const pinned = self.signing orelse return error.NativeIndexSigningUnavailable;
         const digest = try self.outcome.digest();
         try pinned.view.validate(pinned.view.identity.metadata_incarnation);

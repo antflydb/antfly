@@ -11666,7 +11666,7 @@ pub const DataServer = struct {
     fn raftIndexOwnerControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
-        if (request.operation != .fence and request.operation != .reserve and request.operation != .build) return error.UnsupportedNativeIndexOwner;
+        if (request.operation != .fence and request.operation != .reserve and request.operation != .build and request.operation != .source) return error.UnsupportedNativeIndexOwner;
         const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
         try self.waitDataReadSafeWithCancellation(group_id, "index-owner-control", 30_000, context.cancellation);
         var lookup = request.lookup(.permission);
@@ -11691,6 +11691,24 @@ pub const DataServer = struct {
         // Require current enrollment and reporter/root identity before any
         // effect, not merely when attempting post-commit decoration.
         try (try permission.value.raftSigningView(lookup)).requireLocal(scope);
+        if (request.operation == .source) {
+            var wire = try session.claimSource(alloc);
+            errdefer wire.deinit();
+            _ = try permission.value.raftBuild(lookup, wire.value.binding, .{});
+            var result: execution.RaftSourceResult = .{ .root_generation = rooted.root_generation, .wire = wire };
+            if (wire.value.header) |header| if (header.bytes[184] != @backingInt(@import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.SourceStream.State.failed)) {
+                result.signed_source = self.signRaftIndexSource(alloc, group_id, &permission.value, lookup, wire.value, rooted, context) catch |err| failure: {
+                    result.signing_failure = switch (err) {
+                        error.IndexOwnerReceiptChanged => .authority_changed,
+                        error.FileNotFound, error.BackendRuntimeUnavailable => .identity_unavailable,
+                        else => .signing_failed,
+                    };
+                    break :failure null;
+                };
+            };
+            try result.response().validateRaft(request);
+            return .{ .raft_source = result };
+        }
         if (request.operation == .build) {
             const binding = rooted.observation.binding orelse return error.PrivateIndexRootRecoveryRequired;
             const build = try permission.value.raftBuild(lookup, binding, request.build_budget orelse .{});
@@ -11759,6 +11777,14 @@ pub const DataServer = struct {
         const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
         const scope = try self.raftIndexLocalScope(group_id, rooted, context);
         return decision.signRaftControl(request, rooted.observation, scope, root);
+    }
+
+    fn signRaftIndexSource(self: *DataServer, alloc: std.mem.Allocator, group_id: u64, decision: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, request: @import("../metadata/relational_index_publication.zig").OwnerRequest, wire: @import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RootProof {
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir);
+        const scope = try self.raftIndexLocalScope(group_id, rooted, context);
+        return decision.signRaftSource(request, wire, scope, root);
     }
 
     /// Bind a leased owner observation to actual local Raft leadership and the

@@ -193,8 +193,11 @@ pub const Producer = struct {
                     self.phase = .done;
                     return self.result.?;
                 }
-                if (response.value != .source) return error.InvalidPrivateIndexClaimReceipt;
-                const value = response.value.source;
+                const value = switch (response.value) {
+                    .source => |source| source,
+                    .raft_source => |source| source,
+                    else => return error.InvalidPrivateIndexClaimReceipt,
+                };
                 try self.cohort.requireBinding(value.observation.binding);
                 if (value.observation.replication_pending) return .{ .pending = self.phase };
                 if (value.observation.header == null) {
@@ -207,7 +210,7 @@ pub const Producer = struct {
                 // Failed batches intentionally have no deliverable-source proof.
                 if (value.observation.header.?.bytes[184] == @backingInt(jobs.private_claims.SourceStream.State.failed)) return error.PrivateIndexBuildFailed;
                 if (value.signed_source == null) return .{ .pending = self.phase };
-                self.read = if (comptime @hasDecl(@TypeOf(response), "takeSource")) try response.takeSource(self.request) else try value.decodeSigned(self.alloc, self.request);
+                self.read = if (response.value == .raft_source) try value.decodeSignedRaft(self.alloc, self.request) else if (comptime @hasDecl(@TypeOf(response), "takeSource")) try response.takeSource(self.request) else try value.decodeSigned(self.alloc, self.request);
                 const batch = &self.read.?.batch.?;
                 const ordinal = std.mem.readInt(u64, batch.header.bytes[104..112], .little);
                 if (self.head) |head| {
@@ -320,7 +323,10 @@ pub const testing = struct {
             .ordinal = ordinal,
             .rows = (if (previous) |prior| prior.rows else @as(u64, 0)) + std.mem.readInt(u32, header[96..100], .little),
             .batch_rows = std.mem.readInt(u32, header[96..100], .little),
-            .source_sequence = (try data.header.position()).sequence,
+            .source_sequence = switch (try data.header.orderedPosition()) {
+                .native => |value| value.sequence,
+                .raft => |value| value.index,
+            },
             .batch_digest = data.header.digest(),
             .logical_digest = logical,
             .previous_decision = if (previous) |prior| prior.decision_digest else @splat(0),

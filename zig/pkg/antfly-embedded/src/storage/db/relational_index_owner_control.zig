@@ -62,15 +62,24 @@ pub const SourceRead = struct {
     }
 
     pub fn requireIdentity(self: *const SourceRead, identity: Identity) !void {
+        return self.requireIdentityAuthority(identity, .native);
+    }
+
+    pub fn requireRaftIdentity(self: *const SourceRead, identity: Identity) !void {
+        return self.requireIdentityAuthority(identity, .raft);
+    }
+
+    fn requireIdentityAuthority(self: *const SourceRead, identity: Identity, authority: @import("relational_index_publication_progress.zig").Authority) !void {
         try identity.validate();
         _ = try self.binding.encode();
         const b = self.binding;
-        if (b.phase != .reserved or b.authority != .native or b.ordinal != identity.ordinal or
+        if (b.phase != .reserved or b.authority != authority or b.ordinal != identity.ordinal or
             b.fence.owner_group_id != identity.owner_group_id or !b.fence.namespace.eql(identity.namespace) or
             !std.mem.eql(u8, &b.id, &identity.id) or !std.mem.eql(u8, &b.plan_digest, &identity.plan_digest) or
             !std.mem.eql(u8, &b.owner_digest, &identity.owner_digest) or self.replication_pending != (self.error_name != null) or
-            (self.replication_pending and (self.batch != null or self.consumed != null))) return error.InvalidPrivateIndexClaimInventory;
+            (self.replication_pending and (authority == .raft or self.batch != null or self.consumed != null))) return error.InvalidPrivateIndexClaimInventory;
         if (self.consumed) |record| try record.requireFor(self.binding);
+        if (self.batch) |batch| _ = try private_claims.SourceStream.Header.decode(&batch.header.bytes, self.binding, std.mem.readInt(u64, batch.header.bytes[104..112], .little));
         try requireSourcePrefix(self.binding, if (self.batch) |batch| batch.header else null, self.consumed);
     }
 
@@ -97,9 +106,17 @@ pub const SourceWire = struct {
     /// Envelope checks alone do not validate the decoded source body. Remote
     /// consumers must decode before using rows or accepting source provenance.
     pub fn requireIdentity(self: SourceWire, identity: Identity) !void {
+        return self.requireIdentityAuthority(identity, .native);
+    }
+
+    pub fn requireRaftIdentity(self: SourceWire, identity: Identity) !void {
+        return self.requireIdentityAuthority(identity, .raft);
+    }
+
+    fn requireIdentityAuthority(self: SourceWire, identity: Identity, authority: @import("relational_index_publication_progress.zig").Authority) !void {
         if (self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexClaimInventory;
         if (self.error_name) |name| if (!std.mem.eql(u8, name, "ReplicationOutboxPending")) return error.InvalidPrivateIndexClaimInventory;
-        try (SourceRead{ .binding = self.binding, .consumed = self.consumed, .replication_pending = self.replication_pending, .error_name = self.error_name }).requireIdentity(identity);
+        try (SourceRead{ .binding = self.binding, .consumed = self.consumed, .replication_pending = self.replication_pending, .error_name = self.error_name }).requireIdentityAuthority(identity, authority);
         if ((self.header == null) != (self.payload_b64 == null) or (self.replication_pending and self.header != null)) return error.InvalidPrivateIndexClaimInventory;
         if (self.header) |header| _ = try private_claims.SourceStream.Header.decode(&header.bytes, self.binding, std.mem.readInt(u64, header.bytes[104..112], .little));
         try requireSourcePrefix(self.binding, self.header, self.consumed);
@@ -112,10 +129,18 @@ pub const SourceWire = struct {
     }
 
     pub fn decode(self: SourceWire, alloc: Allocator, identity: Identity) !SourceRead {
-        try self.requireIdentity(identity);
+        return self.decodeAuthority(alloc, identity, .native);
+    }
+
+    pub fn decodeRaft(self: SourceWire, alloc: Allocator, identity: Identity) !SourceRead {
+        return self.decodeAuthority(alloc, identity, .raft);
+    }
+
+    fn decodeAuthority(self: SourceWire, alloc: Allocator, identity: Identity, authority: @import("relational_index_publication_progress.zig").Authority) !SourceRead {
+        try self.requireIdentityAuthority(identity, authority);
         // The parsed wire arena may be released immediately after decoding.
         var result: SourceRead = .{ .binding = self.binding, .consumed = self.consumed, .replication_pending = self.replication_pending, .error_name = if (self.replication_pending) "ReplicationOutboxPending" else null };
-        try result.requireIdentity(identity);
+        try result.requireIdentityAuthority(identity, authority);
         if ((self.header == null) != (self.payload_b64 == null) or (self.replication_pending and self.header != null)) return error.InvalidPrivateIndexClaimInventory;
         if (self.payload_b64) |encoded| {
             if (encoded.len > max_payload_b64) return error.InvalidPrivateIndexClaimInventory;
@@ -138,15 +163,21 @@ fn requireSourcePrefix(binding: jobs.Binding, header: ?private_claims.SourceStre
     const ordinal = std.mem.readInt(u64, batch.bytes[104..112], .little);
     if (consumed) |record| {
         try record.requireFor(binding);
+        const position = try batch.orderedPosition();
+        const prior = try record.header.orderedPosition();
+        const sequence = switch (position) {
+            .native => |value| if (binding.authority == .native) value.sequence else return error.InvalidControlReceiptPosition,
+            .raft => |value| if (binding.authority == .raft) value.index else return error.InvalidControlReceiptPosition,
+        };
         if (record.accepted.ordinal == std.math.maxInt(u64) or ordinal != record.accepted.ordinal + 1 or record.accepted.state != .building or
             !std.mem.eql(u8, batch.bytes[256..288], &record.accepted.batch_digest) or !std.mem.eql(u8, batch.bytes[40..72], &record.accepted.scope_digest) or
-            (try batch.position()).sequence <= record.accepted.source_sequence) return error.InvalidPrivateIndexClaimInventory;
+            sequence <= record.accepted.source_sequence or position.term() < prior.term()) return error.InvalidPrivateIndexClaimInventory;
     } else if (ordinal != 1 or !std.mem.allEqual(u8, batch.bytes[256..288], 0)) return error.InvalidPrivateIndexClaimInventory;
 }
 
 fn sourceHeaderCommitment(binding: jobs.Binding, header: private_claims.SourceStream.Header) !integrity.Digest {
     _ = try private_claims.SourceStream.Header.decode(&header.bytes, binding, std.mem.readInt(u64, header.bytes[104..112], .little));
-    if (binding.phase != .reserved or binding.authority != .native or header.bytes[184] == @backingInt(private_claims.SourceStream.State.failed)) return error.InvalidPrivateIndexClaimReceipt;
+    if (binding.phase != .reserved or header.bytes[184] == @backingInt(private_claims.SourceStream.State.failed)) return error.InvalidPrivateIndexClaimReceipt;
     var state = std.crypto.hash.Blake3.init(.{});
     state.update("antfly/private-unique-source-batch/v1");
     state.update(&try binding.encode());

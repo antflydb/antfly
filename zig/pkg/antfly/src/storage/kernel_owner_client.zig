@@ -680,6 +680,25 @@ pub const Owner = struct {
     }
 
     /// Advisory physical binding, not a reservation, receipt or permission.
+    pub fn raftIndexClaimSource(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_owner_control.Identity, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_owner_control.SourceWire) {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        try identity.validate();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > native.Identity.max_json_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_source_json(self.handle, &.{ .table_name = .fromSlice(table_name), .identity_json = .fromSlice(encoded), .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerSourceRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index claim source");
+        if (response.bytes().len == 0 or response.bytes().len > native.SourceWire.max_wire_bytes) return error.InvalidPrivateIndexClaimInventory;
+        var parsed = try std.json.parseFromSlice(native.SourceWire, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.requireRaftIdentity(identity);
+        return parsed;
+    }
+
     pub fn raftIndexOwnerBuild(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildRequest, prepare: bool, options: QueryOptions) !std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_raft_contract.BuildPreparation) {
         const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
         try request.validate();

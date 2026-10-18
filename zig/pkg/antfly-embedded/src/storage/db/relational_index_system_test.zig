@@ -2250,6 +2250,15 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     db = try db_mod.DB.open(alloc, directory.path(), options);
     db_live = true;
     {
+        var wire_read = try db.readRaftIndexClaimSource(alloc, 11, identity, .{});
+        defer wire_read.deinit();
+        try wire_read.requireRaftIdentity(identity);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, wire_read.requireIdentity(identity));
+        try std.testing.expect(wire_read.consumed != null and wire_read.batch != null);
+        try std.testing.expectEqual(@as(u64, 60), (try wire_read.batch.?.header.orderedPosition()).raft.index);
+        _ = try wire_read.digest();
+    }
+    {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try build.verifyRecovery(&read, reserved_binding);

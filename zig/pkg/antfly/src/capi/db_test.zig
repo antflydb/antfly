@@ -1595,6 +1595,47 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     var reread = try Build.call(id, read_input, build_request);
     defer reread.deinit();
     try std.testing.expectEqualDeep(complete.value.progress, reread.value.progress);
+    const SourceRead = struct {
+        fn call(owner: ?*anyopaque, input: kernel_owner_abi.RaftIndexOwnerSourceRequest, expected: contract.Identity) !std.json.Parsed(local.storage_db_relational_index_owner_control.SourceWire) {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexSourceJson(owner, &input, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            var parsed = try std.json.parseFromSlice(local.storage_db_relational_index_owner_control.SourceWire, std.testing.allocator, response.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+            errdefer parsed.deinit();
+            try parsed.value.requireRaftIdentity(expected);
+            return parsed;
+        }
+        fn reject(input: kernel_owner_abi.RaftIndexOwnerSourceRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexSourceJson(null, &input, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok and response.ptr == null and response.len == 0);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqual(kernel_owner_abi.RaftIndexOwnerSourceRequest.operation, failure.operation);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+        }
+    };
+    const source_input: kernel_owner_abi.RaftIndexOwnerSourceRequest = .{ .table_name = .fromSlice("items"), .identity_json = .fromSlice(encoded) };
+    var bad_source = source_input;
+    bad_source.identity_json = .{ .ptr = @ptrFromInt(1), .len = contract.Identity.max_json_bytes + 1 };
+    try SourceRead.reject(bad_source, "InvalidArgument");
+    bad_source = source_input;
+    bad_source.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try SourceRead.reject(bad_source, "DeadlineExceeded");
+    var source_wire = try SourceRead.call(id, source_input, identity);
+    defer source_wire.deinit();
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, source_wire.value.requireIdentity(identity));
+    var decoded_source = try source_wire.value.decodeRaft(a, identity);
+    defer decoded_source.deinit();
+    try decoded_source.requireRaftIdentity(identity);
+    try std.testing.expectEqual(@as(usize, 0), decoded_source.batch.?.rows().len);
+    try std.testing.expectEqual(@as(u64, 5), (try decoded_source.batch.?.header.orderedPosition()).raft.index);
+    try std.testing.expectEqual(@as(u64, 5), (try handle.db.orderedApplyReceipt()).?.index);
+    _ = try decoded_source.digest();
 }
 
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {

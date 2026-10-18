@@ -3739,6 +3739,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             return .{ .identity = self.identity, .root_generation = self.lease.entry.generation, .observation = result };
         }
 
+        pub fn claimSource(self: *@This(), alloc: std.mem.Allocator) !std.json.Parsed(native_index_control.SourceWire) {
+            const normalized = try platformDeadlineContext(self.context);
+            var cancellation = normalized.cancellation;
+            return self.lease.owner().raftIndexClaimSource(alloc, self.table_name, self.identity, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        }
+
         pub fn build(self: *@This(), alloc: std.mem.Allocator, request: raft_index_control.BuildRequest, prepare_page: bool) !std.json.Parsed(raft_index_control.BuildPreparation) {
             if (!std.meta.eql(request.identity, self.identity)) return error.PrivateIndexOwnerJobChanged;
             const normalized = if (prepare_page) try platformDeadlineContext(self.context) else request_operation.RequestContext{};
