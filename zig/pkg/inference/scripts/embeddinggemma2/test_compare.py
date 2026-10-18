@@ -15,6 +15,10 @@
 # limitations under the License.
 
 import math
+import io
+import sys
+from pathlib import Path
+from unittest import mock
 import copy
 import unittest
 
@@ -25,6 +29,49 @@ else:
 
 
 class ComparisonContracts(unittest.TestCase):
+    def test_post_declares_bounded_inference_budget_and_transport_timeout(self):
+        with mock.patch.object(
+            compare.urllib.request, "urlopen", return_value=io.BytesIO(b'{"ok":true}')
+        ) as opened:
+            self.assertEqual(
+                compare.post(
+                    "http://localhost", "/embed", {"input": ["x"]}, timeout=6.3278
+                ),
+                {"ok": True},
+            )
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_header("X-antfly-inference-timeout-ms"), "6327")
+        self.assertEqual(opened.call_args.kwargs["timeout"], 6.3278)
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+
+    def test_post_rejects_invalid_budget_before_network_io(self):
+        with mock.patch.object(compare.urllib.request, "urlopen") as opened:
+            for budget in (0, -1, math.inf, math.nan, 3600.001):
+                with self.subTest(budget=budget):
+                    with self.assertRaises(ValueError):
+                        compare.post("http://localhost", "/embed", {}, timeout=budget)
+            opened.assert_not_called()
+
+    def test_deadline_probe_rejects_unverified_worker_disconnect(self):
+        with mock.patch("sys.path", [str(Path(__file__).resolve().parent), *sys.path]):
+            import video_deadline_qualification as probe
+
+        self.assertEqual(
+            probe.restart_generation(
+                "inference worker stopped unexpectedly; restarting generation=2 delay_ms=100 term=.{ .exited = 86 }"
+            ),
+            2,
+        )
+        for text in (
+            "",
+            "restarting generation=2 exited = 86",
+            "inference worker stopped unexpectedly; restarting generation=2 exited = 1",
+            "inference worker stopped unexpectedly; restarting generation=1 exited = 86",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    probe.restart_generation(text)
+
     def test_case_selection_and_long_sample_controls(self):
         short = {"name": "short", "text": "x", "token_ids": [1] * 512}
         long = {"name": "long", "text": "x", "token_ids": [1] * 8192}

@@ -62,6 +62,25 @@ pub const AudioChunkOptions = struct {
     overlap_duration_ms: u32 = 0,
 };
 
+pub const EmbeddingTarget = api_openapi.ChunkEmbeddingTarget;
+pub const MediaPolicy = api_openapi.MediaChunkPolicy;
+
+/// Internal replay of one member from an already authenticated chunk generation.
+/// This never certifies whole-source coverage and is not persisted in policy.
+pub const Replay = struct { source_version: []const u8, source_fingerprint: []const u8, plan_id: []const u8, ordinal: u64 };
+pub fn cloneReplay(a: Allocator, value: Replay) !Replay {
+    const version = try a.dupe(u8, value.source_version);
+    errdefer a.free(version);
+    const source = try a.dupe(u8, value.source_fingerprint);
+    errdefer a.free(source);
+    return .{ .source_version = version, .source_fingerprint = source, .plan_id = try a.dupe(u8, value.plan_id), .ordinal = value.ordinal };
+}
+pub fn freeReplay(a: Allocator, value: Replay) void {
+    a.free(value.source_version);
+    a.free(value.source_fingerprint);
+    a.free(value.plan_id);
+}
+
 pub const Config = struct {
     provider: Provider,
     api_url: []const u8 = "",
@@ -72,22 +91,29 @@ pub const Config = struct {
     threshold: ?f32 = null,
     text: TextChunkOptions = .{},
     audio: AudioChunkOptions = .{},
+    embedding: ?EmbeddingTarget = null,
+    policy: ?MediaPolicy = null,
+    replay: ?Replay = null,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
-        return .{
-            .provider = self.provider,
-            .api_url = if (self.api_url.len > 0) try alloc.dupe(u8, self.api_url) else "",
-            .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
-            .store_chunks = self.store_chunks,
-            .full_text_index_json = if (self.full_text_index_json.len > 0) try alloc.dupe(u8, self.full_text_index_json) else "",
-            .max_chunks = self.max_chunks,
-            .threshold = self.threshold,
-            .text = try self.text.clone(alloc),
-            .audio = self.audio,
-        };
+        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy };
+        errdefer copy.deinit(alloc);
+        copy.api_url = try alloc.dupe(u8, self.api_url);
+        copy.model = try alloc.dupe(u8, self.model);
+        copy.full_text_index_json = try alloc.dupe(u8, self.full_text_index_json);
+        copy.text = try self.text.clone(alloc);
+        copy.replay = if (self.replay) |value| try cloneReplay(alloc, value) else null;
+        copy.embedding = if (self.embedding) |value| try cloneEmbeddingTarget(alloc, value) else null;
+        return copy;
     }
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
+        if (self.replay) |value| freeReplay(alloc, value);
+        if (self.embedding) |value| {
+            alloc.free(value.model);
+            if (value.task_type) |task| alloc.free(task);
+            if (value.model_identity) |identity| alloc.free(identity);
+        }
         if (self.api_url.len > 0) alloc.free(self.api_url);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.full_text_index_json.len > 0) alloc.free(self.full_text_index_json);
@@ -135,8 +161,9 @@ pub fn parseConfigFromValue(alloc: Allocator, value: json.Value) !Config {
         if (value.object.get("url")) |url_value| {
             if (url_value == .null) return cfg;
             if (url_value != .string) return error.InvalidChunkerConfig;
+            const replacement = try alloc.dupe(u8, url_value.string);
             if (cfg.api_url.len > 0) alloc.free(@constCast(cfg.api_url));
-            cfg.api_url = try alloc.dupe(u8, url_value.string);
+            cfg.api_url = replacement;
         }
     }
     return cfg;
@@ -172,28 +199,34 @@ fn configFromOpenApi(
     provider_cfg: provider_openapi.ChunkerConfig,
     chunk_options: api_openapi.ChunkOptions,
 ) !Config {
-    var cfg = Config{
-        .provider = try Provider.fromSlice(@tagName(provider_cfg.provider)),
-        .api_url = if (provider_cfg.api_url) |api_url| try alloc.dupe(u8, api_url) else "",
-        .model = if (provider_cfg.model) |model| try alloc.dupe(u8, model) else "",
-        .store_chunks = provider_cfg.store_chunks orelse false,
-        .full_text_index_json = "",
-        .max_chunks = if (chunk_options.max_chunks) |max_chunks|
-            std.math.cast(u32, max_chunks) orelse return error.InvalidChunkerConfig
-        else
-            0,
-        .threshold = chunk_options.threshold,
-        .text = try textChunkOptionsFromOpenApi(alloc, chunk_options.text),
-        .audio = try audioChunkOptionsFromOpenApi(chunk_options.audio),
-    };
+    var cfg = Config{ .provider = try Provider.fromSlice(@tagName(provider_cfg.provider)) };
     errdefer cfg.deinit(alloc);
+    cfg.api_url = if (provider_cfg.api_url) |value| try alloc.dupe(u8, value) else "";
+    cfg.model = if (provider_cfg.model) |value| try alloc.dupe(u8, value) else "";
+    cfg.store_chunks = provider_cfg.store_chunks orelse false;
+    cfg.max_chunks = if (chunk_options.max_chunks) |n| std.math.cast(u32, n) orelse return error.InvalidChunkerConfig else 0;
+    cfg.threshold = chunk_options.threshold;
+    cfg.text = try textChunkOptionsFromOpenApi(alloc, chunk_options.text);
+    cfg.audio = try audioChunkOptionsFromOpenApi(chunk_options.audio);
+    cfg.embedding = if (chunk_options.embedding) |value| try cloneEmbeddingTarget(alloc, value) else null;
+    cfg.policy = chunk_options.policy;
 
     if (provider_cfg.full_text_index) |full_text_index| {
         cfg.full_text_index_json = try json.Stringify.valueAlloc(alloc, full_text_index, .{});
     }
 
-    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0) return error.InvalidChunkerConfig;
+    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0 and cfg.embedding == null) return error.InvalidChunkerConfig;
     return cfg;
+}
+
+fn cloneEmbeddingTarget(a: Allocator, value: EmbeddingTarget) !EmbeddingTarget {
+    var result = value;
+    result.model = try a.dupe(u8, value.model);
+    errdefer a.free(result.model);
+    result.task_type = if (value.task_type) |task| try a.dupe(u8, task) else null;
+    errdefer if (result.task_type) |task| a.free(task);
+    result.model_identity = if (value.model_identity) |identity| try a.dupe(u8, identity) else null;
+    return result;
 }
 
 fn textChunkOptionsFromOpenApi(alloc: Allocator, generated: ?api_openapi.TextChunkOptions) !TextChunkOptions {
@@ -234,6 +267,8 @@ const CombinedChunkerConfig = struct {
     threshold: ?f32 = null,
     text: ?api_openapi.TextChunkOptions = null,
     audio: ?api_openapi.AudioChunkOptions = null,
+    embedding: ?EmbeddingTarget = null,
+    policy: ?MediaPolicy = null,
 };
 
 fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
@@ -259,6 +294,8 @@ fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
         .provider = provider,
         .store_chunks = if (cfg.store_chunks) true else null,
         .full_text_index = null,
+        .embedding = cfg.embedding,
+        .policy = cfg.policy,
     };
 }
 

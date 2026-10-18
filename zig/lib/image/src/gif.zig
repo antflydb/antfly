@@ -121,11 +121,37 @@ pub fn decodeFirstFrameAlloc(alloc: Allocator, gif_bytes: []const u8) !Frame {
     return frames[0];
 }
 
+pub const VisitResult = struct { frames: usize = 0, duration_ms: u64 = 0, complete: bool = false };
+pub const BorrowedFrame = struct { rgba: []const u8, width: u32, height: u32, delay_ms: u32 };
+pub const Visitor = struct {
+    context: *anyopaque,
+    /// Borrowed composited canvas; false stops before the next picture.
+    accept: *const fn (*anyopaque, usize, BorrowedFrame) anyerror!bool,
+    result: *VisitResult,
+};
+/// Retains two canvases regardless of animation length. No frame escapes accept.
+pub fn visitFramesAllocBounded(alloc: Allocator, bytes: []const u8, max_canvas_bytes: usize, visitor: Visitor) !void {
+    if (max_canvas_bytes == 0) return error.ImageTooLarge;
+    visitor.result.* = .{};
+    const empty = try decodeFramesAllocLimitedImpl(alloc, bytes, null, max_canvas_bytes, visitor);
+    defer alloc.free(empty);
+    std.debug.assert(empty.len == 0);
+}
 fn decodeFramesAllocLimited(
     alloc: Allocator,
     gif_bytes: []const u8,
     max_frames: ?usize,
     max_total_rgba_bytes: ?usize,
+) ![]Frame {
+    return decodeFramesAllocLimitedImpl(alloc, gif_bytes, max_frames, max_total_rgba_bytes, null);
+}
+
+fn decodeFramesAllocLimitedImpl(
+    alloc: Allocator,
+    gif_bytes: []const u8,
+    max_frames: ?usize,
+    max_total_rgba_bytes: ?usize,
+    visitor: ?Visitor,
 ) ![]Frame {
     var parser = Parser{ .bytes = gif_bytes };
 
@@ -176,7 +202,10 @@ fn decodeFramesAllocLimited(
         const sentinel = try parser.readByte();
 
         switch (sentinel) {
-            0x3B => break, // trailer
+            0x3B => {
+                if (visitor) |v| v.result.complete = true;
+                break;
+            }, // trailer
             0x21 => {
                 const label = try parser.readByte();
                 switch (label) {
@@ -223,21 +252,29 @@ fn decodeFramesAllocLimited(
                 @memcpy(previous_canvas, canvas);
                 try drawFrame(canvas, screen_width, screen_height, descriptor, indices, &palette);
 
-                if (max_total_rgba_bytes) |limit| {
-                    const retained_bytes = std.math.mul(usize, frames.items.len, canvas_len) catch
-                        return error.ImageTooLarge;
-                    if (canvas_len > limit -| retained_bytes) return error.ImageTooLarge;
-                }
-                const rgba = try alloc.dupe(u8, canvas);
-                try frames.append(alloc, .{
-                    .rgba = rgba,
-                    .width = screen_width,
-                    .height = screen_height,
-                    .delay_ms = gce.delay_ms,
-                });
+                if (visitor) |v| {
+                    const frame = BorrowedFrame{ .rgba = canvas, .width = screen_width, .height = screen_height, .delay_ms = gce.delay_ms };
+                    const keep_going = try v.accept(v.context, v.result.frames, frame);
+                    v.result.frames = try std.math.add(usize, v.result.frames, 1);
+                    v.result.duration_ms = try std.math.add(u64, v.result.duration_ms, gce.delay_ms);
+                    if (!keep_going) break;
+                } else {
+                    if (max_total_rgba_bytes) |limit| {
+                        const retained_bytes = std.math.mul(usize, frames.items.len, canvas_len) catch
+                            return error.ImageTooLarge;
+                        if (canvas_len > limit -| retained_bytes) return error.ImageTooLarge;
+                    }
+                    const rgba = try alloc.dupe(u8, canvas);
+                    try frames.append(alloc, .{
+                        .rgba = rgba,
+                        .width = screen_width,
+                        .height = screen_height,
+                        .delay_ms = gce.delay_ms,
+                    });
 
-                if (max_frames) |limit| {
-                    if (frames.items.len >= limit) break;
+                    if (max_frames) |limit| {
+                        if (frames.items.len >= limit) break;
+                    }
                 }
 
                 try applyDisposal(canvas, previous_canvas, screen_width, screen_height, descriptor, gce, background_rgba);

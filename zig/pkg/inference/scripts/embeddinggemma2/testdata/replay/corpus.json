@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "purpose": "Pretrained late WebM window reference preservation; no application relevance labels",
+  "documents": [
+    {
+      "id": "vp9-window-36",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-vp9-480p.webm",
+      "sha256": "ca6aeaac633a85d30808550a152d31ecf0cf376da1f2d202f42a2b728fb63338",
+      "provenance": {
+        "title": "Sintel trailer, Blender Foundation",
+        "license": "CC BY 3.0",
+        "source": "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4",
+        "encoding_receipt": "zig/lib/video/testdata/benchmarks/webm/corpus/manifest.json"
+      },
+      "sampling": {
+        "policy": "timestamps",
+        "start_ns": 36000000000,
+        "end_ns": 38000000000,
+        "max_frames": 2
+      }
+    },
+    {
+      "id": "vp9-window-44",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-vp9-480p.webm",
+      "sha256": "ca6aeaac633a85d30808550a152d31ecf0cf376da1f2d202f42a2b728fb63338",
+      "provenance": {
+        "title": "Sintel trailer, Blender Foundation",
+        "license": "CC BY 3.0",
+        "source": "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4",
+        "encoding_receipt": "zig/lib/video/testdata/benchmarks/webm/corpus/manifest.json"
+      },
+      "sampling": {
+        "policy": "timestamps",
+        "start_ns": 44000000000,
+        "end_ns": 46000000000,
+        "max_frames": 2
+      }
+    },
+    {
+      "id": "av1-window-36",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-av1-480p.webm",
+      "sha256": "db6917f3a9d42ed3fce12384711d31f84ffd1aef682a2ea8f04d7815497ec187",
+      "provenance": {
+        "title": "Sintel trailer, Blender Foundation",
+        "license": "CC BY 3.0",
+        "source": "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4",
+        "encoding_receipt": "zig/lib/video/testdata/benchmarks/webm/corpus/manifest.json"
+      },
+      "sampling": {
+        "policy": "timestamps",
+        "start_ns": 36000000000,
+        "end_ns": 38000000000,
+        "max_frames": 2
+      }
+    },
+    {
+      "id": "av1-window-44",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-av1-480p.webm",
+      "sha256": "db6917f3a9d42ed3fce12384711d31f84ffd1aef682a2ea8f04d7815497ec187",
+      "provenance": {
+        "title": "Sintel trailer, Blender Foundation",
+        "license": "CC BY 3.0",
+        "source": "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4",
+        "encoding_receipt": "zig/lib/video/testdata/benchmarks/webm/corpus/manifest.json"
+      },
+      "sampling": {
+        "policy": "timestamps",
+        "start_ns": 44000000000,
+        "end_ns": 46000000000,
+        "max_frames": 2
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "query-motion",
+      "text": "A moving animated scene."
+    },
+    {
+      "id": "query-scene",
+      "text": "An animated character in a detailed scene."
+    }
+  ]
+}

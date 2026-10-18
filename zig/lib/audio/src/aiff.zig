@@ -48,6 +48,16 @@ const SampleEncoding = enum {
 };
 
 pub fn decodeInterleaved(allocator: std.mem.Allocator, bytes: []const u8) !DecodedInterleaved {
+    return decodeTo(allocator, bytes, null);
+}
+
+/// Emit borrowed blocks of at most 1024 frames without retaining full PCM.
+pub fn visitInterleaved(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    var decoded = try decodeTo(allocator, bytes, sink);
+    defer decoded.deinit();
+}
+
+fn decodeTo(allocator: std.mem.Allocator, bytes: []const u8, sink: ?@import("pcm_sink.zig").Sink) !DecodedInterleaved {
     const parsed = try parse(bytes);
     const bytes_per_sample = switch (parsed.bits_per_sample) {
         8 => @as(usize, 1),
@@ -62,57 +72,66 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, bytes: []const u8) !Decod
     const expected_bytes = try std.math.mul(usize, expected_samples, bytes_per_sample);
     if (parsed.sound_data.len < expected_bytes) return error.UnsupportedAudioFormat;
 
-    const samples = try allocator.alloc(f32, expected_samples);
-    errdefer allocator.free(samples);
+    const capacity = if (sink != null) @min(expected_samples, @as(usize, 1024) * parsed.channels) else expected_samples;
+    const samples = try allocator.alloc(f32, capacity);
+    defer if (sink != null) allocator.free(samples);
+    errdefer if (sink == null) allocator.free(samples);
 
-    for (samples, 0..) |*sample, i| {
-        const offset = i * bytes_per_sample;
-        sample.* = switch (parsed.encoding) {
-            .signed_int => switch (parsed.bits_per_sample) {
-                8 => blk: {
-                    const raw: i8 = @bitCast(parsed.sound_data[offset]);
-                    break :blk @as(f32, @floatFromInt(raw)) / 128.0;
+    var base: usize = 0;
+    while (base < expected_samples) {
+        try @import("work_control.zig").check();
+        const count = @min(capacity, expected_samples - base);
+        for (samples[0..count], 0..) |*sample, i| {
+            const offset = (base + i) * bytes_per_sample;
+            sample.* = switch (parsed.encoding) {
+                .signed_int => switch (parsed.bits_per_sample) {
+                    8 => blk: {
+                        const raw: i8 = @bitCast(parsed.sound_data[offset]);
+                        break :blk @as(f32, @floatFromInt(raw)) / 128.0;
+                    },
+                    16 => blk: {
+                        const raw = std.mem.readInt(i16, parsed.sound_data[offset..][0..2], parsed.endian);
+                        break :blk @as(f32, @floatFromInt(raw)) / 32768.0;
+                    },
+                    24 => blk: {
+                        const raw = readI24(parsed.sound_data[offset..][0..3], parsed.endian);
+                        break :blk @as(f32, @floatFromInt(raw)) / 8388608.0;
+                    },
+                    32 => blk: {
+                        const raw = std.mem.readInt(i32, parsed.sound_data[offset..][0..4], parsed.endian);
+                        break :blk @as(f32, @floatFromInt(raw)) / 2147483648.0;
+                    },
+                    64 => blk: {
+                        const raw = std.mem.readInt(i64, parsed.sound_data[offset..][0..8], parsed.endian);
+                        break :blk @floatCast(@as(f64, @floatFromInt(raw)) / 9223372036854775808.0);
+                    },
+                    else => return error.UnsupportedAudioFormat,
                 },
-                16 => blk: {
-                    const raw = std.mem.readInt(i16, parsed.sound_data[offset..][0..2], parsed.endian);
-                    break :blk @as(f32, @floatFromInt(raw)) / 32768.0;
+                .unsigned_int => switch (parsed.bits_per_sample) {
+                    8 => (@as(f32, @floatFromInt(parsed.sound_data[offset])) - 128.0) / 128.0,
+                    else => return error.UnsupportedAudioFormat,
                 },
-                24 => blk: {
-                    const raw = readI24(parsed.sound_data[offset..][0..3], parsed.endian);
-                    break :blk @as(f32, @floatFromInt(raw)) / 8388608.0;
+                .float => switch (parsed.bits_per_sample) {
+                    32 => @bitCast(std.mem.readInt(u32, parsed.sound_data[offset..][0..4], parsed.endian)),
+                    64 => @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, parsed.sound_data[offset..][0..8], parsed.endian)))),
+                    else => return error.UnsupportedAudioFormat,
                 },
-                32 => blk: {
-                    const raw = std.mem.readInt(i32, parsed.sound_data[offset..][0..4], parsed.endian);
-                    break :blk @as(f32, @floatFromInt(raw)) / 2147483648.0;
+                .ulaw => switch (parsed.bits_per_sample) {
+                    8 => @as(f32, @floatFromInt(g711.decodeMuLaw(parsed.sound_data[offset]))) / 32768.0,
+                    else => return error.UnsupportedAudioFormat,
                 },
-                64 => blk: {
-                    const raw = std.mem.readInt(i64, parsed.sound_data[offset..][0..8], parsed.endian);
-                    break :blk @floatCast(@as(f64, @floatFromInt(raw)) / 9223372036854775808.0);
+                .alaw => switch (parsed.bits_per_sample) {
+                    8 => @as(f32, @floatFromInt(g711.decodeALaw(parsed.sound_data[offset]))) / 32768.0,
+                    else => return error.UnsupportedAudioFormat,
                 },
-                else => return error.UnsupportedAudioFormat,
-            },
-            .unsigned_int => switch (parsed.bits_per_sample) {
-                8 => (@as(f32, @floatFromInt(parsed.sound_data[offset])) - 128.0) / 128.0,
-                else => return error.UnsupportedAudioFormat,
-            },
-            .float => switch (parsed.bits_per_sample) {
-                32 => @bitCast(std.mem.readInt(u32, parsed.sound_data[offset..][0..4], parsed.endian)),
-                64 => @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, parsed.sound_data[offset..][0..8], parsed.endian)))),
-                else => return error.UnsupportedAudioFormat,
-            },
-            .ulaw => switch (parsed.bits_per_sample) {
-                8 => @as(f32, @floatFromInt(g711.decodeMuLaw(parsed.sound_data[offset]))) / 32768.0,
-                else => return error.UnsupportedAudioFormat,
-            },
-            .alaw => switch (parsed.bits_per_sample) {
-                8 => @as(f32, @floatFromInt(g711.decodeALaw(parsed.sound_data[offset]))) / 32768.0,
-                else => return error.UnsupportedAudioFormat,
-            },
-        };
+            };
+        }
+        if (sink) |consumer| try consumer.push(samples[0..count], parsed.sample_rate, parsed.channels);
+        base += count;
     }
 
     return .{
-        .samples = samples,
+        .samples = if (sink != null) try allocator.alloc(f32, 0) else samples,
         .sample_rate = parsed.sample_rate,
         .channels = parsed.channels,
         .allocator = allocator,

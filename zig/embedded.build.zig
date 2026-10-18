@@ -48,7 +48,6 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
         .antfly_imports = shared.production_antfly_imports,
         .antfly_mod = local_module,
     });
-    shared.build_info.link(embedded.libantfly_link_mod);
     const lite_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lite_main.zig"),
         .target = shared.target,
@@ -57,6 +56,7 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     shared.antfly_imports.configureEmbedded(b, lite_module, shared.link_libc);
     lite_module.addImport("antfly-client", embedded.antfly_client_pkg_mod);
     lite_module.addImport("antfly_inference_host", shared.antfly_imports.inference_host);
+    lite_module.addImport("antfly_inference_engine", shared.antfly_imports.inference_engine);
     lite_module.linkLibrary(embedded.native_inference);
     lite_module.linkLibrary(embedded.native_enrichment);
     shared.build_info.link(lite_module);

@@ -1863,7 +1863,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         // classification/decision tasks are declared by a bundle.
         manifest.model_type_origin = .config;
         if (manifest.inputs.len == 0) try setManifestInputs(manifest.allocator, manifest, &.{"text"});
-        for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio")) return error.InvalidModelManifest;
+        for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio") and !std.mem.eql(u8, input, "video")) return error.InvalidModelManifest;
         try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "extract", "classify" });
         try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "typed_decisions", "classification", "extraction" });
         try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{ "embed", "decide" });
@@ -2788,10 +2788,10 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             manifest.pooling = .mean;
             manifest.normalize = true;
             for (manifest.inputs) |input| {
-                if ((std.mem.eql(u8, input, "image") and !cfg.vision) or (std.mem.eql(u8, input, "audio") and !cfg.audio)) return error.InvalidEmbeddingTaskProfile;
+                if (((std.mem.eql(u8, input, "image") or std.mem.eql(u8, input, "video")) and !cfg.vision) or (std.mem.eql(u8, input, "audio") and !cfg.audio)) return error.InvalidEmbeddingTaskProfile;
             }
             if (!manifest.model_manifest_declarations.inputs) {
-                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio", "video" } else if (cfg.vision) &.{ "text", "image", "video" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
             }
         }
     }
@@ -2892,7 +2892,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
             manifest.pooling = .mean;
             manifest.normalize = true;
             if (!manifest.model_manifest_declarations.inputs) {
-                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio", "video" } else if (cfg.vision) &.{ "text", "image", "video" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
             }
         }
     }
@@ -3447,6 +3447,24 @@ fn parseInferenceBundleJsonInternal(
             head.? != .string or head.?.string.len == 0)
         {
             return error.InvalidInferenceBundle;
+        }
+        // A managed pull may contain only an explicitly selected variant,
+        // while the immutable Hub descriptor still names the repo default.
+        // Resolve a complete, published GLiNER variant before requiring the
+        // absent default; never guess a different single GGUF.
+        if (!managed_receipt.artifactPathIsSafe(encoder.?.string) or !managed_receipt.artifactPathIsSafe(head.?.string)) return error.InvalidModelArtifactPath;
+        if (catalog) |published| {
+            if (!try published.exists(encoder.?.string) or !try published.exists(head.?.string)) {
+                if (try published.readOptional("antfly_inference_variants.json")) |variants_bytes| {
+                    defer allocator.free(variants_bytes);
+                    const variants = try parseBundleObject(allocator, variants_bytes);
+                    defer variants.deinit();
+                    const family = variants.value.object.get("family") orelse return error.InvalidInferenceBundle;
+                    if (family != .string or !std.mem.eql(u8, family.string, "gliner2_variants/v1")) return error.InvalidInferenceBundle;
+                    try parseGliner2InferenceVariantsJson(manifest, allocator, catalog, model_dir_path, variants.value.object);
+                    if (manifest.isSplitGlinerBundle()) return .applied;
+                }
+            }
         }
         const encoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, encoder.?.string);
         errdefer allocator.free(encoder_path);
@@ -4675,7 +4693,8 @@ test "GLiNER Decide listing falls back to tokenizer JSON marker IDs" {
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[{\"id\":50368,\"content\":\"[SEP_STRUCT]\"},{\"id\":50369,\"content\":\"[SEP_TEXT]\"},{\"id\":50370,\"content\":\"[P]\"},{\"id\":50371,\"content\":\"[C]\"},{\"id\":50372,\"content\":\"[E]\"},{\"id\":50373,\"content\":\"[R]\"},{\"id\":50374,\"content\":\"[L]\"}]}" });
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
-    try std.testing.expect(!hasGlinerPathHint(path));
+    // Parent checkout/worktree names may legitimately contain "gliner".
+    try std.testing.expect(!hasGlinerPathHint(tmp.sub_path[0..]));
     var listing = try loadListingFromDir(a, path);
     defer listing.deinit();
     try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, listing.gliner_classification_head);
@@ -6425,6 +6444,35 @@ test "manifest parses gliner2 variants gguf pair" {
     try expectCanonicalPath(allocator, encoder_path, manifest.gguf_path.?);
     try expectCanonicalPath(allocator, head_path, manifest.gliner_head_gguf_path.?);
     try std.testing.expect(manifest.hasInput("text"));
+}
+
+test "manifest resolves pulled GLiNER variant when repository default is absent" {
+    const a = std.testing.allocator;
+    const io = compat.testingIo();
+    const dir = try testScratchDir(a, "manifest-gliner-selected-variant");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        a.free(dir);
+    }
+    const variants = "{\"family\":\"gliner2_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"format\":\"Q4_K\",\"encoder\":\"gliner2-encoder.Q4_K.gguf\",\"head\":\"gliner2-head.Q4_K.gguf\"}]}";
+    for ([_][]const u8{ "gliner2-encoder.Q4_K.gguf", "gliner2-head.Q4_K.gguf", "antfly_inference_variants.json" }) |name| {
+        const full = try std.fs.path.join(a, &.{ dir, name });
+        defer a.free(full);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = if (std.mem.endsWith(u8, name, ".json")) variants else "GGUFstub" });
+    }
+    var catalog = try ArtifactCatalog.initPublished(a, dir);
+    defer catalog.deinit();
+    var manifest = ModelManifest{ .allocator = a };
+    defer manifest.deinit();
+    try parseInferenceBundleJsonWithCatalog(
+        &manifest,
+        a,
+        &catalog,
+        "{\"family\":\"gliner2_split_bundle/v1\",\"wrapper\":\"gliner2\",\"encoder\":\"gliner2-encoder.Q8_0.gguf\",\"head\":\"gliner2-head.Q8_0.gguf\"}",
+    );
+    try std.testing.expect(manifest.isSplitGlinerBundle());
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "gliner2-encoder.Q4_K.gguf"));
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gliner_head_gguf_path.?, "gliner2-head.Q4_K.gguf"));
 }
 
 test "manifest parses florence2 variants gguf model" {

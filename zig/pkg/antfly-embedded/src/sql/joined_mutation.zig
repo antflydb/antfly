@@ -384,7 +384,7 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
     var visited: std.StringHashMapUnmanaged(void) = .empty;
     defer visited.deinit(execution.alloc);
     const target = execution.binding.table.?;
-    var previous_layout: ?catalog.Row.TypedLayout = null;
+    var previous_layout: ?*const catalog.Row.TypedLayout = null;
     if (definition_.deleting and definition_.returning != null) {
         const names = try execution.arena.alloc([]const u8, definition_.fields.len);
         for (definition_.fields, names) |field, *name| name.* = field.path;
@@ -399,7 +399,7 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
         bound: Bound,
         mutations: *std.ArrayList(catalog.Mutation),
         seen: *std.StringHashMapUnmanaged(void),
-        old_layout: ?catalog.Row.TypedLayout,
+        old_layout: ?*const catalog.Row.TypedLayout,
         sources: ?*Capture,
         scratch: std.heap.ArenaAllocator,
         fn append(raw: *anyopaque, values: []const scalar.Datum) anyerror!void {

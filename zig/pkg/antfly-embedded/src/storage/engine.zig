@@ -34,6 +34,13 @@ pub const Outcome = @import("native_outcome.zig").Outcome;
 pub const ReplayCallbacks = struct { progress: db.ReplayProgressHook };
 pub const ReplayBoundary = @import("named_callback.zig").Boundary(ReplayCallbacks);
 pub const BackupPlan = struct { value: @import("../api/backup_contract.zig").TableBackupPlan, io: ?native.IoBorrow };
+/// Restore owns a disposable generation; keep its record loops and errors in
+/// the physical storage unit. Callbacks here return no Zig error values.
+pub const PortableRestoreImportOptions = struct {
+    identity_namespace: ?@import("db/doc_identity.zig").Namespace = null,
+    embedding_source_fields: []const @import("portable_backup.zig").ImportOptions.EmbeddingSourceField = &.{},
+    cancellation: types.CancellationToken = .none,
+};
 pub const WriterBorrow = @import("native_writer.zig").Borrow;
 pub const PortableExportOptions = struct {
     value: @import("portable_backup.zig").ExportOptions,
@@ -144,6 +151,7 @@ pub const VTable = struct {
     prepareRestoreStagingIndexesStep: *const fn (self: *DB, alloc: std.mem.Allocator, scope: [32]u8) Outcome(bool),
     beginRestoreStaging: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Scope) Outcome(void),
     finishRestoreStaging: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Digest, phase: @import("db/restore_staging.zig").Phase) Outcome(@import("db/restore_staging.zig").Digest),
+    importPortableRestoreFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, options: PortableRestoreImportOptions) Outcome(void),
     importPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, target_identity: @import("db/doc_identity.zig").Namespace) Outcome(void),
     importCohortPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, proof: @import("portable_backup.zig").CohortProof, cancellation: types.CancellationToken) Outcome(void),
     openRelationalReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(*DB.RelationalReadSession),
@@ -323,12 +331,18 @@ pub const VTable = struct {
     catchUpPendingDerivedReplayWithProgress: *const fn (*DB, *anyopaque, db.ReplayProgressHook, @import("named_callback.zig").Dispatch) Outcome(void),
     relationalSnapshotDeinit: *const fn (*DB.RelationalStatementSnapshot) Outcome(void),
     statementFenceRelease: *const fn (*DB.StatementReadFence) Outcome(void),
+    documentRowsUnderLease: *const fn (*const DB.QueryReadLease, Allocator, u32) Outcome(DB.DocumentRows),
+    documentRowsLookupProjectedBatch: *const fn (*DB.DocumentRows, []const []const u8, []const []const u8, usize) Outcome(DB.DocumentRows.ProjectedBatch),
+    documentRowsLookupBatch: *const fn (*DB.DocumentRows, []const []const u8, usize) Outcome(DB.DocumentRows.Batch),
+    documentRowsLookup: *const fn (*DB.DocumentRows, []const u8) Outcome([]const u8),
+    documentRowsReleasePage: *const fn (*DB.DocumentRows) Outcome(void),
+    documentRowsDeinit: *const fn (*DB.DocumentRows) Outcome(void),
     relationalRowsUnderLease: *const fn (*const DB.QueryReadLease, Allocator, []const []const u8, u32) Outcome(@import("db/relational_rows.zig").Reader),
     relationalReaderDeinit: *const fn (self: *@import("db/relational_rows.zig").Reader) Outcome(void),
     relationalReaderNextPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
     relationalReaderNextTypedPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
-    relationalReaderLookupSqlBatch: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) Outcome(@import("db/relational_rows.zig").Reader.Hydrated),
-    relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?@import("../sql/catalog.zig").Row.TypedLayout) Outcome(?@import("db/relational_rows.zig").Row),
+    relationalReaderLookupSqlBatch: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) Outcome(@import("db/relational_rows.zig").Reader.Hydrated),
+    relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../sql/catalog.zig").Row.TypedLayout) Outcome(?@import("db/relational_rows.zig").Row),
     relationalSessionDeinit: *const fn (session: *@import("db/relational_read_session.zig").Session) Outcome(void),
     relationalSessionCheckpoint: *const fn (session: *const @import("db/relational_read_session.zig").Session) Outcome(void),
     relationalSessionRangeProofs: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator) Outcome([]@import("range_protection.zig").Proof),
@@ -430,6 +444,7 @@ pub const VTable = struct {
     reconcileArtifactDeleteIndex: *const fn (self: *DB, name: []const u8, context: @import("db/artifact_reconcile_intent.zig").Context) Outcome(bool),
     reconcileArtifactAddEnrichment: *const fn (self: *DB, cfg: types.EnrichmentConfig, context: @import("db/artifact_reconcile_intent.zig").Context) Outcome(void),
     artifactInventoryCommand: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(@import("db/artifact_inventory.zig").Command),
+    advanceDocumentAuthorityBackfillPage: *const fn (self: *DB) Outcome(bool),
     advanceArtifactFootprintPage: *const fn (self: *DB) Outcome(bool),
     runGraphMetricServiceMaintenanceJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, body: []const u8) Outcome([]u8),
     scheduleGraphMetricBuild: *const fn (self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8, force: bool) Outcome(types.GraphMetricStatus),

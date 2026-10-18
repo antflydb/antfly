@@ -1,0 +1,21 @@
+{
+  "path": "sintel-6s.mp4",
+  "sha256": "5c6b29872ef18dc0145ad2bd90d26ec33a232fd55afba0cb9b8784bdaef2b694",
+  "source": "../retrieval-long/sintel-52s.mp4",
+  "source_sha256": "bc0b86d65aa4ed3de49dcc062d0d5ef99a85695aa619e2dfd5dfce389581ab11",
+  "source_clip_seconds": 20,
+  "duration_seconds": 6,
+  "width": 128,
+  "height": 72,
+  "fps": 10,
+  "init_end": 991,
+  "fragment_ends": [
+    5277,
+    7588,
+    14529,
+    22782,
+    28629,
+    35574
+  ],
+  "generation": "FFmpeg offline only; libx264 single thread, 1-second closed GOPs, fragmented MP4; trailing mfra removed"
+}

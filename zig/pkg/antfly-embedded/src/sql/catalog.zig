@@ -227,7 +227,7 @@ pub const Row = struct {
     typed_cells: ?TypedCells = null,
 
     pub const TypedCells = struct {
-        layout: TypedLayout,
+        layout: *const TypedLayout,
         values: []const Cell = &.{},
         presence: ?[]const bool = null,
         /// Shared immutable column blocks, owned by the enclosing page lease.
@@ -235,6 +235,30 @@ pub const Row = struct {
         pub fn count(self: TypedCells) usize {
             if (self.columnar != null) return self.layout.names.len;
             return self.values.len;
+        }
+        pub fn frozenJson(self: TypedCells, ordinal: usize) !?@import("execution_batch.zig").FrozenJson {
+            if (ordinal >= self.count()) return error.InvalidSqlBackendResponse;
+            const source = self.columnar orelse return null;
+            if (self.values.len != 0) return error.InvalidSqlBackendResponse;
+            if (self.presence) |flags| if (!flags[ordinal]) return null;
+            var first: usize = 0;
+            for (source.blocks) |block| {
+                if (ordinal - first < block.values.len) return block.frozenJson(source.row, ordinal - first, false);
+                first += block.values.len;
+            }
+            return error.InvalidSqlBackendResponse;
+        }
+        pub fn encodedJson(self: TypedCells, ordinal: usize) !?[]const u8 {
+            if (ordinal >= self.count()) return error.InvalidSqlBackendResponse;
+            const source = self.columnar orelse return null;
+            if (self.values.len != 0) return error.InvalidSqlBackendResponse;
+            if (self.presence) |flags| if (!flags[ordinal]) return null;
+            var first: usize = 0;
+            for (source.blocks) |block| {
+                if (ordinal - first < block.values.len) return block.encodedJson(source.row, ordinal - first, false);
+                first += block.values.len;
+            }
+            return error.InvalidSqlBackendResponse;
         }
         pub fn at(self: TypedCells, ordinal: usize) !Cell {
             if (self.columnar) |source| {
@@ -258,8 +282,9 @@ pub const Row = struct {
 
         /// Names borrow the immutable relation binding; entries belong to the
         /// page arena. Duplicate names must not silently overwrite an ordinal.
-        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !TypedLayout {
-            var result: TypedLayout = .{ .names = names };
+        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !*const TypedLayout {
+            const result = try arena.create(TypedLayout);
+            result.* = .{ .names = names };
             for (names, 0..) |name, index| {
                 const entry = try result.ordinals.getOrPut(arena, name);
                 if (entry.found_existing) return error.InvalidSqlBackendResponse;
@@ -270,7 +295,7 @@ pub const Row = struct {
 
         /// Clone once per emitted page, not once per row. No names or directory
         /// entries may borrow a cursor that can close before the page consumer.
-        pub fn clone(self: TypedLayout, alloc: std.mem.Allocator) !TypedLayout {
+        pub fn clone(self: *const TypedLayout, alloc: std.mem.Allocator) !*const TypedLayout {
             const names = try alloc.alloc([]const u8, self.names.len);
             for (self.names, names) |name, *out| out.* = try alloc.dupe(u8, name);
             return init(alloc, names);
@@ -280,7 +305,7 @@ pub const Row = struct {
     /// Clone once at the page ownership boundary; consumers borrow the typed
     /// cells until that page is released. Layout and allocations must belong
     /// to the same page owner (or a longer-lived immutable binding).
-    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: TypedLayout, values: []const Cell) !Row {
+    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: *const TypedLayout, values: []const Cell) !Row {
         if (layout.ordinals.count() != values.len) return error.InvalidSqlBackendResponse;
         const owned = try alloc.alloc(Cell, values.len);
         for (values, owned) |value, *out| out.* = try @import("operators.zig").cloneDatum(alloc, value);
@@ -289,6 +314,20 @@ pub const Row = struct {
 
     /// Decoding is explicit about the SQL/JSON null boundary. The native
     /// projection's field names are literal names, never dotted JSON paths.
+    pub fn frozenJson(self: Row, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        if (std.mem.eql(u8, name, "_id")) return null;
+        const cells = self.typed_cells orelse return null;
+        try self.validateTyped();
+        const ordinal = cells.layout.ordinals.get(name) orelse return null;
+        return cells.frozenJson(ordinal);
+    }
+    pub fn encodedJson(self: Row, name: []const u8) !?[]const u8 {
+        if (std.mem.eql(u8, name, "_id")) return null;
+        const cells = self.typed_cells orelse return null;
+        try self.validateTyped();
+        const ordinal = cells.layout.ordinals.get(name) orelse return null;
+        return cells.encodedJson(ordinal);
+    }
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
         if (self.typed_cells) |cells| {
@@ -344,7 +383,7 @@ pub const Row = struct {
 
     /// Payload ownership transfer with a page-shared, owned name directory.
     /// Compiled pattern objects retain their existing statement-owner lifetime.
-    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?TypedLayout) !Row {
+    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?*const TypedLayout) !Row {
         var result = self;
         result.id = try alloc.dupe(u8, self.id);
         if (self.index_cursor) |cursor| result.index_cursor = try alloc.dupe(u8, cursor);
@@ -413,6 +452,20 @@ pub const ColumnPage = struct {
             try self.batch.validate();
             for (self.selection) |index| if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
         }
+    }
+    pub fn frozenJson(self: ColumnPage, row: usize, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (self.native) |native| {
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.frozenJson(self.selection[row], ordinal);
+        }
+        return null;
+    }
+    pub fn encodedJson(self: ColumnPage, row: usize, name: []const u8) !?[]const u8 {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (self.native) |native| {
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.encodedJson(self.selection[row], ordinal);
+        }
+        return null;
     }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;

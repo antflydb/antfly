@@ -20,6 +20,7 @@ Face bundle revision. This keeps the large oracle/evidence files outside Git.
 """
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -53,18 +54,60 @@ def prepare(cases, validation, reference):
     return result
 
 
+WINDOW_REFERENCE_SHA256 = (
+    "a5cff9fd74c25a93c8367490218170c94c3c47f6edcc035a2db356202f8dad81"
+)
+
+
+def prepare_windows(data):
+    """Single-window upstream logits; multi-window averages are not raw logits."""
+    if hashlib.sha256(data).hexdigest() != WINDOW_REFERENCE_SHA256:
+        raise ValueError("window reference differs from the pinned upstream capture")
+    capture = json.loads(data)
+    result = []
+    for case in capture["cases"]:
+        if len(case["windows"]) != 1:
+            continue
+        window = case["windows"][0]
+        tasks = json.loads(case["native_schema_json"])["classifications"]
+        logits = case["classification_logits"]
+        if len(tasks) != 1 or len(logits) != len(tasks[0]["labels"]):
+            raise ValueError("unexpected window classification geometry")
+        result.append(
+            {
+                "id": case["id"],
+                "text": window["text"],
+                "schema_json": case["native_schema_json"],
+                "input_ids": window["input_ids"],
+                "logits": [logits],
+            }
+        )
+    if not any(len(case["input_ids"]) == 1024 for case in result):
+        raise ValueError("missing upstream 1024-token boundary")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--reference", choices=("fp32", "q8_0"), default="q8_0")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--window-reference",
+        type=Path,
+        help="Append the pinned single-window upstream context probes (FP32 reference only)",
+    )
     args = parser.parse_args()
     result = prepare(
         json.loads(args.cases.read_text()),
         json.loads(args.validation.read_text()),
         args.reference,
     )
+    if args.window_reference:
+        if args.reference != "fp32":
+            parser.error("window context probes require --reference fp32")
+        result += prepare_windows(args.window_reference.read_bytes())
     args.output.write_text(json.dumps(result, ensure_ascii=False) + "\n")
     print(f"Wrote {len(result)} {args.reference} reference cases to {args.output}")
 

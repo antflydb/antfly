@@ -3042,6 +3042,13 @@ const DocumentPrimaryReadWindow = struct {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         self.retire();
         self.scope = try txn.openReadScope(self.arena.allocator());
+        try readMany(&self.scope.?, physical, output);
+        for (output) |value| if (value) |raw| {
+            self.bytes +|= raw.len;
+        };
+    }
+    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !void {
+        if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         const Entry = struct {
             key: []const u8,
             row: usize,
@@ -3063,10 +3070,7 @@ const DocumentPrimaryReadWindow = struct {
             }
             entry.value_index = count - 1;
         }
-        try self.scope.?.getManySorted(keys[0..count], values[0..count]);
-        for (values[0..count]) |value| if (value) |raw| {
-            self.bytes +|= raw.len;
-        };
+        try scope.getManySorted(keys[0..count], values[0..count]);
         for (entries[0..physical.len]) |entry| output[entry.row] = values[entry.value_index];
     }
 
@@ -4237,7 +4241,13 @@ pub const DB = struct {
                 if (opts.defer_index_backfill_on_open) try db.core.loadIndexesDeferredBackfill() else try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
-            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) try finishGraphMergeImport(&db, null);
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                for (db.core.index_manager.graph_indexes.items) |entry| if (entry.ttl_duration_ns != 0) {
+                    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, resolver_catalog_mod.graph_expiration_namespace_reader_version);
+                    break;
+                };
+                try finishGraphMergeImport(&db, null);
+            }
             // Validate the physical snapshot while the opened generation is
             // still untouched by replay and background workers. Status can
             // then retain this proof as live writes advance past the durable
@@ -25254,12 +25264,17 @@ pub const DB = struct {
         defer guard.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        // Match the other catalog writers' lock order and retain publication
+        // ownership until durable bytes and their cached format agree.
+        self.core.index_manager.catalog_mutex.lockExclusive();
+        defer self.core.index_manager.catalog_mutex.unlockExclusive();
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         try self.requireOnlineArtifactCatalogMutableWithContextLocked(&txn, context);
         try self.requireArtifactReconcileUnfenced(&txn, context);
-        try self.core.index_manager.alignRowDerivedArtifactCatalog(&txn, command.catalogs, configs);
+        const stamp = try self.core.index_manager.alignRowDerivedArtifactCatalogNoLock(&txn, command.catalogs, configs);
         try txn.commit();
+        self.core.index_manager.publishCatalogReaderStamp(stamp);
         self.core.index_manager.invalidateWritePlanSnapshot();
     }
 
@@ -30616,6 +30631,8 @@ pub const DB = struct {
             .enrichment = self.enrichmentStatsWithSupervisorState(.{}),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .promotion_worker_started = if (self.promotion_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
             .repair_metadata_rebuild_pending = self.artifactRepairMetadataRebuildPending(),
             .graph_metric = self.core.index_manager.graphMetricPlannedWorkStats() catch .{},
@@ -30644,7 +30661,22 @@ pub const DB = struct {
     fn resolutionStageStats(self: *DB) types.ReplayStageStats {
         if (!self.hasConfiguredResolvers()) return .{};
         if (self.resolution_runtime) |runtime| return runtime.stats();
-        return self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false) catch .{};
+        return self.persistedResolutionStageStats() catch .{
+            .enabled = true,
+            .catch_up_required = true,
+            .blocked = true,
+            .blocked_reason = "resolver_recovery_state_unavailable",
+        };
+    }
+
+    fn persistedResolutionStageStats(self: *DB) !types.ReplayStageStats {
+        var persisted_stage = try self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false);
+        const resources = self.core.batchExecutionResources();
+        if (try resolution_runtime_mod.hasDurableReresolveBacklog(resources.store)) {
+            persisted_stage.enabled = true;
+            persisted_stage.catch_up_required = true;
+        }
+        return persisted_stage;
     }
 
     fn promotionStageStats(self: *DB) types.ReplayStageStats {
@@ -31502,6 +31534,7 @@ pub const DB = struct {
     /// Leadership and root-image gates cover the short publication transaction;
     /// hashing and scanning happen beforehand under a disposable read snapshot.
     pub fn advanceDocumentAuthorityBackfillPage(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceDocumentAuthorityBackfillPage", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return true;
         if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return false;
         if (!self.document_authority_backfill_mutex.tryLock()) return false;
@@ -37810,6 +37843,35 @@ pub const DB = struct {
     /// File-backed variant for CLI restore paths. Portable decoding uses
     /// bounded positional reads over a locked source generation, so archive
     /// size does not become resident memory.
+    /// Restore decoding and complete-image validation must use the store's
+    /// compilation-local callbacks. A foreign caller borrows only its executor.
+    pub fn importPortableRestoreFileIntoUnpublishedEmpty(
+        self: *DB,
+        alloc: Allocator,
+        io: Io,
+        file: std.Io.File,
+        file_size: u64,
+        options: storage_engine.PortableRestoreImportOptions,
+    ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("importPortableRestoreFileIntoUnpublishedEmpty", .{ self, alloc, io, file, file_size, options });
+        if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
+        try portable_backup.importPortableFileWithOptions(alloc, self.core.store, io, file, file_size, .{
+            .identity_namespace = options.identity_namespace,
+            .prefer_existing_identity_namespace = true,
+            .import_derived_indexes = true,
+            .embedding_source_fields = options.embedding_source_fields,
+            .unpublished_staging = true,
+            .cancellation = options.cancellation,
+        });
+        portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+    }
+
     pub fn importPortableFileIntoUnpublishedEmpty(
         self: *DB,
         alloc: Allocator,
@@ -40161,6 +40223,284 @@ pub const DB = struct {
         return try self.searchWithCapturedRequestAndExecutionContext(alloc, req, .{});
     }
 
+    /// Delayed document hydration over the exact primary generation captured
+    /// with ranking. A byte-bounded document window stays pinned; callers copy
+    /// selected cells before the next lookup or page release retires it.
+    pub const DocumentRows = struct {
+        db: *DB,
+        read: docstore_mod.DocStore.Txn,
+        schema: schema_registry_mod.SchemaView,
+        policy: row_policy_gate_mod.Gate.Lease,
+        window: DocumentPrimaryReadWindow,
+        metadata: std.heap.ArenaAllocator,
+        keys: [64][]const u8 = undefined,
+        ids: [64][]const u8 = undefined,
+        sizes: [64]?u64 = undefined,
+        proofs: [64]?@import("../document_mutation_revision.zig").Content = undefined,
+        cached: usize = 0,
+        next_cached: usize = 0,
+        repair_requested: bool = false,
+        directory_arena: std.heap.ArenaAllocator,
+        directory_scope: ?@import("../backend_erased.zig").ReadScope = null,
+        directories: [64]?[]const u8 = @splat(null),
+        directories_loaded: [64]bool = @splat(false),
+        values: [64]?[]const u8 = undefined,
+        sources: [64]Source = undefined,
+        pub const Batch = struct { values: []const ?[]const u8, consumed: usize };
+        pub const Source = @import("../document_projection.zig").Source;
+        pub const ProjectedBatch = struct { values: []const Source, consumed: usize };
+
+        fn retireDirectories(self: *@This()) void {
+            if (self.directory_scope) |*scope| scope.close();
+            self.directory_scope = null;
+            _ = self.directory_arena.reset(.free_all);
+            @memset(&self.directories_loaded, false);
+            @memset(&self.directories, null);
+        }
+
+        // Keep keys and scalar size proofs separate from body scratch: sorted
+        // reads retire body scratch, and a small byte target can consume this
+        // metadata window over several calls. Never reuse proofs across pages.
+        fn prepare(self: *@This(), documents: []const []const u8) !void {
+            const available = self.cached - self.next_cached;
+            const common = @min(available, documents.len);
+            if (common != 0) {
+                const matches = for (documents[0..common], self.ids[self.next_cached..][0..common]) |wanted, cached_id| {
+                    if (!std.mem.eql(u8, wanted, cached_id)) break false;
+                } else true;
+                if (matches) return;
+            }
+            self.cached = 0;
+            self.next_cached = 0;
+            self.retireDirectories();
+            _ = self.metadata.reset(.free_all);
+            const a = self.metadata.allocator();
+            const count = @min(documents.len, self.keys.len);
+            for (documents[0..count], 0..) |id, index| {
+                self.ids[index] = try a.dupe(u8, id);
+                self.keys[index] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.schema);
+            }
+            var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
+            var timestamps: [64]u64 = undefined;
+            var scope = try self.read.openReadScope(a);
+            defer scope.close();
+            try @import("../document_mutation_revision.zig").loadWindow(&scope, a, self.keys[0..count], self.ids[0..count], contents[0..count], timestamps[0..count]);
+            for (contents[0..count], 0..) |content, index| self.sizes[index] = if (content) |proof| proof.bytes else null;
+            @memcpy(self.proofs[0..count], contents[0..count]);
+            self.cached = count;
+        }
+
+        /// Sorted physical reads restore caller order. Metadata lengths are
+        /// revision-bound to this snapshot; unknown or oversized rows read in
+        /// isolation. A legal single document may exceed the soft byte target.
+        /// Results expire on the next lookup, batch or page release.
+        pub fn lookupBatch(self: *@This(), documents: []const []const u8, max_bytes: usize) !Batch {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookupBatch", .{ self, documents, max_bytes });
+            const hydrated = try self.lookupBatchImpl(documents, &.{}, max_bytes);
+            return .{ .values = self.values[0..hydrated.consumed], .consumed = hydrated.consumed };
+        }
+        pub fn lookupProjectedBatch(self: *@This(), documents: []const []const u8, fields: []const []const u8, max_bytes: usize) !ProjectedBatch {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookupProjectedBatch", .{ self, documents, fields, max_bytes });
+            return self.lookupBatchImpl(documents, fields, max_bytes);
+        }
+        fn lookupBatchImpl(self: *@This(), documents: []const []const u8, fields: []const []const u8, max_bytes: usize) !ProjectedBatch {
+            if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
+            self.window.retire();
+            errdefer self.window.retire();
+            if (documents.len == 1 and fields.len == 0) {
+                self.values[0] = try self.lookup(documents[0]);
+                self.sources[0] = .{ .bytes = self.values[0].? };
+                return .{ .values = self.sources[0..1], .consumed = 1 };
+            }
+            try self.prepare(documents);
+            if (fields.len != 0) if (try self.projectBatch(documents.len, fields, max_bytes)) |projected| return projected;
+            // A declined projection must not retain its metadata/range buffers
+            // beside the full body. The proof cache has a separate owner.
+            self.window.retire();
+            const available = @min(documents.len, self.cached - self.next_cached);
+            const limit = @min(max_bytes, DocumentPrimaryReadWindow.max_bytes);
+            var count: usize = 0;
+            var bytes: u64 = 0;
+            while (count < available) : (count += 1) {
+                const length = self.sizes[self.next_cached + count] orelse break;
+                if (count != 0 and fields.len != 0 and length >= @import("../document_projection.zig").minimum_bytes) break;
+                if (length > limit -| bytes) break;
+                bytes += length;
+            }
+            count = @max(count, 1);
+            const keys = self.keys[self.next_cached..][0..count];
+            if (count == 1) {
+                self.values[0] = self.window.get(&self.read, keys[0], self.sizes[self.next_cached]) catch |err| switch (err) {
+                    error.NotFound => return error.StorageReadTemporarilyUnavailable,
+                    else => return err,
+                };
+            } else try self.window.getMany(&self.read, keys, self.values[0..count]);
+            for (self.values[0..count]) |value| if (value == null) return error.StorageReadTemporarilyUnavailable;
+            self.next_cached += count;
+            for (self.sources[0..count], self.values[0..count]) |*source, value| source.* = .{ .bytes = value.? };
+            return .{ .values = self.sources[0..count], .consumed = count };
+        }
+
+        fn requestRepair(self: *@This()) void {
+            if (self.repair_requested or openModeRequiresReadOnlyBackends(self.db.open_mode)) return;
+            self.repair_requested = true;
+            self.db.document_authority_backfill_requested.store(true, .release);
+        }
+        fn projectBatch(self: *@This(), maximum: usize, fields: []const []const u8, max_bytes: usize) !?ProjectedBatch {
+            const projection = @import("../document_projection.zig");
+            const revision = @import("../document_mutation_revision.zig");
+            const ranges_mod = @import("../value_ranges.zig");
+            const available = @min(maximum, self.cached - self.next_cached);
+            const limit = @min(max_bytes, DocumentPrimaryReadWindow.max_bytes);
+            const a = self.window.arena.allocator();
+            self.window.scope = try self.read.openReadScope(a);
+            const scope = &self.window.scope.?;
+            // Directory metadata is separately bounded by 64 * 32 KiB. Only
+            // projected payload cohorts enter the caller's soft byte window.
+            var directory_keys: [64]projection.Key = undefined;
+            var keys: [64][]const u8 = undefined;
+            var pending: [64]usize = undefined;
+            var pending_count: usize = 0;
+            var fetched: [64]?[]const u8 = @splat(null);
+            var candidates: usize = 0;
+            for (0..available) |i| {
+                const proof = self.proofs[self.next_cached + i] orelse {
+                    self.requestRepair();
+                    break;
+                };
+                if (proof.bytes < projection.minimum_bytes) break;
+                if (!self.directories_loaded[self.next_cached + i]) {
+                    directory_keys[pending_count] = projection.keyForRevision(revision.keyForPhysical(self.keys[self.next_cached + i]).?);
+                    keys[pending_count] = &directory_keys[pending_count];
+                    pending[pending_count] = self.next_cached + i;
+                    pending_count += 1;
+                }
+                candidates += 1;
+            }
+            if (candidates == 0) return null;
+            if (pending_count != 0) {
+                // Keep this bounded metadata lease across payload windows. A
+                // one-row byte limit must not re-read all remaining directories.
+                errdefer self.retireDirectories();
+                if (self.directory_scope == null) self.directory_scope = try self.read.openReadScope(self.directory_arena.allocator());
+                try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
+                for (pending[0..pending_count], fetched[0..pending_count]) |index, raw| {
+                    self.directories[index] = raw;
+                    self.directories_loaded[index] = true;
+                }
+            }
+            const Prepared = struct { fields: []projection.FieldValue, ranges: []ranges_mod.Range, values: [][]const u8, hashes: [][32]u8, duplicate: bool = false };
+            var prepared: [64]Prepared = undefined;
+            var requests: [64]ranges_mod.Request = undefined;
+            var request_count: usize = 0;
+            var count: usize = 0;
+            var retained: usize = 0;
+            while (count < candidates) : (count += 1) {
+                const physical = self.keys[self.next_cached + count];
+                const duplicate = for (0..count) |prior| {
+                    if (std.mem.eql(u8, physical, self.keys[self.next_cached + prior])) break prior;
+                } else null;
+                if (duplicate) |prior| {
+                    prepared[count] = prepared[prior];
+                    prepared[count].duplicate = true;
+                    continue;
+                }
+                const proof = self.proofs[self.next_cached + count].?;
+                const raw = self.directories[self.next_cached + count] orelse {
+                    self.requestRepair();
+                    break;
+                };
+                const directory = (try projection.Directory.open(a, raw, proof)) orelse {
+                    if (!try projection.isCurrent(a, raw, proof)) self.requestRepair();
+                    break;
+                };
+                var selected_bytes: u64 = 0;
+                var selected_count: usize = 0;
+                for (fields) |name| if (directory.find(name)) |field| {
+                    selected_bytes +|= field.length;
+                    selected_count += 1;
+                };
+                if (selected_bytes >= proof.bytes / 2 or selected_count > ranges_mod.maximum_ranges) break;
+                const ranges = try a.alloc(ranges_mod.Range, selected_count);
+                var slot: usize = 0;
+                for (fields) |name| if (directory.find(name)) |field| {
+                    ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
+                    slot += 1;
+                };
+                const cost = if (scope.supportsRange()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else if (selected_count == 0) 0 else proof.bytes;
+                if (count != 0 and cost > limit -| retained) break;
+                retained +|= std.math.cast(usize, cost) orelse return error.InvalidDocumentContentAuthority;
+                const output = try a.alloc(projection.FieldValue, selected_count);
+                const values = try a.alloc([]const u8, selected_count);
+                const hashes = try a.alloc([32]u8, selected_count);
+                slot = 0;
+                for (fields) |name| if (directory.find(name)) |field| {
+                    output[slot] = .{ .name = field.name, .value = undefined };
+                    hashes[slot] = field.digest;
+                    slot += 1;
+                };
+                prepared[count] = .{ .fields = output, .ranges = ranges, .values = values, .hashes = hashes };
+                if (selected_count != 0) {
+                    requests[request_count] = .{ .key = physical, .ranges = ranges, .output = values };
+                    request_count += 1;
+                }
+            }
+            if (count == 0) return null;
+            std.mem.sort(ranges_mod.Request, requests[0..request_count], {}, struct {
+                fn less(_: void, left: ranges_mod.Request, right: ranges_mod.Request) bool {
+                    return std.mem.order(u8, left.key, right.key) == .lt;
+                }
+            }.less);
+            scope.getRangesMany(requests[0..request_count]) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+            for (prepared[0..count], self.sources[0..count]) |item, *source| {
+                if (!item.duplicate) for (item.values, item.hashes, item.fields) |value, hash, *field| {
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+                    if (!std.mem.eql(u8, &digest, &hash)) return error.InvalidDocumentContentAuthority;
+                    field.value = value;
+                };
+                source.* = .{ .fields = item.fields };
+            }
+            self.window.bytes = retained;
+            self.next_cached += count;
+            return .{ .values = self.sources[0..count], .consumed = count };
+        }
+
+        pub fn lookup(self: *@This(), key: []const u8) ![]const u8 {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookup", .{ self, key });
+            self.window.retire();
+            const a = self.window.arena.allocator();
+            const physical = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, key, self.schema);
+            // Ranking already applied visibility/TTL at the captured cut.
+            // Never fall back to a fresh read if the captured row is absent.
+            return self.window.get(&self.read, physical, 0) catch |err| switch (err) {
+                error.NotFound => error.StorageReadTemporarilyUnavailable,
+                else => err,
+            };
+        }
+        /// Page cells already own their selected payloads. Retire the last
+        /// source scope before a portal suspends, keeping only the snapshot.
+        pub fn releasePage(self: *@This()) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsReleasePage", .{self}) catch @panic("incompatible storage owner");
+            self.window.retire();
+            self.retireDirectories();
+            _ = self.metadata.reset(.free_all);
+            self.cached = 0;
+            self.next_cached = 0;
+        }
+        pub fn deinit(self: *@This()) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsDeinit", .{self}) catch @panic("incompatible storage owner");
+            self.window.deinit();
+            self.retireDirectories();
+            self.directory_arena.deinit();
+            self.metadata.deinit();
+            self.read.abort();
+            self.schema.release();
+            self.policy.release();
+            self.* = undefined;
+        }
+    };
+
     /// Own one primary read generation across a local query's selection and
     /// aggregation collection. Acquire only after the Raft read barrier; never
     /// wait for another apply barrier while this lease excludes writers.
@@ -40180,6 +40520,16 @@ pub const DB = struct {
             }, currentTimeNs());
             reader.row_policy_lease = self.row_policy_lease.clone();
             return reader;
+        }
+
+        pub fn documentRows(self: *const QueryReadLease, alloc: Allocator, schema_version: u32) !DocumentRows {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsUnderLease", .{ self, alloc, schema_version });
+            var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
+            errdefer view.release();
+            if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
+            var read = try self.db.core.store.beginReadTxn();
+            errdefer read.abort();
+            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc), .directory_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
@@ -53133,13 +53483,7 @@ fn saveAppliedSequencesBatchLockedContext(
             // Only an already-certified empty publication may carry its zero
             // count across a source-only native commit. Ordinary native
             // ingest keeps the count-sidecar optimization.
-            if (ctx.index_manager.denseIndex(update.index_name)) |entry| {
-                const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(update.index_name) orelse return error.InvalidDerivedApplyState;
-                if (entry.certifiedEmptyNativeCheckpoint(checkpoint)) |certified| {
-                    try apply_state.saveProjectionCheckpointWithSidecar(ctx.alloc, ctx.index_manager.checkpointIo(), ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name, certified);
-                    _ = entry.validateServingCertificate(certified);
-                }
-            }
+            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name);
         } else {
             generic_updates.appendAssumeCapacity(update);
         }
@@ -110467,6 +110811,54 @@ test "db source-only batch retains a certified empty dense generation" {
     return error.IndexNotFound;
 }
 
+test "db source-only watermark retains a certified empty dense generation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("native-empty-watermark-certificate");
+    defer directory.cleanup();
+    var gated = GateDenseEmbedder{ .allowed_successes = .init(0) };
+    var db = try DB.open(alloc, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = gated.interface() },
+    });
+    defer db.close();
+    const cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .coverage_generation = 33,
+        .config_json =
+        \\{"field":"body","dims":3,"embedding_name":"dense_idx","publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"dense_idx"}}
+        ,
+    };
+    try std.testing.expectEqual(@as(?u128, null), try db.admitManagedIndex(cfg));
+    const before = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(@as(?u64, 0), before.published_count);
+    try db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"body\":\"pending embedding\"}" }}, .sync_level = .write });
+    // A sibling's activation can cover a source-only native window through
+    // the generic watermark callback while its producer remains pending.
+    try db.core.saveAppliedSequence(cfg.name, before.applied_sequence + 1);
+    const after = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(before.applied_sequence + 1, after.applied_sequence);
+    try std.testing.expectEqual(@as(?u64, 0), after.published_count);
+    try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var found = false;
+    for (stats.indexes) |item| if (std.mem.eql(u8, item.name, cfg.name)) {
+        found = true;
+        try std.testing.expect(item.serving_snapshot_ready);
+    };
+    try std.testing.expect(found);
+    const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+    entry.verified_serving_certificate = null;
+    try db.batch(.{ .writes = &.{.{ .key = "another", .value = "{\"body\":\"still pending\"}" }}, .sync_level = .write });
+    try db.core.saveAppliedSequence(cfg.name, after.applied_sequence + 1);
+    const uncertified = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(@as(?u64, null), uncertified.published_count);
+    try std.testing.expect(!try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+}
+
 test "db empty inline dense generation finalizes without scanning primary documents" {
     const alloc = std.testing.allocator;
 
@@ -115191,6 +115583,77 @@ test "db graph ttl direct cleanup cannot delete a replaced artifact" {
     var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, artifact);
     defer edge.deinit(alloc);
     try std.testing.expectEqual(@as(f64, 3), edge.weight);
+}
+
+test "db graph ttl migration cold writer fences legacy expiry without changing readonly files" {
+    const alloc = std.testing.allocator;
+    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const migration = @import("maintenance/graph_ttl_migration.zig");
+    var path_tmp = try TestDirectory.init("db-graph-ttl-legacy-namespace");
+    defer path_tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const resolution = try internal_keys.resolutionArtifactKeyAlloc(scratch, "doc:a", "resolver");
+    var promotion: std.ArrayList(u8) = .empty;
+    try promotion.appendSlice(scratch, &internal_keys.promoted_keys_state_prefix);
+    try internal_keys.appendEncodedComponent(&promotion, scratch, resolution);
+    var deadline: u64 = 0;
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"_edges\":{\"g\":{\"links\":[{\"target\":\"doc:b\"}]}}}" }}, .sync_level = .full_index });
+        const rows = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        deadline = try graph_edge_ttl_expiration.deadlineFromKey(rows[0].key);
+        const legacy = try scratch.dupe(u8, rows[0].key);
+        @memcpy(legacy[0..internal_keys.legacy_graph_edge_expiration_index_prefix.len], &internal_keys.legacy_graph_edge_expiration_index_prefix);
+        // Reconstruct the old writer's durable representation, including the
+        // mixed family and pre-migration reader fence. No worker is running.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(legacy, rows[0].value);
+        try txn.delete(rows[0].key);
+        try txn.put(promotion.items, "promotion state");
+        try txn.put(resolver_catalog.minimum_reader_key, "3");
+        try txn.delete("\x00\x00__metadata__:resolvers");
+        try txn.delete(migration.progress_key);
+        try txn.commit();
+    }
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .open_mode = .query_readonly, .start_optional_runtimes = false });
+        defer db.close();
+        const floor = try db.core.store.get(alloc, resolver_catalog.minimum_reader_key);
+        defer alloc.free(floor);
+        try std.testing.expectEqualStrings("3", floor);
+        const rows = try db.core.store.scanPrefix(alloc, &internal_keys.legacy_graph_edge_expiration_index_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, migration.progress_key));
+    }
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&read, 3));
+        }
+        var clock = platform_clock.ManualClock{};
+        clock.setRealtimeNs(deadline + 1);
+        try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = clock.clock() });
+        try db.ttl_runtime.?.runOnce();
+        try std.testing.expectEqual(@as(u64, 1), db.ttl_runtime.?.stats().expired_graph_artifacts);
+        try std.testing.expectEqual(@as(u64, 0), db.ttl_runtime.?.stats().error_count);
+        const preserved = try db.core.store.get(alloc, promotion.items);
+        defer alloc.free(preserved);
+        try std.testing.expectEqualStrings("promotion state", preserved);
+        const edges = try db.getEdges(alloc, "g", "doc:a", "links", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
 }
 
 test "db graph ttl due index rebuild resumes after reopen" {
@@ -134026,6 +134489,174 @@ test "db ordered artifact inventory producer pages resume after restart without 
         try std.testing.expectEqual(@as(u64, 1), (try obligations.load(&read)).?.pending_documents);
         try std.testing.expectError(error.ArtifactCatalogDrift, obligations.requireDrained(&read, authority));
     }
+}
+
+test "db ordered artifact inventory row reconciliation publishes envelopes and preserves reader floors" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("row-inventory-envelope");
+    defer tmp.cleanup();
+    const Check = struct {
+        fn ready(db: *DB, command: inventory.Command) !void {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u32, 4), try resolver_catalog_mod.readMinimumReaderVersion(&read, 4));
+            try std.testing.expectEqualStrings(command.catalogs.resolvers, (try inventory.catalogs(&read)).resolvers);
+            try std.testing.expect((try inventory.status(std.testing.allocator, &read, command.namespace)).ready);
+            try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(command.catalogs));
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try std.testing.expect(plan.plan().matchesArtifactInventory(command.catalogs));
+        }
+    };
+    var expected: ?inventory.Catalogs = null;
+    defer if (expected) |*catalogs| catalogs.deinit(alloc);
+    var committed: ?inventory.Command = null;
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        var old = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer old.release();
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            expected = try inventory.copyCatalogs(alloc, &read);
+        }
+        const envelope = try resolver_catalog_mod.versionedCatalog(alloc, "[]", 4);
+        alloc.free(expected.?.resolvers);
+        expected.?.resolvers = envelope;
+        const command: inventory.Command = .{
+            .namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace),
+            .binding = .{ .epoch = 1, .digest = expected.?.digest(), .semantic_digest = try expected.?.semanticDigest(alloc) },
+            .catalogs = expected.?,
+        };
+        const request: types.BatchRequest = .{ .artifact_catalog = command };
+        const receipt: OrderedApplyReceipt = .{ .term = 1, .index = 1 };
+        try db.reconcileReplicatedArtifactAdmission(request, receipt);
+        // The production caller completes this reconciliation with its
+        // compound source/merge admission. Acknowledge only the catalog side
+        // in this fixture; a standalone catalog mutation cannot bypass an intent.
+        {
+            var ack = try db.core.store.beginWriteTxn();
+            errdefer ack.abort();
+            try inventory.stageOrdered(alloc, &ack, command, receipt.index);
+            try @import("artifact_reconcile_intent.zig").clear(alloc, &ack, command, receipt.index);
+            try ack.commit();
+        }
+        try Check.ready(&db, command);
+        try std.testing.expect(!old.plan().matchesArtifactInventory(command.catalogs));
+        committed = command;
+        // A later, otherwise valid row-only recipe may not erase the permanent
+        // reader fence merely because it has no resolver definitions.
+        var legacy = command;
+        legacy.previous = command.binding;
+        legacy.binding.epoch = 2;
+        legacy.catalogs.resolvers = "[]";
+        legacy.binding.digest = legacy.catalogs.digest();
+        legacy.binding.semantic_digest = try legacy.catalogs.semanticDigest(alloc);
+        try std.testing.expectError(error.ArtifactCatalogDrift, db.reconcileReplicatedArtifactAdmission(.{ .artifact_catalog = legacy }, .{ .term = 1, .index = 2 }));
+        try Check.ready(&db, command);
+        {
+            var cleanup = try db.core.store.beginWriteTxn();
+            errdefer cleanup.abort();
+            try @import("artifact_reconcile_intent.zig").clear(alloc, &cleanup, legacy, 2);
+            try cleanup.commit();
+        }
+    }
+    var reopened = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly });
+    defer reopened.close();
+    try Check.ready(&reopened, committed.?);
+}
+
+test "db ordered artifact inventory reader epoch upgrade refreshes digest and immutable plans" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("reader-upgrade-inventory");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    // Establish a certified old catalog and retain its immutable foreground view.
+    const before = before: {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try inventory.refresh(&txn);
+        const binding = try inventory.local(&txn);
+        try txn.commit();
+        break :before binding;
+    };
+    var old = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer old.release();
+    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, 4);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const after = try inventory.local(&read);
+    try std.testing.expectEqual(before.epoch + 1, after.epoch);
+    const catalogs = try inventory.catalogs(&read);
+    try std.testing.expectEqualStrings("{\"version\":4,\"resolvers\":[]}", catalogs.resolvers);
+    try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(catalogs));
+    var current = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer current.release();
+    try std.testing.expect(current.plan() != old.plan());
+    try std.testing.expect(current.plan().matchesArtifactInventory(catalogs));
+    try std.testing.expect(!old.plan().matchesArtifactInventory(catalogs));
+    // The old plan remains valid for its pinned generation; a no-op upgrade
+    // neither advances the inventory epoch nor rebuilds the new plan.
+    try std.testing.expect(old.plan().matchesArtifactInventory(old.plan().artifact_catalogs.?));
+    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, 4);
+    var again = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer again.release();
+    try std.testing.expect(again.plan() == current.plan());
+    var latest = try db.core.store.beginReadTxn();
+    defer latest.abort();
+    try std.testing.expectEqual(after.epoch, (try inventory.local(&latest)).epoch);
+}
+
+test "db ordered artifact inventory graph TTL definitions retain reader envelope across mutations and reopen" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("ttl-inventory-envelope");
+    defer tmp.cleanup();
+    const Check = struct {
+        fn loaded(db: *DB) !void {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try inventory.local(&read);
+            const catalogs = try inventory.catalogs(&read);
+            // Shard transition admission consumes both the exact binding and
+            // its definition identity, not just loaded-index matching.
+            const command: inventory.Command = .{
+                .namespace = @splat(7),
+                .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(std.testing.allocator) },
+                .catalogs = catalogs,
+            };
+            try command.validate();
+            try std.testing.expectEqual(@as(u32, 4), try resolver_catalog_mod.catalogReaderVersion(std.testing.allocator, catalogs.resolvers));
+            try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(catalogs));
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try std.testing.expect(plan.plan().matchesArtifactInventory(catalogs));
+        }
+    };
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+        try Check.loaded(&db);
+        try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body" });
+        try Check.loaded(&db);
+        try std.testing.expect(try db.deleteIndex("g"));
+        // Removing the last TTL index cannot erase a permanent format fence.
+        try Check.loaded(&db);
+    }
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try Check.loaded(&db);
+    }
+    var readonly = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly });
+    defer readonly.close();
+    try Check.loaded(&readonly);
 }
 
 test "db ordered artifact inventory obsolete producer work is bounded and preserves pinned readers" {

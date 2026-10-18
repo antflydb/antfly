@@ -595,6 +595,14 @@ jobs:
       - name: Test portable Linux x86 inference kernel dispatch
         run: python3 zig/tools/verify_linux_x86_kernels.py
 
+      - name: Test native Linux x86 video decoding and logical indexing
+        working-directory: zig/lib/video
+        run: |
+          uname -srm
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+          zig build test-video -Dcpu=baseline -Doptimize=ReleaseSafe -j1 --summary all
+
       - name: Test optional OpenBLAS dispatch and fallback
         run: python3 zig/tools/verify_runtime_openblas.py --openblas-library /usr/lib/x86_64-linux-gnu/libopenblas.so.0
 
@@ -606,26 +614,10 @@ jobs:
           # A successful aggregate could hide a skipped process check.
           grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
 
-      - name: Set up Node for WASM tests
+      - name: Set up Node for generated source checks
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: ts/package.json
-
-      - name: Build and test Apache WASM artifacts
-        working-directory: zig
-        run: |
-          # The @antfly/web package contract suite runs from its built ESM
-          # artifact in the TypeScript SDK gate.
-          node pkg/antfly-embedded/wasm_client_test.mjs
-          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
-          EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
-          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
-          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
-          cd pkg/inference
-          zig build wasm -Dwasm=true -j1 --summary all
-          node web/test-wasm-abi.mjs wasm32
-          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
-          node web/test-wasm-abi.mjs wasm64
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -677,9 +669,9 @@ jobs:
       - name: Check inference kernels through the root build graph
         working-directory: zig
         run: >-
-          zig build inference-test -Dmetal=false -Dcuda=false --
-          --test-filter "quant kernel compiler"
-          --test-filter "metal renderer"
+          zig build inference-test -Dmetal=false -Dcuda=false
+          -Dtest-filter="quant kernel compiler"
+          -Dtest-filter="metal renderer"
 
       - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
@@ -717,54 +709,6 @@ jobs:
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
-
-      - name: Exercise real Lite extraction through public graph APIs
-        if: needs.changes.outputs.zig_tests == 'true'
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
-          model_dir="$models_root/fastino/gliner2.5-base-v1"
-          trap 'rm -rf "$models_root"' EXIT
-          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
-          cd zig
-          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
-            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            -j1
-          cd pkg/inference
-          python3 ../../tools/run_bounded_zig_build.py build test \
-            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
-            --cache-dir ../../.zig-cache --prefix ../../zig-out
-          cd ../../..
-          python3 scripts/ci/prepare_lite_previous_reader.py
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
-          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
-          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
-              --output "$RUNNER_TEMP/lite-extraction-eval.json"
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
-
-      - name: Locate real-model extraction evaluation
-        id: lite_extraction_report
-        if: always() && needs.changes.outputs.zig_tests == 'true'
-        run: |
-          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
-            echo 'exists=true' >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload real-model extraction evaluation
-        if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: lite-extraction-evaluation
-          path: ${{ runner.temp }}/lite-extraction-eval.json
-          if-no-files-found: error
 
       - name: Release completed pre-unit test artifacts
         if: needs.changes.outputs.zig_tests == 'true'
@@ -855,6 +799,218 @@ jobs:
           path: ${{ runner.temp }}/antfly-tla-traces/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Independent target matrices own their clocks and disposable compiler caches;
+  # they do not consume the native unit gate's watchdog allowance.
+  zig-base-wasm:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      !inputs.full_validation &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      ((inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) }}
+    name: zig-base / wasm
+    needs: [admission, changes]
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: true
+
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Set up Node for WASM tests
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+
+      - name: Build and test Apache WASM artifacts
+        working-directory: zig
+        run: |
+          # The @antfly/web package contract suite runs from its built ESM
+          # artifact in the TypeScript SDK gate.
+          node pkg/antfly-embedded/wasm_client_test.mjs
+          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
+          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
+          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
+          cd pkg/inference
+          zig build wasm -Dwasm=true -j1 --summary all
+          node web/test-wasm-abi.mjs wasm32
+          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
+          node web/test-wasm-abi.mjs wasm64
+
+      - name: Release completed qualification artifacts
+        if: always() && steps.cache.outcome == 'success'
+        run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
+
+  zig-base-lite-models:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      !inputs.full_validation &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      ((inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) &&
+      needs.changes.outputs.zig_tests == 'true' }}
+    name: zig-base / lite-models
+    needs: [admission, changes]
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: true
+
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Build Lite qualification libraries
+        timeout-minutes: 60
+        run: |
+          # Cold current/baseline library builds precede the real-model clock.
+          # The following test step retains its 25-minute execution bound.
+          cd zig
+          python3 tools/run_bounded_zig_build.py build capi \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false -j1
+          cd ..
+          python3 scripts/ci/prepare_lite_previous_reader.py
+
+      - name: Exercise real Lite extraction through public graph APIs
+        if: needs.changes.outputs.zig_tests == 'true'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
+          model_dir="$models_root/fastino/gliner2.5-base-v1"
+          trap 'rm -rf "$models_root"' EXIT
+          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
+          cd zig
+          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi-test \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
+            -j1
+          cd pkg/inference
+          python3 ../../tools/run_bounded_zig_build.py build test \
+            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
+            --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
+          cd ../../..
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
+          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
+              --output "$RUNNER_TEMP/lite-extraction-eval.json"
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
+
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
+        if: always() && needs.changes.outputs.zig_tests == 'true'
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lite-extraction-evaluation
+          path: ${{ runner.temp }}/lite-extraction-eval.json
+          if-no-files-found: error
+
+      - name: Release completed qualification artifacts
+        if: always() && steps.cache.outcome == 'success'
+        run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
 
   zig-full-tests:
     if: >-
@@ -1022,7 +1178,7 @@ jobs:
           cd pkg/inference
           python3 ../../tools/run_bounded_zig_build.py build test \
             '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
-            --cache-dir ../../.zig-cache --prefix ../../zig-out
+            --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
           cd ../../..
           python3 scripts/ci/prepare_lite_previous_reader.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
@@ -1324,13 +1480,16 @@ jobs:
       needs.changes.outputs.model_check == 'true' ||
       needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
-    needs: [admission, changes, zig-base-tests, arm64-codec, grep-qualification]
+    needs: [admission, changes, zig-base-tests, zig-base-wasm, zig-base-lite-models, arm64-codec, grep-qualification]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-base shards
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-base-tests.result }}
+          WASM_RESULT: ${{ needs.zig-base-wasm.result }}
+          LITE_MODEL_RESULT: ${{ needs.zig-base-lite-models.result }}
+          REQUIRE_LITE_MODELS: ${{ needs.changes.outputs.zig_tests == 'true' }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
           GREP_RESULT: ${{ needs.grep-qualification.result }}
         run: |
@@ -1339,6 +1498,10 @@ jobs:
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
           test "$GREP_RESULT" = "success"
+          test "$WASM_RESULT" = "success"
+          if [ "$REQUIRE_LITE_MODELS" = "true" ] || [ "$LITE_MODEL_RESULT" != "skipped" ]; then
+            test "$LITE_MODEL_RESULT" = "success"
+          fi
 
   zig-full:
     if: >-
