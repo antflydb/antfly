@@ -39,6 +39,7 @@ const values = [_]ValueSpec{
     .{ .name = "--max-pending-output" },
     .{ .name = "--max-spill-bytes" },
     .{ .name = "--decision-batch-wait-ms" },
+    .{ .name = "--decision-concurrency" },
     .{ .name = "--dictionary-format", .choices = "auto raw brotli brotli-google" },
     .{ .name = "--max-dictionary-size" },
     .{ .name = "--max-decompression-window" },

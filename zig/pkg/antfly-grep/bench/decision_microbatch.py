@@ -39,12 +39,14 @@ def main():
     parser.add_argument("--files", type=int, default=128)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--provider-lanes", type=int, default=2)
+    parser.add_argument("--candidate-concurrency", type=int, default=0)
     parser.add_argument("--delay-ms", type=int, default=20)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     if (
         min(args.rounds, args.files, args.threads, args.provider_lanes) < 1
         or args.delay_ms < 0
+        or not 0 <= args.candidate_concurrency <= 256
     ):
         parser.error("positive counts and nonnegative delay required")
     binaries = {
@@ -69,6 +71,7 @@ def main():
         "files": args.files,
         "threads": args.threads,
         "provider_lanes": args.provider_lanes,
+        "candidate_concurrency": args.candidate_concurrency,
         "fixture_delay_ms": args.delay_ms,
         "host": {"platform": platform.platform(), "cpu_count": os.cpu_count()},
         "fixture_source_sha256": hashlib.sha256(tests.read_bytes()).hexdigest(),
@@ -92,6 +95,18 @@ def main():
             f"--threads={args.threads}",
             "src",
         ]
+        commands = {
+            name: [
+                binary,
+                *flags,
+                *(
+                    [f"--decision-concurrency={args.candidate_concurrency}"]
+                    if name == "antfly-grep" and args.candidate_concurrency
+                    else []
+                ),
+            ]
+            for name, binary in binaries.items()
+        }
         expected = None
         for name, binary in binaries.items():
             report["binaries"][name] = {
@@ -101,7 +116,7 @@ def main():
                 .strip(),
             }
             result = subprocess.run(
-                [binary, *flags],
+                commands[name],
                 cwd=case.root,
                 env=case.env,
                 capture_output=True,
@@ -121,12 +136,16 @@ def main():
             if expected is not None and expected != signature:
                 raise RuntimeError("non-equivalent evidence")
             expected = signature
-            report["cases"][name] = {"runs": []}
+            report["cases"][name] = {"runs": [], "qualification_summary": rows[-1]}
         for trial in range(args.rounds):
             for name in binaries if trial % 2 == 0 else reversed(binaries):
                 case.server.requests.clear()
-                sample = measure([binaries[name], *flags], case.root, case.env)
+                sample = measure(commands[name], case.root, case.env)
                 sample["requests"] = len(case.server.requests)
+                sample["request_bytes"] = sum(
+                    len(json.dumps(body, separators=(",", ":")).encode())
+                    for _, _, body in case.server.requests
+                )
                 sample["inputs"] = sum(
                     len(body["inputs"]) for _, _, body in case.server.requests
                 )

@@ -69,6 +69,7 @@ const Candidate = struct {
     score: f64 = 0,
     ordinal: usize = 0,
     provenance: @import("document.zig").Provenance = .{},
+
     rows: []RenderRow = &.{},
     view: ?EvidenceView = null,
     before: Summary = .{},
@@ -144,6 +145,8 @@ pub const Search = struct {
     independent_override: ?bool = null,
     reserved_output: usize = 0,
     index_worker: ?*Search = null,
+    local_cwd: ?[]const u8 = null,
+    owns_cwd: bool = false,
     provenance: @import("document.zig").Provenance = .{},
     dictionary: ?*ExternalDictionary = null,
     a: Allocator,
@@ -198,12 +201,15 @@ pub const Search = struct {
         var matcher = try Matcher.initForSearch(a, o);
         errdefer matcher.deinit();
         const dictionary = if (o.search_zip and o.dictionary_path != null) try ExternalDictionary.load(a, io, o.dictionary_path.?, o.dictionary_size_limit, o.dictionary_format) else null;
+        errdefer if (dictionary) |d| d.release();
+        const cwd = if (o.json) try std.process.currentPathAlloc(io, a) else null;
         const tty = std.Io.File.stdout().isTty(io) catch false;
-        return .{ .a = a, .io = io, .options = o, .matcher = matcher, .decider = decision.Client.init(a, io, o), .dictionary = dictionary, .stdout_tty = tty };
+        return .{ .a = a, .io = io, .options = o, .matcher = matcher, .decider = decision.Client.init(a, io, o), .dictionary = dictionary, .stdout_tty = tty, .local_cwd = cwd, .owns_cwd = cwd != null };
     }
     fn initShared(root: *Search) !Search {
         const matcher = try root.matcher.clone(root.a);
         var result: Search = .{ .a = root.a, .io = root.io, .options = root.options, .dictionary = if (root.dictionary) |dictionary| dictionary.retain() else null, .matcher = matcher, .decider = decision.Client.init(root.a, root.io, root.options), .stdout_tty = root.stdout_tty };
+        result.local_cwd = root.local_cwd;
         result.decider.shareCache(&root.decider);
         result.decider.coalescer = root.decider.coalescer;
         result.ranking = root.ranking;
@@ -246,6 +252,7 @@ pub const Search = struct {
             if (task.result) |result| self.a.free(result);
         }
         self.tasks.deinit(self.a);
+        if (self.owns_cwd) self.a.free(self.local_cwd.?);
     }
     pub fn stopped(self: *Search) bool {
         return self.stop or (if (self.shared_limits) |limits| limits.cancel.load(.monotonic) else false);
@@ -373,12 +380,15 @@ pub const Search = struct {
             self.decider.cache_hits += client.cache_hits;
             self.decider.input_tokens += client.input_tokens;
             self.decider.output_tokens += client.output_tokens;
+            self.decider.request_bytes += client.request_bytes;
+            self.decider.request_inputs += client.request_inputs;
+            self.decider.peak_request_bytes = @max(self.decider.peak_request_bytes, client.peak_request_bytes);
         }
         const elapsed = started.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const seconds = @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0;
         const human = try std.fmt.allocPrint(self.a, "{d:.6}s", .{seconds});
         defer self.a.free(human);
-        if (self.options.json and !self.options.quiet) try self.json(.{ .type = "summary", .data = .{ .elapsed_total = .{ .secs = @as(u64, @intCast(@divFloor(elapsed, 1_000_000_000))), .nanos = @as(u32, @intCast(@mod(elapsed, 1_000_000_000))), .human = human }, .stats = self.jsonStats(.{}) }, .stats = self.summary, .requests = self.decider.requests, .input_tokens = self.decider.input_tokens, .output_tokens = self.decider.output_tokens, .cache_hits = self.decider.cache_hits });
+        if (self.options.json and !self.options.quiet) try self.json(.{ .type = "summary", .data = .{ .elapsed_total = .{ .secs = @as(u64, @intCast(@divFloor(elapsed, 1_000_000_000))), .nanos = @as(u32, @intCast(@mod(elapsed, 1_000_000_000))), .human = human }, .stats = self.jsonStats(.{}) }, .stats = self.summary, .requests = self.decider.requests, .input_tokens = self.decider.input_tokens, .output_tokens = self.decider.output_tokens, .request_bytes = self.decider.request_bytes, .request_inputs = self.decider.request_inputs, .peak_request_bytes = self.decider.peak_request_bytes, .cache_hits = self.decider.cache_hits });
         if (self.options.stats and !self.options.json) std.debug.print("{d} matches\n{d} matched lines\n{d} files contained matches\n{d} files searched\n{d} bytes searched\n{s} total\n", .{ self.summary.occurrences, self.summary.matches, self.summary.files_with_matches, self.summary.files, self.summary.bytes, human });
         if (self.options.ask != null and !self.options.quiet and !self.options.suppress_progress) std.debug.print("antfly-grep: {d} files, {d}/{d} regions evaluated, {d} matches, {d} requests, {d} input tokens, {s}\n", .{ self.summary.files, self.summary.regions_evaluated, self.summary.regions_considered, self.summary.matches, self.decider.requests, self.decider.input_tokens, if (self.summary.complete) "complete" else "partial" });
         try self.flushOutput();
@@ -534,6 +544,7 @@ pub const Search = struct {
             }
             return;
         }
+        self.decider.coalescer = if (jobs > 1 and self.options.ask != null) &self.coalescer else null;
         var context = Parallel{ .search = self };
         const threads = try self.a.alloc(std.Thread, jobs);
         defer self.a.free(threads);
@@ -872,6 +883,9 @@ pub const Search = struct {
             root.decider.requests += local.decider.requests;
             root.decider.input_tokens += local.decider.input_tokens;
             root.decider.output_tokens += local.decider.output_tokens;
+            root.decider.request_bytes += local.decider.request_bytes;
+            root.decider.request_inputs += local.decider.request_inputs;
+            root.decider.peak_request_bytes = @max(root.decider.peak_request_bytes, local.decider.peak_request_bytes);
             root.decider.cache_hits += local.decider.cache_hits;
         }
         fn fail(ctx: *Parallel, err: anyerror) void {
@@ -997,7 +1011,7 @@ pub const Search = struct {
             self.summary.matches += 1;
             return;
         }
-        const local_uri = if (self.options.json) try @import("document.zig").localUri(self.a, self.io, path_name) else null;
+        const local_uri = if (self.options.json) try @import("document.zig").localUriAt(self.a, self.local_cwd.?, path_name) else null;
         defer if (local_uri) |uri| self.a.free(uri);
         const previous_source = self.provenance;
         defer self.provenance = previous_source;
@@ -1094,6 +1108,9 @@ pub const Search = struct {
         local.decider.cache_hits = 0;
         local.decider.input_tokens = 0;
         local.decider.output_tokens = 0;
+        local.decider.request_bytes = 0;
+        local.decider.request_inputs = 0;
+        local.decider.peak_request_bytes = 0;
         defer {
             local.provenance = .{};
             local.sink = null;
@@ -1118,6 +1135,9 @@ pub const Search = struct {
             self.decider.requests += local.decider.requests;
             self.decider.input_tokens += local.decider.input_tokens;
             self.decider.output_tokens += local.decider.output_tokens;
+            self.decider.request_bytes += local.decider.request_bytes;
+            self.decider.request_inputs += local.decider.request_inputs;
+            self.decider.peak_request_bytes = @max(self.decider.peak_request_bytes, local.decider.peak_request_bytes);
             self.decider.cache_hits += local.decider.cache_hits;
             self.stop = self.stop or local.stop;
         }

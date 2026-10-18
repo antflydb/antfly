@@ -71,7 +71,7 @@ fn load(a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8,
     var promote = false;
     const record = (if (state.views) |views| views.loadPrepared(a, io, o, key) else null) orelse blk4: {
         promote = true;
-        break :blk4 (if (state.views) |views| views.load(a, io, cache(directory), key) else cache(directory).load(a, io, key));
+        break :blk4 (if (state.views) |views| views.loadLegacyPrepared(a, io, o, key) orelse views.load(a, io, cache(directory), key) else cache(directory).load(a, io, key));
     } orelse blk: {
         if (state.legacy == null) state.legacy = @import("artifact_cache.zig").LegacyPresence.scan(io, directory).sources;
         if (!state.legacy.?) return null;

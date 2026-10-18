@@ -144,11 +144,14 @@ def main():
                 commands[name][-1] = "src/overview.txt"
             if args.top_k:
                 commands[name].insert(1, f"--max-result-files={args.top_k}")
+            cold_start = time.perf_counter()
             result = subprocess.run(
                 commands[name], cwd=root, env=env, capture_output=True, check=True
             )
+            cold_seconds = time.perf_counter() - cold_start
             report["cases"][name] = {
                 "cold_summary": json.loads(result.stdout.splitlines()[-1]),
+                "cold_seconds": cold_seconds,
                 "warm_runs": [],
             }
         for trial in range(args.rounds):

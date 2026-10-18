@@ -17,6 +17,8 @@ const std = @import("std");
 pub const Limits = struct {
     spill_bytes: std.atomic.Value(usize) = .init(0),
     pending_output: std.atomic.Value(usize) = .init(0),
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
     active: std.atomic.Value(usize) = .init(0),
     lanes: std.atomic.Value(usize) = .init(0),
     pause_until_ms: std.atomic.Value(i64) = .init(0),
@@ -25,6 +27,8 @@ pub const Limits = struct {
     source_bytes: std.atomic.Value(usize) = .init(0),
     cancel: std.atomic.Value(bool) = .init(false),
     pub fn acquire(self: *Limits, io: std.Io, max: usize) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         _ = self.lanes.cmpxchgStrong(0, @max(1, max), .monotonic, .monotonic);
         while (true) {
             if (self.cancel.load(.monotonic)) return error.Canceled;
@@ -33,11 +37,20 @@ pub const Limits = struct {
                 const active = self.active.load(.monotonic);
                 if (active < self.lanes.load(.monotonic) and self.active.cmpxchgWeak(active, active + 1, .monotonic, .monotonic) == null) return;
             }
-            try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+            // Releases wake waiters immediately. A bounded timeout observes
+            // cancellation and throttle deadlines without a polling delay on
+            // every successful provider handoff.
+            self.changed.waitTimeout(io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            };
         }
     }
-    pub fn release(self: *Limits) void {
+    pub fn release(self: *Limits, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         _ = self.active.fetchSub(1, .monotonic);
+        self.changed.signal(io);
     }
     pub fn throttle(self: *Limits, io: std.Io, delay_ms: u64) void {
         var old = self.lanes.load(.monotonic);

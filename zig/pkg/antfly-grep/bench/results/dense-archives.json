@@ -1,0 +1,26 @@
+[
+  {
+    "target": "macos-arm64",
+    "binary_sha256": "a7e29f4dccfd2d980b6eeaa96c1de37730f44e9c2f59dd5eb344aa2dd1b336f4",
+    "archive_sha256": "7eedb8bbe3434de357a2635c2a0009c4449857d51988a21f72d900e1c0e4539d",
+    "archive_bytes": 2222040,
+    "required_assets_verified": true,
+    "readme_verified": true
+  },
+  {
+    "target": "linux-arm64",
+    "binary_sha256": "97c4867b2684d4fe2020b31982581d2dc225e9ba7be74334dd033542ec099422",
+    "archive_sha256": "8034f03da8d6871fa36b2773ff9123a779248301234621c50d068e0f582d90fe",
+    "archive_bytes": 2318771,
+    "required_assets_verified": true,
+    "readme_verified": true
+  },
+  {
+    "target": "windows-x86_64",
+    "binary_sha256": "f54f379673410dbc2d02b4a1c585890604db9a76f13590c54f437be6cd245af5",
+    "archive_sha256": "cf0d0f802f81aebac616600907e056881eb388a3e33b9224589f18309e795f58",
+    "archive_bytes": 2436247,
+    "required_assets_verified": true,
+    "readme_verified": true
+  }
+]

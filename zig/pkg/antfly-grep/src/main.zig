@@ -95,6 +95,7 @@ const help =
     \\      --chunk-lines N       Maximum target lines per region (default 80)
     \\      --unit line|block     'line' sets chunk-lines=1
     \\      --context-lines N     Model-only context (default 8)
+    \\      --decision-concurrency N  Provider lanes, independent of file threads (0 follows threads)
     \\      --batch-size N        Inputs per request, 1..128 (default 8)
     \\      --max-regions N       Evaluation budget; exhaustion exits 2
     \\      --timeout-ms N        Request deadline (default 60000)

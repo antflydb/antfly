@@ -29,6 +29,7 @@ complete -c antfly-grep -l count-matches
 complete -c antfly-grep -l crlf
 complete -c antfly-grep -l debug
 complete -c antfly-grep -l decision-batch-wait-ms -r
+complete -c antfly-grep -l decision-concurrency -r
 complete -c antfly-grep -l decision-context -r -f -a 'legacy shared-v1'
 complete -c antfly-grep -l dfa-size-limit -r
 complete -c antfly-grep -l dictionary -r

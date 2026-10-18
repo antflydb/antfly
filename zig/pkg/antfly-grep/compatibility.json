@@ -17,9 +17,10 @@
         "bench/results/macos-arm64-review-differential.json",
         "bench/results/linux-arm64-review-differential.json",
         "bench/results/macos-arm64-followup-differential.json",
-        "bench/results/linux-arm64-followup-differential.json"
+        "bench/results/linux-arm64-followup-differential.json",
+        "bench/results/dense-oracle-variants.json"
       ],
-      "limits": "Pinned goldens plus seeded grammar-based exploration with bounded reduction of flags, patterns and subjects. Generated Linux x86 cases replay fully there; portable ASCII inputs replay elsewhere because upstream empty UTF matching differs by platform. Complete upstream dialect/JIT parity is not claimed. Linux ARM64 and x86-64 PCRE empty-UTF output advances bytes; the pinned macOS ARM64 PCRE output advances codepoints. An oracle-independent CLI regression preserves that contract."
+      "limits": "Pinned goldens plus seeded grammar-based exploration with bounded reduction of flags, patterns and subjects. Generated Linux x86 cases replay fully there; portable ASCII inputs replay elsewhere because upstream empty UTF matching differs by platform and PCRE2 JIT build configuration. Complete upstream dialect/JIT parity is not claimed. The pinned GNU/JIT Linux ARM64 and x86-64 PCRE empty-UTF output advances bytes; the pinned macOS ARM64 PCRE output advances codepoints. An oracle-independent CLI regression preserves that contract. The Linux musl/no-JIT release advances codepoints instead; the baseline/current/oracle comparison records this pre-existing difference."
     },
     {
       "area": "Discovery, binary input, encoding, JSON/statistics",

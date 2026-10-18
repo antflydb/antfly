@@ -103,6 +103,12 @@ pub fn string(value: std.json.Value, name: []const u8) ![]const u8 {
 pub fn localUri(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     const cwd = try std.process.currentPathAlloc(io, a);
     defer a.free(cwd);
+    return localUriAt(a, cwd, path);
+}
+
+/// Search workers share one immutable invocation directory, avoiding getcwd
+/// and its filesystem traversal for every JSON provenance record.
+pub fn localUriAt(a: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
     const absolute = try std.fs.path.resolveAlloc(a, &.{ cwd, path });
     defer a.free(absolute);
     var out: std.Io.Writer.Allocating = .init(a);

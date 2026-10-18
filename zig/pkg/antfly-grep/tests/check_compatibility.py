@@ -39,7 +39,7 @@ counts = {
 lines = [
     "# Compatibility",
     "",
-    "Target: ripgrep 15.2.0 / PCRE2 10.45. Implementation: native Zig.",
+    "Target: ripgrep 15.2.0 / PCRE2 10.45, with the oracle build identities retained in each report. Linux empty-UTF compatibility targets the GNU/JIT-enabled build. Implementation: native Zig.",
     "",
     f"Checked-in differential contracts: {counts['local_fixtures.json']} local-search cases and {counts['pcre2_dialect_fixtures.json']} PCRE2 dialect cases, plus {counts['generated_fixtures.json']} generated cases. Normal tests require no oracle executable.",
     "",

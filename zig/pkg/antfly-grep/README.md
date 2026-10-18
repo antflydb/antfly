@@ -1542,6 +1542,10 @@ unqualified. Existing real-server scenarios were not rerun in this follow-up.
 
 ### Sharded preparations and cross-file decision microbatches
 
+This section records the f63d647a90 implementation and measurements. Source V5
+below supersedes its preparation storage layout; the output and batching
+contracts remain in effect.
+
 Indexed ranked search now preserves complete staged JSON records when a later
 record, error or end event exceeds the output budget. Version 1 and compact JSON
 share this behavior. Ranked text inserts file-heading separators at replay time,
@@ -1619,3 +1623,120 @@ These are synthetic, warm-cache measurements on one shared macOS host. The provi
 Evidence: [one-worker search](bench/results/coalesced-topk-macos.json), [four-worker search](bench/results/coalesced-parallel-macos.json), [unlimited ranking](bench/results/coalesced-unlimited-macos.json), [single-file control](bench/results/coalesced-small-macos.json), [overview control](bench/results/coalesced-overview-macos.json), [provider microbatches](bench/results/coalesced-decisions-macos.json), [generated comparisons](bench/results/coalesced-differential.json), and [source/binary hashes and validation](bench/results/coalesced-validation.json). Reports retain per-run timing, CPU, memory, cache allocation and/or request counts.
 
 Qualification: 180 CLI tests each on macOS and Linux ARM64 (two/one skips), native unit/hardening/tooling checks, four focused ReleaseSafe artifact tests, six Linux hardening tests, 1,000 generated comparisons without mismatches or timeouts, Windows cross-compilation, packaging, Apache boundaries, staged license checks and formatting. Linux correctness uses a two-CPU VM on this Mac. Independent Linux hardware/cold-cache performance, Windows runtime, live providers and full upstream PCRE2/JIT/CLI parity remain unqualified; existing real-server scenarios were not rerun in this follow-up.
+
+### Dense preparations and independent provider tuning
+
+Source V5 retains eight-way lookup and 8,192 records across 16 private shard
+files. Records pack contiguously at their actual encoded size; partially occupied
+buckets no longer reserve 32 KiB and small preparations avoid 4 KiB slot padding. A compact, process-local routing index is bounded to
+128 KiB total. Fingerprints only select candidate pages: the full key, metadata
+and payload checksum must verify before decoding. Warm hits use one positional read of the selected header and payload. Payload publication precedes directory publication; readers
+refresh missing or evicted keys, writers use nonblocking process locks, and
+orphan extents are reclaimed at the hard file ceiling. Maximum logical V5 storage is
+32 MiB plus 704 KiB of directories. Retained older namespaces and decision
+score caches are additional. V2/V3/V4 preparations promote only after source
+validation during ordinary reads; `--cached-only` never migrates or writes.
+
+JSON workers share an immutable invocation working directory for provenance.
+Score-key construction reuses the invariant SHA prefix and empty-context digest while preserving existing V5 score identities, credential
+scopes, stages, revisions and document permissions.
+
+`--decision-concurrency N` independently caps active provider calls (1..256;
+0 follows `--threads`). Single-file batch pools use this limit too, and JSON
+serialization/response scratch is held within provider lanes rather than
+allocated by every waiting file worker. Provider
+lane release signals waiting callers immediately; bounded timed waits still
+observe cancellation and retry cooldowns. Guaranteed oversized batches split
+before allocating their JSON bodies. Both ranked and unranked file-worker
+paths share the bounded microbatcher; single-worker paths bypass it.
+The JSON summary reports `request_bytes`, `request_inputs`, and `peak_request_bytes` for attempted provider calls, counted
+once across batching, retries and workers. Cache-only runs report zero. These
+measure submitted JSON payloads, excluding HTTP/TLS overhead; provider-reported `input_tokens`/`output_tokens`
+remain separate and neither implies billed-cost or relevance guarantees.
+
+Provider tuning can be saved explicitly, and CLI flags override saved values:
+
+```sh
+antfly-grep auth --provider antfly --model MODEL --stdin \
+  --decision-concurrency 4 --batch-size 32 --decision-batch-wait-ms 1 \
+  --decision-context shared-v1
+```
+
+Use shared-v1 only with supporting endpoints. It preserves effective target
+text while sharing repeated context in the request. Larger batches and fewer
+HTTP requests do not by themselves establish lower model token usage or equal
+model relevance; retain a labeled evaluation for each provider/model change.
+
+The tuning adapter measures the actual supplied repository/storage/provider
+combination rather than assigning new host-specific automatic worker caps:
+
+```sh
+python3 zig/pkg/antfly-grep/bench/tune.py \
+  --workers 1,4,8 --providers 1,2,4 --wait-ms 0,1,5 --batch-sizes 8,32 \
+  --rounds 5 --output tuning.json -- \
+  ./antfly-grep --ask retry --model MODEL --json --no-cache ./repository
+```
+
+It checks result evidence across configurations, alternates measurement order,
+records CPU/RSS and timing variance, and measures first output separately.
+Use a fixed labeled fixture for model comparisons; cached runs measure a warm
+retrieval workload and `--no-cache` runs measure provider work. It does not drop
+OS caches. Native Linux/cold-storage and real-provider qualification still
+require those environments.
+
+Paired warm measurements against f63d647a90 on the same shared macOS host:
+
+| Workload | Median elapsed, before → after | Median peak RSS, before → after |
+|---|---:|---:|
+| Top 15, one worker / 2,048 files | 123.45 → 84.40 ms | 4.62 → 4.62 MiB |
+| Top 15, four workers / 2,048 files | 63.46 → 40.95 ms | 5.14 → 5.38 MiB |
+| Unlimited ranking / 2,048 files | 225.59 → 194.04 ms | 5.06 → 5.11 MiB |
+| Single small file | 8.39 → 7.58 ms | 4.17 → 4.16 MiB |
+| 9,000-line overview | 14.10 → 13.81 ms | 8.30 → 8.23 MiB |
+
+One-worker system CPU falls 82.89 → 53.43 ms. The 2,048-file cache's logical
+size changes 45.26 → 24.17 MiB and observed allocated space 45.27 → 24.20 MiB;
+filesystem allocation remains platform dependent. Both binaries reparse zero
+sources and make zero provider calls in these warm runs. RSS is roughly flat,
+with a small increase in the four-worker case. The single-file cache has more
+metadata overhead (observed allocated space 3.99 → 4.03 MiB).
+
+The unranked tuning fixture uses 32 small files, eight file workers, two provider
+lanes, a 10 ms constant-score provider delay and no cache. Changing the gather
+window from 0 to 1 ms reduces requests 32 → 4 and request bytes 14,224 → 4,320;
+median elapsed changes 293.97 → 109.69 ms. Separate repeated first-output
+measurements change 34.35 → 35.82 ms: gathering trades a small initial delay for
+lower overall work. Every configuration returns equivalent evidence. This
+fixes the previously unconnected unranked worker path; ranked search already
+used cross-file batching. Full native batches retain their original call count.
+The 128-file ranked fixture retains 16 requests (498.68 → 495.86 ms).
+
+The supporting shared-v1 transport fixture uploads 412,521 rather than
+10,531,047 bytes with equivalent effective target text and output. This validates
+an existing opt-in protocol and the saved provider configuration path, not a
+new model-quality or billing claim. Local lexical/regex controls remain in the
+report; the profiles do not justify additional JIT complexity in this pass.
+
+Qualification: 184 CLI tests on macOS and ARM64 Linux, ten ReleaseSafe
+cache/options tests on each platform, native unit/hardening/tooling checks,
+1,000 generated ripgrep 15.2 / PCRE2 10.45 comparisons without mismatches or
+timeouts, Windows x86-64 cross-compilation, packaging, license and formatting
+checks. Linux uses a two-CPU VM on this Mac and a GNU/JIT-enabled oracle;
+container-local executable temporary storage supports invalid-UTF8 filenames
+and preprocessor fixtures. The host's filesystem bridge and noexec temporary
+mounts do not provide those same contracts. Independent Linux hardware,
+cold-storage performance, Windows runtime, live-model relevance and billed
+cost remain unqualified. Repository CI still requires human approval.
+
+Evidence: [one-worker search](bench/results/dense-topk-macos.json),
+[four-worker search](bench/results/dense-parallel-macos.json),
+[unlimited ranking](bench/results/dense-unlimited-macos.json),
+[single-file control](bench/results/dense-small-macos.json),
+[overview control](bench/results/dense-overview-macos.json),
+[local lexical/regex controls](bench/results/dense-local-macos.json),
+[ranked HTTP control](bench/results/dense-decisions-macos.json),
+[provider tuning and first-output trials](bench/results/dense-provider-tuning.json),
+[shared transport](bench/results/dense-shared-transport.json),
+[generated comparisons](bench/results/dense-differential.json),
+[oracle build differences](bench/results/dense-oracle-variants.json), and
+[validation and hashes](bench/results/dense-validation.json).

@@ -41,6 +41,21 @@ NATIVE_LIBRARY = str(Path(sys.argv.pop(1)).resolve())
 
 def read_batch(path):
     data = path.read_bytes()
+    if path.name.startswith("source-v5-"):
+        assert data[:8] == b"AGSRC005"
+        prefix, page_size = struct.unpack_from("<II", data, 8)
+        records = []
+        for header in range(64, 64 + 512 * 84, 84):
+            h = data[header : header + 80]
+            slot = struct.unpack_from("<I", data, header + 80)[0]
+            if h[76:80] != b"AGB1" or not 1 <= slot <= 512 * page_size:
+                continue
+            size = struct.unpack_from("<I", h, 64)[0]
+            offset = prefix + slot - 1 + 80
+            body = data[offset : offset + size]
+            if hashlib.sha256(h[:32] + h[64:] + body).digest() == h[32:64]:
+                records.append((header, offset, 0, 0))
+        return {"version": 5, "scores": [], "written": [], "_records": records}
     if path.suffix == ".bin":
         slot_size, ways = (
             (4096, 8)
@@ -804,7 +819,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
         )
-        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v4-*"))
+        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v5-*"))
         self.assertEqual(len(records), 1)
         if os.name != "nt":
             self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
@@ -821,17 +836,62 @@ class CliTests(unittest.TestCase):
             json.loads(changed.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 0
         )
 
-    def test_source_v3_promotes_only_after_validated_normal_reads(self):
+    def test_source_v4_migration_preserves_readonly_and_validates_before_promotion(
+        self,
+    ):
         self.write("a.py", "def retry():\n    STOP()\n")
         args = [*self.decision_args(), "--json", "--threads=1", "a.py"]
         self.raw_cli(*args)
         directory = self.root / ".cache/antfly-grep/decisions"
-        shard = next(directory.glob("source-v4-*"))
+        shard = next(directory.glob("source-v5-*"))
         data = shard.read_bytes()
         header, offset, _, _ = read_batch(shard)["_records"][0]
         h = bytearray(data[header : header + 80])
         size = struct.unpack_from("<I", h, 64)[0]
         body = data[offset : offset + size]
+        h[76:80] = b"AGP1"
+        h[32:64] = hashlib.sha256(h[:32] + h[64:] + body).digest()
+        bucket = int.from_bytes(h[:2], "little") % 1024
+        old = directory / f"source-v4-prepared-{bucket % 16:02x}.bin"
+        prefix = bytearray(4096)
+        prefix[:8] = b"AGSHD001"
+        struct.pack_into("<II", prefix, 8, 32768, 64)
+        struct.pack_into("<I", prefix, 64 + (bucket // 16) * 4, 1)
+        artifact = bytes(prefix) + h + bytes(7 * 80) + body
+        old.write_bytes(artifact)
+        shard.unlink()
+        readonly = self.raw_cli(*args, "--cached-only", "--max-requests=0")
+        self.assertEqual(
+            json.loads(readonly.stdout.splitlines()[-1])["stats"]["source_cache_hits"],
+            1,
+        )
+        self.assertFalse(list(directory.glob("source-v5-*")))
+        normal = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(normal.stdout.splitlines()[-1])["stats"]["source_parses"], 0
+        )
+        self.assertTrue(list(directory.glob("source-v5-*")))
+        self.assertEqual(old.read_bytes(), artifact)
+        next(directory.glob("source-v5-*")).unlink()
+        old.write_bytes(artifact[:-1] + bytes([artifact[-1] ^ 1]))
+        corrupt = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(corrupt.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 0
+        )
+
+    def test_source_v3_promotes_only_after_validated_normal_reads(self):
+        self.write("a.py", "def retry():\n    STOP()\n")
+        args = [*self.decision_args(), "--json", "--threads=1", "a.py"]
+        self.raw_cli(*args)
+        directory = self.root / ".cache/antfly-grep/decisions"
+        shard = next(directory.glob("source-v5-*"))
+        data = shard.read_bytes()
+        header, offset, _, _ = read_batch(shard)["_records"][0]
+        h = bytearray(data[header : header + 80])
+        size = struct.unpack_from("<I", h, 64)[0]
+        body = data[offset : offset + size]
+        h[76:80] = b"AGP1"
+        h[32:64] = hashlib.sha256(h[:32] + h[64:] + body).digest()
         old = directory / f"source-v3-{int.from_bytes(h[:2], 'little') % 1024:03x}.bin"
         old.write_bytes(h + bytes(3 * 80) + body)
         shard.unlink()
@@ -839,12 +899,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
         )
-        self.assertFalse(list(directory.glob("source-v4-*")))
+        self.assertFalse(list(directory.glob("source-v5-*")))
         normal = self.raw_cli(*args)
         self.assertEqual(
             json.loads(normal.stdout.splitlines()[-1])["stats"]["source_parses"], 0
         )
-        self.assertTrue(list(directory.glob("source-v4-*")))
+        self.assertTrue(list(directory.glob("source-v5-*")))
         self.assertEqual(old.read_bytes(), h + bytes(3 * 80) + body)
         self.write("large.txt", "STOP\n" * 600)
         large_args = [
@@ -955,7 +1015,7 @@ class CliTests(unittest.TestCase):
                 path.unlink()
                 continue
             data = path.read_bytes()
-            is_source = path.name.startswith(("source-v3-", "source-v4-"))
+            is_source = path.name.startswith(("source-v3-", "source-v5-"))
             size, ways, buckets = (
                 (262144, 4, 1024)
                 if is_source
@@ -1014,7 +1074,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(result.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
         )
-        self.assertTrue(list(directory.glob("source-v4-*")))
+        self.assertTrue(list(directory.glob("source-v5-*")))
         new_times = [
             stamp
             for path in directory.glob("batch-v10-*")
@@ -3021,6 +3081,72 @@ class CliTests(unittest.TestCase):
         self.raw_cli("skill", "--agent", "codex", "--agent", "claude", "--yes")
         self.assertTrue((self.root / ".agents/skills/antfly-grep/SKILL.md").is_file())
         self.assertTrue((self.root / ".claude/skills/antfly-grep/SKILL.md").is_file())
+
+    def test_provider_tuning_configuration_and_cli_override(self):
+        self.raw_cli(
+            "auth",
+            "--provider",
+            "antfly",
+            "--model",
+            "fixture",
+            "--endpoint",
+            f"http://127.0.0.1:{self.server.server_port}/decisions",
+            "--stdin",
+            "--decision-context",
+            "shared-v1",
+            "--decision-concurrency",
+            "1",
+            "--batch-size",
+            "16",
+            "--decision-batch-wait-ms",
+            "0",
+            input=b"fixture\n",
+        )
+        data = json.loads(
+            (self.root / "config/antfly-grep/credentials.json").read_text()
+        )
+        self.assertEqual(
+            (
+                data["decision_context"],
+                data["decision_concurrency"],
+                data["batch_size"],
+                data["decision_batch_wait_ms"],
+            ),
+            ("shared_v1", 1, 16, 0),
+        )
+        self.write("a.py", "def retry():\n    # STOP\n    return 1\n")
+        self.raw_cli("--ask", "retry", "--no-cache", "--refine", "a.py")
+        self.assertTrue(
+            all(body.get("context_version") == 1 for _, _, body in self.server.requests)
+        )
+        self.server.requests.clear()
+        self.raw_cli(
+            "--ask",
+            "retry",
+            "--no-cache",
+            "--refine",
+            "--decision-context=legacy",
+            "a.py",
+        )
+        self.assertTrue(
+            all("context_version" not in body for _, _, body in self.server.requests)
+        )
+        for flag, value in (
+            ("--decision-concurrency", "257"),
+            ("--batch-size", "0"),
+            ("--decision-batch-wait-ms", "1001"),
+            ("--decision-context", "bad"),
+        ):
+            self.raw_cli(
+                "auth",
+                "--provider",
+                "antfly",
+                "--stdin",
+                flag,
+                value,
+                input=b"fixture\n",
+                code=2,
+            )
 
     def test_provider_presets_custom_routes_and_credentials(self):
         presets = {
@@ -5581,6 +5707,123 @@ class CliTests(unittest.TestCase):
         config = self.table_config([self.indexed_doc(f"f{i}.txt") for i in range(3)])
         self.raw_cli("--table-config", config, "-q", "STOP")
         self.assertEqual(len(self.server.index_requests), 1)
+
+    def test_unranked_file_workers_share_microbatches_and_stream_equivalent_evidence(
+        self,
+    ):
+        for i in range(64):
+            self.write(f"src/f{i:03}.txt", "STOP HIGH\n" if i % 2 else "STOP LOW\n")
+        self.server.delay = 0.01
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--no-rank",
+            "--no-cache",
+            "--no-refine",
+            "--threads=8",
+            "--decision-concurrency=2",
+            "--max-files=0",
+            "--max-requests=unlimited",
+            "src",
+        ]
+        signatures = []
+        counts = []
+        for wait in (0, 20):
+            self.server.requests.clear()
+            result = self.raw_cli(*args, f"--decision-batch-wait-ms={wait}")
+            rows = [json.loads(row) for row in result.stdout.splitlines()]
+            signatures.append(
+                sorted(
+                    json.dumps(
+                        {
+                            k: row.get(k)
+                            for k in ("data", "probability", "scope", "line_number")
+                        },
+                        sort_keys=True,
+                    )
+                    for row in rows
+                    if row["type"] == "match"
+                )
+            )
+            counts.append(len(self.server.requests))
+            self.assertEqual(rows[-1]["requests"], counts[-1])
+            self.assertEqual(rows[-1]["request_inputs"], 64)
+            self.assertEqual(
+                sum(len(body["inputs"]) for _, _, body in self.server.requests), 64
+            )
+            self.assertTrue(rows[-1]["stats"]["complete"])
+        self.assertEqual(signatures[0], signatures[1])
+        self.assertLess(counts[1], counts[0])
+
+    def test_provider_concurrency_is_independent_and_reports_transport_cost(self):
+        self.server.delay = 0.02
+        for i in range(16):
+            self.write(f"src/f{i:02}.txt", "STOP HIGH\n")
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--no-cache",
+            "--no-refine",
+            "--max-files=0",
+            "--max-requests=unlimited",
+            "--threads=8",
+            "--decision-batch-wait-ms=0",
+            "src",
+        ]
+        signatures = []
+        for lanes in (1, 3):
+            self.server.peak = 0
+            self.server.requests.clear()
+            result = self.raw_cli(*args, f"--decision-concurrency={lanes}")
+            rows = [json.loads(row) for row in result.stdout.splitlines()]
+            summary = rows[-1]
+            self.assertLessEqual(self.server.peak, lanes)
+            self.assertEqual(self.server.peak, lanes)
+            signatures.append(
+                sorted(
+                    (
+                        json.dumps(r["data"]["path"], sort_keys=True),
+                        r["line_number"],
+                        r["probability"],
+                    )
+                    for r in rows
+                    if r["type"] == "match"
+                )
+            )
+            bodies = [
+                json.dumps(body, separators=(",", ":")).encode()
+                for _, _, body in self.server.requests
+            ]
+            self.assertEqual(summary["requests"], len(bodies))
+            self.assertEqual(summary["request_inputs"], 16)
+            self.assertEqual(summary["request_bytes"], sum(map(len, bodies)))
+            self.assertEqual(summary["peak_request_bytes"], max(map(len, bodies)))
+        self.assertEqual(signatures[0], signatures[1])
+        self.server.requests.clear()
+        self.raw_cli(
+            *self.decision_args(),
+            "--json",
+            "--no-refine",
+            "--threads=1",
+            "--decision-concurrency=3",
+            "src/f00.txt",
+        )
+        cached = self.raw_cli(
+            *self.decision_args(),
+            "--json",
+            "--no-refine",
+            "--threads=1",
+            "--decision-concurrency=1",
+            "--cached-only",
+            "--max-requests=0",
+            "src/f00.txt",
+        )
+        summary = json.loads(cached.stdout.splitlines()[-1])
+        self.assertEqual(
+            (summary["requests"], summary["request_bytes"], summary["request_inputs"]),
+            (0, 0, 0),
+        )
+        self.raw_cli("--decision-concurrency=257", "STOP", "src", code=2)
 
     def test_shared_decision_context_matches_legacy(self):
         self.write(

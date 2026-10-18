@@ -20,6 +20,12 @@ const Allocator = std.mem.Allocator;
 
 /// Context is borrowed once per region, rather than copied for each target.
 /// The legacy decision wire format is preserved; Typesafe shares context in state.
+const empty_context_hash: [32]u8 = blk: {
+    @setEvalBranchQuota(10000);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("", &digest, .{});
+    break :blk digest;
+};
 pub const Input = struct {
     id: []const u8,
     input: []const u8,
@@ -66,9 +72,15 @@ pub const Client = struct {
     retry_after_ms: u64 = 0,
     input_tokens: usize = 0,
     output_tokens: usize = 0,
+    request_bytes: usize = 0,
+    request_inputs: usize = 0,
+    peak_request_bytes: usize = 0,
     coalescer: ?*Coalescer = null,
     pool: ?*Pool = null,
     score_store: @import("score_store.zig").Store = .{},
+    // Options/query bytes are immutable for an invocation. Retain SHA state
+    // before per-target bytes; preserve every existing on-disk key exactly.
+    key_prefix: ?struct { parts: [10][]const u8, hash: std.crypto.hash.sha2.Sha256 } = null,
     pub fn init(a: Allocator, io: std.Io, options: *const Options) Client {
         return .{ .a = a, .http = httpx.Client.init(a, io), .options = options, .io = io };
     }
@@ -111,7 +123,7 @@ pub const Client = struct {
 
     pub fn decideBatches(self: *Client, inputs: []const Input, scores: []f64) !void {
         @memset(scores, std.math.nan(f64));
-        if (!self.allow_parallel or self.options.jobs <= 1 or inputs.len <= self.options.batch_size) {
+        if (!self.allow_parallel or self.options.providerJobs() <= 1 or inputs.len <= self.options.batch_size) {
             var offset: usize = 0;
             while (offset < inputs.len) {
                 const n = @min(self.options.batch_size, inputs.len - offset);
@@ -229,7 +241,7 @@ pub const Client = struct {
         fn create(parent: *Client) !*Pool {
             const pool = try parent.a.create(Pool);
             errdefer parent.a.destroy(pool);
-            const workers = try parent.a.alloc(Worker, parent.options.jobs);
+            const workers = try parent.a.alloc(Worker, parent.options.providerJobs());
             pool.* = .{ .a = parent.a, .io = parent.io, .options = parent.options, .workers = workers };
             return pool;
         }
@@ -314,6 +326,9 @@ pub const Client = struct {
             local.requests = 0;
             local.input_tokens = 0;
             local.output_tokens = 0;
+            local.request_bytes = 0;
+            local.request_inputs = 0;
+            local.peak_request_bytes = 0;
             local.cache_hits = 0;
             local.limits = parent.limits;
             local.query = parent.query;
@@ -338,6 +353,9 @@ pub const Client = struct {
             parent.requests += local.requests;
             parent.input_tokens += local.input_tokens;
             parent.output_tokens += local.output_tokens;
+            parent.request_bytes += local.request_bytes;
+            parent.request_inputs += local.request_inputs;
+            parent.peak_request_bytes = @max(parent.peak_request_bytes, local.peak_request_bytes);
             parent.cache_hits += local.cache_hits;
         }
     };
@@ -408,15 +426,27 @@ pub const Client = struct {
     }
     fn key(self: *Client, input: Input) [64]u8 {
         if (input.derived_key) |value| return value;
-        var context_hash = input.context_hash orelse blk: {
+        var context_hash = input.context_hash orelse if (input.context.len == 0) empty_context_hash else blk: {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(input.context, &digest, .{});
             break :blk digest;
         };
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        // Include credential scope, endpoint, model and complete effective
-        // question and input. Cached scores contain no source text or token.
-        for ([_][]const u8{ "antfly-grep-decisions-v5", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), if (self.options.broad) "broad" else "direct", &context_hash, input.input }) |part| {
+        const parts = [_][]const u8{ "antfly-grep-decisions-v5", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), if (self.options.broad) "broad" else "direct" };
+        const reusable = if (self.key_prefix) |prefix| for (prefix.parts, parts) |old, part| {
+            if (old.ptr != part.ptr or old.len != part.len) break false;
+        } else true else false;
+        if (!reusable) {
+            var prefix = std.crypto.hash.sha2.Sha256.init(.{});
+            for (parts) |part| {
+                var len: [8]u8 = undefined;
+                std.mem.writeInt(u64, &len, part.len, .little);
+                prefix.update(&len);
+                prefix.update(part);
+            }
+            self.key_prefix = .{ .parts = parts, .hash = prefix };
+        }
+        var hash = self.key_prefix.?.hash;
+        for ([_][]const u8{ &context_hash, input.input }) |part| {
             var len: [8]u8 = undefined;
             std.mem.writeInt(u64, &len, part.len, .little);
             hash.update(&len);
@@ -603,6 +633,15 @@ pub const Client = struct {
     }
     fn requestDirect(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
         if (self.options.cached_only) return error.DecisionCacheMiss;
+        // Raw input bytes are a lower bound on serialized size. Split
+        // guaranteed-oversized batches before allocating/escaping their body.
+        // Shared transport counts each context once, just like its encoder.
+        if (inputs.len > 1 and rawRequestBytes(inputs, self.options.decision_context == .shared_v1 or self.options.backend == .typesafe) > 16 * 1024 * 1024) {
+            const half = inputs.len / 2;
+            try self.requestDirect(inputs[0..half], probabilities[0..half]);
+            try self.requestDirect(inputs[half..], probabilities[half..]);
+            return;
+        }
         var attempt: usize = 0;
         while (true) {
             self.last_status = 0;
@@ -642,11 +681,16 @@ pub const Client = struct {
                 attempt += 1;
                 continue;
             };
-            if (self.limits) |limits| limits.recover(self.options.jobs);
+            if (self.limits) |limits| limits.recover(self.options.providerJobs());
             return;
         }
     }
     fn requestOnce(self: *Client, inputs: []const Input, probabilities: []f64) !void {
+        // Bound serialization/response scratch by provider concurrency too.
+        // Release only after those buffers are freed, including split/retry
+        // errors; waiting file workers retain borrowed source, not JSON copies.
+        if (self.limits) |limits| try limits.acquire(self.io, self.options.providerJobs());
+        defer if (self.limits) |limits| limits.release(self.io);
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
@@ -697,17 +741,16 @@ pub const Client = struct {
         if (self.options.backend == .local) {
             try self.ensureLocal();
             const provider = self.shared_local orelse self.local.?;
+            self.recordRequest(body.len, inputs.len);
             const response = try provider.decide(self.a, body);
             defer self.a.free(response);
-            self.requests += 1;
             const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response, .{});
             defer parsed.deinit();
             if (self.options.backend == .typesafe) try typesafeAnswers(parsed.value, inputs, probabilities, names) else try parseQuestions(parsed.value, inputs, probabilities, names);
+            self.recordUsage(parsed.value);
             return;
         }
-        if (self.limits) |limits| try limits.acquire(self.io, self.options.jobs);
-        defer if (self.limits) |limits| limits.release();
-        self.requests += 1;
+        self.recordRequest(body.len, inputs.len);
         var response = try self.http.post(self.options.endpoint, .{
             .json = body,
             .headers = headers,
@@ -729,12 +772,37 @@ pub const Client = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response.body orelse return error.EmptyDecisionResponse, .{});
         defer parsed.deinit();
         if (self.options.backend == .typesafe) try typesafeAnswers(parsed.value, inputs, probabilities, names) else try parseQuestions(parsed.value, inputs, probabilities, names);
-        if (field(parsed.value, "usage")) |usage| {
+        self.recordUsage(parsed.value);
+    }
+    fn recordRequest(self: *Client, bytes: usize, inputs: usize) void {
+        self.requests += 1;
+        self.request_bytes += bytes;
+        self.request_inputs += inputs;
+        self.peak_request_bytes = @max(self.peak_request_bytes, bytes);
+    }
+    fn recordUsage(self: *Client, value: std.json.Value) void {
+        if (field(value, "usage")) |usage| {
             self.input_tokens += integer(field(usage, "input_tokens"));
             self.output_tokens += integer(field(usage, "output_tokens"));
         }
     }
 };
+fn rawRequestBytes(inputs: []const Input, shared: bool) usize {
+    var count: usize = 0;
+    for (inputs, 0..) |input, i| {
+        count +|= input.input.len;
+        var repeated = false;
+        if (shared) for (inputs[0..i]) |prior| {
+            if (prior.context.ptr == input.context.ptr and prior.context.len == input.context.len) {
+                repeated = true;
+                break;
+            }
+        };
+        if (!repeated) count +|= input.context.len;
+    }
+    return count;
+}
+
 /// Synchronous callers lend one bounded job until completion. The oldest caller
 /// leads a short gather window, detaches compatible jobs and performs HTTP using
 /// its existing connection pool. Other groups can progress concurrently. No
@@ -1007,4 +1075,35 @@ test "prehashed shared contexts preserve cache identity and credential scope" {
     try std.testing.expect(!std.mem.eql(u8, &expected, &client.key(hashed)));
     options.token = "different credential scope";
     try std.testing.expect(!std.mem.eql(u8, &expected, &client.key(input)));
+}
+
+test "prefix reuse preserves the v5 key transcript across stages and scopes" {
+    const a = std.testing.allocator;
+    var o: Options = .{ .ask = "retry", .model = "fixture", .token = "scope" };
+    var c: Client = .{ .a = a, .io = undefined, .http = undefined, .options = &o };
+    const input: Input = .{ .id = "id", .input = "TARGET retry", .context = "" };
+    for ([_]@FieldType(Client, "stage"){ .directory, .region, .line, .region }) |stage| {
+        c.stage = stage;
+        var reference = std.crypto.hash.sha2.Sha256.init(.{});
+        var context_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(input.context, &context_hash, .{});
+        for ([_][]const u8{ "antfly-grep-decisions-v5", o.endpoint, o.model.?, o.token.?, "http", "", "", o.ask.?, @tagName(stage), "direct", &context_hash, input.input }) |part| {
+            var len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len, part.len, .little);
+            reference.update(&len);
+            reference.update(part);
+        }
+        reference.update("filters");
+        reference.update("only");
+        reference.update("not");
+        var digest: [32]u8 = undefined;
+        reference.final(&digest);
+        try std.testing.expectEqual(std.fmt.bytesToHex(digest, .lower), c.key(input));
+        try std.testing.expectEqual(std.fmt.bytesToHex(digest, .lower), c.key(input));
+    }
+    const before = c.key(input);
+    c.cache_scope = @as([32]u8, @splat(7));
+    try std.testing.expect(!std.mem.eql(u8, &before, &c.key(input)));
+    o.model_revision = "next revision";
+    try std.testing.expect(!std.mem.eql(u8, &before, &c.key(input)));
 }

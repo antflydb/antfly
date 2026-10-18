@@ -100,6 +100,7 @@ pub const Options = struct {
     max_depth: usize = std.math.maxInt(usize),
     jobs: usize = 0,
     jobs_auto: bool = false,
+    decision_concurrency: usize = 0,
     color: enum { auto, always, never } = .auto,
     replacement: ?[]const u8 = null,
     sort: ?[]const u8 = null,
@@ -206,6 +207,9 @@ pub const Options = struct {
             .files_without => self.files_without_match = true,
             .json => self.json = true,
         }
+    }
+    pub fn providerJobs(self: *const Options) usize {
+        return @max(1, if (self.decision_concurrency == 0) self.jobs else self.decision_concurrency);
     }
     pub fn deinit(self: *Options, a: Allocator) void {
         self.patterns.deinit(a);
@@ -589,7 +593,7 @@ pub const Options = struct {
                 } else if (std.mem.eql(u8, name, "--ask")) {
                     if (self.ask != null or value.len == 0) return error.InvalidQuestion;
                     self.ask = value;
-                } else if (std.mem.eql(u8, name, "--endpoint")) self.endpoint = value else if (std.mem.eql(u8, name, "--model")) self.model = value else if (std.mem.eql(u8, name, "--threshold")) self.threshold = std.fmt.parseFloat(f64, value) catch return error.InvalidNumber else if (std.mem.eql(u8, name, "--chunk-lines")) self.chunk_lines = try number(value) else if (std.mem.eql(u8, name, "--context-lines")) self.context_lines = try number(value) else if (std.mem.eql(u8, name, "--decision-batch-wait-ms")) self.decision_batch_wait_ms = try number(value) else if (std.mem.eql(u8, name, "--batch-size")) self.batch_size = try number(value) else if (std.mem.eql(u8, name, "--max-regions")) {
+                } else if (std.mem.eql(u8, name, "--endpoint")) self.endpoint = value else if (std.mem.eql(u8, name, "--model")) self.model = value else if (std.mem.eql(u8, name, "--threshold")) self.threshold = std.fmt.parseFloat(f64, value) catch return error.InvalidNumber else if (std.mem.eql(u8, name, "--chunk-lines")) self.chunk_lines = try number(value) else if (std.mem.eql(u8, name, "--context-lines")) self.context_lines = try number(value) else if (std.mem.eql(u8, name, "--decision-concurrency")) self.decision_concurrency = try number(value) else if (std.mem.eql(u8, name, "--decision-batch-wait-ms")) self.decision_batch_wait_ms = try number(value) else if (std.mem.eql(u8, name, "--batch-size")) self.batch_size = try number(value) else if (std.mem.eql(u8, name, "--max-regions")) {
                     if (self.jev_mode) self.max_regions_per_file = try number(value) else self.max_regions = try number(value);
                 } else if (std.mem.eql(u8, name, "--max-file-size")) self.max_file_bytes = try number(value) else if (std.mem.eql(u8, name, "--timeout-ms")) self.timeout_ms = try number(value) else if (std.mem.eql(u8, name, "--max-count")) self.max_count = try number(value) else if (std.mem.eql(u8, name, "--before-context")) self.before = try number(value) else if (std.mem.eql(u8, name, "--after-context")) self.after = try number(value) else if (std.mem.eql(u8, name, "--context")) {
                     self.before = try number(value);
@@ -723,7 +727,7 @@ pub const Options = struct {
         if (self.tables.items.len > 0 and self.table_config == null) return error.TableConfigRequired;
         if (self.max_index_documents == 0 or self.max_pending_output == 0) return error.InvalidNumber;
         if (self.table_config != null and self.inventory) return error.UnsupportedIndexedInventory;
-        if (self.jobs > 256 or (self.max_requests == 0 and !self.cached_only)) return error.InvalidNumber;
+        if (self.jobs > 256 or self.decision_concurrency > 256 or (self.max_requests == 0 and !self.cached_only)) return error.InvalidNumber;
 
         if (self.column and !self.line_numbers_explicit) self.line_numbers = true;
 

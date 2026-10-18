@@ -26,21 +26,59 @@ const Shard = struct {
 };
 pub const Store = struct {
     a: A,
-    prepared: @import("batch_store.zig").Store = .{ .preparations = true },
+    prepared: ?@import("preparation_store.zig").Store = null,
+    prepared_v4: ?*@import("batch_store.zig").Store = null,
+    legacy_checked: bool = false,
+    legacy_present: bool = false,
+    prepared_mutex: std.Io.Mutex = .init,
     shards: [16]Shard = @splat(.{}),
     pub const prepared_body_limit = 4096 - 80;
-    pub const prepared_disk_limit = 32 * 1024 * 1024 + 16 * 4096;
+    pub const prepared_disk_limit = @import("preparation_store.zig").disk_limit;
     pub fn loadPrepared(self: *Store, a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8) ?[]const u8 {
-        return self.prepared.load(a, io, o, 0, key);
+        self.prepared_mutex.lockUncancelable(io);
+        if (self.prepared == null) self.prepared = .{ .a = self.a };
+        self.prepared_mutex.unlock(io);
+        return self.prepared.?.load(a, io, o, key);
+    }
+    pub fn loadLegacyPrepared(self: *Store, a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8) ?[]const u8 {
+        // Probe the old namespace once, not once per missing source key.
+        self.prepared_mutex.lockUncancelable(io);
+        defer self.prepared_mutex.unlock(io);
+        if (!self.legacy_checked) {
+            self.legacy_checked = true;
+            var directory = std.Io.Dir.cwd().openDir(io, o.cache_dir.?, .{ .iterate = true }) catch return null;
+            defer directory.close(io);
+            var it = directory.iterate();
+            while (it.next(io) catch null) |entry| if (std.mem.startsWith(u8, entry.name, "source-v4-")) {
+                self.legacy_present = true;
+                break;
+            };
+        }
+        if (!self.legacy_present) return null;
+        // Source validation in source_cache precedes promotion to V5.
+        if (self.prepared_v4 == null) {
+            const store = self.a.create(@import("batch_store.zig").Store) catch return null;
+            store.* = .{ .preparations = true };
+            self.prepared_v4 = store;
+        }
+        return self.prepared_v4.?.load(a, io, o, 0, key);
     }
     pub fn storePrepared(self: *Store, a: A, io: std.Io, o: *const @import("options.zig").Options, key: [32]u8, body: []const u8) bool {
         if (body.len > prepared_body_limit or o.cached_only) return false;
-        self.prepared.store(a, io, o, 0, key, body);
+        _ = a;
+        self.prepared_mutex.lockUncancelable(io);
+        if (self.prepared == null) self.prepared = .{ .a = self.a };
+        self.prepared_mutex.unlock(io);
+        self.prepared.?.store(io, o, key, body);
         return true;
     }
     pub const memory_limit = 4 * 1024 * 1024;
     pub fn deinit(self: *Store, io: std.Io) void {
-        self.prepared.deinit(io);
+        if (self.prepared) |*prepared| prepared.deinit(io);
+        if (self.prepared_v4) |store| {
+            store.deinit(io);
+            self.a.destroy(store);
+        }
         for (self.shards) |shard| for (shard.pages) |page| if (page) |bytes| self.a.free(bytes);
     }
     pub fn load(self: *Store, a: A, io: std.Io, cache: Cache, key: [32]u8) ?[]const u8 {
