@@ -2219,7 +2219,7 @@ pub export fn antfly_av1_dav1d_send_data(c: [*c]Dav1dContext, in: [*c]Dav1dData)
         }
     }
     if (in.*.data != null) {
-        if (!((in.*.sz > @as(usize, 0)) and (in.*.sz <= (@as(c_ulong, 18446744073709551615) / @as(c_ulong, 2))))) {
+        if (!((in.*.sz > @as(usize, 0)) and (in.*.sz <= (@import("std").math.maxInt(usize) / @as(c_ulong, 2))))) {
             while (true) {
                 if (!false) break;
             }
