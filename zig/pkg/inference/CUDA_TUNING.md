@@ -1213,12 +1213,13 @@ pending NVIDIA hardware qualification.
 |---|---|
 | `EXTENDED_FLASH=1` | cuDNN global/local plans when available, otherwise bundled BF16 WMMA tiles across supported sequence lengths and SM80–SM120; masks and scalar tile tails remain explicit. Portable SM75 PTX never enters an empty WMMA body. |
 | `FUSED_VISION=1` | Fused F32 rotary/Q-scaling math directly into BF16 attention inputs, BF16 SDPA output directly into projection; one final widening at the tower boundary. Declined plans retain the existing path. |
-| `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and split columns. Also pack immutable PLE projections into groups bounded by 16 MiB, preserving BF16 GEMM/scale/norm boundaries. |
+| `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and consume packed rows directly in fused head RMS/rotary and GELU multiply kernels. Also pack immutable PLE projections into groups bounded by 16 MiB, preserving BF16 GEMM/scale/norm boundaries. |
 | `GRAPH_REPLAY=1` | Four retained arenas keyed by batch, padded sequence and mask kind, through four items and 4096 total padded rows. Each arena has a 128-MiB ceiling and retained admission. Fresh typed inputs, masks and prefix lengths are uploaded before replay; compact results are read afterward. |
 | `IMAGE_BATCH=1` | Existing image cohort opt-in also permits up to four staged video pictures. cuDNN vision plans carry the full batch dimension. |
 | `NATIVE_VISION=1` | Native batched head-64 tensor-core attention with BF16 inputs/output and online softmax. Fused rotary packing feeds attention and projection without whole-tensor F32 bridges. No score/probability arenas or cuDNN dependency. The typed BF16 implementation carries a new native-vision identity version. |
 | `MEDIA_BATCH=1` | Up to four ordered text/image/audio groups share preparation waves and length-bucketed BF16 backbone calls. CUDA Pillow resize, reference audio resampling and manual placeholder ordering remain explicit. |
-| `FUSED_BACKBONE=1` | Fuse post-attention norm/residual/pre-FFN norm, post-FFN norm/residual, PLE scale/norm, and PLE norm/residual/scalar. Explicit BF16 conversions preserve intermediate boundaries; six launches per encoder layer are removed. |
+| `FUSED_BACKBONE=1` | Fuse post-attention norm/residual/pre-FFN norm, post-FFN norm/residual, PLE scale/norm, and PLE norm/residual/scalar. Explicit BF16 conversions preserve intermediate boundaries; six launches per encoder layer and three per vision layer are removed. |
+| `TUNED_GEMM=1` | Time up to eight validated cuBLASLt BF16-input/BF16-output algorithms (one warmup, three completed-device iterations), cache the fastest admissible plan, and retry ordinary heuristics on tuning decline before the scalar fallback. |
 
 Packed weights retain up to 512 MiB, and each of the four graph arenas has a
 128 MiB ceiling. Every retained allocation holds both physical context accounting
@@ -1307,3 +1308,28 @@ ordinary validity mask; convolution shares per-row starts. One kernel writes the
 whole cohort, with no per-clip output assembly. Invalid rows and finite mask
 probabilities preserve isolated-clip semantics. Backends that decline segmented
 execution retain the existing per-clip fallback.
+
+BF16-output tuning caches at most 256 plans per cuBLASLt context. Keys include
+operation, input/output types, shape, workspace size, all pointer alignments and
+tuning policy; plans never cross device contexts or driver lifetimes. Tuning
+misses are serialized separately from the short plan-map lock. Cache hits enqueue
+the selected GEMM without retiming. Graph capture permits cache hits only; misses
+decline before discovery or CUDA event timing. Warm the actual geometry and
+workspace before capture. `--require-route tuned_gemm` requires an algorithm
+selected by timing multiple admissible candidates; heuristic retries and tuning
+declines do not satisfy that gate.
+
+Packed head consumers preserve the existing 256-thread RMS reduction, BF16
+normalization and text rotary multiply/add rounding points. Vision rotary fusion
+applies only to routes already consuming BF16 rotary inputs; the F32 attention
+fallback retains its arithmetic. Packed GELU rounds its activation before the
+multiply. `--require-route packed_heads`, `--require-route packed_gelu` and
+`--require-route vision_residual` attest execution of these consumers. GPU tests
+compare them bitwise against the separate kernels across head sizes, masked
+batches and launch tails, and compare tuned GEMM eager/cached/graph results with
+fresh inputs. These tests still require NVIDIA execution before qualification.
+
+`PACKED_PROJECTIONS` uses the `packed-consumers-v3` identity version;
+`FUSED_BACKBONE` uses `vision-residual-v2`. `TUNED_GEMM` has a separate arithmetic
+bit and `tuned-bf16-output-v1` version. Reload and qualify resulting model pins
+before using them. Defaults, CPU and Metal profiles retain their identities.

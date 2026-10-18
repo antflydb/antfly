@@ -50,6 +50,11 @@ pub const Stats = struct {
     extended_flash_launches: u64 = 0,
     fused_backbone_launches: u64 = 0,
     packed_ple_groups: u64 = 0,
+    packed_head_launches: u64 = 0,
+    packed_gelu_launches: u64 = 0,
+    tuned_gemm_calls: u64 = 0,
+    gemm_tuning_declines: u64 = 0,
+    vision_residual_launches: u64 = 0,
 };
 
 pub const Contrastive = struct {
@@ -86,6 +91,8 @@ pub const Module = struct {
     training_rope: driver.CUfunction,
     training_rope_vjp: driver.CUfunction,
     split_columns: driver.CUfunction,
+    packed_heads: driver.CUfunction,
+    packed_gelu: driver.CUfunction,
     vision_rope_pack: driver.CUfunction,
     native_vision: driver.CUfunction,
     audio_segment_conv: driver.CUfunction,
@@ -151,6 +158,8 @@ pub const Module = struct {
             .rope_vjp = try function(ctx, m, "termite_embedding_gemma2_rope_vjp_f32"),
             .training_rope = try function(ctx, m, "termite_embedding_gemma2_training_rope_bf16"),
             .training_rope_vjp = try function(ctx, m, "termite_embedding_gemma2_training_rope_vjp_f32"),
+            .packed_heads = try function(ctx, m, "termite_embedding_gemma2_packed_heads_bf16"),
+            .packed_gelu = try function(ctx, m, "termite_embedding_gemma2_packed_gelu_bf16"),
             .split_columns = try function(ctx, m, "termite_embedding_gemma2_split_columns_bf16"),
             .vision_rope_pack = try function(ctx, m, "termite_embedding_gemma2_vision_rope_pack_bf16"),
             .audio_segment_conv = try function(ctx, m, "termite_embedding_gemma2_audio_segment_conv_f32"),
@@ -406,6 +415,66 @@ pub const Module = struct {
         var k = kernel_size;
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&sp), @ptrCast(&r), @ptrCast(&d), @ptrCast(&k) };
         try self.launch1d(ctx, self.audio_segment_conv, &args, count);
+    }
+
+    pub fn noteTunedGemm(self: *Module) void {
+        self.stats_.tuned_gemm_calls += 1;
+    }
+    pub fn noteTuningDecline(self: *Module) void {
+        self.stats_.gemm_tuning_declines += 1;
+    }
+    pub fn noteVisionResidual(self: *Module) void {
+        self.stats_.vision_residual_launches += 1;
+    }
+
+    pub fn launchPackedHeads(self: *Module, ctx: *Context, q: Buffer, k: Buffer, v: Buffer, input: Buffer, qw: Buffer, kw: Buffer, mask: Buffer, positions: Buffer, rows: u32, sequence: u32, q_heads: u32, kv_heads: u32, dim: u32, eps: f32, theta: f32, vision: bool, q_scale: f32) !void {
+        if (rows == 0 or sequence == 0 or rows % sequence != 0 or !std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(q_scale)) return error.InvalidEmbeddingGemma2Shape;
+        if (vision) {
+            if (q_heads != 12 or kv_heads != 12 or dim != 64) return error.InvalidEmbeddingGemma2Shape;
+        } else try (Attention{ .batch = rows / sequence, .seq = sequence, .q_heads = q_heads, .kv_heads = kv_heads, .head_dim = dim, .local_radius = 0 }).validate();
+        const q_count = try std.math.mul(usize, try std.math.mul(usize, rows, q_heads), dim);
+        const kv_count = try std.math.mul(usize, try std.math.mul(usize, rows, kv_heads), dim);
+        try require(q, q_count * 2);
+        try require(k, kv_count * 2);
+        try require(v, kv_count * 2);
+        try require(input, try std.math.mul(usize, try std.math.add(usize, q_count, try std.math.mul(usize, kv_count, 2)), 2));
+        try require(qw, @as(usize, dim) * 2);
+        try require(kw, @as(usize, dim) * 2);
+        if (vision) try require(positions, try std.math.mul(usize, try std.math.mul(usize, rows, q_heads), 8)) else if (mask.ptr != 0) try require(mask, @as(usize, rows) * 8);
+        var qp = q.ptr;
+        var kp = k.ptr;
+        var vp = v.ptr;
+        var ip = input.ptr;
+        var qwp = qw.ptr;
+        var kwp = kw.ptr;
+        var mp = mask.ptr;
+        var pp = positions.ptr;
+        var r = rows;
+        var seq = sequence;
+        var qh = q_heads;
+        var kh = kv_heads;
+        var d = dim;
+        var e = eps;
+        var t = theta;
+        var mode: u32 = @intFromBool(vision);
+        var scale = q_scale;
+        var args = [_]?*anyopaque{ @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&vp), @ptrCast(&ip), @ptrCast(&qwp), @ptrCast(&kwp), @ptrCast(&mp), @ptrCast(&pp), @ptrCast(&r), @ptrCast(&seq), @ptrCast(&qh), @ptrCast(&kh), @ptrCast(&d), @ptrCast(&e), @ptrCast(&t), @ptrCast(&mode), @ptrCast(&scale) };
+        try launch(ctx, self.packed_heads, &args, .{ rows, q_heads + 2 * kv_heads, 1 }, .{ 256, 1, 1 });
+        self.stats_.launches += 1;
+        self.stats_.packed_head_launches += 1;
+    }
+    pub fn launchPackedGelu(self: *Module, ctx: *Context, output: Buffer, input: Buffer, rows: u32, width: u32) !void {
+        if (rows == 0 or width == 0) return error.InvalidEmbeddingGemma2Shape;
+        const count = try std.math.mul(usize, rows, width);
+        try require(output, try std.math.mul(usize, count, 2));
+        try require(input, try std.math.mul(usize, count, 4));
+        var op = output.ptr;
+        var ip = input.ptr;
+        var r = rows;
+        var w = width;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&w) };
+        try self.launch1d(ctx, self.packed_gelu, &args, count);
+        self.stats_.packed_gelu_launches += 1;
     }
 
     pub fn launchNormResidual(self: *Module, ctx: *Context, hidden: Buffer, next: Buffer, branch: Buffer, post_weight: Buffer, next_weight: ?Buffer, scalar: ?Buffer, rows: u32, width: u32, eps: f32) !void {

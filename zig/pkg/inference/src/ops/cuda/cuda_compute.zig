@@ -2722,7 +2722,7 @@ pub const CudaCompute = struct {
         defer if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS", false)) {
             const after = module.stats();
             std.log.info(
-                "embedding_gemma2_stats batch={} sequence={} encoder_sequence={} requested_dim={} cublaslt_matmuls={} scalar_matmul_fallbacks={} attention_scalar_fallbacks={} attention_launches={} kernel_launches={} output_bytes={} packed_projection_launches_total={} fused_vision_launches_total={} extended_flash_launches_total={} embedding_graph_replays_total={} vision_batched_executes_total={} native_vision_launches_total={} resize_cache_hits_total={} resize_cache_misses_total={} media_batches_total={} fused_backbone_launches_total={} packed_ple_groups_total={}",
+                "embedding_gemma2_stats batch={} sequence={} encoder_sequence={} requested_dim={} cublaslt_matmuls={} scalar_matmul_fallbacks={} attention_scalar_fallbacks={} attention_launches={} kernel_launches={} output_bytes={} packed_projection_launches_total={} fused_vision_launches_total={} extended_flash_launches_total={} embedding_graph_replays_total={} vision_batched_executes_total={} native_vision_launches_total={} resize_cache_hits_total={} resize_cache_misses_total={} media_batches_total={} fused_backbone_launches_total={} packed_ple_groups_total={} packed_head_launches_total={} packed_gelu_launches_total={} tuned_gemm_calls_total={} gemm_tuning_declines_total={} vision_residual_launches_total={}",
                 .{
                     batch,
                     sequence,
@@ -2745,6 +2745,11 @@ pub const CudaCompute = struct {
                     self.embedding_gemma2_media_batches,
                     after.fused_backbone_launches,
                     after.packed_ple_groups,
+                    after.packed_head_launches,
+                    after.packed_gelu_launches,
+                    after.tuned_gemm_calls,
+                    after.gemm_tuning_declines,
+                    after.vision_residual_launches,
                 },
             );
         };
@@ -8141,16 +8146,21 @@ fn runEmbeddingGemma2Encoder(self: *CudaCompute, module: *embedding_gemma2_cuda.
         const in_norm = try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "input_layernorm.weight"));
         try module.launchRmsNorm(&self.ctx, a, hidden_buf, in_norm, @intCast(rows), @intCast(hidden), config.rms_norm_eps);
         var projection_names: [3][256]u8 = undefined;
-        try embeddingGemma2Projection(self, module, .{ bbuf, c, d }, a, .{
+        const packed_qkv = try embeddingGemma2Projection(self, module, .{ bbuf, c, d }, a, .{
             try embedding_gemma2_arch.layerWeightName(&projection_names[0], layer_index, "self_attn.q_proj.weight"),
             try embedding_gemma2_arch.layerWeightName(&projection_names[1], layer_index, "self_attn.k_proj.weight"),
             try embedding_gemma2_arch.layerWeightName(&projection_names[2], layer_index, "self_attn.v_proj.weight"),
-        }, .{ qw, kvw, kvw }, rows, hidden, joined);
-        try module.launchRmsNorm(&self.ctx, a, bbuf, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.q_norm.weight")), @intCast(rows * lc.num_attention_heads), lc.head_dim, config.rms_norm_eps);
-        try module.launchRmsNorm(&self.ctx, bbuf, c, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.k_norm.weight")), @intCast(rows * lc.num_key_value_heads), lc.head_dim, config.rms_norm_eps);
-        try module.launchRmsNorm(&self.ctx, c, d, null, @intCast(rows * lc.num_key_value_heads), lc.head_dim, config.rms_norm_eps);
+        }, .{ qw, kvw, kvw }, rows, hidden, joined, true);
         const ash = embedding_gemma2_cuda.Attention{ .batch = @intCast(batch), .seq = @intCast(encoder_sequence), .q_heads = lc.num_attention_heads, .kv_heads = lc.num_key_value_heads, .head_dim = lc.head_dim, .local_radius = if (lc.kind == .sliding_attention) config.sliding_window else 0 };
-        try module.launchTrainingRope(&self.ctx, a, bbuf, mask, ash, lc.rope_theta, 1.0);
+        if (packed_qkv) {
+            var qname: [256]u8 = undefined;
+            try module.launchPackedHeads(&self.ctx, a, bbuf, c, joined, try weight(self, try embedding_gemma2_arch.layerWeightName(&qname, layer_index, "self_attn.q_norm.weight")), try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.k_norm.weight")), mask, .{}, @intCast(rows), @intCast(encoder_sequence), lc.num_attention_heads, lc.num_key_value_heads, lc.head_dim, config.rms_norm_eps, lc.rope_theta, false, 1);
+        } else {
+            try module.launchRmsNorm(&self.ctx, a, bbuf, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.q_norm.weight")), @intCast(rows * lc.num_attention_heads), lc.head_dim, config.rms_norm_eps);
+            try module.launchRmsNorm(&self.ctx, bbuf, c, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.k_norm.weight")), @intCast(rows * lc.num_key_value_heads), lc.head_dim, config.rms_norm_eps);
+            try module.launchRmsNorm(&self.ctx, c, d, null, @intCast(rows * lc.num_key_value_heads), lc.head_dim, config.rms_norm_eps);
+            try module.launchTrainingRope(&self.ctx, a, bbuf, mask, ash, lc.rope_theta, 1.0);
+        }
         try embeddingGemma2Attention(self, module, d, a, bbuf, c, mask, sequence_lengths, ash, all_attention_tokens_valid);
         try embeddingGemma2Matmul(self, module, a, d, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "self_attn.o_proj.weight")), rows, qw, hidden);
         if (self.embedding_gemma2_policy.fused_backbone) {
@@ -8161,12 +8171,12 @@ fn runEmbeddingGemma2Encoder(self: *CudaCompute, module: *embedding_gemma2_cuda.
             try module.launchResidual(&self.ctx, hidden_buf, hidden_buf, bbuf, null, @intCast(rows * hidden), 1, 0);
             try module.launchRmsNorm(&self.ctx, a, hidden_buf, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "pre_feedforward_layernorm.weight")), @intCast(rows), @intCast(hidden), config.rms_norm_eps);
         }
-        try embeddingGemma2Projection(self, module, .{ bbuf, c, .{} }, a, .{
+        const packed_mlp = try embeddingGemma2Projection(self, module, .{ bbuf, c, .{} }, a, .{
             try embedding_gemma2_arch.layerWeightName(&projection_names[0], layer_index, "mlp.gate_proj.weight"),
             try embedding_gemma2_arch.layerWeightName(&projection_names[1], layer_index, "mlp.up_proj.weight"),
             "",
-        }, .{ intermediate, intermediate, 0 }, rows, hidden, joined);
-        try module.launchGeluMul(&self.ctx, d, bbuf, c, @intCast(rows * intermediate));
+        }, .{ intermediate, intermediate, 0 }, rows, hidden, joined, true);
+        if (packed_mlp) try module.launchPackedGelu(&self.ctx, d, joined, @intCast(rows), @intCast(intermediate)) else try module.launchGeluMul(&self.ctx, d, bbuf, c, @intCast(rows * intermediate));
         try embeddingGemma2Matmul(self, module, a, d, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "mlp.down_proj.weight")), rows, intermediate, hidden);
         if (self.embedding_gemma2_policy.fused_backbone) {
             try module.launchNormResidual(&self.ctx, hidden_buf, .{}, a, try weight(self, try embedding_gemma2_arch.layerWeightName(&name_buf, layer_index, "post_feedforward_layernorm.weight")), null, null, @intCast(rows), @intCast(hidden), config.rms_norm_eps);
@@ -8218,7 +8228,7 @@ fn runEmbeddingGemma2Encoder(self: *CudaCompute, module: *embedding_gemma2_cuda.
     try module.launchMeanL2(&self.ctx, full, bbuf, mask, @intCast(batch), @intCast(encoder_sequence), config.outputDim());
 }
 
-fn embeddingGemma2Projection(self: *CudaCompute, module: *embedding_gemma2_cuda.Module, outputs: [3]buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, names: [3][]const u8, widths: [3]usize, rows: usize, in_dim: usize, joined: buffer_mod.DeviceBuffer) !void {
+fn embeddingGemma2Projection(self: *CudaCompute, module: *embedding_gemma2_cuda.Module, outputs: [3]buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, names: [3][]const u8, widths: [3]usize, rows: usize, in_dim: usize, joined: buffer_mod.DeviceBuffer, retain_packed: bool) !bool {
     var sources: [3]buffer_mod.DeviceBuffer = @splat(.{});
     var width: usize = 0;
     for (names, widths, sources[0..names.len]) |name, w, *source| {
@@ -8243,13 +8253,14 @@ fn embeddingGemma2Projection(self: *CudaCompute, module: *embedding_gemma2_cuda.
         };
         if (buffer) |weights| {
             try embeddingGemma2Matmul(self, module, joined, input, weights, rows, in_dim, width);
-            try module.launchSplitColumns(&self.ctx, outputs, joined, @intCast(rows), .{ @intCast(widths[0]), @intCast(widths[1]), @intCast(widths[2]) });
+            if (!retain_packed) try module.launchSplitColumns(&self.ctx, outputs, joined, @intCast(rows), .{ @intCast(widths[0]), @intCast(widths[1]), @intCast(widths[2]) });
             module.notePackedProjection();
-            return;
+            return true;
         }
     }
     for (outputs, sources, widths) |output, source, w| if (w != 0)
         try embeddingGemma2Matmul(self, module, output, input, source, rows, in_dim, w);
+    return false;
 }
 
 /// Audio projections retain F32 outputs. Only immutable BF16 weights pack;
@@ -8296,10 +8307,17 @@ fn embeddingGemma2PackedNamed(ctx: *anyopaque, input: CT, names: []const []const
 fn embeddingGemma2Matmul(self: *CudaCompute, module: *embedding_gemma2_cuda.Module, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) !void {
     if (self.cublaslt) |*blas| {
         const workspace = cublasLtWorkspace(self);
-        blas.matmulBf16WeightBf16Out(&self.ctx, dst, input, weight, workspace, rows, in_dim, out_dim) catch |err| {
-            std.log.debug("EmbeddingGemma2 cuBLASLt BF16 output fallback: rows={d} in={d} out={d} err={s}", .{ rows, in_dim, out_dim, @errorName(err) });
+        const tuning = cublaslt_mod.MatmulTuning{ .enabled = self.embedding_gemma2_policy.tuned_gemm };
+        const selection = blas.matmulBf16WeightBf16OutWithTuning(&self.ctx, dst, input, weight, workspace, rows, in_dim, out_dim, tuning) catch retry: {
+            if (tuning.enabled) {
+                module.noteTuningDecline();
+                break :retry blas.matmulBf16WeightBf16OutWithTuning(&self.ctx, dst, input, weight, workspace, rows, in_dim, out_dim, .{}) catch {
+                    return module.launchMatmul(&self.ctx, dst, input, weight, @intCast(rows), @intCast(in_dim), @intCast(out_dim));
+                };
+            }
             return module.launchMatmul(&self.ctx, dst, input, weight, @intCast(rows), @intCast(in_dim), @intCast(out_dim));
         };
+        if (tuning.enabled and selection == .tuned) module.noteTunedGemm();
         module.noteCublasLtMatmul();
         return;
     }
@@ -20380,18 +20398,22 @@ fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usiz
         if (control) |value| try value.check();
         const w = try embedding_gemma2_vision.layerWeights(&names, layer);
         try module.launchRmsNorm(&self.ctx, a, state, try weight(self, w.input_norm), @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
-        try embeddingGemma2Projection(self, module, .{ b, c, d }, a, .{ w.q, w.k, w.v }, .{ hidden, hidden, hidden }, rows, hidden, joined);
-        try module.launchRmsNorm(&self.ctx, a, b, try weight(self, w.q_norm), @intCast(rows * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
-        try module.launchRmsNorm(&self.ctx, b, c, try weight(self, w.k_norm), @intCast(rows * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
-        try module.launchRmsNorm(&self.ctx, c, d, null, @intCast(rows * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
-
+        const packed_qkv = try embeddingGemma2Projection(self, module, .{ b, c, d }, a, .{ w.q, w.k, w.v }, .{ hidden, hidden, hidden }, rows, hidden, joined, native or fused != null);
+        const packed_rotary = packed_qkv and (native or fused != null);
+        if (packed_rotary) {
+            try module.launchPackedHeads(&self.ctx, fused_q, fused_k, c, joined, try weight(self, w.q_norm), try weight(self, w.k_norm), .{}, positions_device, @intCast(rows), @intCast(sequence), embedding_gemma2_vision.head_count, embedding_gemma2_vision.head_count, embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps, embedding_gemma2_vision.rope_theta, true, embedding_gemma2_vision.q_attention_scale);
+        } else {
+            try module.launchRmsNorm(&self.ctx, a, b, try weight(self, w.q_norm), @intCast(rows * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
+            try module.launchRmsNorm(&self.ctx, b, c, try weight(self, w.k_norm), @intCast(rows * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
+            try module.launchRmsNorm(&self.ctx, c, d, null, @intCast(rows * embedding_gemma2_vision.head_count), embedding_gemma2_vision.head_dim, embedding_gemma2_vision.rms_norm_eps);
+        }
         if (native) {
-            try module.launchVisionRopePack(&self.ctx, fused_q, fused_k, a, b, positions_device, @intCast(count), embedding_gemma2_vision.rope_theta, embedding_gemma2_vision.q_attention_scale);
+            if (!packed_rotary) try module.launchVisionRopePack(&self.ctx, fused_q, fused_k, a, b, positions_device, @intCast(count), embedding_gemma2_vision.rope_theta, embedding_gemma2_vision.q_attention_scale);
             try module.launchNativeVision(&self.ctx, d, fused_q, fused_k, c, batch, sequence);
             self.embedding_gemma2_native_vision_launches += 1;
             self.stats.launch_attention += 1;
         } else if (fused) |attention_plan| {
-            try module.launchVisionRopePack(&self.ctx, fused_q, fused_k, a, b, positions_device, @intCast(count), embedding_gemma2_vision.rope_theta, embedding_gemma2_vision.q_attention_scale);
+            if (!packed_rotary) try module.launchVisionRopePack(&self.ctx, fused_q, fused_k, a, b, positions_device, @intCast(count), embedding_gemma2_vision.rope_theta, embedding_gemma2_vision.q_attention_scale);
             const workspace = if (attention_plan.workspace.len == 0) @as(usize, 0) else attention_plan.workspace.ptr;
             if (!try self.embedding_gemma2_cudnn.?.executeVision(attention_plan.key, fused_q.ptr, fused_k.ptr, c.ptr, d.ptr, workspace)) return error.CudnnFailure;
             self.stats.launch_attention += 1;
@@ -20414,14 +20436,24 @@ fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usiz
             try self.kernels.launchF32ToBf16(&self.ctx, d, tensorFromCt(attention).buffer, count);
         }
         try embeddingGemma2Matmul(self, module, a, d, try weight(self, w.out), rows, hidden, hidden);
-        try module.launchRmsNorm(&self.ctx, b, a, try weight(self, w.post_attention_norm), @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
-        try module.launchResidual(&self.ctx, state, state, b, null, @intCast(count), 1, 0);
-        try module.launchRmsNorm(&self.ctx, a, state, try weight(self, w.pre_ffn_norm), @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
-        try embeddingGemma2Projection(self, module, .{ b, c, .{} }, a, .{ w.gate, w.up, "" }, .{ intermediate, intermediate, 0 }, rows, hidden, joined);
-        try module.launchGeluMul(&self.ctx, d, b, c, @intCast(intermediate_count));
+        if (self.embedding_gemma2_policy.fused_backbone) {
+            try module.launchNormResidual(&self.ctx, state, a, a, try weight(self, w.post_attention_norm), try weight(self, w.pre_ffn_norm), null, @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
+            module.noteVisionResidual();
+        } else {
+            try module.launchRmsNorm(&self.ctx, b, a, try weight(self, w.post_attention_norm), @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
+            try module.launchResidual(&self.ctx, state, state, b, null, @intCast(count), 1, 0);
+            try module.launchRmsNorm(&self.ctx, a, state, try weight(self, w.pre_ffn_norm), @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
+        }
+        const packed_mlp = try embeddingGemma2Projection(self, module, .{ b, c, .{} }, a, .{ w.gate, w.up, "" }, .{ intermediate, intermediate, 0 }, rows, hidden, joined, true);
+        if (packed_mlp) try module.launchPackedGelu(&self.ctx, d, joined, @intCast(rows), @intCast(intermediate)) else try module.launchGeluMul(&self.ctx, d, b, c, @intCast(intermediate_count));
         try embeddingGemma2Matmul(self, module, a, d, try weight(self, w.down), rows, intermediate, hidden);
-        try module.launchRmsNorm(&self.ctx, b, a, try weight(self, w.post_ffn_norm), @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
-        try module.launchResidual(&self.ctx, state, state, b, null, @intCast(count), 1, 0);
+        if (self.embedding_gemma2_policy.fused_backbone) {
+            try module.launchNormResidual(&self.ctx, state, .{}, a, try weight(self, w.post_ffn_norm), null, null, @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
+            module.noteVisionResidual();
+        } else {
+            try module.launchRmsNorm(&self.ctx, b, a, try weight(self, w.post_ffn_norm), @intCast(rows), hidden, embedding_gemma2_vision.rms_norm_eps);
+            try module.launchResidual(&self.ctx, state, state, b, null, @intCast(count), 1, 0);
+        }
     }
     return try embeddingGemma2VisionF32Tensor(self, module, state, rows, hidden);
 }
@@ -26213,61 +26245,62 @@ test "embeddinggemma2 CUDA fused backbone preserves every BF16 boundary bitwise"
     defer compute.deinit();
     const module = try compute.embeddingGemma2Module();
     const rows = 3;
-    const width = 512;
-    const count = rows * width;
-    var values: [count]u16 = undefined;
-    var weights: [width]u16 = undefined;
-    for (&values, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@sin(@as(f32, @floatFromInt(i)) * 0.37))) >> 16);
-    for (&weights, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(0.5 + @as(f32, @floatFromInt(i % 7)) / 8)) >> 16);
-    var buffers: [7]buffer_mod.DeviceBuffer = @splat(.{});
-    defer {
-        compute.ctx.synchronize() catch {};
-        for (&buffers) |*b| b.free(&compute.ctx);
-    }
-    for (&buffers) |*b| b.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count * 2);
-    const input = buffers[0];
-    const weight = buffers[1];
-    const expected = buffers[2];
-    const actual = buffers[3];
-    const temp = buffers[4];
-    const next = buffers[5];
-    const scalar = buffers[6];
-    const scale_bits: [1]u16 = .{0x3f40};
-    try weight.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weights));
-    try scalar.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&scale_bits));
-    for (0..3) |mode| {
+    inline for (.{ 512, 768 }) |width| {
+        const count = rows * width;
+        var values: [count]u16 = undefined;
+        var weights: [width]u16 = undefined;
+        for (&values, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@sin(@as(f32, @floatFromInt(i)) * 0.37))) >> 16);
+        for (&weights, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(0.5 + @as(f32, @floatFromInt(i % 7)) / 8)) >> 16);
+        var buffers: [7]buffer_mod.DeviceBuffer = @splat(.{});
+        defer {
+            compute.ctx.synchronize() catch {};
+            for (&buffers) |*b| b.free(&compute.ctx);
+        }
+        for (&buffers) |*b| b.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count * 2);
+        const input = buffers[0];
+        const weight = buffers[1];
+        const expected = buffers[2];
+        const actual = buffers[3];
+        const temp = buffers[4];
+        const next = buffers[5];
+        const scalar = buffers[6];
+        const scale_bits: [1]u16 = .{0x3f40};
+        try weight.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weights));
+        try scalar.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&scale_bits));
+        for (0..3) |mode| {
+            try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+            try expected.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+            try actual.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+            try module.launchRmsNorm(&compute.ctx, temp, input, weight, rows, width, 1e-6);
+            try module.launchResidual(&compute.ctx, expected, expected, temp, null, count, 1, 0);
+            if (mode == 2) try module.launchScaleDevice(&compute.ctx, expected, expected, scalar, count);
+            if (mode == 0) try module.launchRmsNorm(&compute.ctx, next, expected, weight, rows, width, 1e-6);
+            // next aliases branch, exactly as the encoder's post-attention route.
+            try module.launchNormResidual(&compute.ctx, actual, input, input, weight, if (mode == 0) weight else null, if (mode == 2) scalar else null, rows, width, 1e-6);
+            var x: [count]u16 = undefined;
+            var y: [count]u16 = undefined;
+            try expected.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&x));
+            try actual.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&y));
+            try compute.ctx.synchronize();
+            try std.testing.expectEqualSlices(u16, &x, &y);
+            if (mode == 0) {
+                try next.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&x));
+                try input.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&y));
+                try compute.ctx.synchronize();
+                try std.testing.expectEqualSlices(u16, &x, &y);
+            }
+        }
         try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
-        try expected.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
-        try actual.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
-        try module.launchRmsNorm(&compute.ctx, temp, input, weight, rows, width, 1e-6);
-        try module.launchResidual(&compute.ctx, expected, expected, temp, null, count, 1, 0);
-        if (mode == 2) try module.launchScaleDevice(&compute.ctx, expected, expected, scalar, count);
-        if (mode == 0) try module.launchRmsNorm(&compute.ctx, next, expected, weight, rows, width, 1e-6);
-        // next aliases branch, exactly as the encoder's post-attention route.
-        try module.launchNormResidual(&compute.ctx, actual, input, input, weight, if (mode == 0) weight else null, if (mode == 2) scalar else null, rows, width, 1e-6);
+        try module.launchScale(&compute.ctx, temp, input, count, 1.0 / @sqrt(@as(f32, width)));
+        try module.launchRmsNorm(&compute.ctx, expected, temp, weight, rows, width, 1e-6);
+        try module.launchScaleRms(&compute.ctx, input, input, weight, rows, width, 1.0 / @sqrt(@as(f32, width)), 1e-6);
         var x: [count]u16 = undefined;
         var y: [count]u16 = undefined;
         try expected.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&x));
-        try actual.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&y));
+        try input.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&y));
         try compute.ctx.synchronize();
         try std.testing.expectEqualSlices(u16, &x, &y);
-        if (mode == 0) {
-            try next.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&x));
-            try input.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&y));
-            try compute.ctx.synchronize();
-            try std.testing.expectEqualSlices(u16, &x, &y);
-        }
     }
-    try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
-    try module.launchScale(&compute.ctx, temp, input, count, 1.0 / @sqrt(@as(f32, width)));
-    try module.launchRmsNorm(&compute.ctx, expected, temp, weight, rows, width, 1e-6);
-    try module.launchScaleRms(&compute.ctx, input, input, weight, rows, width, 1.0 / @sqrt(@as(f32, width)), 1e-6);
-    var x: [count]u16 = undefined;
-    var y: [count]u16 = undefined;
-    try expected.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&x));
-    try input.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&y));
-    try compute.ctx.synchronize();
-    try std.testing.expectEqualSlices(u16, &x, &y);
 }
 
 test "embeddinggemma2 CUDA native BF16 vision matches previous native output bits across batches and tails" {
@@ -26427,4 +26460,148 @@ test "embeddinggemma2 CUDA packed audio projections retain F32 output across pai
             for (0..5) |row| try std.testing.expectEqualSlices(f32, expected[row * 16 ..][0..16], actual[(row * count + index) * 16 ..][0..16]);
         }
     }
+}
+
+// Compare packed consumers against the separate kernels, including batch resets,
+// masked text positions, vision axes and incomplete launch tails.
+test "embeddinggemma2 CUDA packed consumers preserve BF16 boundaries bitwise" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var compute = try CudaCompute.init(allocator);
+    defer compute.deinit();
+    const module = try compute.embeddingGemma2Module();
+    inline for (.{ .{ 4, 2, 256 }, .{ 4, 1, 512 }, .{ 12, 12, 64 } }) |geometry| {
+        const qh = geometry[0];
+        const kh = geometry[1];
+        const dim = geometry[2];
+        const vision = dim == 64;
+        const sequence = 17;
+        const rows = 2 * sequence;
+        const qcount = rows * qh * dim;
+        const kcount = rows * kh * dim;
+        const packed_count = qcount + 2 * kcount;
+        const values = try allocator.alloc(u16, packed_count);
+        defer allocator.free(values);
+        for (values, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@sin(@as(f32, @floatFromInt(i)) * 0.037))) >> 16);
+        var weights: [dim]u16 = undefined;
+        for (&weights, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(0.5 + @as(f32, @floatFromInt(i % 7)) / 8)) >> 16);
+        var mask: [rows]i64 = undefined;
+        for (&mask, 0..) |*m, i| m.* = if (i % 5 == 0 or i % sequence > 13) 0 else 1;
+        var positions: [rows * qh * 2]u32 = undefined;
+        for (0..rows) |row| for (0..qh) |head| {
+            positions[(row * qh + head) * 2] = @intCast((row % sequence) / 5);
+            positions[(row * qh + head) * 2 + 1] = @intCast((row % sequence) % 5);
+        };
+        var buffers: [13]buffer_mod.DeviceBuffer = @splat(.{});
+        defer {
+            compute.ctx.synchronize() catch {};
+            for (&buffers) |*buffer| buffer.free(&compute.ctx);
+        }
+        const lengths = [_]usize{ packed_count * 2, qcount * 2, kcount * 2, kcount * 2, qcount * 2, kcount * 2, kcount * 2, qcount * 2, kcount * 2, kcount * 2, dim * 2, rows * 8, positions.len * 4 };
+        for (&buffers, lengths) |*buffer, len| buffer.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, len);
+        try buffers[0].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(values));
+        try buffers[10].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weights));
+        try buffers[11].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&mask));
+        try buffers[12].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&positions));
+        try module.launchSplitColumns(&compute.ctx, .{ buffers[1], buffers[2], buffers[3] }, buffers[0], rows, .{ qh * dim, kh * dim, kh * dim });
+        try module.launchRmsNorm(&compute.ctx, buffers[4], buffers[1], buffers[10], rows * qh, dim, 1e-6);
+        try module.launchRmsNorm(&compute.ctx, buffers[5], buffers[2], buffers[10], rows * kh, dim, 1e-6);
+        try module.launchRmsNorm(&compute.ctx, buffers[6], buffers[3], null, rows * kh, dim, 1e-6);
+        const theta: f32 = if (dim == 512) 1000000 else 10000;
+        const scale: f32 = if (vision) 8 else 1;
+        if (vision) {
+            try module.launchVisionRopePack(&compute.ctx, buffers[1], buffers[2], buffers[4], buffers[5], buffers[12], qcount, theta, scale);
+        } else {
+            try module.launchTrainingRope(&compute.ctx, buffers[4], buffers[5], buffers[11], .{ .batch = 2, .seq = sequence, .q_heads = qh, .kv_heads = kh, .head_dim = dim, .local_radius = 0 }, theta, 1);
+        }
+        try module.launchPackedHeads(&compute.ctx, buffers[7], buffers[8], buffers[9], buffers[0], buffers[10], buffers[10], buffers[11], buffers[12], rows, sequence, qh, kh, dim, 1e-6, theta, vision, scale);
+        const expected = [_]usize{ if (vision) 1 else 4, if (vision) 2 else 5, 6 };
+        for (expected, [_]usize{ 7, 8, 9 }, [_]usize{ qcount, kcount, kcount }) |ref, actual, count| {
+            const x = try allocator.alloc(u16, count);
+            defer allocator.free(x);
+            const y = try allocator.alloc(u16, count);
+            defer allocator.free(y);
+            try buffers[ref].copyToHost(&compute.ctx, std.mem.sliceAsBytes(x));
+            try buffers[actual].copyToHost(&compute.ctx, std.mem.sliceAsBytes(y));
+            try compute.ctx.synchronize();
+            try std.testing.expectEqualSlices(u16, x, y);
+        }
+    }
+    const rows = 3;
+    const width = 257;
+    const count = rows * width;
+    var values: [count * 2]u16 = undefined;
+    for (&values, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@sin(@as(f32, @floatFromInt(i)) * 0.07) * 4)) >> 16);
+    var buffers: [5]buffer_mod.DeviceBuffer = @splat(.{});
+    defer {
+        compute.ctx.synchronize() catch {};
+        for (&buffers) |*buffer| buffer.free(&compute.ctx);
+    }
+    for (&buffers, 0..) |*buffer, i| buffer.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count * (if (i == 0) @as(usize, 4) else 2));
+    try buffers[0].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    try module.launchSplitColumns(&compute.ctx, .{ buffers[1], buffers[2], .{} }, buffers[0], rows, .{ width, width, 0 });
+    try module.launchGeluMul(&compute.ctx, buffers[3], buffers[1], buffers[2], count);
+    try module.launchPackedGelu(&compute.ctx, buffers[4], buffers[0], rows, width);
+    var x: [count]u16 = undefined;
+    var y: [count]u16 = undefined;
+    try buffers[3].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&x));
+    try buffers[4].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&y));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u16, &x, &y);
+}
+
+test "embeddinggemma2 CUDA tuned BF16 GEMM caches and replays fresh inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const blas = if (compute.cublaslt) |*value| value else return error.SkipZigTest;
+    const rows = 17;
+    const width = 64;
+    var inputs: [rows * width]u16 = undefined;
+    var weights: [width * width]u16 = undefined;
+    for (&inputs, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) / 8)) >> 16);
+    // Identity weights make all admissible GEMM reductions exact, so this
+    // verifies layout, BF16 output, cache and replay rather than tolerance.
+    @memset(&weights, 0);
+    for (0..width) |i| weights[i * width + i] = 0x3f80;
+    var buffers: [4]buffer_mod.DeviceBuffer = @splat(.{});
+    defer {
+        compute.ctx.synchronize() catch {};
+        for (&buffers) |*buffer| buffer.free(&compute.ctx);
+    }
+    for (&buffers, [_]usize{ inputs.len * 2, weights.len * 2, inputs.len * 2, inputs.len * 2 }) |*buffer, len| buffer.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, len);
+    try buffers[0].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&inputs));
+    try buffers[1].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weights));
+    const workspace = cublasLtWorkspace(&compute);
+    try blas.matmulBf16WeightBf16Out(&compute.ctx, buffers[2], buffers[0], buffers[1], workspace, rows, width, width);
+    const tuning = cublaslt_mod.MatmulTuning{ .enabled = true };
+    const selected = try blas.matmulBf16WeightBf16OutWithTuning(&compute.ctx, buffers[3], buffers[0], buffers[1], workspace, rows, width, width, tuning);
+    const plans = blas.tensor_core_plans.count();
+    try std.testing.expectEqual(selected, try blas.matmulBf16WeightBf16OutWithTuning(&compute.ctx, buffers[3], buffers[0], buffers[1], workspace, rows, width, width, tuning));
+    try std.testing.expectEqual(plans, blas.tensor_core_plans.count());
+    var actual: [rows * width]u16 = undefined;
+    for (buffers[2..4]) |buffer| {
+        try buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+        try compute.ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, &inputs, &actual);
+    }
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+    errdefer if (compute.ctx.debug_graph_capture_active) {
+        const aborted = compute.ctx.endStreamCapture() catch null;
+        compute.ctx.destroyGraph(aborted);
+    };
+    // An unseen geometry must decline before first-use discovery/timing.
+    try std.testing.expectError(error.CublasLtUnsupported, blas.matmulBf16WeightBf16OutWithTuning(&compute.ctx, buffers[3], buffers[0], buffers[1], workspace, rows - 1, width, width, tuning));
+    try std.testing.expectEqual(selected, try blas.matmulBf16WeightBf16OutWithTuning(&compute.ctx, buffers[3], buffers[0], buffers[1], workspace, rows, width, width, tuning));
+    const graph = try compute.ctx.endStreamCapture();
+    defer compute.ctx.destroyGraph(graph);
+    const executable = try compute.ctx.instantiateGraph(graph);
+    defer compute.ctx.destroyGraphExec(executable);
+    @memset(&inputs, 0x3f00);
+    try buffers[0].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&inputs));
+    try compute.ctx.launchGraph(executable);
+    try buffers[3].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u16, &inputs, &actual);
+    try std.testing.expectEqual(plans, blas.tensor_core_plans.count());
 }

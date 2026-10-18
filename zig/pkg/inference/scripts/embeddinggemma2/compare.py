@@ -616,6 +616,10 @@ CUDA_ROUTES = {
     "native_vision": "native_vision_launches_total",
     "media_batch": "media_batches_total",
     "packed_ple": "packed_ple_groups_total",
+    "packed_heads": "packed_head_launches_total",
+    "packed_gelu": "packed_gelu_launches_total",
+    "tuned_gemm": "tuned_gemm_calls_total",
+    "vision_residual": "vision_residual_launches_total",
     "fused_backbone": "fused_backbone_launches_total",
 }
 

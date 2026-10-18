@@ -25,12 +25,14 @@ pub const Policy = struct {
     native_vision: bool = false,
     media_batch: bool = false,
     fused_backbone: bool = false,
-    pub fn arithmeticBits(self: Policy) u8 {
-        return @as(u8, @intFromBool(self.extended_flash)) | (@as(u8, @intFromBool(self.fused_vision)) << 1) | (@as(u8, @intFromBool(self.packed_projections)) << 2) | (@as(u8, @intFromBool(self.graph_replay)) << 3) | (@as(u8, @intFromBool(self.image_batch)) << 4) | (@as(u8, @intFromBool(self.native_vision)) << 5) | (@as(u8, @intFromBool(self.media_batch)) << 6) | (@as(u8, @intFromBool(self.fused_backbone)) << 7);
+    tuned_gemm: bool = false,
+    pub fn arithmeticBits(self: Policy) u16 {
+        return @as(u16, @intFromBool(self.extended_flash)) | (@as(u16, @intFromBool(self.fused_vision)) << 1) | (@as(u16, @intFromBool(self.packed_projections)) << 2) | (@as(u16, @intFromBool(self.graph_replay)) << 3) | (@as(u16, @intFromBool(self.image_batch)) << 4) | (@as(u16, @intFromBool(self.native_vision)) << 5) | (@as(u16, @intFromBool(self.media_batch)) << 6) | (@as(u16, @intFromBool(self.fused_backbone)) << 7) | (@as(u16, @intFromBool(self.tuned_gemm)) << 8);
     }
 };
 pub fn configured() Policy {
     return .{
+        .tuned_gemm = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TUNED_GEMM", false),
         .fused_backbone = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE", false),
         .native_vision = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_NATIVE_VISION", false),
         .media_batch = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_MEDIA_BATCH", false),
@@ -44,6 +46,6 @@ pub fn configured() Policy {
 
 test "embeddinggemma2 CUDA arithmetic profiles are disjoint including graph padding and image cohorts" {
     const std = @import("std");
-    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true } };
+    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true }, .{ .tuned_gemm = true }, .{ .tuned_gemm = true, .packed_projections = true }, .{ .tuned_gemm = true, .fused_backbone = true, .graph_replay = true } };
     for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(left.arithmeticBits() != right.arithmeticBits());
 }

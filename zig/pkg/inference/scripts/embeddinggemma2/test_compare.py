@@ -198,9 +198,16 @@ class ComparisonContracts(unittest.TestCase):
 class CudaRouteTests(unittest.TestCase):
     def test_qualification_requires_executed_routes(self):
         routes = compare.cuda_routes(
-            "extended_flash_launches_total=3 extended_flash_launches_total=9 embedding_graph_replays_total=4 native_vision_launches_total=2 media_batches_total=1 fused_backbone_launches_total=96 packed_ple_groups_total=2"
+            "extended_flash_launches_total=3 extended_flash_launches_total=9 embedding_graph_replays_total=4 native_vision_launches_total=2 media_batches_total=1 fused_backbone_launches_total=96 packed_ple_groups_total=2 packed_head_launches_total=24 packed_gelu_launches_total=24 tuned_gemm_calls_total=100 vision_residual_launches_total=32"
         )
         self.assertEqual(routes["extended_flash"], 9)
+        with self.assertRaisesRegex(ValueError, "tuned_gemm"):
+            compare.require_cuda_routes(
+                compare.cuda_routes(
+                    "gemm_tuning_declines_total=9 cublaslt_matmuls_total=9"
+                ),
+                ["tuned_gemm"],
+            )
         compare.require_cuda_routes(
             routes,
             [
@@ -210,6 +217,10 @@ class CudaRouteTests(unittest.TestCase):
                 "media_batch",
                 "fused_backbone",
                 "packed_ple",
+                "packed_heads",
+                "packed_gelu",
+                "tuned_gemm",
+                "vision_residual",
             ],
         )
         with self.assertRaisesRegex(ValueError, "fused_vision"):

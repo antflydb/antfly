@@ -587,3 +587,13 @@ BF16 encoder arena, including zero padding. Optional graph replay supports up to
 four items and 4096 padded rows, with shape-specific addresses, bounded retained
 admission and synchronized eviction. Grouped immutable PLE projections use a
 16-MiB output budget rather than retaining all 24 layers for long contexts.
+
+CUDA packed projection consumers read QKV and gate/up GEMM rows directly, keeping
+head RMS, text rotary and GELU BF16 rounding boundaries. Vision head fusion is
+limited to attention routes that already consume BF16 rotary output. The fused
+backbone profile also combines vision residual/norm passes. Optional BF16-output
+GEMM tuning uses bounded completed-device trials and a context-owned bounded
+cache; cache misses decline during graph capture. These profiles remain opt-in,
+carry versioned model identities and require NVIDIA vector/ranking and timing
+qualification. See [CUDA tuning](../../pkg/inference/CUDA_TUNING.md) for controls,
+memory bounds and observed execution gates.

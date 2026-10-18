@@ -432,3 +432,13 @@ final output allocation. Shared row metadata resets chunk alignment and causal
 taps at each clip boundary; signed validity tags distinguish invalid rows from
 out-of-clip keys even with finite mask values. Backend declines retain isolated
 per-clip execution. Metadata stays alive until all submitted groups complete.
+
+CUDA packed projection consumers read QKV and gate/up GEMM rows directly, keeping
+head RMS, text rotary and GELU BF16 rounding boundaries. Vision head fusion is
+limited to attention routes that already consume BF16 rotary output. The fused
+backbone profile also combines vision residual/norm passes. Optional BF16-output
+GEMM tuning uses bounded completed-device trials and a context-owned bounded
+cache; cache misses decline during graph capture. These profiles remain opt-in,
+carry versioned model identities and require NVIDIA vector/ranking and timing
+qualification. See [CUDA tuning](../../pkg/inference/CUDA_TUNING.md) for controls,
+memory bounds and observed execution gates.

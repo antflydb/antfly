@@ -370,6 +370,11 @@ pub const CublasLt = struct {
         _ = try self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, .{}, .dense, null);
     }
 
+    /// Shape/alignment/workspace-specific bounded tuning, cached for replay.
+    pub fn matmulBf16WeightBf16OutWithTuning(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, tuning: MatmulTuning) Error!MatmulSelection {
+        return self.matmulWeightOut(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_16BF, CUDA_R_16BF, tuning, .dense, null);
+    }
+
     /// Tensor-core input-gradient contraction for a frozen row-major BF16
     /// weight. `grad_output_bf16` is [rows, out_dim], `weight_bf16` is
     /// [out_dim, in_dim], and the F32 result is [rows, in_dim].
@@ -1254,6 +1259,12 @@ test "tensor core plan keys distinguish incompatible layouts" {
         .alignment_d_bytes = 256,
         .tuning_fingerprint = 0,
     };
+    var bf16_output = common;
+    bf16_output.output_type = CUDA_R_16BF;
+    try std.testing.expect(!std.meta.eql(common, bf16_output));
+    var bf16_input = bf16_output;
+    bf16_input.input_type = CUDA_R_16BF;
+    try std.testing.expect(!std.meta.eql(bf16_output, bf16_input));
     var batched = common;
     batched.kind = .strided_batched;
     try std.testing.expect(!std.meta.eql(common, batched));

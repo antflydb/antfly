@@ -1132,3 +1132,16 @@ bounded to four items, 4096 padded rows and four 128-MiB arenas; grouped PLE use
 at most 16 MiB of output scratch. BF16 composition avoids F32 widening for hard
 tokens and batched input storage. These implementation changes do not establish
 NVIDIA speedups without hardware measurements.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TUNED_GEMM=1` enables bounded first-use
+cuBLASLt tuning for BF16-output projections. Selected plans cache by geometry,
+workspace and pointer alignment; tuning declines retry ordinary cuBLASLt
+heuristics. Warm actual shapes before graph capture. Require observed selection
+with `--require-route tuned_gemm`; a heuristic-only run does not qualify tuning.
+
+Packed projections consume QKV and gate/up outputs directly, preserving BF16
+rounding boundaries. Fused backbone execution also combines vision residual/norm
+passes. These opt-in profiles have new identity versions; reload and qualify
+pins with NVIDIA differential tests, pretrained vectors/rankings and completed
+GPU timing before production use. The packed vision rotary consumer applies only
+to existing BF16 attention routes. CPU and Metal profiles are unaffected.

@@ -304,3 +304,67 @@ extern "C" __global__ void termite_embedding_gemma2_audio_segment_conv_f32(
     }
     out[i] = sum;
 }
+
+// One block owns a complete head. RMS reduction and every BF16 conversion
+// match the separate norm/rotary kernels; packed GEMM rows remain immutable.
+extern "C" __global__ void termite_embedding_gemma2_packed_heads_bf16(
+    __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v,
+    const __nv_bfloat16* input, const __nv_bfloat16* qw, const __nv_bfloat16* kw,
+    const long long* mask, const unsigned* positions, unsigned rows, unsigned seq,
+    unsigned q_heads, unsigned kv_heads, unsigned dim, float eps, float theta,
+    unsigned vision, float q_scale) {
+    unsigned row = blockIdx.x, slot = blockIdx.y, tid = threadIdx.x;
+    if (row >= rows || dim > 512u) return;
+    unsigned kind = slot < q_heads ? 0u : slot < q_heads + kv_heads ? 1u : 2u;
+    unsigned head = slot - (kind == 0u ? 0u : kind == 1u ? q_heads : q_heads + kv_heads);
+    unsigned heads = kind == 0u ? q_heads : kv_heads;
+    unsigned start = kind == 0u ? 0u : kind == 1u ? q_heads * dim : (q_heads + kv_heads) * dim;
+    size_t base = (size_t)row * (q_heads + 2u * kv_heads) * dim + start + head * dim;
+    const __nv_bfloat16* weight = kind == 0u ? qw : kind == 1u ? kw : nullptr;
+    __nv_bfloat16* dst = (kind == 0u ? q : kind == 1u ? k : v) + ((size_t)row * heads + head) * dim;
+    __shared__ float sums[8], inv;
+    __shared__ __nv_bfloat16 normalized[512];
+    float sum = 0.0f;
+    for (unsigned d = tid; d < dim; d += blockDim.x) { float x = __bfloat162float(input[base+d]); sum += x*x; }
+    sum = eg2_warp_sum(sum);
+    if ((tid & 31u) == 0) sums[tid >> 5u] = sum;
+    __syncthreads();
+    if (tid < 32u) {
+        float x = tid < 8u ? sums[tid] : 0.0f; x = eg2_warp_sum(x);
+        if (tid == 0u) inv = rsqrtf(x / (float)dim + eps);
+    }
+    __syncthreads();
+    for (unsigned d = tid; d < dim; d += blockDim.x) normalized[d] = __float2bfloat16_rn(__bfloat162float(input[base+d]) * inv * (weight ? __bfloat162float(weight[d]) : 1.0f));
+    __syncthreads();
+    bool rotate = kind != 2u && (vision || !mask || mask[row] != 0);
+    for (unsigned d = tid; d < dim; d += blockDim.x) {
+        if (!rotate) { dst[d] = normalized[d]; continue; }
+        if (vision) {
+            unsigned local = d % 32u, pair = local % 16u, first = d - local;
+            float angle = (float)positions[((size_t)row * q_heads + head) * 2u + d / 32u] * (1.0f / powf(theta, (2.0f * pair) / 32.0f));
+            float sn = sinf(angle), cs = cosf(angle);
+            float lo = __bfloat162float(normalized[first+pair]), hi = __bfloat162float(normalized[first+16u+pair]);
+            float x = local < 16u ? lo * cs - hi * sn : lo * sn + hi * cs;
+            dst[d] = __float2bfloat16_rn(kind == 0u ? x * q_scale : x);
+        } else {
+            unsigned half = dim / 2u, pair = d % half;
+            float angle = __fmul_rn((float)(row % seq), eg2_training_rope_inverse_frequency(theta, dim, pair));
+            float sn, cs; sincosf(angle, &sn, &cs);
+            float s = __bfloat162float(__float2bfloat16_rn(sn)), c = __bfloat162float(__float2bfloat16_rn(cs));
+            float lo = __bfloat162float(normalized[pair]), hi = __bfloat162float(normalized[pair+half]);
+            __nv_bfloat16 a = __float2bfloat16_rn((d < half ? lo : hi) * c);
+            __nv_bfloat16 b = __float2bfloat16_rn((d < half ? -hi : lo) * s);
+            dst[d] = __float2bfloat16_rn(__bfloat162float(a) + __bfloat162float(b));
+        }
+    }
+}
+extern "C" __global__ void termite_embedding_gemma2_packed_gelu_bf16(
+    __nv_bfloat16* out, const __nv_bfloat16* input, unsigned rows, unsigned width) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * width) return;
+    size_t base = (i / width) * width * 2u + i % width;
+    float x = __bfloat162float(input[base]);
+    float g = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    g = __bfloat162float(__float2bfloat16_rn(g));
+    out[i] = __float2bfloat16_rn(g * __bfloat162float(input[base+width]));
+}
