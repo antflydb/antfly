@@ -619,9 +619,9 @@ jobs:
       - name: Check inference kernels through the root build graph
         working-directory: zig
         run: >-
-          zig build inference-test -Dmetal=false -Dcuda=false --
-          --test-filter "quant kernel compiler"
-          --test-filter "metal renderer"
+          zig build inference-test -Dmetal=false -Dcuda=false
+          -Dtest-filter="quant kernel compiler"
+          -Dtest-filter="metal renderer"
 
       - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
