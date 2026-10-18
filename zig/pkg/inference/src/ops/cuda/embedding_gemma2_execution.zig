@@ -24,7 +24,7 @@ pub const packed_limit = 512 * 1024 * 1024;
 pub const arena_limit = 128 * 1024 * 1024;
 pub const graph_rows_limit = 4096;
 pub const Arena = struct {
-    kind: enum { encoder, vision } = .encoder,
+    kind: enum { encoder, vision, audio } = .encoder,
     grid_x: usize = 0,
     grid_y: usize = 0,
     geometry_ready: bool = false,
@@ -45,6 +45,8 @@ pub const Arena = struct {
     timed_uses: u64 = 0,
     last_used: u64 = 0,
     uses: u64 = 0,
+    timing: ?@import("context.zig").ProfileEventPair = null,
+    timing_replay: ?bool = null,
     completion: driver.CUevent = null,
     pending: bool = false,
     fence_valid: bool = false,
@@ -98,6 +100,7 @@ pub const Arena = struct {
         self.disabled = err != error.Cancelled and err != error.Timeout;
     }
     fn deinit(self: *Arena, ctx: *Context) void {
+        if (self.timing) |pair| ctx.destroyProfileEventPair(pair);
         if (self.completion != null) ctx.destroyEvent(self.completion);
         if (self.graph != null) ctx.destroyGraphExec(self.graph);
         for (&self.buffers) |*buffer| buffer.free(ctx);
@@ -178,15 +181,18 @@ pub const Cache = struct {
     }
 
     pub fn arena(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, sizes: [11]usize) !?*Arena {
-        return self.arenaFor(ctx, batch, sequence, mask_kind, 0, 0, sizes);
+        return self.arenaFor(ctx, .encoder, batch, sequence, mask_kind, 0, 0, sizes);
     }
 
     pub fn visionArena(self: *Cache, ctx: *Context, batch: usize, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
         if (grid_x == 0 or grid_y == 0) return null;
         const sequence = try std.math.mul(usize, grid_x, grid_y);
-        return self.arenaFor(ctx, batch, sequence, 0, grid_x, grid_y, sizes);
+        return self.arenaFor(ctx, .vision, batch, sequence, 0, grid_x, grid_y, sizes);
     }
 
+    pub fn audioArena(self: *Cache, ctx: *Context, key: u64, bytes: usize) !?*Arena {
+        return self.arenaFor(ctx, .audio, 1, 1, 0, @intCast(key), 0, .{ bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    }
     fn victim(self: *Cache) *Arena {
         for (&self.arenas) |*slot| if (slot.bytes() == 0) return slot;
         return self.oldestOccupied(null).?;
@@ -200,8 +206,7 @@ pub const Cache = struct {
         return best;
     }
 
-    fn arenaFor(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
-        const kind: @FieldType(Arena, "kind") = if (grid_x == 0) .encoder else .vision;
+    fn arenaFor(self: *Cache, ctx: *Context, kind: @FieldType(Arena, "kind"), batch: usize, sequence: usize, mask_kind: u8, grid_x: usize, grid_y: usize, sizes: [11]usize) !?*Arena {
         if (batch == 0 or batch > (if (kind == .encoder) @as(usize, 4) else 8) or sequence == 0 or sequence > 8192 or batch > graph_rows_limit / sequence) return null;
         self.clock +|= 1;
         for (&self.arenas) |*entry| if (entry.kind == kind and entry.grid_x == grid_x and entry.grid_y == grid_y and entry.sequence == sequence and entry.batch == batch and entry.mask_kind == mask_kind) {

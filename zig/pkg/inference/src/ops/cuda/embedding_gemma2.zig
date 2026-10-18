@@ -39,6 +39,7 @@ pub const Attention = struct {
 
 pub const Stats = struct {
     launches: u64 = 0,
+    audio_frontend_fused_launches: u64 = 0,
     audio_fft_launches: u64 = 0,
     audio_conv_tiled_launches: u64 = 0,
     audio_conv_bf16_launches: u64 = 0,
@@ -86,6 +87,7 @@ pub const Module = struct {
     audio_clamp: driver.CUfunction,
     audio_glu_rows: driver.CUfunction,
     audio_frontend: driver.CUfunction,
+    audio_logmel: driver.CUfunction,
     audio_fft512: driver.CUfunction,
     audio_conv_tiled: driver.CUfunction,
     audio_conv_bf16: driver.CUfunction,
@@ -159,6 +161,7 @@ pub const Module = struct {
             .audio_clamp = try function(ctx, m, "termite_gemma4_audio_clamp_f32"),
             .audio_glu_rows = try function(ctx, m, "termite_gemma4_audio_glu_rows_f32"),
             .audio_frontend = try function(ctx, m, "antfly_audio_frontend_f32"),
+            .audio_logmel = try function(ctx, m, "antfly_audio_logmel_f32"),
             .audio_fft512 = try function(ctx, m, "antfly_audio_fft512_f32"),
             .audio_conv_tiled = try function(ctx, m, "antfly_audio_conv_tiled_f32"),
             .audio_conv_bf16 = try function(ctx, m, "antfly_audio_conv_bf16_wmma"),
@@ -362,6 +365,25 @@ pub const Module = struct {
         try self.launch1d(ctx, self.audio_clamp, &args, count);
     }
 
+    pub fn launchAudioLogMel(self: *Module, ctx: *Context, out: Buffer, pcm: Buffer, plan: Buffer, mask: Buffer, frames: usize, hop: usize, floor: f32) !void {
+        const needed = try std.math.add(usize, try std.math.mul(usize, frames - 1, hop), 320);
+        if (needed > std.math.maxInt(u32) or frames > std.math.maxInt(u32) / 512) return error.InvalidEmbeddingGemma2Shape;
+        try require(pcm, needed * 4);
+        try require(out, frames * 128 * 4);
+        try require(plan, 2048 * 4);
+        try require(mask, frames * 4);
+        var ip = pcm.ptr;
+        var pp = plan.ptr;
+        var mp = mask.ptr;
+        var op = out.ptr;
+        var hp: u32 = @intCast(hop);
+        var fp = floor;
+        var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&pp), @ptrCast(&mp), @ptrCast(&op), @ptrCast(&hp), @ptrCast(&fp) };
+        try ctx.makeCurrent();
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.audio_logmel, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        self.stats_.launches += 1;
+        self.stats_.audio_frontend_fused_launches += 1;
+    }
     pub fn launchAudioFft512(self: *Module, ctx: *Context, out: Buffer, input: Buffer, tw: Buffer, frames: usize) !void {
         if (frames == 0 or frames > std.math.maxInt(u32) / 320) return error.InvalidEmbeddingGemma2Shape;
         try require(out, frames * 257 * 4);

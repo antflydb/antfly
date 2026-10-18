@@ -1209,3 +1209,45 @@ projection and model execution. They do not establish end-to-end or PyTorch
 speed. The independent ReleaseFast CPU spectrum benchmark found Accelerate
 faster at 200/1000 frames, supporting measured CPU selection rather than a
 universal FFT default.
+
+Audio preparation additionally offers a fused window/FFT/sparse-mel/log-mask
+kernel and precise-F32 Metal matrix convolution, with tiled and direct
+fallbacks. Warm feature preparation owns
+one Metal frame unless the caller supplies one. The direct batch estimate
+recovers three-clip Metal or two-clip CUDA cohorts at 1,000 frames within the same
+128 MiB envelope. Diagnostics can force the staged frontend with
+`ANTFLY_EMBEDDINGGEMMA2_AUDIO_UNFUSED=1` and direct Metal convolution with
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DIRECT_CONV=1`.
+
+CUDA `AUDIO_FRONTEND_FUSED` and `AUDIO_GRAPH` flags use the
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_` prefix and remain separately identified
+qualification candidates. The latter learns real conformer buffer lifetimes,
+then captures stable addresses under the existing shared graph budget. Use
+`--require-route audio_frontend_fused`, `audio_arena` and `audio_graph` to attest
+execution before comparing pretrained vectors/rankings and completed latency.
+The `ANTFLY_EMBEDDINGGEMMA2_BENCH_AUDIO=1` test named `completed fused frontend
+and tiled Metal convolution benchmark` measures warm framed frontend and
+convolution routes separately with completed GPU and wall times.
+
+On an Apple M4 Max with the Debug host harness, three warmups and five timed
+iterations, resident-input preparation and two-clip convolution measured the
+following completed GPU times. Convolution uses 128 input channels, 32 output
+channels, width 64, and input height `ceil(audio_frames / 2)`.
+
+| Audio frames | Staged FFT frontend µs | Fused frontend µs | Direct conv µs | Tiled conv µs | Matrix conv µs |
+|---|---:|---:|---:|---:|---:|
+| 40 | 81.2 | 27.2 | 889.7 | 484.7 | 275.8 |
+| 200 | 145.2 | 48.9 | 2888.7 | 1773.5 | 588.4 |
+| 1000 | 261.9 | 166.6 | 3621.4 | 2554.5 | 836.1 |
+
+These measurements exclude uploads, decoding and model execution. The harness
+also reports completed wall time; these kernel comparisons do not establish
+end-to-end or PyTorch speed. The retained-peak regression measured 103.1 MiB of
+additional device allocation for the three-clip, 1,000-frame Metal cohort while
+its command frame remained open, below the unchanged 128 MiB envelope.
+
+The pretrained Metal ordered-media suite passes against the pinned official
+PyTorch F32 oracle after these changes, including audio cohorts. Audio cosine
+similarity was 0.999999998 with maximum absolute error 0.000008523; image,
+text/image orderings and mixed inputs also passed. This qualifies the tested
+fixtures; CUDA arithmetic and graph candidates still need NVIDIA qualification.

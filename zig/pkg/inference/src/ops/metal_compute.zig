@@ -15665,6 +15665,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn audioFlattenBatchOp(ctx: *anyopaque, input: CT, batch: usize, time: usize, freq: usize, channels: usize) anyerror!?CT {
         return audioFrontendOp(ctx, input, null, .{ .mode = 4, .batch = std.math.cast(u32, batch) orelse return error.InvalidTensorShape, .rows = std.math.cast(u32, time) orelse return error.InvalidTensorShape, .width = std.math.cast(u32, freq) orelse return error.InvalidTensorShape, .hop = std.math.cast(u32, channels) orelse return error.InvalidTensorShape });
     }
+    fn audioBatchLayoutsEnabledOp(_: *anyopaque) bool {
+        return !disableRuntimeElementwise();
+    }
+    fn audioLogMelOp(ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var x = (try self.gemma4AudioDeviceOperand(pcm)) orelse return null;
+        defer x.deinit();
+        var p = (try self.gemma4AudioDeviceOperand(plan)) orelse return null;
+        defer p.deinit();
+        var m = (try self.gemma4AudioDeviceOperand(mask)) orelse return null;
+        defer m.deinit();
+        const out = (try metal_runtime.decoderRuntimeAudioLogMel(self.provider_impl, x, p, m, frames, hop, floor)) orelse return null;
+        return self.ctFromOwnedMetalTensor(out);
+    }
     fn audioFft512Op(ctx: *anyopaque, input: CT, tw: CT, frames: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
@@ -33351,6 +33366,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.clampSilu = clampSiluOp;
         vt.spatialPoolPrepare = spatialPoolPrepareOp;
         vt.audioFrontend = audioFrontendOp;
+        vt.audioLogMelEnabled = audioBatchLayoutsEnabledOp;
+        vt.audioLogMel = audioLogMelOp;
+        vt.audioBatchLayoutsEnabled = audioBatchLayoutsEnabledOp;
         vt.audioFft512 = audioFft512Op;
         vt.channelLayerNormReluBatch = audioChannelNormBatchOp;
         vt.flattenChannelsTimeFreqBatch = audioFlattenBatchOp;

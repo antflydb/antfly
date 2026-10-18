@@ -66,6 +66,9 @@ pub const DeviceBuffer = struct {
     /// Original allocation size, independent of a logical view's length.
     /// Non-owning descriptors constructed from pointers have no charge.
     allocation_bytes: usize = 0,
+    /// Suballocations of a graph arena cannot be freed through an op's direct
+    /// error cleanup. The arena owner alone releases their physical storage.
+    borrowed: bool = false,
 
     pub fn alloc(ctx: *context_mod.CudaContext, len: usize) driver_mod.Error!DeviceBuffer {
         if (len == 0) return .{};
@@ -85,6 +88,10 @@ pub const DeviceBuffer = struct {
     }
 
     pub fn free(self: *DeviceBuffer, ctx: *context_mod.CudaContext) void {
+        if (self.borrowed) {
+            self.* = .{};
+            return;
+        }
         if (self.ptr != 0) {
             ctx.makeCurrent() catch {};
             const result = ctx.driver.fns.cuMemFree(self.ptr);
@@ -167,4 +174,11 @@ test "CUDA physical OOM releases its reservation and permits a later allocation"
     try std.testing.expectEqual(@as(usize, 16), ctx.device_allocations.snapshot().live);
     buffer.free(&ctx);
     try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
+}
+
+test "embeddinggemma2 CUDA graph suballocation error cleanup never frees its arena" {
+    var borrowed = DeviceBuffer{ .ptr = 1234, .len = 256, .borrowed = true };
+    borrowed.free(undefined);
+    try std.testing.expectEqual(@as(usize, 0), borrowed.len);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), borrowed.ptr);
 }

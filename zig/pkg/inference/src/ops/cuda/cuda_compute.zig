@@ -2321,10 +2321,16 @@ pub const CudaCompute = struct {
     embedding_gemma2_constants: std.StringHashMapUnmanaged(*CudaTensor) = .empty,
     embedding_gemma2_constant_bytes: usize = 0,
     embedding_gemma2_constant_count: usize = 0,
+    embedding_gemma2_constant_generation: u64 = 0,
     embedding_gemma2_patch_rows_written: usize = 0,
     embedding_gemma2_audio_constant_hits: u64 = 0,
     embedding_gemma2_constant_hits: u64 = 0,
     embedding_gemma2_constant_misses: u64 = 0,
+    audio_plans: @import("audio_execution_plan.zig").Cache = .{},
+    audio_execution_active: bool = false,
+    audio_scope: ?*@import("audio_execution_plan.zig").Scope = null,
+    audio_arena_executes: u64 = 0,
+    audio_graph_replays: u64 = 0,
     embedding_gemma2_execution: @import("embedding_gemma2_execution.zig").Cache = .{},
     embedding_gemma2_vision_graph_replays: u64 = 0,
     embedding_gemma2_policy: @import("embedding_gemma2_policy.zig").Policy = .{},
@@ -2598,6 +2604,7 @@ pub const CudaCompute = struct {
 
     fn clearEmbeddingGemma2Constants(self: *CudaCompute, context_destroyed: bool) !void {
         if (self.embedding_gemma2_constants.capacity() == 0) return;
+        self.embedding_gemma2_constant_generation +%= 1;
         if (!context_destroyed and self.embedding_gemma2_constants.count() != 0) try self.ctx.synchronize();
         var iterator = self.embedding_gemma2_constants.iterator();
         while (iterator.next()) |entry| {
@@ -2611,6 +2618,8 @@ pub const CudaCompute = struct {
     }
 
     pub fn evictEmbeddingGemma2Caches(self: *CudaCompute) !void {
+        if (self.audio_execution_active) return error.ResourceTemporarilyUnavailable;
+        self.audio_plans.clear();
         try self.embedding_gemma2_resize.clear(&self.ctx);
         try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
         try self.clearEmbeddingGemma2Constants(false);
@@ -2785,7 +2794,7 @@ pub const CudaCompute = struct {
                     after.short_cudnn_attention_launches,
                 },
             );
-            std.log.info("embedding_gemma2_prep_stats audio_constant_hits_total={} model_constant_hits_total={} model_constant_live_bytes={} patch_rows_written_total={} audio_fft_launches_total={} audio_conv_tiled_launches_total={} audio_conv_bf16_launches_total={} audio_batch_layout_launches_total={}", .{ self.embedding_gemma2_audio_constant_hits, self.embedding_gemma2_constant_hits, self.embedding_gemma2_constant_bytes, self.embedding_gemma2_patch_rows_written, after.audio_fft_launches, after.audio_conv_tiled_launches, after.audio_conv_bf16_launches, after.audio_batch_layout_launches });
+            std.log.info("embedding_gemma2_prep_stats audio_constant_hits_total={} model_constant_hits_total={} model_constant_live_bytes={} patch_rows_written_total={} audio_fft_launches_total={} audio_conv_tiled_launches_total={} audio_conv_bf16_launches_total={} audio_batch_layout_launches_total={} audio_frontend_fused_launches_total={} audio_arena_executes_total={} audio_graph_replays_total={}", .{ self.embedding_gemma2_audio_constant_hits, self.embedding_gemma2_constant_hits, self.embedding_gemma2_constant_bytes, self.embedding_gemma2_patch_rows_written, after.audio_fft_launches, after.audio_conv_tiled_launches, after.audio_conv_bf16_launches, after.audio_batch_layout_launches, after.audio_frontend_fused_launches, self.audio_arena_executes, self.audio_graph_replays });
         };
         var owned = std.ArrayListUnmanaged(buffer_mod.DeviceBuffer).empty;
         defer {
@@ -3140,6 +3149,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        self.audio_plans.clear();
         const retained_cleanup_failed = failed: {
             self.embedding_gemma2_resize.clear(&self.ctx) catch break :failed true;
             self.embedding_gemma2_execution.clear(self.allocator, &self.ctx) catch break :failed true;
@@ -6431,6 +6441,7 @@ fn getDenseStreamWeight(self: *CudaCompute, name: []const u8) !?*CudaTensor {
 }
 
 fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !void {
+    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_h2d_copy bytes={d} disabled=1", .{bytes.len});
@@ -7705,6 +7716,7 @@ fn flushDeferredDecodeScalarUpload(self: *CudaCompute) !void {
 }
 
 fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
+    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_d2h_copy bytes={d} disabled=1", .{bytes.len});
@@ -7740,6 +7752,7 @@ fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.Devi
 }
 
 fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
+    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     const tried_pinned_scalar_download = pinnedScalarDownloadEligible(self, bytes);
     if (try copyToPinnedScalarDownloadAndSync(self, device, bytes)) return;
     if (tried_pinned_scalar_download) self.stats.pinned_scalar_download_fallbacks += 1;
@@ -9317,6 +9330,9 @@ test "CUDA op-profile pool free-stack, drain no-op, and category mapping" {
     // slots, the empty-ring drain fast path (never touches the GPU context), and
     // the category -> stat-field mapping for the newly added prefill buckets.
     var compute: CudaCompute = undefined;
+    compute.audio_scope = null;
+    compute.audio_execution_active = false;
+    compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
     compute.profile_pool = .{};
     compute.stats = .{};
@@ -9841,6 +9857,9 @@ fn allocGreedyTokenDeviceBuffer(self: *CudaCompute, byte_len: usize) !DeviceBuff
 
 test "CUDA greedy graph output borrows only the prepared replay slot" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
     self.debug_cuda_graph_prepared_slot = 3;
@@ -9865,6 +9884,9 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
 
 test "CUDA greedy graph output lease remains armed for retry and consumes on tensor creation" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.allocator = std.testing.allocator;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
@@ -9894,6 +9916,15 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
+    if (self.audio_scope) |scope| if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
+    var result = try allocDeviceBufferOrdinary(self, len);
+    if (self.audio_scope) |scope| {
+        result.len = len;
+        scope.plan.allocate(len, result.ptr);
+    }
+    return result;
+}
+fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
     const seq = self.temp_trace_seq;
@@ -9987,9 +10018,17 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
+    if (self.audio_scope) |scope| {
+        if (scope.base == 0) scope.release(buffer.ptr) else if (scope.owns(buffer.ptr)) {
+            scope.release(buffer.ptr);
+            buffer.* = .{};
+            return;
+        }
+    }
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
     if (releasePinnedTempSlot(self, buffer)) return;
+    if (buffer.allocation_bytes != 0) buffer.len = buffer.allocation_bytes;
     const cache_budget = cudaTempCacheBudgetBytes(self);
     var cached_bytes: usize = 0;
     for (self.temp_buffers.items) |cached| cached_bytes += cached.len;
@@ -10427,6 +10466,9 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     // No driver is needed: acquired handles may free their metadata, but must
     // never attempt to free the resident model's device allocations.
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.allocator = allocator;
     self.a4b_runtime = null;
@@ -10885,6 +10927,9 @@ fn disarmSplitkOnlineDecodeReplay(self: *CudaCompute) void {
 
 test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.allocator = std.testing.allocator;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
@@ -10933,6 +10978,9 @@ fn preparePersistentCudaBufferReallocation(self: *CudaCompute) !void {
 
 test "CUDA persistent buffer reallocation invalidates graph pointers and rejects capture" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.allocator = std.testing.allocator;
     self.debug_cuda_graph_slots = @as([max_cuda_graph_replay_slots]CudaGraphReplaySlot, @splat(.{}));
@@ -10963,6 +11011,9 @@ fn clearDebugCudaGraphCaptureState(self: *CudaCompute) void {
 
 test "clearing CUDA graph capture state removes stale disabled latch" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.debug_cuda_graph_capture_active = true;
     self.debug_cuda_graph_capture_disabled = true;
@@ -10979,6 +11030,9 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
 
 test "CUDA graph request reset clears stale capture and scalar state" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.ctx.debug_graph_capture_active = false;
     self.generated_gqa_score_prework_templates = .empty;
@@ -11013,6 +11067,9 @@ test "CUDA graph request reset clears stale capture and scalar state" {
 
 test "CUDA request reset clears pinned temp slot ABI mappings" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
     self.allocator = std.testing.allocator;
     self.temp_buffer_mutex = .unlocked;
@@ -12176,9 +12233,207 @@ fn supportsLinearPackedNamedOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.packed_projections;
 }
+/// One actual warm invocation initializes caches; the next learns lifetimes.
+/// Capture uses only bounded arena addresses and validates every allocation/free.
+fn audioBufferView(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize) !buffer_mod.DeviceBuffer {
+    if (offset > buffer.len or bytes > buffer.len - offset) return error.InvalidShape;
+    return .{ .ptr = buffer.ptr + offset, .len = bytes, .borrowed = true };
+}
+fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.audio_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
+    self.audio_execution_active = true;
+    defer self.audio_execution_active = false;
+    var hash = std.hash.Wyhash.init(key);
+    const bits = self.embedding_gemma2_policy.arithmeticBits();
+    hash.update(std.mem.asBytes(&bits));
+    hash.update(std.mem.asBytes(&self.embedding_gemma2_execution.weight_generation));
+    hash.update(std.mem.asBytes(&self.cublaslt_workspace_scratch.buffer.ptr));
+    hash.update(std.mem.asBytes(&self.embedding_gemma2_constant_generation));
+    var input_bytes: usize = 0;
+    for (inputs) |ct| {
+        const t = tensorFromCt(ct);
+        try ensureF32(t);
+        hash.update(std.mem.sliceAsBytes(t.shape));
+        const n = t.elem_count * 4;
+        hash.update(std.mem.asBytes(&n));
+        input_bytes = try std.math.add(usize, input_bytes, std.mem.alignForward(usize, n, 256));
+    }
+    if (input_bytes > 128 * 1024 * 1024) return null;
+    var canonical: [20]CT = undefined;
+    var canonical_count: usize = 0;
+    defer for (canonical[0..canonical_count]) |ct| freeTensor(self, ct);
+    for (inputs) |ct| {
+        const t = tensorFromCt(ct);
+        const alias = try borrowModelConstant(self, t);
+        tensorFromCt(alias).buffer.len = t.elem_count * 4;
+        canonical[canonical_count] = alias;
+        canonical_count += 1;
+    }
+    const base_key = hash.final();
+    const entry = self.audio_plans.get(base_key);
+    if (entry.disabled) return null;
+    if (!entry.warmed) {
+        const out = try run(context, canonical[0..canonical_count]);
+        entry.warmed = true;
+        return out;
+    }
+    const plan_mod = @import("audio_execution_plan.zig");
+    if (entry.plan == null) {
+        const plan = try std.heap.c_allocator.create(plan_mod.Plan);
+        plan.* = .{};
+        entry.plan = plan;
+        var scope = plan_mod.Scope{ .plan = plan };
+        const h2d_before = self.stats.h2d_bytes;
+        const d2h_before = self.stats.d2h_bytes;
+        self.audio_scope = &scope;
+        const out = run(context, canonical[0..canonical_count]) catch |err| {
+            self.audio_scope = null;
+            if (err == error.Cancelled or err == error.Timeout) {
+                std.heap.c_allocator.destroy(plan);
+                entry.plan = null;
+            } else entry.disabled = true;
+            return err;
+        };
+        self.audio_scope = null;
+        if (!plan.finish(tensorFromCt(out).buffer.ptr) or self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before) entry.disabled = true;
+        return out;
+    }
+    const plan = entry.plan.?;
+    const bytes = try std.math.add(usize, input_bytes, plan.peak);
+    if (bytes > plan_mod.limit) return null;
+    // The full event ABI participates in the key, so metadata eviction cannot
+    // accidentally attach a newly learned layout to a previous graph.
+    var layout = std.hash.Wyhash.init(base_key);
+    for (plan.events[0..plan.event_count]) |e| {
+        layout.update(std.mem.asBytes(&e.slot));
+        const flag: @TypeOf(bits) = @intFromBool(e.allocate);
+        layout.update(std.mem.asBytes(&flag));
+        const a = plan.allocations[e.slot];
+        layout.update(std.mem.asBytes(&a.bytes));
+        layout.update(std.mem.asBytes(&a.offset));
+    }
+    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, layout.final(), bytes)) orelse return null;
+    defer arena.noteUse(&self.ctx);
+    var stable: [20]CT = undefined;
+    var count: usize = 0;
+    var offset: usize = 0;
+    defer for (stable[0..count]) |ct| freeTensor(self, ct);
+    for (inputs) |ct| {
+        const t = tensorFromCt(ct);
+        const n = t.elem_count * 4;
+        const buffer = try audioBufferView(arena.buffers[0], offset, n);
+        try copyFromDeviceTracked(self, buffer, t.buffer, n);
+        const shape = try self.allocator.dupe(i64, t.shape);
+        const borrowed = createTensor(self, buffer, shape, t.elem_count) catch |err| {
+            self.allocator.free(shape);
+            return err;
+        };
+        tensorFromCt(borrowed).owns_buffer = false;
+        stable[count] = borrowed;
+        count += 1;
+        offset += std.mem.alignForward(usize, n, 256);
+    }
+    // Collect only completed events, with no new stream/device wait.
+    if (arena.timing_replay) |replay| if (arena.timing) |pair| {
+        var ms: f32 = 0;
+        if (self.ctx.driver.fns.cuEventElapsedTime(&ms, pair.start, pair.end) == 0) {
+            if (ms > 0) arena.recordCompleted(replay, @intFromFloat(@as(f64, ms) * 1000000));
+            arena.timing_replay = null;
+        }
+    };
+    if (arena.timing == null) arena.timing = self.ctx.createProfileEventPair() catch null;
+    if (arena.timing_replay == null) if (arena.timing) |pair| try self.ctx.recordProfileStart(pair);
+    const capture_sample = arena.graph == null;
+    const replay = arena.graph != null and arena.preferReplay();
+    if (replay) {
+        try self.ctx.launchGraph(arena.graph);
+        self.audio_graph_replays += 1;
+    } else {
+        var scope = plan_mod.Scope{ .plan = plan, .base = arena.buffers[0].ptr + input_bytes };
+        const capture = arena.graph == null and !arena.disabled;
+        if (capture) self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
+            arena.disabled = true;
+            return null;
+        };
+        const h2d_before = self.stats.h2d_bytes;
+        const d2h_before = self.stats.d2h_bytes;
+        self.audio_scope = &scope;
+        const result = run(context, stable[0..count]) catch |err| {
+            self.audio_scope = null;
+            if (capture) {
+                if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
+            }
+            arena.captureFailed(err);
+            entry.disabled = err != error.Cancelled and err != error.Timeout;
+            if (err == error.Cancelled or err == error.Timeout) return err;
+            if (!capture and err != error.AudioPlanChanged and err != error.CudaGraphCaptureUnsafeHostCopy) return err;
+            return null;
+        };
+        self.audio_scope = null;
+        const result_tensor = tensorFromCt(result);
+        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == plan.event_count and result_tensor.buffer.ptr == scope.base + plan.allocations[plan.output].offset;
+        result_tensor.owns_buffer = false;
+        freeTensor(self, result);
+        if (!matches) {
+            if (capture) {
+                if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
+            }
+            entry.disabled = true;
+            return null;
+        }
+        if (capture) {
+            const graph = self.ctx.endStreamCapture() catch {
+                entry.disabled = true;
+                return null;
+            };
+            defer self.ctx.destroyGraph(graph);
+            arena.graph = self.ctx.instantiateGraph(graph) catch {
+                entry.disabled = true;
+                return null;
+            };
+            try self.ctx.launchGraph(arena.graph);
+        }
+    }
+    self.audio_arena_executes += 1;
+    if (arena.timing_replay == null) if (arena.timing) |pair| {
+        try self.ctx.recordProfileEnd(pair);
+        arena.timing_replay = if (capture_sample) null else replay;
+    };
+    const t = tensorFromCt(inputs[0]);
+    const out = try self.createEmbeddingGemma2Tensor(t.shape, .f32);
+    errdefer freeTensor(self, out);
+    const result = try audioBufferView(arena.buffers[0], input_bytes + plan.allocations[plan.output].offset, t.elem_count * 4);
+    try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, t.elem_count * 4);
+    return out;
+}
+fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.capability_profile == .embedding_gemma2;
+}
+fn audioLogMelEnabledOp(ctx: *anyopaque) bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.audio_frontend_fused;
+}
+fn audioLogMelOp(ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_frontend_fused) return null;
+    const x = tensorFromCt(pcm);
+    const p = tensorFromCt(plan);
+    const m = tensorFromCt(mask);
+    try ensureF32(x);
+    try ensureF32(p);
+    try ensureF32(m);
+    const needed = try std.math.add(usize, try std.math.mul(usize, frames - 1, hop), 320);
+    if (x.elem_count < needed or p.elem_count != 2048 or m.elem_count != frames) return error.InvalidTensorShape;
+    const out = try self.createEmbeddingGemma2Tensor(&.{ @intCast(frames), 128 }, .f32);
+    errdefer freeTensor(self, out);
+    try (try self.embeddingGemma2Module()).launchAudioLogMel(&self.ctx, tensorFromCt(out).buffer, x.buffer, p.buffer, m.buffer, frames, hop, floor);
+    return out;
+}
 fn audioFft512EnabledOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.audio_fft;
+    return self.capability_profile == .embedding_gemma2 and (self.embedding_gemma2_policy.audio_fft or self.embedding_gemma2_policy.audio_frontend_fused);
 }
 fn audioFft512Op(ctx: *anyopaque, input: CT, tw: CT, frames: usize) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -12387,6 +12642,9 @@ fn gemma4AudioDepthwiseSegmentedOp(ctx: *anyopaque, input: CT, weight: CT, start
 
 test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
     var self: CudaCompute = undefined;
+    self.audio_scope = null;
+    self.audio_execution_active = false;
+    self.embedding_gemma2_constant_generation = 0;
     self.ctx.info.compute_major = 7;
     try std.testing.expect((try gemma4AudioClampScalarOp(&self, undefined, -1, 1)) == null);
     try std.testing.expect((try gemma4AudioGluRowsOp(&self, undefined, 1, 1)) == null);
@@ -15183,6 +15441,9 @@ fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTenso
 
 test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     var compute: CudaCompute = undefined;
+    compute.audio_scope = null;
+    compute.audio_execution_active = false;
+    compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
     compute.gliner_boundary_inference = false;
     compute.gliner_mixed_attention = false;
@@ -20073,6 +20334,9 @@ fn glinerQ8F16AttentionEligible(self: *const CudaCompute, batch: usize, seq: usi
 
 test "GLiNER Decide CUDA Q8 long-context attention requires complete supported mirror profile" {
     var compute: CudaCompute = undefined;
+    compute.audio_scope = null;
+    compute.audio_execution_active = false;
+    compute.embedding_gemma2_constant_generation = 0;
     compute.gliner_encoder_attention = true;
     compute.gliner_q8_f16_mirrors = true;
     compute.gliner_q8_f16_attention = true;
@@ -25645,6 +25909,10 @@ const vtable = ops.ComputeBackend.VTable{
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
     .audioFrontend = &audioFrontendOp,
+    .audioExecution = &audioExecutionOp,
+    .audioLogMelEnabled = &audioLogMelEnabledOp,
+    .audioLogMel = &audioLogMelOp,
+    .audioBatchLayoutsEnabled = &audioBatchLayoutsEnabledOp,
     .audioFft512 = &audioFft512Op,
     .audioFft512Enabled = &audioFft512EnabledOp,
     .channelLayerNormReluBatch = &audioChannelNormBatchOp,
@@ -27051,6 +27319,9 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             copies = 0;
             var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
             var compute: CudaCompute = undefined;
+            compute.audio_scope = null;
+            compute.audio_execution_active = false;
+            compute.embedding_gemma2_constant_generation = 0;
             compute.allocator = a;
             compute.capability_profile = .embedding_gemma2;
             compute.embedding_gemma2_constants = .empty;
@@ -27122,4 +27393,20 @@ test "embeddinggemma2 CUDA constant snapshots preserve bits after mutation evict
     const actual = try cb.toFloat32(hit, std.testing.allocator);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualSlices(f32, &original, actual);
+}
+
+test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclamation before GPU access" {
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .embedding_gemma2;
+    compute.embedding_gemma2_policy = .{ .audio_graph = true };
+    compute.audio_execution_active = true;
+    try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
+    var plan: @import("audio_execution_plan.zig").Plan = undefined;
+    var scope = @import("audio_execution_plan.zig").Scope{ .plan = &plan, .base = 1 };
+    compute.audio_scope = &scope;
+    var bytes = [_]u8{0};
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, undefined, &bytes));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTracked(&compute, undefined, &bytes));
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTrackedAndSync(&compute, undefined, &bytes));
 }

@@ -10328,6 +10328,15 @@ pub fn decoderRuntimeRmsNormResidual(self: anytype, input: MetalTensor, residual
 
 pub extern fn termite_metal_decode_runtime_norm_residual_device(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, output: ?*anyopaque, output_offset: usize) c_int;
 
+pub fn decoderRuntimeAudioLogMel(self: anytype, pcm: MetalTensor, plan: MetalTensor, mask: MetalTensor, frames: usize, hop: usize, floor: f32) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    const needed = try std.math.add(usize, try std.math.mul(usize, frames - 1, hop), 320);
+    if (pcm.elemCount() < needed or plan.elemCount() != 2048 or mask.elemCount() != frames or needed > std.math.maxInt(u32)) return error.InvalidTensorShape;
+    var out = try MetalTensor.deviceAllocate(runtime, frames * 128 * 4, .private, &.{ @intCast(frames), 128 });
+    errdefer out.deinit();
+    return finishDeviceOutput(&out, antfly_metal_audio_logmel(runtime, pcm.deviceHandle(), pcm.deviceByteOffset(), plan.deviceHandle(), plan.deviceByteOffset(), mask.deviceHandle(), mask.deviceByteOffset(), frames, hop, floor, out.deviceHandle(), out.deviceByteOffset()));
+}
+extern fn antfly_metal_audio_logmel(runtime: ?*RawMetalDecodeRuntime, pcm: ?*anyopaque, pcm_offset: usize, plan: ?*anyopaque, plan_offset: usize, mask: ?*anyopaque, mask_offset: usize, frames: usize, hop: usize, floor: f32, out: ?*anyopaque, out_offset: usize) c_int;
 pub fn decoderRuntimeAudioFft512(self: anytype, input: MetalTensor, tw: MetalTensor, frames: usize) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (frames == 0 or frames > std.math.maxInt(u32) / 320 or input.elemCount() != frames * 320 or tw.elemCount() != 512) return error.InvalidTensorShape;

@@ -1472,3 +1472,14 @@ extern "C" __global__ void antfly_audio_conv_tiled_f32(float *out,const float *i
     }
     if(channel<oc && pos<oh*ow) out[((size_t)batch*oc+channel)*oh*ow+pos]=acc;
 }
+
+extern "C" __global__ void antfly_audio_logmel_f32(const float *input,const float *plan,const float *mask,float *out,unsigned hop,float floor) {
+unsigned tid=threadIdx.x,frame=blockIdx.x;__shared__ float2 values[512];__shared__ float mag[257];
+for(unsigned i=tid;i<512;i+=256) { unsigned r=__brev(i)>>23; values[r]=make_float2(i<320 ? input[(size_t)frame*hop+i]*plan[512+i] : 0.f,0.f); }
+__syncthreads();
+for(unsigned len=2;len<=512;len*=2) { unsigned span=len/2,j=tid%span,a=(tid/span)*len+j,b=a+span,w=j*(512/len);float2 x=values[a],y=values[b];float2 v=make_float2(__fsub_rn(__fmul_rn(y.x,plan[2*w]),__fmul_rn(y.y,plan[2*w+1])),__fadd_rn(__fmul_rn(y.x,plan[2*w+1]),__fmul_rn(y.y,plan[2*w])));values[a]=make_float2(__fadd_rn(x.x,v.x),__fadd_rn(x.y,v.y));values[b]=make_float2(__fsub_rn(x.x,v.x),__fsub_rn(x.y,v.y));__syncthreads(); }
+bool bad=false;
+for(unsigned i=tid;i<257;i+=256) { float2 x=values[i];mag[i]=sqrtf(__fadd_rn(__fmul_rn(x.x,x.x),__fmul_rn(x.y,x.y)));bad|=!isfinite(mag[i]); }
+int nonfinite=__syncthreads_or(bad);
+if(tid<128) { unsigned first=(unsigned)plan[832+tid*3],end=(unsigned)plan[833+tid*3],off=(unsigned)plan[834+tid*3];float sum=0.f;for(unsigned k=nonfinite ? 0 : first;k<(nonfinite ? 257 : end);k++) { float weight=k>=first && k<end ? plan[off+k-first] : 0.f; sum=__fadd_rn(sum,__fmul_rn(mag[k],weight)); }out[(size_t)frame*128+tid]=logf(sum+floor)*mask[frame]; }
+}

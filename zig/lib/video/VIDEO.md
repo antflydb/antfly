@@ -632,3 +632,17 @@ separately identified opt-in candidates pending NVIDIA qualification.
 CUDA clamp metadata uses immutable scalar lookups before packed projection.
 CUDA graph retention shares the existing memory ceiling across reuse-aware
 vision/backbone descriptors and fences only evicted storage by completion event.
+
+The fixed audio frontend can fuse windowing, FFT, sparse mel projection and
+log/masking in one accelerator block, with one caller-owned or preparation-owned
+Metal command frame. F32 SIMD-group matrix convolution reuses NCHW tiles on
+compatible Metal devices, with tiled F32 and direct fallbacks. Batch admission
+counts current live/retained buffers and the CUDA masking buffer; legacy backends
+retain the transpose allowance under the same 128 MiB limit.
+
+CUDA conformer plans are opt-in. Actual eager requests warm and learn bounded
+buffer lifetimes before capture. Stable input/mask/segment/scale storage, immutable
+prepared depthwise weights and generation-aware keys preserve replay ownership.
+Audio shares vision/backbone graph admission and completion-fenced eviction;
+capture/admission declines retain eager execution, and cancellation remains
+retryable. Kernel and graph qualification require actual route counters.

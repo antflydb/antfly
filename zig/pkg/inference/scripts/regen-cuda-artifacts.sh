@@ -199,6 +199,7 @@ tmp_sm89="$tmp_root/kernels.sm89.cubin"
 trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"; rmdir "$tmp_root"' EXIT
 
 required_symbols=(
+  antfly_audio_logmel_f32
   antfly_audio_fft512_f32
   antfly_audio_conv_tiled_f32
   antfly_audio_conv_bf16_wmma
@@ -530,7 +531,7 @@ write_or_check() {
 
 build_portable_ptx() {
   "$nvcc" -ptx -arch=compute_75 "$src" -o "$tmp_ptx"
-  perl -0pi -e 's/\n+\z/\n/' "$tmp_ptx"
+  perl -0pi -e 's/[ \t]+\n/\n/g; s/\n+\z/\n/' "$tmp_ptx"
 
   if ! grep -q '^\.version 9\.2' "$tmp_ptx"; then
     printf 'error: generated PTX is not PTX ISA 9.2\n' >&2

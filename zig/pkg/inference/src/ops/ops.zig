@@ -2054,6 +2054,10 @@ pub const ComputeBackend = struct {
         /// position bias; see `Gemma4AudioLocalAttentionParams`.
         /// Starts has one exact F32 clip start index per row; no cross-clip taps.
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT = null,
+        audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
+        audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
+        audioBatchLayoutsEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioFft512Enabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioFft512: ?*const fn (ctx: *anyopaque, input: CT, twiddles: CT, frames: usize) anyerror!?CT = null,
         channelLayerNormReluBatch: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, batch: usize, channels: usize, positions: usize, eps: f32) anyerror!?CT = null,
@@ -4756,6 +4760,29 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, weight, channels, positions, eps);
     }
 
+    pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
+        const op = self.vtable.audioExecution orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, key, inputs, context, run);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
+    pub fn supportsAudioBatchLayouts(self: *const ComputeBackend) bool {
+        return self.vtable.channelLayerNormReluBatch != null and self.vtable.flattenChannelsTimeFreqBatch != null and if (self.vtable.audioBatchLayoutsEnabled) |op| op(self.ptr) else false;
+    }
+    pub fn supportsAudioLogMel(self: *const ComputeBackend) bool {
+        return self.vtable.audioLogMel != null and if (self.vtable.audioLogMelEnabled) |op| op(self.ptr) else true;
+    }
+    pub fn audioLogMel(self: *const ComputeBackend, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) !?CT {
+        if (frames == 0 or frames > std.math.maxInt(u32) / 512 or hop == 0 or hop > std.math.maxInt(u32) or !std.math.isFinite(floor) or floor <= 0) return error.InvalidTensorShape;
+        const op = self.vtable.audioLogMel orelse return null;
+        try self.checkExecutionControl();
+        const result = try op(self.ptr, pcm, plan, mask, frames, hop, floor);
+        errdefer if (result) |ct| self.free(ct);
+        try self.checkExecutionControl();
+        return result;
+    }
     pub fn supportsAudioFft512(self: *const ComputeBackend) bool {
         if (self.vtable.audioFft512 == null) return false;
         return if (self.vtable.audioFft512Enabled) |op| op(self.ptr) else true;

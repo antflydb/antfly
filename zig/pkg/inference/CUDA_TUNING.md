@@ -1454,6 +1454,56 @@ qualification on NVIDIA hardware. The harness routes `audio_conv_tiled`,
 `audio_conv_bf16`, `audio_fft` and `audio_batch_layout` require actual launch
 counters. Compilation and CPU/Metal tests do not qualify these CUDA candidates.
 
+The fused frontend uses a fixed 8 KiB plan containing twiddles, window and a
+compact sparse mel filterbank. One cooperative block windows PCM, computes FFT
+and magnitude in shared memory, accumulates only supported mel coefficients,
+and writes masked log-mel rows directly. Nonfinite magnitudes use the original
+dense coefficient semantics. Metal selects this precise-F32 route by default;
+`ANTFLY_EMBEDDINGGEMMA2_AUDIO_UNFUSED=1` retains the staged reference. Preparation
+owns one command frame when the caller has none, including the reference route.
+Warm preparation does not upload immutable plans again. CUDA's separate
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_FRONTEND_FUSED=1` profile and
+`--require-route audio_frontend_fused` gate qualify its changed arithmetic.
+
+Metal's 3×3 stride-two convolution uses F32 SIMD-group matrix implicit GEMM
+for at least 16 input channels when a compatible 32-lane pipeline is available;
+other devices retain tiled F32 implicit GEMM. The generic direct kernel remains the fallback and can be
+forced with `ANTFLY_EMBEDDINGGEMMA2_METAL_DIRECT_CONV=1`;
+`ANTFLY_EMBEDDINGGEMMA2_METAL_TILED_CONV=1` forces the tiled fallback. All use the precise
+library and retain NCHW storage. Direct batch admission counts two retained
+first-convolution buffers and three second-convolution buffers; CUDA additionally
+counts its inter-layer masking buffer. Legacy routes keep the prior transpose
+allowance. For 1,000 frames the unchanged 128 MiB envelope admits three Metal
+clips or two CUDA clips, versus one under the legacy layout. A direct-layout
+backend may not silently allocate the larger legacy path after this admission.
+The retained-peak regression allocates the real three-clip, 1,000-frame Metal
+cohort inside an open command frame: its measured device-allocation increase
+was 108,101,632 bytes (103.1 MiB), below the unchanged 128 MiB cap.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_GRAPH=1` adds an independently
+identified conformer execution candidate. The first real invocation warms
+weights/algorithms; the next learns allocation/free lifetimes. Later invocations
+copy inputs and dynamic mask/segment/scale tensors into stable storage, then
+validate and capture the entire twelve-layer conformer. Reused offsets follow
+same-stream consumer lifetimes. The complete allocation/free ABI, input geometry,
+segments, arithmetic flags, packed-weight generation, constant-cache generation
+and cuBLAS workspace address participate in plan selection. Depthwise tables
+are transformed on device and cached as immutable model constants before capture.
+Only traces with no host transfers qualify; unexpected host copies decline the
+planned execution before capture can retain transient host addresses.
+
+Audio arenas share the existing eight-descriptor / 512 MiB aggregate graph
+cache and 128 MiB per-arena cap with vision/backbone. Planning metadata is limited
+to eight traces, each with at most 2,048 allocations and 4,096 lifetime events.
+Admission or capture declines retain eager execution. Layout drift disables the
+candidate; cancellation leaves it retryable. Borrowed suballocations cannot be
+freed by individual operators' error cleanup. Completion events fence eviction;
+nonblocking completed-device event pairs choose warm eager/replay submission,
+excluding capture setup. Outputs copy to independent request storage before the
+arena can be overwritten. `--require-route audio_arena` and `audio_graph` require
+actual arena executions and graph replays. NVIDIA vector/ranking, sustained-load
+and completed-time qualification remain required before promotion.
+
 Graph retention has eight lightweight descriptors under the prior aggregate
 512 MiB arena ceiling; each arena remains limited to 128 MiB. Hits refresh
 recency and reuse counts. Empty slots need no drain, recent reused shapes resist
