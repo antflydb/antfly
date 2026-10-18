@@ -81,6 +81,7 @@ pub const Prepared = struct {
     jsonb: []?[]const u8,
     encoded_size: usize,
     compact: bool,
+    canonical: bool = false,
     work: arrays.Budget,
 
     pub fn init(backing: A, input: arrays.Value, options: Options) !Prepared {
@@ -93,6 +94,13 @@ pub const Prepared = struct {
     }
 
     fn initAdmitted(backing: A, scratch: A, value: arrays.Value, options: Options, work: *arrays.Budget) !Prepared {
+        if (value.stored) |view| if (view.validation != null) {
+            // Admission already proved these immutable bytes canonical. Keep
+            // the same logical preparation charge without decoding every cell.
+            try work.consume(value.cardinality());
+            if (view.bytes.len > options.wire_bytes) return error.SqlProgramLimitExceeded;
+            return .{ .value = value, .allocator = backing, .jsonb = &.{}, .encoded_size = view.bytes.len, .compact = view.compact, .canonical = true, .work = work.* };
+        };
         var non_null: usize = 0;
         for (0..value.cardinality()) |array_cell_0| {
             const element = value.flatCell(array_cell_0);
@@ -141,6 +149,20 @@ pub const Prepared = struct {
     pub fn writeInto(self: *Prepared, bytes: []u8) !void {
         if (bytes.len != self.encoded_size) return error.InvalidSqlArrayStorage;
         try self.work.consume(0);
+        if (self.canonical) {
+            const view = self.value.stored.?;
+            // Retain the previous reconstruction's logical cell/payload work
+            // and bounded cancellation checks, but copy its final encoding.
+            try self.work.consume(view.validation.?.element_work);
+            var copied: usize = 0;
+            while (copied < bytes.len) {
+                const end = copied + @min(bytes.len - copied, 256);
+                try self.work.consume(end - copied);
+                @memcpy(bytes[copied..end], view.bytes[copied..end]);
+                copied = end;
+            }
+            return;
+        }
         var cleared: usize = 0;
         while (cleared < bytes.len) {
             const end = cleared + @min(bytes.len - cleared, 256);
@@ -366,6 +388,14 @@ pub fn viewLeaky(a: A, expected: arrays.ElementType, bytes: []const u8, options:
 pub fn borrowLeaky(a: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Value {
     if (!@import("array_compact.zig").supported(expected)) return (try decodeLeaky(a, expected, bytes, options)).value;
     const view = try validateCanonical(a, expected, bytes, options);
+    return borrowValidatedLeaky(a, view);
+}
+
+/// Internal codec handoff: the producer owns immutable bytes and has checked
+/// every cell. External/authentication-only inputs must use borrowLeaky.
+pub fn borrowValidatedLeaky(a: A, view: layout.View) !arrays.Value {
+    if (view.validation == null) return error.InvalidSqlArrayStorage;
+    const expected = view.kind;
     const axes = try a.alloc(arrays.Dimension, view.rank);
     for (axes, 0..) |*axis, index| axis.* = try view.dimension(index);
     const owned = try a.create(layout.View);
@@ -1494,4 +1524,68 @@ test "SQL compact stored array views unwind every allocation failure" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "SQL canonical array copies preserve bytes logical quotas and bounded cancellation" {
+    const a = std.testing.allocator;
+    for ([_]struct { kind: arrays.ElementType, text: []const u8 }{
+        .{ .kind = .text, .text = "[-2:0]={\"é\\\"kept\",NULL,\"\"}" },
+        .{ .kind = .int64, .text = "[0:1][3:4]={{9007199254740993,NULL},{-7,0}}" },
+        .{ .kind = .float32, .text = "{NaN,Infinity,NULL,-Infinity,1.25}" },
+        .{ .kind = .boolean, .text = "{t,NULL,f}" },
+        .{ .kind = .int16, .text = "{}" },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = (try @import("array_text.zig").decodeLeaky(arena.allocator(), case.kind, case.text, .{ .compact = true })).value;
+        var old_view = value.stored.?.*;
+        old_view.validation = null;
+        var old_value = value;
+        old_value.stored = &old_view;
+        var direct = try Prepared.init(a, value, .{});
+        defer direct.deinit();
+        var fallback = try Prepared.init(a, old_value, .{});
+        defer fallback.deinit();
+        try std.testing.expect(direct.canonical and !fallback.canonical);
+        try std.testing.expectEqual(direct.work.remaining, fallback.work.remaining);
+        const bytes = try a.alloc(u8, direct.encoded_size);
+        defer a.free(bytes);
+        const old_bytes = try a.alloc(u8, fallback.encoded_size);
+        defer a.free(old_bytes);
+        try direct.writeInto(bytes);
+        try fallback.writeInto(old_bytes);
+        try std.testing.expectEqualSlices(u8, value.stored.?.bytes, bytes);
+        try std.testing.expectEqualSlices(u8, old_bytes, bytes);
+        try std.testing.expectEqual(direct.work.remaining, fallback.work.remaining);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, Prepared.init(a, value, .{ .wire_bytes = bytes.len - 1 }));
+        const required = (arrays.Limits{}).work - direct.work.remaining;
+        var short = try Prepared.init(a, value, .{ .values = .{ .work = required - 1 } });
+        defer short.deinit();
+        try std.testing.expectError(error.SqlProgramLimitExceeded, short.writeInto(bytes));
+    }
+    const Cancel = struct {
+        calls: usize = 0,
+        fn poll(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return error.Canceled;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const text: [4096]u8 = @splat('x');
+    const input = try arrays.Value.init(.text, &.{.{ .length = 1 }}, &.{arrays.Element.json(.{ .string = &text })}, .{});
+    const raw = try encodeAlloc(arena.allocator(), input, .{});
+    const value = try borrowLeaky(arena.allocator(), .text, raw, .{});
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = a };
+    var prepared = try Prepared.init(a, value, .{ .context = &parent });
+    defer prepared.deinit();
+    var cancel: Cancel = .{};
+    parent.ptr = &cancel;
+    parent.checkpoint = Cancel.poll;
+    parent.since_poll = 256;
+    const bytes = try a.alloc(u8, prepared.encoded_size);
+    defer a.free(bytes);
+    try std.testing.expectError(error.Canceled, prepared.writeInto(bytes));
+    try std.testing.expectEqual(@as(usize, 3), cancel.calls);
 }

@@ -649,6 +649,12 @@ components:
         uri:
           type: string
           minLength: 1
+          description: Parquet prefix, Iceberg table, or an explicit Parquet snapshot head ending in .parquet-manifest.json. Snapshot heads name immutable checksummed file-list chunks; each query revalidates the head without listing the data prefix.
+        row_identity_version:
+          type: integer
+          enum: [1, 2]
+          readOnly: true
+          description: Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
         schema_fingerprint:
           type: string
           default: auto

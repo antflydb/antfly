@@ -633,6 +633,30 @@ pub const Row = struct {
             if (self.columnar != null) return self.layout.names.len;
             return self.values.len;
         }
+        pub fn frozenJson(self: TypedCells, ordinal: usize) !?@import("execution_batch.zig").FrozenJson {
+            if (ordinal >= self.count()) return error.InvalidSqlBackendResponse;
+            const source = self.columnar orelse return null;
+            if (self.values.len != 0) return error.InvalidSqlBackendResponse;
+            if (self.presence) |flags| if (!flags[ordinal]) return null;
+            var first: usize = 0;
+            for (source.blocks) |block| {
+                if (ordinal - first < block.values.len) return block.frozenJson(source.row, ordinal - first, false);
+                first += block.values.len;
+            }
+            return error.InvalidSqlBackendResponse;
+        }
+        pub fn encodedJson(self: TypedCells, ordinal: usize) !?[]const u8 {
+            if (ordinal >= self.count()) return error.InvalidSqlBackendResponse;
+            const source = self.columnar orelse return null;
+            if (self.values.len != 0) return error.InvalidSqlBackendResponse;
+            if (self.presence) |flags| if (!flags[ordinal]) return null;
+            var first: usize = 0;
+            for (source.blocks) |block| {
+                if (ordinal - first < block.values.len) return block.encodedJson(source.row, ordinal - first, false);
+                first += block.values.len;
+            }
+            return error.InvalidSqlBackendResponse;
+        }
         pub fn at(self: TypedCells, ordinal: usize) !Cell {
             if (self.columnar) |source| {
                 if (self.values.len != 0 or ordinal >= self.layout.names.len) return error.InvalidSqlBackendResponse;
@@ -687,6 +711,20 @@ pub const Row = struct {
 
     /// Decoding is explicit about the SQL/JSON null boundary. The native
     /// projection's field names are literal names, never dotted JSON paths.
+    pub fn frozenJson(self: Row, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        if (std.mem.eql(u8, name, "_id")) return null;
+        const cells = self.typed_cells orelse return null;
+        try self.validateTyped();
+        const ordinal = cells.layout.ordinals.get(name) orelse return null;
+        return cells.frozenJson(ordinal);
+    }
+    pub fn encodedJson(self: Row, name: []const u8) !?[]const u8 {
+        if (std.mem.eql(u8, name, "_id")) return null;
+        const cells = self.typed_cells orelse return null;
+        try self.validateTyped();
+        const ordinal = cells.layout.ordinals.get(name) orelse return null;
+        return cells.encodedJson(ordinal);
+    }
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
         if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
@@ -820,6 +858,40 @@ pub const ColumnPage = struct {
             for (self.selection) |index| if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
         }
     }
+    /// Declared NUMERIC reads fixed coefficients directly. Raw callers retain
+    /// the established exact string contract for detected decimal columns.
+    pub fn typedCell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, numeric: bool) !Row.Cell {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (numeric and self.native == null) if (self.batch.findColumn(name)) |column| {
+            const index = self.selection[row];
+            if (index >= self.batch.rowCount() or index >= column.rowCount()) return error.InvalidSqlBackendResponse;
+            if (column.values == .decimal128 and !column.nulls.isNull(index)) {
+                const decimal = column.values.decimal128;
+                @import("../common/decimal128.zig").validateCoefficient(decimal.values[index], decimal.precision, decimal.scale) catch return error.InvalidSqlBackendResponse;
+                var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
+                var number = try @import("numeric_value.zig").fromScaledInteger(&context, decimal.values[index], @intCast(decimal.scale));
+                errdefer number.deinit();
+                const value = try alloc.create(@import("numeric_value.zig").Value);
+                value.* = number.value;
+                return @import("scalar.zig").Datum.typedNumeric(value);
+            }
+        };
+        return self.cell(alloc, row, name);
+    }
+    pub fn frozenJson(self: ColumnPage, row: usize, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (self.native) |native| {
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.frozenJson(self.selection[row], ordinal);
+        }
+        return null;
+    }
+    pub fn encodedJson(self: ColumnPage, row: usize, name: []const u8) !?[]const u8 {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (self.native) |native| {
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.encodedJson(self.selection[row], ordinal);
+        }
+        return null;
+    }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];
@@ -832,10 +904,11 @@ pub const ColumnPage = struct {
             return .{ .value = .null, .sql_null = true };
         }
         if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
-        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.row_refs[index]) }, .sql_null = false };
+        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.rowRef(index)) }, .sql_null = false };
         const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
         if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
         const value: std.json.Value = switch (column.values) {
+            .encoded => |values| try values.at(index),
             .dictionary_i64 => |values| .{ .integer = values.at(index) },
             .dictionary_f64 => |values| .{ .float = values.at(index) },
             .i64 => |values| .{ .integer = values[index] },
@@ -844,6 +917,7 @@ pub const ColumnPage = struct {
             .bytes => |values| .{ .string = values[index] },
             .dictionary_bytes => |values| .{ .string = values.at(index) },
             .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
+            .decimal128 => |values| .{ .string = try values.text(alloc, index) },
             .vector_f32 => return error.UnsupportedSqlExecution,
         };
         return .{ .value = value, .sql_null = false };
@@ -852,10 +926,122 @@ pub const ColumnPage = struct {
 
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
+/// Borrowed snapshot-local costing evidence. Providers never perform I/O for
+/// optimizer statistics; absent fields remain unknown. Frequencies and hashes
+/// describe semantic equality keys, and are advisory rather than pruning proof.
+pub const ColumnStatistics = @import("../serverless/external_source/types.zig").ColumnStatistics;
+/// Mergeable, advisory snapshot statistics. Fixed binary aggregates fit ordered
+/// page summaries; no sketch or frequency estimate can authorize pruning.
+pub const StatisticsSketch = struct {
+    pub const encoded_bytes = 224;
+    rows: u64 = 0,
+    non_null: u64 = 0,
+    bytes: u64 = 0,
+    registers: [64]u8 = @splat(0),
+    bounded: bool = true,
+    minimum: i64 = std.math.maxInt(i64),
+    maximum: i64 = std.math.minInt(i64),
+    hot: [4]ColumnStatistics.Frequency = @splat(.{ .hash = 0, .rows = 0 }),
+    fn frequency(self: *@This(), hash: u64, count: u64) void {
+        if (count == 0) return;
+        var least: usize = 0;
+        for (&self.hot, 0..) |*value, i| {
+            if (value.rows != 0 and value.hash == hash) {
+                value.rows +|= count;
+                return;
+            }
+            if (value.rows < self.hot[least].rows) least = i;
+        }
+        // Weighted Misra-Gries cancellation keeps counts as lower bounds.
+        if (self.hot[least].rows == 0) {
+            self.hot[least] = .{ .hash = hash, .rows = count };
+            return;
+        }
+        const removed = @min(count, self.hot[least].rows);
+        for (&self.hot) |*value| value.rows -= removed;
+        if (count > removed) self.frequency(hash, count - removed);
+    }
+    pub fn add(self: *@This(), value: @import("scalar.zig").Datum, width: usize) !void {
+        self.rows +|= 1;
+        self.bytes +|= 1;
+        if (value.sql_null) return;
+        self.non_null +|= 1;
+        self.bytes +|= width;
+        const digest = try @import("scalar.zig").semanticHashDatum(value);
+        const bucket: usize = @intCast(digest & 63);
+        self.registers[bucket] = @max(self.registers[bucket], @as(u8, @intCast(@min(59, @ctz(digest >> 6) + 1))));
+        self.frequency(digest, 1);
+        const integer: ?i64 = if (value.numeric != null) null else switch (value.value) {
+            .integer => |v| v,
+            .bool => |v| @intFromBool(v),
+            else => null,
+        };
+        if (integer) |v| {
+            self.minimum = @min(self.minimum, v);
+            self.maximum = @max(self.maximum, v);
+        } else self.bounded = false;
+    }
+    pub fn merge(self: *@This(), other: @This()) void {
+        self.rows +|= other.rows;
+        self.non_null +|= other.non_null;
+        self.bytes +|= other.bytes;
+        for (&self.registers, other.registers) |*r, value| r.* = @max(r.*, value);
+        self.bounded = self.bounded and other.bounded;
+        self.minimum = @min(self.minimum, other.minimum);
+        self.maximum = @max(self.maximum, other.maximum);
+        for (other.hot) |value| self.frequency(value.hash, value.rows);
+    }
+    pub fn estimate(self: @This(), a: std.mem.Allocator, name: []const u8) !ColumnStatistics {
+        var inverse: f64 = 0;
+        var empty: f64 = 0;
+        for (self.registers) |rank| {
+            inverse += std.math.pow(f64, 2, -@as(f64, @floatFromInt(rank)));
+            if (rank == 0) empty += 1;
+        }
+        const raw = if (empty != 0) 64 * @log(64 / empty) else 0.709 * 64 * 64 / inverse;
+        const count: u64 = @intFromFloat(@min(@as(f64, @floatFromInt(self.non_null)), @max(0, @min(@as(f64, @floatFromInt(std.math.maxInt(u64) - 2048)), @round(raw)))));
+        var frequencies: std.ArrayList(ColumnStatistics.Frequency) = .empty;
+        errdefer frequencies.deinit(a);
+        for (self.hot) |value| if (value.rows != 0) try frequencies.append(a, value);
+        return .{ .name = name, .population_rows = self.rows, .non_null_rows = self.non_null, .distinct_count = count, .average_bytes = @intCast(@min(std.math.maxInt(u32), @max(1, self.bytes / @max(1, self.rows)))), .min_integer = if (self.bounded and self.non_null != 0) self.minimum else null, .max_integer = if (self.bounded and self.non_null != 0) self.maximum else null, .frequencies = try frequencies.toOwnedSlice(a) };
+    }
+    pub fn encode(self: @This()) [encoded_bytes]u8 {
+        var bytes: [encoded_bytes]u8 = @splat(0);
+        bytes[0] = 1;
+        bytes[1] = @intFromBool(self.bounded);
+        std.mem.writeInt(u64, bytes[8..16], self.rows, .little);
+        std.mem.writeInt(u64, bytes[16..24], self.non_null, .little);
+        std.mem.writeInt(u64, bytes[24..32], self.bytes, .little);
+        std.mem.writeInt(i64, bytes[32..40], self.minimum, .little);
+        std.mem.writeInt(i64, bytes[40..48], self.maximum, .little);
+        bytes[48..112].* = self.registers;
+        for (self.hot, 0..) |value, i| {
+            const offset = 112 + i * 16;
+            std.mem.writeInt(u64, bytes[offset..][0..8], value.hash, .little);
+            std.mem.writeInt(u64, bytes[offset + 8 ..][0..8], value.rows, .little);
+        }
+        return bytes;
+    }
+    pub fn decode(bytes: []const u8) !@This() {
+        if (bytes.len != encoded_bytes or bytes[0] != 1 or bytes[1] > 1) return error.InvalidSqlBackendResponse;
+        var result: @This() = .{ .rows = std.mem.readInt(u64, bytes[8..16], .little), .non_null = std.mem.readInt(u64, bytes[16..24], .little), .bytes = std.mem.readInt(u64, bytes[24..32], .little), .minimum = std.mem.readInt(i64, bytes[32..40], .little), .maximum = std.mem.readInt(i64, bytes[40..48], .little), .bounded = bytes[1] != 0, .registers = bytes[48..112].* };
+        if (result.non_null > result.rows or (result.bounded and result.non_null != 0 and result.minimum > result.maximum)) return error.InvalidSqlBackendResponse;
+        for (result.registers) |rank| if (rank > 59) return error.InvalidSqlBackendResponse;
+        for (&result.hot, 0..) |*value, i| {
+            const offset = 112 + i * 16;
+            value.* = .{ .hash = std.mem.readInt(u64, bytes[offset..][0..8], .little), .rows = std.mem.readInt(u64, bytes[offset + 8 ..][0..8], .little) };
+            if (value.rows > result.non_null) return error.InvalidSqlBackendResponse;
+        }
+        return result;
+    }
+};
 pub const Cursor = struct {
     /// True only when this cursor preserves every requested Scan.order key.
     order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
+    /// Optional estimate after the captured Scan.conditions, never an execution cap.
+    column_statistics: []const ColumnStatistics = &.{},
+    estimated_filtered_rows: ?u64 = null,
     estimated_rows: ?u64 = null,
     estimated_bytes: ?u64 = null,
     ptr: *anyopaque,
@@ -867,13 +1053,22 @@ pub const Cursor = struct {
     set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
     /// Negotiate complete key spooling before building the filter. Absent
     /// means Bloom/domain evidence suffices; do not spill unused exact tuples.
+    /// Planning may also inspect this capability for identity join keys.
+    /// Read captured metadata only; do not start scans or fetch source objects.
     wants_exact_filter: ?*const fn (*anyopaque, []const @import("dynamic_filter.zig").Column) anyerror!bool = null,
     /// Split an unopened pinned scan into disjoint work for exact associative
     /// reducers. Providers may distribute row groups dynamically; child order
     /// is not source order. Children share the snapshot and close before their parent.
     split_scan: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Release dynamically claimed work when a reducer completes or stops
+    /// early. This does not close the cursor; its owner still calls close().
+    finish_partition: ?*const fn (*anyopaque) void = null,
     /// Ordered, disjoint ranges whose concatenation preserves source order.
     split_ordered: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Rolling ordered ranges. Consume and close every child before asking for
+    /// the next bounded batch; null is end of source. Later file/footer errors
+    /// are reported only when the caller reaches that batch.
+    split_ordered_batch: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
     /// Provider estimate of retained metadata per ordered child. Planning
     /// limits fan-out before cloning a large immutable inventory.
     ordered_split_bytes: usize = 0,
@@ -1257,4 +1452,47 @@ test "SQL typed array column adapters preserve dimensions and owned index contin
     @memset(&cursor, 'x');
     try std.testing.expectEqualStrings("next", owned.index_cursor.?);
     try std.testing.expectEqual(@as(i32, -3), (try owned.cell("a")).array.?.dimensions[0].lower);
+}
+
+test "lake SQL decimal columns distinguish declared NUMERIC from exact string reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rowsource = @import("../storage/rowsource/types.zig");
+    const page: ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "a" }}, .columns = &.{rowsource.ColumnVector{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{9007199254740993125}, .precision = 22, .scale = 3 } } }} }, .selection = &.{0} };
+    const raw = try page.cell(a, 0, "n");
+    try std.testing.expectEqualStrings("9007199254740993.125", raw.value.string);
+    const native = try page.typedCell(a, 0, "n", true);
+    try std.testing.expect(native.numeric != null);
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+    try std.testing.expectEqualStrings(raw.value.string, try @import("numeric_value.zig").format(&context, native.numeric.?.*));
+}
+
+test "SQL durable planner sketches merge duplicate keys nulls widths and bounded heavy frequencies" {
+    const a = std.testing.allocator;
+    var full: StatisticsSketch = .{};
+    var left: StatisticsSketch = .{};
+    var right: StatisticsSketch = .{};
+    for (0..20000) |i| {
+        const value = @import("scalar.zig").Datum.fromJson(if (i % 5 == 0) .null else .{ .integer = if (i < 10000) 7 else @intCast(i) });
+        try full.add(value, 8);
+        if (i < 10000) try left.add(value, 8) else try right.add(value, 8);
+    }
+    left.merge(right);
+    try std.testing.expectEqualDeep(full.registers, left.registers);
+    try std.testing.expectEqual(full.rows, left.rows);
+    const roundtrip = try StatisticsSketch.decode(&left.encode());
+    try std.testing.expectEqualDeep(left, roundtrip);
+    const estimate = try left.estimate(a, "key");
+    defer a.free(estimate.frequencies);
+    try std.testing.expectEqual(@as(?u64, 20000), estimate.population_rows);
+    try std.testing.expectEqual(@as(?u64, 16000), estimate.non_null_rows);
+    try std.testing.expect(estimate.distinct_count.? > 5000 and estimate.distinct_count.? < 12000);
+    try std.testing.expectEqual(@as(?u32, 7), estimate.average_bytes);
+    try std.testing.expectEqual(@as(?i64, 7), estimate.min_integer);
+    try std.testing.expectEqual(@as(?i64, 19999), estimate.max_integer);
+    for (estimate.frequencies) |frequency| try std.testing.expect(frequency.rows <= 8000);
+    var malformed = left.encode();
+    malformed[48] = 60;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, StatisticsSketch.decode(&malformed));
 }

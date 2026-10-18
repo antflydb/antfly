@@ -619,22 +619,67 @@ pub fn Adapter(comptime native: type) type {
             arena: std.heap.ArenaAllocator,
             result: types.SearchResult,
             reader: ?DB.RelationalRows.Reader,
+            documents: ?DB.DocumentRows,
+            policy: ?@FieldType(DB.QueryReadLease, "row_policy_lease"),
+            needs_document: bool,
+            source_fields: []const []const u8,
             layout: *const catalog.Row.TypedLayout,
             projection: dependencies.sql_document_row.Projection,
             position: usize = 0,
+            column_page: ?catalog.Page = null,
+            const NativePage = struct { page: catalog.Page, values: ?dependencies.sql_execution_batch.Batch = null };
+            fn retireColumns(self: *@This()) void {
+                if (self.column_page) |*page| page.deinit();
+                self.column_page = null;
+            }
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retireColumns();
+                return (try nextMode(false, ptr, alloc, limit)).page;
+            }
+            fn nextColumns(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retireColumns();
+                _ = alloc;
+                // A column producer owns its page until its next pull. The
+                // consumer may reset its page arena before making that call.
+                const result = try nextMode(true, ptr, dependencies.sql_memory_budget.reclaimingAllocator(self.alloc), limit);
+                self.column_page = result.page;
+                errdefer self.retireColumns();
+                // Column readers borrow this page until the next cursor pull.
+                const a = self.column_page.?.owned_arena.?.allocator();
+                const values = try a.create(dependencies.sql_execution_batch.Batch);
+                values.* = result.values.?;
+                const names = try a.alloc([]const u8, values.width());
+                for (names[0..self.projection.columns.len], self.projection.columns) |*name, column| name.* = column.name;
+                // Identity is implicit in row cursors, even when Scan.fields
+                // contains only stored fields. Preserve it in native pages.
+                names[names.len - 1] = "_id";
+                const selection = try a.alloc(usize, values.len());
+                for (selection, 0..) |*index, i| index.* = i;
+                return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = result.page.after };
+            }
+            fn nextMode(comptime encoded_mode: bool, ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !NativePage {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                defer if (self.documents) |*documents| documents.releasePage();
                 if (limit == 0 or limit > 4096) return error.InvalidSqlLimit;
                 var page = std.heap.ArenaAllocator.init(alloc);
                 errdefer page.deinit();
                 const a = page.allocator();
                 const count = @min(self.result.hits.len - self.position, limit);
                 const rows = try a.alloc(catalog.Row, count);
+                const json_slots = if (encoded_mode) try a.alloc(?[]const u8, count * self.projection.columns.len) else &.{};
+                if (encoded_mode) @memset(json_slots, null);
                 const layout = try self.layout.clone(a);
                 const score_slot = layout.ordinals.get("score");
                 const highlight_slot = layout.ordinals.get("_highlights");
                 var produced: usize = 0;
                 var bytes: usize = 0;
+                var document_values: []const DB.DocumentRows.Source = &.{};
+                var document_begin: usize = 0;
+                var document_end: usize = 0;
+                var document_scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer document_scratch.deinit();
                 while (produced < count and bytes < 256 * 1024) {
                     if (self.reader) |*reader| {
                         // Large highlight JSON is hydrated one row at a time;
@@ -666,25 +711,63 @@ pub fn Adapter(comptime native: type) type {
                         produced += batch.consumed;
                     } else {
                         const hit = self.result.hits[self.position + produced];
-                        var document = if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
-                        if (document != .object) return error.InvalidSqlBackendResponse;
-                        try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
-                        if (try highlightsValueLeaky(a, hit.highlights)) |value| try document.object.put(a, "_highlights", value) else _ = document.object.swapRemove("_highlights");
+                        if (!document_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
+                        if (self.needs_document) if (self.documents) |*documents| {
+                            if (produced == document_end) {
+                                const n = @min(count - produced, 64);
+                                var ids: [64][]const u8 = undefined;
+                                for (self.result.hits[self.position + produced ..][0..n], 0..) |candidate, index| ids[index] = candidate.id;
+                                const batch = try documents.lookupProjectedBatch(ids[0..n], self.source_fields, 256 * 1024);
+                                document_values = batch.values;
+                                document_begin = produced;
+                                document_end = produced + batch.consumed;
+                            }
+                        };
+                        const source: dependencies.sql_document_row.Projection.SearchSource = if (!self.needs_document) .{ .value = .{ .object = .empty } } else if (self.documents != null) switch (document_values[produced - document_begin]) {
+                            .bytes => |raw| .{ .bytes = raw },
+                            .fields => |fields| .{ .fields = fields },
+                        } else if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
+                        const highlights = if (highlight_slot != null) try highlightsValueLeaky(document_scratch.allocator(), hit.highlights) else null;
                         const out = &rows[produced];
-                        out.* = try self.projection.projectValue(a, hit.id, 0, document);
+                        const encoded: ?[]?[]const u8 = if (encoded_mode) json_slots[produced * self.projection.columns.len ..][0..self.projection.columns.len] else null;
+                        out.* = try self.projection.projectSearchEncoded(a, document_scratch.allocator(), layout, hit.id, source, .{ .score = if (hit.score) |score| @as(f64, score) else null, .highlights = highlights }, encoded);
                         bytes +|= out.id.len;
-                        for (try out.fieldNames()) |name| bytes +|= try dependencies.sql_operators.datumBytes(try out.cell(name));
+                        for (try out.fieldNames(), 0..) |name, column| bytes +|= if (encoded_mode and encoded.?[column] != null) encoded.?[column].?.len else try dependencies.sql_operators.datumBytes(try out.cell(name));
                         produced += 1;
                     }
                 }
                 const end = self.position + produced;
                 const after = if (end < self.result.hits.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null;
                 self.position = end;
-                return .{ .rows = rows[0..produced], .after = after, .owned_arena = page };
+                const view = if (encoded_mode) blk: {
+                    const View = struct {
+                        rows: []const catalog.Row,
+                        json: []const ?[]const u8,
+                        width: usize,
+                        fn cell(raw: *anyopaque, cell_alloc: std.mem.Allocator, row: usize, column: usize) anyerror!dependencies.sql_scalar.Datum {
+                            const self_: *@This() = @ptrCast(@alignCast(raw));
+                            if (column == self_.width) return dependencies.sql_scalar.Datum.json(.{ .string = self_.rows[row].id });
+                            if (self_.json[row * self_.width + column]) |raw_json| return dependencies.sql_scalar.Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, cell_alloc, raw_json, .{ .parse_numbers = false }));
+                            return self_.rows[row].typed_cells.?.values[column];
+                        }
+                        fn encoded(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+                            const self_: *@This() = @ptrCast(@alignCast(raw));
+                            if (column == self_.width) return null;
+                            return self_.json[row * self_.width + column];
+                        }
+                    };
+                    const owner = try a.create(View);
+                    owner.* = .{ .rows = rows[0..produced], .json = json_slots, .width = self.projection.columns.len };
+                    break :blk dependencies.sql_execution_batch.Batch{ .reader = .{ .ptr = owner, .read = View.cell, .read_json = View.encoded, .count = produced, .width = self.projection.columns.len + 1 } };
+                } else null;
+                return .{ .page = .{ .rows = rows[0..produced], .after = after, .owned_arena = page }, .values = view };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retireColumns();
                 if (self.reader) |*reader| reader.deinit();
+                if (self.documents) |*documents| documents.deinit();
+                if (self.policy) |*held| held.release();
                 self.result.deinit();
                 self.arena.deinit();
                 self.alloc.destroy(self);
@@ -716,9 +799,9 @@ pub fn Adapter(comptime native: type) type {
         const SearchCursor = dependencies.sql_search_cursor.Cursor(SearchProvider);
 
         fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, prepared: PreparedSearch) !catalog.Cursor {
-            // Statement capture fences already exclude primary mutation on
-            // every participating table. The native lease also fences search
-            // index/schema access while ranking and capturing the primary cut.
+            // Capture ranking and the primary reader under one apply fence.
+            // The reader owns its immutable snapshot after this lease releases;
+            // paging never keeps the writer-excluding lease alive.
             var lease = try self.db.beginQueryReadLease();
             defer lease.release();
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
@@ -726,40 +809,54 @@ pub fn Adapter(comptime native: type) type {
             if (self.db.core.identity_namespace.table_id != table.id or view.version() != table.schema_version or
                 (view.storageMode() == .relational) != (table.storage_mode == .relational)) return error.PreparedGenerationChanged;
             var search = prepared.query.req;
-            // Validation precedes capture, including unused presentation
-            // options. Do not compute highlights SQL never demands.
             if (!prepared.highlights) search.highlight = null;
-            var captured = try lease.search(alloc, search);
+            const document_root = table.storage_mode == .document and request.needsDocument(table);
+            var ranked = search;
+            const delayed_hydration = !document_root and search.query != .graph and search.graph_queries.len == 0 and
+                search.graph_metric_queries.len == 0 and search.graph_metric_rerank == null and search.graph_query_transport == null and
+                search.hierarchy_children == null and search.highlight == null and !search.hasHitEvaluation() and search.return_mode == .parent and
+                !search.hierarchy_include_source and !search.hierarchy_include_unit and
+                !search.hierarchy_grouped_matches and search.aggregations_json.len == 0;
+            if (delayed_hydration) ranked.include_stored = false;
+            var documents: ?DB.DocumentRows = if (delayed_hydration and table.storage_mode == .document) try lease.documentRows(alloc, table.schema_version) else null;
+            errdefer if (documents) |*reader| reader.deinit();
+            var captured = try lease.search(alloc, ranked);
             errdefer captured.result.deinit();
-            if (table.storage_mode == .relational) {
-                const cursor = try alloc.create(RelationalSearchCursor);
-                errdefer alloc.destroy(cursor);
-                var arena = std.heap.ArenaAllocator.init(alloc);
-                errdefer arena.deinit();
-                const a = arena.allocator();
-                var fields: std.ArrayList([]const u8) = .empty;
-                var output_names: std.StringArrayHashMapUnmanaged(void) = .empty;
-                for (request.fields) |field| {
-                    if (!std.mem.eql(u8, field, "_id")) try output_names.put(a, try a.dupe(u8, field), {});
-                    if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "score") and !std.mem.eql(u8, field, "_highlights")) try fields.append(a, field);
-                }
-                var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, fields.items, table.schema_version) else null;
-                errdefer if (reader) |*value| value.deinit();
-                const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
-                const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.init(a, table, request.fields) else .{ .columns = &.{} };
-                // Finish allocating before moving the arena: a later allocation
-                // could add a chunk that the cursor's earlier copy would not own.
-                cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .layout = layout, .projection = projection };
-                return .{ .ptr = cursor, .next = RelationalSearchCursor.next, .close = RelationalSearchCursor.close };
+            if (document_root) {
+                var policy = lease.row_policy_lease.clone();
+                errdefer policy.release();
+                return (try SearchCursor.init(alloc, table, request.fields, captured.result, null, policy)).iface();
             }
-            var typed_reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational)
-                try lease.relationalRows(alloc, prepared.fields, table.schema_version)
-            else
-                null;
-            errdefer if (typed_reader) |*reader| reader.deinit();
-            var policy: ?SearchProvider.Lease = if (typed_reader == null) lease.row_policy_lease.clone() else null;
+            const cursor = try alloc.create(RelationalSearchCursor);
+            errdefer alloc.destroy(cursor);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            var fields: std.ArrayList([]const u8) = .empty;
+            var output_names: std.StringArrayHashMapUnmanaged(void) = .empty;
+            for (request.fields) |field| {
+                if (!std.mem.eql(u8, field, "_id")) try output_names.put(a, try a.dupe(u8, field), {});
+                if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "score") and !std.mem.eql(u8, field, "_highlights")) try fields.append(a, field);
+            }
+            var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, prepared.fields, table.schema_version) else null;
+            errdefer if (reader) |*value| value.deinit();
+            var policy = if (reader == null) lease.row_policy_lease.clone() else null;
             errdefer if (policy) |*held| held.release();
-            return (try SearchCursor.init(alloc, table, request.fields, captured.result, typed_reader, policy)).iface();
+            const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
+            const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.initSearch(a, table, request.fields) else .{ .columns = &.{} };
+            var source_fields: std.StringArrayHashMapUnmanaged(void) = .empty;
+            for (projection.columns) |column| {
+                if (!std.mem.eql(u8, column.path, "score") and !std.mem.eql(u8, column.path, "_highlights")) try source_fields.put(a, column.path, {});
+            }
+            const needs_document = source_fields.count() != 0;
+            if (!needs_document) if (documents) |*document_reader| {
+                document_reader.deinit();
+                documents = null;
+            };
+            // Finish allocating before moving the arena: a later allocation
+            // could add a chunk that the cursor's earlier copy would not own.
+            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .policy = policy, .needs_document = needs_document, .source_fields = source_fields.keys(), .layout = layout, .projection = projection };
+            return .{ .ptr = cursor, .next = RelationalSearchCursor.next, .next_columns = if (reader == null) RelationalSearchCursor.nextColumns else null, .close = RelationalSearchCursor.close };
         }
 
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {

@@ -770,6 +770,14 @@ const OwnedRead = struct {
         page: Pull.BatchPage,
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (try self.page.values.frozenJson(row, column)) |value| {
+                if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
+                return .{ .frozen_json = value, .sql_null = false };
+            }
+            if (try self.page.values.encodedJson(row, column)) |bytes| {
+                if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
+                return .{ .json_bytes = bytes, .sql_null = false };
+            }
             const value = try self.page.values.cell(alloc, row, column);
             if (value.temporal() != null) {
                 const instant = try @import("antfly_local_sources").sql_scalar.timestampResult(value, self.page.columns[column].type);
@@ -1466,6 +1474,8 @@ const GuardedCatalog = struct {
         }
         fn cursor(self: *@This(), release: *const fn (*anyopaque) void) catalog.Cursor {
             return .{
+                .column_statistics = self.inner.column_statistics,
+                .estimated_filtered_rows = self.inner.estimated_filtered_rows,
                 .estimated_rows = self.inner.estimated_rows,
                 .estimated_bytes = self.inner.estimated_bytes,
                 .ptr = self,
@@ -1834,7 +1844,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             return cursor(ptr);
         }
         fn cursor(ptr: *anyopaque) catalog.Cursor {
-            return .{ .estimated_rows = 99, .estimated_bytes = 1024, .ptr = ptr, .next = next, .next_columns = nextColumns, .count_rows = countRows, .set_dynamic_filter = setFilter, .split_scan = split, .split_ordered = split, .close = close };
+            return .{ .estimated_filtered_rows = 7, .estimated_rows = 99, .estimated_bytes = 1024, .ptr = ptr, .next = next, .next_columns = nextColumns, .count_rows = countRows, .set_dynamic_filter = setFilter, .split_scan = split, .split_ordered = split, .close = close };
         }
         fn next(ptr: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1927,6 +1937,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     const page = try cursor.next(cursor.ptr, alloc, 1);
     page.deinit();
     try std.testing.expectEqual(@as(usize, 1), native_cursor.pages);
+    try std.testing.expectEqual(@as(?u64, 7), cursor.estimated_filtered_rows);
     try std.testing.expectEqual(@as(?u64, 99), cursor.estimated_rows);
     try std.testing.expectEqual(@as(?u64, 1024), cursor.estimated_bytes);
     _ = try cursor.next_columns.?(cursor.ptr, alloc, 1);
@@ -2187,4 +2198,55 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 1, too_precise));
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 0, too_precise));
     try std.testing.expectEqual(@as(i128, -31_536_000_000_000_000), try wire_values.timestampNanos(try datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" })));
+}
+
+test "SQL pgwire native frozen JSON renders exact numbers without scalar delivery" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const sources = @import("antfly_local_sources");
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            for ([_]bool{ false, true }) |parse_numbers| {
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"x\":[9007199254740993,1.25],\"s\":\"a\\nb\"}", .{ .parse_numbers = parse_numbers });
+                const rows = [_]sources.sql_operators.Row{.{ .values = &.{sources.sql_scalar.Datum.json(root)}, .keys = &.{}, .ordinal = 0 }};
+                for ([_]sources.sql_spill.ColumnarVersion{ .v1, .v2 }) |version| {
+                    const bytes = try sources.sql_spill.encodeColumnarBlockVersionAlloc(alloc, &rows, 1 << 20, version);
+                    const block = try sources.sql_spill.decodeColumnarBlockWithCache(alloc, a, bytes, 1 << 20);
+                    defer block.deinit();
+                    const Reader = struct {
+                        value: sources.sql_execution_batch.FrozenJson,
+                        fn cell(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !sources.sql_scalar.Datum {
+                            return error.UnexpectedScalarMaterialization;
+                        }
+                        fn frozen(raw: *anyopaque, _: usize, _: usize) !?sources.sql_execution_batch.FrozenJson {
+                            return @as(*@This(), @ptrCast(@alignCast(raw))).value;
+                        }
+                    };
+                    var reader: Reader = .{ .value = (try block.frozenJson(0, 0, false)).? };
+                    var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+                        .arena = .init(a),
+                        .columns = &.{.{ .name = "j", .type = .json }},
+                        .values = .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 1, .width = 1 } },
+                        .exhausted = true,
+                    } };
+                    defer owner.page.deinit();
+                    var scratch = std.heap.FixedBufferAllocator.init(&.{});
+                    const cell = try OwnedRead.PageOwner.cell(&owner, scratch.allocator(), 0, 0);
+                    try std.testing.expect(!cell.sql_null and cell.value == .null and cell.json_bytes == null and cell.frozen_json != null);
+                    const expected = try std.json.Stringify.valueAlloc(alloc, root, .{});
+                    for ([_]u16{ 0, 1 }) |format| {
+                        var buffer: [256]u8 = undefined;
+                        var output: std.Io.Writer = .fixed(&buffer);
+                        try wire_values.encodeCellInto(scratch.allocator(), &output, .{ .name = "j", .type = .json }, format, cell, buffer.len);
+                        const prefix: usize = @intFromBool(format == 1);
+                        if (prefix != 0) try std.testing.expectEqual(@as(u8, 1), output.buffered()[0]);
+                        try std.testing.expectEqualStrings(expected, output.buffered()[prefix..]);
+                    }
+                }
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

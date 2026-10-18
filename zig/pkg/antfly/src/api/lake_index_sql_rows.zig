@@ -435,8 +435,8 @@ const Owner = struct {
                 try page.validate();
                 const cells = try sa.alloc(local.sql_scalar.Datum, request.fields.len);
                 for (page.selection, 0..) |physical, row| {
-                    if (physical >= page.batch.row_refs.len) return error.InvalidNativeLakeRowIndex;
-                    const rank = ranks.get(try local.storage_rowsource_identity.allocId(sa, page.batch.row_refs[physical])) orelse return error.InvalidNativeLakeRowIndex;
+                    if (physical >= page.batch.rowCount()) return error.InvalidNativeLakeRowIndex;
+                    const rank = ranks.get(try local.storage_rowsource_identity.allocId(sa, page.batch.rowRef(physical))) orelse return error.InvalidNativeLakeRowIndex;
                     if (positions[rank] != null) return error.InvalidNativeLakeRowIndex;
                     for (request.fields, cells) |field, *cell| {
                         const value = try page.cell(sa, row, field);
@@ -474,8 +474,8 @@ const Owner = struct {
             if (page.selection.len == 0) continue;
             if (!self.exhausted() and page.after == null) {
                 const last = page.selection[page.selection.len - 1];
-                if (last >= page.batch.row_refs.len) return error.InvalidSqlBackendResponse;
-                page.after = try local.storage_rowsource_identity.allocId(self.window.allocator(), page.batch.row_refs[last]);
+                if (last >= page.batch.rowCount()) return error.InvalidSqlBackendResponse;
+                page.after = try local.storage_rowsource_identity.allocId(self.window.allocator(), page.batch.rowRef(last));
             }
             try self.read_context.ensureActive();
             return page;
@@ -514,6 +514,12 @@ pub const Predicate = struct {
         try owner.read_context.ensureActive();
         return owner.reader.containsPhysical(ref, owner.predicate_lower, owner.predicate_upper);
     }
+    pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
+        if (self.scan) return null;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.intersectsPhysical(first, last, owner.predicate_lower, owner.predicate_upper);
+    }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -539,7 +545,7 @@ pub const Predicate = struct {
                 continue;
             }
             const refs = try a.alloc(local.storage_rowsource_types.RowRef, page.selection.len);
-            for (refs, page.selection) |*ref, position| ref.* = page.batch.row_refs[position];
+            for (refs, page.selection) |*ref, position| ref.* = page.batch.rowRef(position);
             return refs;
         };
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -1295,7 +1301,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             return err;
         };
         owner.read_context = owner.lease.?.readContext();
-        selected = (try @import("lake_index_selection.zig").selectCached(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache)) orelse return null;
+        selected = (try @import("lake_index_selection.zig").selectCachedWithLease(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache, owner.lease)) orelse return null;
     }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);
@@ -1492,8 +1498,20 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             if (cost.* > scan_cost and candidates != 0) return null;
         }
     }
+    var statistics: std.ArrayList(catalog.ColumnStatistics) = .empty;
+    const published = if (source.file_navigation) |navigation| navigation.statistics else source.planner_statistics;
+    if (!source.selected_catalog_view) for (request.fields) |field| {
+        const column = table.column(field) catch continue;
+        for (published) |entry| if (std.mem.eql(u8, entry.name, column.path)) {
+            var value = entry;
+            value.name = field;
+            try statistics.append(ca, value);
+            break;
+        };
+    };
+    const estimates = source.estimates();
     keep = true;
-    return .{ .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
+    return .{ .column_statistics = statistics.items, .estimated_rows = if (estimates) |value| value.rows else if (root.page) |page| page.records else 0, .estimated_bytes = if (estimates) |value| value.bytes else null, .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
 }
 
 pub fn prefixSuccessor(a: A, prefix: []const u8) !?[]const u8 {

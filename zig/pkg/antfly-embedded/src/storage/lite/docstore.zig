@@ -3277,6 +3277,51 @@ pub const Txn = struct {
             return self.scratch.allocator();
         }
 
+        pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+            if (requests.len > 64) return error.InvalidBatch;
+            const a = self.resultAllocator();
+            var translated: [64]@import("../value_ranges.zig").Request = undefined;
+            var initialized: usize = 0;
+            defer if (self.parent.prefix.len != 0) for (translated[0..initialized]) |request| a.free(request.key);
+            var overlay = false;
+            for (requests, 0..) |request, i| {
+                const key = if (self.parent.prefix.len == 0) request.key else try std.mem.concat(a, u8, &.{ self.parent.prefix, request.key });
+                translated[i] = .{ .key = key, .ranges = request.ranges, .output = request.output };
+                initialized += 1;
+                overlay = overlay or self.parent.pending_tree.getEntryFor(key).node != null;
+            }
+            if (overlay) {
+                for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+            } else try (try self.parent.readFile()).readDocumentRangesBatchAlloc(a, self.parent.checkpoint, translated[0..requests.len]);
+        }
+        pub fn getRanges(self: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+            const a = self.resultAllocator();
+            const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });
+            defer if (self.parent.prefix.len > 0) a.free(full);
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const bytes = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                const Pending = struct {
+                    a: Allocator,
+                    bytes: []const u8,
+                    pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                        return ctx.a.dupe(u8, ctx.bytes[begin..][0..len]);
+                    }
+                };
+                return @import("../value_ranges.zig").read(bytes.len, ranges, output, Pending{ .a = a, .bytes = bytes });
+            }
+            return (try self.parent.readFile()).readDocumentRangesAlloc(a, self.parent.checkpoint, full, ranges, output);
+        }
+        pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+            const a = self.resultAllocator();
+            const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });
+            defer if (self.parent.prefix.len > 0) a.free(full);
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const value = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                if (offset > value.len or length > value.len - offset) return error.EndOfStream;
+                return a.dupe(u8, value[@intCast(offset)..][0..length]);
+            }
+            return (try self.parent.readFile()).readDocumentRangeAlloc(a, self.parent.checkpoint, full, offset, length);
+        }
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return self.parent.getOwned(self.resultAllocator(), key);
         }
@@ -6445,6 +6490,9 @@ test "lite scoped reads release values without growing parent point reads" {
         try std.testing.expectError(error.BufferTooSmall, scope.getInto("doc", out[0..1]));
         const value = try scope.get("doc");
         try std.testing.expectEqualSlices(u8, payload, value);
+        try std.testing.expectEqualSlices(u8, payload[4090..][0..8192], try scope.getRange("doc", 4090, 8192));
+        try std.testing.expectEqual(@as(usize, 0), (try scope.getRange("doc", payload.len, 0)).len);
+        try std.testing.expectError(error.EndOfStream, scope.getRange("doc", payload.len - 1, 2));
         try std.testing.expectError(error.NotFound, scope.get("missing"));
         scope.close();
         try std.testing.expectEqual(@as(usize, 0), budget.live);
@@ -6496,10 +6544,17 @@ test "lite scoped write reads preserve copied values across pending mutations" {
     const disk = try scope.get("doc");
     try txn.put("doc", "pending");
     const pending = try scope.get("doc");
+    try std.testing.expectEqualStrings("end", try scope.getRange("doc", 1, 3));
+    var spans: [3][]const u8 = undefined;
+    try scope.getRanges("doc", &.{ .{ .offset = 1, .length = 3 }, .{ .offset = 0, .length = 1 }, .{ .offset = 1, .length = 3 } }, &spans);
+    try std.testing.expectEqualStrings("end", spans[0]);
+    try std.testing.expectEqualStrings("p", spans[1]);
+    try std.testing.expectEqual(spans[0].ptr, spans[2].ptr);
     try txn.delete("doc");
     try std.testing.expectError(error.NotFound, scope.get("doc"));
     try std.testing.expectEqualStrings("disk", disk);
     try std.testing.expectEqualStrings("pending", pending);
+    try std.testing.expectEqualStrings("end", spans[0]);
     try std.testing.expectEqual(@as(u32, 0), txn.snapshot_reads.count());
 }
 

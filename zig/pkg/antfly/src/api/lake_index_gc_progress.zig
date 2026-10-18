@@ -39,15 +39,18 @@ const Checkpoint = struct {
     marked: u64 = 0,
     sweep_after: ?[]const u8 = null,
     enumeration: ?[]const u8 = null,
+    deferred_retention: bool = false,
 };
 pub const Job = union(enum) {
     publication: local.metadata_lake_index_catalog.Publication,
+    generation_page: struct { ref: local.serverless_manifest_artifact_ref.ProviderGenerationRef, depth: u8 },
     artifact: Ref,
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
     text_directory: artifacts.ChunkRef,
-    text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool },
-    page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false },
+    text_root: artifacts.ChunkRef,
+    text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
+    page: struct { ref: tree.Ref, ordered_rows: bool, native_files: bool = false, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
 };
 pub const Progress = struct {
     collector: *gc.Collector,
@@ -109,14 +112,37 @@ pub const Progress = struct {
             },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
             .text_directory => |ref| try collector.markTextDirectory(a, ref),
-            .text_manifest => |manifest| try collector.markTextManifest(a, manifest.ref, manifest.seekable),
+            .text_root => |ref| try collector.markTextRootAuto(a, ref),
+            .text_manifest => |manifest| try collector.markTextManifestMode(a, manifest.ref, manifest.seekable, manifest.maintenance_only),
             .contribution_page => |page| {
                 if (!try self.expand(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len }, "contributions")) return;
                 try stores.chargeReadBudget(&collector.remaining_reads, page.byte_len);
                 for (try @import("lake_index_directory.zig").loadContributionPage(a, collector.store, page, collector.cancellation(), null)) |contribution| try self.enqueue(.{ .artifact = contribution.artifact });
             },
+            .generation_page => |page| {
+                const ref = page.ref;
+                if (!try self.expand(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, "cloud-generation-page")) return;
+                const object = collector.store.providerStore() orelse return error.CloudGenerationStoreUnavailable;
+                var reader: @import("../serverless/artifacts/cloud_generations.zig").Reader = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .cache_limit = 0 };
+                defer reader.deinit();
+                try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
+                const node = try reader.read(a, ref, page.depth, collector.cancellation());
+                for (node.children) |child| try self.enqueue(.{ .generation_page = .{ .ref = child.ref, .depth = page.depth + 1 } });
+            },
             .publication => |publication| {
+                if (publication.cloud_generations) |cloud| try self.enqueue(.{ .generation_page = .{ .ref = cloud.root, .depth = 0 } });
                 try self.enqueue(.{ .chunk = .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len } });
+                // Resumable GC expands publications directly instead of calling
+                // Collector.markPublication. Protect navigation independently of
+                // directory deduplication, including retained reader-only roots.
+                if (publication.source_navigation) |ref| {
+                    if (try self.expand(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, "source-navigation")) {
+                        try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
+                        const navigation = try @import("lake_source_navigation.zig").load(a, collector.store, ref, collector.cancellation(), null);
+                        if (!std.mem.eql(u8, &navigation.domain, &self.value.domain)) return error.InvalidNativeLakeGcReference;
+                        for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
+                    }
+                }
                 var hydrated = publication;
                 if (publication.directory) |directory| {
                     if (!try self.expand(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, "directory")) return;
@@ -132,18 +158,31 @@ pub const Progress = struct {
             },
             .page => |job_page| {
                 const page = job_page.ref;
-                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
+                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.native_files) "native-file-state-page" else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
                 var write_bytes: u64 = 0;
                 var pages: page_store.PageStore = .{ .domain = self.value.domain, .artifacts = &collector.store, .cancellation = collector.cancellation(), .remaining_read_bytes = &collector.remaining_reads, .remaining_write_bytes = &write_bytes };
                 const Visitor = struct {
                     progress: *Progress,
                     ordered: bool,
                     contributions: bool,
+                    native_files: bool,
+                    text_files: @FieldType(@FieldType(Job, "page"), "text_files"),
                     a: A,
                     pub fn child(visitor: *@This(), ref: tree.Ref) !void {
-                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .contributions = visitor.contributions } });
+                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .native_files = visitor.native_files, .contributions = visitor.contributions, .text_files = visitor.text_files } });
                     }
                     pub fn record(visitor: *@This(), key: []const u8, bytes: []const u8) !void {
+                        if (visitor.native_files) {
+                            const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(visitor.a, key, bytes, visitor.progress.value.domain);
+                            for (file.docs) |ref| try visitor.progress.enqueue(.{ .chunk = ref });
+                            return;
+                        }
+                        if (visitor.text_files) |files| {
+                            if (key.len != 36 or std.mem.readInt(u32, key[32..36], .big) != 0) return error.InvalidNativeLakeGcReference;
+                            const record_ = try @import("lake_index_text_directory.zig").decodeFileRecord(visitor.a, key[0..32].*, bytes, visitor.progress.value.domain);
+                            try visitor.progress.enqueue(.{ .text_manifest = .{ .ref = record_.manifest, .seekable = files.seekable, .maintenance_only = files.maintenance_only } });
+                            return;
+                        }
                         if (visitor.contributions) {
                             const value = try std.json.parseFromSliceLeaky(local.metadata_lake_index_catalog.FileContribution, visitor.a, bytes, .{ .allocate = .alloc_always });
                             try @import("lake_index_contributions.zig").validate(value);
@@ -155,7 +194,7 @@ pub const Progress = struct {
                         if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| try visitor.progress.enqueue(.{ .chunk = cover.block });
                     }
                 };
-                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .contributions = job_page.contributions, .a = a };
+                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .native_files = job_page.native_files, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };
                 try tree.walkPage(a, pages.store(), page, &visitor);
             },
         }
@@ -178,10 +217,59 @@ pub const Progress = struct {
         self.value.work = try tree.apply(self.work_a, self.page_cache.store(), self.value.work, self.queued.items);
         const bytes = try std.json.Stringify.valueAlloc(self.a, self.value, .{});
         const upload = try self.pages.artifacts.putScoped(.{ .domain = self.pages.domain, .attempt = self.pages.attempt }, bytes, self.collector.cancellation());
+        defer if (upload.provider_version) |version| self.pages.artifacts.allocator.free(version);
         return .{ .kind = .external_base_source, .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
     }
 };
+/// Once a store has no serving, reader or builder roots, cleanup needs no
+/// immutable mark checkpoint. Otherwise retention on GC's own checkpoints can
+/// create a permanent chain of protected bookkeeping objects after table drop.
+fn sweepEmptyStore(collector: *gc.Collector, state: lifecycle.State) !?gc.Result {
+    const object = collector.store.providerStore() orelse return null;
+    if (object.fs_client != null or object.client.vtable.list_object_versions == null) return null;
+    if (state.collection.?.progress != null) return null;
+    if (state.pending) |pending| if (std.mem.eql(u8, &pending.signature.store, &collector.identity)) return null;
+    const roots = try state.gcPublications(collector.a);
+    defer collector.a.free(roots);
+    for (roots) |root| {
+        if (!std.mem.eql(u8, &root.signature.store, &collector.identity) or !std.meta.eql(root.namespace, collector.namespace)) continue;
+        const retired = for (state.collection.?.retired) |generation| {
+            if (generation == root.generation) break true;
+        } else false;
+        if (!retired) return null;
+    }
+    const Visitor = struct {
+        collector: *gc.Collector,
+        deferred: bool = false,
+        fn visit(raw: *anyopaque, scope: stores.UploadScope, id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const c = self.collector;
+            try c.check();
+            if (scope.fencingToken() < c.upload_floor or scope.fencingToken() >= c.upload_cutoff) return;
+            c.result.eligible += 1;
+            c.store.deleteWithCancellation(id, c.cancellation()) catch |err| switch (err) {
+                error.ArtifactRetentionActive, error.ArtifactVersionDeletionPaused => {
+                    self.deferred = true;
+                    return;
+                },
+                error.FileNotFound => {},
+                else => return err,
+            };
+            c.result.deleted += 1;
+        }
+    };
+    var visitor: Visitor = .{ .collector = collector };
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(collector.table, collector.identity, collector.namespace);
+    collector.store.visitScopedUploads(domain, .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_floor = collector.upload_floor, .fencing_cutoff = collector.upload_cutoff, .max_entries = @max(1, @min(128, collector.options.max_deleted)) }, collector.cancellation()) catch |err| switch (err) {
+        error.ArtifactEnumerationPaused => visitor.deferred = true,
+        else => return err,
+    };
+    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = visitor.deferred } });
+    collector.result.complete = true;
+    return collector.result;
+}
 pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
+    if (try sweepEmptyStore(collector, state)) |result| return result;
     // Background callers commonly use an arena. Own the backing here so
     // releasing page/job scratch actually frees memory during a bounded pass.
     var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 128 * 1024 * 1024 };
@@ -224,7 +312,14 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     var progress: Progress = .{ .collector = collector, .a = a, .work_a = budget.allocator(), .value = value, .pages = &pages, .page_cache = &page_cache, .old_end = value.end, .previous = if (collection.progress) |ref| ref.artifact_id else null };
     collector.progress = &progress;
     defer collector.progress = null;
-    if (collection.progress == null) for (try state.gcPublications(a)) |publication| {
+    const publications = try state.gcPublications(a);
+    if (collector.store.providerStore()) |object| object.cloud_io = collector.context.io;
+    var cloud_union: ?@import("lake_cloud_publication.zig").UnionBinding = if (collector.store.providerStore()) |object| try @import("lake_cloud_publication.zig").UnionBinding.init(collector.a, object, publications, collection.retired, collector.namespace, collector.identity) else null;
+    defer if (cloud_union) |*binding| binding.deinit();
+    if (collection.progress == null) for (state.stores) |binding| {
+        if (std.mem.eql(u8, &binding.identity, &collector.identity)) if (binding.vacuum) |cut| if (cut.marks) |root| try progress.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false } });
+    };
+    if (collection.progress == null) for (publications) |publication| {
         if (!std.meta.eql(publication.namespace, collector.namespace) or !std.mem.eql(u8, &publication.signature.store, &collector.identity)) continue;
         const retired = for (collection.retired) |generation| {
             if (generation == publication.generation) break true;
@@ -286,7 +381,13 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         try collector.check();
         if (live) continue;
         collector.result.eligible += 1;
-        try collector.store.delete(id);
+        collector.store.deleteWithCancellation(id, collector.cancellation()) catch |err| switch (err) {
+            error.ArtifactRetentionActive => {
+                progress.value.deferred_retention = true;
+                continue;
+            },
+            else => return err,
+        };
         collector.result.deleted += 1;
     }
     // The lexical cursor follows backend order, independent of batched probes.
@@ -302,12 +403,17 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         try collector.authority.apply(collector.table, .{ .checkpoint_collection = .{ .token = collector.token, .previous = progress.previous, .progress = next, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms } });
         return collector.result;
     }
-    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms } });
+    const cloud_checkpoints = if (collector.store.providerStore()) |object| try object.usesObjectVersions(collector.cancellation()) else false;
+    try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = progress.value.deferred_retention or cloud_checkpoints, .vacuum = if (cloud_checkpoints) .{ .domain = domain, .floor = progress.value.floor, .cutoff = progress.value.cutoff, .marks = progress.value.marks } else null } });
     // Legacy nonce staging predates journal-discoverable pending-v2 files.
     // Its advisory migration cleanup must never gate collection completion.
     collector.store.cleanupRetiredScopedTemporaryRange(domain, collector.upload_floor, collector.upload_cutoff, collector.cancellation()) catch |err| {
         std.log.warn("completed lake GC legacy staging cleanup deferred: {t}", .{err});
     };
+    if (cloud_checkpoints) {
+        collector.result.complete = true;
+        return collector.result; // mark pages are now durable vacuum evidence
+    }
     // The metadata receipt is durable before private checkpoint reclamation.
     // Interrupted cleanup leaves ordinary below-cutoff orphans for the next GC.
     const Cleanup = struct {
@@ -329,4 +435,137 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     };
     collector.result.complete = true;
     return collector.result;
+}
+
+test "external lake global frontier cloud retirement keeps locked stores and drains without protected checkpoint chains" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var object = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native");
+    defer object.deinit();
+    var store = object.artifactStore();
+    const identity: [32]u8 = @splat(5);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(7, identity, namespace);
+    const scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var orphan = try store.putScoped(scope, "retired protected payload", .none);
+    defer orphan.deinit(a);
+    const Harness = struct {
+        a: A,
+        state: lifecycle.State,
+        fn read(raw: *anyopaque, alloc: A, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            return lifecycle.encode(alloc, @as(*@This(), @ptrCast(@alignCast(raw))).state);
+        }
+        fn mutate(raw: *anyopaque, _: u64, revision: u64, mutation: lifecycle.Mutation, _: local.api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.state.revision != revision) return error.CatalogGenerationChanged;
+            self.state = try mutation.apply(self.a, self.state);
+        }
+    };
+    var harness: Harness = .{ .a = ca, .state = .{ .generation = 2, .reader_upload_floor = 1, .namespace = namespace, .dropped = true, .stores = &.{.{ .identity = identity, .locator = .{ .protocol = .gcs, .connection = "cloud", .bucket = "bucket", .prefix = "native", .root = "https://storage.googleapis.com" } }} } };
+    var collector: gc.Collector = .{ .a = a, .table = 7, .authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate }, .store = store, .identity = identity, .context = .{ .io = std.testing.io }, .token = @splat(1), .options = .{ .dry_run = false } };
+    const serial = provider.serial;
+    const protected = try collector.run();
+    try std.testing.expect(protected.complete);
+    try std.testing.expectEqual(@as(usize, 0), protected.deleted);
+    try std.testing.expectEqual(@as(usize, 1), harness.state.stores.len);
+    try std.testing.expectEqual(serial, provider.serial);
+    provider.now_ms = provider.until_ms;
+    collector.token = @splat(2);
+    const drained = try collector.run();
+    try std.testing.expect(drained.complete);
+    try std.testing.expectEqual(@as(usize, 1), drained.deleted);
+    try std.testing.expectEqual(@as(usize, 0), harness.state.stores.len);
+    try std.testing.expectEqual(serial, provider.serial);
+}
+
+test "external lake global frontier resumable GC retains delete-version and native file-state pages until the last reader retires" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("delete-proof-resumable-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(7);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(1, identity, null);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var pages: page_store.PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer builder.deinit();
+    try builder.add(&@as([32]u8, @splat(0)), "exact provider delete selector");
+    const versions = (try builder.finish()).?;
+    const navigation: @import("lake_source_navigation.zig").Root = .{ .domain = domain, .source = "source", .schema = "schema", .snapshot = "first", .count = 0, .coverage = .{ .plan = @splat(1), .data = @splat(2) }, .delete_proof = .{ .recipe = @splat(3), .digest = @splat(4), .source = @splat(5), .data = @splat(2), .count = 1, .versions = versions } };
+    var nav_ref = try store.put(try std.json.Stringify.valueAlloc(ca, navigation, .{}));
+    defer nav_ref.deinit(a);
+    var inventory = try store.put("inventory");
+    defer inventory.deinit(a);
+    var publication: local.metadata_lake_index_catalog.Publication = .{ .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol, .generation = 1, .token = store.upload_scope.?.attempt, .signature = .{ .desired = @splat(1), .source = @splat(5), .credentials = @splat(2), .store = identity }, .published_at_ms = 1, .base_source = .{ .external_iceberg = .{ .format = .iceberg, .source_uri = "s3://bucket/table", .snapshot_id = "first", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = nav_ref.artifact_id, .checksum = nav_ref.checksum, .byte_len = nav_ref.byte_len } };
+    var document = try store.put(&@as([96]u8, @splat('x')));
+    defer document.deinit(a);
+    const native = @import("lake_index_native_state.zig");
+    const state_file: native.File = .{ .id = "file", .digest = @splat(3), .count = 1, .docs = &.{.{ .artifact_id = document.artifact_id, .checksum = document.checksum, .byte_len = document.byte_len }} };
+    var file_builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer file_builder.deinit();
+    try file_builder.add(&native.Selection.idKey(state_file.id), try std.json.Stringify.valueAlloc(ca, state_file, .{}));
+    const file_directory = (try file_builder.finish()).?;
+    const sparse_binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .sparse, .source_kind = .external_iceberg, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "first", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"embedding"} };
+    const sparse_root: @import("lake_index_native_sparse.zig").Root = .{ .binding = sparse_binding, .config_json = "{}", .generation = .{ .domain = domain, .files = &.{} }, .file_directory = file_directory };
+    var sparse_ref = try store.put(try std.json.Stringify.valueAlloc(ca, sparse_root, .{}));
+    defer sparse_ref.deinit(a);
+    publication.declarations = &.{.{ .name = "sparse", .binding = sparse_binding, .artifact = .{ .kind = .sparse_segment, .metadata_version = 3, .artifact_id = sparse_ref.artifact_id, .checksum = sparse_ref.checksum, .byte_len = sparse_ref.byte_len } }};
+    const Harness = struct {
+        a: A,
+        state: lifecycle.State,
+        fn read(raw: *anyopaque, alloc: A, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            return lifecycle.encode(alloc, @as(*@This(), @ptrCast(@alignCast(raw))).state);
+        }
+        fn mutate(raw: *anyopaque, _: u64, revision: u64, mutation: lifecycle.Mutation, _: local.api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (revision != self.state.revision) return error.CatalogGenerationChanged;
+            self.state = try mutation.apply(self.a, self.state);
+        }
+        fn collect(self: *@This(), store_: stores.ArtifactStore, identity_: [32]u8, token: [16]u8) !void {
+            for (0..64) |_| {
+                var collector: gc.Collector = .{ .a = std.testing.allocator, .table = 1, .authority = .{ .ptr = self, .context = .{}, .read = read, .mutate = mutate }, .store = store_, .identity = identity_, .context = .{}, .token = token, .options = .{ .dry_run = false, .max_marked = 1, .max_deleted = 1 } };
+                if ((try collector.run()).complete) return;
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    var harness: Harness = .{ .a = ca, .state = try (lifecycle.State{}).synchronize(ca, .{ .generation = 1, .published = publication }) };
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    harness.state = try harness.state.acquire(ca, @splat(9), 1, now);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 2, std.testing.io);
+    var next = navigation;
+    next.delete_proof = null;
+    next.snapshot = "second";
+    var next_ref = try store.put(try std.json.Stringify.valueAlloc(ca, next, .{}));
+    defer next_ref.deinit(a);
+    publication.generation = 2;
+    publication.declarations = &.{};
+    publication.token = store.upload_scope.?.attempt;
+    publication.source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = next_ref.artifact_id, .checksum = next_ref.checksum, .byte_len = next_ref.byte_len };
+    publication.base_source.external_iceberg.snapshot_id = "second";
+    harness.state = try harness.state.synchronize(ca, .{ .generation = 2, .published = publication });
+    try harness.collect(store, identity, @splat(6));
+    const selector_id = try page_store.PageStore.identity(domain, versions);
+    const retained = try store.getAlloc(&selector_id);
+    a.free(retained);
+    const kept_document = try store.getAlloc(document.artifact_id);
+    a.free(kept_document);
+    harness.state = try harness.state.release(ca, @splat(9));
+    try harness.collect(store, identity, @splat(8));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&selector_id));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(document.artifact_id));
 }

@@ -49,7 +49,7 @@ def main() -> int:
 
     manifest_path = args.snapshot_dir / "cli-snapshot.json"
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("schema_version") != 1:
+    if manifest.get("schema_version") not in (1, 2):
         raise SystemExit(
             f"unsupported CLI snapshot schema: {manifest.get('schema_version')}"
         )
@@ -68,7 +68,8 @@ def main() -> int:
     ) != manifest.get("version"):
         raise SystemExit("CLI snapshot has invalid registry versions")
     python_version = registry_versions.get("python")
-    if not isinstance(python_version, str) or not python_version:
+    legacy_python = manifest["schema_version"] == 1
+    if legacy_python and (not isinstance(python_version, str) or not python_version):
         raise SystemExit("CLI snapshot has no Python registry version")
 
     artifacts = manifest.get("artifacts")
@@ -91,7 +92,7 @@ def main() -> int:
         if sha256(path) != artifact.get("sha256"):
             raise SystemExit(f"SHA-256 mismatch for CLI snapshot artifact: {name}")
         kind = artifact.get("kind")
-        if kind not in {"npm", "python"}:
+        if kind not in ({"npm", "python"} if legacy_python else {"npm"}):
             raise SystemExit(f"invalid CLI snapshot artifact kind for {name}: {kind!r}")
         kinds[str(kind)] = kinds.get(str(kind), 0) + 1
         package = artifact.get("package")
@@ -110,7 +111,9 @@ def main() -> int:
         raise SystemExit(
             f"CLI snapshot file set mismatch: expected {sorted(expected_files)}, got {sorted(actual_files)}"
         )
-    if kinds != {"npm": 4, "python": 3}:
+    if not legacy_python and registry_versions != {"npm": manifest["version"]}:
+        raise SystemExit("npm-only CLI snapshot has unexpected registry versions")
+    if kinds != ({"npm": 4, "python": 3} if legacy_python else {"npm": 4}):
         raise SystemExit(f"CLI snapshot artifact counts are invalid: {kinds}")
     if npm_packages != NPM_PACKAGES:
         raise SystemExit(

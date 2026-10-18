@@ -200,6 +200,14 @@ pub const View = struct {
     slots_start: usize,
     payload_start: usize,
     compact: bool,
+    /// Only a full canonical scan may publish this immutable admission proof.
+    /// It expires with bytes; authentication-only views deliberately omit it.
+    validation: ?Validation = null,
+    pub const Validation = struct {
+        element_work: usize,
+        non_null: usize,
+        binary_wire_bytes: usize,
+    };
 
     /// Only for canonical bytes admitted by the owning codec and protected by
     /// row/page authentication. Checks extents in O(rank), not payload values
@@ -226,9 +234,12 @@ pub const View = struct {
     /// Authentication-only projection remains O(rank) and is not validation.
     pub fn openWithBudget(kind: Kind, bytes: []const u8, limits: Limits, budget: anytype) !View {
         try budget.charge(1);
-        const view = openAuthenticated(kind, bytes, limits) catch |err| return if (err == error.SqlProgramLimitExceeded) budget.limit() else err;
+        var view = openAuthenticated(kind, bytes, limits) catch |err| return if (err == error.SqlProgramLimitExceeded) budget.limit() else err;
         const count = view.count;
-        if (count == 0) return view;
+        if (count == 0) {
+            if (supportsValidation(kind)) view.validation = .{ .element_work = 0, .non_null = 0, .binary_wire_bytes = 12 };
+            return view;
+        }
         const slots_start = view.slots_start;
         const minimum = try sectionSize(kind, view.rank, count);
         if (count % 8 != 0) {
@@ -244,18 +255,19 @@ pub const View = struct {
                 previous = next;
             }
         }
+        var non_null_cells: usize = 0;
         if (width(kind) != 0) {
-            var non_null: usize = 0;
             for (0..(count + 63) / 64) |block| {
                 try budget.charge(1);
-                if (view.compact and view.offset(block) != non_null) return error.InvalidSqlArrayStorage;
+                if (view.compact and view.offset(block) != non_null_cells) return error.InvalidSqlArrayStorage;
                 const bits = @min(64, @as(usize, count) - block * 64);
                 const mask = if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
-                non_null += @popCount(~view.nullWord(block) & mask);
+                non_null_cells += @popCount(~view.nullWord(block) & mask);
             }
-            if (view.compact and view.offset((count + 63) / 64) != non_null) return error.InvalidSqlArrayStorage;
-            if (view.compact != usesCompact(kind, count, non_null)) return error.NonCanonicalSqlArrayStorage;
+            if (view.compact and view.offset((count + 63) / 64) != non_null_cells) return error.InvalidSqlArrayStorage;
+            if (view.compact != usesCompact(kind, count, non_null_cells)) return error.NonCanonicalSqlArrayStorage;
         }
+        var text_bytes: usize = 0;
         for (0..count) |i| {
             try budget.charge(1);
             const raw = view.cellUnchecked(i);
@@ -275,6 +287,8 @@ pub const View = struct {
                     if (std.math.isNan(@as(f64, @bitCast(bits))) and bits != 0x7ff8000000000000) return error.NonCanonicalSqlArrayStorage;
                 },
                 .text => {
+                    non_null_cells += 1;
+                    text_bytes += raw.bytes.len;
                     var position: usize = 0;
                     while (position < raw.bytes.len) {
                         var end = position + @min(raw.bytes.len - position, 256);
@@ -300,7 +314,24 @@ pub const View = struct {
                 else => {},
             }
         }
+        if (supportsValidation(kind)) {
+            const words = std.math.mul(usize, count, 4) catch return budget.limit();
+            const payload = if (kind == .text) text_bytes else std.math.mul(usize, non_null_cells, width(kind)) catch return budget.limit();
+            const prefix = std.math.add(usize, 12 + @as(usize, view.rank) * 8, words) catch return budget.limit();
+            view.validation = .{
+                .element_work = std.math.add(usize, count, text_bytes) catch return budget.limit(),
+                .non_null = non_null_cells,
+                .binary_wire_bytes = std.math.add(usize, prefix, payload) catch return budget.limit(),
+            };
+        }
         return view;
+    }
+
+    fn supportsValidation(kind: Kind) bool {
+        return switch (kind) {
+            .uuid, .numeric, .jsonb => false,
+            else => true,
+        };
     }
 
     pub fn dimension(self: View, axis: usize) !Dimension {

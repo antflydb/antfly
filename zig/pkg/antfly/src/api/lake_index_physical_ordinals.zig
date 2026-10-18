@@ -98,6 +98,7 @@ pub const Builder = struct {
             var upload = self.store.*;
             upload.allocator = self.out;
             const ref = try upload.putWithCancellation(bytes, self.cancellation);
+            defer if (ref.provider_version) |version| upload.allocator.free(version);
             block.bitmap = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
         }
         try self.blocks.append(self.out, block);

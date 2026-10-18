@@ -360,6 +360,83 @@ pub fn parse(ctx: *Context, input: []const u8) !Owned {
     return finish(ctx.alloc, storage, @intCast(high), @intCast(scale), negative);
 }
 
+/// Stack-owned canonical NUMERIC limbs for a fixed coefficient. Consumers
+/// borrow view() only while this owner remains at its stable address.
+pub const ScaledInteger = struct {
+    digits: [12]u16 = undefined,
+    count: usize = 0,
+    weight: i32 = 0,
+    scale: u16,
+    negative: bool,
+    pub fn init(coefficient: i128, scale: u16) !ScaledInteger {
+        if (scale > maximum_scale) return error.InvalidNumericRepresentation;
+        var result: ScaledInteger = .{ .scale = scale, .negative = coefficient < 0 };
+        var coefficient_magnitude: u128 = @abs(coefficient);
+        var reversed: [12]u16 = undefined;
+        var count: usize = 0;
+        while (coefficient_magnitude != 0) {
+            reversed[count] = @intCast(coefficient_magnitude % base);
+            coefficient_magnitude /= base;
+            count += 1;
+        }
+        if (count == 0) {
+            result.negative = false;
+            return result;
+        }
+        const padding: u16 = @intCast(@mod(-@as(i32, scale), 4));
+        var carry: u32 = 0;
+        for (reversed[0..count]) |*digit| {
+            const shifted = @as(u32, digit.*) * powers[padding] + carry;
+            digit.* = @intCast(shifted % base);
+            carry = shifted / base;
+        }
+        if (carry != 0) {
+            reversed[count] = @intCast(carry);
+            count += 1;
+        }
+        result.weight = @as(i32, @intCast(count)) - 1 - @divTrunc(@as(i32, scale) + padding, 4);
+        var zeros: usize = 0;
+        while (zeros < count and reversed[zeros] == 0) zeros += 1;
+        result.count = count - zeros;
+        for (result.digits[0..result.count], 0..) |*digit, index| digit.* = reversed[count - index - 1];
+        return result;
+    }
+    pub fn view(self: *const ScaledInteger) Value {
+        return .{ .digits = self.digits[0..self.count], .weight = self.weight, .scale = self.scale, .negative = self.negative };
+    }
+};
+/// Exact common-literal lowering for coefficient kernels. A declined literal
+/// retains arbitrary-precision comparison (fractional, huge and special values).
+pub fn coefficientAtScale(value: Value, scale: u16) ?i128 {
+    if (value.kind != .finite) return null;
+    var coefficient_magnitude: u128 = 0;
+    for (value.digits) |digit| {
+        coefficient_magnitude = std.math.mul(u128, coefficient_magnitude, base) catch return null;
+        coefficient_magnitude = std.math.add(u128, coefficient_magnitude, digit) catch return null;
+    }
+    var shift: i64 = (@as(i64, value.weight) - @as(i64, @intCast(value.digits.len)) + 1) * 4 + scale;
+    if (coefficient_magnitude == 0) return 0;
+    if (shift > 39 or shift < -39) return null;
+    while (shift > 0) : (shift -= 1) coefficient_magnitude = std.math.mul(u128, coefficient_magnitude, 10) catch return null;
+    while (shift < 0) : (shift += 1) {
+        if (coefficient_magnitude % 10 != 0) return null;
+        coefficient_magnitude /= 10;
+    }
+    if (value.negative) {
+        if (coefficient_magnitude == @as(u128, @intCast(std.math.maxInt(i128))) + 1) return std.math.minInt(i128);
+        return -(std.math.cast(i128, coefficient_magnitude) orelse return null);
+    }
+    return std.math.cast(i128, coefficient_magnitude);
+}
+pub fn fromScaledInteger(ctx: *Context, coefficient: i128, scale: u16) !Owned {
+    const fixed = try ScaledInteger.init(coefficient, scale);
+    try ctx.charge(fixed.count * 2 + 1);
+    if (fixed.count == 0) return zero(ctx.alloc, scale);
+    const storage = try ctx.allocate(fixed.count);
+    @memcpy(storage, fixed.digits[0..fixed.count]);
+    return .{ .alloc = ctx.alloc, .allocation = storage, .value = .{ .digits = storage, .weight = fixed.weight, .scale = scale, .negative = fixed.negative } };
+}
+
 fn radixDigit(byte: u8, radix: u8) ?u8 {
     const digit: u8 = switch (byte) {
         '0'...'9' => byte - '0',
@@ -1098,11 +1175,7 @@ fn divideMode(ctx: *Context, left: Value, right: Value, integer: bool) !Owned {
         return special(ctx.alloc, if (negative) .negative_infinity else .positive_infinity);
     }
     if (right.kind != .finite) return zero(ctx.alloc, 0);
-    const first_left = if (left.isZero()) 0 else left.digits[0];
-    const estimate_weight = left.weight - right.weight - @as(i32, @intFromBool(first_left <= right.digits[0]));
-    // PostgreSQL selects at least sixteen significant digits from the leading
-    // base-10000 groups and clamps division display scale to one thousand.
-    const scale: u16 = if (integer) 0 else @intCast(std.math.clamp(@max(16 - estimate_weight * 4, @max(left.scale, right.scale)), 0, 1000));
+    const scale: u16 = if (integer) 0 else divisionScale(left, right);
     if (left.isZero()) return zero(ctx.alloc, scale);
     // One entire guard group proves the final decimal rounding digit exactly.
     const fractional_groups: i32 = if (integer) 0 else @divTrunc(@as(i32, scale) + 3, 4) + 1;
@@ -1113,6 +1186,14 @@ fn divideMode(ctx: *Context, left: Value, right: Value, integer: bool) !Owned {
     if (integer) return quotient;
     defer quotient.deinit();
     return quantize(ctx, quotient.value, scale, .half_away);
+}
+
+/// Shared finite division display-scale rule. Callers prove a nonzero finite
+/// divisor before using it; both coefficient and limb kernels round half away.
+pub fn divisionScale(left: Value, right: Value) u16 {
+    const first_left = if (left.isZero()) 0 else left.digits[0];
+    const estimate_weight = left.weight - right.weight - @as(i32, @intFromBool(first_left <= right.digits[0]));
+    return @intCast(std.math.clamp(@max(16 - estimate_weight * 4, @max(left.scale, right.scale)), 0, 1000));
 }
 
 pub fn remainder(ctx: *Context, left: Value, right: Value) !Owned {
@@ -1641,4 +1722,47 @@ test "SQL exact NUMERIC multiplication benchmark retains one bounded output allo
         try std.testing.expectEqual(operand.value.digits.len * 2, result.value.digits.len);
         std.debug.print("NUMERIC multiply: decimal_digits={d} groups={d} allocations={d} work={d} elapsed_ns={d}\n", .{ digits, operand.value.digits.len, tracked.alloc_index, 8 * 1024 * 1024 - ctx.remaining, elapsed });
     }
+}
+
+test "SQL scaled integer conversion preserves exact decimal128 coefficients without text" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { coefficient: i128, scale: u16, expected: []const u8 }{
+        .{ .coefficient = 0, .scale = 4, .expected = "0.0000" },
+        .{ .coefficient = 12300, .scale = 4, .expected = "1.2300" },
+        .{ .coefficient = -1, .scale = 38, .expected = "-0.00000000000000000000000000000000000001" },
+        .{ .coefficient = 9007199254740993125, .scale = 3, .expected = "9007199254740993.125" },
+        .{ .coefficient = 99999999999999999999999999999999999999, .scale = 2, .expected = "999999999999999999999999999999999999.99" },
+        .{ .coefficient = std.math.minInt(i128), .scale = 0, .expected = "-170141183460469231731687303715884105728" },
+    };
+    for (cases) |case| {
+        var context: Context = .{ .alloc = a };
+        var value = try fromScaledInteger(&context, case.coefficient, case.scale);
+        defer value.deinit();
+        const text = try format(&context, value.value);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+        try validateCanonical(&context, value.value);
+    }
+}
+
+test "SQL stack decimal coefficients preserve canonical equality hashes and exact literal lowering" {
+    const a = std.testing.allocator;
+    for ([_]struct { value: i128, scale: u16 }{ .{ .value = 12300, .scale = 4 }, .{ .value = -1, .scale = 38 }, .{ .value = 0, .scale = 38 }, .{ .value = std.math.minInt(i128), .scale = 0 } }) |item| {
+        const fixed = try ScaledInteger.init(item.value, item.scale);
+        var context: Context = .{ .alloc = a };
+        try validateCanonical(&context, fixed.view());
+        var owned = try fromScaledInteger(&context, item.value, item.scale);
+        defer owned.deinit();
+        try std.testing.expectEqual(std.math.Order.eq, try order(&context, fixed.view(), owned.value));
+        try std.testing.expectEqual(@as(?i128, item.value), coefficientAtScale(fixed.view(), item.scale));
+        var left = std.hash.Wyhash.init(0);
+        var right = std.hash.Wyhash.init(0);
+        try hash(&context, fixed.view(), &left);
+        try hash(&context, owned.value, &right);
+        try std.testing.expectEqual(left.final(), right.final());
+    }
+    const fraction = try ScaledInteger.init(12301, 4);
+    try std.testing.expectEqual(@as(?i128, null), coefficientAtScale(fraction.view(), 2));
+    const integer = try ScaledInteger.init(12300, 4);
+    try std.testing.expectEqual(@as(?i128, 123), coefficientAtScale(integer.view(), 2));
 }

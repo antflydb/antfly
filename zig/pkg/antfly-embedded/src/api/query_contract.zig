@@ -2354,7 +2354,7 @@ fn applyCommonSearchRequestOptions(
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
-        const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and snapshot.len <= 512;
+        const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and (snapshot.len <= 512 or @import("../serverless/manifest/artifact_ref.zig").retainedGenerationToken(snapshot));
         if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
         if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
@@ -19386,6 +19386,21 @@ test "external lake query parser accepts bounded retained capabilities and rejec
     defer parsed.deinit(a);
     try std.testing.expectEqualStrings(token, parsed.req.remote_snapshot.?);
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", "{\"remote_snapshot\":\"lake2:short\"}"));
+    for ([_]usize{ 256, 4096 }) |version_size| {
+        const encoded = try a.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(version_size));
+        defer a.free(encoded);
+        const version = try a.alloc(u8, version_size);
+        defer a.free(version);
+        @memset(version, 'v');
+        _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, version);
+        const long = try std.fmt.allocPrint(a, "native2:{s}:g:{s}:42", .{ retained_key, encoded });
+        defer a.free(long);
+        const long_body = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = long }, .{});
+        defer a.free(long_body);
+        var accepted = try parseQueryRequest(a, null, "history", long_body);
+        defer accepted.deinit(a);
+        try std.testing.expectEqualStrings(long, accepted.req.remote_snapshot.?);
+    }
     const oversized_key: [513]u8 = @splat('a');
     const oversized = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = "lake2:" ++ oversized_key }, .{});
     defer a.free(oversized);
