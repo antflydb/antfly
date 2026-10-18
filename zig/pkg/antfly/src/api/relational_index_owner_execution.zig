@@ -489,6 +489,8 @@ pub const RaftRecoveryControlResponse = struct {
     state: ?jobs.RaftCancellationState = null,
     audit: ?local.storage_db_relational_index_raft_contract.AuditProgress = null,
     installation: ?local.storage_db_relational_index_raft_contract.InstallationProgress = null,
+    terminal: ?publication.TerminalRecord = null,
+    terminal_retired: bool = false,
     signed_ack: ?publication.Ack = null,
     signing_failure: ?SigningFailure = null,
 
@@ -499,36 +501,51 @@ pub const RaftRecoveryControlResponse = struct {
         if (self.root_generation == 0 or owner.authority != .raft or owner.namespace.table_id != request.table_id or owner.group_id != request.group_id or
             !std.mem.eql(u8, &owner.plan_id, &request.id)) return error.InvalidIndexOwnerReceipt;
         var physical: ?native.AuditOutcome = null;
-        switch (self.accepted.receipt.action) {
-            .fenced, .reserved => {
-                if (self.audit != null or self.installation != null or !std.meta.eql(try publication.raftControlReceipt(self.state orelse return error.InvalidIndexOwnerReceipt, self.accepted.receipt.action), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
-            },
-            .validated => {
-                if (self.state != null or self.installation != null) return error.InvalidIndexOwnerReceipt;
-                const observed = self.audit orelse return error.InvalidIndexOwnerReceipt;
-                var build = try local.storage_db_relational_index_raft_contract.BuildRequest.initRaft(.{ .id = owner.plan_id, .plan_digest = owner.plan_digest, .owner_digest = owner.fence_digest, .ordinal = owner.ordinal, .namespace = owner.namespace, .owner_group_id = owner.group_id }, observed.outcome.binding, .{});
-                build.target_expectation = observed.outcome.expected;
-                try observed.validateFor(build);
-                if (observed.seal) |seal| {
-                    if (!std.meta.eql(try seal.command.receiptAt(seal.position), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
-                } else if (self.signed_ack != null) return error.InvalidIndexOwnerReceipt;
-                physical = observed.outcome;
-            },
-            .installed => {
-                if (self.state != null or self.audit != null) return error.InvalidIndexOwnerReceipt;
-                const observed = self.installation orelse return error.InvalidIndexOwnerReceipt;
-                const installed = observed.installed orelse return error.InvalidIndexOwnerReceipt;
-                try observed.validateFor(installed.command.intent());
-                if (!std.meta.eql(try installed.command.receiptAt(installed.position), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
-                physical = observed.physical;
-            },
-            else => return error.InvalidIndexOwnerReceipt,
+        var expected = self.accepted.receipt;
+        if (self.terminal) |terminal| {
+            if (self.state != null or self.audit != null or self.installation != null) return error.InvalidIndexOwnerReceipt;
+            expected = try terminal.receipt();
+            const predecessor = switch (terminal) {
+                .release => |record| try record.intent.installed.command.receiptAt(record.intent.installed.position),
+                .cancel_release => |record| try record.intent.canceled.receipt(),
+            };
+            if (!std.meta.eql(expected.owner, owner) or
+                !std.meta.eql(if (self.accepted.receipt.action == .released or self.accepted.receipt.action == .cancel_released) expected else predecessor, self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
+        } else {
+            if (self.terminal_retired) return error.InvalidIndexOwnerReceipt;
+            switch (self.accepted.receipt.action) {
+                .fenced, .reserved => {
+                    if (self.audit != null or self.installation != null or !std.meta.eql(try publication.raftControlReceipt(self.state orelse return error.InvalidIndexOwnerReceipt, self.accepted.receipt.action), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
+                },
+                .validated => {
+                    if (self.state != null or self.installation != null) return error.InvalidIndexOwnerReceipt;
+                    const observed = self.audit orelse return error.InvalidIndexOwnerReceipt;
+                    var build = try local.storage_db_relational_index_raft_contract.BuildRequest.initRaft(.{ .id = owner.plan_id, .plan_digest = owner.plan_digest, .owner_digest = owner.fence_digest, .ordinal = owner.ordinal, .namespace = owner.namespace, .owner_group_id = owner.group_id }, observed.outcome.binding, .{});
+                    build.target_expectation = observed.outcome.expected;
+                    try observed.validateFor(build);
+                    if (observed.seal) |seal| {
+                        if (!std.meta.eql(try seal.command.receiptAt(seal.position), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
+                    } else if (self.signed_ack != null) return error.InvalidIndexOwnerReceipt;
+                    physical = observed.outcome;
+                },
+                .installed => {
+                    if (self.state != null or self.audit != null) return error.InvalidIndexOwnerReceipt;
+                    const observed = self.installation orelse return error.InvalidIndexOwnerReceipt;
+                    const installed = observed.installed orelse return error.InvalidIndexOwnerReceipt;
+                    try observed.validateFor(installed.command.intent());
+                    if (!std.meta.eql(try installed.command.receiptAt(installed.position), self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
+                    physical = observed.physical;
+                },
+                else => return error.InvalidIndexOwnerReceipt,
+            }
         }
         if (self.signed_ack) |ack| {
             try ack.validate();
             if (self.signing_failure != null or ack.table_id != request.table_id or ack.signed.proof.authority != .raft or ack.signed.proof.root_generation != self.root_generation or
-                !std.meta.eql(ack.signed.receipt, self.accepted.receipt)) return error.InvalidIndexOwnerReceipt;
-            if (physical) |outcome| {
+                !std.meta.eql(ack.signed.receipt, expected)) return error.InvalidIndexOwnerReceipt;
+            if (self.terminal) |terminal| {
+                if (!self.terminal_retired or !std.meta.eql(try publication.TerminalWitness.fromRecord(terminal), ack.terminal orelse return error.InvalidIndexOwnerReceipt)) return error.InvalidIndexOwnerReceipt;
+            } else if (physical) |outcome| {
                 const witness = ack.auditEvidence() orelse return error.InvalidIndexOwnerReceipt;
                 if (!std.meta.eql(witness.outcome, outcome)) return error.InvalidIndexOwnerReceipt;
             } else if (self.accepted.receipt.action == .validated or self.accepted.receipt.action == .installed) return error.InvalidIndexOwnerReceipt;
@@ -3407,7 +3424,7 @@ test "relational index publication installed receiver binds fresh decision and r
     var bare = ack;
     bare.installation = null;
     try std.testing.expectError(error.InvalidIndexOwnerReceipt, bare.validate());
-    const encoded = try publication.StoredProof.encode(ack.signed, ack.validation, ack.installation, ack.cancellation);
+    const encoded = try publication.StoredProof.encode(ack.signed, ack.validation, ack.installation, ack.cancellation, ack.terminal);
     const decoded = try publication.StoredProof.decode(alloc, encoded.slice());
     try std.testing.expectEqualDeep(ack.installation.?, decoded.installation.?);
     const fixed = try ack.signed.encode();

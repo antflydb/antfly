@@ -11912,9 +11912,9 @@ pub const DataServer = struct {
         return .{ .raft = response };
     }
 
-    /// Recovery is read-only with respect to replicated state. Root-local
-    /// audit cursors are bounded and disposable; no prepared command from this
-    /// path is ever sent to Raft, including an already installed owner's retry.
+    /// Recovery never repeats a fence-lifting effect. Nonterminal root-local
+    /// audits are bounded and disposable; terminal recovery may only resume
+    /// companion GC against the exact already-committed release record.
     fn raftIndexRecoverControl(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
         const execution = antfly.public_api.relational_index_owner_execution;
         const local = @import("antfly_local_sources");
@@ -11926,9 +11926,17 @@ pub const DataServer = struct {
         var response: execution.RaftRecoveryControlResponse = .{ .root_generation = session.rootGeneration(), .accepted = grant.accepted };
         const scope = try self.raftIndexLocalScopeAtRoot(group_id, grant.identity(), session.rootGeneration(), context);
         try grant.signing.requireLocal(scope);
+        if (grant.terminal != null) {
+            if (try self.raftIndexRecoverTerminal(alloc, table_name, group_id, request, permission, &session, scope, context)) |terminal| return terminal;
+            // No terminal effect exists. Installation can be re-audited while
+            // its fence remains held; completed cancellation needs its own
+            // retained-cleanup adoption, not an invented release or an audit
+            // of the now-deleted candidate.
+            if (grant.retained != .installation or grant.accepted.receipt.action != .installed) return error.PrivateIndexRootRecoveryRequired;
+        }
         const runtime = try self.ensureBackendRuntime();
         const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-        const control = grant.validation == null and grant.installation == null;
+        const control = grant.retained == .control;
         if (control) {
             var observed = try session.cancelStep(alloc, .{ .cancel = grant.intent }, false);
             defer observed.deinit();
@@ -11941,18 +11949,19 @@ pub const DataServer = struct {
             return .{ .raft_recovery = response };
         };
         const root_scope: local.storage_db_relational_index_owner_control.AuditRoot = .{ .root_dir = self.write_source.replica_root_dir, .root_incarnation = root.root_incarnation };
-        if (grant.installation) |installed| {
+        if (grant.retained == .installation) {
+            const installed = grant.retained.installation;
             var observed = try session.lifecycle(alloc, .{ .install = .{ .intent = installed.command.intent(), .budget = request.build_budget orelse .{} } }, true, root_scope);
             defer observed.deinit();
             response.installation = observed.value.progress.install;
-        } else if (grant.validation != null) {
+        } else if (grant.retained == .validation) {
             const build = try grant.auditRequest(request.build_budget orelse .{});
             var observed: ?std.json.Parsed(local.storage_db_relational_index_raft_contract.BuildPreparation) = session.audit(alloc, build, root_scope, false) catch |err| historical: {
                 if (err != error.PrivateIndexOwnerJobChanged) return err;
                 // Installation can have committed before its ACK was observed.
                 // Its audited predecessor is the same frozen validation; never
                 // reconstruct the retired preimage from current mutable rows.
-                const intent: local.storage_db_relational_index_validation.InstallIntent = .{ .validation = grant.validation.?, .metadata_decision = try @import("../metadata/relational_index_publication.zig").InstallGrant.decisionDigest(permission.metadata_group_id, permission.metadata_incarnation, permission.head) };
+                const intent: local.storage_db_relational_index_validation.InstallIntent = .{ .validation = grant.retained.validation, .metadata_decision = try @import("../metadata/relational_index_publication.zig").InstallGrant.decisionDigest(permission.metadata_group_id, permission.metadata_incarnation, permission.head) };
                 var installed = try session.lifecycle(alloc, .{ .install = .{ .intent = intent, .budget = request.build_budget orelse .{} } }, true, root_scope);
                 defer installed.deinit();
                 const physical = installed.value.progress.install;
@@ -11969,6 +11978,70 @@ pub const DataServer = struct {
         if (ready) response.signed_ack = signed: {
             const ack = if (response.state) |state| grant.sign(permission.head.revision, state, scope, root) else if (response.audit) |audit| grant.signPhysical(permission.head.revision, audit.outcome, audit.seal, null, audit.outcome.audit.physical_root_incarnation, scope, root) else grant.signPhysical(permission.head.revision, response.installation.?.physical.?, null, response.installation.?.installed, response.installation.?.physical.?.audit.physical_root_incarnation, scope, root);
             break :signed ack catch |err| {
+                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+                break :signed null;
+            };
+        };
+        try response.validate(request);
+        return .{ .raft_recovery = response };
+    }
+
+    fn raftIndexRecoverTerminal(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, permission: *const @import("../metadata/relational_index_publication.zig").OwnerDecision, session: *antfly.public_api.ProvisionedKernelOwnerSource.RaftIndexOwnerSession, scope: @import("../metadata/relational_index_publication.zig").RaftLocalScope, context: antfly.public_api.operation.RequestContext) !?antfly.public_api.relational_index_owner_execution.Result {
+        const execution = antfly.public_api.relational_index_owner_execution;
+        const local = @import("antfly_local_sources");
+        const grant = permission.raft_recovery orelse return error.PrivateIndexRootRecoveryRequired;
+        const terminal = grant.terminal orelse return error.PrivateIndexRootRecoveryRequired;
+        var response: execution.RaftRecoveryControlResponse = .{ .root_generation = session.rootGeneration(), .accepted = grant.accepted };
+        switch (try grant.terminalIntent()) {
+            .release => |intent| {
+                var observed = try session.lifecycle(alloc, .{ .release = intent }, true, null);
+                defer observed.deinit();
+                var progress_ = observed.value.progress.release;
+                const record = progress_.record orelse return null;
+                try terminal.requireRecord(.{ .release = record }, grant.retained);
+                if (observed.value.gc) |gc| {
+                    var lookup = request.lookup(.permission);
+                    lookup.raft_reporter = scope.reporter;
+                    const remaining_ns = if (context.deadline_ns) |deadline| remaining: {
+                        const now = (antfly.public_api.table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
+                        if (now >= deadline) return error.DeadlineExceeded;
+                        break :remaining deadline - now;
+                    } else 30 * std.time.ns_per_s;
+                    try self.proposeRaftBatchGroup(alloc, group_id, table_name, .{ .relational_index_owner_control = .{ .release_gc = gc } }, .{ .discovery = .cached, .admission_deadline_ns = self.dataRaftMonotonicNs() +| remaining_ns, .required_local_term = scope.leader_term, .allow_remote_forward = false, .visibility_cancellation = context.cancellation, .index_owner_permission = .{ .decision = permission, .request = lookup, .root_generation = session.rootGeneration(), .context = context } });
+                    var recovered = try session.lifecycle(alloc, .{ .release = intent }, false, null);
+                    defer recovered.deinit();
+                    progress_ = recovered.value.progress.release;
+                }
+                response.terminal = .{ .release = progress_.record orelse return error.PrivateIndexRootRecoveryRequired };
+                response.terminal_retired = progress_.retired;
+            },
+            .cancel_release => |intent| {
+                var observed = try session.cancelStep(alloc, .{ .release = intent }, false);
+                defer observed.deinit();
+                const record = observed.value.progress.release orelse return null;
+                try terminal.requireRecord(.{ .cancel_release = record }, grant.retained);
+                response.terminal = .{ .cancel_release = record };
+                response.terminal_retired = true;
+            },
+        }
+        if (response.terminal_retired) response.signed_ack = signed: {
+            const runtime = self.ensureBackendRuntime() catch {
+                response.signing_failure = .identity_unavailable;
+                break :signed null;
+            };
+            const io = runtime.apiIo() orelse {
+                response.signing_failure = .identity_unavailable;
+                break :signed null;
+            };
+            const root = local.storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir) catch {
+                response.signing_failure = .identity_unavailable;
+                break :signed null;
+            };
+            const actual = self.raftIndexLocalScopeAtRoot(group_id, grant.identity(), session.rootGeneration(), context) catch |err| {
+                response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
+                break :signed null;
+            };
+            break :signed grant.signTerminal(permission.head.revision, response.terminal.?, response.terminal_retired, actual, root) catch |err| {
                 response.signing_failure = if (err == error.IndexOwnerReceiptChanged) .authority_changed else .signing_failed;
                 break :signed null;
             };

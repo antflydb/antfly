@@ -480,38 +480,84 @@ pub const CancellationWitness = struct {
     }
 };
 
-fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !void {
+/// A replacement root cannot repeat a historical build audit after release:
+/// ordinary writes are already allowed. The held owner instead verifies this
+/// retained terminal record against its actual durable apply marker. Metadata
+/// separately rejoins its all-owner decision and accepted predecessor receipt.
+pub const TerminalRecord = union(enum) {
+    release: raft_control.Release.Record,
+    cancel_release: raft_control.Release.CancellationRecord,
+
+    pub fn receipt(self: @This()) !progress.Receipt {
+        return switch (self) {
+            inline else => |record| record.intent.receiptAt(record.position),
+        };
+    }
+};
+
+/// A fixed commitment, not another copy of the large immutable predecessor.
+/// Metadata reconstructs the exact canonical record from its accepted cut,
+/// cohort decision and the signed terminal position before accepting this.
+pub const TerminalWitness = struct {
+    record_digest: Digest,
+
+    pub fn fromRecord(record: TerminalRecord) !@This() {
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/index-terminal-record/v1");
+        switch (record) {
+            .release => |value| {
+                const encoded = try value.encode();
+                state.update(encoded.slice());
+            },
+            .cancel_release => |value| state.update(&try value.encode()),
+        }
+        var result: @This() = undefined;
+        state.final(&result.record_digest);
+        return result;
+    }
+    pub fn verifyFor(self: @This(), signed: SignedReceipt) !void {
+        try signed.verifySignature();
+        try self.verifyScope(signed);
+    }
+    fn verifyScope(self: @This(), signed: SignedReceipt) !void {
+        if ((signed.receipt.action != .released and signed.receipt.action != .cancel_released) or std.mem.allEqual(u8, &self.record_digest, 0)) return error.InvalidIndexOwnerReceipt;
+    }
+};
+
+fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness, terminal: ?TerminalWitness) !void {
     if ((signed.receipt.action == .validated) != (validation != null) or
         (signed.receipt.action == .installed) != (installation != null) or
         (signed.receipt.action == .canceled) != (cancellation != null)) return error.InvalidIndexOwnerReceipt;
+    if (terminal != null and signed.receipt.action != .released and signed.receipt.action != .cancel_released) return error.InvalidIndexOwnerReceipt;
 }
 
 /// One retained stage record, not a second independently committed journal.
 /// Native validation/installation retain mandatory bounded physical witnesses;
 /// neither bare receipts nor older private witness formats are accepted.
 pub const StoredProof = struct {
-    const magic = "AIVP\x03\x00\x00\x00";
+    const magic = "AIVP\x04\x00\x00\x00";
     bytes: [max_ack_bytes]u8,
     len: usize,
-    const Witnesses = struct { validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness };
-    pub const Decoded = struct { signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness = null, cancellation: ?CancellationWitness = null };
+    const Witnesses = struct { validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness, terminal: ?TerminalWitness };
+    pub const Decoded = struct { signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness = null, cancellation: ?CancellationWitness = null, terminal: ?TerminalWitness = null };
 
     pub fn slice(self: *const @This()) []const u8 {
         return self.bytes[0..self.len];
     }
-    pub fn encode(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !@This() {
-        try requireWitnesses(signed, validation, installation, cancellation);
+    pub fn encode(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness, terminal: ?TerminalWitness) !@This() {
+        try requireWitnesses(signed, validation, installation, cancellation, terminal);
         if (validation) |witness| try witness.verifyFor(signed) else if (installation) |witness| try witness.verifyFor(signed) else if (cancellation) |witness| try witness.verifyFor(signed) else try signed.verifySignature();
-        return encodeCanonical(signed, validation, installation, cancellation);
+        if (terminal) |witness| try witness.verifyScope(signed);
+        return encodeCanonical(signed, validation, installation, cancellation, terminal);
     }
-    fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !StoredProof {
+    fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness, terminal: ?TerminalWitness) !StoredProof {
         var result: @This() = .{ .bytes = undefined, .len = 0 };
         const fixed = try signed.encode();
-        if (validation != null or installation != null or cancellation != null) {
+        if (validation != null or installation != null or cancellation != null or terminal != null) {
             @memcpy(result.bytes[0..8], magic);
             @memcpy(result.bytes[8..][0..SignedReceipt.encoded_len], &fixed);
             var writer = std.Io.Writer.fixed(result.bytes[8 + SignedReceipt.encoded_len ..]);
-            std.json.Stringify.value(Witnesses{ .validation = validation, .installation = installation, .cancellation = cancellation }, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
+            std.json.Stringify.value(Witnesses{ .validation = validation, .installation = installation, .cancellation = cancellation, .terminal = terminal }, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
             result.len = 8 + SignedReceipt.encoded_len + writer.end;
         } else {
             @memcpy(result.bytes[0..SignedReceipt.encoded_len], &fixed);
@@ -522,7 +568,7 @@ pub const StoredProof = struct {
     pub fn decode(alloc: Allocator, raw: []const u8) !Decoded {
         if (raw.len == SignedReceipt.encoded_len) {
             const signed = try SignedReceipt.decode(raw);
-            requireWitnesses(signed, null, null, null) catch return error.InvalidCatalogRecord;
+            requireWitnesses(signed, null, null, null, null) catch return error.InvalidCatalogRecord;
             return .{ .signed = signed, .validation = null };
         }
         if (raw.len <= 8 + SignedReceipt.encoded_len or raw.len > max_ack_bytes or !std.mem.eql(u8, raw[0..8], magic)) return error.InvalidCatalogRecord;
@@ -534,13 +580,14 @@ pub const StoredProof = struct {
         defer parsed.deinit();
         // The fixed receipt decoder already verified its logical signature.
         const witnesses = parsed.value;
-        requireWitnesses(signed, witnesses.validation, witnesses.installation, witnesses.cancellation) catch return error.InvalidCatalogRecord;
+        requireWitnesses(signed, witnesses.validation, witnesses.installation, witnesses.cancellation, witnesses.terminal) catch return error.InvalidCatalogRecord;
         if (witnesses.validation) |witness| witness.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
         if (witnesses.installation) |witness| witness.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
         if (witnesses.cancellation) |witness| witness.verifyScope(signed) catch return error.InvalidCatalogRecord;
-        const canonical = try encodeCanonical(signed, witnesses.validation, witnesses.installation, witnesses.cancellation);
+        if (witnesses.terminal) |witness| witness.verifyScope(signed) catch return error.InvalidCatalogRecord;
+        const canonical = try encodeCanonical(signed, witnesses.validation, witnesses.installation, witnesses.cancellation, witnesses.terminal);
         if (!std.mem.eql(u8, raw, canonical.slice())) return error.InvalidCatalogRecord;
-        return .{ .signed = signed, .validation = witnesses.validation, .installation = witnesses.installation, .cancellation = witnesses.cancellation };
+        return .{ .signed = signed, .validation = witnesses.validation, .installation = witnesses.installation, .cancellation = witnesses.cancellation, .terminal = witnesses.terminal };
     }
 };
 pub const max_ack_status_bytes = 8192;
@@ -568,13 +615,15 @@ pub const Ack = struct {
     validation: ?ValidationWitness = null,
     installation: ?InstallationWitness = null,
     cancellation: ?CancellationWitness = null,
+    terminal: ?TerminalWitness = null,
 
     pub fn validate(self: Ack) !void {
         if (self.table_id == 0 or self.signed.receipt.owner.namespace.table_id != self.table_id or
             self.expected_revision == 0 or self.expected_revision == std.math.maxInt(u64)) return error.InvalidGenerationPublication;
         try (progress.OwnerState{ .owner = self.signed.receipt.owner }).validate();
-        try requireWitnesses(self.signed, self.validation, self.installation, self.cancellation);
+        try requireWitnesses(self.signed, self.validation, self.installation, self.cancellation, self.terminal);
         if (self.validation) |witness| try witness.verifyFor(self.signed) else if (self.installation) |witness| try witness.verifyFor(self.signed) else if (self.cancellation) |witness| try witness.verifyFor(self.signed) else try self.signed.verifySignature();
+        if (self.terminal) |witness| try witness.verifyScope(self.signed);
     }
 
     pub fn auditEvidence(self: @This()) ?AuditEvidence {
@@ -591,6 +640,7 @@ pub const AckStatus = struct {
     owner: progress.OwnerState,
     validation_digest: ?Digest = null,
     installation_digest: ?Digest = null,
+    terminal_digest: ?Digest = null,
     replication_pending: bool = false,
 
     pub fn isAcknowledged(self: AckStatus, request: Ack) !bool {
@@ -623,6 +673,10 @@ pub const AckStatus = struct {
         if (request.installation) |witness| {
             const retained = self.installation_digest orelse return error.InvalidCatalogRecord;
             if (!std.mem.eql(u8, &retained, &witness.signed.outcome_digest)) return false;
+        }
+        if (request.terminal) |witness| {
+            const retained = self.terminal_digest orelse return false;
+            if (!std.mem.eql(u8, &retained, &witness.record_digest)) return false;
         }
         return !self.replication_pending and std.mem.eql(u8, &root, &try request.signed.commitment());
     }
@@ -875,7 +929,7 @@ pub const ReleaseGrant = struct {
 
 /// Shared live-apply and recovery check. Root replacement requires a distinct
 /// physical recovery protocol; a release signature cannot adopt an old cut.
-pub fn requireReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, installed: StoredProof.Decoded, signed: SignedReceipt) !void {
+pub fn requireReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, installed: StoredProof.Decoded, signed: SignedReceipt, terminal: ?TerminalWitness) !void {
     const witness = installed.installation orelse return error.InvalidCatalogRecord;
     const grant: ReleaseGrant = .{
         .installed = .{ .command = witness.command, .position = installed.signed.receipt.position },
@@ -883,8 +937,13 @@ pub fn requireReleaseReceipt(group: u64, incarnation: local.metadata_incarnation
         .installation_proof = installed.signed.proof,
     };
     try grant.validateFor(group, incarnation, head, owner);
-    if (!std.meta.eql(try grant.intent().receiptAt(signed.receipt.position), signed.receipt) or
-        !std.meta.eql(installed.signed.proof.identity, signed.proof.identity) or
+    if (!std.meta.eql(try grant.intent().receiptAt(signed.receipt.position), signed.receipt)) return error.IndexOwnerReceiptChanged;
+    if (terminal) |physical| {
+        try physical.verifyScope(signed);
+        if (!std.meta.eql(physical, try TerminalWitness.fromRecord(.{ .release = .{ .intent = grant.intent(), .position = signed.receipt.position } }))) return error.IndexOwnerReceiptChanged;
+        return;
+    }
+    if (!std.meta.eql(installed.signed.proof.identity, signed.proof.identity) or
         !std.meta.eql(installed.signed.proof.authority, signed.proof.authority) or
         installed.signed.proof.root_generation != signed.proof.root_generation or
         installed.signed.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
@@ -942,24 +1001,67 @@ pub const CancellationReleaseGrant = struct {
 
 /// Reconstruct terminal cancellation from the accepted cleanup checkpoint.
 /// A signed action tag alone is not evidence of the cohort release decision.
-pub fn requireCancellationReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, canceled: StoredProof.Decoded, signed: SignedReceipt) !void {
+pub fn requireCancellationReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, canceled: StoredProof.Decoded, signed: SignedReceipt, terminal: ?TerminalWitness) !void {
     const witness = canceled.cancellation orelse return error.InvalidCatalogRecord;
     const grant: CancellationReleaseGrant = .{ .canceled = witness.record, .cleanup_proof = canceled.signed.proof, .decision_digest = try cancellationReleaseDecisionDigest(group, incarnation, head) };
     try grant.validateFor(group, incarnation, head, owner);
-    if (!std.meta.eql(try grant.intent().receiptAt(signed.receipt.position), signed.receipt) or
-        !std.meta.eql(canceled.signed.proof.identity, signed.proof.identity) or
+    if (!std.meta.eql(try grant.intent().receiptAt(signed.receipt.position), signed.receipt)) return error.IndexOwnerReceiptChanged;
+    if (terminal) |physical| {
+        try physical.verifyScope(signed);
+        if (!std.meta.eql(physical, try TerminalWitness.fromRecord(.{ .cancel_release = .{ .intent = grant.intent(), .position = signed.receipt.position } }))) return error.IndexOwnerReceiptChanged;
+        return;
+    }
+    if (!std.meta.eql(canceled.signed.proof.identity, signed.proof.identity) or
         !std.meta.eql(canceled.signed.proof.authority, signed.proof.authority) or
         canceled.signed.proof.root_generation != signed.proof.root_generation or
         canceled.signed.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
 }
 
+/// Observe a terminal record under the current root, never execute an old
+/// root's release decision. Only already-committed companion retirement may
+/// advance under this grant; the fence-lifting effect itself stays forbidden.
+pub const RaftTerminalGrant = struct {
+    pub const Intent = union(enum) { release: raft_control.Release.Intent, cancel_release: raft_control.Release.CancellationIntent };
+    metadata_decision: Digest,
+    predecessor_proof: RootProof,
+
+    pub fn intent(self: @This(), retained: RaftRecoveryGrant.Retained) !Intent {
+        return switch (retained) {
+            .installation => |installed| .{ .release = .{ .installed = installed, .metadata_decision = self.metadata_decision } },
+            .cancellation => |canceled| .{ .cancel_release = .{ .canceled = canceled, .metadata_decision = self.metadata_decision } },
+            else => error.InvalidCatalogRecord,
+        };
+    }
+    pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, retained: RaftRecoveryGrant.Retained) !void {
+        switch (try self.intent(retained)) {
+            .release => |value| try (ReleaseGrant{ .installed = value.installed, .decision_digest = value.metadata_decision, .installation_proof = self.predecessor_proof }).validateFor(group, incarnation, head, owner),
+            .cancel_release => |value| try (CancellationReleaseGrant{ .canceled = value.canceled, .decision_digest = value.metadata_decision, .cleanup_proof = self.predecessor_proof }).validateFor(group, incarnation, head, owner),
+        }
+    }
+
+    pub fn requireRecord(self: @This(), record: TerminalRecord, retained: RaftRecoveryGrant.Retained) !void {
+        switch (try self.intent(retained)) {
+            .release => |value| if (record != .release or !std.meta.eql(record.release.intent, value)) return error.IndexOwnerReceiptChanged,
+            .cancel_release => |value| if (record != .cancel_release or !std.meta.eql(record.cancel_release.intent, value)) return error.IndexOwnerReceiptChanged,
+        }
+        _ = try record.receipt();
+    }
+};
+
 pub const RaftRecoveryGrant = struct {
+    /// One retained stage, not the sum of every mutually exclusive witness.
+    pub const Retained = union(enum) {
+        control,
+        validation: local.storage_db_relational_index_validation.Seal,
+        installation: local.storage_db_relational_index_validation.Installed,
+        cancellation: local.storage_db_relational_index_owner_job.Canceled,
+    };
     table_name: []const u8,
     intent: raft_control.Admission,
     accepted: SignedReceipt,
     signing: RaftSigningView,
-    validation: ?local.storage_db_relational_index_validation.Seal = null,
-    installation: ?local.storage_db_relational_index_validation.Installed = null,
+    retained: Retained = .control,
+    terminal: ?RaftTerminalGrant = null,
 
     pub fn init(incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, accepted: SignedReceipt, signing: RaftSigningView) !@This() {
         try dispatch.requireOwner(owner.owner);
@@ -973,12 +1075,22 @@ pub const RaftRecoveryGrant = struct {
         var result: @This() = .{ .table_name = dispatch.table_name, .intent = .{ .id = head.plan_id, .plan_digest = head.plan_digest, .owner_digest = owner.owner.fence_digest, .ordinal = owner.owner.ordinal, .fence = try privateIndexFence(dispatch.id, dispatch.owner), .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest }, .accepted = retained.signed, .signing = signing };
         if (retained.validation) |witness| {
             try witness.verifyFor(retained.signed);
-            result.validation = .{ .command = try witness.outcome.logicalCommand(), .position = retained.signed.receipt.position };
+            result.retained = .{ .validation = .{ .command = try witness.outcome.logicalCommand(), .position = retained.signed.receipt.position } };
         }
         if (retained.installation) |witness| {
             try witness.verifyFor(retained.signed);
-            result.installation = .{ .command = witness.command, .position = retained.signed.receipt.position };
+            result.retained = .{ .installation = .{ .command = witness.command, .position = retained.signed.receipt.position } };
         }
+        try result.validateFor(incarnation, head, owner);
+        return result;
+    }
+
+    pub fn initTerminal(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, accepted: SignedReceipt, predecessor: StoredProof.Decoded, metadata_decision: Digest, signing: RaftSigningView) !@This() {
+        try dispatch.requireOwner(owner.owner);
+        const terminal: RaftTerminalGrant = .{ .metadata_decision = metadata_decision, .predecessor_proof = predecessor.signed.proof };
+        var result: @This() = .{ .table_name = dispatch.table_name, .intent = .{ .id = head.plan_id, .plan_digest = head.plan_digest, .owner_digest = owner.owner.fence_digest, .ordinal = owner.owner.ordinal, .fence = try privateIndexFence(dispatch.id, dispatch.owner), .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest }, .accepted = accepted, .signing = signing, .terminal = terminal };
+        if (predecessor.installation) |witness| result.retained = .{ .installation = .{ .command = witness.command, .position = predecessor.signed.receipt.position } } else if (predecessor.cancellation) |witness| result.retained = .{ .cancellation = witness.record } else return error.InvalidCatalogRecord;
+        try terminal.validateFor(group, incarnation, head, owner, result.retained);
         try result.validateFor(incarnation, head, owner);
         return result;
     }
@@ -991,20 +1103,60 @@ pub const RaftRecoveryGrant = struct {
         try self.accepted.verifySignature();
         try self.signing.validate(incarnation, owner.owner);
         const action = self.accepted.receipt.action;
-        if ((action != .fenced and action != .reserved and action != .validated and action != .installed) or self.table_name.len == 0 or !std.meta.eql(self.accepted.receipt.owner, owner.owner) or
+        if ((action != .fenced and action != .reserved and action != .validated and action != .installed and action != .canceled and action != .released and action != .cancel_released) or self.table_name.len == 0 or !std.meta.eql(self.accepted.receipt.owner, owner.owner) or
             (try owner.latestReceiptAction()) != action or !std.mem.eql(u8, &try self.accepted.receipt.digest(), &owner.receipts[@backingInt(action)]) or
             !std.mem.eql(u8, &try self.accepted.commitment(), &owner.attestations[@backingInt(action)]) or
             !std.mem.eql(u8, &self.intent.id, &head.plan_id) or !std.mem.eql(u8, &self.intent.plan_digest, &head.plan_digest) or
             !std.mem.eql(u8, &self.intent.owner_digest, &owner.owner.fence_digest) or self.intent.ordinal != owner.owner.ordinal or
             !self.intent.fence.namespace.eql(owner.owner.namespace) or self.intent.fence.owner_group_id != owner.owner.group_id or
             !std.mem.eql(u8, &self.intent.candidate_digest, &head.candidate_digest) or !std.mem.eql(u8, &self.intent.reservation_digest, &head.reservation_digest)) return error.InvalidCatalogRecord;
-        if ((action == .validated) != (self.validation != null) or (action == .installed) != (self.installation != null)) return error.InvalidCatalogRecord;
-        if (self.validation) |seal| if (!std.meta.eql(try seal.command.receiptAt(seal.position), self.accepted.receipt)) return error.InvalidCatalogRecord;
-        if (self.installation) |installed| if (!std.meta.eql(try installed.command.receiptAt(installed.position), self.accepted.receipt)) return error.InvalidCatalogRecord;
+        switch (action) {
+            .fenced, .reserved => if (self.retained != .control or self.terminal != null) return error.InvalidCatalogRecord,
+            .validated => if (self.retained != .validation or self.terminal != null) return error.InvalidCatalogRecord,
+            .installed, .released => if (self.retained != .installation) return error.InvalidCatalogRecord,
+            .canceled, .cancel_released => if (self.retained != .cancellation) return error.InvalidCatalogRecord,
+        }
+        if ((action == .released or action == .canceled or action == .cancel_released) and self.terminal == null) return error.InvalidCatalogRecord;
+        const predecessor: ?progress.Receipt = switch (self.retained) {
+            .control => null,
+            .validation => |seal| try seal.command.receiptAt(seal.position),
+            .installation => |installed| try installed.command.receiptAt(installed.position),
+            .cancellation => |canceled| try canceled.receipt(),
+        };
+        if (action != .released and action != .cancel_released) if (predecessor) |receipt| if (!std.meta.eql(receipt, self.accepted.receipt)) return error.InvalidCatalogRecord;
+    }
+
+    pub fn terminalIntent(self: @This()) !RaftTerminalGrant.Intent {
+        return (self.terminal orelse return error.PrivateIndexRootRecoveryRequired).intent(self.retained);
+    }
+
+    pub fn requireRetirementGC(self: @This(), command: raft_control.Command) !void {
+        const terminal = self.terminal orelse return error.PrivateIndexRootRecoveryRequired;
+        if (command != .release_gc) return error.PrivateIndexRootRecoveryRequired;
+        try command.validate();
+        try terminal.requireRecord(.{ .release = command.release_gc.record }, self.retained);
+        if (self.accepted.receipt.action == .released and !std.meta.eql(try command.release_gc.record.intent.receiptAt(command.release_gc.record.position), self.accepted.receipt)) return error.IndexOwnerReceiptChanged;
+    }
+
+    pub fn signTerminal(self: @This(), revision: u64, record: TerminalRecord, retired: bool, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        const terminal = self.terminal orelse return error.PrivateIndexRootRecoveryRequired;
+        try terminal.requireRecord(record, self.retained);
+        try self.signing.requireLocal(actual);
+        if (!retired) return error.GenerationRetirementPending;
+        const receipt = try record.receipt();
+        if (receipt.position != .raft or receipt.position.raft.term > actual.leader_term or receipt.position.raft.index > actual.completed_index or
+            ((self.accepted.receipt.action == .released or self.accepted.receipt.action == .cancel_released) and !std.meta.eql(self.accepted.receipt, receipt))) return error.IndexOwnerReceiptChanged;
+        const result: Ack = .{ .table_id = receipt.owner.namespace.table_id, .expected_revision = revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = self.signing.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) }, .terminal = try TerminalWitness.fromRecord(record) };
+        try result.validate();
+        return result;
     }
 
     pub fn auditRequest(self: @This(), budget: local.storage_db_relational_index_jobs.Budget) !raft_control.BuildRequest {
-        const seal = if (self.validation) |seal| seal else (self.installation orelse return error.InvalidCatalogRecord).command.validation;
+        const seal = switch (self.retained) {
+            .validation => |seal| seal,
+            .installation => |installed| installed.command.validation,
+            else => return error.InvalidCatalogRecord,
+        };
         var result = try raft_control.BuildRequest.initRaft(self.identity(), seal.command.binding, budget);
         result.target_expectation = seal.command.expected;
         try result.validate();
@@ -1022,16 +1174,18 @@ pub const RaftRecoveryGrant = struct {
         if (canonical != .raft or canonical.raft.term > actual.leader_term or canonical.raft.index > actual.completed_index or
             self.accepted.receipt.position.raft.term > actual.leader_term or self.accepted.receipt.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
         const logical = try audit.logicalCommand();
-        if (self.validation) |accepted| {
+        if (self.retained == .validation) {
+            const accepted = self.retained.validation;
             if (installed != null or !std.meta.eql(seal orelse return error.PrivateIndexTargetValidationRequired, accepted) or !std.meta.eql(logical, accepted.command)) return error.PrivateIndexAuditScopeChanged;
         } else {
-            const accepted = self.installation orelse return error.InvalidCatalogRecord;
+            if (self.retained != .installation) return error.InvalidCatalogRecord;
+            const accepted = self.retained.installation;
             if (seal != null or !std.meta.eql(installed orelse return error.PrivateIndexTargetValidationRequired, accepted) or !std.meta.eql(logical, accepted.command.validation.command)) return error.PrivateIndexAuditScopeChanged;
         }
         const proof: RootProof = .{ .identity = self.signing.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined };
         const physical: SignedAudit = .{ .outcome_digest = try audit.readyDigest(), .proof = try proof.sign(root, try audit.readyDigest()) };
         var ack: Ack = .{ .table_id = self.accepted.receipt.owner.namespace.table_id, .expected_revision = revision, .signed = .{ .receipt = self.accepted.receipt, .proof = try proof.sign(root, try self.accepted.receipt.digest()) } };
-        if (self.validation != null) ack.validation = .{ .outcome = audit, .signed = physical } else ack.installation = .{ .outcome = audit, .command = self.installation.?.command, .signed = physical };
+        if (self.retained == .validation) ack.validation = .{ .outcome = audit, .signed = physical } else ack.installation = .{ .outcome = audit, .command = self.retained.installation.command, .signed = physical };
         try ack.validate();
         return ack;
     }
@@ -1061,6 +1215,12 @@ pub fn raftControlReceipt(state: local.storage_db_relational_index_owner_job.Raf
         else => return error.InvalidIndexOwnerReceipt,
     };
     return .{ .owner = .{ .plan_id = binding.id, .plan_digest = binding.plan_digest, .ordinal = binding.ordinal, .group_id = binding.fence.owner_group_id, .namespace = binding.fence.namespace, .authority = .raft, .fence_digest = binding.owner_digest }, .action = action, .position = position, .candidate_digest = binding.integrity_candidate, .reservation_digest = binding.integrity_reserved, .evidence_digest = try raft_control.effectEvidence(binding, effect, position) };
+}
+
+test "relational index publication recovery retains one stage and a fixed terminal commitment" {
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(TerminalWitness));
+    try std.testing.expect(@sizeOf(RaftRecoveryGrant) <= 4096);
+    try std.testing.expect(@sizeOf(RaftRecoveryGrant.Retained) < @sizeOf(local.storage_db_relational_index_validation.Seal) + @sizeOf(local.storage_db_relational_index_validation.Installed) + @sizeOf(local.storage_db_relational_index_owner_job.Canceled));
 }
 
 pub const OwnerDecision = struct {
@@ -1098,6 +1258,7 @@ pub const OwnerDecision = struct {
             if (self.dispatch != null or self.inputs != null or self.native_signing != null or self.raft_signing != null or self.attestation != null or
                 self.target_expectation != null or self.installation != null or self.release != null or self.cancellation_release != null or self.claim_routes != null or request.claim_groups != null) return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_incarnation, self.head, self.owner);
+            if (grant.terminal) |terminal| try terminal.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner, grant.retained);
             const reporter = request.raft_reporter orelse return error.InvalidCatalogRecord;
             if (reporter.node_id != grant.signing.identity.node_id or reporter.store_id != grant.signing.identity.store_id) return error.InvalidCatalogRecord;
             return;
@@ -1571,6 +1732,11 @@ pub const OwnerDecision = struct {
     }
 
     pub fn requireRaftReleaseProposal(self: OwnerDecision, table_name: []const u8, request: OwnerRequest, command: raft_control.Command) !void {
+        if (self.raft_recovery) |grant| {
+            try self.requireRequest(request);
+            if (request.operation != .release or !std.mem.eql(u8, table_name, grant.table_name)) return error.GenerationPublicationChanged;
+            return grant.requireRetirementGC(command);
+        }
         const intent = try self.raftReleaseIntent(request);
         try command.validate();
         const supplied = switch (command) {
@@ -2695,10 +2861,10 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
             }
             if (action == .cancel_released) {
                 const cleanup = try storedProof(a, (try optionalGet(txn, try proofKey(&buf, group, table, @intCast(i), .canceled))) orelse return error.InvalidCatalogRecord, head, owner, .canceled);
-                requireCancellationReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, cleanup, signed) catch return error.InvalidCatalogRecord;
+                requireCancellationReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, cleanup, signed, retained.terminal) catch return error.InvalidCatalogRecord;
             }
             if (action == .released) {
-                requireReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed) catch return error.InvalidCatalogRecord;
+                requireReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed, retained.terminal) catch return error.InvalidCatalogRecord;
             }
             if (retained.validation) |witness| {
                 const frozen = @import("relational_index_delivery_journal.zig").frozenTargetForRecovery(a, txn, group, head, owner, signed.proof.identity.metadata_incarnation) catch |err| switch (err) {

@@ -4708,6 +4708,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try std.testing.expectEqual(decision.value.head.revision + 1, status.value.head.revision);
                 try std.testing.expectEqual(decision.value.head.phase, status.value.head.phase);
                 try std.testing.expectEqualDeep(decision.value.head.counts, status.value.head.counts);
+                if (after_decision) expected = try testRaftTerminalRootRecovery(alloc, &clone, group, lookup, physical, current, root);
             }
             var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = path });
             defer reopened.deinit();
@@ -4718,6 +4719,100 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             defer status.deinit();
             try std.testing.expect(try status.value.isAcknowledged(expected));
         }
+    }
+
+    fn testRaftTerminalRootRecovery(alloc: std.mem.Allocator, store: *RaftApplyStore, group: u64, lookup: index_publication.OwnerRequest, audit: @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditOutcome, scope: index_publication.RaftLocalScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !index_publication.Ack {
+        const local = @import("antfly_local_sources");
+        var request = lookup;
+        request.operation = .install;
+        const bytes = try store.relationalIndexOwnerDecisionJson(alloc, group, request);
+        defer alloc.free(bytes);
+        var permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, bytes, .{});
+        defer permission.deinit();
+        const install = permission.value.installation orelse return error.TestMissingInstallGrant;
+        const installed: local.storage_db_relational_index_validation.Installed = .{ .command = .{ .validation = install.validation, .metadata_decision = install.decision_digest, .schema_digest = @splat(3), .activation_digest = @splat(4) }, .position = .{ .raft = .{ .term = 2, .index = 12 } } };
+        var actual = scope;
+        actual.completed_index = 13;
+        const installed_ack = try permission.value.signRaftInstallation(request, installed, audit, audit.audit.physical_root_incarnation, actual, root);
+        {
+            // Synthetic physical summaries/cuts qualify the real metadata
+            // transaction, not storage execution. Report the same observed
+            // completed prefix before attempting acceptance.
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const header = (try store.loadStoreHeaderTxn(&txn, group, scope.reporter.store_id)).?;
+            defer metadata_table_manager.freeStore(alloc, header);
+            const address = try RaftApplyStore.ReportAddress.active(a, &txn, group, header.store_id);
+            const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &txn, group, address, request.group_id, true)).?;
+            const groups = try a.dupe(metadata.GroupStatusReport, report.group_statuses);
+            groups[0].raft_applied_index = actual.completed_index;
+            var observed = header;
+            observed.group_statuses = groups;
+            observed.runtime_statuses = report.runtime_statuses;
+            _ = try store.updateListingStoreTxn(&txn, group, header.store_id, observed);
+            try txn.commit();
+        }
+        const encoded = try std.json.Stringify.valueAlloc(alloc, installed_ack, .{});
+        defer alloc.free(encoded);
+        try store.validateRelationalIndexOwnerAck(group, encoded);
+        try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = encoded });
+        actual.root_generation += 1;
+        try setIndexTestRootGeneration(alloc, store, group, installed_ack.signed, actual.root_generation);
+        request.operation = .release;
+        const recovery_bytes = try store.relationalIndexOwnerDecisionJson(alloc, group, request);
+        defer alloc.free(recovery_bytes);
+        var recovery = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, recovery_bytes, .{});
+        defer recovery.deinit();
+        try recovery.value.requireRequest(request);
+        const grant = recovery.value.raft_recovery orelse return error.TestMissingRaftRecoveryGrant;
+        const terminal = try grant.terminalIntent();
+        const record: index_publication.TerminalRecord = .{ .release = .{ .intent = terminal.release, .position = .{ .raft = .{ .term = 2, .index = 13 } } } };
+        try std.testing.expectError(error.GenerationRetirementPending, grant.signTerminal(recovery.value.head.revision, record, false, actual, root));
+        const ack = try grant.signTerminal(recovery.value.head.revision, record, true, actual, root);
+        const execution = @import("../../api/relational_index_owner_execution.zig");
+        const control_request: execution.Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .release };
+        var response: execution.ControlResponse = .{ .raft_recovery = .{ .root_generation = actual.root_generation, .accepted = installed_ack.signed, .terminal = record, .terminal_retired = true, .signed_ack = ack } };
+        try std.testing.expectEqualDeep(ack, (try response.recoveryAck(control_request)).?);
+        response.raft_recovery.terminal_retired = false;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, response.validate(control_request));
+        try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, recovery.value.requireRaftReleaseProposal(grant.table_name, request, .{ .release = terminal.release }));
+        try recovery.value.requireRaftReleaseProposal(grant.table_name, request, .{ .release_gc = .{ .record = record.release, .entries = &.{} } });
+        var changed = record;
+        changed.release.intent.metadata_decision[0] ^= 1;
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, grant.signTerminal(recovery.value.head.revision, changed, true, actual, root));
+        var missing = ack;
+        missing.terminal = null;
+        const missing_bytes = try std.json.Stringify.valueAlloc(alloc, missing, .{});
+        defer alloc.free(missing_bytes);
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, missing_bytes));
+        const ack_bytes = try std.json.Stringify.valueAlloc(alloc, ack, .{});
+        defer alloc.free(ack_bytes);
+        try store.validateRelationalIndexOwnerAck(group, ack_bytes);
+        try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = ack_bytes });
+        try verifyRelationRecoveryForTest(store, alloc, group);
+        const status_bytes = try store.relationalIndexOwnerAckStatusJson(alloc, group, ack);
+        defer alloc.free(status_bytes);
+        var status = try std.json.parseFromSlice(index_publication.AckStatus, alloc, status_bytes, .{});
+        defer status.deinit();
+        try std.testing.expect(try status.value.isAcknowledged(ack));
+        var corrupt = ack;
+        corrupt.terminal.?.record_digest[0] ^= 1;
+        try std.testing.expect(!try status.value.isAcknowledged(corrupt));
+        {
+            // The logical signature/owner commitment is unchanged. Recovery
+            // must independently join the fixed witness to the exact accepted
+            // predecessor and decision, not trust its outer framing.
+            const proof = try index_publication.StoredProof.encode(corrupt.signed, null, null, null, corrupt.terminal);
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var key_buf: [192]u8 = undefined;
+            try txn.put(try index_publication.proofKey(&key_buf, group, request.table_id, recovery.value.owner.owner.ordinal, .released), proof.slice());
+            try std.testing.expectError(error.InvalidCatalogRecord, verifyIndexPublicationGroupTxn(alloc, &txn, group));
+        }
+        return ack;
     }
 
     fn testNativeAcceptance(store: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, signed: @import("../relational_index_source_delivery.zig").Signed, read: *const @import("antfly_local_sources").storage_db_relational_index_owner_control.SourceRead, subset: *@import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Subset, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, proof: index_publication.RootProof) !void {
@@ -5304,7 +5399,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const receipt = try record.receipt();
         const ack: index_publication.Ack = .{ .table_id = head.table_id, .expected_revision = head.revision, .signed = .{ .receipt = receipt, .proof = try accepted.signed.proof.sign(root, try receipt.digest()) }, .cancellation = .{ .record = record } };
         try ack.validate();
-        const proof = try index_publication.StoredProof.encode(ack.signed, null, null, ack.cancellation);
+        const proof = try index_publication.StoredProof.encode(ack.signed, null, null, ack.cancellation, null);
         try std.testing.expectEqualDeep(ack.cancellation, (try index_publication.StoredProof.decode(alloc, proof.slice())).cancellation);
         const bare = try ack.signed.encode();
         try std.testing.expectError(error.InvalidCatalogRecord, index_publication.StoredProof.decode(alloc, &bare));
@@ -5411,6 +5506,21 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             invalid = grant;
             invalid.decision_digest[0] ^= 1;
             try std.testing.expectError(error.InvalidCatalogRecord, invalid.validateFor(group, permission.value.metadata_incarnation, later, permission.value.owner));
+            {
+                var terminal_position = position;
+                terminal_position.sequence += 1;
+                const terminal: index_publication.TerminalRecord = .{ .cancel_release = .{ .intent = grant.intent(), .position = .{ .native = terminal_position } } };
+                const logical = try terminal.receipt();
+                var current = ack.signed.proof;
+                current.root_generation += 1;
+                const signed: index_publication.SignedReceipt = .{ .receipt = logical, .proof = try current.sign(root, try logical.digest()) };
+                const predecessor: index_publication.StoredProof.Decoded = .{ .signed = ack.signed, .validation = null, .cancellation = ack.cancellation };
+                try std.testing.expectError(error.IndexOwnerReceiptChanged, index_publication.requireCancellationReleaseReceipt(group, permission.value.metadata_incarnation, permission.value.head, permission.value.owner, predecessor, signed, null));
+                var witness = try index_publication.TerminalWitness.fromRecord(terminal);
+                try index_publication.requireCancellationReleaseReceipt(group, permission.value.metadata_incarnation, permission.value.head, permission.value.owner, predecessor, signed, witness);
+                witness.record_digest[0] ^= 1;
+                try std.testing.expectError(error.IndexOwnerReceiptChanged, index_publication.requireCancellationReleaseReceipt(group, permission.value.metadata_incarnation, permission.value.head, permission.value.owner, predecessor, signed, witness));
+            }
             try setIndexTestRootGeneration(alloc, store, group, ack.signed, grant.cleanup_proof.root_generation + 1);
             try std.testing.expectError(error.IndexOwnerReceiptChanged, store.relationalIndexOwnerDecisionJson(alloc, group, request));
             try setIndexTestRootGeneration(alloc, store, group, ack.signed, grant.cleanup_proof.root_generation);
@@ -5421,7 +5531,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             forged.signed.receipt = try forged.cancellation.?.record.receipt();
             forged.signed.proof = try forged.signed.proof.sign(root, try forged.signed.receipt.digest());
             try forged.validate();
-            const forged_proof = try index_publication.StoredProof.encode(forged.signed, null, null, forged.cancellation);
+            const forged_proof = try index_publication.StoredProof.encode(forged.signed, null, null, forged.cancellation, null);
             const original = blk: {
                 var txn = try store.store.beginWriteTxn();
                 errdefer txn.abort();
@@ -6002,7 +6112,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 changed_owner.receipts[@backingInt(index_progress.Action.released)] = try forged.signed.receipt.digest();
                 changed_owner.attestations[@backingInt(index_progress.Action.released)] = try forged.signed.commitment();
                 try txn.put(try index_publication.ownerKey(&buf, group, lookup.table_id, ordinal), &try changed_owner.encode());
-                const changed_proof = try index_publication.StoredProof.encode(forged.signed, null, null, null);
+                const changed_proof = try index_publication.StoredProof.encode(forged.signed, null, null, null, null);
                 try txn.put(try index_publication.proofKey(&buf, group, lookup.table_id, ordinal, .released), changed_proof.slice());
                 try std.testing.expectError(error.InvalidCatalogRecord, index_publication.verifyJob(alloc, &txn, group, lookup.table_id));
             }
@@ -7564,7 +7674,7 @@ test "relational index publication terminal replacement bounds owner retention a
                 next_owner.attestations[@backingInt(action)] = try signed.commitment();
                 ack.next_owner = try next_owner.encode();
                 try ack.stage(&txn, hk, ok);
-                const proof_bytes = try index_publication.StoredProof.encode(signed, null, null, cancellation_witness);
+                const proof_bytes = try index_publication.StoredProof.encode(signed, null, null, cancellation_witness, null);
                 try txn.put(try index_publication.proofKey(&buf, group, plan.before.table_id, @intCast(i), action), proof_bytes.slice());
             }
         }
@@ -18870,10 +18980,12 @@ pub const RaftApplyStore = struct {
         if (logical_present != !std.mem.allEqual(u8, &previous_root, 0)) return error.InvalidCatalogRecord;
         const retained = try stagingGet(txn, try index_publication.proofKey(&buf, group_id, ack.table_id, ordinal, action));
         var previous_evidence: ?index_publication.AuditEvidence = null;
+        var previous_terminal: ?[32]u8 = null;
         if (logical_present) {
             const previous = try index_publication.storedProof(self.alloc, retained orelse return error.InvalidCatalogRecord, head, previous_owner, action);
             if (previous.validation) |witness| previous_evidence = .{ .outcome = witness.outcome, .signed = witness.signed };
             if (previous.installation) |witness| previous_evidence = .{ .outcome = witness.outcome, .signed = witness.signed };
+            if (previous.terminal) |witness| previous_terminal = witness.record_digest;
         } else if (retained != null) return error.InvalidCatalogRecord;
         const cleanup_refresh = head.phase == .canceling and logical_present and (action == .fenced or action == .reserved) and (try previous_owner.latestReceiptAction()) == action;
         try self.requireIndexOwnerRootProofTxn(txn, group_id, ack.signed.receipt.owner, ack.signed.receipt.position, ack.signed.proof, head.reader_requirements, action == .canceled or action == .cancel_released or cleanup_refresh);
@@ -18885,9 +18997,9 @@ pub const RaftApplyStore = struct {
         if (ack.installation) |witness| try self.verifyRelationalIndexInstallationTxn(txn, group_id, witness);
         if (ack.cancellation) |witness| try self.verifyRelationalIndexCancellationTxn(txn, group_id, head, previous_owner, witness, ack.signed);
         if (action == .released)
-            try self.verifyRelationalIndexReleaseTxn(txn, group_id, head, previous_owner, ack.signed);
+            try self.verifyRelationalIndexReleaseTxn(txn, group_id, head, previous_owner, ack.signed, ack.terminal);
         if (action == .cancel_released)
-            try self.verifyRelationalIndexCancellationReleaseTxn(txn, group_id, head, previous_owner, ack.signed);
+            try self.verifyRelationalIndexCancellationReleaseTxn(txn, group_id, head, previous_owner, ack.signed, ack.terminal);
         const root = try ack.signed.commitment();
         if (previous_evidence) |previous| {
             const old_grant = previous.signed.proof;
@@ -18897,7 +19009,8 @@ pub const RaftApplyStore = struct {
                 old_grant.root_generation == new_grant.root_generation and old_grant.reporter_incarnation == new_grant.reporter_incarnation and
                 !std.mem.eql(u8, &previous.signed.outcome_digest, &next_evidence.signed.outcome_digest)) return error.IndexOwnerReceiptChanged;
         }
-        if (!std.mem.eql(u8, &root, &previous_root)) {
+        const terminal_changed = if (ack.terminal) |witness| logical_present and (previous_terminal == null or !std.mem.eql(u8, &witness.record_digest, &previous_terminal.?)) else false;
+        if (!std.mem.eql(u8, &root, &previous_root) or terminal_changed) {
             if (!update.changed) {
                 // A different current root can re-attest only the latest
                 // completed stage. Never rewrite historical phase evidence.
@@ -18911,7 +19024,7 @@ pub const RaftApplyStore = struct {
             next_owner.attestations[action_index] = root;
             update.next_owner = try next_owner.encode();
         }
-        return .{ .table_id = ack.table_id, .ordinal = ordinal, .update = update, .action = action, .proof_bytes = if (update.changed) try index_publication.StoredProof.encode(ack.signed, ack.validation, ack.installation, ack.cancellation) else undefined };
+        return .{ .table_id = ack.table_id, .ordinal = ordinal, .update = update, .action = action, .proof_bytes = if (update.changed) try index_publication.StoredProof.encode(ack.signed, ack.validation, ack.installation, ack.cancellation, ack.terminal) else undefined };
     }
 
     fn ackRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
@@ -19034,7 +19147,7 @@ pub const RaftApplyStore = struct {
         try index_publication.requireCancellationWitness(group_id, head, owner, dispatch.value, witness, signed, prior);
     }
 
-    fn verifyRelationalIndexReleaseTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, owner: index_progress.OwnerState, signed: index_publication.SignedReceipt) !void {
+    fn verifyRelationalIndexReleaseTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, owner: index_progress.OwnerState, signed: index_publication.SignedReceipt, terminal: ?index_publication.TerminalWitness) !void {
         _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_release_version);
         var buf: [192]u8 = undefined;
         const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, head.table_id, owner.owner.ordinal, .installed)), head, owner, .installed);
@@ -19047,15 +19160,15 @@ pub const RaftApplyStore = struct {
         };
         try grant.validateFor(group_id, incarnation, head, owner);
         _ = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, grant.installed.command.validation.command.binding, null, .installation);
-        try index_publication.requireReleaseReceipt(group_id, incarnation, head, owner, accepted, signed);
+        try index_publication.requireReleaseReceipt(group_id, incarnation, head, owner, accepted, signed, terminal);
     }
 
-    fn verifyRelationalIndexCancellationReleaseTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, owner: index_progress.OwnerState, signed: index_publication.SignedReceipt) !void {
+    fn verifyRelationalIndexCancellationReleaseTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, owner: index_progress.OwnerState, signed: index_publication.SignedReceipt, terminal: ?index_publication.TerminalWitness) !void {
         var buf: [192]u8 = undefined;
         const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, head.table_id, owner.owner.ordinal, .canceled)), head, owner, .canceled);
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
         _ = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, (accepted.cancellation orelse return error.InvalidCatalogRecord).record.binding, null, .cancellation);
-        try index_publication.requireCancellationReleaseReceipt(group_id, incarnation, head, owner, accepted, signed);
+        try index_publication.requireCancellationReleaseReceipt(group_id, incarnation, head, owner, accepted, signed, terminal);
     }
 
     fn verifyRelationalIndexInstallationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, witness: index_publication.InstallationWitness) !void {
@@ -19323,6 +19436,10 @@ pub const RaftApplyStore = struct {
             const retained = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .installed)), head, owner, .installed);
             status.installation_digest = (retained.installation orelse return error.InvalidCatalogRecord).signed.outcome_digest;
         }
+        if (request.terminal != null and !std.mem.allEqual(u8, &owner.receipts[@backingInt(request.signed.receipt.action)], 0)) {
+            const retained = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, request.signed.receipt.action)), head, owner, request.signed.receipt.action);
+            if (retained.terminal) |witness| status.terminal_digest = witness.record_digest;
+        }
         if (request.cancellation) |witness| if (!std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.canceled)], 0)) {
             const retained = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .canceled)), head, owner, .canceled);
             if (!std.meta.eql((retained.cancellation orelse return error.InvalidCatalogRecord).record, witness.record)) return error.InvalidCatalogRecord;
@@ -19446,9 +19563,9 @@ pub const RaftApplyStore = struct {
         var attest = false;
         var raft_recovery_proof: ?index_publication.StoredProof.Decoded = null;
         if (owner.owner.authority == .raft and head.phase != .published and head.phase != .canceled) {
-            if (try owner.latestReceiptAction()) |latest| if (latest == .fenced or latest == .reserved or latest == .validated or latest == .installed) {
+            if (try owner.latestReceiptAction()) |latest| if (latest == .fenced or latest == .reserved or latest == .validated or latest == .installed or latest == .released or latest == .cancel_released or (latest == .canceled and head.phase == .cancel_releasing)) {
                 const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, latest)), head, owner, latest);
-                const control_cleanup = head.phase == .canceling and (latest == .fenced or latest == .reserved);
+                const control_cleanup = (head.phase == .canceling and (latest == .fenced or latest == .reserved)) or latest == .canceled or latest == .cancel_released;
                 self.requireIndexOwnerRootProofTxn(&txn, group_id, accepted.signed.receipt.owner, accepted.signed.receipt.position, accepted.signed.proof, head.reader_requirements, control_cleanup) catch |err| switch (err) {
                     error.IndexOwnerReceiptChanged => raft_recovery_proof = accepted,
                     else => return err,
@@ -19501,13 +19618,21 @@ pub const RaftApplyStore = struct {
             const reporter = request.raft_reporter orelse return error.IndexOwnerReceiptChanged;
             const action = accepted.signed.receipt.action;
             const control = action == .fenced or action == .reserved;
-            const signing = (try self.raftIndexSigningViewModeTxn(&txn, group_id, incarnation, owner.owner, reporter, head.reader_requirements, head.phase == .canceling and control)) orelse return error.IndexOwnerReceiptChanged;
-            if (!control) {
+            const cancellation_terminal = head.phase == .cancel_releasing and (action == .canceled or action == .cancel_released);
+            const terminal = cancellation_terminal or (head.phase == .releasing and (action == .installed or action == .released));
+            const signing = (try self.raftIndexSigningViewModeTxn(&txn, group_id, incarnation, owner.owner, reporter, head.reader_requirements, (head.phase == .canceling and control) or cancellation_terminal)) orelse return error.IndexOwnerReceiptChanged;
+            if (terminal) {
+                const predecessor = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, if (cancellation_terminal) .canceled else .installed)), head, owner, if (cancellation_terminal) .canceled else .installed);
+                const metadata_decision = if (cancellation_terminal) try index_publication.cancellationReleaseDecisionDigest(group_id, incarnation, head) else try index_publication.ReleaseGrant.decisionDigest(group_id, incarnation, head);
+                decision.raft_recovery = try index_publication.RaftRecoveryGrant.initTerminal(group_id, incarnation, head, owner, d, accepted.signed, predecessor, metadata_decision, signing);
+            } else if (!control) {
                 const frozen = try index_delivery.frozenTargetForRecovery(alloc, &txn, group_id, head, owner, incarnation);
                 const expected = if (accepted.validation) |w| w.outcome.expected else (accepted.installation orelse return error.InvalidCatalogRecord).outcome.expected;
                 if (!std.meta.eql(frozen.expected, expected)) return error.InvalidCatalogRecord;
+                decision.raft_recovery = try index_publication.RaftRecoveryGrant.initPhysical(incarnation, head, owner, d, accepted, signing);
+            } else {
+                decision.raft_recovery = try index_publication.RaftRecoveryGrant.init(incarnation, head, owner, d, accepted.signed, signing);
             }
-            decision.raft_recovery = if (control) try index_publication.RaftRecoveryGrant.init(incarnation, head, owner, d, accepted.signed, signing) else try index_publication.RaftRecoveryGrant.initPhysical(incarnation, head, owner, d, accepted, signing);
             try decision.requireRequest(request);
             return std.json.Stringify.valueAlloc(alloc, decision, .{});
         }

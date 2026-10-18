@@ -180,18 +180,28 @@ its root proof. The same read-only grant now covers accepted validation and
 installation: bounded root-local audits must reproduce the frozen logical
 command and original retained cut before a fresh physical witness can be signed.
 If installation committed before its ACK was observed, recovery uses the existing
-installed-history auditor, never a reconstructed mutable predecessor. Recovery
-decisions carry no schema inputs or proposal permission. The worker re-enters
+installed-history auditor, never a reconstructed mutable predecessor. Nonterminal
+recovery decisions carry no schema inputs or proposal permission. The worker re-enters
 recovery after a source stream encounters a replacement root and then resumes
 from its durable journal. Snapshot-restored decisions use the shared derived
 report-index barrier before reading current-root reports. A real metadata-store
 regression persists validation re-attestation both before and after the catalog
 decision, cold-reopens it, and verifies the original cut, counts and phase stay
-unchanged. The focused Debug gate passes 72 metadata, four receiver and one
-decoder-floor tests, with zero failures or leaks. Terminal and
-completed-cancellation root adoption remain unfinished; the worker's Raft cohort
-guard remains, public CREATE stays guarded, and no original SQL case is closed
-by these component changes.
+unchanged. Terminal recovery inspects the existing release or cancellation-release
+record instead of auditing rows after fence release. Only bounded companion GC
+against an already-committed release may be proposed; recovery cannot issue a
+new fence-lifting effect. A fixed 32-byte canonical-record commitment is joined
+to metadata's accepted predecessor, cohort decision and signed terminal cut in
+both accepting apply and snapshot verification. ACK status checks that exact
+commitment as well. The grant retains one tagged stage, not multiple duplicate
+predecessors, and a footprint regression caps it at 4 KiB. The default-stack
+Debug gate passes 73 metadata, four receiver and one decoder-floor tests with
+zero failures or leaks. Normal terminal re-attestation is persisted and verified
+after cold metadata reopen; the shared cancellation-release join also rejects
+missing or changed record commitments. Completed-cancellation adoption before
+terminal release and distributed lifecycle fault qualification remain unfinished.
+The worker's Raft cohort guard remains, public CREATE stays guarded, and no
+original SQL case is closed by these component changes.
 Cancellation intent now commits at a real Raft position, including an owner's
 first entry or an owner that has not visited the job. Ordinary work stays closed;
 explicit cancellation controls drain and burn the exact generation. Cleanup

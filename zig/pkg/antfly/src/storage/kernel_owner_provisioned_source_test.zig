@@ -892,7 +892,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         const cleanup_ack = (try value.ack()).?;
         try cleanup_ack.validate();
         try std.testing.expectEqualDeep(completed.outcome.value.record.?, cleanup_ack.cancellation.?.record);
-        const retained_proof = try publication.StoredProof.encode(cleanup_ack.signed, null, null, cleanup_ack.cancellation);
+        const retained_proof = try publication.StoredProof.encode(cleanup_ack.signed, null, null, cleanup_ack.cancellation, null);
         try std.testing.expectEqualDeep(cleanup_ack.cancellation, (try publication.StoredProof.decode(alloc, retained_proof.slice())).cancellation);
         var signing_failure = try execution.cancelCompletionStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
         defer signing_failure.deinit();
