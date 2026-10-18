@@ -3801,7 +3801,9 @@ test "SQL pgwire native read cursor keeps transported JSON encoded through colum
     try std.testing.expectEqualStrings("{\"x\":[9007199254740993]}", (try columns.encodedJson(0, "j")).?);
     try std.testing.expectEqualStrings("key", (try columns.cell(sa, 0, "_id")).value.string);
     const page_row = cursor.column_page.?.rows[0];
-    const frozen = page_row.typed_cells.?.columnar.?.blocks[0].values[0].values.dynamic.json[0].?;
+    const columnar = page_row.typed_cells.?.columnar.?.blocks[0];
+    const range = (try columnar.frozenJson(0, 0, false)).?;
+    const frozen = columnar.json_owner.?.cached.get(@intFromPtr(range.bytes.ptr)).?;
     try std.testing.expect(frozen.value == null);
     const end = try Adapter.ReadCursor.nextColumns(&cursor, a, 1);
     try std.testing.expectEqual(@as(usize, 0), end.selection.len);

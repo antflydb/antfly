@@ -1336,7 +1336,10 @@ test "SQL native partition batches preserve frozen outer rows residuals and reta
                     }
                     // Frozen forwarding must not populate the source DOM cache.
                     if (join.probe_input) |*input| if (input.view().encoded) |block| {
-                        for (block.values) |column| if (column.values == .dynamic) for (column.values.dynamic.json) |value| if (value) |json_| try std.testing.expect(json_.value == null);
+                        if (block.json_owner) |owner| {
+                            var cached = owner.cached.valueIterator();
+                            while (cached.next()) |entry| try std.testing.expect(entry.*.value == null);
+                        }
                     };
                 }
             }

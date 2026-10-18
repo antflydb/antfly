@@ -411,7 +411,9 @@ fn consumerTests() type {
                         const row = retained.rows[0].sqlRow();
                         try std.testing.expectEqualStrings("{\"x\":[9007199254740993,1e-3]}", (try row.encodedJson("j")).?);
                         const ordinal = row.typed_cells.?.layout.ordinals.get("j").?;
-                        const frozen = retained.columnar_blocks[0].values[ordinal].values.dynamic.json[0].?;
+                        const columnar = retained.columnar_blocks[0];
+                        const range = (try columnar.frozenJson(0, ordinal, false)).?;
+                        const frozen = columnar.json_owner.?.cached.get(@intFromPtr(range.bytes.ptr)).?;
                         try std.testing.expect(frozen.value == null);
                         const replay = try encodeVersion(a, 1, retained.rows, null, version);
                         try std.testing.expectEqualSlices(u8, bytes, replay);
