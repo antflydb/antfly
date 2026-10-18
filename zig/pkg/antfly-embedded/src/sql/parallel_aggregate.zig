@@ -20,17 +20,172 @@ const catalog = @import("catalog.zig");
 const binding = @import("aggregate_binding.zig");
 const operators = @import("operators.zig");
 const scheduling = @import("parallel_scheduler.zig");
+const Result = struct {
+    backing: std.mem.Allocator,
+    budget: @import("memory_budget.zig"),
+    grouped: ?*operators.Grouped = null,
+    fn deinit(self: *Result) void {
+        if (self.grouped) |grouped| grouped.deinit();
+        std.debug.assert(self.budget.live == 0);
+        self.backing.destroy(self);
+    }
+};
+/// Stable allocator/owners survive until the final typed batches are consumed.
+const Reduction = struct {
+    backing: std.mem.Allocator,
+    allocator: scheduling.LockedAllocator,
+    results: [4]?*Result = @splat(null),
+    groups: [4]*operators.Grouped = undefined,
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        for (self.results) |result| if (result) |owned| owned.deinit();
+        self.backing.destroy(self);
+    }
+};
+const ReduceWork = struct {
+    context: runtime.Context,
+    owner: *Reduction,
+    sources: []const ?*Result,
+    selections: []const [][]usize,
+    lane: usize,
+    workspace: usize,
+    ready: *std.Io.Event,
+    fn run(self: @This()) anyerror!*Result {
+        try self.ready.wait(self.context.backend.execution_io.?);
+        const a = self.owner.allocator.allocator();
+        const result = try a.create(Result);
+        result.* = .{ .backing = a, .budget = .{ .backing = a, .limit = self.workspace } };
+        errdefer result.deinit();
+        result.grouped = try operators.Grouped.create(result.budget.allocator(), self.sources[0].?.grouped.?.specs, .{ .groups = self.context.limits.scan_rows, .bytes = self.workspace / 2, .spill = self.context.spill });
+        var ordinal: u64 = 0;
+        for (self.sources, self.selections) |source, selections| {
+            try self.context.checkpoint();
+            try result.grouped.?.mergeExactSelected(source.?.grouped.?, ordinal, selections[self.lane]);
+            ordinal = try std.math.add(u64, ordinal, source.?.grouped.?.rows_seen);
+        }
+        return result;
+    }
+};
+/// Hand unreduced spill streams to global hash owners without a serial
+/// local-finalize / decode / re-encode pass. In-memory locals export compact
+/// checkpoints once; on-disk locals move their existing extents unchanged.
+fn reduceSpilled(manager: *@import("spill.zig").Manager, grouped: *operators.Grouped, locals: []const ?*Result, workspace: usize) !bool {
+    var key_count: ?usize = null;
+    var sources: [4]*@import("spill_grouped.zig").Grouped = undefined;
+    var count: usize = 0;
+    var source_bases: [4]u64 = undefined;
+    var partitions: ?usize = null;
+    var rows: u64 = 0;
+    var bases: [4]u64 = undefined;
+    for (locals, 0..) |local, index| {
+        if (local.?.grouped.?.key_count) |width| {
+            if (key_count) |known| {
+                if (width != known) return error.InvalidSqlBackendResponse;
+            } else key_count = width;
+        }
+        bases[index] = rows;
+        rows = try std.math.add(u64, rows, local.?.grouped.?.rows_seen);
+        if (local.?.grouped.?.external) |source| {
+            if (!source.canTransferPartitions()) return false;
+            if (partitions) |n| {
+                if (n != source.partition_count) return false;
+            } else partitions = source.partition_count;
+            sources[count] = source;
+            source_bases[count] = bases[index];
+            count += 1;
+        }
+    }
+    const external = try grouped.backing.create(@import("spill_grouped.zig").Grouped);
+    errdefer grouped.backing.destroy(external);
+    external.* = try @import("spill_grouped.zig").Grouped.init(grouped.backing, manager, grouped.specs, key_count orelse return error.InvalidSqlBackendResponse, workspace * locals.len);
+    errdefer external.deinit();
+    external.partition_count = partitions.?;
+    for (locals, 0..) |local, index| if (local.?.grouped.?.external == null) try local.?.grouped.?.exportPartialAt(external, bases[index]);
+    try external.preparePartitionTransfer(sources[0..count], source_bases[0..count]);
+    // No fallible operation follows the first ownership transfer.
+    for (locals, 0..) |local, index| if (local.?.grouped.?.external) |source| external.transferPartitions(source, bases[index]);
+    grouped.external = external;
+    grouped.key_count = key_count;
+    grouped.finished = true;
+    grouped.rows_seen = rows;
+    return true;
+}
+fn reduce(context: runtime.Context, grouped: *operators.Grouped, locals: []const ?*Result, workspace: usize) !bool {
+    var partials: usize = 0;
+    for (locals) |local| {
+        const source = local.?.grouped.?;
+        if (source.external != null) return reduceSpilled(context.spill orelse return false, grouped, locals, workspace);
+        partials +|= source.groupCount();
+    }
+    if (partials < 4096 or grouped.key_count == 0) return false;
+    const owner = try context.alloc.create(Reduction);
+    owner.* = .{ .backing = context.alloc, .allocator = .{ .backing = if (context.spill) |manager| manager.allocator() else context.alloc } };
+    var adopted = false;
+    defer if (!adopted) Reduction.release(owner);
+    var arena = std.heap.ArenaAllocator.init(owner.allocator.allocator());
+    defer arena.deinit();
+    const selections = try arena.allocator().alloc([][]usize, locals.len);
+    for (locals, selections) |source, *selection| selection.* = try source.?.grouped.?.partitionGroups(arena.allocator(), locals.len);
+    const io = context.backend.execution_io.?;
+    var tasks: [4]?scheduling.Task(anyerror!*Result) = @splat(null);
+    defer for (&tasks, 0..) |*task, lane| if (task.*) |*pending| {
+        owner.results[lane] = pending.cancel(io) catch null;
+        task.* = null;
+    };
+    var ready: std.Io.Event = .unset;
+    var work: [4]ReduceWork = undefined;
+    for (0..locals.len) |lane| {
+        work[lane] = .{ .context = context, .owner = owner, .sources = locals, .selections = selections, .lane = lane, .workspace = workspace, .ready = &ready };
+        if (lane != 0) tasks[lane] = scheduling.global().submit(io, workspace, ReduceWork.run, .{work[lane]});
+    }
+    ready.set(io);
+    var failure: ?anyerror = null;
+    for (work[0..locals.len], 0..) |item, lane| if (tasks[lane] == null) {
+        owner.results[lane] = item.run() catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+    };
+    for (tasks[0..locals.len], 0..) |*task, lane| if (task.*) |*pending| {
+        owner.results[lane] = pending.await(io) catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+        task.* = null;
+    };
+    if (failure) |err| return switch (err) {
+        // Decline before changing the destination; all local partials remain
+        // readable for its established serial/spilling reduction.
+        error.OutOfMemory, error.SqlProgramLimitExceeded => false,
+        else => err,
+    };
+    var rows: u64 = 0;
+    for (locals, 0..) |source, lane| {
+        rows = try std.math.add(u64, rows, source.?.grouped.?.rows_seen);
+        owner.groups[lane] = owner.results[lane].?.grouped.?;
+    }
+    try grouped.adoptReducers(.{ .ptr = owner, .groups = owner.groups[0..locals.len], .release = Reduction.release }, rows);
+    adopted = true;
+    return true;
+}
 const Work = struct {
     context: runtime.Context,
     bound: *const binding.Bound,
     cursor: catalog.Cursor,
-    parts: usize,
-    visited: *std.atomic.Value(usize),
-    pages: *std.atomic.Value(usize),
-    fn run(self: Work) anyerror!*operators.Grouped {
+    workspace: usize,
+    ready: *std.Io.Event,
+    quota: *@import("native_scan_quota.zig").Quota,
+    fn run(self: Work) anyerror!*Result {
+        defer if (self.cursor.finish_partition) |finish| finish(self.cursor.ptr);
+        try self.ready.wait(self.context.backend.execution_io.?);
+        const result = self.context.alloc.create(Result) catch return error.ParallelAggregateMemoryExceeded;
+        result.* = .{ .backing = self.context.alloc, .budget = .{ .backing = self.context.alloc, .limit = self.workspace } };
+        errdefer result.deinit();
         var context = self.context;
-        const local = operators.Grouped.create(context.alloc, self.bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / (4 * self.parts), .spill = context.spill }) catch return error.ParallelAggregateMemoryExceeded;
-        errdefer local.deinit();
+        context.alloc = result.budget.allocator();
+        context.limits.retained_bytes = self.workspace;
+        const local = operators.Grouped.create(context.alloc, self.bound.specs, .{ .groups = context.limits.scan_rows, .bytes = self.workspace / 2, .spill = context.spill }) catch return error.ParallelAggregateMemoryExceeded;
+        result.grouped = local;
         if (self.bound.group_count == 0) local.ensureGlobalGroup() catch return error.ParallelAggregateMemoryExceeded;
         while (true) {
             try context.checkpoint();
@@ -42,16 +197,17 @@ const Work = struct {
                 else => err,
             };
             if (page.selection.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
-            const visited = self.visited.fetchAdd(page.selection.len, .monotonic);
-            if (page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
-            if (self.pages.fetchAdd(1, .monotonic) >= context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+            // Terminal EOF proves exhaustion and spends no logical page credit.
+            // Empty nonterminal responses still count, bounding broken cursors.
+            if (page.selection.len == 0 and page.after == null) break;
+            try self.quota.admit(page.selection.len, page.after == null);
             @import("aggregate_runtime.zig").addColumns(context, self.bound, local, arena.allocator(), page) catch |err| return switch (err) {
                 error.OutOfMemory, error.SqlProgramLimitExceeded => error.ParallelAggregateMemoryExceeded,
                 else => err,
             };
             if (page.after == null) break;
         }
-        return local;
+        return result;
     }
 };
 fn compatible(program: @import("scalar.zig").Program) bool {
@@ -71,17 +227,21 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
     for (bound.specs) |spec| if (!operators.exactMergeable(spec)) return false;
     if (bound.input.predicate) |program| if (!compatible(program)) return false;
     for (bound.input.projections) |program| if (program) |value| if (!compatible(value)) return false;
+    const scheduler = scheduling.global();
+    const budget = scheduler.cpuWorkspaceBudget(context.limits.retained_bytes / 2);
+    const maximum = scheduler.fanout(4, budget, 1024 * 1024);
+    if (maximum < 2) return false;
     var allocator: scheduling.LockedAllocator = .{ .backing = context.alloc };
     const a = if (context.spill) |manager| manager.allocator() else allocator.allocator();
-    const cursors = (scan.partitions(context, a, table, request, 4) catch |err| return switch (err) {
+    const cursors = (scan.partitions(context, a, table, request, maximum) catch |err| return switch (err) {
         error.OutOfMemory => false,
         else => err,
     }) orelse return false;
     defer a.free(cursors);
     defer for (cursors) |cursor| cursor.close(cursor.ptr);
     if (cursors.len < 2 or cursors.len > 4) return error.InvalidSqlBackendResponse;
-    var tasks: [4]?scheduling.Task(anyerror!*operators.Grouped) = @splat(null);
-    var locals: [4]?*operators.Grouped = @splat(null);
+    var tasks: [4]?scheduling.Task(anyerror!*Result) = @splat(null);
+    var locals: [4]?*Result = @splat(null);
     // Join before releasing local buffers or pinned child cursors on all exits.
     defer {
         for (&tasks, &locals) |*task, *local| if (task.*) |*pending| {
@@ -90,19 +250,26 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
         };
         for (locals) |local| if (local) |value| value.deinit();
     }
-    var visited: std.atomic.Value(usize) = .init(0);
-    var pages: std.atomic.Value(usize) = .init(0);
+    var quota: @import("native_scan_quota.zig").Quota = .{ .capacity = context.limits.executionRows(), .row_limit = context.limits.scan_rows, .page_limit = context.limits.scan_pages };
     var worker_context = context;
     worker_context.alloc = a;
     var failure: ?anyerror = null;
+    var ready: std.Io.Event = .unset;
+    // Complete admission before any lane can recursively submit expression or
+    // I/O work. One lane always runs on the caller; denied lanes run afterward.
+    var work: [4]Work = undefined;
+    const workspace = budget / cursors.len;
     for (cursors, 0..) |cursor, index| {
-        const work: Work = .{ .context = worker_context, .bound = bound, .cursor = cursor, .parts = cursors.len, .visited = &visited, .pages = &pages };
-        tasks[index] = scheduling.global().submit(io, context.limits.retained_bytes / cursors.len, Work.run, .{work});
-        if (tasks[index] == null) locals[index] = work.run() catch |err| blk: {
+        work[index] = .{ .context = worker_context, .bound = bound, .cursor = cursor, .workspace = workspace, .ready = &ready, .quota = &quota };
+        if (index != 0) tasks[index] = scheduler.submit(io, workspace, Work.run, .{work[index]});
+    }
+    ready.set(io);
+    for (work[0..cursors.len], 0..) |item, index| if (tasks[index] == null) {
+        locals[index] = item.run() catch |err| blk: {
             failure = failure orelse err;
             break :blk null;
         };
-    }
+    };
     for (tasks[0..cursors.len], 0..) |*task, index| if (task.*) |*pending| {
         locals[index] = pending.await(io) catch |err| blk: {
             failure = failure orelse err;
@@ -116,11 +283,61 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
         if (err == error.ParallelAggregateMemoryExceeded) return false;
         return err;
     }
+    if (bound.group_count != 0) {
+        const reduced = reduce(context, grouped, locals[0..cursors.len], workspace) catch |err| switch (err) {
+            error.OutOfMemory, error.SqlProgramLimitExceeded => false,
+            else => return err,
+        };
+        if (reduced) return true;
+    }
     var ordinal: u64 = 0;
     for (locals[0..cursors.len]) |local| {
-        const source = local.?;
+        const source = local.?.grouped.?;
         try grouped.mergeExact(source, ordinal);
         ordinal = try std.math.add(u64, ordinal, source.rows_seen);
     }
     return true;
+}
+
+test "SQL final spill exchange combines disk and memory locals without serial finalization" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    var locals: [3]?*Result = @splat(null);
+    defer for (locals) |local| if (local) |owned| owned.deinit();
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count } };
+    for (&locals, 0..) |*slot, lane| {
+        const result = try a.create(Result);
+        result.* = .{ .backing = a, .budget = .{ .backing = a, .limit = 1024 * 1024 } };
+        slot.* = result;
+        result.grouped = try operators.Grouped.create(result.budget.allocator(), &specs, .{ .bytes = 128 * 1024, .spill = &manager });
+        for (0..(if (lane == 2) @as(usize, 3) else 2048)) |index| {
+            const key = @import("scalar.zig").Datum.json(.{ .integer = @intCast(index) });
+            const value = @import("scalar.zig").Datum.json(.{ .integer = if (lane == 0) @intCast(index) else if (lane == 1) -@as(i64, @intCast(index)) else 7 });
+            try result.grouped.?.add(&.{key}, &.{ value, value });
+        }
+        try std.testing.expect((result.grouped.?.external != null) == (lane != 2));
+    }
+    const target = try operators.Grouped.create(a, &specs, .{ .bytes = 512 * 1024, .spill = &manager });
+    defer target.deinit();
+    try std.testing.expect(try reduceSpilled(&manager, target, &locals, 512 * 1024));
+    try std.testing.expectEqual(@as(u64, 4099), target.rows_seen);
+    for (locals[0..2]) |local| for (local.?.grouped.?.external.?.partitions) |file| try std.testing.expect(file == null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var seen: [2048]bool = @splat(false);
+    while (true) {
+        _ = arena.reset(.free_all);
+        const result = (try target.nextResult(arena.allocator())) orelse break;
+        const key: usize = @intCast(result.keys[0].value.integer);
+        try std.testing.expect(!seen[key]);
+        seen[key] = true;
+        try std.testing.expectEqual(@as(i64, if (key < 3) 7 else 0), result.aggregates[0].value.integer);
+        try std.testing.expectEqual(@as(i64, if (key < 3) 3 else 2), result.aggregates[1].value.integer);
+        try std.testing.expectEqual(@as(u64, key), result.ordinal);
+    }
+    for (seen) |present| try std.testing.expect(present);
 }

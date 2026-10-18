@@ -370,6 +370,8 @@ fn listAllKeysAlloc(alloc: Allocator, store: Store, max_keys: u32) ![][]u8 {
 fn listAllObjectVersionsAlloc(alloc: Allocator, store: Store, max_keys: u32) ![]object_storage.ObjectVersionEntry {
     var entries = std.ArrayListUnmanaged(object_storage.ObjectVersionEntry).empty;
     errdefer freeObjectVersionList(alloc, &entries);
+    var page_token: ?[]u8 = null;
+    defer if (page_token) |value| alloc.free(value);
     var key_marker: ?[]u8 = null;
     defer if (key_marker) |value| alloc.free(value);
     var version_id_marker: ?[]u8 = null;
@@ -377,6 +379,7 @@ fn listAllObjectVersionsAlloc(alloc: Allocator, store: Store, max_keys: u32) ![]
     while (true) {
         var result = try store.client.listObjectVersions(store.bucket, .{
             .prefix = store.prefix,
+            .continuation_token = page_token,
             .key_marker = key_marker,
             .version_id_marker = version_id_marker,
             .max_keys = max_keys,
@@ -396,6 +399,13 @@ fn listAllObjectVersionsAlloc(alloc: Allocator, store: Store, max_keys: u32) ![]
             };
         }
         if (!result.is_truncated) break;
+        if (result.next_continuation_token) |next| {
+            if (page_token != null and std.mem.eql(u8, page_token.?, next)) return error.SeedPrefixCleanupPaginationStalled;
+            const owned = try alloc.dupe(u8, next);
+            if (page_token) |value| alloc.free(value);
+            page_token = owned;
+            continue;
+        }
         const next_key = result.next_key_marker orelse return error.InvalidListVersionsResponse;
         if (key_marker != null and
             std.mem.eql(u8, key_marker.?, next_key) and

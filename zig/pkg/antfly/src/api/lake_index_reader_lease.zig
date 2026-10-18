@@ -64,6 +64,14 @@ pub const Handle = struct {
         try self.parent.ensureActive();
         try self.owner.check();
     }
+    pub fn retain(self: *const Handle) !*Handle {
+        try self.parent.ensureActive();
+        try self.owner.check();
+        const copy = try std.heap.page_allocator.create(Handle);
+        copy.* = self.*;
+        _ = self.owner.users.fetchAdd(1, .acq_rel);
+        return copy;
+    }
     pub fn deinit(self: *Handle) void {
         _ = self.owner.users.fetchSub(1, .acq_rel);
         std.heap.page_allocator.destroy(self);
@@ -284,6 +292,13 @@ test "external lake native reader pool amortizes admission and fences every cach
         try std.testing.expect(first.owner == handle.owner);
         try handle.readContext().ensureActive();
     }
+    const short = try pool.acquire(std.testing.io, authority, 4, 1, .{});
+    const retained_copy = try short.retain();
+    defer retained_copy.deinit();
+    short.deinit();
+    // A source can retain authority after its short index cursor closes.
+    try retained_copy.readContext().ensureActive();
+    try std.testing.expect(first.owner == retained_copy.owner);
     try std.testing.expectEqual(@as(usize, 1), harness.mutations);
     var replacement = publication;
     replacement.generation = 2;

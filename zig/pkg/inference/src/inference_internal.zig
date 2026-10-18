@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const pull_diagnostics = @import("registry/pull_diagnostics.zig");
+
 const build_options = @import("build_options");
 pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
 pub const gliner_span_v2_executor = @import("extractors/gliner_span_v2_executor.zig");
