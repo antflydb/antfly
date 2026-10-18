@@ -89,6 +89,26 @@ def admitted(
 
 
 class PromotionJobConditionsTests(unittest.TestCase):
+    def test_pypi_pause_allows_aliases_and_journal_completion(self):
+        results = dict.fromkeys(
+            (
+                "prepare-release-promotion",
+                "begin-release-channel",
+                "publish-cli-npm",
+                "prepare-zig-homebrew",
+                "stage-container",
+                "promote-channel-aliases",
+                "publish-github-release",
+            ),
+            "success",
+        )
+        results["publish-cli-pypi"] = "skipped"
+        for homebrew in ("success", "skipped"):
+            results["prepare-zig-homebrew"] = homebrew
+            for job in ("promote-channel-aliases", "complete-release-channel"):
+                with self.subTest(job=job, homebrew=homebrew):
+                    self.assertTrue(admitted(condition(job), results))
+
     def test_rc_skip_and_stable_success_admit_ready_jobs(self):
         for job, dependencies in JOBS.items():
             for ancestor in ("skipped", "success"):
